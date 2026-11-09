@@ -86,14 +86,15 @@ class Engine:
             return None
         return json.dumps(planning_settings(self.session, self._order))
 
-    def execute(self, planned: str, tables: dict | None = None,
+    def execute(self, planned: tuple[str, dict], tables: dict | None = None,
                 on_rows: Callable | None = None, hint=None) -> pa.Table | None:
         """Run a region Rust planned and return its rows.
 
         Args:
-            planned: The planned region as JSON: its physical plan, the
-                operators it lowers, DataFusion's plan of the region, and
-                each scan's files; or its refusal.
+            planned: The planned region as JSON (its physical plan, the
+                operators it lowers, and DataFusion's plan of the region;
+                or its refusal), and by alias each scan's token store and
+                value columns as pyarrow Tables.
             tables: The rows of each table the region reads, by name.
             on_rows: Optional callable(pyarrow Table) handed the region's
                 rows as they finish, each row once; the call then
@@ -108,13 +109,14 @@ class Engine:
         from quail.api.region_inputs import region_query
         from quail.physical.plan import RefusalError, refusal_from_fields
 
-        found = json.loads(planned)
+        text, scans = planned
+        found = json.loads(text)
         if "refusal" in found:
             raise RefusalError(refusal_from_fields(found["refusal"]))
         query = region_query(self.session, found["operators"],
                              logical=found.get("logical", ""), order=self._order,
                              tables=tables, keep_order=True)
-        query.adopt_plan(found)
+        query.adopt_plan(found, scans)
         return self._run(query, on_rows, hint)
 
     def _run(self, query, on_rows: Callable | None = None,

@@ -21,7 +21,6 @@ quail-inputs = { path = "../quail-inputs" }
 quail-physical = { path = "../quail-physical" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
-tempfile = "3"
 quail-planner = { path = "../quail-planner" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 

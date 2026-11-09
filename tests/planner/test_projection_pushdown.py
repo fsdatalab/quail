@@ -30,6 +30,11 @@ def _session(tmp_path, tokenizer=TOKENIZER):
     return session
 
 
+def _token_buffer(scan):
+    """The address of the first token id a scan's store holds."""
+    return scan.tokens.arrow_array.chunk(0).values.buffers()[1].address
+
+
 def test_projected_results_token_reuse_and_join_projection(tmp_path):
     session = _session(tmp_path)
     truth = {"r": {"q:": [1, 0, 1]}}
@@ -47,14 +52,14 @@ def test_projected_results_token_reuse_and_join_projection(tmp_path):
     # the id, then the document, which locates answers
     assert store.projected_columns == ("id", "review")
     # a later query reads the same token store instead of tokenizing again
-    tokenized = store.tokens.path
+    tokenized = _token_buffer(store)
 
     later = session.sql(
         "SELECT r.stars, r.review FROM reviews r WHERE "
         "AI_FILTER(PROMPT('q: {0}', r.review))")
     second = _run(later, make_executor(truth))
     assert sorted(second.to_rows()) == [(3, "fine one"), (5, "good one")]
-    assert later.token_inputs()["r"].tokens.path == tokenized
+    assert _token_buffer(later.token_inputs()["r"]) == tokenized
 
     truth = {"r": {"q:": [0, 1, 0]}}
 
@@ -69,7 +74,7 @@ def test_projected_results_token_reuse_and_join_projection(tmp_path):
     star = _run(everything, make_executor(truth))
     assert star.columns == ["r.id", "r.review", "r.stars", "r.wide"]
     assert star.to_rows() == [("r1", "bad one", 1, "y" * 50)]
-    assert everything.token_inputs()["r"].tokens.path == tokenized
+    assert _token_buffer(everything.token_inputs()["r"]) == tokenized
     session.close()
 
     session = _session(tmp_path)

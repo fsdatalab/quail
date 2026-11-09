@@ -28,13 +28,14 @@ use quail_planner::operators::Operators;
 use quail_planner::prompts::Turn;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::planning::{PlanOutcome, Planner, Settings, TableRows, planned_json};
+use crate::planning::{PlannedRegion, Planner, ScanInputs, Settings, TableRows, outcome_json};
 use crate::pyarrow::{from_pyarrow, stream_from_pyarrow, to_pyarrow};
 use crate::python_failure;
 
 /// Runs each model region by calling the engine's
-/// `execute(planned, tables, sink)` or `run_region(payload, tables,
-/// fetch)`. `execute` hands the sink each batch of finished rows as the
+/// `execute(planned, tables, sink, hint)` or `run_region(payload,
+/// tables, fetch)`; `planned` is the planned region's JSON and its scans,
+/// as [`scans_to_pyarrow`] hands them over. `execute` hands the sink each batch of finished rows as the
 /// region runs and returns None, or returns the rows; `run_region`
 /// returns them, as a pyarrow Table or RecordBatchReader.
 #[derive(Debug)]
@@ -174,14 +175,15 @@ impl PythonRunner {
 
     /// Plan a region in Rust, or None when Python plans it: a region that
     /// asks no model. `payload` is the region as [`region_json`] writes it;
-    /// the plan carries its DataFusion plan on to Python.
+    /// the plan carries its DataFusion plan on to Python, beside what its
+    /// scans read.
     fn plan_here(
         &self,
         region: &ModelRegion,
         inputs: &[InputRows],
         payload: &str,
         fetch: Option<usize>,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<PlannedRegion>> {
         let Some((planner, settings)) = &self.planning else {
             return Ok(None);
         };
@@ -214,26 +216,24 @@ impl PythonRunner {
         let compile = |error: quail_planner::CompileError| {
             DataFusionError::Plan(format!("CompileError: {}", error.0))
         };
-        let mut planned = match planner.plan(&operators, &tables, settings) {
-            Ok(PlanOutcome::Planned(planned)) => planned_json(&planned).map_err(compile)?,
-            Ok(PlanOutcome::Refused(refused)) => crate::planning::refused_json(&refused),
-            Ok(PlanOutcome::Fixed(plan)) => plan,
-            Err(error) => return Err(compile(error)),
-        };
+        let (outcome, scans) = planner
+            .plan(&operators, &tables, settings)
+            .map_err(compile)?;
+        let mut planned = outcome_json(&outcome).map_err(compile)?;
         planned["logical"] = logical.into();
-        Ok(Some(planned.to_string()))
+        Ok(Some((planned.to_string(), scans)))
     }
 
     /// Plan a region without running it, over the rows of its inputs that
     /// call no model; an input that calls a model plans as empty.
     ///
     /// Returns the region as [`region_json`] writes it, and the planned
-    /// region as JSON or None when Python plans it.
+    /// region or None when Python plans it.
     pub(crate) fn plan_only(
         &self,
         region: &ModelRegion,
         inputs: &[InputRows],
-    ) -> Result<(String, Option<String>)> {
+    ) -> Result<(String, Option<PlannedRegion>)> {
         let payload = self.request(region)?;
         let sorted = inputs
             .iter()
@@ -309,8 +309,9 @@ impl PythonRunner {
                 tables.push((name.clone(), to_pyarrow(py, schema, batches.clone())?));
             }
             let tables = tables.into_py_dict(py)?;
-            let answer = match &planned {
-                Some(found) => {
+            let answer = match planned {
+                Some((found, scans)) => {
+                    let found = (found, scans_to_pyarrow(py, &scans)?);
                     let sink = Bound::new(py, sink)?;
                     let hint = held.map(|hint| Bound::new(py, hint)).transpose()?;
                     self.engine
@@ -336,6 +337,31 @@ impl PythonRunner {
         }
         Ok(())
     }
+}
+
+/// What each scan reads, by alias, as Python's `adopt_plan` takes it:
+/// (the token store, the value columns), each a pyarrow Table over the
+/// same buffers.
+///
+/// # Errors
+///
+/// pyarrow is not importable.
+pub fn scans_to_pyarrow<'py>(
+    py: Python<'py>,
+    scans: &[ScanInputs],
+) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+    let found = pyo3::types::PyDict::new(py);
+    for scan in scans {
+        let tokens = to_pyarrow(
+            py,
+            Arc::clone(scan.tokens.schema()),
+            scan.tokens.record_batches().to_vec(),
+        )?;
+        let (schema, batches) = &scan.columns;
+        let columns = to_pyarrow(py, Arc::clone(schema), batches.clone())?;
+        found.set_item(&scan.alias, (tokens, columns))?;
+    }
+    Ok(found)
 }
 
 impl RegionRunner for PythonRunner {

@@ -34,7 +34,7 @@ from quail.backends.quail.graph import (
 )
 from quail.backends.resources import freeze_loaded_objects, release_models
 from quail.common import budgets
-from quail.common.tokens import decode_payload_documents, select_documents
+from quail.common.tokens import decode_payload_documents
 from quail.execution.types import PhysicalResponse
 from quail.physical import Scan
 from quail.physical.plan import graph_from_envelope
@@ -605,15 +605,9 @@ def execute_quail_multi(payload, registry, graph):
     boot_s = round(time.perf_counter() - started, 2)
     say(f"all {gpus} GPUs ready; running the query")
 
-    # file backed token buffers go to the children by reference
-    documents = decode_payload_documents(payload["documents"])
-    query = {**payload, "documents": {
-        alias: select_documents(found, range(len(found)))
-        for alias, found in documents.items()}}
-
     def serve(paths, wanted):
         try:
-            workers.round("region", [{"query": query, "socket": path,
+            workers.round("region", [{"query": payload, "socket": path,
                                       "wanted": wanted} for path in paths])
         except BaseException:
             # the children that listen would wait for the region forever

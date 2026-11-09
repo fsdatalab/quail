@@ -9,13 +9,11 @@ mod physical;
 
 use std::io::Cursor;
 
-use datafusion::arrow::array::AsArray;
 use datafusion::arrow::ipc::reader::StreamReader;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::logical_expr::LogicalPlan;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use quail::planning::PlanOutcome;
 use quail::planning::pricer_fields;
 use quail::pyarrow::to_pyarrow;
 use quail_datafusion::derive;
@@ -112,17 +110,31 @@ impl NativeSession {
     }
 
     /// Plan each model region of a query without running it: per region,
-    /// (the region as JSON, its planned region as JSON or None when
-    /// Python plans it).
+    /// (the region as JSON, None when Python plans it or else (its
+    /// planned region as JSON, its scans as `quail::scans_to_pyarrow`
+    /// hands them over))).
+    #[allow(clippy::type_complexity)]
     #[pyo3(signature = (query, dialect=None))]
-    fn plans(
+    fn plans<'py>(
         &self,
-        py: Python<'_>,
+        py: Python<'py>,
         query: &str,
         dialect: Option<String>,
-    ) -> PyResult<Vec<(String, Option<String>)>> {
-        py.detach(|| self.session.plans(query, dialect.as_deref()))
-            .map_err(python_error)
+    ) -> PyResult<Vec<(String, Option<(String, Bound<'py, pyo3::types::PyDict>)>)>> {
+        let found = py
+            .detach(|| self.session.plans(query, dialect.as_deref()))
+            .map_err(python_error)?;
+        found
+            .into_iter()
+            .map(|(payload, planned)| {
+                let planned = planned
+                    .map(|(plan, scans)| {
+                        Ok::<_, PyErr>((plan, quail::scans_to_pyarrow(py, &scans)?))
+                    })
+                    .transpose()?;
+                Ok((payload, planned))
+            })
+            .collect()
     }
 
     /// Return the inputs of each model region of a query that call no
@@ -557,66 +569,8 @@ fn refusal_fields(refusal: &quail_planner::search::Refusal) -> serde_json::Value
     serde_json::json!({"refusal": quail::planning::refusal_json(refusal)})
 }
 
-/// Tokenize the texts of `table`'s first column into a token store at
-/// `path`, with the `tokenizer.json` at `tokenizer_file`.
-#[pyfunction]
-fn write_token_store(path: &str, table: &Bound<'_, PyAny>, tokenizer_file: &str) -> PyResult<()> {
-    let tokenizer = quail_inputs::HfTokenizer::from_file(std::path::Path::new(tokenizer_file))
-        .map_err(|error| python_error(error.into()))?;
-    let batches = quail::pyarrow::from_pyarrow(table)?;
-    let py = table.py();
-    py.detach(|| {
-        let mut writer = quail_inputs::TokenStoreWriter::create(std::path::Path::new(path))?;
-        for batch in &batches {
-            writer.write_texts(&tokenizer, batch.column(0).as_string::<i32>())?;
-        }
-        writer.finish().map(|_| ())
-    })
-    .map_err(|error| python_error(error.into()))
-}
-
-/// Return the planner's statistics of the token store at `path`: the
-/// prefix index order and parent and shared tokens of its tree at
-/// `page_tokens`, and each document's first equal document (equal also
-/// in each column of `columns`, a pyarrow Table).
-#[pyfunction]
-#[pyo3(signature = (path, page_tokens, columns=None))]
-fn prefix_statistics<'py>(
-    py: Python<'py>,
-    path: &str,
-    page_tokens: i64,
-    columns: Option<&Bound<'py, PyAny>>,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    let store = quail_inputs::TokenStore::open(std::path::Path::new(path))
-        .map_err(|error| python_error(error.into()))?;
-    let values: Vec<datafusion::arrow::array::ArrayRef> = match columns {
-        None => Vec::new(),
-        Some(table) => {
-            let batches = quail::pyarrow::from_pyarrow(table)?;
-            let schema = batches
-                .first()
-                .map(|batch| batch.schema())
-                .ok_or_else(|| PyRuntimeError::new_err("columns has no batch"))?;
-            let batch = datafusion::arrow::compute::concat_batches(&schema, &batches)
-                .map_err(|error| python_error(error.into()))?;
-            batch.columns().to_vec()
-        }
-    };
-    let documents = store.documents();
-    let index = quail_inputs::PrefixIndex::new(&documents);
-    let tree = index.tree(page_tokens);
-    let first = quail_inputs::first_documents(&documents, &values)
-        .map_err(|error| python_error(error.into()))?;
-    let found = pyo3::types::PyDict::new(py);
-    found.set_item("order", &tree.order)?;
-    found.set_item("parent", &tree.parent)?;
-    found.set_item("shared", &tree.shared)?;
-    found.set_item("first_documents", first)?;
-    Ok(found)
-}
-
 /// A model's tokenizer, read from its `tokenizer.json`: the one the
-/// planner writes token stores with and the GPU worker decodes with.
+/// planner tokenizes documents with and the GPU worker decodes with.
 #[pyclass(name = "Tokenizer", module = "_quail_native", frozen)]
 struct Tokenizer {
     inner: quail_inputs::HfTokenizer,
@@ -981,39 +935,6 @@ fn read_operators(operators: &str) -> PyResult<quail_planner::operators::Operato
     serde_json::from_str(operators).map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
-/// A region's operators, its tables' rows, and the settings, read from
-/// what Python passes the planner.
-fn planning_inputs(
-    operators: &str,
-    tables: &Bound<'_, pyo3::types::PyDict>,
-    settings: &str,
-) -> PyResult<(
-    quail_planner::operators::Operators,
-    std::collections::HashMap<String, quail::planning::TableRows>,
-    quail::planning::Settings,
-)> {
-    let operators = read_operators(operators)?;
-    let settings: quail::planning::Settings = from_json(settings)?;
-    let mut rows = std::collections::HashMap::new();
-    for (name, entry) in tables.iter() {
-        let (identity, table): (Option<String>, Bound<'_, PyAny>) = entry.extract()?;
-        let reader = quail::pyarrow::stream_from_pyarrow(&table)?;
-        let schema = datafusion::arrow::array::RecordBatchReader::schema(&reader);
-        let batches = reader
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|error| python_error(error.into()))?;
-        rows.insert(
-            name.extract::<String>()?,
-            quail::planning::TableRows {
-                identity,
-                schema,
-                batches,
-            },
-        );
-    }
-    Ok((operators, rows, settings))
-}
-
 /// Plans model regions in Rust for one session, with the session's
 /// tokenizer, keeping the token stores of tables read whole.
 #[pyclass(name = "NativePlanner", module = "_quail_native")]
@@ -1032,57 +953,6 @@ impl NativePlanner {
                     .map_err(|error| PyRuntimeError::new_err(error.0))?,
             ),
         })
-    }
-
-    /// Prepare a region for a backend other than Quail's: its column
-    /// placements, its scans' files, and the planning context's fields,
-    /// over `tables` as `plan` reads them.
-    ///
-    /// Returns (the prepared region as JSON, None) or (None, a
-    /// CompileError's message).
-    fn prepare(
-        &self,
-        py: Python<'_>,
-        operators: &str,
-        tables: &Bound<'_, pyo3::types::PyDict>,
-        settings: &str,
-    ) -> PyResult<(Option<String>, Option<String>)> {
-        let (operators, rows, settings) = planning_inputs(operators, tables, settings)?;
-        let prepared = match py.detach(|| self.planner.prepare(&operators, &rows, &settings)) {
-            Ok(prepared) => prepared,
-            Err(error) => return Ok((None, Some(error.0))),
-        };
-        let found = quail::planning::prepared_json(&prepared)
-            .map_err(|error| PyRuntimeError::new_err(error.0))?;
-        Ok((Some(found.to_string()), None))
-    }
-
-    /// Plan a region's operators, as JSON, over `tables`: by provider
-    /// name, (content identity or None, the rows as a pyarrow Table).
-    /// `settings` is the configuration as JSON.
-    ///
-    /// Returns (the plan as JSON, None) or (None, a CompileError's
-    /// message). The plan holds the envelope, estimates, pricer, the
-    /// chosen operators, the context fields, and each scan's files, or
-    /// the refusal. A request backend's plan holds the envelope, the
-    /// operators, and the scans.
-    fn plan(
-        &self,
-        py: Python<'_>,
-        operators: &str,
-        tables: &Bound<'_, pyo3::types::PyDict>,
-        settings: &str,
-    ) -> PyResult<(Option<String>, Option<String>)> {
-        let (operators, rows, settings) = planning_inputs(operators, tables, settings)?;
-        let found = py.detach(|| self.planner.plan(&operators, &rows, &settings));
-        let found = match found {
-            Ok(PlanOutcome::Planned(planned)) => quail::planning::planned_json(&planned)
-                .map_err(|error| PyRuntimeError::new_err(error.0))?,
-            Ok(PlanOutcome::Refused(refused)) => quail::planning::refused_json(&refused),
-            Ok(PlanOutcome::Fixed(plan)) => plan,
-            Err(error) => return Ok((None, Some(error.0))),
-        };
-        Ok((Some(found.to_string()), None))
     }
 }
 
@@ -1237,13 +1107,11 @@ pub fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(column_placements, module)?)?;
     module.add_function(wrap_pyfunction!(prompt_lowering, module)?)?;
     module.add_function(wrap_pyfunction!(plan_operator, module)?)?;
-    module.add_function(wrap_pyfunction!(write_token_store, module)?)?;
     module.add_function(wrap_pyfunction!(collect_answers, module)?)?;
     module.add_function(wrap_pyfunction!(edit_graph, module)?)?;
     module.add_function(wrap_pyfunction!(region_facts, module)?)?;
     module.add_function(wrap_pyfunction!(limited_operators, module)?)?;
     module.add_function(wrap_pyfunction!(execution_report, module)?)?;
-    module.add_function(wrap_pyfunction!(prefix_statistics, module)?)?;
     module.add_function(wrap_pyfunction!(region_stages, module)?)?;
     module.add_function(wrap_pyfunction!(run_stages, module)?)?;
     module.add_function(wrap_pyfunction!(read_and_write_plan, module)?)

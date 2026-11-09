@@ -41,8 +41,8 @@ use quail_datafusion::{
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::unbounded_channel;
 
-pub use crate::engine::region_json;
 use crate::engine::{PythonRunner, PythonTable, RegionCall};
+pub use crate::engine::{region_json, scans_to_pyarrow};
 
 /// The model and hardware a [`Session`] runs on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -485,7 +485,7 @@ impl Session {
         &self,
         query: &str,
         dialect: Option<&str>,
-    ) -> Result<Vec<(String, Option<String>)>> {
+    ) -> Result<Vec<(String, Option<planning::PlannedRegion>)>> {
         let regions = self.regions(query, dialect)?;
         let computed = self.region_inputs(query, dialect)?;
         regions

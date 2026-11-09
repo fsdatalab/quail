@@ -15,7 +15,7 @@ from quail.api.execute import execute_query
 from quail.api.region_inputs import input_scans
 from quail.common.expressions import CompileError
 from quail.common.pairs import FIRST_DOCUMENT, columns_key
-from quail.common.tokens import ColumnStore, ScanInput, TokenStore
+from quail.common.tokens import ScanInput, TokenStore
 from quail.execution.finished import finished_table
 from quail.execution.metrics import NodeMetrics, NodeResult, scalar_node_metrics
 from quail.execution.result import QueryResult
@@ -212,7 +212,8 @@ class Query:
                 region = region_query(self.session, found["operators"],
                                       logical=found["logical"], order=self.order)
                 if planned is not None:
-                    region.adopt_plan(json.loads(planned))
+                    text, scans = planned
+                    region.adopt_plan(json.loads(text), scans)
                 regions.append(region)
             self._regions = regions
         return self._regions
@@ -369,26 +370,23 @@ class RegionQuery:
         self._plan = self._searched_plan = refusal
         return refusal
 
-    def _adopt_scans(self, found: dict) -> None:
-        """Read the token store and column files Rust wrote as the inputs."""
-        self._token_inputs, self._document_tokens = {}, {}
-        for alias, files in found["scans"].items():
-            store = TokenStore(files["tokens"])
-            self._token_inputs[alias] = ScanInput(store, {
-                name: ColumnStore(path) for name, path in files["columns"]})
-            self._document_tokens[alias] = store.lengths
-
-    def adopt_plan(self, found: dict):
-        """Take the plan Rust made, and read its scans' files as the inputs.
+    def adopt_plan(self, found: dict, scans: dict):
+        """Take the plan Rust made, and its scans' tokens and columns as the inputs.
 
         Args:
-            found: A planned or refused region, as ``NativePlanner.plan``
-                returns it and read from JSON.
+            found: A planned or refused region, read from the JSON Rust
+                planned it as.
+            scans: By alias, (the token store, the value columns) of each
+                scan, as pyarrow Tables over Rust's buffers.
 
         Returns:
             The physical plan, or the Refusal.
         """
-        self._adopt_scans(found)
+        self._token_inputs, self._document_tokens = {}, {}
+        for alias, (tokens, columns) in scans.items():
+            store = TokenStore(tokens)
+            self._token_inputs[alias] = ScanInput(store, columns)
+            self._document_tokens[alias] = store.lengths
         plan = plan_from_json(found)
         if isinstance(plan, Refusal):
             self._plan = self._searched_plan = plan

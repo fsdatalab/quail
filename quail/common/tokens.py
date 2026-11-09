@@ -1,11 +1,10 @@
-"""File backed token storage and Arrow token views."""
+"""In-memory token stores and Arrow token views."""
 
 from __future__ import annotations
 
 import bisect
 import json
 from collections.abc import Sequence
-from contextlib import ExitStack
 from dataclasses import asdict
 
 import _quail_native
@@ -199,39 +198,6 @@ class TokenLengths(Sequence):
 Tokenizer = _quail_native.Tokenizer
 
 
-class ColumnStore:
-    """Provide one memory mapped source column for result rows."""
-
-    def __init__(self, path: str):
-        self.path = path
-        with ExitStack() as resources:
-            self._source = resources.enter_context(pa.memory_map(path, "r"))
-            self._reader = resources.enter_context(pa.ipc.open_file(self._source))
-            self.name = self._reader.schema.names[0]
-            self._values = None
-            self._resources = resources.pop_all()
-
-    @property
-    def values(self) -> pa.ChunkedArray:
-        """Return the column as one memory mapped chunked array."""
-        if self._values is None:
-            self._values = pa.chunked_array(
-                [
-                    self._reader.get_batch(index).column(0)
-                    for index in range(self._reader.num_record_batches)
-                ],
-                type=self._reader.schema.field(0).type,
-            )
-        return self._values
-
-    def __len__(self) -> int:
-        return len(self.values)
-
-    def close(self) -> None:
-        """Close the memory mapped Arrow file."""
-        self._resources.close()
-
-
 def token_keys(tokens: pa.ChunkedArray) -> pa.ChunkedArray:
     """Each document's tokens as one binary value, to group equal documents.
 
@@ -255,40 +221,38 @@ def token_keys(tokens: pa.ChunkedArray) -> pa.ChunkedArray:
 
 
 class TokenStore(Sequence):
-    """Provide random token access from one memory mapped Arrow file."""
+    """Provide random token access to a token store Rust built in memory.
+
+    Args:
+        table: The store's columns: each document's token ids and token
+            count, and optionally each token's character range.
+    """
 
     _token_column = "__quail_token_ids"
     _count_column = "__quail_token_count"
     _offset_column = "__quail_token_offsets"
 
-    def __init__(self, path: str):
-        self.path = path
-        with ExitStack() as resources:
-            self._source = resources.enter_context(pa.memory_map(path, "r"))
-            self._reader = resources.enter_context(pa.ipc.open_file(self._source))
-            self.has_offsets = self._offset_column in self._reader.schema.names
-            self._documents_by_batch = []
-            self._length_batches = []
-            self._ends = []
-            total = 0
-            for index in range(self._reader.num_record_batches):
-                batch = self._reader.get_batch(index)
-                self._documents_by_batch.append(
-                    ArrowTokenDocuments(
-                        batch.column(self._token_column),
-                        batch.column(self._offset_column) if self.has_offsets
-                        else None))
-                self._length_batches.append(batch.column(self._count_column))
-                total += len(batch)
-                self._ends.append(total)
-            self._lengths = TokenLengths(
-                pa.chunked_array(self._length_batches, type=pa.int64()), self)
-            self._prefix_index = None
-            self._resources = resources.pop_all()
+    def __init__(self, table: pa.Table):
+        self._table = table
+        self.has_offsets = self._offset_column in table.column_names
+        self._documents_by_batch = []
+        self._ends = []
+        total = 0
+        for batch in table.to_batches():
+            self._documents_by_batch.append(ArrowTokenDocuments(
+                batch.column(self._token_column),
+                batch.column(self._offset_column) if self.has_offsets else None))
+            total += len(batch)
+            self._ends.append(total)
+        self._lengths = TokenLengths(table.column(self._count_column), self)
+        self._prefix_index = None
+
+    def __reduce__(self):
+        return TokenStore, (self._table,)
 
     @property
     def lengths(self) -> TokenLengths:
-        """Return the file backed document length sequence."""
+        """Return the document length sequence."""
         return self._lengths
 
     @property
@@ -318,10 +282,7 @@ class TokenStore(Sequence):
     @property
     def arrow_array(self) -> pa.ChunkedArray:
         """Return the stored token batches without copying their buffers."""
-        return pa.chunked_array(
-            [self._reader.get_batch(index).column(self._token_column)
-             for index in range(self._reader.num_record_batches)],
-            type=self._reader.schema.field(self._token_column).type)
+        return self._table.column(self._token_column)
 
     def __len__(self):
         return self._ends[-1] if self._ends else 0
@@ -332,22 +293,19 @@ class TokenStore(Sequence):
         batch_index, local = _locate_chunk(index, len(self), self._ends)
         return self._documents_by_batch[batch_index][local]
 
-    def close(self) -> None:
-        """Close the memory mapped Arrow file."""
-        self._prefix_index = None
-        self._resources.close()
-
-    def select(self, indices) -> "TokenSelection":
-        """Return a file reference for selected document positions."""
-        return TokenSelection(self.path, indices)
-
 
 class ScanInput:
-    """The tokenized documents of one scan and its stored value columns."""
+    """The tokenized documents of one scan and its value columns.
 
-    def __init__(self, tokens: "TokenStore", columns: dict):
+    Args:
+        tokens: The TokenStore of the scan's document column.
+        columns: The value columns the executor reads, one row per
+            document.
+    """
+
+    def __init__(self, tokens: "TokenStore", columns: pa.Table):
         self.tokens = tokens
-        self._columns = dict(columns)
+        self._columns = columns
 
     @property
     def lengths(self) -> TokenLengths:
@@ -356,46 +314,12 @@ class ScanInput:
 
     @property
     def projected_columns(self) -> tuple[str, ...]:
-        """Return the value columns stored for this scan."""
-        return tuple(self._columns)
+        """Return the value columns kept for this scan."""
+        return tuple(self._columns.column_names)
 
     def column(self, name: str) -> pa.ChunkedArray:
-        """Return one stored value column."""
-        return self._columns[name].values
-
-
-class TokenSelection(Sequence):
-    """Open selected token documents inside a child process."""
-
-    def __init__(self, path: str, indices):
-        self._path = path
-        self._indices = indices
-        self._store = None
-
-    def _open(self) -> TokenStore:
-        if self._store is None:
-            self._store = TokenStore(self._path)
-        return self._store
-
-    def __len__(self):
-        return len(self._indices)
-
-    def __getitem__(self, index):
-        if isinstance(index, slice):
-            return [self[i] for i in range(*index.indices(len(self)))]
-        return self._open()[self._indices[index]]
-
-    def __getstate__(self):
-        return self._path, self._indices
-
-    def __setstate__(self, state):
-        self._path, self._indices = state
-        self._store = None
-
-    def select(self, indices) -> "TokenSelection":
-        """Return a file reference for positions of this selection."""
-        return TokenSelection(
-            self._path, [self._indices[index] for index in indices])
+        """Return one value column."""
+        return self._columns.column(name)
 
 
 class DocumentPrefixes(Sequence):
@@ -432,13 +356,6 @@ class DocumentKeys(Sequence):
         if isinstance(index, slice):
             return [self[i] for i in range(*index.indices(len(self)))]
         return self._alias, self._indices[index]
-
-
-def select_documents(documents, indices):
-    """Select documents without copying file backed token buffers."""
-    if isinstance(documents, (TokenStore, TokenSelection)):
-        return documents.select(indices)
-    return [documents[index] for index in indices]
 
 
 def concat_tokens(*parts):

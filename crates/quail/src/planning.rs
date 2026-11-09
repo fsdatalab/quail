@@ -2,22 +2,20 @@
 //! them, and search its physical plans.
 //!
 //! [`Planner::plan`] takes a region's operators and the rows of each
-//! table it scans. For each scan it writes a token store of the document
-//! column and a column file of each value column the executor reads, in
-//! the files Python's `TokenStore` and `ColumnStore` open. It computes
-//! the statistics the planner reads from them, then runs the column
-//! placements and the plan search with the model's tokenizer.
+//! table it scans. For each scan it tokenizes the document column into
+//! an in-memory token store, and keeps the value columns the executor
+//! reads; Python's `TokenStore` and `ScanInput` read both over the same
+//! buffers. It computes the statistics the planner reads from them, then
+//! runs the column placements and the plan search with the model's
+//! tokenizer.
 
 use std::collections::{BTreeMap, HashMap};
-use std::fs::File;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{Array, ArrayRef, AsArray, RecordBatch, StringArray};
 use arrow::compute::cast;
-use arrow::datatypes::{DataType, Schema};
-use arrow::ipc::writer::FileWriter;
+use arrow::datatypes::DataType;
 use arrow::row::{RowConverter, SortField};
 use quail_datafusion::expressions::PhysicalValue;
 use quail_inputs::{HfTokenizer, PrefixIndex, TokenStore, TokenStoreWriter, last_tokens};
@@ -69,45 +67,46 @@ pub struct TableRows {
 /// [`Planner::plan`] does not tokenize.
 pub const DOCUMENT_EXPRESSION: &str = "a document must be a column or a struct field";
 
-/// The files the executor reads for one scan.
+/// What the executor reads for one scan.
 #[derive(Debug, Clone)]
-pub struct ScanFiles {
+pub struct ScanInputs {
     pub alias: String,
     /// The token store of the scan's document column.
-    pub tokens: PathBuf,
-    /// Each value column's name and column file, in the scan's order.
-    pub columns: Vec<(String, PathBuf)>,
+    pub tokens: Arc<TokenStore>,
+    /// The value columns, in the scan's order, over the rows' buffers.
+    pub columns: crate::stages::Table,
 }
 
-/// A region's selected physical plan, the operators it lowers, the
-/// context it was planned in, and the files its scans read.
+/// A planned region as JSON, and what its scans read.
+pub type PlannedRegion = (String, Vec<ScanInputs>);
+
+/// A region's selected physical plan, the operators it lowers, and the
+/// context it was planned in.
 pub struct Planned {
     pub selected: Selected,
     pub operators: Operators,
     /// The planning context's fields, as Python's planner reads them, to
     /// price an edited plan the same way.
     pub fields: serde_json::Value,
-    pub scans: Vec<ScanFiles>,
 }
 
-/// What [`Planner::plan`] returns for a region.
+/// What [`Planner::plan`] returns for a region, beside its scans.
 pub enum PlanOutcome {
     /// Quail's backend's plan, priced, which an edit prices again.
     Planned(Box<Planned>),
     /// The refusal of every alternative.
-    Refused(Refused),
-    /// A request backend's plan, which nothing prices, as JSON with its
-    /// scans' files.
+    Refused(Refusal),
+    /// A request backend's plan, which nothing prices, as JSON.
     Fixed(serde_json::Value),
 }
 
-/// A region's column placements, its scans' files, and the planning
+/// A region's column placements, its scans' inputs, and the planning
 /// context's fields, before a backend lowers it.
 pub struct Prepared {
     pub alternatives: Vec<Alternative>,
     /// The planning context's fields, as Python's planner reads them.
     pub fields: serde_json::Value,
-    pub scans: Vec<ScanFiles>,
+    pub scans: Vec<ScanInputs>,
     measured: Measured,
 }
 
@@ -121,23 +120,13 @@ struct Measured {
     pair_fractions: BTreeMap<usize, f64>,
 }
 
-/// A region every alternative of which was refused, with the files of
-/// its scans, which the speed-of-light estimate still reads.
-#[derive(Debug)]
-pub struct Refused {
-    pub refusal: Refusal,
-    pub scans: Vec<ScanFiles>,
-}
-
 /// Plans regions for one session: holds the model's tokenizer, and the
-/// token stores and column files its queries wrote.
+/// token stores of the tables its queries read whole.
 pub struct Planner {
     tokenizer: HfTokenizer,
-    directory: tempfile::TempDir,
-    files: AtomicUsize,
     /// (identity, document column, whether it holds character ranges)
     /// -> the token store of a table read whole, kept for later queries.
-    stores: Mutex<HashMap<(String, String, bool), PathBuf>>,
+    stores: Mutex<HashMap<(String, String, bool), Arc<TokenStore>>>,
 }
 
 fn arrow_error(error: impl std::fmt::Display) -> CompileError {
@@ -146,9 +135,7 @@ fn arrow_error(error: impl std::fmt::Display) -> CompileError {
 
 impl std::fmt::Debug for Planner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Planner")
-            .field("directory", &self.directory.path())
-            .finish_non_exhaustive()
+        f.debug_struct("Planner").finish_non_exhaustive()
     }
 }
 
@@ -157,15 +144,10 @@ impl Planner {
     ///
     /// # Errors
     ///
-    /// The tokenizer does not read, or no temporary directory is made.
+    /// The tokenizer does not read.
     pub fn new(tokenizer_file: &Path) -> Result<Self, CompileError> {
         Ok(Self {
             tokenizer: HfTokenizer::from_file(tokenizer_file).map_err(arrow_error)?,
-            directory: tempfile::Builder::new()
-                .prefix("quail-tokens-")
-                .tempdir()
-                .map_err(arrow_error)?,
-            files: AtomicUsize::new(0),
             stores: Mutex::new(HashMap::new()),
         })
     }
@@ -175,14 +157,9 @@ impl Planner {
         &self.tokenizer
     }
 
-    fn file(&self, kind: &str) -> PathBuf {
-        let number = self.files.fetch_add(1, Ordering::Relaxed);
-        self.directory.path().join(format!("{kind}-{number}.arrow"))
-    }
-
-    /// Place the column operators of `found`, write each scan's token
-    /// store and column files from `tables`, and measure them: what every
-    /// backend plans from.
+    /// Place the column operators of `found`, tokenize each scan's
+    /// documents from `tables` and keep its value columns, and measure
+    /// them: what every backend plans from.
     ///
     /// # Errors
     ///
@@ -224,8 +201,7 @@ impl Planner {
             let rows = tables
                 .get(&scan.provider)
                 .ok_or_else(|| CompileError::new(format!("no rows for table {}", scan.provider)))?;
-            let (store, path) = self.token_store(scan, rows, extracted.contains(&scan.alias))?;
-            let mut columns = Vec::new();
+            let store = self.token_store(scan, rows, extracted.contains(&scan.alias))?;
             let mut names = scan.columns.clone();
             // the executor reads the document's text to locate answers in it
             if let Some(source) = source_column(&scan.column)
@@ -233,13 +209,10 @@ impl Planner {
             {
                 names.push(source);
             }
-            for name in &names {
-                columns.push((name.clone(), self.column_file(name, rows)?));
-            }
-            files.push(ScanFiles {
+            files.push(ScanInputs {
                 alias: scan.alias.clone(),
-                tokens: path,
-                columns,
+                tokens: Arc::clone(&store),
+                columns: value_columns(&names, rows)?,
             });
             let documents = store.documents();
             document_tokens.insert(scan.alias.clone(), store.lengths().to_vec());
@@ -311,7 +284,8 @@ impl Planner {
     /// Plan `found` over `tables`, each scanned table's rows by provider
     /// name, for `settings`.
     ///
-    /// Returns the plan, or the refusal of every alternative.
+    /// Returns the plan, or the refusal of every alternative, and what
+    /// the region's scans read.
     ///
     /// # Errors
     ///
@@ -322,7 +296,7 @@ impl Planner {
         found: &Operators,
         tables: &HashMap<String, TableRows>,
         settings: &Settings,
-    ) -> Result<PlanOutcome, CompileError> {
+    ) -> Result<(PlanOutcome, Vec<ScanInputs>), CompileError> {
         let Prepared {
             alternatives,
             fields,
@@ -370,7 +344,7 @@ impl Planner {
             backend: settings.backend.clone(),
         };
         if let Some(request) = &settings.request {
-            return request_outcome(&alternatives, &context, request, &files);
+            return Ok((request_outcome(&alternatives, &context, request)?, files));
         }
         let operators: Vec<(Operators, Vec<String>)> = alternatives
             .iter()
@@ -378,18 +352,15 @@ impl Planner {
             .collect();
         let searched =
             quail_planner::optimize::search_plan(&operators, &context, &settings.physical_rules)?;
-        Ok(match searched {
+        let outcome = match searched {
             Ok(selected) => PlanOutcome::Planned(Box::new(Planned {
                 operators: alternatives[selected.alternative].operators.clone(),
                 selected,
                 fields,
-                scans: files,
             })),
-            Err(refusal) => PlanOutcome::Refused(Refused {
-                refusal,
-                scans: files,
-            }),
-        })
+            Err(refusal) => PlanOutcome::Refused(refusal),
+        };
+        Ok((outcome, files))
     }
 
     /// The token store of a scan's document column: a table read whole
@@ -399,7 +370,7 @@ impl Planner {
         scan: &Scan,
         rows: &TableRows,
         with_offsets: bool,
-    ) -> Result<(TokenStore, PathBuf), CompileError> {
+    ) -> Result<Arc<TokenStore>, CompileError> {
         let key = rows
             .identity
             .as_ref()
@@ -414,17 +385,15 @@ impl Planner {
                         .then(|| stores.get(&(identity.clone(), column.clone(), false)))
                         .flatten()
                 });
-            if let Some(path) = found {
-                return Ok((TokenStore::open(path).map_err(arrow_error)?, path.clone()));
+            if let Some(store) = found {
+                return Ok(Arc::clone(store));
             }
         }
-        let path = self.file("tokens");
         let mut writer = if with_offsets {
-            TokenStoreWriter::create_with_offsets(&path)
+            TokenStoreWriter::with_offsets()
         } else {
-            TokenStoreWriter::create(&path)
-        }
-        .map_err(arrow_error)?;
+            TokenStoreWriter::new()
+        };
         let built = match &scan.column {
             ScanColumn::Expression(expression) => Some(PhysicalValue::new(expression)?),
             ScanColumn::Unnamed(_) => None,
@@ -435,43 +404,40 @@ impl Planner {
                 .write_texts(&self.tokenizer, &texts)
                 .map_err(arrow_error)?;
         }
-        let store = writer.finish().map_err(arrow_error)?;
+        let store = Arc::new(writer.finish());
         if let Some(key) = key {
             self.stores
                 .lock()
                 .expect("the stores lock")
-                .insert(key, path.clone());
+                .insert(key, Arc::clone(&store));
         }
-        Ok((store, path))
+        Ok(store)
     }
+}
 
-    /// Write one value column of the rows to a column file.
-    fn column_file(&self, name: &str, rows: &TableRows) -> Result<PathBuf, CompileError> {
-        let path = self.file("column");
-        let batches = &rows.batches;
-        let field = rows
-            .schema
-            .field_with_name(name)
-            .cloned()
-            .map_err(|_| CompileError::new(format!("no column {name}")))?;
-        let metadata = HashMap::from([("quail.kind".to_string(), "column_store".to_string())]);
-        let schema = Arc::new(Schema::new(vec![field]).with_metadata(metadata));
-        let file = File::create(&path).map_err(arrow_error)?;
-        let mut writer = FileWriter::try_new(file, &schema).map_err(arrow_error)?;
-        for batch in batches {
-            let column = batch
-                .column_by_name(name)
-                .ok_or_else(|| CompileError::new(format!("no column {name}")))?;
-            writer
-                .write(
-                    &RecordBatch::try_new(Arc::clone(&schema), vec![Arc::clone(column)])
-                        .map_err(arrow_error)?,
-                )
-                .map_err(arrow_error)?;
-        }
-        writer.finish().map_err(arrow_error)?;
-        Ok(path)
-    }
+/// The columns `names` of the rows, over the rows' buffers.
+fn value_columns(names: &[String], rows: &TableRows) -> Result<crate::stages::Table, CompileError> {
+    let missing = |name: &String| CompileError::new(format!("no column {name}"));
+    let indices = names
+        .iter()
+        .map(|name| rows.schema.index_of(name).map_err(|_| missing(name)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let schema = Arc::new(rows.schema.project(&indices).map_err(arrow_error)?);
+    let batches = rows
+        .batches
+        .iter()
+        .map(|batch| {
+            let columns = indices
+                .iter()
+                .map(|index| Arc::clone(batch.column(*index)))
+                .collect();
+            let options =
+                arrow::array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+            RecordBatch::try_new_with_options(Arc::clone(&schema), columns, &options)
+                .map_err(arrow_error)
+        })
+        .collect::<Result<_, _>>()?;
+    Ok((schema, batches))
 }
 
 /// Each alias's scan, with the value columns any alternative reads.
@@ -693,7 +659,6 @@ fn request_outcome(
     alternatives: &[Alternative],
     context: &PlanningContext,
     request: &quail_planner::request_plan::RequestSettings,
-    files: &[ScanFiles],
 ) -> Result<PlanOutcome, CompileError> {
     let mut found = Vec::new();
     for alternative in alternatives {
@@ -704,9 +669,7 @@ fn request_outcome(
         )?);
     }
     let Some(selected) = found.iter().position(|plan| plan.get("refusal").is_none()) else {
-        let mut refused = found.swap_remove(0);
-        refused["scans"] = scans_json(files);
-        return Ok(PlanOutcome::Fixed(refused));
+        return Ok(PlanOutcome::Fixed(found.swap_remove(0)));
     };
     let candidates: Vec<serde_json::Value> = alternatives
         .iter()
@@ -730,25 +693,10 @@ fn request_outcome(
         "device": context.device.name, "gpus": 1,
         "settings": plan_settings, "graph": plan["graph"],
     });
-    Ok(PlanOutcome::Fixed(fixed_json(
-        envelope,
-        &alternatives[selected].operators,
-        files,
-    )?))
-}
-
-/// A plan nothing prices as JSON: its envelope, the operators it
-/// lowers, and each scan's files.
-fn fixed_json(
-    envelope: serde_json::Value,
-    found: &Operators,
-    files: &[ScanFiles],
-) -> Result<serde_json::Value, CompileError> {
-    Ok(serde_json::json!({
+    Ok(PlanOutcome::Fixed(serde_json::json!({
         "envelope": envelope, "estimated_seconds": 0.0,
-        "operators": operators_json(found)?,
-        "scans": scans_json(files),
-    }))
+        "operators": operators_json(&alternatives[selected].operators)?,
+    })))
 }
 
 /// Operators as JSON text, as Python passes them back to Rust.
@@ -760,44 +708,6 @@ pub fn operators_json(found: &Operators) -> Result<String, CompileError> {
     serde_json::to_string(found).map_err(arrow_error)
 }
 
-/// Each scan's files as JSON, by alias.
-fn scans_json(scans: &[ScanFiles]) -> serde_json::Value {
-    scans
-        .iter()
-        .map(|scan| {
-            (
-                scan.alias.clone(),
-                serde_json::json!({"tokens": scan.tokens, "columns": scan.columns}),
-            )
-        })
-        .collect::<serde_json::Map<String, serde_json::Value>>()
-        .into()
-}
-
-/// A prepared region as JSON: each column placement's operators and
-/// rules, the context fields, and each scan's files.
-///
-/// # Errors
-///
-/// The operators do not write.
-pub fn prepared_json(prepared: &Prepared) -> Result<serde_json::Value, CompileError> {
-    let alternatives = prepared
-        .alternatives
-        .iter()
-        .map(|alternative| {
-            Ok(serde_json::json!([
-                operators_json(&alternative.operators)?,
-                alternative.rules,
-            ]))
-        })
-        .collect::<Result<Vec<_>, CompileError>>()?;
-    Ok(serde_json::json!({
-        "alternatives": alternatives,
-        "fields": prepared.fields,
-        "scans": scans_json(&prepared.scans),
-    }))
-}
-
 /// A refusal's fields as JSON.
 pub fn refusal_json(refusal: &Refusal) -> serde_json::Value {
     serde_json::json!({
@@ -806,22 +716,27 @@ pub fn refusal_json(refusal: &Refusal) -> serde_json::Value {
     })
 }
 
-/// A refused region as JSON: the refusal and each scan's files.
-pub fn refused_json(refused: &Refused) -> serde_json::Value {
-    serde_json::json!({
-        "refusal": refusal_json(&refused.refusal),
-        "scans": scans_json(&refused.scans),
+/// A region's outcome as JSON: a refusal's fields under `refusal`, a
+/// request backend's plan, or Quail's plan as [`planned_json`] writes it.
+///
+/// # Errors
+///
+/// The operators do not write.
+pub fn outcome_json(outcome: &PlanOutcome) -> Result<serde_json::Value, CompileError> {
+    Ok(match outcome {
+        PlanOutcome::Planned(planned) => planned_json(planned)?,
+        PlanOutcome::Refused(refusal) => serde_json::json!({"refusal": refusal_json(refusal)}),
+        PlanOutcome::Fixed(plan) => plan.clone(),
     })
 }
 
 /// A planned region as JSON: the plan's envelope, estimates, and pricer,
-/// the chosen operators, the context fields, and each scan's files.
+/// the chosen operators, and the context fields.
 ///
 /// # Errors
 ///
 /// The operators do not write.
 pub fn planned_json(planned: &Planned) -> Result<serde_json::Value, CompileError> {
-    let scans = scans_json(&planned.scans);
     let plan = &planned.selected.plan;
     Ok(serde_json::json!({
         "envelope": plan.envelope(),
@@ -831,6 +746,5 @@ pub fn planned_json(planned: &Planned) -> Result<serde_json::Value, CompileError
         "pricer": pricer_fields(&plan.pricer),
         "operators": operators_json(&planned.operators)?,
         "fields": planned.fields,
-        "scans": scans,
     }))
 }

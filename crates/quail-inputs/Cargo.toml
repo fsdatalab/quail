@@ -8,10 +8,8 @@ publish = false
 
 [dependencies]
 serde_json = "1"
-arrow = { version = "59.3.2", default-features = false, features = ["ipc"] }
+arrow = { version = "59.3.2", default-features = false, features = [] }
 # the 1.0 release candidate tokenizes about 30 times faster than 0.22
 # with the same ids; pinned until 1.0 is released
 tokenizers = { version = "=1.0.0-rc.3", default-features = false, features = ["parallelism", "serialize", "normalizers", "bpe", "unicode-scripts"] }
 
-[dev-dependencies]
-tempfile = "3"

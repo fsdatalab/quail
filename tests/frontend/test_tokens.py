@@ -13,10 +13,16 @@ from quail.common.tokens import (
     prefix_tree,
 )
 
-native = pytest.importorskip("_quail_native")
+
+def _store(documents):
+    """A TokenStore of token id lists, as Rust's planner hands one over."""
+    return TokenStore(pa.table({
+        "__quail_token_ids": pa.array(documents, pa.large_list(pa.int32())),
+        "__quail_token_count": pa.array(map(len, documents), pa.int64()),
+    }))
 
 
-def test_token_views_store_concatenations_and_shared_prefixes(tmp_path, monkeypatch):
+def test_token_views_store_concatenations_and_shared_prefixes(monkeypatch):
     tokens = pa.chunked_array([
         pa.array([[1, 2, 3], [], [4, 5]], type=pa.large_list(pa.int32()))
     ])
@@ -36,35 +42,18 @@ def test_token_views_store_concatenations_and_shared_prefixes(tmp_path, monkeypa
     assert list(combined) == [1, 2, 1, 2, 3, 20]
     assert combined.token_parts[1] is first
 
-    from helpers.sessions import TOKENIZER
-
-    tokenizer_file = str(TOKENIZER / "tokenizer.json")
-    texts = ["one two", "three", "four five six"]
-    path = tmp_path / "tokens.arrow"
-    native.write_token_store(str(path), pa.table({"body": texts}), tokenizer_file)
-    store = TokenStore(str(path))
-    assert path.exists()
-    lengths = list(store.lengths)
-    assert len(lengths) == 3 and all(length > 0 for length in lengths)
-    assert store._reader.schema.names == [
-        "__quail_token_ids", "__quail_token_count"]
+    store = _store([[1, 2, 3], [4, 5], [1, 2, 9]])
+    assert list(store.lengths) == [3, 2, 3]
     index = store.prefix_index
     with monkeypatch.context() as patch:
         patch.setattr("quail.common.tokens._token_array",
                       lambda *_: pytest.fail("prefix preparation ran twice"))
         assert prefix_tree(store, 1) is index.tree(1)
         assert prefix_tree(store, 16) is index.tree(16)
-    store.close()
 
-    native.write_token_store(str(path), pa.table({"body": ["word " * 1000] * 10}),
-                             tokenizer_file)
-    store = TokenStore(str(path))
-    assert store.prefix_index is not index
-    length = len(store[0])
-    assert prefix_tree(store, 16).shared_tokens == 9 * (length // 16 * 16)
-    encoded = pickle.dumps(store.select(range(10)))
-    restored = pickle.loads(encoded)
-    assert len(encoded) < 1000
+    long = _store([list(range(1000))] * 10)
+    assert long.prefix_index is not index
+    assert prefix_tree(long, 16).shared_tokens == 9 * (999 // 16 * 16)
+    restored = pickle.loads(pickle.dumps(long))
     assert len(restored) == 10
-    assert len(restored[0]) == length
-
+    assert list(restored[9]) == list(range(1000))

@@ -35,7 +35,6 @@ from quail.common.tokens import (
     DocumentKeys,
     DocumentPrefixes,
     concat_tokens,
-    select_documents,
 )
 from quail.execution.finished import finished_rows, finished_table
 from quail.execution.ids import id_positions
@@ -665,7 +664,8 @@ def prepare_join_inputs(nodes, inputs, context: ExecutionContext,
     config = state["retention"]
     apply_retention(state["gpu"].arena, config,
                     config.get("before", {}).get(node.node_id, {}), by_alias)
-    documents = {alias: select_documents(state["documents"][alias], by_alias[alias])
+    documents = {alias: [state["documents"][alias][index]
+                         for index in by_alias[alias]]
                  for member in nodes for alias in member.partners}
     prefixes = (DocumentPrefixes(node.document_head, state["documents"][node.anchor],
                                  by_alias[node.anchor])
