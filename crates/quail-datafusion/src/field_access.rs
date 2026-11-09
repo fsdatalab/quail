@@ -43,9 +43,7 @@ impl ExprPlanner for StructFieldAccess {
         ) {
             return Ok(PlannerResult::Original(expr));
         }
-        let field = keys
-            .into_iter()
-            .fold(expr.left, |value, key| get_field(value, key));
+        let field = keys.into_iter().fold(expr.left, get_field);
         Ok(PlannerResult::Planned(field))
     }
 }
