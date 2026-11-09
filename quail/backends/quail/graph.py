@@ -192,8 +192,9 @@ def execute_staged_graph(payload, graph: PhysicalGraph, gpus: int, serve,
         graph: The region's graph.
         gpus: How many GPUs, one server each.
         serve: Callable(paths, wanted) that starts a server listening at
-            each socket path and returns a callable that waits for them
-            and returns what each one's ``serve_region`` returned.
+            each socket path and returns an owned handle. Its ``finish``
+            waits for each server's result; ``abort`` stops every server
+            without waiting indefinitely for a coordinator connection.
             wanted lists the (node, port) pairs FinishedRows reads.
         device: The GPUs' device spec.
     """
@@ -207,19 +208,24 @@ def execute_staged_graph(payload, graph: PhysicalGraph, gpus: int, serve,
         if rows is not None:
             rows.report(pa.ipc.open_stream(data).read_all())
 
+    # No listener exists until Python preparation and native decoding succeed.
+    graph_json = compute.to_json()
+    stages_json = json.dumps(payload["stages"])
+    groupings = stage_groupings(graph, payload)
+    _quail_native.validate_stages(graph_json, stages_json, groupings)
     started = time.perf_counter()
     with tempfile.TemporaryDirectory() as directory:
         paths = [os.path.join(directory, f"gpu{index}.sock") for index in range(gpus)]
-        results = serve(paths, wanted)
+        servers = serve(paths, wanted)
         try:
-            _quail_native.run_stages(compute.to_json(), json.dumps(payload["stages"]),
-                                     stage_groupings(graph, payload), paths, report)
+            _quail_native.run_stages(graph_json, stages_json, groupings, paths, report)
+            outputs = servers.finish()
         except BaseException:
-            # the servers have ended; their failure is in this error
-            with contextlib.suppress(Exception):
-                results()
+            # A listener may never have received its coordinator connection.
+            # Receiving its result here would wait forever in accept().
+            with contextlib.suppress(BaseException):
+                servers.abort()
             raise
-        outputs = results()
     wall = time.perf_counter() - started
     result = merged_run(compute, [output["results"] for output in outputs])
     report = graph_report(graph, result, wall, device, gpus=gpus,

@@ -15,7 +15,7 @@ use datafusion::datasource::TableType;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::logical_expr::{Expr, LogicalPlan};
 use datafusion::physical_plan::ExecutionPlan;
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyAttributeError, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::IntoPyDict;
 use std::collections::HashMap;
@@ -54,10 +54,20 @@ pub struct Executor {
     pub(crate) prompting: (Turn, String),
     /// While a query runs: the thread that called DataFusion, and where
     /// a worker sends it a region to run.
-    pub(crate) caller: Mutex<Option<(ThreadId, UnboundedSender<RegionCall>)>>,
+    caller: Mutex<Option<(ThreadId, UnboundedSender<RegionCall>)>>,
+    /// Own the caller route for the whole query, including error cleanup.
+    execution: Mutex<()>,
     /// The planner and configuration Rust plans each region with, then
     /// calls the engine's `execute`; None calls `run_region`.
     pub(crate) planning: Option<(Arc<Planner>, Settings)>,
+}
+
+fn optional_string_attribute(engine: &Bound<'_, PyAny>, name: &str) -> PyResult<Option<String>> {
+    match engine.getattr(name) {
+        Ok(found) => found.extract(),
+        Err(error) if error.is_instance_of::<PyAttributeError>(engine.py()) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 impl Executor {
@@ -101,11 +111,9 @@ impl Executor {
     ///
     /// An attribute is missing or malformed.
     pub fn with_engine(engine: Py<PyAny>) -> Result<Self> {
-        let tokenizer_file = Python::attach(|py| match engine.bind(py).getattr("tokenizer_file") {
-            Ok(found) => found.extract::<Option<String>>(),
-            Err(_) => Ok(None),
-        })
-        .map_err(python_failure)?;
+        let tokenizer_file =
+            Python::attach(|py| optional_string_attribute(engine.bind(py), "tokenizer_file"))
+                .map_err(python_failure)?;
         let planner = tokenizer_file
             .map(|path| Planner::new(std::path::Path::new(&path)))
             .transpose()
@@ -127,10 +135,7 @@ impl Executor {
             let turn: (String, String) = bound.getattr("turn")?.extract()?;
             let layout: String = bound.getattr("layout")?.extract()?;
             let rules: Option<Vec<String>> = bound.getattr("rules")?.extract()?;
-            let settings: Option<String> = match bound.getattr("settings") {
-                Ok(found) => found.extract()?,
-                Err(_) => None,
-            };
+            let settings = optional_string_attribute(bound, "settings")?;
             Ok::<_, PyErr>(((turn, layout), rules, settings))
         })
         .map_err(python_failure)?;
@@ -149,7 +154,50 @@ impl Executor {
             owns_engine: false,
             prompting,
             caller: Mutex::new(None),
+            execution: Mutex::new(()),
             planning,
+        })
+    }
+}
+
+/// Clears the route before releasing exclusive execution ownership.
+/// Keeping this outside the query future also covers early errors and unwinding.
+pub(crate) struct CallerGuard<'a> {
+    executor: &'a Executor,
+    _execution: std::sync::MutexGuard<'a, ()>,
+}
+
+impl Drop for CallerGuard<'_> {
+    fn drop(&mut self) {
+        *self
+            .executor
+            .caller
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+    }
+}
+
+impl Executor {
+    pub(crate) fn enter(&self, sender: UnboundedSender<RegionCall>) -> Result<CallerGuard<'_>> {
+        let thread = std::thread::current().id();
+        if self
+            .caller
+            .lock()
+            .expect("the caller lock")
+            .as_ref()
+            .is_some_and(|(owner, _)| *owner == thread)
+        {
+            return Err(DataFusionError::Execution(
+                "an executor cannot run a reentrant query".into(),
+            ));
+        }
+        let execution = self.execution.lock().map_err(|_| {
+            DataFusionError::Execution("the executor's previous query panicked".into())
+        })?;
+        *self.caller.lock().expect("the caller lock") = Some((thread, sender));
+        Ok(CallerGuard {
+            executor: self,
+            _execution: execution,
         })
     }
 }

@@ -104,8 +104,9 @@ impl CutNode {
 ///
 /// # Errors
 ///
-/// A node reads a port no scan or stage writes.
+/// The graph is invalid, or a node reads a port no scan or stage writes.
 pub fn stages(graph: &PhysicalGraph) -> Result<Vec<Stage>, String> {
+    crate::physical::validate_graph(&graph.nodes, &graph.root)?;
     let by_id: BTreeMap<&str, &PhysicalNode> =
         graph.nodes.iter().map(|node| (node.id(), node)).collect();
     let mut pending: Vec<&str> = graph
@@ -265,6 +266,46 @@ fn reaches(reads: &[BTreeSet<usize>], from: usize, to: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stages_reject_invalid_graphs_before_traversal() {
+        use crate::physical::{InputPort, Node, ScanAttributes, ValueType, port};
+
+        let scan = PhysicalNode::Scan(Node {
+            id: "scan:r".into(),
+            inputs: Vec::new(),
+            attributes: ScanAttributes {
+                alias: "r".into(),
+                input_id: "r".into(),
+                num_documents: 1,
+                total_tokens: 1,
+                predicates: Vec::new(),
+                expected_rows: None,
+            },
+        });
+        let graph = PhysicalGraph {
+            nodes: vec![scan.clone()],
+            root: port("scan:r", "rows:r"),
+        };
+        assert!(stages(&graph).is_ok());
+        for (source, expected) in [("scan:r", "cycle"), ("missing", "missing output")] {
+            let mut malformed = graph.clone();
+            malformed.nodes[0].inputs_mut().push(InputPort {
+                name: "rows:r".into(),
+                value_type: ValueType::Rows,
+                source: port(source, "rows:r"),
+                schema: Vec::new(),
+            });
+            assert!(stages(&malformed).unwrap_err().contains(expected));
+        }
+        let mut duplicate = graph;
+        duplicate.nodes.push(scan);
+        assert!(
+            stages(&duplicate)
+                .unwrap_err()
+                .contains("duplicate physical node id")
+        );
+    }
 
     fn node(id: &str, role: Role, inputs: &[(&str, &str)]) -> CutNode {
         CutNode {

@@ -1110,6 +1110,22 @@ fn region_stages(graph: &str) -> PyResult<String> {
     serde_json::to_string(&cut).map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
+/// Decode the coordinator's inputs before starting any GPU listeners.
+#[pyfunction]
+fn validate_stages(
+    graph: &str,
+    stages: &str,
+    groupings: std::collections::HashMap<String, Vec<Vec<i64>>>,
+) -> PyResult<()> {
+    let graph: quail_planner::physical::PhysicalGraph = from_json(graph)?;
+    let _: Vec<quail_planner::stages::Stage> = from_json(stages)?;
+    quail_planner::physical::validate_graph(&graph.nodes, &graph.root)
+        .map_err(PyValueError::new_err)?;
+    // Extraction above checks the group keys and document ids as well.
+    drop(groupings);
+    Ok(())
+}
+
 /// Run a region's stages on GPU servers, as `crate::stages::run_stages`
 /// runs them.
 ///
@@ -1243,6 +1259,7 @@ pub fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(limited_operators, module)?)?;
     module.add_function(wrap_pyfunction!(execution_report, module)?)?;
     module.add_function(wrap_pyfunction!(region_stages, module)?)?;
+    module.add_function(wrap_pyfunction!(validate_stages, module)?)?;
     module.add_function(wrap_pyfunction!(run_stages, module)?)?;
     module.add_function(wrap_pyfunction!(read_and_write_plan, module)?)
 }

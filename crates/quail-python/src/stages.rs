@@ -550,10 +550,25 @@ pub fn run_stages(
     }
     // each server waits for this connection, so a region that cannot
     // run still connects, then ends
-    let servers = servers
-        .iter()
-        .map(|path| Ok(Arc::new(Mutex::new(Server::connect(path)?))))
-        .collect::<Result<Vec<_>>>()?;
+    let mut connected = Vec::with_capacity(servers.len());
+    let mut first_error = None;
+    for path in servers {
+        match Server::connect(path) {
+            Ok(server) => connected.push(Arc::new(Mutex::new(server))),
+            Err(error) => {
+                // Do not strand the later listeners in accept(). Preserve
+                // the first error, but connect and end every reachable peer.
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    let servers = connected;
+    if let Some(error) = first_error {
+        for server in &servers {
+            let _ = server.lock().expect("the server lock").end();
+        }
+        return Err(error);
+    }
     let scans = graph
         .nodes
         .iter()

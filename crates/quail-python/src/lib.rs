@@ -103,16 +103,19 @@ impl std::fmt::Debug for Session {
     }
 }
 
-/// A Python exception as a DataFusion error whose text ends with the
-/// exception's traceback: the traceback is lost once the error leaves
-/// Python, so a failure inside a callback names its line.
+/// A Python exception as a DataFusion error with its traceback and
+/// chained causes: these are otherwise lost once the error leaves Python.
 pub(crate) fn python_failure(error: PyErr) -> DataFusionError {
-    let text = Python::attach(
-        |py| match error.traceback(py).map(|traceback| traceback.format()) {
-            Some(Ok(traceback)) => format!("{error}\n{}", traceback.trim_end()),
-            _ => error.to_string(),
-        },
-    );
+    let text = Python::attach(|py| {
+        let formatted = py
+            .import("traceback")
+            .and_then(|module| module.call_method1("format_exception", (error.value(py),)))
+            .and_then(|lines| lines.extract::<Vec<String>>());
+        match formatted {
+            Ok(lines) => lines.concat().trim_end().to_string(),
+            Err(_) => error.to_string(),
+        }
+    });
     DataFusionError::External(text.into())
 }
 
@@ -198,6 +201,11 @@ impl Session {
 
     /// A session that runs each model region on `executor`, with the
     /// optimizer rules the executor's engine names.
+    ///
+    /// SQL calls sharing an executor, even across sessions, are serialized.
+    /// Each model region runs on its query's calling thread. Nested SQL on
+    /// the same executor from that thread returns an error rather than
+    /// deadlocking or replacing the outer query's caller route.
     ///
     /// # Errors
     ///
@@ -287,21 +295,24 @@ impl Session {
 
     /// Run a query read in `dialect`, a DataFusion dialect name such as
     /// "BigQuery" ("Snowflake" by default), and return its schema and
-    /// rows.
+    /// rows. Concurrent calls sharing this executor wait their turn.
     ///
     /// # Errors
     ///
-    /// The query does not plan, or a region or operator fails.
+    /// The query does not plan, a region or operator fails, or the caller
+    /// tries to run nested SQL on the same executor.
     pub fn sql_in_dialect(
         &self,
         query: &str,
         dialect: Option<&str>,
     ) -> Result<(SchemaRef, Vec<RecordBatch>)> {
         let runner = Arc::clone(&self.runner);
+        let (sender, mut calls) = unbounded_channel::<RegionCall>();
+        // An executor can be shared by sessions, but its Python engine and
+        // caller route belong to one query at a time. Acquire before block_on
+        // so waiting callers do not occupy a runtime worker.
+        let _caller = runner.enter(sender)?;
         self.runtime().block_on(async {
-            let (sender, mut calls) = unbounded_channel::<RegionCall>();
-            *runner.caller.lock().expect("the caller lock") =
-                Some((std::thread::current().id(), sender));
             let context = self.context.clone();
             let (query, dialect) = (query.to_string(), dialect.map(str::to_string));
             // a worker runs the query, so the operators above a region
@@ -339,16 +350,14 @@ impl Session {
             tokio::pin!(query);
             // DataFusion's workers run the operators; this thread runs
             // each model region they hand it
-            let done = loop {
+            loop {
                 tokio::select! {
                     done = &mut query => break done
                         .map_err(|error| DataFusionError::External(Box::new(error)))
                         .and_then(|done| done),
                     Some(call) = calls.recv() => runner.serve(call),
                 }
-            };
-            *runner.caller.lock().expect("the caller lock") = None;
-            done
+            }
         })
     }
 

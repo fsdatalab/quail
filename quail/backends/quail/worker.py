@@ -7,7 +7,7 @@ its partition of the region's stages to Rust over a Unix socket.
 
 import atexit
 import time
-from contextlib import ExitStack
+from contextlib import ExitStack, suppress
 from dataclasses import dataclass
 from typing import Any
 
@@ -550,20 +550,41 @@ class GpuWorkers:
         return [data for _, data in replies]
 
     def close(self, *, terminate=False):
-        """Stop every child and close its pipe."""
+        """Stop children, including listeners still waiting for a connection.
+
+        Closing the pipe wakes idle children without a potentially blocking
+        send. Active children get bounded grace, then terminate/kill fallbacks.
+        """
         children, self.children = self.children, []
         for process, conn in children:
-            if not terminate and process.is_alive():
-                try:
-                    conn.send(("shutdown", None))
-                except (BrokenPipeError, OSError):
-                    pass
             conn.close()
-        for process, _ in children:
-            if terminate:
+            if terminate and process.is_alive():
                 process.terminate()
-            process.join()
-            process.close()
+        for process, _ in children:
+            process.join(timeout=1)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=1)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=1)
+            if not process.is_alive():
+                process.close()
+
+
+class RegionServers:
+    """Own the in-flight region on a worker pool, separately from its results."""
+
+    def __init__(self, workers):
+        self.workers = workers
+
+    def finish(self):
+        """Collect results only after the coordinator has ended every server."""
+        return self.workers.receive()
+
+    def abort(self):
+        """Discard this pool without receiving from unconnected listeners."""
+        self.workers.close(terminate=True)
 
 
 def _close_children(terminate=False):
@@ -606,14 +627,16 @@ def execute_quail_multi(payload, registry, graph):
     say(f"all {gpus} GPUs ready; running the query")
 
     def serve(paths, wanted):
+        servers = RegionServers(workers)
         try:
             workers.round("region", [{"query": payload, "socket": path,
                                       "wanted": wanted} for path in paths])
         except BaseException:
-            # the children that listen would wait for the region forever
-            _close_children(terminate=True)
+            # The other children may already be waiting in accept().
+            with suppress(BaseException):
+                servers.abort()
             raise
-        return workers.receive
+        return servers
 
     report = execute_staged_graph(
         payload, graph, gpus, serve, registry.device(envelope["device"]))

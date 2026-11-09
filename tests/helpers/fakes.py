@@ -413,15 +413,34 @@ def thread_servers(states, payload, graph):
         for thread in threads:
             thread.start()
 
-        def results():
-            for thread in threads:
-                thread.join()
-            for thread in threads:
-                if thread.error is not None:
-                    raise thread.error
-            return [thread.result for thread in threads]
+        class Servers:
+            def finish(self):
+                for thread in threads:
+                    thread.join(timeout=30)
+                    assert not thread.is_alive(), "stage server did not finish"
+                for thread in threads:
+                    if thread.error is not None:
+                        raise thread.error
+                return [thread.result for thread in threads]
 
-        return results
+            def abort(self):
+                import contextlib
+                import socket
+
+                # Wake servers that did not get a coordinator connection.
+                # Already-connected peers see EOF when the coordinator exits.
+                message = b'{"end": true}'
+                for path in paths:
+                    with contextlib.suppress(OSError), socket.socket(
+                            socket.AF_UNIX) as connection:
+                        connection.settimeout(0.2)
+                        connection.connect(path)
+                        connection.sendall(len(message).to_bytes(8, "little") + message)
+                for thread in threads:
+                    thread.join(timeout=2)
+                    assert not thread.is_alive(), "stage server did not abort"
+
+        return Servers()
 
     return serve
 
