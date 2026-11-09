@@ -82,6 +82,9 @@ use-base-python = true
 [tool.uv]
 # uv's Python builds include the C headers Triton needs at startup
 python-preference = "only-managed"
+# Require the installed Rust toolchain instead of letting maturin create
+# another CARGO_HOME and invalidate dependency reuse (see AGENTS.md).
+extra-build-variables = { quail-engine = { MATURIN_NO_INSTALL_RUST = "1" } }
 # uv rebuilds the project, and its Rust module, when any of these change
 cache-keys = [
     { file = "pyproject.toml" },
@@ -89,6 +92,8 @@ cache-keys = [
     { file = "Cargo.lock" },
     { file = "crates/**/*.rs" },
     { file = "crates/**/Cargo.toml" },
+    { file = ".cargo/config.toml" },
+    { file = "rust-toolchain.toml" },
 ]
 
 [tool.pytest.ini_options]
