@@ -50,7 +50,7 @@ use crate::join_back::join_back;
 use crate::lift::lift_relational;
 use crate::region::ModelRegion;
 use crate::shared::{ROW_COLUMN, SharedInput, row_field};
-use quail_planner::expressions::UNSUPPORTED;
+use quail_planner::expressions::{CompileError, UNSUPPORTED};
 
 /// The name of [`ClaimModelRegions`], which runs after every other
 /// optimizer rule.
@@ -841,7 +841,7 @@ fn refusal(plan: &LogicalPlan, config: &ConfigOptions) -> Result<Option<String>>
                 .and_then(|placed| select_list(placed, None))
                 .and_then(|selected| lift_relational(selected).map(|(region, _)| region));
             return match placed.map(|placed| derive_error(&placed)) {
-                Ok(Some(error)) => plan_err!("{error}"),
+                Ok(Some(error)) => plan_err!("{}", error.0),
                 _ => Ok(None),
             };
         }
@@ -858,19 +858,19 @@ fn refusal(plan: &LogicalPlan, config: &ConfigOptions) -> Result<Option<String>>
 }
 
 /// Quail's binder's error for `plan` as a region, if it has one.
-fn derive_error(plan: &LogicalPlan) -> Option<String> {
+fn derive_error(plan: &LogicalPlan) -> Option<CompileError> {
     // the chat turn and layout change the prompts, not what Quail reads
     let turn: quail_planner::prompts::Turn = (String::new(), String::new());
     let region = ModelRegion::new(plan.clone());
-    crate::derive::derive_region(&region, &turn, "ai-if")
-        .err()
-        .map(|error| error.0)
+    crate::derive::derive_region(&region, &turn, "ai-if").err()
 }
 
 /// Quail's refusal of `plan`, a region's operators after DataFusion's
 /// optimizer, when the refusal is of a shape DataFusion can run instead.
 fn refusal_of(plan: &LogicalPlan) -> Option<String> {
-    derive_error(plan).filter(|error| error.contains(UNSUPPORTED))
+    derive_error(plan)
+        .filter(CompileError::is_unsupported)
+        .map(|error| error.0)
 }
 
 /// `plan` with each term of its filter that is a correlated `EXISTS` of

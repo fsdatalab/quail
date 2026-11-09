@@ -15,19 +15,48 @@ use serde_json::Value;
 pub const UNSUPPORTED: &str = "is outside what Quail binds from DataFusion";
 
 /// A query that is malformed or outside the language, or a plan the
-/// configuration cannot run, with its refusal.
+/// configuration cannot run, with its refusal and its kind.
 #[derive(Debug, Clone, PartialEq)]
-pub struct CompileError(pub String, pub Option<Box<Refusal>>);
+pub struct CompileError(pub String, pub Option<Box<Refusal>>, pub ErrorKind);
+
+/// What a [`CompileError`] refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// A query Quail cannot answer as written.
+    Invalid,
+    /// A region shape the binder does not read; DataFusion runs those
+    /// operators around a smaller region instead.
+    Unsupported,
+}
 
 impl CompileError {
     /// An error with the message and no refusal.
     pub fn new(message: impl Into<String>) -> Self {
-        CompileError(message.into(), None)
+        CompileError(message.into(), None, ErrorKind::Invalid)
+    }
+
+    /// A region shape the binder does not read, with [`UNSUPPORTED`] in
+    /// its message.
+    pub fn unsupported(what: &str) -> Self {
+        CompileError(
+            format!("{what} {UNSUPPORTED}"),
+            None,
+            ErrorKind::Unsupported,
+        )
     }
 
     /// An error carrying a refusal; its message is the first reason.
     pub fn refused(refusal: Refusal) -> Self {
-        CompileError(refusal.reasons[0].clone(), Some(Box::new(refusal)))
+        CompileError(
+            refusal.reasons[0].clone(),
+            Some(Box::new(refusal)),
+            ErrorKind::Invalid,
+        )
+    }
+
+    /// Whether the error refuses a region shape DataFusion can run.
+    pub fn is_unsupported(&self) -> bool {
+        self.2 == ErrorKind::Unsupported
     }
 }
 

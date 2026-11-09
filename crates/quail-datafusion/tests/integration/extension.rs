@@ -138,3 +138,34 @@ async fn a_host_writes_ai_functions_by_their_dotted_names() -> Result<()> {
     assert_eq!(counts.value(0), 1);
     Ok(())
 }
+
+#[test]
+fn quails_executor_builds_an_expression_that_calls_a_hosts_function() -> Result<()> {
+    use datafusion::logical_expr::{ColumnarValue, Volatility, col, create_udf};
+    use quail_datafusion::expressions::{PhysicalExpression, expression};
+    use quail_physical::ColumnRef;
+
+    // a host function the executor's own DataFusion session does not have
+    let shout = create_udf(
+        "quail_test_shout",
+        vec![DataType::Utf8],
+        DataType::Utf8,
+        Volatility::Immutable,
+        Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+    );
+    let mut state = SessionStateBuilder::new().with_default_features().build();
+    datafusion::execution::FunctionRegistry::register_udf(&mut state, Arc::new(shout.clone()))?;
+    QuailExtension::new(Arc::new(KeepsFirstReview)).register(state)?;
+    let test = shout.call(vec![col("body")]);
+    let encoded = expression(&test, |column| {
+        let reference = ColumnRef {
+            alias: "r".into(),
+            provider: "reviews".into(),
+            column: column.name.clone(),
+        };
+        Ok((reference, DataType::Utf8))
+    })
+    .expect("the test encodes");
+    assert!(PhysicalExpression::new(&encoded).is_ok());
+    Ok(())
+}

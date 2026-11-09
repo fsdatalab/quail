@@ -46,6 +46,7 @@ pub mod region_hint;
 mod repeated;
 pub mod rules;
 mod shared;
+pub mod similar;
 mod substring;
 
 use std::sync::Arc;

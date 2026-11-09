@@ -24,8 +24,8 @@ use quail_physical::{
     Alias, ColumnRef, Equality, ExtractStruct, GetField, ModelCall, ScoreTest, ValueExpression,
 };
 use quail_planner::expressions::{
-    CompileError, SPAN_SUFFIX, UNSUPPORTED, aliased_call, call_aliases, column_alias_of,
-    column_name, compile_error, explain_call, repr_list, repr_str,
+    CompileError, SPAN_SUFFIX, aliased_call, call_aliases, column_alias_of, column_name,
+    compile_error, explain_call, repr_list, repr_str,
 };
 use quail_planner::operators::{Scan, ScanColumn, Schema};
 use quail_planner::prompts::{self, Turn};
@@ -38,7 +38,7 @@ pub(crate) type Hinted = (ValueExpression, Option<f64>);
 const DEFAULT_MAP_ANSWER_TOKENS: i64 = 256;
 
 pub(crate) fn unsupported<T>(what: &str) -> Result<T, CompileError> {
-    compile_error(format!("{what} {UNSUPPORTED}"))
+    Err(CompileError::unsupported(what))
 }
 
 /// Each output column name of a SELECT list and its expression, but a

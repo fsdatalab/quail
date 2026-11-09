@@ -109,6 +109,7 @@ impl QuailExtension {
         state.register_udf(crate::regexps::regexp_functions())?;
         state.register_expr_planner(Arc::new(StructFieldAccess))?;
         state.register_function_rewrite(Arc::new(SnowflakeRegexpLike))?;
+        crate::expressions::share_functions(&state);
         Ok(state)
     }
 

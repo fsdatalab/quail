@@ -14,6 +14,7 @@ from helpers.sessions import CONFIG, TOKENIZER
 
 import quail
 from quail.builtins import LOGICAL_RULES, built_in_registry
+from quail.common.expressions import CompileError, SimilarCallWarning
 
 RULE = "merge_repeated_ai_calls"
 REVIEWS = pa.table({
@@ -116,3 +117,19 @@ def test_an_extraction_in_select_and_its_field_in_where_asks_each_row_once(sessi
         result = finish(session.sql(sql), Oracle(answers=when)).collect()
         assert sorted(row["r.id"] for row in result.to_pylist()) == ["r0", "r2", "r4"]
         assert sorted(asked) == list(range(6))
+
+
+def test_calls_that_differ_only_in_spelling_are_refused(sessions):
+    sql = ("SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('kind: {0}', r.body)) "
+           "AND AI_FILTER(PROMPT('Kind {0}', r.body))")
+    with pytest.raises(CompileError, match="differ only in case, whitespace"):
+        sessions[0].sql(sql).explain()
+
+
+def test_calls_a_typo_apart_warn_and_both_run(sessions):
+    sql = ("SELECT r.id FROM reviews r "
+           "WHERE AI_FILTER(PROMPT('Is the review kind? {0}', r.body)) "
+           "AND AI_FILTER(PROMPT('Is the reveiw kind? {0}', r.body))")
+    with pytest.warns(SimilarCallWarning, match="differ in a few letters"):
+        query = sessions[0].sql(sql)
+        query.explain()

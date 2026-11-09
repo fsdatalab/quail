@@ -106,7 +106,7 @@ class SessionContext:
         derived, _ = self._native.region_plans(text, tuple(model.turn),
                                                model.prompt_layout)
         regions = []
-        for found, message in derived:
+        for found, message, _ in derived:
             if message is not None:
                 raise CompileError(message)
             regions.append(json.loads(found))

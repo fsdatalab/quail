@@ -44,6 +44,10 @@ class CompileError(ValueError):
     """Raised when a query is malformed or outside the language."""
 
 
+class SimilarCallWarning(UserWarning):
+    """Two AI calls of a query differ by a typo, so the model answers each."""
+
+
 def effective_selectivity(selectivity: float | None) -> float:
     """Return the selectivity the planner uses: the given one or the default."""
     return DEFAULT_SELECTIVITY if selectivity is None else selectivity

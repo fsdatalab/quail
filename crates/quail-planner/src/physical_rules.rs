@@ -1168,7 +1168,7 @@ pub fn apply_plan_rules(
                 changed = true;
             }
             Ok(_) => {}
-            Err(CompileError(_, Some(refusal))) => return Ok(Err(*refusal)),
+            Err(CompileError(_, Some(refusal), _)) => return Ok(Err(*refusal)),
             Err(error) => return Err(error),
         }
     }
