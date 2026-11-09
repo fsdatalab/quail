@@ -1213,7 +1213,7 @@ impl StageServer {
 pub fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     physical::register(module)?;
     // the rule lists Python's registry starts from
-    module.add("LOGICAL_RULES", quail_datafusion::LOGICAL_RULES.to_vec())?;
+    module.add("LOGICAL_RULES", quail_datafusion::default_rule_names())?;
     module.add(
         "PHYSICAL_RULES",
         quail_planner::physical_rules::PHYSICAL_RULES.to_vec(),

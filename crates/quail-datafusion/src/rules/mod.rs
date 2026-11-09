@@ -1,8 +1,8 @@
 //! The logical optimizer rules of a session with Quail.
 //!
 //! DataFusion's optimizer runs its own rules over the whole plan, each
-//! `AiNode` included, with Quail's rules among them. [`LOGICAL_RULES`]
-//! is the default order: DataFusion's default rules, with Quail's thirteen
+//! `AiNode` included, with Quail's rules among them. [`default_rule_names`]
+//! gives the default order: DataFusion's default rules, with Quail's thirteen
 //! before `replace_distinct_aggregate`, which turns a `DISTINCT` into a
 //! GROUP BY. Then
 //! [`crate::ClaimModelRegions`] runs last: it runs the listed rules
@@ -51,9 +51,8 @@ pub const QUAIL_RULES: [&str; 13] = [
 /// The rule Quail's rules run before.
 const QUAIL_RULES_BEFORE: &str = "replace_distinct_aggregate";
 
-/// The logical optimizer rules a session runs by default, in order: each
-/// name is an `OptimizerRule`'s `name()`.
-pub const LOGICAL_RULES: [&str; 38] = [
+#[cfg(test)]
+const EXPECTED_DEFAULT_RULES: [&str; 38] = [
     "rewrite_set_comparison",
     "optimize_unions",
     "unions_to_filter",
@@ -193,19 +192,23 @@ pub(crate) fn default_rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
     rules
 }
 
+/// The default logical optimizer rule names, without the final region claim.
+pub fn default_rule_names() -> Vec<String> {
+    default_rules()
+        .iter()
+        .map(|rule| rule.name().to_string())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn the_default_rules_are_datafusions_with_quails_before_replacing_distinct() {
-        let names: Vec<String> = default_rules()
-            .iter()
-            .map(|rule| rule.name().to_string())
-            .collect();
-        assert_eq!(names, LOGICAL_RULES);
-        let listed: Vec<String> = LOGICAL_RULES.iter().map(ToString::to_string).collect();
-        let rules = logical_rules(&listed).unwrap();
+        let names = default_rule_names();
+        assert_eq!(names, EXPECTED_DEFAULT_RULES);
+        let rules = logical_rules(&names).unwrap();
         assert_eq!(
             rules.last().unwrap().name(),
             crate::region::claim::CLAIM_RULE

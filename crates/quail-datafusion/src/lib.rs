@@ -64,7 +64,7 @@ pub use rules::placement::PlaceAiNodes;
 pub use rules::projection::PushDownProjectionIntoAiNodes;
 pub use rules::repeated::MergeRepeatedAiCalls;
 pub use rules::substring::PushDownSubstringPrechecks;
-pub use rules::{LOGICAL_RULES, logical_rule};
+pub use rules::{default_rule_names, logical_rule};
 
 /// Build a DataFusion session state with Quail registered.
 ///
@@ -75,10 +75,7 @@ pub use rules::{LOGICAL_RULES, logical_rule};
 ///
 /// A `DATAFUSION_*` environment option has an invalid value.
 pub fn session_state(runner: Arc<dyn RegionRunner>) -> Result<SessionState> {
-    session_state_with_rules(
-        runner,
-        LOGICAL_RULES.iter().map(ToString::to_string).collect(),
-    )
+    session_state_with_rules(runner, default_rule_names())
 }
 
 /// Build a DataFusion session state with Quail registered, whose

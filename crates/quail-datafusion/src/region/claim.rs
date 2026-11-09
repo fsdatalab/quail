@@ -382,7 +382,7 @@ pub(super) fn kept_by_datafusion(plan: &LogicalPlan) -> Result<bool> {
 /// reported when the region is planned.
 ///
 /// The trial lowers `plan`, coerces its types, and runs the default
-/// optimizer rules over it ([`crate::rules::LOGICAL_RULES`]), as the
+/// optimizer rules over it ([`crate::rules::default_rule_names`]), as the
 /// session would.
 ///
 /// # Errors

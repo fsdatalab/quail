@@ -142,12 +142,7 @@ impl Executor {
             )),
             _ => None,
         };
-        let rules = rules.unwrap_or_else(|| {
-            quail_datafusion::LOGICAL_RULES
-                .iter()
-                .map(ToString::to_string)
-                .collect()
-        });
+        let rules = rules.unwrap_or_else(quail_datafusion::default_rule_names);
         Ok(Self {
             engine,
             rules,
