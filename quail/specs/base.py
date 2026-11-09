@@ -380,11 +380,6 @@ class DeviceSpec:
     mamf_fp8_flops: float = 0.0    # 0 uses the specification rate
     mamf_bf16_flops: float = 0.0
 
-    def gemm_flops(self, precision: Precision) -> float:
-        """Return measured GEMM throughput, or the specification rate."""
-        measured = {"fp8": self.mamf_fp8_flops, "bf16": self.mamf_bf16_flops}
-        return measured.get(precision, 0.0) or self.arithmetic_bandwidth(precision)
-
     def __post_init__(self):
         for precision in get_args(Precision):
             if not self.arithmetic_bandwidth(precision) > 0:

@@ -40,8 +40,8 @@ def _head_bytes():
     return 2 * QWEN3_4B_FP8.hidden * QWEN3_4B_FP8.vocab
 
 
-def _readout_seconds(rows, passes):
-    return max(_head_bytes() * rows / H100_SXM.gemm_flops("bf16"),
+def _readout_seconds(rust, rows, passes):
+    return max(_head_bytes() * rows / rust.gemm_flops(H100_SXM.name, "bf16"),
                _head_bytes() * passes / H100_SXM.hbm_bw)
 
 
@@ -117,7 +117,7 @@ def test_one_round_rules_are_priced_like_filters(rust):
         assert cost.seconds == pytest.approx(
             rust.unrounded_seconds(asdict(work), QWEN3_4B_FP8.name, H100_SXM.name,
                                    CHUNK, 0.0, 0)
-            + _readout_seconds(len(lengths) * suffix, cost.passes))
+            + _readout_seconds(rust, len(lengths) * suffix, cost.passes))
         assert cost.suffix_tokens == len(lengths) * suffix
         assert cost.rounds == 1
 

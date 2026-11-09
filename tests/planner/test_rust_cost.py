@@ -33,12 +33,6 @@ def test_every_spec_file_is_read(rust):
     assert sorted(rust.device_names()) == sorted(DEVICES)
 
 
-def test_every_device_has_the_same_gemm_rates(rust):
-    for name, device in DEVICES.items():
-        for precision in ("fp8", "bf16", "fp32"):
-            assert rust.gemm_flops(name, precision) == device.gemm_flops(precision)
-
-
 def test_the_array_sum_rounds_as_numpy_does():
     generator = np.random.default_rng(0)
     for length in (0, 1, 7, 8, 9, 127, 128, 129, 1000, 4097):
