@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import time
 import warnings
 from dataclasses import asdict, replace
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
@@ -301,13 +300,9 @@ class RegionQuery:
     """One model region of a query: its plan, and its run in this process."""
 
     def __init__(self, session: "Session", operators: str,
-                 order: str | None = None, *, logical: str = "", catalog=None,
-                 assumed_rows=None):
+                 order: str | None = None, *, logical: str = "", catalog=None):
         self.session = session
         self.catalog = session.catalog if catalog is None else catalog
-        # rows of each input table not yet computed, as a CTE's before it
-        # runs, by table name
-        self.assumed_rows = {} if assumed_rows is None else dict(assumed_rows)
         # the region's operators, as Rust's JSON: as derived, then as the
         # planner chose them
         self.operators = operators
@@ -317,15 +312,12 @@ class RegionQuery:
         self._facts = {}
         self.order = order
         self._plan = None
-        self._searched_plan = None
         self._document_tokens = None
         self._token_inputs = None
-        self._planning_started_at = None
-        self._planning_finished_at = None
+        # seconds Rust took to tokenize the inputs and plan the region
+        self._planning_s = 0.0
         # each filtered input's rows' positions in its registered table
         self.source_rows = {}
-        # each input that holds a registered table whole: its identity
-        self.input_identities = {}
 
     def facts(self, operators: str | None = None) -> dict:
         """Return what Rust reads from the region's operators, once per value.
@@ -345,21 +337,12 @@ class RegionQuery:
         return self._facts[operators]
 
     def token_inputs(self) -> dict:
-        """Return the token store of every scanned alias.
-
-        Plans first, then waits for any background tokenization, so
-        planning and the speed of light estimate share these stores.
-        """
+        """Return the token store of every scanned alias, as Rust planned with it."""
         self.plan()
         return self._token_inputs
 
     def plan(self):
-        """Plan the query once and return its physical plan or refusal.
-
-        Document lengths are exact for a tokenized column. For any other
-        column they are estimated from a sample while a background thread
-        tokenizes it. The tree rewrites and the physical planner both read
-        these lengths.
+        """Return the physical plan Rust made for the region, or its refusal.
 
         Returns:
             The physical plan, or a Refusal when no backend can run it.
@@ -370,7 +353,7 @@ class RegionQuery:
         refusal = backend_refusal(self.session)
         if refusal is None:
             raise RuntimeError("a model region is planned by Rust's session")
-        self._plan = self._searched_plan = refusal
+        self._plan = refusal
         return refusal
 
     def adopt_plan(self, found: dict, scans: dict):
@@ -385,6 +368,7 @@ class RegionQuery:
         Returns:
             The physical plan, or the Refusal.
         """
+        self._planning_s = found.pop("planning_s", 0.0)
         self._token_inputs, self._document_tokens = {}, {}
         for alias, (tokens, columns) in scans.items():
             store = TokenStore(tokens)
@@ -392,23 +376,18 @@ class RegionQuery:
             self._document_tokens[alias] = store.lengths
         plan = plan_from_json(found)
         if isinstance(plan, Refusal):
-            self._plan = self._searched_plan = plan
+            self._plan = plan
             return plan
         self.operators = plan.operators
         if self.session.config.gpu_timing:
             plan = replace(plan, settings={**plan.settings, "gpu_timing": True})
-        if self._planning_started_at is None:
-            self._planning_started_at = self._planning_finished_at = time.perf_counter()
-        self._plan = self._searched_plan = plan
+        self._plan = plan
         return plan
 
     @property
     def planning_s(self) -> float:
-        """Return wall time spent planning this query."""
-        if self._planning_started_at is None:
-            return 0.0
-        finished = self._planning_finished_at or time.perf_counter()
-        return finished - self._planning_started_at
+        """Return the seconds Rust took to tokenize the inputs and plan the region."""
+        return self._planning_s
 
     def explain(self, *, verbose: bool = False,
                 analyze: bool = False) -> str:

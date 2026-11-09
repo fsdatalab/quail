@@ -187,7 +187,7 @@ async fn an_exists_gate_becomes_a_semi_join_inside_the_region() -> Result<()> {
     // the gate's table is an input DataFusion scans for the region
     assert_eq!(
         shape.last().map(String::as_str),
-        Some("TableScan: aspects__a")
+        Some("TableScan: aspects@a")
     );
     Ok(())
 }

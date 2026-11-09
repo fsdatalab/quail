@@ -140,12 +140,12 @@ async fn a_host_writes_ai_functions_by_their_dotted_names() -> Result<()> {
 }
 
 #[test]
-fn quails_executor_builds_an_expression_that_calls_a_hosts_function() -> Result<()> {
+fn an_expression_that_calls_a_hosts_function_is_refused_by_name() -> Result<()> {
     use datafusion::logical_expr::{ColumnarValue, Volatility, col, create_udf};
     use quail_datafusion::expressions::{PhysicalExpression, expression};
     use quail_physical::ColumnRef;
 
-    // a host function the executor's own DataFusion session does not have
+    // a host function Quail's executor does not have
     let shout = create_udf(
         "quail_test_shout",
         vec![DataType::Utf8],
@@ -166,6 +166,7 @@ fn quails_executor_builds_an_expression_that_calls_a_hosts_function() -> Result<
         Ok((reference, DataType::Utf8))
     })
     .expect("the test encodes");
-    assert!(PhysicalExpression::new(&encoded).is_ok());
+    let refused = PhysicalExpression::new(&encoded).expect_err("an unknown function");
+    assert!(refused.0.contains("quail_test_shout"), "{}", refused.0);
     Ok(())
 }

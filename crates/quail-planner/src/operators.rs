@@ -56,11 +56,11 @@ pub enum ScanColumn {
 
 /// What separates a table's name from its alias in the name of a model
 /// region's input that holds some of the table's rows, as in
-/// `reviews__r`.
-pub const INPUT_SEPARATOR: &str = "__";
+/// `reviews@r`. A registered table's name has none.
+pub const INPUT_SEPARATOR: &str = "@";
 
 /// The registered table a scanned provider reads: the provider itself,
-/// or the table a region's input `<table>__<alias>` holds rows of.
+/// or the table a region's input `<table>@<alias>` holds rows of.
 pub fn table_name(provider: &str) -> &str {
     provider.split(INPUT_SEPARATOR).next().unwrap_or(provider)
 }

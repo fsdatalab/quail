@@ -1,11 +1,17 @@
 //! Quail: AI functions in SQL, on DataFusion.
 //!
-//! A [`Session`] runs SQL in DataFusion with Quail's AI functions. Each
-//! part of a query that calls the model is one model region, which
-//! Quail's executor plans and runs; DataFusion runs every other
-//! operator. The executor is Quail's Python package, which a Rust
-//! program runs in an embedded Python interpreter. Python's
-//! `quail.Session` is this same `Session`.
+//! Quail adds AI functions to DataFusion and runs the model work of a
+//! query on the GPU:
+//!
+//! - `quail_datafusion::QuailExtension` is the DataFusion extension: the
+//!   AI functions, Quail's optimizer rules, and model regions. It hands
+//!   each model region to a `RegionRunner`.
+//! - [`Executor`] is Quail's `RegionRunner`. It plans each model region
+//!   and runs it on Quail's GPU executor, the `quail` Python package, in
+//!   an embedded Python interpreter.
+//! - [`Session`] is a DataFusion session with the extension registered
+//!   and an [`Executor`] as its runner, and a blocking `sql()`. Python's
+//!   `quail.Session` is this `Session`.
 //!
 //! ```ignore
 //! let config = quail::EngineConfig::new("qwen3-4b-fp8", "h100-sxm");
@@ -15,6 +21,10 @@
 //!     "SELECT r.id FROM reviews r \
 //!      WHERE AI.IF(PROMPT('Does the review discuss the ending?\n\n{0}', r.body))",
 //! )?;
+//!
+//! // or add Quail to a DataFusion session of your own
+//! let executor = Arc::new(quail::Executor::open(&config)?);
+//! let state = quail_datafusion::QuailExtension::new(executor).register(state)?;
 //! ```
 
 mod engine;
@@ -25,7 +35,7 @@ pub mod results;
 pub mod stages;
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
@@ -41,7 +51,8 @@ use quail_datafusion::{
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::unbounded_channel;
 
-use crate::engine::{PythonRunner, PythonTable, RegionCall};
+pub use crate::engine::Executor;
+use crate::engine::{PythonTable, RegionCall};
 pub use crate::engine::{region_json, scans_to_pyarrow};
 
 /// The model and hardware a [`Session`] runs on.
@@ -80,9 +91,7 @@ pub struct Session {
     context: SessionContext,
     /// Taken when the session drops, to shut down without blocking.
     runtime: Option<Runtime>,
-    runner: Arc<PythonRunner>,
-    /// Whether this session opened its engine, and closes it.
-    owns_engine: bool,
+    runner: Arc<Executor>,
 }
 
 impl std::fmt::Debug for Session {
@@ -135,36 +144,15 @@ pub fn start_python() -> Result<()> {
 }
 
 impl Session {
-    /// Open a session on `config`, starting Python if this process has
-    /// not, and loading Quail's executor from the `quail` package.
-    ///
-    /// The interpreter finds `quail` on its own path, or in the virtual
-    /// environment `VIRTUAL_ENV` names.
+    /// Open a session on `config`: Quail's [`Executor`] for `config`, as
+    /// [`Executor::open`] opens it, with a DataFusion session that runs
+    /// every model region on it.
     ///
     /// # Errors
     ///
     /// Python cannot import `quail`, or Quail refuses the configuration.
     pub fn new(config: &EngineConfig) -> Result<Self> {
-        start_python()?;
-        let engine = Python::attach(|py| {
-            let engine = py
-                .import("quail.api.engine")?
-                .getattr("Engine")?
-                .call_method1(
-                    "open",
-                    (
-                        config.model.as_str(),
-                        config.device.as_str(),
-                        config.gpus,
-                        config.backend.as_str(),
-                    ),
-                )?;
-            Ok::<_, PyErr>(engine.unbind())
-        })
-        .map_err(python_failure)?;
-        let mut session = Self::with_engine(engine)?;
-        session.owns_engine = true;
-        Ok(session)
+        Self::with_executor(Arc::new(Executor::open(config)?))
     }
 
     /// A session whose model regions run on `engine`, a Python object
@@ -177,34 +165,23 @@ impl Session {
     /// pyarrow Table or RecordBatchReader. An engine with a `settings`
     /// attribute also has `execute(planned, tables, sink)`, which takes
     /// a region Rust planned and either calls `sink` with each pyarrow
-    /// Table of rows as they finish and returns None, or returns them. `turn` and `layout` are the
-    /// model's chat-turn text and prompt layout.
-    /// `rules` names the optimizer rules each model region runs, in
-    /// order, or is None for the built-in rules.
+    /// Table of rows as they finish and returns None, or returns them.
+    /// `turn` and `layout` are the model's chat-turn text and prompt
+    /// layout. `rules` names the optimizer rules each model region
+    /// runs, in order, or is None for the built-in rules. When the engine
+    /// has a `tokenizer_file` attribute, the path of the model's
+    /// `tokenizer.json`, Rust plans each region with it.
     ///
     /// # Errors
     ///
     /// An attribute is missing or a rule name is unknown.
-    /// When the engine has a `tokenizer_file` attribute, the path of the
-    /// model's `tokenizer.json`, Rust plans each region with it.
     pub fn with_engine(engine: Py<PyAny>) -> Result<Self> {
-        let tokenizer_file = Python::attach(|py| match engine.bind(py).getattr("tokenizer_file") {
-            Ok(found) => found.extract::<Option<String>>(),
-            Err(_) => Ok(None),
-        })
-        .map_err(python_failure)?;
-        let planner = tokenizer_file
-            .map(|path| planning::Planner::new(std::path::Path::new(&path)))
-            .transpose()
-            .map_err(|error| DataFusionError::Plan(format!("CompileError: {}", error.0)))?
-            .map(Arc::new);
-        Self::with_planner(engine, planner)
+        Self::with_executor(Arc::new(Executor::with_engine(engine)?))
     }
 
     /// A session as [`Session::with_engine`] describes, whose regions
     /// `planner` plans in Rust when the engine has a `settings`
-    /// attribute, the configuration as JSON, and the engine's `execute`
-    /// runs; without a planner every region goes to `run_region`.
+    /// attribute; without a planner every region goes to `run_region`.
     ///
     /// # Errors
     ///
@@ -213,47 +190,24 @@ impl Session {
         engine: Py<PyAny>,
         planner: Option<Arc<planning::Planner>>,
     ) -> Result<Self> {
-        let (prompting, rules, settings) = Python::attach(|py| {
-            let bound = engine.bind(py);
-            let turn: (String, String) = bound.getattr("turn")?.extract()?;
-            let layout: String = bound.getattr("layout")?.extract()?;
-            let rules: Option<Vec<String>> = bound.getattr("rules")?.extract()?;
-            let settings: Option<String> = match bound.getattr("settings") {
-                Ok(found) => found.extract()?,
-                Err(_) => None,
-            };
-            Ok::<_, PyErr>(((turn, layout), rules, settings))
-        })
-        .map_err(python_failure)?;
-        let planning = match (planner, settings) {
-            (Some(planner), Some(settings)) => Some((
-                planner,
-                serde_json::from_str::<planning::Settings>(&settings)
-                    .map_err(|error| DataFusionError::External(Box::new(error)))?,
-            )),
-            _ => None,
-        };
-        let rules = rules.unwrap_or_else(|| {
-            quail_datafusion::LOGICAL_RULES
-                .iter()
-                .map(ToString::to_string)
-                .collect()
-        });
-        let runner = Arc::new(PythonRunner {
-            engine,
-            prompting,
-            caller: Mutex::new(None),
-            planning,
-        });
+        Self::with_executor(Arc::new(Executor::with_planner(engine, planner)?))
+    }
+
+    /// A session that runs each model region on `executor`, with the
+    /// optimizer rules the executor's engine names.
+    ///
+    /// # Errors
+    ///
+    /// A rule name is unknown.
+    pub fn with_executor(executor: Arc<Executor>) -> Result<Self> {
         let context = quail_datafusion::session_context_with_rules(
-            Arc::clone(&runner) as Arc<dyn RegionRunner>,
-            rules,
+            Arc::clone(&executor) as Arc<dyn RegionRunner>,
+            executor.rules.clone(),
         )?;
         Ok(Self {
             context,
             runtime: Some(Runtime::new()?),
-            runner,
-            owns_engine: false,
+            runner: executor,
         })
     }
 
@@ -269,8 +223,16 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// DataFusion refuses the name.
+    /// DataFusion refuses the name, or it has
+    /// `quail_planner::operators::INPUT_SEPARATOR` in it.
     pub fn register_table(&self, name: &str, table: Arc<dyn TableProvider>) -> Result<()> {
+        let separator = quail_planner::operators::INPUT_SEPARATOR;
+        if name.contains(separator) {
+            return datafusion::common::plan_err!(
+                "table name {name:?} has {separator:?}, which Quail keeps for the \
+                 inputs of model regions"
+            );
+        }
         self.context.register_table(name, table)?;
         Ok(())
     }
@@ -528,12 +490,6 @@ impl Drop for Session {
         // that one's runtime, where a blocking shutdown is not allowed
         if let Some(runtime) = self.runtime.take() {
             runtime.shutdown_background();
-        }
-        if self.owns_engine {
-            Python::attach(|py| {
-                // a close that fails leaves nothing this session can release
-                let _ = self.runner.engine.call_method0(py, "close");
-            });
         }
     }
 }

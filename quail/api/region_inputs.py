@@ -23,10 +23,6 @@ from quail.catalog import (
     table_name,
 )
 
-# planning before a run assumes this many rows of this many tokens each
-ASSUMED_INPUT_ROWS = 1_000
-ASSUMED_INPUT_TOKENS = 32
-
 
 def input_scans(facts: dict, catalog) -> dict:
     """Return each scan of a region input, by its table name.
@@ -88,8 +84,7 @@ def region_query(session, operators: str, *, tables: dict | None = None,
     if not scans:
         return RegionQuery(session, operators, **options)
     providers = dict(session.catalog.providers)
-    assumed = {}
-    rows, identities = {}, {}
+    rows = {}
     for name, scan in scans.items():
         if tables is not None and name in tables:
             table = tables[name]
@@ -101,19 +96,11 @@ def region_query(session, operators: str, *, tables: dict | None = None,
                 # the table's order
                 order = pc.sort_indices(found)
                 table, rows[name] = table.take(order), pc.take(found, order)
-            if found is not None:
-                base = session.catalog.get(table_name(name))
-                if len(found) == base.statistics().num_rows:
-                    # the whole table: its token store is kept for later queries
-                    identities[name] = base.content_identity()
         else:
             table = scan_schema(scan).empty_table()
-            assumed[name] = ASSUMED_INPUT_ROWS
         providers[name] = MemoryTableProvider(table, id_col="",
                                               identity=f"input:{name}")
     catalog = Catalog(providers)
-    query = RegionQuery(session, operators, catalog=catalog, assumed_rows=assumed,
-                        **options)
+    query = RegionQuery(session, operators, catalog=catalog, **options)
     query.source_rows = rows
-    query.input_identities = identities
     return query

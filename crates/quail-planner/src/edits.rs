@@ -7,11 +7,11 @@
 
 use std::collections::BTreeSet;
 
-use quail_physical::{InputPort, PhysicalNode, PortRef, ValueType, build_pipelines};
+use quail_physical::{InputPort, PhysicalGraph, PhysicalNode, PortRef, ValueType, build_pipelines};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::physical_rules::{Graph, plan_kv_retention};
+use crate::physical_rules::plan_kv_retention;
 
 /// One edit of a planned graph.
 #[derive(Debug, Clone, Deserialize)]
@@ -38,7 +38,7 @@ pub enum Edit {
 ///
 /// The edit names a node or edge the graph does not have, removes a node
 /// that changes what the query means, or leaves an invalid graph.
-pub fn edit_graph(graph: &Graph, edit: &Edit) -> Result<Graph, String> {
+pub fn edit_graph(graph: &PhysicalGraph, edit: &Edit) -> Result<PhysicalGraph, String> {
     let edited = match edit {
         Edit::Insert { node, between } => insert(graph, node.as_ref().clone(), between)?,
         Edit::Remove { node_id } => remove(graph, node_id)?,
@@ -58,7 +58,7 @@ pub fn edit_graph(graph: &Graph, edit: &Edit) -> Result<Graph, String> {
 /// already retain, and whose path no longer ends in a join, recomputes
 /// its documents at the join.
 pub fn recompute_seconds(
-    graph: &Graph,
+    graph: &PhysicalGraph,
     estimates: &Map<String, Value>,
     retained: &BTreeSet<String>,
 ) -> f64 {
@@ -91,7 +91,7 @@ pub fn recompute_seconds(
 /// # Errors
 ///
 /// The graph breaks one of its rules.
-pub fn validate_graph(graph: &Graph) -> Result<(), String> {
+pub fn validate_graph(graph: &PhysicalGraph) -> Result<(), String> {
     quail_physical::validate_graph(&graph.nodes, &graph.root)
 }
 
@@ -99,7 +99,7 @@ fn type_name(value_type: ValueType) -> String {
     quail_physical::value_type_name(value_type).to_string()
 }
 
-fn find<'a>(graph: &'a Graph, node_id: &str) -> Result<&'a PhysicalNode, String> {
+fn find<'a>(graph: &'a PhysicalGraph, node_id: &str) -> Result<&'a PhysicalNode, String> {
     graph
         .nodes
         .iter()
@@ -108,7 +108,7 @@ fn find<'a>(graph: &'a Graph, node_id: &str) -> Result<&'a PhysicalNode, String>
 }
 
 /// The one input port of `consumer` that reads `producer`.
-fn edge(graph: &Graph, producer: &str, consumer: &str) -> Result<InputPort, String> {
+fn edge(graph: &PhysicalGraph, producer: &str, consumer: &str) -> Result<InputPort, String> {
     find(graph, producer)?;
     let target = find(graph, consumer)?;
     let ports: Vec<&InputPort> = target
@@ -127,10 +127,10 @@ fn edge(graph: &Graph, producer: &str, consumer: &str) -> Result<InputPort, Stri
 }
 
 fn insert(
-    graph: &Graph,
+    graph: &PhysicalGraph,
     mut node: PhysicalNode,
     (producer, consumer): &(String, String),
-) -> Result<Graph, String> {
+) -> Result<PhysicalGraph, String> {
     let port = edge(graph, producer, consumer)?;
     if graph
         .nodes
@@ -183,13 +183,13 @@ fn insert(
             nodes.push(existing.clone());
         }
     }
-    Ok(Graph {
+    Ok(PhysicalGraph {
         nodes,
         root: graph.root.clone(),
     })
 }
 
-fn remove(graph: &Graph, node_id: &str) -> Result<Graph, String> {
+fn remove(graph: &PhysicalGraph, node_id: &str) -> Result<PhysicalGraph, String> {
     let node = find(graph, node_id)?;
     if !matches!(node, PhysicalNode::Barrier(_)) {
         return Err(format!(
@@ -229,7 +229,7 @@ fn remove(graph: &Graph, node_id: &str) -> Result<Graph, String> {
             existing
         })
         .collect();
-    Ok(Graph {
+    Ok(PhysicalGraph {
         nodes,
         root: graph.root.clone(),
     })

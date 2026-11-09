@@ -1642,6 +1642,15 @@ fn cut_input(
     {
         return Ok(Transformed::no(node));
     }
+    // the input's name ends with the alias after the last separator, which
+    // an alias with the separator in it would make ambiguous; the region
+    // then reads the table itself
+    if qualifier
+        .table()
+        .contains(quail_planner::operators::INPUT_SEPARATOR)
+    {
+        return Ok(Transformed::no(node));
+    }
     // not the table's own name: two aliases of one table read different rows
     let name = format!(
         "{}{}{}",

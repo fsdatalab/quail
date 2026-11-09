@@ -25,7 +25,6 @@ use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column, DFSchema, ScalarValue};
-use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::{BinaryExpr, Cast, Expr, Like, Operator, TryCast};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::prelude::SessionContext;
@@ -44,27 +43,12 @@ fn position_name(index: usize) -> String {
 }
 
 /// The DataFusion session whose functions decode and build
-/// expressions: DataFusion's, and each scalar function of every session
-/// Quail is added to ([`share_functions`]).
+/// expressions: DataFusion's own and Quail's. Quail's executor decodes a
+/// region's expressions outside the session that planned them, so an
+/// expression that calls a host's own function does not build.
 fn session() -> &'static SessionContext {
     static SESSION: OnceLock<SessionContext> = OnceLock::new();
     SESSION.get_or_init(SessionContext::new)
-}
-
-/// Let the expressions a region hands Quail's executor call `state`'s
-/// scalar functions, such as a host's own UDF in a test of an answer.
-///
-/// The executor decodes expressions outside any DataFusion session, so
-/// it reads functions by name from one process-wide registry; a
-/// function registered later under a taken name replaces the earlier
-/// one.
-pub(crate) fn share_functions(state: &SessionState) {
-    let shared = session().state();
-    for (name, function) in state.scalar_functions() {
-        if shared.scalar_functions().get(name) != Some(function) {
-            session().register_udf(function.as_ref().clone());
-        }
-    }
 }
 
 /// `data_type` with every nested field nullable and without metadata,

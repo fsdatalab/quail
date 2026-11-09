@@ -12,7 +12,7 @@ logical:
   
   Instruction: answer TRUE if the customer commits to buying, FALSE otherwise."), c.transcript)) AS commit_score
     SubqueryAlias: c
-      TableScan: sales_calls__c
+      TableScan: sales_calls@c
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens

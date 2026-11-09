@@ -1191,11 +1191,10 @@ struct PlacedConditions {
 /// or on the result rows.
 ///
 /// `computed` maps (alias, column) to the kind of the operator that
-/// computes it; `unnested` holds the aliases of unnested lists.
+/// computes it.
 fn place_conditions(
     conditions: Vec<Term>,
     computed: &BTreeMap<(String, String), &str>,
-    unnested: &[String],
 ) -> Result<PlacedConditions, CompileError> {
     let mut placed = PlacedConditions::default();
     for term in conditions {
@@ -1211,7 +1210,7 @@ fn place_conditions(
             })
             .collect();
         let kinds: BTreeSet<&str> = owners.iter().flatten().map(|(kind, _)| *kind).collect();
-        let one_table = aliases.len() == 1 && !aliases.iter().any(|alias| unnested.contains(alias));
+        let one_table = aliases.len() == 1;
         if one_table && owners.len() == 1 && owners.contains(&None) {
             if term.selectivity.is_some() {
                 return compile_error(format!(
@@ -1646,7 +1645,7 @@ impl<'w, 'a> Assembly<'w, 'a> {
                 });
             }
         }
-        let conditions = place_conditions(terms, &computed, &binder.unnested())?;
+        let conditions = place_conditions(terms, &computed)?;
         Ok(Self {
             walk,
             binder,

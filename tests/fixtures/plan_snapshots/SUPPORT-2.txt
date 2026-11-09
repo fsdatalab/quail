@@ -11,7 +11,7 @@ logical:
         SubqueryAlias: a
           TableScan: support_messages projection=[id, content]
         SubqueryAlias: u
-          TableScan: support_messages__u
+          TableScan: support_messages@u
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens

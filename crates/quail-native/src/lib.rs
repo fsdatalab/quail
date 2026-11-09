@@ -524,7 +524,7 @@ fn plan_operator<'py>(
             let graph: quail_physical::PhysicalGraph = json_value(get("graph"))?;
             let edit: quail_planner::edits::Edit = json_value(get("edit"))?;
             let retained: std::collections::BTreeSet<String> = json_value(get("retained"))?;
-            let graph = quail_planner::physical_rules::Graph {
+            let graph = quail_physical::PhysicalGraph {
                 nodes: graph.nodes,
                 root: graph.root,
             };
@@ -1002,7 +1002,7 @@ fn execution_report(
 fn edit_graph(graph: &str, edit: &str) -> PyResult<(Option<String>, Option<String>)> {
     let graph: quail_physical::PhysicalGraph = from_json(graph)?;
     let edit: quail_planner::edits::Edit = from_json(edit)?;
-    let graph = quail_planner::physical_rules::Graph {
+    let graph = quail_physical::PhysicalGraph {
         nodes: graph.nodes,
         root: graph.root,
     };
@@ -1191,6 +1191,12 @@ impl StageServer {
 #[pymodule]
 pub fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     physical::register(module)?;
+    // the rule lists Python's registry starts from
+    module.add("LOGICAL_RULES", quail_datafusion::LOGICAL_RULES.to_vec())?;
+    module.add(
+        "PHYSICAL_RULES",
+        quail_planner::physical_rules::PHYSICAL_RULES.to_vec(),
+    )?;
     module.add_class::<NativeSession>()?;
     module.add_class::<Tokenizer>()?;
     module.add_class::<PrefixIndex>()?;

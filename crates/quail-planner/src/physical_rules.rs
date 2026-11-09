@@ -8,7 +8,7 @@ use quail_cost::budgets::{cheaper_attention_path, chunk_budget, tree_attention_a
 use quail_cost::packing::choose_pass_groups;
 use quail_cost::retention::coefficients;
 use quail_cost::statistics::AliasStats;
-use quail_physical::{PhysicalNode, PortRef, build_pipelines, topological_nodes};
+use quail_physical::{PhysicalGraph, PhysicalNode, build_pipelines, topological_nodes};
 use serde_json::{Map, Value};
 
 use crate::classify::classify_statistics;
@@ -32,25 +32,17 @@ pub const PHYSICAL_RULES: [&str; 9] = [
     "should_stop_answers_early",
 ];
 
-/// An executable graph: its nodes and the port that returns the result.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Graph {
-    pub nodes: Vec<PhysicalNode>,
-    pub root: PortRef,
-}
-
-impl Graph {
-    fn with_nodes(&self, nodes: Vec<PhysicalNode>) -> Graph {
-        Graph {
-            nodes,
-            root: self.root.clone(),
-        }
+/// `graph` with `nodes` in place of its own, returning the same port.
+fn with_nodes(graph: &PhysicalGraph, nodes: Vec<PhysicalNode>) -> PhysicalGraph {
+    PhysicalGraph {
+        nodes,
+        root: graph.root.clone(),
     }
 }
 
-type Rewrite = Result<Option<Graph>, CompileError>;
+type Rewrite = Result<Option<PhysicalGraph>, CompileError>;
 
-fn should_push_down_limit(graph: &Graph, settings: &mut Map<String, Value>) -> Rewrite {
+fn should_push_down_limit(graph: &PhysicalGraph, settings: &mut Map<String, Value>) -> Rewrite {
     let limit = graph.nodes.iter().find_map(|node| match node {
         PhysicalNode::Limit(limit) => Some(limit.attributes.count),
         _ => None,
@@ -73,7 +65,7 @@ fn should_push_down_limit(graph: &Graph, settings: &mut Map<String, Value>) -> R
 }
 
 fn choose_classify_implementation(
-    graph: &Graph,
+    graph: &PhysicalGraph,
     context: &PlanningContext,
     settings: &mut Map<String, Value>,
 ) -> Rewrite {
@@ -131,7 +123,7 @@ fn choose_classify_implementation(
         replaced.attributes.spec = Some(chosen);
         nodes[index] = PhysicalNode::AiClassify(replaced);
     }
-    Ok(Some(graph.with_nodes(nodes)))
+    Ok(Some(with_nodes(graph, nodes)))
 }
 
 /// The kind of question a node asks in a set-attention pass, if any.
@@ -242,7 +234,7 @@ fn set_pass_group(node: &mut PhysicalNode, group: i64) {
     }
 }
 
-fn pack_set_passes(graph: &Graph, context: &PlanningContext) -> Rewrite {
+fn pack_set_passes(graph: &PhysicalGraph, context: &PlanningContext) -> Rewrite {
     if context.model.attention_mask != "set"
         || !graph
             .nodes
@@ -258,7 +250,7 @@ fn pack_set_passes(graph: &Graph, context: &PlanningContext) -> Rewrite {
             set_pass_group(node, *group);
         }
     }
-    Ok(Some(graph.with_nodes(nodes)))
+    Ok(Some(with_nodes(graph, nodes)))
 }
 
 fn tokens_of(values: &[Value]) -> Vec<i64> {
@@ -392,7 +384,7 @@ fn document_ends(
 /// A table a node reads, its prompt head, and the tokens after its documents.
 type Tail = (String, Vec<i64>, Vec<i64>);
 
-fn join_document_ends(graph: &Graph, context: &PlanningContext) -> Rewrite {
+fn join_document_ends(graph: &PhysicalGraph, context: &PlanningContext) -> Rewrite {
     if context.model.attention_mask != "set" || context.decode.is_none() {
         return Ok(None);
     }
@@ -443,12 +435,12 @@ fn join_document_ends(graph: &Graph, context: &PlanningContext) -> Rewrite {
         }
         nodes.push(node);
     }
-    Ok(changed.then(|| graph.with_nodes(nodes)))
+    Ok(changed.then(|| with_nodes(graph, nodes)))
 }
 
 /// Set operators' KV retention from the next compatible document consumer,
 /// as `plan_kv_retention`.
-pub fn plan_kv_retention(graph: &Graph) -> Graph {
+pub fn plan_kv_retention(graph: &PhysicalGraph) -> PhysicalGraph {
     let nodes = &graph.nodes;
     let paths = build_pipelines(nodes, &[]);
     let starts: Vec<usize> = topological_nodes(nodes)
@@ -503,11 +495,11 @@ pub fn plan_kv_retention(graph: &Graph) -> Graph {
             }
         }
     }
-    graph.with_nodes(replaced)
+    with_nodes(graph, replaced)
 }
 
 fn should_retain_kv(
-    graph: &Graph,
+    graph: &PhysicalGraph,
     context: &PlanningContext,
     settings: &mut Map<String, Value>,
 ) -> Rewrite {
@@ -699,7 +691,7 @@ fn set_shares_prefixes(node: &mut PhysicalNode) {
     }
 }
 
-fn should_share_prefixes(graph: &Graph, context: &PlanningContext) -> Rewrite {
+fn should_share_prefixes(graph: &PhysicalGraph, context: &PlanningContext) -> Rewrite {
     let model = &context.model;
     if !model.reuses_kv() {
         return Ok(None);
@@ -782,7 +774,7 @@ fn should_share_prefixes(graph: &Graph, context: &PlanningContext) -> Rewrite {
         nodes.push(node);
         changed = true;
     }
-    Ok(changed.then(|| graph.with_nodes(nodes)))
+    Ok(changed.then(|| with_nodes(graph, nodes)))
 }
 
 fn has_spec(node: &PhysicalNode) -> bool {
@@ -806,7 +798,10 @@ fn mean_length(context: &PlanningContext, alias: &str) -> f64 {
 }
 
 /// The attention path for each table's answer branches, as `_answer_attention`.
-fn answer_attention(graph: &Graph, context: &PlanningContext) -> BTreeMap<String, &'static str> {
+fn answer_attention(
+    graph: &PhysicalGraph,
+    context: &PlanningContext,
+) -> BTreeMap<String, &'static str> {
     let mut branches: Vec<(String, Vec<(i64, i64)>)> = Vec::new();
     for node in &graph.nodes {
         let found = match node {
@@ -886,7 +881,7 @@ fn attention_of(node: &mut PhysicalNode) -> Option<&mut String> {
     }
 }
 
-fn choose_attention_path(graph: &Graph, context: &PlanningContext) -> Rewrite {
+fn choose_attention_path(graph: &PhysicalGraph, context: &PlanningContext) -> Rewrite {
     let model = &context.model;
     let forced = context.attention.as_deref();
     if let Some(forced) = forced
@@ -978,11 +973,11 @@ fn choose_attention_path(graph: &Graph, context: &PlanningContext) -> Rewrite {
         }
         nodes.push(node);
     }
-    Ok(changed.then(|| graph.with_nodes(nodes)))
+    Ok(changed.then(|| with_nodes(graph, nodes)))
 }
 
 fn should_deduplicate(
-    graph: &Graph,
+    graph: &PhysicalGraph,
     context: &PlanningContext,
     settings: &mut Map<String, Value>,
 ) -> Rewrite {
@@ -1024,7 +1019,7 @@ fn should_deduplicate(
 /// test is decided TRUE when nothing else reads the answer: no other
 /// `Filter` and not the region's projection, which reads an extraction's
 /// answers as one struct.
-fn should_stop_answers_early(graph: &Graph, context: &PlanningContext) -> Rewrite {
+fn should_stop_answers_early(graph: &PhysicalGraph, context: &PlanningContext) -> Rewrite {
     let Some(found) = &context.operators else {
         return Ok(None);
     };
@@ -1111,7 +1106,7 @@ fn should_stop_answers_early(graph: &Graph, context: &PlanningContext) -> Rewrit
         }
         changed = true;
     }
-    Ok(changed.then(|| graph.with_nodes(nodes)))
+    Ok(changed.then(|| with_nodes(graph, nodes)))
 }
 
 /// Apply one rule by name.
@@ -1122,7 +1117,7 @@ fn should_stop_answers_early(graph: &Graph, context: &PlanningContext) -> Rewrit
 /// plan, or a callback fails.
 pub fn apply_rule(
     name: &str,
-    graph: &Graph,
+    graph: &PhysicalGraph,
     context: &PlanningContext,
     settings: &mut Map<String, Value>,
 ) -> Rewrite {
@@ -1156,7 +1151,7 @@ pub fn apply_plan_rules(
     context: &PlanningContext,
 ) -> Result<Planned, CompileError> {
     let mut settings = plan.settings.clone();
-    let mut graph = Graph {
+    let mut graph = PhysicalGraph {
         nodes: plan.nodes.clone(),
         root: plan.root.clone(),
     };

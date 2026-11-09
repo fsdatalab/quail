@@ -24,7 +24,7 @@ logical:
   Projection: m.id
     AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Judge strictly from the agent step above whether it runs the project's tests or a reproduction script.\n\n{0}\n\nInstruction: answer TRUE if the step runs tests or a reproduction script, FALSE otherwise."), m.content), named_struct(Utf8("selectivity"), Float64(0.2946534217550425))), filter: __quail_answer_1, returns: []
       SubqueryAlias: m
-        TableScan: issue_messages__m
+        TableScan: issue_messages@m
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens

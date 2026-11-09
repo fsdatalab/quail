@@ -11,9 +11,9 @@ logical:
     AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("DOCUMENT {0} and DOCUMENT {1} are the patches of two agent runs on the same issue. Does the patch in DOCUMENT {1} take a different approach from the patch in DOCUMENT {0}? Answer TRUE if the two patches change different code or fix the issue in different ways, FALSE if they make essentially the same change."), s.patch, f.patch), named_struct(Utf8("selectivity"), Float64(0.06837606837606838))), filter: __quail_answer_1, returns: []
       Inner Join: s.instance_id = f.instance_id
         SubqueryAlias: s
-          TableScan: issue_runs__s
+          TableScan: issue_runs@s
         SubqueryAlias: f
-          TableScan: issue_runs__f
+          TableScan: issue_runs@f
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens

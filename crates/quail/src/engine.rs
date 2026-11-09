@@ -13,7 +13,7 @@ use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{Constraints, DataFusionError, Result};
 use datafusion::datasource::TableType;
 use datafusion::datasource::memory::MemorySourceConfig;
-use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::{Expr, LogicalPlan};
 use datafusion::physical_plan::ExecutionPlan;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -30,7 +30,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::planning::{PlannedRegion, Planner, ScanInputs, Settings, TableRows, outcome_json};
 use crate::pyarrow::{from_pyarrow, stream_from_pyarrow, to_pyarrow};
-use crate::python_failure;
+use crate::{EngineConfig, python_failure, start_python};
 
 /// Runs each model region by calling the engine's
 /// `execute(planned, tables, sink, hint)` or `run_region(payload,
@@ -38,9 +38,17 @@ use crate::python_failure;
 /// as [`scans_to_pyarrow`] hands them over. `execute` hands the sink each batch of finished rows as the
 /// region runs and returns None, or returns the rows; `run_region`
 /// returns them, as a pyarrow Table or RecordBatchReader.
+///
+/// It is the [`RegionRunner`] a [`crate::Session`] runs model regions
+/// on. To add Quail to a DataFusion session of your own, register
+/// `QuailExtension::new(Arc::new(Executor::open(&config)?))`.
 #[derive(Debug)]
-pub(crate) struct PythonRunner {
+pub struct Executor {
     pub(crate) engine: Py<PyAny>,
+    /// The optimizer rules each model region runs, by name, in order.
+    pub(crate) rules: Vec<String>,
+    /// Whether this executor opened its engine, and closes it.
+    owns_engine: bool,
     /// The model's chat-turn text and prompt layout, which each region's
     /// prompts are bound in.
     pub(crate) prompting: (Turn, String),
@@ -50,6 +58,116 @@ pub(crate) struct PythonRunner {
     /// The planner and configuration Rust plans each region with, then
     /// calls the engine's `execute`; None calls `run_region`.
     pub(crate) planning: Option<(Arc<Planner>, Settings)>,
+}
+
+impl Executor {
+    /// Open Quail's executor for `config`, starting Python if this process
+    /// has not, and loading it from the `quail` package.
+    ///
+    /// The interpreter finds `quail` on its own path, or in the virtual
+    /// environment `VIRTUAL_ENV` names.
+    ///
+    /// # Errors
+    ///
+    /// Python cannot import `quail`, or Quail refuses the configuration.
+    pub fn open(config: &EngineConfig) -> Result<Self> {
+        start_python()?;
+        let engine = Python::attach(|py| {
+            let engine = py
+                .import("quail.api.engine")?
+                .getattr("Engine")?
+                .call_method1(
+                    "open",
+                    (
+                        config.model.as_str(),
+                        config.device.as_str(),
+                        config.gpus,
+                        config.backend.as_str(),
+                    ),
+                )?;
+            Ok::<_, PyErr>(engine.unbind())
+        })
+        .map_err(python_failure)?;
+        let mut executor = Self::with_engine(engine)?;
+        executor.owns_engine = true;
+        Ok(executor)
+    }
+
+    /// An executor that runs model regions on `engine`, a Python object
+    /// as [`crate::Session::with_engine`] describes, planning each region
+    /// in Rust when the engine has a `tokenizer_file` attribute.
+    ///
+    /// # Errors
+    ///
+    /// An attribute is missing or malformed.
+    pub fn with_engine(engine: Py<PyAny>) -> Result<Self> {
+        let tokenizer_file = Python::attach(|py| match engine.bind(py).getattr("tokenizer_file") {
+            Ok(found) => found.extract::<Option<String>>(),
+            Err(_) => Ok(None),
+        })
+        .map_err(python_failure)?;
+        let planner = tokenizer_file
+            .map(|path| Planner::new(std::path::Path::new(&path)))
+            .transpose()
+            .map_err(|error| DataFusionError::Plan(format!("CompileError: {}", error.0)))?
+            .map(Arc::new);
+        Self::with_planner(engine, planner)
+    }
+
+    /// An executor as [`Executor::with_engine`] describes, whose regions
+    /// `planner` plans in Rust when the engine has a `settings`
+    /// attribute; without a planner every region goes to `run_region`.
+    ///
+    /// # Errors
+    ///
+    /// An attribute is missing or malformed.
+    pub fn with_planner(engine: Py<PyAny>, planner: Option<Arc<Planner>>) -> Result<Self> {
+        let (prompting, rules, settings) = Python::attach(|py| {
+            let bound = engine.bind(py);
+            let turn: (String, String) = bound.getattr("turn")?.extract()?;
+            let layout: String = bound.getattr("layout")?.extract()?;
+            let rules: Option<Vec<String>> = bound.getattr("rules")?.extract()?;
+            let settings: Option<String> = match bound.getattr("settings") {
+                Ok(found) => found.extract()?,
+                Err(_) => None,
+            };
+            Ok::<_, PyErr>(((turn, layout), rules, settings))
+        })
+        .map_err(python_failure)?;
+        let planning = match (planner, settings) {
+            (Some(planner), Some(settings)) => Some((
+                planner,
+                serde_json::from_str::<Settings>(&settings)
+                    .map_err(|error| DataFusionError::External(Box::new(error)))?,
+            )),
+            _ => None,
+        };
+        let rules = rules.unwrap_or_else(|| {
+            quail_datafusion::LOGICAL_RULES
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        });
+        Ok(Self {
+            engine,
+            rules,
+            owns_engine: false,
+            prompting,
+            caller: Mutex::new(None),
+            planning,
+        })
+    }
+}
+
+impl Drop for Executor {
+    fn drop(&mut self) {
+        if self.owns_engine {
+            Python::attach(|py| {
+                // a close that fails leaves nothing this executor can release
+                let _ = self.engine.call_method0(py, "close");
+            });
+        }
+    }
 }
 
 /// A region a DataFusion worker hands to the calling thread to run.
@@ -163,31 +281,30 @@ impl RegionSink {
     }
 }
 
-impl PythonRunner {
-    /// One region's operators and DataFusion plan, as [`region_json`]
-    /// writes them.
-    fn request(&self, region: &ModelRegion) -> Result<String> {
+impl Executor {
+    /// One region's operators and DataFusion plan.
+    fn request(&self, region: &ModelRegion) -> Result<(Operators, LogicalPlan)> {
         let (turn, layout) = &self.prompting;
-        let (operators, plan) = derive::derive_region(region, turn, layout)
-            .map_err(|error| DataFusionError::Plan(format!("CompileError: {}", error.0)))?;
-        region_json(&operators, &plan)
+        derive::derive_region(region, turn, layout)
+            .map_err(|error| DataFusionError::Plan(format!("CompileError: {}", error.0)))
     }
 
     /// Plan a region in Rust, or None when Python plans it: a region that
-    /// asks no model. `payload` is the region as [`region_json`] writes it;
-    /// the plan carries its DataFusion plan on to Python, beside what its
-    /// scans read.
+    /// asks no model. `derived` is the region's operators and DataFusion
+    /// plan; the plan carries the DataFusion plan's text on to Python,
+    /// beside what its scans read.
     fn plan_here(
         &self,
         region: &ModelRegion,
         inputs: &[InputRows],
-        payload: &str,
+        derived: &(Operators, LogicalPlan),
         fetch: Option<usize>,
     ) -> Result<Option<PlannedRegion>> {
         let Some((planner, settings)) = &self.planning else {
             return Ok(None);
         };
-        let (mut operators, logical) = read_region_json(payload)?;
+        let mut operators = derived.0.clone();
+        let logical = derived.1.display_indent().to_string();
         if let Some(fetch) = fetch {
             operators = operators.limited(fetch as i64);
         }
@@ -202,6 +319,8 @@ impl PythonRunner {
         if !asks_model {
             return Ok(None);
         }
+        // planning reads, and tokenizes, each input's documents first
+        let started = std::time::Instant::now();
         let mut tables = named_tables(region)?;
         for ((name, batches), input) in inputs.iter().zip(&region.inputs) {
             tables.insert(
@@ -221,6 +340,7 @@ impl PythonRunner {
             .map_err(compile)?;
         let mut planned = outcome_json(&outcome).map_err(compile)?;
         planned["logical"] = logical.into();
+        planned["planning_s"] = started.elapsed().as_secs_f64().into();
         Ok(Some((planned.to_string(), scans)))
     }
 
@@ -234,14 +354,14 @@ impl PythonRunner {
         region: &ModelRegion,
         inputs: &[InputRows],
     ) -> Result<(String, Option<PlannedRegion>)> {
-        let payload = self.request(region)?;
+        let derived = self.request(region)?;
         let sorted = inputs
             .iter()
             .zip(&region.inputs)
             .map(|((name, batches), input)| Ok((name.clone(), in_source_order(input, batches)?)))
             .collect::<Result<Vec<InputRows>>>()?;
-        let planned = self.plan_here(region, &sorted, &payload, None)?;
-        Ok((payload, planned))
+        let planned = self.plan_here(region, &sorted, &derived, None)?;
+        Ok((region_json(&derived.0, &derived.1)?, planned))
     }
 
     /// Run a call's region on this thread and send its rows, then the end.
@@ -274,7 +394,7 @@ impl PythonRunner {
         hint: &RegionHint,
         rows: &RowSender,
     ) -> Result<()> {
-        let payload = self.request(region)?;
+        let derived = self.request(region)?;
         let inputs = collect_inputs(inputs)?;
         let mut sorted;
         let mut held = None;
@@ -286,9 +406,9 @@ impl PythonRunner {
                     Ok((name.clone(), in_source_order(input, batches)?))
                 })
                 .collect::<Result<Vec<InputRows>>>()?;
-            held = input_hint(region, &payload, fetch, hint, &mut sorted)?;
+            held = input_hint(region, &derived.0, fetch, hint, &mut sorted)?;
             (
-                self.plan_here(region, &sorted, &payload, fetch)?,
+                self.plan_here(region, &sorted, &derived, fetch)?,
                 sorted.as_slice(),
             )
         } else {
@@ -300,6 +420,11 @@ impl PythonRunner {
             rows: rows.clone(),
             names: names.clone(),
             schema: Arc::clone(schema.inner()),
+        };
+        // Python reads a region it plans as JSON
+        let payload = match &planned {
+            None => Some(region_json(&derived.0, &derived.1)?),
+            Some(_) => None,
         };
         let reader = Python::attach(|py| {
             // each input as a pyarrow Table, by the table name the region reads
@@ -317,9 +442,11 @@ impl PythonRunner {
                     self.engine
                         .call_method1(py, "execute", (found, tables, sink, hint))?
                 }
-                None => self
-                    .engine
-                    .call_method1(py, "run_region", (&payload, tables, fetch))?,
+                None => self.engine.call_method1(
+                    py,
+                    "run_region",
+                    (payload.as_deref(), tables, fetch),
+                )?,
             };
             // an engine that sent every row to the sink returns None
             let answer = answer.bind(py);
@@ -364,7 +491,7 @@ pub fn scans_to_pyarrow<'py>(
     Ok(found)
 }
 
-impl RegionRunner for PythonRunner {
+impl RegionRunner for Executor {
     /// Run the region on the thread that called DataFusion, so the GPU
     /// process's per-thread state is set up once, not on each worker.
     fn run(
@@ -404,12 +531,11 @@ impl RegionRunner for PythonRunner {
 /// rows those are, so such a region takes no hint.
 fn input_hint(
     region: &ModelRegion,
-    payload: &str,
+    operators: &Operators,
     fetch: Option<usize>,
     hint: &RegionHint,
     inputs: &mut [InputRows],
 ) -> Result<Option<InputHint>> {
-    let (operators, _) = read_region_json(payload)?;
     if hint.is_empty()
         || fetch.is_some()
         || operators.fetch.is_some()
@@ -495,16 +621,6 @@ pub fn region_json(
         "warnings": warnings,
     })
     .to_string())
-}
-
-/// A region's operators and DataFusion plan text from [`region_json`].
-fn read_region_json(payload: &str) -> Result<(Operators, String)> {
-    let external = |error: serde_json::Error| DataFusionError::External(Box::new(error));
-    let found: serde_json::Value = serde_json::from_str(payload).map_err(external)?;
-    let operators =
-        serde_json::from_str(found["operators"].as_str().unwrap_or_default()).map_err(external)?;
-    let logical = found["logical"].as_str().unwrap_or_default().to_string();
-    Ok((operators, logical))
 }
 
 /// An input's rows in the order of the registered table it holds rows of,

@@ -305,7 +305,7 @@ pub(crate) struct Binder {
     turn: Turn,
     layout: String,
     /// (alias, provider, schema) of each table in scope, in the order
-    /// they were added; an unnested list has no provider.
+    /// they were added.
     tables: Vec<(String, String, SchemaRef)>,
     /// alias -> the document expression its prompts read.
     document_columns: Vec<(String, ValueExpression)>,
@@ -1330,8 +1330,7 @@ impl Binder {
         columns: &[ValueExpression],
         structs: &[ExtractStruct],
     ) -> Result<(), CompileError> {
-        // an unnested list has no provider; its name is not a table's
-        let is_alias = |name: &str| self.provider(name).is_some_and(|found| !found.is_empty());
+        let is_alias = |name: &str| self.provider(name).is_some();
         for found in structs {
             if is_alias(&found.name) {
                 return compile_error(format!(
@@ -1409,15 +1408,6 @@ impl Binder {
             columns: Vec::new(),
             predicates: Vec::new(),
         }
-    }
-
-    /// The unnested lists: the tables without a provider.
-    pub(crate) fn unnested(&self) -> Vec<String> {
-        self.tables
-            .iter()
-            .filter(|(_, provider, _)| provider.is_empty())
-            .map(|(alias, _, _)| alias.clone())
-            .collect()
     }
 
     // ------------------------------------------------------------ SELECT list

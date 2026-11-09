@@ -429,3 +429,22 @@ def test_a_region_that_reads_another_regions_rows_runs_after_it(context):
     # q1 keeps r0, r2, and r3, and the LIMIT r0 and r2; the oracle answers
     # q2 by each document's position in the second region's input, 1 and 1
     assert _rows(context.sql(text)) == [("r0",), ("r2",)]
+
+
+def test_a_table_name_with_underscores_keeps_its_rows_in_a_region():
+    session = quail.Session(CONFIG, tokenizer=TOKENIZER)
+    try:
+        ORACLE.catalog = session.catalog
+        context = quail.SessionContext(session,
+                                       physical_executor=oracle_executor(ORACLE))
+        context.register("reviews__archive",
+                         quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
+        # a plain test cuts the table's rows into a region input
+        text = ("SELECT r.id FROM reviews__archive r WHERE r.stars > 1 "
+                "AND AI_FILTER(PROMPT('q1: {0}', r.body)) ORDER BY r.id")
+        assert _rows(context.sql(text)) == [("r0",), ("r2",)]
+        with pytest.raises(quail.common.expressions.CompileError, match="'@'"):
+            context.register("reviews@r",
+                             quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
+    finally:
+        session.close()

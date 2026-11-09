@@ -8,7 +8,7 @@ logical:
   Projection: t.id
     AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Judge strictly from the agent trace above whether the agent recovered after pursuing an approach that did not work. Recovery means the agent recognized or moved past the unsuccessful approach and then made useful progress with a different or corrected approach.\n\n{0}\n\nInstruction: answer TRUE if the trace shows the agent recovering after an unsuccessful approach, FALSE otherwise."), t.trace), named_struct(Utf8("selectivity"), Float64(0.3216704288939052))), filter: __quail_answer_1, returns: []
       SubqueryAlias: t
-        TableScan: agent_traces__t
+        TableScan: agent_traces@t
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
