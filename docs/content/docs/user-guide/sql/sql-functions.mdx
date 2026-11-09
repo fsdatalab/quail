@@ -45,8 +45,11 @@ an AI call must read a value from `GROUP BY` or a window calculation.
 
 Use `AI.IF` in `ON` for a [join](/docs/user-guide/sql/ai-functions#joining).
 Add column comparisons to restrict the pairs that the model reads.
-DataFusion also supports ordinary joins around model regions, including
-outer joins. Not every join needs an AI call.
+`LEFT`, `RIGHT`, and `FULL` joins can also use AI predicates in `ON`.
+Quail finds matching pairs with an inner AI join, then DataFusion restores
+the unmatched rows from the original inputs. Duplicate rows remain separate,
+and null join keys follow the SQL predicate's null semantics.
+Not every join needs an AI call.
 
 ### EXISTS and NOT EXISTS
 
@@ -66,7 +69,9 @@ and [Filter on answers](/docs/user-guide/sql/ai-functions#filter-on-answers).
 
 - Comparisons exclude null values. Use `IS NULL` to keep them.
 - Combine ordinary conditions with `AND`, `OR`, or `NOT`.
-- `OR` with AI calls has [additional limits](/docs/user-guide/sql/ai-functions#filtering).
+- AI answers can appear inside `OR`, `NOT`, comparisons, and other SQL
+  expressions. The [fallback](#unsupported-sql) may evaluate answers before
+  applying the condition; do not assume SQL short-circuiting avoids model work.
 
 ### ORDER BY
 
@@ -212,13 +217,30 @@ the query's outer `ORDER BY` controls returned row order.
 
 ### Window limits
 
-A later AI call cannot read a window value in the same `SELECT`.
-Put the window calculation in a CTE or `FROM` subquery instead.
+An AI call can read a window expression through the fallback: DataFusion
+computes the window result before the model reads it. To refer to the window
+result by a column name, put it in a CTE or `FROM` subquery.
 
 ## Unsupported SQL
 
-Quail checks AI calls and their restrictions within model regions.
-DataFusion checks the surrounding SQL.
-See [AI functions](/docs/user-guide/sql/ai-functions) for function-specific
+An expression need not fit Quail's optimized model-region shapes to use
+an AI answer. Quail first tries its existing optimized plan. If that shape
+is unsupported, it computes each AI call as a named column over a
+DataFusion-computed region input, then runs the original SQL operator over
+those columns in DataFusion. The input can itself be a join, aggregate,
+window calculation, CTE, literal row, or other DataFusion relation; it need
+not be a base table. `VALUES` rows with AI calls use the same projection
+fallback, preserving duplicate rows.
+
+This fallback covers SQL combinations of AI answers rather than adding a
+separate model operator for every expression shape. It preserves the SQL
+operator's result semantics, but can require more model calls and
+materialization than an optimized region. Outer joins with AI in `ON`
+add a matching-pairs step to restore unmatched rows correctly.
+
+Fallback does not make invalid SQL or invalid AI arguments valid.
+DataFusion still checks the SQL; Quail still checks prompt arguments,
+function options, and model capabilities. See
+[AI functions](/docs/user-guide/sql/ai-functions) for function-specific
 limits and [Refusals](/docs/user-guide/results#refusals) for configuration
 errors.

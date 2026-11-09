@@ -59,8 +59,9 @@ WHERE AI.IF(PROMPT('Does this review mention a positive aspect? {0}', r.body))
   AND AI.IF(PROMPT('Does this review discuss the ending? {0}', r.body));
 ```
 
-Filters on the same table alias must read the same document column.
-Use `AND` when every filter must pass.
+Use `AND` when every filter must pass. Calls that read the same document
+can share model-region work. Other expression shapes use the
+[SQL fallback](/docs/user-guide/sql/sql-functions#unsupported-sql).
 
 E.g., if `reviews` also has a boolean `flagged` column, keep flagged
 reviews or reviews that mention a refund:
@@ -72,12 +73,15 @@ WHERE r.flagged
    OR AI.IF(PROMPT('Does this review mention a refund? {0}', r.body));
 ```
 
-- Quail checks ordinary conditions first. It skips the model when one is
-  `TRUE`.
-- With several `AI.IF` terms, Quail asks in written order until one is
-  `TRUE`.
-- Each term must read the same table. `OR` with an AI join or a score
-  comparison is unsupported.
+For eligible same-input `AI.IF` disjunctions, Quail checks ordinary
+conditions first and skips model calls once a term is `TRUE`. It can also
+stop after the first passing AI term.
+
+Other disjunctions, including score comparisons and predicates over joined
+inputs, use the [SQL fallback](/docs/user-guide/sql/sql-functions#unsupported-sql)
+when they cannot form an optimized model region. DataFusion evaluates the
+condition over named AI answers; this path need not skip model calls just
+because another term is already true.
 
 ### Joining
 
@@ -163,9 +167,12 @@ JOIN documents d ON AI.SCORE(
     PROMPT('Is {1} relevant to {0}?', q.text, d.body)) >= 0.8;
 ```
 
-A two-document prompt must contain `{0}` exactly once.
+The optimized pair-scoring path uses `{0}` exactly once. Other prompt
+shapes use the SQL fallback over materialized pairs.
 Use `CROSS JOIN` with `AI.SCORE` in `SELECT` to return unfiltered pair scores.
-A query cannot combine `AI.SCORE` with `AI.IF`.
+A query can combine `AI.SCORE`, `AI.IF`, and `AI.CLASSIFY`; incompatible
+operators run in separate model regions. The configured model must support
+the requested operations.
 
 ### Model behavior
 
@@ -244,7 +251,8 @@ JOIN aspects a ON AI.IF(
     PROMPT('Does the review discuss this aspect? {0} {1}', r.body, a.aspect));
 ```
 
-Joined classification requires one GPU and cannot use `AI.SCORE`.
+The optimized joined-classification operator requires one GPU. A query
+that also uses `AI.SCORE` can run those calls in separate model regions.
 See [Classification answers](/docs/user-guide/results#classification-answers)
 to inspect labels that later filters remove.
 
