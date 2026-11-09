@@ -137,29 +137,6 @@ def decode_runs(label_ids) -> DecodeRuns:
     return DecodeRuns(runs, first, after, rounds)
 
 
-def decode_round_tokens(label_ids) -> list[list[int]]:
-    """Return the tokens a greedy decode feeds for each label, per round.
-
-    The first round's count includes the answer cue. A label's list
-    ends at the round that decides it.
-    """
-    runs = decode_runs(label_ids)
-    trie = label_trie(label_ids)
-    counts = []
-    for ids in label_ids:
-        ids = tuple(ids)
-        node = runs.first
-        fed = [1 + len(runs.runs[0])]
-        while node in trie:
-            target, run = runs.after[node, ids[len(node)]]
-            if run is None:
-                break
-            fed.append(len(runs.runs[run]))
-            node = target
-        counts.append(fed)
-    return counts
-
-
 def fed_nodes(read) -> set:
     """Return the read nodes and their ancestors, whose tokens are fed."""
     return {node[:depth] for node in read for depth in range(len(node) + 1)}

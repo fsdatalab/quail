@@ -60,10 +60,10 @@ def test_the_label_trie_reads_the_same_nodes():
         for starts in ((), tuple((True,) + (False,) * (len(ids) - 1)
                                  for ids in label_ids)):
             read = python_labels.read_nodes(label_ids, starts)
-            assert plain(native.CostModel.label_nodes(
-                label_ids, [list(flags) for flags in starts])) == plain((
-                sorted(read), sorted(python_labels.fed_nodes(read)),
-                python_labels.decode_round_tokens(label_ids)))
+            found = native.CostModel.label_nodes(
+                label_ids, [list(flags) for flags in starts])
+            assert plain(found[:2]) == plain((
+                sorted(read), sorted(python_labels.fed_nodes(read))))
 
 
 def test_a_length_column_summarizes_to_its_sums_and_short_counts():

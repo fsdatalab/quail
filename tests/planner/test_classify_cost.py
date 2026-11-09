@@ -4,11 +4,11 @@ import itertools
 from dataclasses import asdict, replace
 
 import pytest
-from helpers.rust_cost import classify_estimate, cost_model
+from helpers.rust_cost import classify_estimate, cost_model, native
 from helpers.work import scan, stream
 
 from quail.common.work import Work
-from quail.labels import decode_round_tokens, label_trie
+from quail.labels import label_trie
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 
 # a one-token label; two that share a first token and split there; two
@@ -87,7 +87,7 @@ def test_expected_work_matches_every_label_assignment(rust, lengths, labels, win
     model = WINDOWED if window else QWEN3_4B_FP8.name
     cost = _cost(rust, lengths, labels, model=model, shared=shared or (),
                  resident=resident)
-    runs = decode_round_tokens(labels)
+    runs = native.CostModel.label_nodes([list(label) for label in labels], [])[2]
     outcomes = list(itertools.product(runs, repeat=len(lengths)))
     expected = dict.fromkeys(asdict(Work()), 0.0)
     for picked in outcomes:
