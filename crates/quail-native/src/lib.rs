@@ -569,6 +569,98 @@ fn refusal_fields(refusal: &quail_planner::search::Refusal) -> serde_json::Value
     serde_json::json!({"refusal": quail::planning::refusal_json(refusal)})
 }
 
+/// The token lists of a pyarrow Table's first column, as int32 lists.
+fn token_batches(
+    table: &Bound<'_, PyAny>,
+) -> PyResult<Vec<datafusion::arrow::array::LargeListArray>> {
+    use datafusion::arrow::array::AsArray;
+    use datafusion::arrow::datatypes::{DataType, Field};
+    let lists = DataType::LargeList(std::sync::Arc::new(Field::new_list_field(
+        DataType::Int32,
+        true,
+    )));
+    quail::pyarrow::from_pyarrow(table)?
+        .iter()
+        .map(|batch| {
+            let column =
+                datafusion::arrow::compute::cast(batch.column(0), &lists).map_err(arrow_error)?;
+            Ok(column.as_list::<i64>().clone())
+        })
+        .collect()
+}
+
+/// The documents of a token store or any token sequences sorted by their
+/// tokens, as `quail_inputs::PrefixIndex`; its trees at each page size
+/// share the sort.
+#[pyclass(name = "PrefixIndex", module = "_quail_native", frozen)]
+struct PrefixIndex {
+    index: quail_inputs::PrefixIndex,
+}
+
+#[pymethods]
+impl PrefixIndex {
+    /// Sort the documents of `tokens`, a pyarrow Table whose first column
+    /// holds each document's integer token ids.
+    #[new]
+    fn new(py: Python<'_>, tokens: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let batches = token_batches(tokens)?;
+        let index =
+            py.detach(|| quail_inputs::PrefixIndex::new(&quail_inputs::Documents::new(&batches)));
+        Ok(Self { index })
+    }
+
+    /// The prefix tree whose shares round down to `page_tokens`: each
+    /// document's position in sorted order, the position it borrows from
+    /// or None, and the tokens it borrows.
+    #[allow(clippy::type_complexity)]
+    fn tree(&self, page_tokens: i64) -> PyResult<(Vec<usize>, Vec<Option<usize>>, Vec<i64>)> {
+        if page_tokens < 1 {
+            return Err(PyValueError::new_err("page_tokens must be positive"));
+        }
+        let tree = self.index.tree(page_tokens);
+        Ok((tree.order, tree.parent, tree.shared))
+    }
+}
+
+/// Each document's first document with the same tokens and the same
+/// values in each column of `columns`, as `quail_inputs::first_documents`:
+/// an int32 pyarrow Array. `tokens` is a pyarrow Table whose first column
+/// holds each document's token ids; `columns` a pyarrow Table or None.
+#[pyfunction]
+#[pyo3(signature = (tokens, columns=None))]
+fn first_documents<'py>(
+    py: Python<'py>,
+    tokens: &Bound<'py, PyAny>,
+    columns: Option<&Bound<'py, PyAny>>,
+) -> PyResult<Bound<'py, PyAny>> {
+    use datafusion::arrow::array::{ArrayRef, Int32Array, RecordBatchReader};
+    let batches = token_batches(tokens)?;
+    let values: Vec<ArrayRef> = match columns {
+        None => Vec::new(),
+        Some(table) => {
+            let reader = quail::pyarrow::stream_from_pyarrow(table)?;
+            let schema = reader.schema();
+            let found = reader
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(arrow_error)?;
+            datafusion::arrow::compute::concat_batches(&schema, &found)
+                .map_err(arrow_error)?
+                .columns()
+                .to_vec()
+        }
+    };
+    let first = py
+        .detach(|| quail_inputs::first_documents(&quail_inputs::Documents::new(&batches), &values))
+        .map_err(arrow_error)?;
+    let first: ArrayRef = std::sync::Arc::new(
+        first
+            .into_iter()
+            .map(|position| position as i32)
+            .collect::<Int32Array>(),
+    );
+    quail::pyarrow::array_to_pyarrow(py, &first)
+}
+
 /// A model's tokenizer, read from its `tokenizer.json`: the one the
 /// planner tokenizes documents with and the GPU worker decodes with.
 #[pyclass(name = "Tokenizer", module = "_quail_native", frozen)]
@@ -1092,6 +1184,7 @@ pub fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     physical::register(module)?;
     module.add_class::<NativeSession>()?;
     module.add_class::<Tokenizer>()?;
+    module.add_class::<PrefixIndex>()?;
     module.add_class::<NativePlanner>()?;
     module.add_class::<NativeFinishedRows>()?;
     module.add_class::<StageServer>()?;
@@ -1100,6 +1193,7 @@ pub fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(explain_plan, module)?)?;
     module.add_function(wrap_pyfunction!(parse_expression, module)?)?;
     module.add_function(wrap_pyfunction!(model_answers, module)?)?;
+    module.add_function(wrap_pyfunction!(first_documents, module)?)?;
     module.add_function(wrap_pyfunction!(prompt_layout, module)?)?;
     module.add_function(wrap_pyfunction!(read_specs, module)?)?;
     module.add("SHARED_PRE", quail_planner::prompts::SHARED_PRE)?;

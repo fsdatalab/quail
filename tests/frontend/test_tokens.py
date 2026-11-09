@@ -44,15 +44,16 @@ def test_token_views_store_concatenations_and_shared_prefixes(monkeypatch):
 
     store = _store([[1, 2, 3], [4, 5], [1, 2, 9]])
     assert list(store.lengths) == [3, 2, 3]
-    index = store.prefix_index
+    tree = prefix_tree(store, 1)
+    assert (tree.order, tree.parent, tree.shared) == (
+        [0, 2, 1], [None, None, 0], [0, 0, 2])
     with monkeypatch.context() as patch:
-        patch.setattr("quail.common.tokens._token_array",
-                      lambda *_: pytest.fail("prefix preparation ran twice"))
-        assert prefix_tree(store, 1) is index.tree(1)
-        assert prefix_tree(store, 16) is index.tree(16)
+        patch.setattr("_quail_native.PrefixIndex",
+                      lambda *_: pytest.fail("the documents were sorted twice"))
+        assert prefix_tree(store, 1) is tree
+        assert prefix_tree(store, 2).shared == [0, 0, 2]
 
     long = _store([list(range(1000))] * 10)
-    assert long.prefix_index is not index
     assert prefix_tree(long, 16).shared_tokens == 9 * (999 // 16 * 16)
     restored = pickle.loads(pickle.dumps(long))
     assert len(restored) == 10

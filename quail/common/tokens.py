@@ -10,9 +10,8 @@ from dataclasses import asdict
 import _quail_native
 import numpy as np
 import pyarrow as pa
-from pyarrow import compute as pc
 
-from quail.common.selection import group_ids
+from quail.common.selection import equality_keys
 
 
 class TokenView(Sequence):
@@ -24,10 +23,7 @@ class TokenView(Sequence):
         return len(self._values)
 
     def __iter__(self):
-        try:
-            return iter(self.numpy())
-        except (TypeError, ValueError):
-            return iter(self._values.to_pylist())
+        return iter(self.numpy())
 
     def __getitem__(self, index):
         if isinstance(index, slice):
@@ -193,31 +189,9 @@ class TokenLengths(Sequence):
         return values if dtype is None else values.astype(dtype, copy=False)
 
 
-# a model's tokenizer, run in Rust: the planner writes token stores with it
+# a model's tokenizer, run in Rust: the planner tokenizes documents with it
 # and the GPU worker encodes continuations and decodes answers with it
 Tokenizer = _quail_native.Tokenizer
-
-
-def token_keys(tokens: pa.ChunkedArray) -> pa.ChunkedArray:
-    """Each document's tokens as one binary value, to group equal documents.
-
-    Integer tokens are viewed as their bytes without copying the token
-    buffer; the words of a test tokenizer are joined.
-    """
-    chunks = []
-    for chunk in tokens.chunks:
-        values = chunk.values
-        if not pa.types.is_integer(values.type):
-            # a word holds no control character, so the join is exact
-            chunks.append(pc.binary_join(chunk, "\x00").cast(pa.large_binary()))
-            continue
-        width = values.type.byte_width
-        offsets = (chunk.offsets.to_numpy().astype(np.int64)
-                   + values.offset) * width
-        chunks.append(pa.Array.from_buffers(
-            pa.large_binary(), len(chunk),
-            [None, pa.py_buffer(offsets), values.buffers()[1]]))
-    return pa.chunked_array(chunks, pa.large_binary())
 
 
 class TokenStore(Sequence):
@@ -246,6 +220,7 @@ class TokenStore(Sequence):
             self._ends.append(total)
         self._lengths = TokenLengths(table.column(self._count_column), self)
         self._prefix_index = None
+        self._trees = {}
 
     def __reduce__(self):
         return TokenStore, (self._table,)
@@ -255,29 +230,33 @@ class TokenStore(Sequence):
         """Return the document length sequence."""
         return self._lengths
 
-    @property
-    def prefix_index(self) -> "PrefixIndex":
-        """Return the document order and common prefix lengths, computed once."""
+    def prefix_tree(self, page_tokens: int) -> "PrefixTree":
+        """Return the store's prefix tree at a page size.
+
+        The documents are sorted once; each page size's tree is built
+        once from that sort.
+        """
         if self._prefix_index is None:
-            self._prefix_index = PrefixIndex(self)
-        return self._prefix_index
+            self._prefix_index = _quail_native.PrefixIndex(
+                pa.table({"tokens": self.arrow_array}))
+        if page_tokens not in self._trees:
+            self._trees[page_tokens] = PrefixTree(
+                *self._prefix_index.tree(page_tokens))
+        return self._trees[page_tokens]
 
     def first_documents_with(self, columns) -> pa.Array:
         """Each document's first document with its tokens and its row values.
 
-        The documents are grouped by hashing their token bytes, like a
-        GROUP BY, so no prefix index is built.
-
         Args:
             columns: Arrow arrays, one value per document; two documents
-                share a first document only if they are equal in each.
+                share a first document only if they are equal in each,
+                with nulls equal, NaNs equal, and -0.0 equal to 0.0.
         """
-        if not len(self):
-            return pa.array([], pa.int32())
-        groups = group_ids([token_keys(self.arrow_array), *columns])
-        _, first, inverse = np.unique(groups, return_index=True,
-                                      return_inverse=True)
-        return pa.array(first[inverse], pa.int32())
+        values = (pa.table({str(index): equality_keys(column, nan_equal=True)
+                            for index, column in enumerate(columns)})
+                  if columns else None)
+        return _quail_native.first_documents(
+            pa.table({"tokens": self.arrow_array}), values)
 
     @property
     def arrow_array(self) -> pa.ChunkedArray:
@@ -376,32 +355,25 @@ def decode_payload_documents(documents):
             for alias, value in documents.items()}
 
 
-def longest_common_prefix(left, right) -> int:
-    """Return the length of the token prefix two sequences share."""
-    limit = min(len(left), len(right))
-    for index in range(limit):
-        if left[index] != right[index]:
-            return index
-    return limit
-
-
 def _token_array(document):
-    """A document's token ids as an int32 array, without a Python list."""
-    import numpy as np
-
+    """A document's integer token ids as an int32 array."""
     parts = getattr(document, "token_parts", (document,))
-    arrays = []
-    for part in parts:
-        if hasattr(part, "numpy"):
-            try:
-                arrays.append(np.asarray(part.numpy(), dtype=np.int32))
-                continue
-            except (TypeError, ValueError):
-                pass
-        arrays.append(np.asarray(list(part), dtype=np.int32))
+    arrays = [np.asarray(part.numpy() if hasattr(part, "numpy") else list(part),
+                         dtype=np.int32)
+              for part in parts]
     if not arrays:
         return np.empty(0, dtype=np.int32)
     return arrays[0] if len(arrays) == 1 else np.concatenate(arrays)
+
+
+def _token_lists(documents) -> pa.Table:
+    """Documents' integer token ids as a table of one int32 list column."""
+    arrays = [_token_array(documents[index]) for index in range(len(documents))]
+    offsets = np.zeros(len(arrays) + 1, dtype=np.int64)
+    np.cumsum([len(array) for array in arrays], out=offsets[1:])
+    values = np.concatenate(arrays) if arrays else np.empty(0, dtype=np.int32)
+    return pa.table({"tokens": pa.LargeListArray.from_arrays(
+        pa.array(offsets), pa.array(values))})
 
 
 class PrefixTree:
@@ -437,66 +409,18 @@ class PrefixTree:
         return sum(self.shared)
 
 
-class PrefixIndex:
-    """Sorted document positions and common prefixes shared by page-size trees."""
-
-    def __init__(self, documents):
-        n = len(documents)
-        try:
-            arrays = [_token_array(documents[i]) for i in range(n)]
-        except (TypeError, ValueError):
-            # Test tokenizers may return words instead of integer token IDs.
-            arrays = [tuple(documents[i]) for i in range(n)]
-            keys = arrays
-            common = longest_common_prefix
-        else:
-            # Big-endian bytes sort in token order for nonnegative token IDs.
-            keys = [a.astype(">i4").tobytes() for a in arrays]
-            common = _array_common_prefix
-        self.order = sorted(range(n), key=keys.__getitem__)
-        self.shared = np.zeros(n, dtype=np.int64)
-        # Every document computes its final token, including exact duplicates.
-        for previous, index in zip(self.order, self.order[1:]):
-            self.shared[index] = min(common(arrays[previous], arrays[index]),
-                                     max(len(arrays[index]) - 1, 0))
-        self._trees = {}
-
-    def tree(self, page_tokens: int) -> PrefixTree:
-        """Return borrowed parents and lengths rounded to a page size."""
-        if page_tokens not in self._trees:
-            shared = (self.shared // page_tokens * page_tokens).tolist()
-            parent = [None] * len(shared)
-            for previous, index in zip(self.order, self.order[1:]):
-                pages = shared[index]
-                if pages:
-                    owner = previous
-                    while parent[owner] is not None and shared[owner] >= pages:
-                        owner = parent[owner]
-                    parent[index] = owner
-            self._trees[page_tokens] = PrefixTree(self.order, parent, shared)
-        return self._trees[page_tokens]
-
-
-def _array_common_prefix(left, right) -> int:
-    """Find the first unequal token without materializing every mismatch index."""
-    limit = min(len(left), len(right))
-    if not limit:
-        return 0
-    differ = left[:limit] != right[:limit]
-    first = int(differ.argmax())
-    return first if differ[first] else limit
-
-
 def prefix_tree(documents, page_tokens: int) -> PrefixTree:
     """Build the prefix tree of a document set.
 
     Args:
-        documents: Token sequences, indexable by position.
+        documents: A TokenStore, or integer token sequences indexable by
+            position.
         page_tokens: Tokens per KV page; shares round down to it.
     """
-    index = (documents.prefix_index if isinstance(documents, TokenStore)
-             else PrefixIndex(documents))
-    return index.tree(page_tokens)
+    if isinstance(documents, TokenStore):
+        return documents.prefix_tree(page_tokens)
+    index = _quail_native.PrefixIndex(_token_lists(documents))
+    return PrefixTree(*index.tree(page_tokens))
 
 
 def model_answers(spec, tokenizer) -> tuple[set, set, tuple[int, ...]]:
