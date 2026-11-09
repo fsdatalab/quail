@@ -123,7 +123,8 @@ def test_a_field_of_an_extracted_struct_is_selected_beside_a_joined_column(
         session):
     query = session.sql(
         "SELECT x.id, x.stars, x.found.who AS who FROM (SELECT r.id, r.stars, "
-        "AI.EXTRACT(r.body, {'who': 'Who wrote it?'}) AS found FROM reviews r) x "
+        "AI.EXTRACT(r.body, STRUCT('Who wrote it?' AS who)) AS found "
+        "FROM reviews r) x "
         "ORDER BY x.id", dialect="bq")
     oracle = Oracle(answers=lambda spec, document: f"w{document}")
     rows = finish(query, oracle).to_rows()

@@ -324,6 +324,8 @@ pub(crate) struct Binder {
 pub(crate) struct Selected {
     pub(crate) columns: Vec<ValueExpression>,
     pub(crate) structs: Vec<ExtractStruct>,
+    /// The structs whose spans the SELECT list returns.
+    pub(crate) spans: Vec<String>,
     /// The output column names, in SELECT order.
     pub(crate) output: Vec<String>,
 }
@@ -1439,13 +1441,25 @@ impl Binder {
         let mut selected = Selected {
             columns: Vec::new(),
             structs: Vec::new(),
+            spans: Vec::new(),
             output: Vec::new(),
         };
+        let mut extracts: Vec<(&str, Expr)> = Vec::new();
+        let mut spans: Vec<(&str, Expr)> = Vec::new();
         for item in projection {
             let (node, alias) = unalias(item);
             let node = self.output_of(node).unwrap_or_else(|| node.clone());
             if is_call(&node, "ai_extract_span") {
+                let Some(alias) = alias else {
+                    return unsupported("AI.EXTRACT_SPAN without an AS name in SELECT");
+                };
+                spans.push((alias, node));
                 continue;
+            }
+            if is_call(&node, "ai_extract")
+                && let Some(alias) = alias
+            {
+                extracts.push((alias, node.clone()));
             }
             for column in self.bind_select_item(&node, alias, &mut selected.structs)? {
                 selected.output.push(column_name(&column, true));
@@ -1453,6 +1467,18 @@ impl Binder {
                     selected.columns.push(column);
                 }
             }
+        }
+        for (alias, span) in spans {
+            let paired = extracts
+                .iter()
+                .find(|(_, extract)| arguments(extract) == arguments(&span));
+            let Some((name, _)) = paired else {
+                return compile_error(format!(
+                    "AI.EXTRACT_SPAN(...) AS {alias} returns the answer positions of an \
+                     AI.EXTRACT in SELECT with the same arguments"
+                ));
+            };
+            selected.spans.push((*name).to_string());
         }
         let mut unique = selected.output.clone();
         unique.sort();

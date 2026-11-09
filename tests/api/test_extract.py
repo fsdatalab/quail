@@ -46,7 +46,9 @@ def test_score_and_extract_return_both_columns(session, monkeypatch, filtered):
         "March 3, 2027" if document == 0 else None))
     query = session.sql(
         "SELECT c.id, AI.SCORE(PROMPT('Is this a lease? {0}', c.text)) AS score, "
-        f"AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease FROM contracts c "
+        f"AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease, "
+        f"AI.EXTRACT_SPAN(c.text, {{'ends': '{QUESTION}'}}) AS lease_span "
+        "FROM contracts c "
         + ("WHERE AI.SCORE(PROMPT('Is this a lease? {0}', c.text)) > 0.15"
            if filtered else ""))
     result = finish(query, oracle)
@@ -202,9 +204,10 @@ def test_request_backend_runs_the_fields_of_a_document_together():
 def test_stock_vllm_plans_and_runs_an_extraction(monkeypatch):
     session = request_tests._session(
         "stock_vllm", contracts={"id": ["a", "b", "c", "d"], "text": TEXTS})
+    fields = f"c.text, {{'ends': '{QUESTION}', 'term': 'How long is the term?'}}"
     query = session.sql(
-        f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}', "
-        f"'term': 'How long is the term?'}}) AS lease FROM contracts c")
+        f"SELECT c.id, AI.EXTRACT({fields}) AS lease, "
+        f"AI.EXTRACT_SPAN({fields}) AS lease_span FROM contracts c")
     boot = {"client": _PhraseClient(), "sampling_params": object(),
             "capacity": request_tests.CAPACITY}
     monkeypatch.setattr(
@@ -245,7 +248,7 @@ def test_stock_vllm_extracts_every_row_a_top_k_reads(monkeypatch):
             boot, {"kind": "cold", "boot_s": 0.1}))
     # the region extracts every row; DataFusion sorts them and keeps two
     rows = request_tests._run_stock_vllm(session, query).collect()
-    assert rows.column_names == ["c.id", "lease", "lease_span"]
+    assert rows.column_names == ["c.id", "lease"]
     leases = dict(zip(rows.column("c.id").to_pylist(),
                       rows.column("lease").to_pylist(), strict=True))
     assert len(leases) == 4
@@ -254,8 +257,10 @@ def test_stock_vllm_extracts_every_row_a_top_k_reads(monkeypatch):
     session.close()
 
 
-STRUCT_SQL = ("SELECT c.id, AI.EXTRACT(c.text, {'ends': '" + QUESTION
-              + "', 'rent': 'What is the rent?'}) AS lease FROM contracts c")
+STRUCT_FIELDS = ("c.text, {'ends': '" + QUESTION
+                 + "', 'rent': 'What is the rent?'}")
+STRUCT_SQL = (f"SELECT c.id, AI.EXTRACT({STRUCT_FIELDS}) AS lease, "
+              f"AI.EXTRACT_SPAN({STRUCT_FIELDS}) AS lease_span FROM contracts c")
 
 
 def _struct_answers():
@@ -431,3 +436,10 @@ def test_an_extracted_tables_token_store_holds_each_tokens_characters(session):
     view = scan.tokens[0]
     assert view.character_offsets is not None
     assert len(view.character_offsets) == len(view)
+
+
+def test_a_span_column_reads_an_extraction_with_the_same_arguments(session):
+    with pytest.raises(CompileError, match="AI.EXTRACT_SPAN"):
+        session.sql("SELECT c.id, AI.EXTRACT(c.text, {'ends': 'When?'}) AS lease, "
+                    "AI.EXTRACT_SPAN(c.text, {'ends': 'Why?'}) AS lease_span "
+                    "FROM contracts c")

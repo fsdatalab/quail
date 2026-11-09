@@ -100,7 +100,7 @@ def query_sql(info: PlanInfo, selectivity=None) -> str:
     for item in info.sae_features:
         outputs[item.output] = (
             f"AI.SAE_FEATURES({prompt(item.prompt, item.relation)}, "
-            f"pooling => {sql_string(item.pooling)})")
+            f"{{'pooling': {sql_string(item.pooling)}}})")
     for item in info.maps:
         outputs[item.output] = (
             f"AI.MAP({document(item.relation)}, "

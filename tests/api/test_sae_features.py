@@ -30,7 +30,7 @@ def session():
 
 
 FEATURES = ("AI.SAE_FEATURES(PROMPT('{0}\\n\\nWhat is this review about?', "
-            "r.body), pooling => 'last')")
+            "r.body), {'pooling': 'last'})")
 
 
 def test_features_run_returns_the_lists_and_the_answer_table(session):
@@ -95,7 +95,7 @@ def test_datafusion_unnests_the_feature_lists_the_region_returns(session):
         {"r.id": 11, "f.feature": 2}, {"r.id": 11, "f.feature": 100}]
 @pytest.mark.parametrize("comparison, num_rows", [("IS NULL", 0), ("IS NOT NULL", 3)])
 def test_feature_list_null_tests_keep_empty_lists(session, comparison, num_rows):
-    features = "AI.SAE_FEATURES(PROMPT('Topic? {0}', r.body), pooling => 'last')"
+    features = "AI.SAE_FEATURES(PROMPT('Topic? {0}', r.body), {'pooling': 'last'})"
     query = session.sql(
         f"SELECT r.id, {features} AS features FROM reviews r "
         f"WHERE {features} {comparison}")
@@ -105,7 +105,7 @@ def test_feature_list_null_tests_keep_empty_lists(session, comparison, num_rows)
 
 @pytest.mark.parametrize("test", ["{} = 'x'", "LENGTH({}) > 0"])
 def test_feature_lists_must_be_unnested_before_testing_their_fields(session, test):
-    features = "AI.SAE_FEATURES(PROMPT('Topic? {0}', r.body), pooling => 'last')"
+    features = "AI.SAE_FEATURES(PROMPT('Topic? {0}', r.body), {'pooling': 'last'})"
     with pytest.raises(CompileError, match="UNNEST"):
         session.sql(
             f"SELECT r.id, {features} AS features FROM reviews r "

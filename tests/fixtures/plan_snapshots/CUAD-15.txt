@@ -5,8 +5,8 @@ SortExec: TopK(fetch=20), expr=[id@0 ASC NULLS LAST], preserve_partitioning=[fal
 
 model region:
 logical:
-  Projection: c.id, contract, contract_span
-    AiNode: contract = ai_extract(c.text, named_struct(Utf8("expiration_date"), Utf8("On what date will the contract's initial term expire?")))
+  Projection: c.id, contract
+    AiNode: contract = ai_extract(c.text, named_struct(Utf8("expiration_date"), Utf8("On what date will the contract's initial term expire?"))), returns: [contract]
       AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("{0}\n\nCan a party terminate this  contract without cause (solely by giving a notice and allowing a waiting  period to expire)?"), c.text), named_struct(Utf8("selectivity"), Float64(0.3273942093541203))), filter: __quail_answer_1, returns: []
         SubqueryAlias: c
           TableScan: contracts projection=[id, text]

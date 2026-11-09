@@ -1,6 +1,6 @@
 logical:
-  Projection: c.id, contract, contract_span
-    AiNode: contract = ai_extract(c.text, named_struct(Utf8("agreement_date"), Utf8("The date of the contract")))
+  Projection: c.id, contract
+    AiNode: contract = ai_extract(c.text, named_struct(Utf8("agreement_date"), Utf8("The date of the contract"))), returns: [contract]
       SubqueryAlias: c
         TableScan: contracts projection=[id, text]
 

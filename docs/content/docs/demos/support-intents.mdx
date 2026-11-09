@@ -66,7 +66,7 @@ with quail.Session(config) as session:
         FROM conversations t,
              UNNEST(AI.SAE_FEATURES(
                  PROMPT('{0}\n\nWhat is the customer asking for?', t.request),
-                 pooling => 'last')) AS intent
+                 {'pooling': 'last'})) AS intent
     """).collect()
 ```
 

@@ -203,7 +203,7 @@ def _join_sequence(catalog, sels=(0.1, 0.1), anchors=(None, None)):
 
 def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
     operators = compile_sql("""
-        SELECT r.id FROM reviews r JOIN products p JOIN threads t
+        SELECT r.id FROM reviews r CROSS JOIN products p JOIN threads t
         ON AI_FILTER(PROMPT('m {0} {1} {2}', r.review, p.description, t.thread),
                      {'selectivity': 0.02})
     """, catalog)

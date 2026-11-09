@@ -175,7 +175,8 @@ def test_an_extraction_under_a_select_list_returns_only_the_columns_it_reads():
 def test_an_extraction_the_query_returns_keeps_its_spans():
     session = _extract_session(LOGICAL_RULES)
     query = session.sql(
-        "SELECT r.id, AI_EXTRACT(r.body, {'w': 'which?'}) AS e FROM reviews r")
+        "SELECT r.id, AI_EXTRACT(r.body, {'w': 'which?'}) AS e, "
+        "AI_EXTRACT_SPAN(r.body, {'w': 'which?'}) AS e_span FROM reviews r")
     assert "returns:" not in query.logical
     rows = finish(query, Oracle(answers=lambda spec, document: "ab")).collect()
     assert "e_span" in rows.column_names

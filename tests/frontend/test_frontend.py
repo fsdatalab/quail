@@ -44,7 +44,7 @@ THREE_WAY_TEMPLATE = ("Review {0} praises the thread in {1} and the "
 THREE_WAY_ON = """
     SELECT a.id, b.id, p.asin
     FROM reviews a
-    JOIN threads b
+    CROSS JOIN threads b
     JOIN products p
       ON AI_FILTER(PROMPT('%s', a.review, b.thread, p.description),
                    {'selectivity': 0.02, 'anchor': 'b'})

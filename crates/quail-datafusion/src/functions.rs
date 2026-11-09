@@ -18,8 +18,8 @@ use datafusion::logical_expr::{
 ///
 /// SQL may also write `AI.IF` for `ai_filter`, and `AI.<name>` or
 /// `ai.<name>` for every other `ai_<name>`; see [`ai_function_name`].
-/// `ai_extract_span` is the answer positions of an `ai_extract`; see
-/// [`crate::add_extract_spans`].
+/// `ai_extract_span` is the answer positions of an `ai_extract` with the
+/// same arguments, which the same model run answers.
 pub const AI_FUNCTION_NAMES: [&str; 7] = [
     "ai_filter",
     "ai_score",
@@ -249,75 +249,5 @@ pub(crate) fn column_call_kind(expr: &Expr) -> Option<&'static str> {
         "ai_map" => Some("map"),
         "ai_sae_features" => Some("features"),
         _ => None,
-    }
-}
-
-/// Write each `{'key': value, ...}` literal outside quotes as
-/// `named_struct('key', value, ...)`.
-///
-/// DataFusion reads the brace literal in the Snowflake dialect only;
-/// the front end also takes it in BigQuery SQL, as the questions of an
-/// `AI.EXTRACT`.
-pub fn brace_structs(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len());
-    // per open brace, the parentheses opened inside it
-    let mut braces: Vec<usize> = Vec::new();
-    let mut quote: Option<char> = None;
-    let mut chars = sql.chars().peekable();
-    while let Some(c) = chars.next() {
-        if let Some(open) = quote {
-            out.push(c);
-            if c == open {
-                if chars.peek() == Some(&open) {
-                    out.push(chars.next().expect("a doubled quote"));
-                } else {
-                    quote = None;
-                }
-            }
-            continue;
-        }
-        match c {
-            '\'' | '"' | '`' => {
-                quote = Some(c);
-                out.push(c);
-            }
-            '{' => {
-                braces.push(0);
-                out.push_str("named_struct(");
-            }
-            '}' if !braces.is_empty() => {
-                braces.pop();
-                out.push(')');
-            }
-            '(' => {
-                if let Some(depth) = braces.last_mut() {
-                    *depth += 1;
-                }
-                out.push(c);
-            }
-            ')' => {
-                if let Some(depth) = braces.last_mut() {
-                    *depth = depth.saturating_sub(1);
-                }
-                out.push(c);
-            }
-            ':' if braces.last() == Some(&0) => out.push(','),
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-#[cfg(test)]
-mod brace_tests {
-    use super::brace_structs;
-
-    #[test]
-    fn a_brace_literal_becomes_a_named_struct_outside_quotes() {
-        assert_eq!(
-            brace_structs("AI.EXTRACT(c.text, {'terms': 'Why: {0}?', 'n': f(a, b)})"),
-            "AI.EXTRACT(c.text, named_struct('terms', 'Why: {0}?', 'n', f(a, b)))"
-        );
-        assert_eq!(brace_structs("SELECT 'it''s {x}'"), "SELECT 'it''s {x}'");
     }
 }

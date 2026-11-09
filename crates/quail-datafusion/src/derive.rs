@@ -203,7 +203,10 @@ fn derive_operators(
     let mut binder = Binder::new(turn, layout, &select);
     let relation = Relation::bind(&walk, &mut binder, &answers)?;
     let Selected {
-        columns, structs, ..
+        columns,
+        structs,
+        spans,
+        ..
     } = binder.bind_select(&select)?;
     binder.validate_query(&columns, &structs)?;
     let unplaced_term = relation.unplaced;
@@ -228,6 +231,7 @@ fn derive_operators(
     found.projection = Projection {
         columns: columns.iter().cloned().map(Projected::Expression).collect(),
         structs,
+        spans,
     };
     found.projections = found
         .projection

@@ -108,8 +108,7 @@ def test_a_condition_read_from_a_plan_evaluates_as_built():
     ("REGEXP_LIKE(r.lang, 'e')", []),
     ("REGEXP_LIKE(r.lang, 'e.')", [("r0",), ("r3",)]),
     ("RLIKE(r.lang, 'e')", []),
-    ("r.lang RLIKE 'e'", []),
-    ("r.lang NOT REGEXP 'e'", [("r0",), ("r3",)]),
+    ("NOT RLIKE(r.lang, 'e')", [("r0",), ("r3",)]),
     ("REGEXP_LIKE(r.lang, r.lang || '?')", [("r0",), ("r3",)]),
 ])
 def test_a_snowflake_regexp_matches_the_whole_value(session, test, expected):

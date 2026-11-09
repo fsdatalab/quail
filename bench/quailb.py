@@ -29,7 +29,6 @@ import quail_b as benchmark
 from bench import substrait
 from bench.results import write_json
 from quail.api.prompts import bind_classify_prompt, bind_extract_prompt
-from quail.common.expressions import SPAN_SUFFIX
 from quail.execution.result import answer_values
 from quail.physical import (
     AiClassify,
@@ -247,15 +246,11 @@ def run_output(result, info: PlanInfo, tables) -> RunOutput:
         "extracts", info.extracts, "answer", pa.string(),
         name_of=lambda operator: _extract_name(info, operator))
     # quail-b checks that a plan selects ids, labels, scores, answer
-    # structs, and measures; an answer struct brings its span struct,
-    # which the benchmark does not take
+    # structs, and measures
     names = list(info.columns)
     started = time.perf_counter()
     table = result.collect()
     collection_s = time.perf_counter() - started
-    spans = [f"{struct.name}{SPAN_SUFFIX}" for struct in info.structs]
-    table = table.drop_columns([name for name in table.column_names
-                              if name in spans])
     return RunOutput(
         filter_answers, join_answers, table.rename_columns(names),
         result.report["wall_s"], dict(result.report, collection_s=collection_s),

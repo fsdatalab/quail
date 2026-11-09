@@ -32,7 +32,6 @@ mod guards;
 mod hints;
 mod identified;
 mod join_back;
-mod joins;
 mod keyed;
 mod lift;
 mod limit;
@@ -60,9 +59,7 @@ use datafusion::execution::context::{SessionConfig, SessionContext, SessionState
 use datafusion::sql::parser::Statement;
 
 pub use absorb::AbsorbIntoAiNodes;
-pub use aliases::{
-    SPAN_SUFFIX, add_extract_spans, distinct_order_ordinals, positional_ai_arguments,
-};
+pub use aliases::{SPAN_SUFFIX, distinct_order_ordinals};
 pub use claim::ClaimModelRegions;
 pub use distinct::{EliminateDistinct, PushDownDistinct};
 pub use exec::{
@@ -71,7 +68,7 @@ pub use exec::{
 };
 pub use extension::QuailExtension;
 pub use field_access::StructFieldAccess;
-pub use functions::{AI_FUNCTION_NAMES, brace_structs, is_ai_call, quail_functions};
+pub use functions::{AI_FUNCTION_NAMES, is_ai_call, quail_functions};
 pub use guards::PushDownCaseGuards;
 pub use identified::IdentifiedTable;
 pub use keyed::{PushDownCountThreshold, PushDownSemiJoinFetch};
@@ -80,6 +77,7 @@ pub use lower::{LowerAiCalls, lower_ai_calls};
 pub use or_guards::PushDownOrGuards;
 pub use placement::PlaceAiNodes;
 pub use projection::PushDownProjectionIntoAiNodes;
+pub use regexps::SnowflakeRegexpLike;
 pub use region::ModelRegion;
 pub use region_hint::{RegionColumn, RegionColumns, RegionHint};
 pub use repeated::MergeRepeatedAiCalls;
@@ -147,10 +145,11 @@ pub fn session_context_with_rules(
 
 /// Plan a SQL query that may call AI functions as `AI.<name>(...)`.
 ///
-/// The query is parsed in the session's SQL dialect. Before DataFusion
-/// binds it, each regular expression test matches as the dialect says
-/// (see [`regexps`]), and each extraction gets its answer positions column (see
-/// [`add_extract_spans`]).
+/// The query is parsed in the session's SQL dialect. `SessionContext::sql`
+/// plans the same SQL, except two shapes this function rewrites before
+/// DataFusion binds the query: an `UNNEST` in `FROM` of a list a model
+/// call returns ([`take_unnests`]), and an `ORDER BY` of a `SELECT
+/// DISTINCT` that repeats a struct field ([`distinct_order_ordinals`]).
 pub async fn sql(context: &SessionContext, query: &str) -> Result<DataFrame> {
     sql_in_dialect(context, query, None).await
 }
@@ -175,21 +174,11 @@ pub async fn sql_in_dialect(
             .sql_parser
             .default_null_ordering = "nulls_min".to_string();
     }
-    let mut text = query.to_string();
-    if matches!(dialect, datafusion::config::Dialect::BigQuery) {
-        text = brace_structs(&text);
-    }
-    let mut statement = state.sql_to_statement(&text, &dialect)?;
+    // the analyzer reads the dialect, such as for Snowflake's REGEXP_LIKE
+    state.config_mut().options_mut().sql_parser.dialect = dialect;
+    let mut statement = state.sql_to_statement(query, &dialect)?;
     if let Statement::Statement(inner) = &mut statement {
-        match dialect {
-            datafusion::config::Dialect::Snowflake => regexps::anchor_snowflake_regexps(inner),
-            datafusion::config::Dialect::BigQuery => regexps::bigquery_regexp_contains(inner),
-            _ => {}
-        }
-        joins::flatten_joins(inner);
         take_unnests(inner);
-        positional_ai_arguments(inner);
-        add_extract_spans(inner);
         distinct_order_ordinals(inner);
     }
     let plan = state.statement_to_plan(statement).await?;

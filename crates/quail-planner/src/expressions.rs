@@ -341,12 +341,20 @@ pub fn asked_call(asked: &Asked) -> &ModelCall {
     }
 }
 
-/// Every struct column of a SELECT list and its member columns, answers
-/// and spans.
-pub fn packing(structs: &[ExtractStruct]) -> Vec<(String, Vec<(String, String)>)> {
+/// Every struct column of a SELECT list and its member columns: the
+/// answers, and the spans of each struct named in `spans`.
+pub fn packing(
+    structs: &[ExtractStruct],
+    spans: &[String],
+) -> Vec<(String, Vec<(String, String)>)> {
     let mut found = Vec::new();
     for found_struct in structs {
-        for suffix in ["", SPAN_SUFFIX] {
+        let suffixes: &[&str] = if spans.contains(&found_struct.name) {
+            &["", SPAN_SUFFIX]
+        } else {
+            &[""]
+        };
+        for suffix in suffixes {
             found.push((
                 format!("{}{suffix}", found_struct.name),
                 found_struct

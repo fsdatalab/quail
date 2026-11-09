@@ -60,7 +60,7 @@ NODE_CASES = {
                     "WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) LIMIT 2"),
     "quail.ai_sae_features": ("qwen3.5-2b-sae-bf16", 1,
                      "SELECT r.id, f.feature FROM reviews r, UNNEST(AI.SAE_FEATURES("
-                     "PROMPT('{0} What is this about?', r.body), pooling => 'last')) "
+                     "PROMPT('{0} What is this about?', r.body), {'pooling': 'last'})) "
                      "AS f"),
 }
 

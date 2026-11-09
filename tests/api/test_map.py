@@ -142,7 +142,7 @@ def test_a_map_only_used_by_a_test_is_computed_once(session):
     ("label", "AI.CLASSIFY(PROMPT('Topic? {0}', r.body), ARRAY['a', 'b'])", ""),
     ("extract", "AI.EXTRACT(r.body, {'topic': 'Topic?'})", "['topic']"),
     ("map", "AI.MAP(r.body, 'Topic?', 16)", ""),
-    ("features", "AI.SAE_FEATURES(PROMPT('Topic? {0}', r.body), pooling => 'last')",
+    ("features", "AI.SAE_FEATURES(PROMPT('Topic? {0}', r.body), {'pooling': 'last'})",
      ""),
 ])
 def test_every_column_operator_supports_a_plain_result_test(session, kind, call,

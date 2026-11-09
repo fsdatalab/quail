@@ -146,7 +146,8 @@ def test_session_sql_runs_a_query_that_needs_sql_around_its_model_region(context
 
 def test_an_extraction_returns_and_filters_on_its_answer_positions(context):
     fields = "c.text, {'end': 'q6: When does it end?'}"
-    text = (f"SELECT c.id, AI.EXTRACT({fields}) AS lease FROM contracts c "
+    text = (f"SELECT c.id, AI.EXTRACT({fields}) AS lease, "
+            f"AI.EXTRACT_SPAN({fields}) AS lease_span FROM contracts c "
             f"WHERE AI.EXTRACT_SPAN({fields})['end']['start'] < 15")
     expected = finish(context.session.sql(text), ORACLE).collect()
     table = context.sql(text)

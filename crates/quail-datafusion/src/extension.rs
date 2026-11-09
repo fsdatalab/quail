@@ -26,7 +26,7 @@ use datafusion::physical_planner::ExtensionPlanner;
 use crate::exec::{ModelRegionPlanner, QuailQueryPlanner, RegionRunner};
 use crate::functions::quail_functions;
 use crate::rules::{logical_rules, with_quail_rules};
-use crate::{LowerAiCalls, StructFieldAccess};
+use crate::{LowerAiCalls, SnowflakeRegexpLike, StructFieldAccess};
 
 /// Quail's additions to a DataFusion session: the AI functions, the
 /// planner of `value['field']` on a struct in Snowflake SQL, the rules
@@ -106,7 +106,9 @@ impl QuailExtension {
         for function in quail_functions() {
             state.register_udf(function)?;
         }
+        state.register_udf(crate::regexps::regexp_functions())?;
         state.register_expr_planner(Arc::new(StructFieldAccess))?;
+        state.register_function_rewrite(Arc::new(SnowflakeRegexpLike))?;
         Ok(state)
     }
 
