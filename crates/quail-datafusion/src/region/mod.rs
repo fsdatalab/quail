@@ -35,6 +35,9 @@ use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore};
 /// the node is planned physically.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd)]
 pub struct ModelRegion {
+    /// Query-local identity assigned in logical traversal order after claiming.
+    /// Preserved through physical planning, independent of execution order.
+    pub id: Option<usize>,
     /// The claimed operators after DataFusion's optimizer, with the AI
     /// calls as `AiNode`s, from the region's root down to its scans.
     pub plan: LogicalPlan,
@@ -51,6 +54,7 @@ impl ModelRegion {
     /// Create a model region over the given operators.
     pub fn new(plan: LogicalPlan) -> Self {
         Self {
+            id: None,
             plan,
             inputs: Vec::new(),
             input_names: Vec::new(),

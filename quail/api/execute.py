@@ -132,15 +132,22 @@ def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
     carries that region's plan, metrics, and answers, and, when the region
     is the whole query, the region's own rows, which keep Quail's added
     columns such as a label's probabilities. A query of several model
-    regions reports each region's report under ``regions``.
+    regions retains each executed result in ``region_results``, keyed by its
+    query-local logical ID, and reports each report under ``regions``.
     """
     from quail.api.context import SessionContext
 
     whole = query.bound_whole()
+    if plan is not None and query.num_regions != 1:
+        raise ValueError("an edited plan requires exactly one model region; "
+                         f"the query has {query.num_regions}")
     results, region_tables, region_s = [], [], []
+    region_results = {}
     started = time.perf_counter()
 
     def run_query(region, on_rows=None, hint=None):
+        if region.region_id is None or region.region_id in region_results:
+            raise RuntimeError("model region has a missing or duplicate logical ID")
         if plan is not None and results:
             raise RuntimeError("an edited plan is for a query of one model region")
         region_started = time.perf_counter()
@@ -148,6 +155,7 @@ def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
                                  on_backend_ready, on_execution_ready, on_rows, hint)
         region_s.append(time.perf_counter() - region_started)
         results.append(result)
+        region_results[region.region_id] = result
         table = result.collect()
         region_tables.append(table)
         return table
@@ -155,8 +163,11 @@ def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
     context = SessionContext(query.session, order=query.order, run_query=run_query)
     table = context.sql(query.text, query.dialect)
     if len(results) != 1:
-        return QueryResult.from_table(table, report={
-            "regions": [result.report for result in results]} if results else None)
+        result = QueryResult.from_table(table, report={
+            "regions": [region_results[key].report for key in sorted(region_results)]
+        } if results else None)
+        result.region_results = region_results
+        return result
     (region,) = results
     # the time outside the region: building the context, planning the
     # SQL, gathering the region's rows, and the operators around it
@@ -165,6 +176,9 @@ def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
     result = QueryResult.from_table(region_tables[0] if whole else table,
                                     report=region.report)
     result.plan = region.plan
+    result.physical_plan = region.physical_plan
+    result.region_id = region.region_id
+    result.region_results = region_results
     result.node_metrics = region.node_metrics
     result.answer_tables = region.answer_tables
     result.survivor_indices = region.survivor_indices

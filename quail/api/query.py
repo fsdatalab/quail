@@ -212,7 +212,8 @@ class Query:
             for payload, planned in found:
                 found = json.loads(payload)
                 region = region_query(self.session, found["operators"],
-                                      logical=found["logical"], order=self.order)
+                                      logical=found["logical"], order=self.order,
+                                      region_id=found["region_id"])
                 if planned is not None:
                     text, scans = planned
                     region.adopt_plan(json.loads(text), scans)
@@ -247,14 +248,26 @@ class Query:
             verbose: Include runtime settings and internal node fields.
             analyze: Run the query first, like EXPLAIN ANALYZE, and show
                 each node's measured rows, time, and tokens beside the
-                planner's estimates.
+                planner's estimates. Regions SQL did not read are labeled
+                not executed and show estimates only.
         """
         regions = self.regions()
         result = self.run() if analyze else None
-        if result is not None and len(regions) == 1:
-            texts = [regions[0]._explain(result, verbose)]
-        else:
-            texts = [region._explain(None, verbose) for region in regions]
+        if result is not None:
+            unexpected = (set(result.region_results)
+                          - {region.region_id for region in regions})
+            if unexpected:
+                raise RuntimeError(
+                    f"executed model regions do not match the query: {unexpected}")
+        texts = []
+        for region in regions:
+            executed = (result.region_results.get(region.region_id)
+                        if result is not None else None)
+            text = region._explain(executed, verbose)
+            if result is not None and executed is None:
+                # LIMIT and other SQL operators need not read every model region.
+                text = "not executed (estimated plan):\n" + text
+            texts.append(text)
         if len(regions) == 1 and self._whole and not regions[0].has_inputs():
             return texts[0]
         around = (result.datafusion_plan if result is not None
@@ -300,8 +313,10 @@ class RegionQuery:
     """One model region of a query: its plan, and its run in this process."""
 
     def __init__(self, session: "Session", operators: str,
-                 order: str | None = None, *, logical: str = "", catalog=None):
+                 order: str | None = None, *, logical: str = "", catalog=None,
+                 region_id: int | None = None):
         self.session = session
+        self.region_id = region_id
         self.catalog = session.catalog if catalog is None else catalog
         # the region's operators, as Rust's JSON: as derived, then as the
         # planner chose them
@@ -409,10 +424,11 @@ class RegionQuery:
             result: The QueryResult of running the plan, or None.
             verbose: Include runtime settings and internal node fields.
         """
-        # plan() first: it replaces self.operators with the chosen ones
-        physical = self.plan()
+        # A downstream region may have been inspected with empty placeholder
+        # inputs. ANALYZE must use the plan chosen for its actual input rows.
+        physical = (result.physical_plan if result is not None
+                    and result.physical_plan is not None else self.plan())
         if result is not None:
-            physical = self._plan
             # the root relation is lazy, so its row count is taken here
             rows = (result.region_rows if result.region_rows is not None
                     else result.count())
@@ -423,8 +439,9 @@ class RegionQuery:
             result.report.setdefault("node_metrics", {}).setdefault(
                 root, {})["output_rows"] = rows
         registry = self.session.registry
-        text = explain(self.logical, self.operators, physical, verbose=verbose,
-                       result=result,
+        operators = physical.operators if not isinstance(physical, Refusal) else None
+        text = explain(self.logical, operators or self.operators, physical,
+                       verbose=verbose, result=result,
                        rules=tuple(registry.rules.values()),
                        usd_per_hour=(
                            self.session.device.usd_per_hour or None))
@@ -543,6 +560,9 @@ class RegionQuery:
         rows = finished.rows()
         result = QueryResult.from_table(rows, report=report)
         result.plan = plan.graph
+        result.physical_plan = plan
+        result.region_id = self.region_id
+        report["region_id"] = self.region_id
         measured = dict(out.get("node_metrics", {}))
         for node in plan.nodes:
             if isinstance(node, Limit):

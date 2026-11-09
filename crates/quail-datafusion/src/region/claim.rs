@@ -1,6 +1,7 @@
 //! Claim optimized model regions and choose their boundaries.
 //! Leave unsupported operators and relational result work in DataFusion.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::common::config::ConfigOptions;
@@ -62,7 +63,7 @@ impl OptimizerRule for ClaimModelRegions {
     ) -> Result<Transformed<LogicalPlan>> {
         if !calls_ai(&plan)? {
             // Fallback columns may already be sealed by the analyzer.
-            let cleaned = drop_unread_probabilities(plan.clone())?;
+            let cleaned = number_regions(drop_unread_probabilities(plan.clone())?)?;
             return Ok(if cleaned == plan {
                 Transformed::no(plan)
             } else {
@@ -72,8 +73,45 @@ impl OptimizerRule for ClaimModelRegions {
         let optimized =
             Optimizer::with_rules(self.rules.clone()).optimize(plan, config, |_, _| {})?;
         let claimed = claim_regions(optimized, None)?;
-        drop_unread_probabilities(claimed).map(Transformed::yes)
+        number_regions(drop_unread_probabilities(claimed)?).map(Transformed::yes)
     }
+}
+
+/// Number occurrences, not plan contents: identical sibling regions still run
+/// separately. Repeated readers of a SharedInput keep the same numbered subtree.
+/// Numbering is query-local, so inspection and execution agree even though
+/// SharedInput's process-global keys differ between compilations.
+fn number_regions(plan: LogicalPlan) -> Result<LogicalPlan> {
+    fn visit(
+        plan: LogicalPlan,
+        next: &mut usize,
+        shared: &mut HashMap<u64, LogicalPlan>,
+    ) -> Result<LogicalPlan> {
+        plan.transform_down_with_subqueries(|node| {
+            if let Some(input) = as_node::<SharedInput>(&node) {
+                let numbered = if let Some(known) = shared.get(&input.key) {
+                    known.clone()
+                } else {
+                    let mut input = input.clone();
+                    input.input = visit(input.input, next, shared)?;
+                    let key = input.key;
+                    let numbered = extension_node(input);
+                    shared.insert(key, numbered.clone());
+                    numbered
+                };
+                return Ok(Transformed::new(numbered, true, TreeNodeRecursion::Jump));
+            }
+            if let Some(region) = as_node::<ModelRegion>(&node) {
+                let mut region = region.clone();
+                region.id = Some(*next);
+                *next += 1;
+                return Ok(Transformed::yes(extension_node(region)));
+            }
+            Ok(Transformed::no(node))
+        })
+        .map(|done| done.data)
+    }
+    visit(plan, &mut 0, &mut HashMap::new())
 }
 
 /// `plan` with each classification that asks for its labels'

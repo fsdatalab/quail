@@ -441,6 +441,27 @@ fn value_columns(names: &[String], rows: &TableRows) -> Result<crate::stages::Ta
     Ok((schema, batches))
 }
 
+/// The document and value columns each provider must materialize, including
+/// columns read only by a different placement alternative.
+pub(crate) fn required_columns(operators: &Operators) -> HashMap<String, Vec<String>> {
+    let alternatives = placements(operators);
+    let scans = scans_of(
+        alternatives
+            .iter()
+            .map(|alternative| &alternative.operators),
+    );
+    let mut required: HashMap<String, Vec<String>> = HashMap::new();
+    for scan in scans {
+        let names = required.entry(scan.provider).or_default();
+        for name in scan.columns.into_iter().chain(source_column(&scan.column)) {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    required
+}
+
 /// Each alias's scan, with the value columns any alternative reads.
 fn scans_of<'a>(alternatives: impl Iterator<Item = &'a Operators>) -> Vec<Scan> {
     let mut found: Vec<Scan> = Vec::new();

@@ -115,7 +115,8 @@ class Engine:
             raise RefusalError(refusal_from_fields(found["refusal"]))
         query = region_query(self.session, found["operators"],
                              logical=found.get("logical", ""), order=self._order,
-                             tables=tables, keep_order=True)
+                             tables=tables, keep_order=True,
+                             region_id=found.get("region_id"))
         query.adopt_plan(found, scans)
         return self._run(query, on_rows, hint)
 
@@ -146,7 +147,8 @@ class Engine:
         if fetch is not None:
             operators = _quail_native.limited_operators(operators, fetch)
         query = region_query(self.session, operators, logical=found["logical"],
-                             order=self._order, tables=tables)
+                             order=self._order, tables=tables,
+                             region_id=found.get("region_id"))
         return self._run(query)
 
     def close(self) -> None:

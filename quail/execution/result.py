@@ -288,7 +288,13 @@ def iter_rows(table: pa.Table):
 
 
 class QueryResult:
-    """A query's rows as one Arrow table, with the run's plan, report, and answers."""
+    """A query's rows as one Arrow table, with its plan, report, and answers.
+
+    ``region_results`` maps query-local logical occurrence IDs to the model
+    regions that actually executed, including their rows and measurements.
+    Each region retains its full ``physical_plan`` as well as ``plan`` (the
+    executed graph). SQL can skip regions, for example under a LIMIT.
+    """
 
     def __init__(self, table: pa.Table, report: dict | None = None):
         self.columns = list(table.column_names)
@@ -305,6 +311,11 @@ class QueryResult:
         # DataFusion's plan around the model region, when it ran one
         self.datafusion_plan: str | None = None
         self.region_rows: int | None = None
+        # Full executed plan (including estimates), alongside .plan's graph.
+        self.physical_plan = None
+        self.region_id: int | None = None
+        # Query-local logical occurrence IDs, never completion-order indices.
+        self.region_results: dict[int, QueryResult] = {}
 
     @classmethod
     def from_table(cls, table: pa.Table,
@@ -369,6 +380,10 @@ class QueryResult:
         from quail.explain import physical_tree
 
         if self.plan is None:
+            if self.region_results:
+                return "\n\n".join(
+                    f"model region {key + 1}:\n{region.explain(verbose=verbose)}"
+                    for key, region in sorted(self.region_results.items()))
             return "no physical plan was executed"
         tree = physical_tree(self.plan, verbose=verbose,
                              node_metrics=self.node_metrics, report=self.report)

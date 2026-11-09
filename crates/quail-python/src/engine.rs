@@ -338,8 +338,7 @@ impl Executor {
     /// beside what its scans read.
     fn plan_here(
         &self,
-        region: &ModelRegion,
-        inputs: &[InputRows],
+        tables: &HashMap<String, TableRows>,
         derived: &(Operators, LogicalPlan),
         fetch: Option<usize>,
     ) -> Result<Option<PlannedRegion>> {
@@ -364,22 +363,11 @@ impl Executor {
         }
         // planning reads, and tokenizes, each input's documents first
         let started = std::time::Instant::now();
-        let mut tables = named_tables(region)?;
-        for ((name, batches), input) in inputs.iter().zip(&region.inputs) {
-            tables.insert(
-                name.clone(),
-                TableRows {
-                    identity: whole_table_identity(input),
-                    schema: Arc::new(input.schema().as_arrow().clone()),
-                    batches: batches.clone(),
-                },
-            );
-        }
         let compile = |error: quail_planner::error::CompileError| {
             DataFusionError::Plan(format!("CompileError: {}", error.message()))
         };
         let (outcome, scans) = planner
-            .plan(&operators, &tables, settings)
+            .plan(&operators, tables, settings)
             .map_err(compile)?;
         let mut planned = outcome_json(&outcome).map_err(compile)?;
         planned["logical"] = logical.into();
@@ -403,8 +391,16 @@ impl Executor {
             .zip(&region.inputs)
             .map(|((name, batches), input)| Ok((name.clone(), in_source_order(input, batches)?)))
             .collect::<Result<Vec<InputRows>>>()?;
-        let planned = self.plan_here(region, &sorted, &derived, None)?;
-        Ok((region_json(&derived.0, &derived.1)?, planned))
+        let planned = if self.planning.is_some() {
+            let tables = planning_tables(region, &sorted, &derived.0)?;
+            self.plan_here(&tables, &derived, None)?
+        } else {
+            None
+        };
+        Ok((
+            with_region_id(region_json(&derived.0, &derived.1)?, region.id)?,
+            planned,
+        ))
     }
 
     /// Run a call's region on this thread and send its rows, then the end.
@@ -449,11 +445,9 @@ impl Executor {
                     Ok((name.clone(), in_source_order(input, batches)?))
                 })
                 .collect::<Result<Vec<InputRows>>>()?;
-            held = input_hint(region, &derived.0, fetch, hint, &mut sorted)?;
-            (
-                self.plan_here(region, &sorted, &derived, fetch)?,
-                sorted.as_slice(),
-            )
+            let mut tables = planning_tables(region, &sorted, &derived.0)?;
+            held = input_hint(region, &derived.0, fetch, hint, &mut sorted, &mut tables)?;
+            (self.plan_here(&tables, &derived, fetch)?, sorted.as_slice())
         } else {
             (None, inputs.as_slice())
         };
@@ -464,9 +458,18 @@ impl Executor {
             names: names.clone(),
             schema: Arc::clone(schema.inner()),
         };
+        // Carry the logical occurrence's identity, not callback completion order.
+        let planned = planned
+            .map(|(payload, scans)| {
+                Ok::<_, DataFusionError>((with_region_id(payload, region.id)?, scans))
+            })
+            .transpose()?;
         // Python reads a region it plans as JSON
         let payload = match &planned {
-            None => Some(region_json(&derived.0, &derived.1)?),
+            None => Some(with_region_id(
+                region_json(&derived.0, &derived.1)?,
+                region.id,
+            )?),
             Some(_) => None,
         };
         let reader = Python::attach(|py| {
@@ -578,6 +581,7 @@ fn input_hint(
     fetch: Option<usize>,
     hint: &RegionHint,
     inputs: &mut [InputRows],
+    tables: &mut HashMap<String, TableRows>,
 ) -> Result<Option<InputHint>> {
     if hint.is_empty()
         || fetch.is_some()
@@ -586,7 +590,22 @@ fn input_hint(
     {
         return Ok(None);
     }
-    let columns = RegionColumns::of(region);
+    let mut columns = RegionColumns::of(region);
+    // Named tables are projected before materialization. Hint source positions
+    // refer to their registered schemas, so translate them to these batches.
+    for (name, provider) in identified_scans(region)? {
+        if let Some(rows) = tables.get(&name) {
+            for column in &mut columns.0 {
+                if let quail_datafusion::RegionColumn::Source(table, index) = column
+                    && *table == name
+                {
+                    *index = rows
+                        .schema
+                        .index_of(provider.schema().field(*index).name())?;
+                }
+            }
+        }
+    }
     let mut rows = HashMap::new();
     for table in hint.tables(&columns) {
         let found = match inputs.iter().position(|(name, _)| *name == table) {
@@ -596,9 +615,18 @@ fn input_hint(
                 let keep = BooleanArray::from(hint.keep(&columns, &table, &all)?);
                 let kept = filter_record_batch(&all, &keep)?;
                 inputs[input].1 = vec![kept.clone()];
+                if let Some(rows) = tables.get_mut(&table) {
+                    // The logical input still describes the whole table. Do
+                    // not reuse or populate its cache after a runtime hint.
+                    rows.identity = None;
+                    rows.batches = vec![kept.clone()];
+                }
                 Some(kept)
             }
-            None => named_rows(region, &table)?,
+            None => tables
+                .get(&table)
+                .map(|rows| concat_batches(&rows.schema, &rows.batches))
+                .transpose()?,
         };
         if let Some(found) = found {
             rows.insert(table, found);
@@ -622,21 +650,14 @@ fn identified_scans(region: &ModelRegion) -> Result<Vec<(String, Arc<dyn TablePr
             && let Ok(provider) = source_as_provider(&scan.source)
             && provider.downcast_ref::<IdentifiedTable>().is_some()
         {
-            found.push((scan.table_name.table().to_string(), provider));
+            let name = scan.table_name.table().to_string();
+            if !found.iter().any(|(known, _)| *known == name) {
+                found.push((name, provider));
+            }
         }
         Ok(TreeNodeRecursion::Continue)
     })?;
     Ok(found)
-}
-
-/// Every row of a table the region reads by name, as one batch, when
-/// its rows come from Python.
-fn named_rows(region: &ModelRegion, table: &str) -> Result<Option<RecordBatch>> {
-    let found = named_tables(region)?;
-    let Some(rows) = found.get(table) else {
-        return Ok(None);
-    };
-    Ok(Some(concat_batches(&rows.schema, &rows.batches)?))
 }
 
 /// A region as JSON: `operators`, its operators as JSON text, and
@@ -664,6 +685,14 @@ pub fn region_json(
         "warnings": warnings,
     })
     .to_string())
+}
+
+/// Add the logical occurrence's ID to either a region or its planned envelope.
+fn with_region_id(payload: String, id: Option<usize>) -> Result<String> {
+    let mut payload: serde_json::Value = serde_json::from_str(&payload)
+        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+    payload["region_id"] = serde_json::json!(id);
+    Ok(payload.to_string())
 }
 
 /// An input's rows in the order of the registered table it holds rows of,
@@ -749,60 +778,122 @@ fn in_source_order(
     Ok(vec![take_record_batch(&rows, &order)?])
 }
 
-/// The rows and identity of each identified table a region reads by
-/// name, by table name.
-fn named_tables(region: &ModelRegion) -> Result<HashMap<String, TableRows>> {
-    let found = identified_scans(region)?;
+/// Materialize each named table once, projecting the union of columns all
+/// placements read. Keep these same batches for runtime hints and planning.
+fn planning_tables(
+    region: &ModelRegion,
+    inputs: &[InputRows],
+    operators: &Operators,
+) -> Result<HashMap<String, TableRows>> {
+    let required = crate::planning::required_columns(operators);
+    let columns = RegionColumns::of(region);
     let mut tables = HashMap::new();
-    for (name, provider) in found {
+    for (name, provider) in identified_scans(region)? {
         let table = provider
             .downcast_ref::<IdentifiedTable>()
             .expect("an identified table");
         let Some(python) = table.inner().downcast_ref::<PythonTable>() else {
             continue;
         };
+        let mut names = required.get(&name).cloned().unwrap_or_default();
+        // The hint reads passed-through columns by source position. Include
+        // them and primary keys even if no physical alternative reads them.
+        for column in &columns.0 {
+            if let quail_datafusion::RegionColumn::Source(source, index) = column
+                && *source == name
+            {
+                names.push(python.schema.field(*index).name().clone());
+            }
+        }
+        for constraint in python.constraints.iter() {
+            if let datafusion::common::Constraint::PrimaryKey(indices) = constraint {
+                names.extend(
+                    indices
+                        .iter()
+                        .map(|index| python.schema.field(*index).name().clone()),
+                );
+            }
+        }
+        let mut indices = names
+            .iter()
+            .map(|name| python.schema.index_of(name))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        indices.sort_unstable();
+        indices.dedup();
+        let schema = Arc::new(python.schema.project(&indices)?);
+        let names = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect();
         tables.insert(
             name,
             TableRows {
                 identity: Some(table.identity().to_string()),
-                schema: Arc::clone(&python.schema),
-                batches: python.rows()?,
+                schema,
+                batches: python.scan_columns(names)?,
+            },
+        );
+    }
+    for ((name, batches), input) in inputs.iter().zip(&region.inputs) {
+        tables.insert(
+            name.clone(),
+            TableRows {
+                identity: whole_table_identity(input),
+                schema: Arc::new(input.schema().as_arrow().clone()),
+                batches: batches.clone(),
             },
         );
     }
     Ok(tables)
 }
 
-/// The content identity of an input that is a whole table with one,
-/// read without filters.
+/// The content identity of unchanged base columns in source order. Computed
+/// or renamed columns must not share token stores with another projection of
+/// the same table, even when both plans choose the same generated name.
 fn whole_table_identity(input: &datafusion::logical_expr::LogicalPlan) -> Option<String> {
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
     use datafusion::datasource::source_as_provider;
     use datafusion::logical_expr::LogicalPlan;
     let mut identity = None;
     let mut whole = true;
+    let mut scans = 0;
     let _ = input.apply(|node| {
         match node {
             LogicalPlan::TableScan(scan) => {
+                scans += 1;
                 whole &= scan.filters.is_empty() && scan.fetch.is_none();
                 identity = source_as_provider(&scan.source).ok().and_then(|provider| {
-                    provider
-                        .downcast_ref::<IdentifiedTable>()
-                        .map(|table| table.identity().to_string())
+                    let table = provider.downcast_ref::<IdentifiedTable>()?;
+                    let python = table.inner().downcast_ref::<PythonTable>()?;
+                    // in_source_order restores only inputs retaining the source
+                    // primary key. Otherwise partition order is not stable.
+                    let ordered = python.constraints.iter().any(|constraint| {
+                        matches!(constraint, datafusion::common::Constraint::PrimaryKey(keys)
+                            if keys.len() == 1 && input.schema().as_arrow()
+                                .index_of(python.schema.field(keys[0]).name()).is_ok())
+                    });
+                    ordered.then(|| table.identity().to_string())
                 });
             }
-            LogicalPlan::SubqueryAlias(_) | LogicalPlan::Projection(_) => {}
+            LogicalPlan::SubqueryAlias(_) => {}
+            LogicalPlan::Projection(projection) => {
+                whole &= projection
+                    .expr
+                    .iter()
+                    .all(|expr| matches!(expr, Expr::Column(_)));
+            }
             LogicalPlan::Extension(extension)
                 if extension
                     .node
                     .as_any()
                     .downcast_ref::<SharedInput>()
-                    .is_some() => {}
+                    .is_some_and(|shared| !shared.numbered) => {}
             _ => whole = false,
         }
         Ok(TreeNodeRecursion::Continue)
     });
-    if whole { identity } else { None }
+    if whole && scans == 1 { identity } else { None }
 }
 
 /// Give a batch of Quail's rows the region's schema: each region
@@ -852,17 +943,6 @@ pub(crate) struct PythonTable {
 }
 
 impl PythonTable {
-    /// Every row of the table.
-    pub(crate) fn rows(&self) -> Result<Vec<RecordBatch>> {
-        let columns: Vec<String> = self
-            .schema
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect();
-        self.scan_columns(columns)
-    }
-
     /// One column of the table's rows.
     fn column_rows(&self, name: &str) -> Result<Vec<RecordBatch>> {
         self.scan_columns(vec![name.to_string()])
@@ -931,6 +1011,62 @@ impl TableProvider for PythonTable {
 mod tests {
     use super::*;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+    #[test]
+    fn hint_filtered_inputs_lose_their_whole_table_cache_identity() {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::common::ScalarValue;
+        use datafusion::datasource::{MemTable, provider_as_source};
+        use datafusion::logical_expr::{LogicalPlanBuilder, Operator};
+        use datafusion::physical_expr::expressions::{BinaryExpr, Column, Literal};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let source = MemTable::try_new(Arc::clone(&schema), vec![vec![batch.clone()]]).unwrap();
+        let plan = LogicalPlanBuilder::scan("input", provider_as_source(Arc::new(source)), None)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut region = ModelRegion::new(plan.clone());
+        region.inputs = vec![plan];
+        region.input_names = vec!["input".into()];
+        for threshold in [0, 1, 3] {
+            let mut inputs = vec![("input".into(), vec![batch.clone()])];
+            let mut tables = HashMap::from([(
+                "input".into(),
+                TableRows {
+                    identity: Some("whole-table".into()),
+                    schema: Arc::clone(&schema),
+                    batches: vec![batch.clone()],
+                },
+            )]);
+            let hint = RegionHint {
+                tests: vec![Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new("id", 0)),
+                    Operator::Gt,
+                    Arc::new(Literal::new(ScalarValue::Int64(Some(threshold)))),
+                ))],
+            };
+            input_hint(
+                &region,
+                &Operators::default(),
+                None,
+                &hint,
+                &mut inputs,
+                &mut tables,
+            )
+            .unwrap()
+            .unwrap();
+            let rows = &tables["input"];
+            assert!(rows.identity.is_none());
+            assert_eq!(rows.batches, inputs[0].1);
+            assert_eq!(rows.batches[0].num_rows(), (3 - threshold) as usize);
+        }
+    }
 
     #[test]
     fn executor_rows_missing_a_required_column_return_an_error() {
