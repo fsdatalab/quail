@@ -204,9 +204,8 @@ def test_copy_branches_match_reference_after_filters_and_limits(
     parts = [part]
     question = [700, 701]
     if filtered:
-        parts.insert(
-            0, FilterOperator(SimpleNamespace(question_token_ids=question), ids, Bits())
-        )
+        node = SimpleNamespace(question_token_ids=question, negated=False)
+        parts.insert(0, FilterOperator(node, ids, Bits()))
     stages = gated_stages(parts)
     prefixes, keys, tree, dependencies = part.branch_inputs(
         part.extraction.prefixes,

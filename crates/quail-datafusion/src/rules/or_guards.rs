@@ -37,6 +37,9 @@
 //! every other term. A guard writes `t_1 OR t_2 IS NOT TRUE` as `t_1 IS
 //! NOT TRUE AND t_2 IS NOT TRUE`, which is the same test.
 //!
+//! A term of the OR may read an answer as `NOT b`; the guards are the
+//! same, with `NOT b` in the place of `b`.
+//!
 //! The executor's AI filter asks the model about the rows where the
 //! guard is TRUE and passes each row where `a` is TRUE without asking.
 
@@ -72,13 +75,10 @@ impl OptimizerRule for PushDownOrGuards {
 }
 
 /// The terms of an `AI.IF` node's filter OR other than its answer `b`,
-/// when the filter is `a ∨ b` as the module describes.
-pub(crate) fn or_terms(node: &AiNode) -> Option<Expr> {
+/// when the filter is `a ∨ b` as the module describes, and whether the
+/// OR reads the answer as `NOT b`.
+pub(crate) fn or_terms(node: &AiNode) -> Option<(Expr, bool)> {
     let filter = node.filter.as_ref()?;
-    let is_answer = |term: &Expr| {
-        matches!(term, Expr::Column(column)
-            if column.relation.is_none() && column.name == node.answer)
-    };
     let reads_answer = |term: &Expr| {
         term.column_refs()
             .iter()
@@ -88,8 +88,9 @@ pub(crate) fn or_terms(node: &AiNode) -> Option<Expr> {
     let mut found = None;
     for conjunct in &conjuncts {
         let terms = split_binary(conjunct, Operator::Or);
-        let (answers, others): (Vec<&Expr>, Vec<&Expr>) =
-            terms.into_iter().partition(|term| is_answer(term));
+        let (answers, others): (Vec<&Expr>, Vec<&Expr>) = terms
+            .into_iter()
+            .partition(|term| node.answer_term(term).is_some());
         if answers.is_empty() || others.is_empty() {
             if reads_answer(conjunct) {
                 return None;
@@ -99,7 +100,10 @@ pub(crate) fn or_terms(node: &AiNode) -> Option<Expr> {
         if found.is_some() || others.iter().any(|term| reads_answer(term)) {
             return None;
         }
-        found = disjunction(others.into_iter().cloned());
+        let negated = answers
+            .iter()
+            .any(|term| node.answer_term(term) == Some(true));
+        found = disjunction(others.into_iter().cloned()).map(|rest| (rest, negated));
     }
     found
 }
@@ -117,14 +121,19 @@ fn push_down_or(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     if !plain {
         return Ok(Transformed::no(plan));
     }
-    let Some(rest) = or_terms(node) else {
+    let Some((rest, _)) = or_terms(node) else {
         return Ok(Transformed::no(plan));
     };
     // the earlier AI.IFs of the OR, which return their answers below
     let answers = answer_nodes(&node.input);
+    // the answer an OR's term reads, as the column or its NOT
+    let answer_of = |term: &Expr| match term {
+        Expr::Not(inner) => inner.try_as_col().cloned(),
+        other => other.try_as_col().cloned(),
+    };
     let is_answer = |term: &Expr| {
-        matches!(term, Expr::Column(column)
-            if column.relation.is_none() && answers.contains(&column.name))
+        answer_of(term)
+            .is_some_and(|column| column.relation.is_none() && answers.contains(&column.name))
     };
     let (read, plain): (Vec<Expr>, Vec<Expr>) = split_binary(&rest, Operator::Or)
         .into_iter()
@@ -141,13 +150,16 @@ fn push_down_or(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
             let Some(asked) = as_node::<AiNode>(&below) else {
                 return Ok(Transformed::no(below));
             };
-            let answer = Expr::Column(Column::from_name(asked.answer.clone()));
-            if !read.contains(&answer) {
+            let answer = Column::from_name(asked.answer.clone());
+            let Some(term) = read
+                .iter()
+                .find(|term| answer_of(term).as_ref() == Some(&answer))
+            else {
                 return Ok(Transformed::no(below));
-            }
+            };
             let mut guarded = asked.clone();
             guarded.guard = not_true(&seen);
-            seen.push(answer);
+            seen.push(term.clone());
             Ok(Transformed::yes(extension_node(guarded.checked()?)))
         })?
         .data;

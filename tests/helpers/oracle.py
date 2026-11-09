@@ -414,7 +414,7 @@ class OracleFilter(FilterOperator):
             if not keeps(node.alias, int(document)):
                 continue
             oracle.asked.append((node.alias, int(document)))
-            passed = oracle._filter_answer(node, document)
+            passed = oracle._filter_answer(node, document) != node.negated
             self.answers[local] = [passed]
             self.finished.append((local, passed))
             if one_by_one:

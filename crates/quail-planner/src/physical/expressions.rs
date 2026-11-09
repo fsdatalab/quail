@@ -240,6 +240,10 @@ tagged_struct! {
         /// The estimated fraction of documents where the guard is TRUE;
         /// None without a guard, or for the default selectivity.
         guard_selectivity: Option<f64>,
+        /// Whether the predicate is `NOT AI.IF(...)`: a document passes
+        /// when the model answers no, and `selectivity` is the fraction
+        /// of documents that do.
+        negated: bool = default,
     }
 }
 

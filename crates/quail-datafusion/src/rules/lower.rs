@@ -7,7 +7,8 @@
 //!
 //! - A `Filter` keeps its other terms; each `AI.IF` term, or comparison
 //!   of an `AI.SCORE` call, is an `AiNode` above it whose filter tests
-//!   the answer. A term that reads two tables is an AI join. An OR of
+//!   the answer. A `NOT AI.IF` term is the same node with the filter
+//!   `NOT answer`. A term that reads two tables is an AI join. An OR of
 //!   one `AI.IF` and terms that ask no model, such as `r.flagged OR
 //!   AI.IF(...)`, is an `AiNode` whose filter is the OR with the answer
 //!   in the call's place. With more `AI.IF`s, such as `r.flagged OR
@@ -96,10 +97,20 @@ fn unhint(expr: &Expr) -> (Expr, Option<Expr>) {
     }
 }
 
-/// Whether a term is a predicate the model answers: an `AI.IF` call or a
-/// comparison of an `AI.SCORE` call.
+/// The `AI.IF` call of a term that is one or the `NOT` of one.
+fn filter_call(term: &Expr) -> Option<&Expr> {
+    let call = match term {
+        Expr::Not(inner) => inner.as_ref(),
+        other => other,
+    };
+    (function_name(call) == Some("ai_filter")).then_some(call)
+}
+
+/// Whether a term is a predicate the model answers: an `AI.IF` call, a
+/// `NOT` of one, or a comparison of an `AI.SCORE` call.
 fn is_asked(term: &Expr) -> bool {
     match hinted(term) {
+        found if filter_call(found).is_some() => true,
         Expr::BinaryExpr(binary)
             if matches!(
                 binary.op,
@@ -114,7 +125,7 @@ fn is_asked(term: &Expr) -> bool {
             function_name(&binary.left) == Some("ai_score")
                 || function_name(&binary.right) == Some("ai_score")
         }
-        other => function_name(other) == Some("ai_filter"),
+        _ => false,
     }
 }
 
@@ -138,23 +149,24 @@ fn split_asked(predicate: &Expr) -> (Terms, Terms, usize) {
 }
 
 /// The `AI.IF` calls of an OR whose other terms ask no model and read no
-/// model answer, such as `r.flagged OR AI.IF(...) OR AI.IF(...)`, in
+/// model answer, such as `r.flagged OR AI.IF(...) OR NOT AI.IF(...)`, in
 /// written order, and the OR's terms.
 fn or_asked(term: &Expr) -> Option<(Vec<&Expr>, Vec<&Expr>)> {
     let terms = split_binary(term, Operator::Or);
     if terms.len() < 2 {
         return None;
     }
-    let (calls, others): (Vec<&Expr>, Vec<&Expr>) = terms
+    let calls: Vec<&Expr> = terms
         .iter()
-        .copied()
-        .partition(|found| function_name(found) == Some("ai_filter"));
+        .filter_map(|found| filter_call(found))
+        .collect();
+    let others = terms.iter().filter(|found| filter_call(found).is_none());
     let plain = |found: &Expr| {
         !found
             .exists(|inner| Ok(crate::is_ai_call(inner) || matches!(inner, Expr::Exists(_))))
             .unwrap_or(true)
     };
-    (!calls.is_empty() && others.iter().all(|found| plain(found))).then_some((calls, terms))
+    (!calls.is_empty() && others.into_iter().all(|found| plain(found))).then_some((calls, terms))
 }
 
 /// `term` with its first occurrence of `call` replaced by `with`.
@@ -210,12 +222,10 @@ fn asked_node(
         let call = calls[0];
         let filter = terms
             .into_iter()
-            .map(|found| {
-                if found == call {
-                    read.clone()
-                } else {
-                    found.clone()
-                }
+            .map(|found| match found {
+                found if found == call => read.clone(),
+                Expr::Not(inner) if inner.as_ref() == call => Expr::Not(Box::new(read.clone())),
+                found => found.clone(),
             })
             .reduce(Expr::or)
             .expect("an OR's terms");
@@ -231,6 +241,7 @@ fn asked_node(
             let call = std::mem::replace(binary.right.as_mut(), read);
             (call, Expr::BinaryExpr(binary))
         }
+        Expr::Not(call) => (*call, Expr::Not(Box::new(read))),
         call => (call, read),
     };
     let (_, field) = call.to_field(input.schema())?;

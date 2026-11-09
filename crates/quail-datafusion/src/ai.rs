@@ -205,6 +205,18 @@ impl AiNode {
         Ok(self)
     }
 
+    /// Whether `term` is the node's answer column or its `NOT`, and which:
+    /// true for the `NOT`. None for any other term.
+    pub fn answer_term(&self, term: &Expr) -> Option<bool> {
+        let (read, negated) = match term {
+            Expr::Not(inner) => (inner.as_ref(), true),
+            other => (other, false),
+        };
+        matches!(read, Expr::Column(column)
+            if column.relation.is_none() && column.name == self.answer)
+        .then_some(negated)
+    }
+
     /// This node over `input` instead of its own.
     ///
     /// # Errors

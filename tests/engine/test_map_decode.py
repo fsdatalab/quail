@@ -195,8 +195,8 @@ def test_map_answers_equal_greedy_decoding(monkeypatch, budget, question, lag,
                           map_node("b", tails[1], limits[1])], ids, 0)
     parts = [maps]
     if question is not None:
-        parts = [FilterOperator(SimpleNamespace(question_token_ids=question), ids,
-                            Bits(), 0), maps]
+        node = SimpleNamespace(question_token_ids=question, negated=False)
+        parts = [FilterOperator(node, ids, Bits(), 0), maps]
     stages = gated_stages(parts)
     prefixes, keys, tree, dependencies = maps.branch_inputs(
         documents, [("d", i) for i in ids], None, setup.page_tokens, len(stages) - 1)
@@ -306,7 +306,7 @@ def test_fused_document_operators_equal_running_each_operator_alone(
              for q, (tail, answer_limit) in enumerate(zip(
                  [[500, 501], [600, 601], [650, 651]], [1, 7, 9]))][:num_maps]
     setup = Setup(path="unified", pages=pages, budget=200)
-    question = SimpleNamespace(question_token_ids=[750, 751])
+    question = SimpleNamespace(question_token_ids=[750, 751], negated=False)
 
     def run(parts, ids, limit=None):
         arena = make_arena(setup)
@@ -487,8 +487,8 @@ def test_recomputed_documents_keep_shared_reads_correct_at_later_map_stages(
     first = MapOperator(None, nodes[:2], ids, 0)
     second = MapOperator(None, nodes[2:], ids, 2)
     question = [750, 751]
-    parts = [first, FilterOperator(SimpleNamespace(question_token_ids=question), ids,
-                               Bits(), 0), second]
+    node = SimpleNamespace(question_token_ids=question, negated=False)
+    parts = [first, FilterOperator(node, ids, Bits(), 0), second]
     stages = gated_stages(parts)
     prefixes, keys, tree, dependencies = first.branch_inputs(
         documents, [("d", a) for a in ids], prefix_tree(documents, 4), 4, 0)

@@ -12,7 +12,7 @@ macro_rules! tagged_struct {
     (
         $(#[$doc:meta])*
         $name:ident($body:ident, $wrapper:ident) = $tag:literal $(| $old:literal)* {
-            $($(#[$field_doc:meta])* $field:ident: $field_type:ty),* $(,)?
+            $($(#[$field_doc:meta])* $field:ident: $field_type:ty $(= $absent:ident)?),* $(,)?
         }
     ) => {
         $(#[$doc])*
@@ -24,7 +24,7 @@ macro_rules! tagged_struct {
         #[derive(serde::Serialize, serde::Deserialize)]
         #[serde(deny_unknown_fields)]
         struct $body {
-            $($field: $field_type,)*
+            $($(#[serde($absent)])? $field: $field_type,)*
         }
 
         #[derive(serde::Serialize, serde::Deserialize)]

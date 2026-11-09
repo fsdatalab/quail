@@ -967,8 +967,9 @@ impl<'a, 'c> Estimate<'a, 'c> {
         };
         let mut passed = Vec::new();
         for row in rows {
-            let mut passes = predicate.answer.is_some();
-            for asked in std::iter::once(prompt.as_ref()).chain(&ored) {
+            let mut passes = predicate.answer.is_some()
+                || self.passes(prompt, &[(alias, *row)])? != predicate.negated;
+            for asked in &ored {
                 passes = passes || self.passes(asked, &[(alias, *row)])?;
             }
             if passes {

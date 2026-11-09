@@ -257,6 +257,13 @@ fn refusal(
             "backends",
         ));
     }
+    if ored.clone().any(|predicate| predicate.negated) {
+        return Ok(refuse(
+            format!("NOT AI.IF runs on the Quail backend only, not {backend}"),
+            "negated_filter_needs_quail_backend".into(),
+            "backends",
+        ));
+    }
     let has_extract = !found.extracts.is_empty();
     for (function, present) in [
         ("AI.EXTRACT", has_extract),

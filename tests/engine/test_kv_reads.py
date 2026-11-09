@@ -112,6 +112,12 @@ def test_small_filters_joins_and_filters_feeding_joins(arena_kind):
     check_join_after_join([parent, child], *join_parts(), setup)
 
 
+def test_a_negated_filter_chain_keeps_the_documents_answered_no(arena_kind):
+    rng = random.Random(7)
+    documents, setup = small(rng, arena_kind, 40, (40, 80, 400), (24, 60))
+    check_filter(documents, questions(rng), setup, negated=True)
+
+
 @pytest.mark.parametrize("path,window,canvas,state_slots", [
     ("tree", None, (), 0),
     ("tree", 32, (), 0),

@@ -325,7 +325,7 @@ async fn a_projected_ai_if_returns_a_boolean_without_filtering_rows() -> Result<
 }
 
 #[tokio::test]
-async fn datafusion_negates_the_boolean_answer_of_ai_if() -> Result<()> {
+async fn a_negated_ai_filter_is_one_filter_that_keeps_the_no_answers() -> Result<()> {
     let context = context()?;
     let query = "SELECT r.id FROM reviews r \
         WHERE NOT AI.IF(PROMPT('Does this discuss the ending? {0}', r.body))";
@@ -338,12 +338,14 @@ async fn datafusion_negates_the_boolean_answer_of_ai_if() -> Result<()> {
         "ai-if",
     )
     .unwrap();
-    assert!(operators.filters.iter().any(|(_, predicates)| {
-        predicates
-            .iter()
-            .any(|predicate| predicate.answer.is_some())
-    }));
-    assert!(lines(&plan).iter().any(|line| line.starts_with("Filter:")));
+    let predicates: Vec<_> = operators
+        .filters
+        .iter()
+        .flat_map(|(_, predicates)| predicates)
+        .collect();
+    assert_eq!(predicates.len(), 1);
+    assert!(predicates[0].negated && predicates[0].answer.is_none());
+    assert!(!lines(&plan).iter().any(|line| line.starts_with("Filter:")));
     Ok(())
 }
 

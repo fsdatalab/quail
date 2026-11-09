@@ -559,6 +559,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                     guard: predicate.guard.clone(),
                     alternative: predicate.alternative.clone(),
                     answer: predicate.answer.clone(),
+                    negated: predicate.negated,
                 },
             )));
             surviving *= row_selectivity(&predicate);

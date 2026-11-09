@@ -201,6 +201,9 @@ physical_nodes! {
         alternative: Option<ValueExpression>,
         #[serde(default)]
         answer: Option<String>,
+        /// Whether a document passes when the model answers no.
+        #[serde(default)]
+        negated: bool,
     }
     /// An `AI.SCORE` call.
     AiScore(AiScoreAttributes) = "quail.ai_score" {

@@ -103,6 +103,7 @@ mod tests {
                 guard: None,
                 alternative: None,
                 answer: None,
+                negated: false,
             },
         });
         let map = PhysicalNode::AiMap(Node {
@@ -127,6 +128,7 @@ mod tests {
             "guard",
             "alternative",
             "answer",
+            "negated",
             "stop_tests",
             "stop_when_true",
             "hint_tests",

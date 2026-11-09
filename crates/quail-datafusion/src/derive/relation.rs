@@ -178,21 +178,19 @@ impl Relation {
             return Ok(());
         }
         // an AI.IF in an OR passes the rows where the OR's other terms are TRUE
-        let alternative = match &node.filter {
-            Some(Expr::Column(column))
-                if node.function() == "ai_filter"
-                    && column.relation.is_none()
-                    && column.name == node.answer =>
-            {
-                None
+        let filter = node
+            .filter
+            .as_ref()
+            .filter(|_| node.function() == "ai_filter");
+        let (alternative, negated) = match filter {
+            Some(filter) if node.answer_term(filter).is_some() => {
+                (None, node.answer_term(filter) == Some(true))
             }
-            Some(filter)
-                if node.function() == "ai_filter" && split_conjunction(filter).len() == 1 =>
-            {
+            Some(filter) if split_conjunction(filter).len() == 1 => {
                 match crate::rules::or_guards::or_terms(node) {
-                    Some(rest) => {
+                    Some((rest, negated)) => {
                         let rest = walk.filter_answers(&rest, binder);
-                        Some(binder.bind_condition(&rest)?)
+                        (Some(binder.bind_condition(&rest)?), negated)
                     }
                     None => {
                         return unsupported(
@@ -201,7 +199,7 @@ impl Relation {
                     }
                 }
             }
-            _ => None,
+            _ => (None, false),
         };
         let guard = match &node.guard {
             Some(guard) => {
@@ -239,20 +237,25 @@ impl Relation {
             if let Some(answer) = &answer {
                 self.answers.push((answer.clone(), options.selectivity));
             }
+            // the call's selectivity is the fraction the model answers yes for
+            let selectivity = options
+                .selectivity
+                .map(|yes| if negated { 1.0 - yes } else { yes });
             let filter = FilterPredicate {
                 expression: predicate,
-                selectivity: options.selectivity,
+                selectivity,
                 guard,
                 alternative,
                 answer,
                 guard_selectivity,
+                negated,
             };
             push(&mut self.filters, &read[0], filter);
             return Ok(());
         }
-        if alternative.is_some() || guard.is_some() || answer.is_some() {
+        if alternative.is_some() || guard.is_some() || answer.is_some() || negated {
             return unsupported(&format!(
-                "DataFusion must evaluate the disjunction {} over joined model results.",
+                "DataFusion must evaluate {} over joined model results.",
                 walk.written(node.filter.as_ref().unwrap_or(&node.call), &[])
             ));
         }

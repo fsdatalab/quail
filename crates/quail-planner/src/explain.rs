@@ -1168,6 +1168,9 @@ impl TreeRows<'_> {
                 condition_text(alternative)
             ));
         }
+        if matches!(known, PhysicalNode::AiFilter(filter) if filter.attributes.negated) {
+            details.push("passes each row where the model answers no".to_string());
+        }
         if let Some(answer) = known.answer() {
             details.push(format!(
                 "keeps every row and returns its answer as {answer}"

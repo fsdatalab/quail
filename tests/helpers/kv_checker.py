@@ -381,8 +381,11 @@ class Run:
         return prefix_tree(documents, self.setup.page_tokens)
 
 
-def check_filter(documents, questions, setup):
-    """Run a filter chain and check its answers and its KV reads."""
+def check_filter(documents, questions, setup, negated=False):
+    """Run a filter chain and check its answers and its KV reads.
+
+    A negated chain keeps the documents the model answers no for.
+    """
     tail = list(setup.canvas)
     answers = {}
     for document in documents:
@@ -390,7 +393,7 @@ def check_filter(documents, questions, setup):
             h = chain(document + q + tail)
             answers[h] = answer(h)
     run = Run(setup, answers)
-    parts = [FilterOperator(SimpleNamespace(question_token_ids=q),
+    parts = [FilterOperator(SimpleNamespace(question_token_ids=q, negated=negated),
                         list(range(len(documents))), passthrough(), len(tail))
              for q in questions]
     got, _, _ = StageExecutor(
@@ -401,7 +404,7 @@ def check_filter(documents, questions, setup):
         want = []
         for q in questions:
             want.append(answers[chain(document + q + tail)])
-            if not want[-1]:
+            if bool(want[-1]) == negated:
                 break
         assert [int(stage[d][0]) for stage in got if d in stage] == want, (
             f"document {d}")

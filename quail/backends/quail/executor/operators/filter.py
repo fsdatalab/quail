@@ -60,6 +60,7 @@ class FilterOperator(SingleNodeOperator):
         self.stages = filter_stages(
             [list(node.question_token_ids)],
             async_answers)
+        self._keep_answer()
         self.answers = {}
         self.finished = []      # (document, passed) settled since the last take
 
@@ -71,6 +72,12 @@ class FilterOperator(SingleNodeOperator):
             operators[0].stages[0].readout)
         for operator, stage in zip(operators, stages):
             operator.stages = [stage]
+            operator._keep_answer()
+
+    def _keep_answer(self):
+        """Advance a document on the answer the filter keeps: no when negated."""
+        if self.node.negated:
+            self.stages[0].decide = lambda _, row: not any(row)
 
     def settle(self, document, survived, row):
         self.finished.append((document, survived))
@@ -98,7 +105,8 @@ class FilterOperator(SingleNodeOperator):
         """Record filter answers and leave token accounting to the region."""
         for stage in every:
             for document, row in stage.items():
-                self.answers.setdefault(document, []).append(int(row[0]))
+                self.answers.setdefault(document, []).append(
+                    int(bool(row[0]) != self.node.negated))
         return len(self.answers) * (len(self.stages[0].suffixes[0])
                                     + self.frame_tokens
                                     + self.canvas_tokens)

@@ -202,6 +202,46 @@ def test_datafusion_sql_shapes_with_model_calls(constant_model, shape):
         assert "classify" in table.column_names[1].lower()
 
 
+NEGATED = {
+    "alone": (f"SELECT r.id FROM r WHERE NOT {PREDICATE}", ["r1", "r3"]),
+    "after another AI filter": (
+        "SELECT r.id FROM r WHERE AI.IF(PROMPT('q2: {0}', r.body)) "
+        f"AND NOT {PREDICATE}",
+        ["r3"],
+    ),
+    "in an OR": (f"SELECT r.id FROM r WHERE NOT {PREDICATE} OR r.stars = 1",
+                 ["r0", "r1", "r3"]),
+    "under a LIMIT": (f"SELECT r.id FROM r WHERE NOT {PREDICATE} LIMIT 1", ["r1"]),
+}
+
+
+@pytest.mark.parametrize("shape", NEGATED)
+def test_a_negated_ai_filter_runs_in_one_model_region(shape):
+    session = quail.Session(CONFIG, tokenizer=TOKENIZER)
+    oracle = Oracle(filters={"r": {"q1:": [1, 0, 1, 0], "q2:": [1, 0, 0, 1]}})
+    oracle.catalog = session.catalog
+    context = quail.SessionContext(session, physical_executor=oracle_executor(oracle))
+    context.register("r", quail.DocumentProvider.from_table(R, id_col="id"))
+    query, expected = NEGATED[shape]
+    try:
+        plans = context.sql("EXPLAIN " + query)
+        logical = plans.column("plan").to_pylist()[
+            plans.column("plan_type").to_pylist().index("logical_plan")]
+        # DataFusion neither filters on the answer nor computes the input rows
+        assert "Filter:" not in logical and "SharedInput" not in logical
+        oracle.asked.clear()
+        assert sorted(context.sql(query).column(0).to_pylist()) == expected
+        if shape == "under a LIMIT":
+            # the LIMIT is the filter's fetch: the model stops once a row passes
+            plan = session.sql(query).explain()
+            assert "filter: NOT __quail_answer_1, fetch: 1" in plan
+        if shape == "in an OR":
+            # r0 passes on its stars, so the model is not asked about it
+            assert ("r", 0) not in oracle.asked
+    finally:
+        session.close()
+
+
 REGION_BOUNDARY_QUERIES = {
     "score compared with a numeric expression": (
         f"SELECT r.id FROM r WHERE {SCORE} > r.stars / 4.0"

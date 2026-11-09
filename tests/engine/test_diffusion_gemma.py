@@ -28,8 +28,8 @@ def test_canvas_rows_are_charged_in_filter_streams_and_packed_chunks(
     # the questions' shared preamble is the frame, written once; each
     # stage's suffix is its question past it, and canvas rows follow
     # every suffix
-    parts = [FilterOperator(SimpleNamespace(question_token_ids=q), [0, 1],
-                        answers, canvas_tokens=3) for q in questions]
+    nodes = [SimpleNamespace(question_token_ids=q, negated=False) for q in questions]
+    parts = [FilterOperator(node, [0, 1], answers, canvas_tokens=3) for node in nodes]
     stages = gated_stages(parts)
     assert [stage.frame for stage in stages] == [[40, 41], [40, 41]]
     assert [stage.suffixes for stage in stages] == [[[42]], [[43, 44]]]
