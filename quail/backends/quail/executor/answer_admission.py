@@ -309,6 +309,8 @@ class HeadroomAdmission:
         # (refresh, bucket, pages) for each
         self.granted = []
         self.granted_at = []
+        # admissions that committed only some of a document's waiting answers
+        self.partial_admissions = 0
 
     def _bind(self):
         decoder = self.decoder
@@ -744,6 +746,7 @@ class HeadroomAdmission:
         decision = self._decision
         members = (decision[1] if decision is not None and decision[0] == anchor
                    else (anchor,))
+        self.partial_admissions += len(members) < len(self._waiting_members(anchor))
         self.committed[list(members)] = True
         slots = self._answer_slots(members)
         if self.choose_headroom:

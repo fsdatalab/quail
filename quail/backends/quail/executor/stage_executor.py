@@ -1091,6 +1091,8 @@ class StageExecutor:
                 self.answer_admission, "trace", [])
             self.stats["headroom_granted"] = getattr(
                 self.answer_admission, "granted", [])
+            self.stats["headroom_partial_admissions"] = getattr(
+                self.answer_admission, "partial_admissions", 0)
             self.stats["pass_work"] = dict(self.pass_work)
             if self.pass_decode_rows:
                 self.stats["pass_work"]["median_decode_rows"] = float(
