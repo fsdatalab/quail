@@ -190,11 +190,8 @@ runs the rest of the part above the region
   reads a region input through the same `SharedInput` as the region,
   so DataFusion computes the input's rows once; it scans an identified
   table the region reads by name again;
-- each `UNNEST` of an `AI.SAE_FEATURES` list, as DataFusion's `Unnest`
-  of the list column the region returns;
 - each test of the result rows: a test of more than one table's
-  columns, which needs every model call's answer first, or of an
-  unnested list's fields;
+  columns, which needs every model call's answer first;
 - the SELECT list's expressions other than its columns and model calls;
 - every ORDER BY, LIMIT, OFFSET, DISTINCT, GROUP BY, and window.
 

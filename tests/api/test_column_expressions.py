@@ -57,5 +57,5 @@ def test_select_order_and_group_take_expressions(session):
         "GROUP BY r.details.kind ORDER BY r.details.kind")
     assert _run(grouped, executor).to_rows() == [("a", 2), ("b", 1)]
     distinct = session.sql(
-        f"SELECT DISTINCT r.details.kind {FILTERED} ORDER BY r.details.kind")
+        f"SELECT DISTINCT r.details.kind {FILTERED} ORDER BY 1")
     assert _run(distinct, executor).to_rows() == [("a",), ("b",)]

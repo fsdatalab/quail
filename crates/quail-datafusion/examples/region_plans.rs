@@ -9,7 +9,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::{Result, tree_node::TreeNode, tree_node::TreeNodeRecursion};
 use datafusion::datasource::MemTable;
 use datafusion::logical_expr::LogicalPlan;
-use quail_datafusion::{ModelRegion, RegionRunner, session_context, sql};
+use quail_datafusion::{ModelRegion, RegionRunner, session_context};
 
 #[derive(Debug)]
 struct NoRows;
@@ -59,7 +59,7 @@ async fn main() -> Result<()> {
             context.register_table(name.as_str(), Arc::new(table))?;
         }
         println!("== {}", query["id"].as_str().unwrap());
-        let plan = match sql(&context, query["sql"].as_str().unwrap()).await {
+        let plan = match context.sql(query["sql"].as_str().unwrap()).await {
             Err(error) => {
                 println!("BIND ERROR: {error}");
                 continue;

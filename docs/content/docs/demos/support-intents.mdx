@@ -62,22 +62,25 @@ with quail.Session(config) as session:
     session.register("conversations", quail.DocumentProvider.from_table(
         conversations, id_col="id"))
     features = session.sql(r"""
-        SELECT t.id, intent.feature, intent.strength
-        FROM conversations t,
-             UNNEST(AI.SAE_FEATURES(
-                 PROMPT('{0}\n\nWhat is the customer asking for?', t.request),
-                 {'pooling': 'last'})) AS intent
+        SELECT x.id, x.intent['feature'] AS feature,
+               x.intent['strength'] AS strength
+        FROM (SELECT t.id,
+                     UNNEST(AI.SAE_FEATURES(
+                         PROMPT('{0}\n\nWhat is the customer asking for?', t.request),
+                         {'pooling': 'last'})) AS intent
+              FROM conversations t) x
     """).collect()
 ```
 
 `AI.SAE_FEATURES` returns up to 100 positive feature values per request
-with this configuration. `UNNEST(...) AS intent` expands each list into rows:
+with this configuration. `UNNEST(...) AS intent` expands each list into
+rows, one struct per feature:
 
 | Column | Meaning |
 | --- | --- |
-| `t.id` | The conversation ID. |
-| `intent.feature` | The feature ID. |
-| `intent.strength` | Its activation strength for this request. |
+| `x.id` | The conversation ID. |
+| `feature` | The feature ID. |
+| `strength` | Its activation strength for this request. |
 
 ## Find common features and inspect their requests
 

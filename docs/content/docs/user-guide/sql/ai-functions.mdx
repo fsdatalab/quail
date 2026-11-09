@@ -607,39 +607,26 @@ expression.
 
 ### Unnest the features
 
-Put the call in `UNNEST` in `FROM` to get one row for each feature. The
-rows have the columns `f.feature` and `f.strength`, where `f` is the
-`AS` name. The other columns repeat for each feature. Use these columns
-in `SELECT`, `WHERE`, `GROUP BY`, `ORDER BY`, and aggregates. To give a
-field another name in the result, write `f.feature AS feature_id` in
-`SELECT`. `WHERE` uses the original name.
+Put the call in DataFusion's `UNNEST` in `SELECT` to get one row for
+each feature, as a struct with the fields `feature` and `strength`. The
+other columns repeat for each feature, and a row with no features gives
+no rows. Read the fields with `['feature']` and `['strength']` from a
+derived table, and use them in `SELECT`, `WHERE`, `GROUP BY`,
+`ORDER BY`, and aggregates.
 
 For example, with the same `tickets` table, the following query counts
 how many requests return each feature:
 
 ```sql
-SELECT f.feature, COUNT(*) AS requests
-FROM tickets t,
-     UNNEST(AI.SAE_FEATURES(PROMPT('{0}\n\nWhat is the customer asking for?',
-                                   t.request),
-                            {'pooling': 'last'})) AS f
-GROUP BY f.feature
+SELECT x.f['feature'] AS feature, COUNT(*) AS requests
+FROM (SELECT t.id,
+             UNNEST(AI.SAE_FEATURES(PROMPT('{0}\n\nWhat is the customer asking for?',
+                                           t.request),
+                                    {'pooling': 'last'})) AS f
+      FROM tickets t) x
+GROUP BY x.f['feature']
 ORDER BY requests DESC;
 ```
-
-To read two lists, use one of these forms:
-
-- `UNNEST(a, b) AS u(f, g)` puts the lists side by side. Row `i` has
-  element `i` of each list. If one list is shorter, its fields are null
-  in the rows after its end.
-- `UNNEST(a) AS f, UNNEST(b) AS g` gives each pair of elements, one from
-  each list.
-
-A `WHERE` test of a feature field compares the field with literals.
-Use a comma or `CROSS JOIN` before `UNNEST`. A row with no features
-then gives no rows. To keep that row with null fields, write
-`LEFT JOIN UNNEST(...) AS f ON TRUE`. Other joins, other `ON` conditions,
-`USING`, and `WITH ORDINALITY` are not supported.
 
 ### Limits
 
@@ -649,7 +636,6 @@ then gives no rows. To keep that row with null fields, write
   `AI.CLASSIFY`, or `AI.EXTRACT`.
 - `ORDER BY`, `DISTINCT`, and `GROUP BY` cannot use the feature list.
   Use the fields of an `UNNEST` instead.
-- `UNNEST` reads `AI.SAE_FEATURES` calls only.
 - Calls over the same documents share their KV. If any call uses
   `'max'`, Quail also keeps the document features for the later calls.
   It reads each question in full and does not share prefixes between

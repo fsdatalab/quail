@@ -4,8 +4,8 @@
 //! Before DataFusion's optimizer, [`lower_regions`] finds each part of a
 //! query that Quail can plan and lowers its AI calls into `AiNode`s
 //! there ([`crate::LowerAiCalls`]). It walks the plan from the root.
-//! DataFusion keeps each `Aggregate`, `Window`, `Sort`, `Limit`, and
-//! `Distinct`, each AI call of theirs moved into a `Projection` below
+//! DataFusion keeps each `Aggregate`, `Window`, `Sort`, `Limit`,
+//! `Distinct`, and `Unnest`, each AI call of theirs moved into a `Projection` below
 //! them under a name they then read; and a `Projection`, `Filter`, or
 //! `SubqueryAlias` that calls no AI function above one of those. The
 //! first other operator whose whole subtree Quail can plan, and which
@@ -715,6 +715,7 @@ fn kept_by_datafusion(plan: &LogicalPlan) -> Result<bool> {
             | LogicalPlan::Sort(_)
             | LogicalPlan::Limit(_)
             | LogicalPlan::Distinct(_)
+            | LogicalPlan::Unnest(_)
     ) {
         return Ok(true);
     }
@@ -732,14 +733,11 @@ fn kept_by_datafusion(plan: &LogicalPlan) -> Result<bool> {
     })
 }
 
-/// The outermost AI calls in `expr`, each once; an unnested field counts
-/// whole, with the AI call it reads.
+/// The outermost AI calls in `expr`, each once.
 fn ai_calls(expr: &Expr) -> Result<Vec<Expr>> {
     let mut calls: Vec<Expr> = Vec::new();
     expr.apply(|inner| {
-        let unnested = matches!(inner, Expr::ScalarFunction(call)
-            if call.name() == crate::UNNEST_FIELD && inner.exists(|e| Ok(is_ai_call(e)))?);
-        if unnested || is_ai_call(inner) {
+        if is_ai_call(inner) {
             if !calls.contains(inner) {
                 calls.push(inner.clone());
             }

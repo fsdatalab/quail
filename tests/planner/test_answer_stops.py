@@ -146,7 +146,8 @@ def _plan_test(sql):
 
 LAW_SQL = ("SELECT r.id, AI_EXTRACT(r.body, {'law': 'Which law?'}) AS e "
            "FROM reviews r "
-           "WHERE AI_EXTRACT(r.body, {'law': 'Which law?'})['law'] = 'State of California'")
+           "WHERE AI_EXTRACT(r.body, {'law': 'Which law?'})['law'] "
+           "= 'State of California'")
 
 
 @pytest.mark.parametrize("prefix", [" State", "State", "State of", "State of ",

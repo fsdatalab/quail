@@ -5,11 +5,8 @@
 //! into the region, which runs on the GPU, and the operators above it,
 //! which run in DataFusion on the rows the region returns:
 //!
-//! - each `UNNEST` of an `AI.SAE_FEATURES` list, as DataFusion's
-//!   `Unnest` of the list column the region returns;
 //! - each test of the result rows: a test of more than one table's
-//!   columns, which needs every model call's answer first, or of an
-//!   unnested list's fields;
+//!   columns, which needs every model call's answer first;
 //! - the SELECT list's expressions, other than its columns and model
 //!   calls.
 //!
@@ -23,15 +20,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{Column, Result, ScalarValue, UnnestOptions};
+use datafusion::common::tree_node::TreeNode;
+use datafusion::common::{Column, Result};
 use datafusion::logical_expr::utils::{conjunction, split_conjunction};
 use datafusion::logical_expr::{Expr, JoinType, LogicalPlan, LogicalPlanBuilder, Projection};
 
 use crate::ai::{AiNode, Semantics};
 use crate::extension::{as_node, extension_node};
-use crate::functions::{function_name, is_ai_call, is_quail_call};
-use crate::unnest::{UNNEST_FIELD, UNNEST_TEST};
+use crate::functions::{is_ai_call, is_quail_call};
 
 /// The operators DataFusion runs above a region, lowest first.
 #[derive(Debug, Default)]
@@ -41,12 +37,6 @@ pub(crate) struct Above {
 
 #[derive(Debug)]
 enum Step {
-    /// One row per element of the list columns, zipped; with `outer`, a
-    /// row with no elements stays as one row of nulls.
-    Unnest {
-        lists: Vec<Column>,
-        outer: bool,
-    },
     Filter(Expr),
     Projection(Vec<Expr>),
 }
@@ -68,47 +58,12 @@ impl Above {
         let mut builder = LogicalPlanBuilder::from(region);
         for step in self.steps {
             builder = match step {
-                Step::Unnest { lists, outer } => {
-                    if outer {
-                        // DataFusion keeps a null list's row, not an empty one's
-                        let exprs: Vec<Expr> = builder
-                            .schema()
-                            .columns()
-                            .into_iter()
-                            .map(|column| {
-                                if !lists.contains(&column) {
-                                    return Ok(Expr::Column(column));
-                                }
-                                let list = Expr::Column(column.clone());
-                                let length = datafusion::functions_nested::expr_fn::cardinality(
-                                    list.clone(),
-                                );
-                                Ok(datafusion::logical_expr::when(
-                                    length.gt(Expr::Literal(ScalarValue::UInt64(Some(0)), None)),
-                                    list,
-                                )
-                                .end()?
-                                .alias_qualified(column.relation.clone(), column.name.clone()))
-                            })
-                            .collect::<Result<_>>()?;
-                        builder = builder.project(exprs)?;
-                    }
-                    let options = UnnestOptions::new().with_preserve_nulls(outer);
-                    builder.unnest_columns_with_options(lists, options)?
-                }
                 Step::Filter(predicate) => builder.filter(predicate)?,
                 Step::Projection(exprs) => builder.project(exprs)?,
             };
         }
         builder.build()
     }
-}
-
-/// One `UNNEST` of the query: each list's name and the region column
-/// that holds it, and whether it keeps a row with no elements.
-struct Unnested {
-    lists: Vec<(String, Column)>,
-    outer: bool,
 }
 
 /// Split a part whose root is its SELECT list into the region and the
@@ -125,44 +80,24 @@ pub(crate) fn lift_relational(plan: LogicalPlan) -> Result<(LogicalPlan, Above)>
     let answers = answer_tables(&root.input);
     let mut lifted: Vec<Expr> = Vec::new();
     let relation = take_row_tests(root.input.as_ref().clone(), &answers, false, &mut lifted)?;
-    let mut unnests: Vec<Unnested> = Vec::new();
-    let mut tests: Vec<Expr> = Vec::new();
-    for term in lifted {
-        match unnest_of(&term) {
-            Some(Some(unnest)) => unnests.push(unnest),
-            // an UNNEST of anything but a column stays for the binder to refuse
-            Some(None) => return Ok((plan, Above::default())),
-            None => tests.push(term),
-        }
-    }
-    let lists: BTreeMap<String, Column> = unnests
-        .iter()
-        .flat_map(|unnest| unnest.lists.iter().cloned())
-        .collect();
-    let read_fields = |expr: &Expr| read_unnested(expr, &lists);
-    let tests: Vec<Expr> = tests.iter().map(read_fields).collect::<Result<_>>()?;
+    let tests = lifted;
     // each SELECT list item the region returns as it is, by position
     let mut kept: Vec<Expr> = Vec::new();
     let mut selected: Vec<Expr> = Vec::new();
     for (expr, (qualifier, field)) in root.expr.iter().zip(root.schema.iter()) {
-        let unnested = expr
-            .exists(|inner| Ok(function_name(inner) == Some(UNNEST_FIELD)))
-            .unwrap_or(false);
         let calls_model = expr.exists(|inner| Ok(is_ai_call(inner))).unwrap_or(false);
         let column = matches!(expr, Expr::Column(_));
-        if !unnested && (calls_model || column) {
+        if calls_model || column {
             if !kept.contains(expr) {
                 kept.push(expr.clone());
             }
             selected.push(Expr::Column(Column::new(qualifier.cloned(), field.name())));
             continue;
         }
-        let computed = read_fields(expr)?.unalias();
+        let computed = expr.clone().unalias();
         selected.push(computed.alias_qualified(qualifier.cloned(), field.name()));
     }
-    let moved = !tests.is_empty()
-        || !unnests.is_empty()
-        || selected.iter().any(|expr| !matches!(expr, Expr::Column(_)));
+    let moved = !tests.is_empty() || selected.iter().any(|expr| !matches!(expr, Expr::Column(_)));
     if !moved {
         return Ok((with_a_column(plan)?, Above::default()));
     }
@@ -175,14 +110,11 @@ pub(crate) fn lift_relational(plan: LogicalPlan) -> Result<(LogicalPlan, Above)>
         })
         .collect();
     let mut read: Vec<Expr> = Vec::new();
-    let lists_read = unnests
-        .iter()
-        .flat_map(|unnest| unnest.lists.iter().map(|(_, column)| column.clone()));
     let columns_read = tests
         .iter()
         .chain(&selected)
         .flat_map(|expr| expr.column_refs().into_iter().cloned());
-    for column in lists_read.chain(columns_read) {
+    for column in columns_read {
         if relation.schema().has_column(&column) && !returned.contains(&column) {
             let expr = Expr::Column(column);
             if !read.contains(&expr) {
@@ -196,12 +128,6 @@ pub(crate) fn lift_relational(plan: LogicalPlan) -> Result<(LogicalPlan, Above)>
         Arc::new(relation),
     )?))?;
     let mut above = Above::default();
-    for unnest in unnests {
-        above.steps.push(Step::Unnest {
-            lists: unnest.lists.into_iter().map(|(_, column)| column).collect(),
-            outer: unnest.outer,
-        });
-    }
     if let Some(predicate) = conjunction(tests) {
         above.steps.push(Step::Filter(predicate));
     }
@@ -249,18 +175,10 @@ fn answer_tables(plan: &LogicalPlan) -> BTreeMap<String, BTreeSet<String>> {
     found
 }
 
-/// Whether a test runs on the result rows: an `UNNEST` or a test of an
-/// unnested list's fields; or a test of more than one table's columns
-/// that calls no model and has no subquery, other than a join's key.
+/// Whether a test runs on the result rows: a test of more than one
+/// table's columns that calls no model and has no subquery, other than a
+/// join's key.
 fn is_row_test(term: &Expr, answers: &BTreeMap<String, BTreeSet<String>>, join_key: bool) -> bool {
-    let unnests = term
-        .exists(|inner| {
-            Ok(matches!(function_name(inner), Some(name) if name == UNNEST_TEST || name == UNNEST_FIELD))
-        })
-        .unwrap_or(false);
-    if unnests {
-        return true;
-    }
     let special = term
         .exists(|inner| {
             Ok(is_quail_call(inner)
@@ -297,21 +215,14 @@ fn is_column_equality(term: &Expr) -> bool {
 /// order, children first.
 ///
 /// `fixed` says an operator above limits or gates the rows, so a test of
-/// several tables below it stays; an `UNNEST` and its tests move anyway.
+/// several tables below it stays.
 fn take_row_tests(
     plan: LogicalPlan,
     answers: &BTreeMap<String, BTreeSet<String>>,
     fixed: bool,
     lifted: &mut Vec<Expr>,
 ) -> Result<LogicalPlan> {
-    let lifts = |term: &Expr, join_key: bool| {
-        let unnests = term
-            .exists(|inner| {
-                Ok(matches!(function_name(inner), Some(name) if name == UNNEST_TEST || name == UNNEST_FIELD))
-            })
-            .unwrap_or(false);
-        unnests || (!fixed && is_row_test(term, answers, join_key))
-    };
+    let lifts = |term: &Expr, join_key: bool| !fixed && is_row_test(term, answers, join_key);
     // the operator's own tests come after the ones below it
     let split = |predicate: &Expr, join_key: bool| -> (Vec<Expr>, Vec<Expr>) {
         split_conjunction(predicate)
@@ -380,65 +291,4 @@ fn take_row_tests(
             other.with_new_exprs(other.expressions(), inputs)
         }
     }
-}
-
-/// The `UNNEST` a lifted term records, if it is one: Some(None) when one
-/// of its lists is not a column the region returns.
-fn unnest_of(term: &Expr) -> Option<Option<Unnested>> {
-    let Expr::ScalarFunction(call) = term else {
-        return None;
-    };
-    if call.name() != UNNEST_TEST {
-        return None;
-    }
-    let outer = matches!(
-        call.args.first(),
-        Some(Expr::Literal(ScalarValue::Boolean(Some(true)), _))
-    );
-    let mut lists = Vec::new();
-    for pair in call.args[1..].chunks(2) {
-        let (Some(name), Some(Expr::Column(column))) = (string_literal(&pair[0]), pair.get(1))
-        else {
-            return Some(None);
-        };
-        lists.push((name, column.clone()));
-    }
-    Some(Some(Unnested { lists, outer }))
-}
-
-fn string_literal(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::Literal(ScalarValue::Utf8(Some(text)), _)
-        | Expr::Literal(ScalarValue::LargeUtf8(Some(text)), _)
-        | Expr::Literal(ScalarValue::Utf8View(Some(text)), _) => Some(text.clone()),
-        _ => None,
-    }
-}
-
-/// `expr` reading each unnested field from its list's column, which an
-/// `Unnest` makes one element per row: `quail_unnest_field(<list>, 'f',
-/// 'feature')` as `get_field(<f's column>, 'feature')`.
-fn read_unnested(expr: &Expr, lists: &BTreeMap<String, Column>) -> Result<Expr> {
-    expr.clone()
-        .transform_down(|inner| {
-            if let Expr::ScalarFunction(call) = &inner
-                && call.name() == UNNEST_FIELD
-                && let (Some(name), Some(field)) = (
-                    call.args.get(1).and_then(string_literal),
-                    call.args.get(2).and_then(string_literal),
-                )
-                && let Some(column) = lists.get(&name)
-            {
-                return Ok(Transformed::new(
-                    datafusion::functions::core::expr_fn::get_field(
-                        Expr::Column(column.clone()),
-                        field,
-                    ),
-                    true,
-                    datafusion::common::tree_node::TreeNodeRecursion::Jump,
-                ));
-            }
-            Ok(Transformed::no(inner))
-        })
-        .map(|done| done.data)
 }

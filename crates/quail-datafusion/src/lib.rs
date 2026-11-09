@@ -9,8 +9,9 @@
 //! ```ignore
 //! let context = quail_datafusion::session_context(runner);
 //! context.register_table("reviews", reviews)?;
-//! let rows = quail_datafusion::sql(&context, "SELECT r.id FROM reviews r \
-//!     WHERE AI.IF(PROMPT('Does the review discuss the ending?\n\n{0}', r.body))")
+//! let rows = context
+//!     .sql("SELECT r.id FROM reviews r \
+//!         WHERE AI.IF(PROMPT('Does the review discuss the ending?\n\n{0}', r.body))")
 //!     .await?
 //!     .collect()
 //!     .await?;
@@ -18,7 +19,6 @@
 
 mod absorb;
 pub mod ai;
-mod aliases;
 mod binding;
 mod claim;
 pub mod derive;
@@ -47,19 +47,15 @@ mod repeated;
 pub mod rules;
 mod shared;
 mod substring;
-mod unnest;
 
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::common::{DFSchema, Result};
-use datafusion::dataframe::DataFrame;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::context::{SessionConfig, SessionContext, SessionState};
-use datafusion::sql::parser::Statement;
 
 pub use absorb::AbsorbIntoAiNodes;
-pub use aliases::{SPAN_SUFFIX, distinct_order_ordinals};
 pub use claim::ClaimModelRegions;
 pub use distinct::{EliminateDistinct, PushDownDistinct};
 pub use exec::{
@@ -68,7 +64,7 @@ pub use exec::{
 };
 pub use extension::QuailExtension;
 pub use field_access::StructFieldAccess;
-pub use functions::{AI_FUNCTION_NAMES, is_ai_call, quail_functions};
+pub use functions::{AI_FUNCTION_NAMES, SPAN_SUFFIX, is_ai_call, quail_functions};
 pub use guards::PushDownCaseGuards;
 pub use identified::IdentifiedTable;
 pub use keyed::{PushDownCountThreshold, PushDownSemiJoinFetch};
@@ -84,7 +80,6 @@ pub use repeated::MergeRepeatedAiCalls;
 pub use rules::{LOGICAL_RULES, logical_rule};
 pub use shared::{ROW_COLUMN, SharedInput, SharedInputExec};
 pub use substring::PushDownSubstringPrechecks;
-pub use unnest::{UNNEST_FIELD, UNNEST_TEST, take_unnests};
 
 /// Build a DataFusion session state with Quail registered.
 ///
@@ -143,48 +138,6 @@ pub fn session_context_with_rules(
     )?))
 }
 
-/// Plan a SQL query that may call AI functions as `AI.<name>(...)`.
-///
-/// The query is parsed in the session's SQL dialect. `SessionContext::sql`
-/// plans the same SQL, except two shapes this function rewrites before
-/// DataFusion binds the query: an `UNNEST` in `FROM` of a list a model
-/// call returns ([`take_unnests`]), and an `ORDER BY` of a `SELECT
-/// DISTINCT` that repeats a struct field ([`distinct_order_ordinals`]).
-pub async fn sql(context: &SessionContext, query: &str) -> Result<DataFrame> {
-    sql_in_dialect(context, query, None).await
-}
-
-/// Plan a SQL query as [`sql`] does, read in `dialect` (a DataFusion
-/// dialect name, such as `BigQuery`) instead of the session's.
-pub async fn sql_in_dialect(
-    context: &SessionContext,
-    query: &str,
-    dialect: Option<&str>,
-) -> Result<DataFrame> {
-    let mut state = context.state();
-    let dialect = match dialect {
-        Some(name) => name.parse()?,
-        None => state.config().options().sql_parser.dialect,
-    };
-    if matches!(dialect, datafusion::config::Dialect::BigQuery) {
-        // BigQuery sorts NULLs first in ascending order, as the front end reads it
-        state
-            .config_mut()
-            .options_mut()
-            .sql_parser
-            .default_null_ordering = "nulls_min".to_string();
-    }
-    // the analyzer reads the dialect, such as for Snowflake's REGEXP_LIKE
-    state.config_mut().options_mut().sql_parser.dialect = dialect;
-    let mut statement = state.sql_to_statement(query, &dialect)?;
-    if let Statement::Statement(inner) = &mut statement {
-        take_unnests(inner);
-        distinct_order_ordinals(inner);
-    }
-    let plan = state.statement_to_plan(statement).await?;
-    Ok(DataFrame::new(state, plan))
-}
-
 /// Quail's name for each column of a schema: `alias.column` for a
 /// table's column, as in `r.id`, and the bare name otherwise.
 pub fn quail_column_names(schema: &DFSchema) -> Vec<String> {
@@ -198,21 +151,9 @@ pub fn quail_column_names(schema: &DFSchema) -> Vec<String> {
 }
 
 /// Quail's name for a column DataFusion names by its expression: a
-/// struct field `r.details[body]` is `r.details.body`, and an unnested
-/// field `quail_unnest_field(..., Utf8("f"), Utf8("feature"))` is
-/// `f.feature`. Any other name is unchanged.
+/// struct field `r.details[body]` is `r.details.body`. Any other name is
+/// unchanged.
 fn quail_name(name: &str) -> String {
-    let unnested = name
-        .strip_prefix(&format!("{UNNEST_FIELD}("))
-        .and_then(|rest| rest.strip_suffix("\"))"))
-        .and_then(|rest| {
-            let (rest, field) = rest.rsplit_once("\"),Utf8(\"")?;
-            let (_, list) = rest.rsplit_once(",Utf8(\"")?;
-            Some(format!("{list}.{field}"))
-        });
-    if let Some(found) = unnested {
-        return found;
-    }
     let Some((column, fields)) = name.split_once('[') else {
         return name.to_string();
     };

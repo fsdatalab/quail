@@ -342,8 +342,7 @@ impl Session {
             // a worker runs the query, so the operators above a region
             // read its rows while this thread runs the region
             let query = self.runtime().spawn(async move {
-                let frame =
-                    quail_datafusion::sql_in_dialect(&context, &query, dialect.as_deref()).await?;
+                let frame = frame(&context, &query, dialect.as_deref()).await?;
                 let schema = quail_schema(frame.schema());
                 // renaming the columns keeps each column's buffers
                 let batches = frame
@@ -380,7 +379,7 @@ impl Session {
     /// The query does not plan.
     pub fn explain(&self, query: &str, dialect: Option<&str>) -> Result<String> {
         self.runtime().block_on(async {
-            let plan = quail_datafusion::sql_in_dialect(&self.context, query, dialect)
+            let plan = frame(&self.context, query, dialect)
                 .await?
                 .create_physical_plan()
                 .await?;
@@ -398,7 +397,7 @@ impl Session {
     /// The query does not plan.
     pub fn optimized_plan(&self, query: &str, dialect: Option<&str>) -> Result<LogicalPlan> {
         self.runtime().block_on(async {
-            quail_datafusion::sql_in_dialect(&self.context, query, dialect)
+            frame(&self.context, query, dialect)
                 .await?
                 .into_optimized_plan()
         })
@@ -537,4 +536,29 @@ impl Drop for Session {
             });
         }
     }
+}
+
+/// DataFusion's plan of `query`, read in `dialect` (a DataFusion dialect
+/// name, such as "BigQuery") or the session's dialect.
+///
+/// # Errors
+///
+/// The dialect is unknown, or the query does not plan.
+async fn frame(
+    context: &SessionContext,
+    query: &str,
+    dialect: Option<&str>,
+) -> Result<datafusion::dataframe::DataFrame> {
+    let mut state = context.state();
+    if let Some(name) = dialect {
+        let dialect: datafusion::config::Dialect = name.parse()?;
+        let options = state.config_mut().options_mut();
+        options.sql_parser.dialect = dialect;
+        if matches!(dialect, datafusion::config::Dialect::BigQuery) {
+            // BigQuery sorts NULLs first in ascending order
+            options.sql_parser.default_null_ordering = "nulls_min".to_string();
+        }
+    }
+    let plan = state.create_logical_plan(query).await?;
+    Ok(datafusion::dataframe::DataFrame::new(state, plan))
 }

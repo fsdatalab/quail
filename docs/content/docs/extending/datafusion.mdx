@@ -77,22 +77,21 @@ A session with its own `QueryPlanner` calls `register_rules` instead,
 and adds `extension_planner()` to the extension planners its planner
 passes to `DefaultPhysicalPlanner`.
 
-## What needs Quail's `sql()`
+## SQL
 
-`context.sql` plans Quail's SQL as `quail_datafusion::sql` does, except
-two shapes that `sql()` rewrites before DataFusion binds the query:
+`context.sql` plans Quail's SQL; there is no separate entry point.
+`register` adds, beside the AI functions and rules:
 
-- `UNNEST` in `FROM` of a list an AI function returns, such as
-  `FROM tickets t, UNNEST(AI.SAE_FEATURES(...)) AS f`. DataFusion cannot
-  unnest a list another table in the same `FROM` computes.
-- An `ORDER BY` of a `SELECT DISTINCT` that repeats a struct field, such
-  as `SELECT DISTINCT r.details.kind ... ORDER BY r.details.kind`, which
-  DataFusion refuses.
+- `StructFieldAccess`, an `ExprPlanner` that plans Snowflake's
+  `value['field']` on a struct, such as `AI.EXTRACT(...)['ends']`, as
+  `get_field`.
+- `SnowflakeRegexpLike`, a `FunctionRewrite` that makes `REGEXP_LIKE`
+  and `RLIKE` match the whole value when the session reads Snowflake
+  SQL, and `regexp_like` under the names `rlike` and `regexp_contains`.
 
-`register` also adds `StructFieldAccess`, which plans Snowflake's
-`value['field']` on a struct as `get_field`, and `SnowflakeRegexpLike`,
-which makes `REGEXP_LIKE` match the whole value when the session reads
-Snowflake SQL.
+The SQL is DataFusion's: `WHERE` cannot read a `SELECT` alias, so a
+query repeats the AI call, which Quail asks the model once for; and
+`UNNEST` goes in `SELECT`, with DataFusion's `Unnest` above the region.
 
 ## From datafusion-python
 

@@ -35,7 +35,7 @@ use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
 use datafusion::prelude::SessionContext;
 use quail_datafusion::{
     IdentifiedTable, InputStream, ModelRegion, ModelRegionExec, RegionBatches, RegionRunner,
-    session_context, sql,
+    session_context,
 };
 
 fn text_schema(columns: &[&str]) -> Arc<Schema> {
@@ -191,7 +191,7 @@ async fn context(settings: &[&str]) -> Result<SessionContext> {
 
 /// The plan of `query` and its rows, each as text.
 async fn run(context: &SessionContext, query: &str) -> Result<(Arc<dyn ExecutionPlan>, String)> {
-    let plan = sql(context, query).await?.create_physical_plan().await?;
+    let plan = context.sql(query).await?.create_physical_plan().await?;
     let batches = collect(Arc::clone(&plan), context.task_ctx()).await?;
     let rows = datafusion::arrow::util::pretty::pretty_format_batches(&batches)?.to_string();
     Ok((plan, rows))

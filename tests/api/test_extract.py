@@ -383,7 +383,8 @@ def test_not_and_or_of_answers_run_after_the_extractions_they_read(session):
     fields = f"c.text, {{'ends': '{QUESTION}', 'rent': 'How much?'}}"
     lease, span = f"AI.EXTRACT({fields})", f"AI.EXTRACT_SPAN({fields})"
     head = f"SELECT c.id, {lease} AS lease FROM contracts c WHERE "
-    ends, rent, start = f"{lease}['ends']", f"{lease}['rent']", f"{span}['ends']['start']"
+    ends, rent = f"{lease}['ends']", f"{lease}['rent']"
+    start = f"{span}['ends']['start']"
 
     def placed(query):
         found = operators_of(query)

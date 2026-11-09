@@ -998,10 +998,6 @@ impl Relation {
             relation.bind_asked(walk, binder, id, node)?;
         }
         for term in walk.where_terms(answers) {
-            if crate::functions::function_name(&term) == Some(crate::UNNEST_TEST) {
-                // DataFusion unnests a list column the region returns
-                return unsupported("an UNNEST of a list that is not a model call's answer");
-            }
             relation.bind_where_term(binder, &term)?;
         }
         Ok(relation)
