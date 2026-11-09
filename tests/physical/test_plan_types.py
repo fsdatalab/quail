@@ -1,4 +1,4 @@
-"""The Rust plan types (crates/quail-planner/src/physical/) read and write every plan unchanged."""
+"""The Rust plan types (quail_planner::physical) read and write every plan."""
 
 import json
 import zlib
