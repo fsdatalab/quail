@@ -324,7 +324,10 @@ impl ExecutionPlan for ModelRegionExec {
                         remaining: fetch,
                     }) {
                         // the receiver is gone once DataFusion stops reading
-                        if sender.blocking_send(batch).is_err() {
+                        if sender
+                            .blocking_send(batch.and_then(with_struct_nulls))
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -347,6 +350,44 @@ impl ExecutionPlan for ModelRegionExec {
 /// How many batches each channel into and out of a region holds before
 /// its sender waits.
 const BUFFERED_BATCHES: usize = 2;
+
+/// Carry a nullable struct's validity into its children before SQL reads them.
+/// DataFusion's get_field reads child arrays directly, so a null span must not
+/// expose the zero-filled storage beneath its null struct.
+fn with_struct_nulls(batch: RecordBatch) -> Result<RecordBatch> {
+    use datafusion::arrow::array::{Array, ArrayRef, StructArray, make_array};
+    use datafusion::arrow::buffer::NullBuffer;
+
+    fn normalize(array: &ArrayRef) -> Result<ArrayRef> {
+        let Some(values) = array.as_any().downcast_ref::<StructArray>() else {
+            return Ok(Arc::clone(array));
+        };
+        let columns = values
+            .columns()
+            .iter()
+            .map(|column| {
+                let nulls = NullBuffer::union(values.nulls(), column.nulls());
+                let data = column.to_data().into_builder().nulls(nulls).build()?;
+                normalize(&make_array(data))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Arc::new(StructArray::try_new(
+            values.fields().clone(),
+            columns,
+            values.nulls().cloned(),
+        )?))
+    }
+
+    RecordBatch::try_new(
+        batch.schema(),
+        batch
+            .columns()
+            .iter()
+            .map(normalize)
+            .collect::<Result<_>>()?,
+    )
+    .map_err(Into::into)
+}
 
 /// One region input's batches, read on a thread that may block.
 ///
@@ -467,5 +508,37 @@ impl QueryPlanner for QuailQueryPlanner {
             ModelRegionPlanner::new(Arc::clone(&self.runner)),
         )]);
         planner.create_physical_plan(logical_plan, session).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{Array, Int32Array, StructArray};
+    use datafusion::arrow::buffer::NullBuffer;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+    #[test]
+    fn null_structs_do_not_expose_child_storage_to_sql() -> Result<()> {
+        let span = StructArray::new(
+            vec![Arc::new(Field::new("start", DataType::Int32, true))].into(),
+            vec![Arc::new(Int32Array::from(vec![0]))],
+            Some(NullBuffer::from(vec![false])),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "span",
+            span.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(span)])?;
+        let normalized = with_struct_nulls(batch)?;
+        let span = normalized
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(span.is_null(0));
+        assert!(span.column(0).is_null(0));
+        Ok(())
     }
 }

@@ -5,12 +5,11 @@ use std::sync::Arc;
 
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::common::{Column, DataFusionError, Result, plan_err};
+use datafusion::common::{Column, Result, plan_err};
 use datafusion::logical_expr::utils::{conjunction, split_conjunction};
 use datafusion::logical_expr::{
     Aggregate, Expr, Filter, LogicalPlan, LogicalPlanBuilder, Projection, Window,
 };
-use quail_planner::error::UNSUPPORTED;
 
 use super::claim::{
     calls_ai, calls_ai_function, is_subquery, kept_by_datafusion, quail_plans, refusal, select_list,
@@ -34,6 +33,12 @@ pub(crate) fn lower_regions(plan: LogicalPlan, config: &ConfigOptions) -> Result
     // the call each written name, such as `AI.CLASSIFY(...)`, names
     let mut written: Vec<(String, String)> = Vec::new();
     plan.apply(|node| {
+        for (qualifier, field) in node.schema().iter() {
+            extracted.reserved.push(field.name().clone());
+            if let Some(qualifier) = qualifier {
+                extracted.reserved.push(qualifier.table().to_string());
+            }
+        }
         for expr in node.expressions() {
             if let Expr::Alias(alias) = &expr
                 && is_ai_call(&alias.expr)
@@ -112,11 +117,14 @@ fn drop_written_names(plan: LogicalPlan) -> Result<LogicalPlan> {
 #[derive(Debug, Default)]
 struct Extracted {
     num_calls: usize,
+    num_inputs: usize,
     /// The SELECT list's names, by the name of the call or column each
     /// one renames.
     aliases: Vec<(String, String)>,
     /// The names given to moved calls.
     used: Vec<String>,
+    /// User column and relation names that generated names must not shadow.
+    reserved: Vec<String>,
     /// Whether the plan being claimed has had its filters pushed down.
     pushed: bool,
     /// The session's configuration, which a trial of a part runs in.
@@ -124,9 +132,36 @@ struct Extracted {
 }
 
 impl Extracted {
+    fn fresh_call(&mut self) -> String {
+        loop {
+            self.num_calls += 1;
+            let name = format!("__quail_call_{}", self.num_calls);
+            if !self.reserved.contains(&name)
+                && !self
+                    .reserved
+                    .contains(&format!("{name}{}", crate::SPAN_SUFFIX))
+                && !self.used.contains(&name)
+            {
+                self.reserved.push(name.clone());
+                return name;
+            }
+        }
+    }
+
+    fn fresh_input(&mut self) -> String {
+        loop {
+            self.num_inputs += 1;
+            let name = format!("__quail_input_{}", self.num_inputs);
+            if !self.reserved.contains(&name) {
+                self.reserved.push(name.clone());
+                return name;
+            }
+        }
+    }
+
     /// Move each AI call of an `Aggregate`, `Window`, or `Sort` into a
     /// `Projection` below it.
-    fn extract(&mut self, node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
+    fn extract(&mut self, node: LogicalPlan, seal: bool) -> Result<Transformed<LogicalPlan>> {
         if !matches!(
             node,
             LogicalPlan::Aggregate(_)
@@ -155,7 +190,7 @@ impl Extracted {
         if calls.is_empty() {
             return Ok(Transformed::no(node));
         }
-        let named = self.name(calls);
+        let named = self.name(calls, node.inputs()[0].schema());
         let read = |expr: &Expr| read_calls(expr, &named);
         let exprs: Vec<Expr> = node.expressions().iter().map(read).collect::<Result<_>>()?;
         // the projection passes on the input columns an aggregate reads,
@@ -176,8 +211,12 @@ impl Extracted {
             }
         }
         read_columns.extend(named.iter().map(|(call, name)| call.clone().alias(name)));
-        let projection =
-            LogicalPlan::Projection(Projection::try_new(read_columns, Arc::new(input))?);
+        let projection = Projection::try_new(read_columns, Arc::new(input))?;
+        let projection = if seal {
+            self.isolate_projection(projection)?
+        } else {
+            LogicalPlan::Projection(projection)
+        };
         let rewritten = match &node {
             LogicalPlan::Aggregate(aggregate) => {
                 // the operators above read each output by its original name
@@ -246,7 +285,7 @@ impl Extracted {
         if calls.is_empty() {
             return Ok(plan);
         }
-        let named = self.name(calls);
+        let named = self.name(calls, below);
         let mut exprs: Vec<Expr> = below.columns().into_iter().map(Expr::Column).collect();
         exprs.extend(named.iter().map(|(call, name)| call.clone().alias(name)));
         let input = LogicalPlan::Projection(Projection::try_new(exprs, Arc::clone(&window.input))?);
@@ -266,7 +305,11 @@ impl Extracted {
 
     /// A column name for each call: the SELECT list's name for it, or a
     /// new hidden one.
-    fn name(&mut self, calls: Vec<Expr>) -> Vec<(Expr, String)> {
+    fn name(
+        &mut self,
+        calls: Vec<Expr>,
+        input: &datafusion::common::DFSchema,
+    ) -> Vec<(Expr, String)> {
         calls
             .into_iter()
             .map(|call| {
@@ -274,12 +317,13 @@ impl Extracted {
                 let named = self
                     .aliases
                     .iter()
-                    .find(|(found, name)| *found == key && !self.used.contains(name))
+                    .find(|(found, name)| {
+                        *found == key
+                            && !self.used.contains(name)
+                            && !input.has_column_with_unqualified_name(name)
+                    })
                     .map(|(_, name)| name.clone());
-                let name = named.unwrap_or_else(|| {
-                    self.num_calls += 1;
-                    format!("__quail_call_{}", self.num_calls)
-                });
+                let name = named.unwrap_or_else(|| self.fresh_call());
                 self.used.push(name.clone());
                 (call, name)
             })
@@ -298,7 +342,7 @@ impl Extracted {
         if kept_by_datafusion(&plan)? {
             let plan = match plan {
                 LogicalPlan::Aggregate(_) | LogicalPlan::Window(_) | LogicalPlan::Sort(_) => {
-                    self.extract(plan)?.data
+                    self.extract(plan, false)?.data
                 }
                 plan => plan,
             };
@@ -312,54 +356,178 @@ impl Extracted {
                 .collect::<Result<Vec<_>>>()?;
             return plan.with_new_exprs(plan.expressions(), claimed);
         }
-        if quail_plans(&plan)? {
+        {
             let selected = select_list(plan.clone(), needed.clone())?;
             let pushed = precompute_plain_expressions(push_plain_terms(selected)?)?;
             // a FROM or JOIN subquery the region does not read through runs
             // before the region, as its own input
-            let (bound, inputs, reads) = split_inputs(pushed)?;
+            let (bound, inputs, reads) = match split_inputs(pushed) {
+                Ok(split) => split,
+                Err(_) => return self.hand_back(plan, needed),
+            };
             if !calls_ai(&bound)? {
                 // every model call is in a subquery that runs first: DataFusion
                 // runs this part, and the subqueries are claimed below it
-                return self.hand_back(plan, needed, None);
+                return self.hand_back(plan, needed);
             }
-            match refusal(&bound, &self.config)? {
-                None => {
-                    let mut claimed = Vec::new();
-                    for (name, input) in inputs {
-                        claimed.push((name, self.claim(input, None)?));
-                    }
-                    let lowered = crate::lower_ai_calls(bound)?;
-                    return read_inputs(lowered, &reads, &claimed);
+            if quail_plans(&bound)? {
+                let refused = refusal(&bound, &self.config)?.is_some();
+                let mut claimed = Vec::new();
+                for (name, input) in inputs {
+                    claimed.push((name, self.claim(input, None)?));
                 }
-                Some(refusal) => return self.hand_back(plan, needed, Some(refusal)),
+                let lowered = match crate::lower_ai_calls(bound) {
+                    Ok(lowered) => lowered,
+                    Err(_) if refused => return self.hand_back(plan, needed),
+                    Err(error) => return Err(error),
+                };
+                let restored = read_inputs(lowered, &reads, &claimed)?;
+                if !refused || super::claim::native_plan_fits(&restored, &self.config) {
+                    return Ok(restored);
+                }
+                return self.hand_back(plan, needed);
             }
         }
-        self.hand_back(plan, needed, None)
+        self.hand_back(plan, needed)
     }
 
-    /// Let DataFusion run the part of `plan` that Quail does not bind.
-    ///
-    /// First DataFusion's `PushDownFilter` moves each filter as far down
-    /// as SQL allows, such as a test of one table below a join, and the
-    /// result is claimed again. Then DataFusion keeps `plan`'s operator,
-    /// its AI calls moved into a projection below it, and its inputs are
-    /// claimed. `refusal` is Quail's reason it cannot run `plan`
-    /// whole; it is the error when a model call is still outside every
-    /// region.
-    fn hand_back(
-        &mut self,
-        plan: LogicalPlan,
-        needed: Option<Vec<Column>>,
-        refusal: Option<String>,
-    ) -> Result<LogicalPlan> {
-        // the reason Quail cannot run this operator explains a failure
-        // better than one found below it
-        self.hand_back_parts(plan, needed, refusal.clone())
-            .map_err(|error| match refusal {
-                Some(refusal) => DataFusionError::Plan(refusal),
-                None => error,
+    /// Bind only the calls of a projection. DataFusion computes every input
+    /// row, including joins, grouping, and expressions the region cannot bind.
+    /// Unique input names preserve duplicate SQL column names; the outer
+    /// projection restores the original output names and qualifiers.
+    fn isolate_projection(&mut self, projection: Projection) -> Result<LogicalPlan> {
+        let projection = crate::rules::lower::precompute_prompt_arguments(projection)?;
+        let name = self.fresh_input();
+        let input = self.claim(projection.input.as_ref().clone(), None)?;
+        let columns = input.schema().columns();
+        let renamed: Vec<Expr> = columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| Expr::Column(column.clone()).alias(format!("column_{index}")))
+            .collect();
+        let input = LogicalPlanBuilder::from(input).project(renamed)?.build()?;
+        // This is a relation of computed rows, not the source table: its
+        // identity must survive duplicate rows, aggregates and renamed keys.
+        let input =
+            crate::extension::extension_node(super::shared::SharedInput::try_new(input, false)?);
+        let input = LogicalPlanBuilder::from(input)
+            .alias(name.as_str())?
+            .build()?;
+        let replacements = input.schema().columns();
+        let remap = |expr: Expr| -> Result<Expr> {
+            Ok(expr
+                .transform_up(|expr| {
+                    if let Expr::Column(column) = &expr
+                        && let Some(index) = columns.iter().position(|found| found == column)
+                    {
+                        return Ok(Transformed::yes(Expr::Column(replacements[index].clone())));
+                    }
+                    Ok(Transformed::no(expr))
+                })?
+                .data)
+        };
+        let mut calls = Vec::new();
+        for expr in &projection.expr {
+            for call in ai_calls(expr)? {
+                if !calls.contains(&call) {
+                    calls.push(call);
+                }
+            }
+        }
+        let named: Vec<_> = calls
+            .into_iter()
+            .map(|call| {
+                let mut name = self.fresh_call();
+                if crate::functions::function_name(&call) == Some("ai_extract_span") {
+                    name.push_str(crate::SPAN_SUFFIX);
+                }
+                self.used.push(name.clone());
+                (call, name)
             })
+            .collect();
+        let mut exprs: Vec<Expr> = replacements.iter().cloned().map(Expr::Column).collect();
+        for (call, name) in &named {
+            if let Expr::ScalarFunction(span) = call
+                && span.name() == "ai_extract_span"
+            {
+                let extraction =
+                    Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
+                        crate::rules::lower::quail_function("ai_extract"),
+                        span.args.clone(),
+                    ));
+                let answer = name.strip_suffix(crate::SPAN_SUFFIX).unwrap_or(name);
+                exprs.push(remap(extraction)?.alias(answer));
+            }
+            exprs.push(remap(call.clone())?.alias(name));
+        }
+        let isolated = LogicalPlan::Projection(Projection::try_new(exprs, Arc::new(input))?);
+        let (bound, inputs, _) = split_inputs(isolated)?;
+        if refusal(&bound, &self.config)?.is_some() {
+            if named.len() > 1 {
+                // Calls that cannot share document storage or model settings
+                // run in separate regions over the same rows.
+                let mut input = projection.input.as_ref().clone();
+                for (call, name) in &named {
+                    let mut exprs: Vec<_> = input
+                        .schema()
+                        .columns()
+                        .into_iter()
+                        .map(Expr::Column)
+                        .collect();
+                    exprs.push(call.clone().alias(name));
+                    input =
+                        self.isolate_projection(Projection::try_new(exprs, Arc::new(input))?)?;
+                }
+                let exprs = projection
+                    .expr
+                    .iter()
+                    .zip(projection.schema.iter())
+                    .map(|(expr, (qualifier, field))| {
+                        Ok(read_calls(expr, &named)?
+                            .alias_qualified(qualifier.cloned(), field.name()))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                return Ok(LogicalPlan::Projection(Projection::try_new(
+                    exprs,
+                    Arc::new(input),
+                )?));
+            }
+            return plan_err!(
+                "This model call cannot use this expression; compute its arguments in a subquery first."
+            );
+        }
+        let lowered = super::claim::claim_isolated(bound, inputs, &self.config)?;
+        let returned = lowered.schema().columns();
+        let lowered = crate::extension::extension_node(super::shared::SharedInput::scoped(
+            lowered,
+            self.fresh_input(),
+        )?);
+        let scoped = lowered.schema().columns();
+        let scope = |expr: Expr| -> Result<Expr> {
+            Ok(expr
+                .transform_up(|expr| {
+                    if let Expr::Column(column) = &expr
+                        && let Some(index) = returned.iter().position(|found| found == column)
+                    {
+                        return Ok(Transformed::yes(Expr::Column(scoped[index].clone())));
+                    }
+                    Ok(Transformed::no(expr))
+                })?
+                .data)
+        };
+        let exprs = projection
+            .expr
+            .iter()
+            .zip(projection.schema.iter())
+            .map(|(expr, (qualifier, field))| {
+                Ok(scope(remap(read_calls(expr, &named)?)?)?
+                    .alias_qualified(qualifier.cloned(), field.name()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(LogicalPlan::Projection(Projection::try_new(
+            exprs,
+            Arc::new(lowered),
+        )?))
     }
 
     /// `plan` with the model regions of each uncorrelated `IN` subquery
@@ -371,6 +539,21 @@ impl Extracted {
         let mut failed = None;
         let claimed = plan.map_expressions(|expr| {
             expr.transform_down(|inner| match inner {
+                Expr::ScalarSubquery(mut found)
+                    if found.outer_ref_columns.is_empty()
+                        && calls_ai_function(&found.subquery)? =>
+                {
+                    found.subquery = Arc::new(self.claim(found.subquery.as_ref().clone(), None)?);
+                    Ok(Transformed::yes(Expr::ScalarSubquery(found)))
+                }
+                Expr::Exists(mut found)
+                    if found.subquery.outer_ref_columns.is_empty()
+                        && calls_ai_function(&found.subquery.subquery)? =>
+                {
+                    found.subquery.subquery =
+                        Arc::new(self.claim(found.subquery.subquery.as_ref().clone(), None)?);
+                    Ok(Transformed::yes(Expr::Exists(found)))
+                }
                 Expr::InSubquery(mut found)
                     if found.subquery.outer_ref_columns.is_empty()
                         && calls_ai_function(&found.subquery.subquery)? =>
@@ -396,12 +579,87 @@ impl Extracted {
         }
     }
 
-    fn hand_back_parts(
-        &mut self,
-        plan: LogicalPlan,
-        needed: Option<Vec<Column>>,
-        refusal: Option<String>,
-    ) -> Result<LogicalPlan> {
+    /// Shrink a refused region, leaving its relational work in DataFusion.
+    fn hand_back(&mut self, plan: LogicalPlan, needed: Option<Vec<Column>>) -> Result<LogicalPlan> {
+        // VALUES has no child relation. Expose its row contexts as ordinary
+        // projections, then apply the same column fallback to each one.
+        if let LogicalPlan::Values(values) = &plan {
+            let mut rows = Vec::new();
+            for row in &values.values {
+                let exprs: Vec<Expr> = row
+                    .iter()
+                    .zip(values.schema.iter())
+                    .map(|(expr, (qualifier, field))| {
+                        expr.clone()
+                            .alias_qualified(qualifier.cloned(), field.name())
+                    })
+                    .collect();
+                let one = LogicalPlanBuilder::empty(true).project(exprs)?.build()?;
+                rows.push(self.claim(one, None)?);
+            }
+            let mut rows = rows.into_iter();
+            let Some(first) = rows.next() else {
+                return Ok(plan);
+            };
+            let mut union = LogicalPlanBuilder::from(first);
+            for row in rows {
+                union = union.union(row)?;
+            }
+            return union.build();
+        }
+        self.num_inputs += 1;
+        if let Some(join) =
+            super::join::lower_outer_join(&plan, self.num_inputs, |input| self.claim(input, None))?
+        {
+            return Ok(join);
+        }
+        // An inner ON test consumes the joined rows, just like WHERE.
+        // Keeping non-model keys on the join avoids constructing unrelated pairs.
+        if let LogicalPlan::Join(join) = &plan
+            && join.join_type == datafusion::logical_expr::JoinType::Inner
+        {
+            let mut base = join.clone();
+            let mut tests = Vec::new();
+            base.on.retain(|(left, right)| {
+                let asks = [left, right]
+                    .iter()
+                    .any(|expr| expr.exists(|inner| Ok(is_ai_call(inner))).unwrap_or(false));
+                if asks {
+                    tests.push(match join.null_equality {
+                        datafusion::common::NullEquality::NullEqualsNull => {
+                            datafusion::logical_expr::binary_expr(
+                                left.clone(),
+                                datafusion::logical_expr::Operator::IsNotDistinctFrom,
+                                right.clone(),
+                            )
+                        }
+                        _ => left.clone().eq(right.clone()),
+                    });
+                }
+                !asks
+            });
+            if let Some(filter) = &join.filter
+                && !ai_calls(filter)?.is_empty()
+            {
+                tests.push(filter.clone());
+                base.filter = None;
+            }
+            if let Some(predicate) = conjunction(tests) {
+                let filtered = LogicalPlan::Filter(Filter::try_new(
+                    predicate,
+                    Arc::new(LogicalPlan::Join(base)),
+                )?);
+                // Do not push these tests back into ON: evaluate them as columns.
+                let extracted = self.extract(filtered, true)?.data;
+                let inputs = extracted
+                    .inputs()
+                    .into_iter()
+                    .cloned()
+                    .map(|input| self.claim(input, None))
+                    .collect::<Result<Vec<_>>>()?;
+                return extracted.with_new_exprs(extracted.expressions(), inputs);
+            }
+        }
         if !self.pushed {
             let pushed = push_down_filters(&plan);
             if pushed != plan {
@@ -431,7 +689,23 @@ impl Extracted {
                 return self.claim(split, needed);
             }
         }
-        let plan = self.extract(plan)?.data;
+        // Keep the established lowering (including guards and fetch pushdown)
+        // whenever it binds. Seal only the rewrite that still needs fallback;
+        // otherwise successful queries would lose their existing model plans.
+        let extracted = self.extract(plan.clone(), false)?;
+        let plan = if extracted.transformed && refusal(&extracted.data, &self.config)?.is_some() {
+            self.extract(plan, true)?.data
+        } else {
+            extracted.data
+        };
+        if let LogicalPlan::Projection(projection) = &plan
+            && projection
+                .expr
+                .iter()
+                .any(|expr| expr.exists(|inner| Ok(is_ai_call(inner))).unwrap_or(false))
+        {
+            return self.isolate_projection(projection.clone());
+        }
         let inputs: Vec<LogicalPlan> = plan.inputs().into_iter().cloned().collect();
         let claimed = inputs
             .into_iter()
@@ -441,15 +715,14 @@ impl Extracted {
             })
             .collect::<Result<Vec<_>>>()?;
         let kept = plan.with_new_exprs(plan.expressions(), claimed)?;
-        // a part below that Quail lowered holds its calls in `AiNode`s
-        if calls_ai_function(&kept)? {
-            return plan_err!(
-                "{}",
-                refusal.unwrap_or_else(|| format!(
-                    "a model call in this operator {UNSUPPORTED}:\n{}",
-                    plan.display()
-                ))
-            );
+        // Inputs have their own claims. A native score projection can still
+        // hold a raw call until the final claim, so inspect this operator only.
+        if kept
+            .expressions()
+            .iter()
+            .any(|expr| !ai_calls(expr).unwrap_or_default().is_empty())
+        {
+            return plan_err!("Move this model call into a SELECT over a subquery.");
         }
         Ok(kept)
     }
@@ -484,6 +757,18 @@ fn read_calls(expr: &Expr, named: &[(Expr, String)]) -> Result<Expr> {
                 None => Ok(Transformed::no(inner)),
             },
         )?
+        .data
+        .transform_up(|expr| {
+            if crate::functions::function_name(&expr) != Some("hint") {
+                return Ok(Transformed::no(expr));
+            }
+            let mut binder =
+                crate::derive::binding::Binder::new(&(String::new(), String::new()), "ai-if", &[]);
+            let (test, _) = binder
+                .unwrap_hint(&expr)
+                .map_err(|error| datafusion::common::DataFusionError::Plan(error.to_string()))?;
+            Ok(Transformed::yes(test))
+        })?
         .data)
 }
 

@@ -91,6 +91,55 @@ use datafusion::common::tree_node::TreeNode;
 const FILTER_QUERY: &str = "SELECT r.id FROM reviews r \
     WHERE AI.IF(PROMPT('Does this review discuss the ending?\n\n{0}', r.body))";
 
+#[tokio::test]
+async fn outer_ai_on_predicates_plan_without_leaving_calls_in_datafusion() -> Result<()> {
+    let context = context()?;
+    for join_type in ["LEFT", "RIGHT", "FULL"] {
+        let query = format!(
+            "SELECT r.body, a.aspect FROM reviews r {join_type} JOIN aspects a \
+             ON AI.IF(PROMPT('Does {{0}} discuss {{1}}?', r.body, a.aspect))"
+        );
+        let plan = optimized(&context, &query).await?;
+        assert_eq!(regions(&plan).len(), 1, "{}", plan.display_indent());
+        assert_eq!(plan.schema().fields().len(), 2);
+        context.sql(&query).await?.create_physical_plan().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn outer_ai_joins_precompute_nullable_scalar_on_keys() -> Result<()> {
+    let context = context()?;
+    for join_type in ["LEFT", "RIGHT", "FULL"] {
+        let query = format!(
+            "SELECT r.body, a.aspect FROM reviews r {join_type} JOIN aspects a \
+             ON NULLIF(r.body, 'Too long.') = a.aspect \
+             AND AI.IF(PROMPT('Does {{0}} discuss {{1}}?', r.body, a.aspect))"
+        );
+        let plan = optimized(&context, &query).await?;
+        assert_eq!(regions(&plan).len(), 1, "{}", plan.display_indent());
+        context.sql(&query).await?.create_physical_plan().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn conjunctive_ai_on_predicates_plan_without_scalar_model_udfs() -> Result<()> {
+    let context = context()?;
+    for join_type in ["INNER", "LEFT", "RIGHT", "FULL"] {
+        let query = format!(
+            "SELECT r.body, a.aspect FROM reviews r {join_type} JOIN aspects a \
+             ON AI.IF(PROMPT('first {{0}} {{1}}', r.body, a.aspect)) \
+             AND AI.IF(PROMPT('second {{0}} {{1}}', r.body, a.aspect))"
+        );
+        let plan = optimized(&context, &query).await?;
+        assert!(!regions(&plan).is_empty(), "{}", plan.display_indent());
+        assert_eq!(plan.schema().fields().len(), 2);
+        context.sql(&query).await?.create_physical_plan().await?;
+    }
+    Ok(())
+}
+
 #[test]
 fn malformed_environment_options_return_errors() {
     const CHILD: &str = "QUAIL_TEST_INVALID_SESSION_ENV";
@@ -132,6 +181,37 @@ async fn a_filter_query_becomes_one_model_region() -> Result<()> {
 }
 
 #[tokio::test]
+async fn datafusion_tests_score_values_with_other_expressions() -> Result<()> {
+    let context = context()?;
+    for predicate in [
+        "AI.SCORE(PROMPT('Rate {0}', r.body)) > length(r.body) / 100.0",
+        "AI.SCORE(PROMPT('Rate {0}', r.body)) > 0.5 OR r.id = 'r0'",
+    ] {
+        let frame = context
+            .sql(&format!(
+                "SELECT r.id FROM reviews r WHERE {predicate} ORDER BY r.id"
+            ))
+            .await?;
+        let plan = frame.clone().into_optimized_plan()?;
+        assert_eq!(regions(&plan).len(), 1, "{}", plan.display_indent());
+        frame.create_physical_plan().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_scalar_subquery_claims_its_model_work() -> Result<()> {
+    let context = context()?;
+    let frame = context
+        .sql(
+            "SELECT (SELECT COUNT(*) FROM reviews r WHERE AI.IF(PROMPT('Keep {0}?', r.body))) AS n",
+        )
+        .await?;
+    frame.create_physical_plan().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_query_without_ai_calls_has_no_model_region() -> Result<()> {
     let context = context()?;
     let plan = optimized(&context, "SELECT id FROM reviews WHERE id = 'r1'").await?;
@@ -164,6 +244,118 @@ async fn datafusion_groups_the_answers_a_region_returns() -> Result<()> {
             .any(|line| line.starts_with("AiNode: label = ai_classify")),
         "{inner:?}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unnamed_classification_keeps_its_sql_output_name() -> Result<()> {
+    let context = context()?;
+    for function in ["AI.CLASSIFY", "ai_classify"] {
+        let query = format!(
+            "SELECT {function}(PROMPT('Tone of {{0}}?', r.body), ['good', 'bad']) \
+             FROM reviews r"
+        );
+        let frame = context.sql(&query).await?;
+        let name = frame.schema().field(0).name().clone();
+        let plan = frame.into_optimized_plan()?;
+        assert_eq!(plan.schema().field(0).name(), &name);
+        let found = regions(&plan);
+        assert_eq!(found.len(), 1);
+        let (operators, _) = quail_datafusion::derive::derive_region(
+            &found[0],
+            &(String::new(), String::new()),
+            "ai-if",
+        )
+        .unwrap();
+        assert_eq!(operators.classifies.len(), 1);
+        assert!(operators.filters.is_empty());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_projected_ai_if_returns_a_boolean_without_filtering_rows() -> Result<()> {
+    let context = context()?;
+    for expression in [
+        "AI.IF(PROMPT('Does this discuss the ending? {0}', r.body)) AS has_ending",
+        "AI.IF(PROMPT('Does this discuss the ending? {0}', r.body))",
+        "ai_filter(PROMPT('Does this discuss the ending? {0}', r.body))",
+    ] {
+        let query = format!("SELECT r.id, {expression} FROM reviews r");
+        let frame = context.sql(&query).await?;
+        let name = frame.schema().field(1).name().clone();
+        let plan = frame.into_optimized_plan()?;
+        assert_eq!(plan.schema().field(1).name(), &name);
+        assert_eq!(plan.schema().field(1).data_type(), &DataType::Boolean);
+        let found = regions(&plan);
+        assert_eq!(found.len(), 1);
+        let (operators, _) = quail_datafusion::derive::derive_region(
+            &found[0],
+            &(String::new(), String::new()),
+            "ai-if",
+        )
+        .unwrap();
+        let predicates: Vec<_> = operators
+            .filters
+            .iter()
+            .flat_map(|(_, predicates)| predicates)
+            .collect();
+        assert_eq!(predicates.len(), 1);
+        let answer = predicates[0].answer.as_ref().expect("a retained answer");
+        assert!(
+            operators
+                .scans
+                .iter()
+                .all(|scan| !scan.columns.contains(answer))
+        );
+        assert!(
+            quail_planner::results::source_columns(&operators)
+                .iter()
+                .all(|(name, _)| name != answer)
+        );
+        assert!(
+            quail_planner::results::answer_columns(&operators)
+                .iter()
+                .any(|(name, _, kind, _, _)| name == answer && kind == "boolean")
+        );
+        assert!(predicates[0].alternative.is_none());
+        assert!(predicates[0].guard.is_none());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn datafusion_negates_the_boolean_answer_of_ai_if() -> Result<()> {
+    let context = context()?;
+    let query = "SELECT r.id FROM reviews r \
+        WHERE NOT AI.IF(PROMPT('Does this discuss the ending? {0}', r.body))";
+    let plan = optimized(&context, query).await?;
+    let found = regions(&plan);
+    assert_eq!(found.len(), 1);
+    let (operators, _) = quail_datafusion::derive::derive_region(
+        &found[0],
+        &(String::new(), String::new()),
+        "ai-if",
+    )
+    .unwrap();
+    assert!(operators.filters.iter().any(|(_, predicates)| {
+        predicates
+            .iter()
+            .any(|predicate| predicate.answer.is_some())
+    }));
+    assert!(lines(&plan).iter().any(|line| line.starts_with("Filter:")));
+    Ok(())
+}
+
+#[tokio::test]
+async fn ai_if_can_read_a_literal_without_a_from_clause() -> Result<()> {
+    let context = context()?;
+    let query = "SELECT AI.IF(PROMPT('Does this discuss the ending? {0}', 'hello')) AS answer";
+    let plan = optimized(&context, query).await?;
+    assert_eq!(plan.schema().field(0).name(), "answer");
+    assert_eq!(plan.schema().field(0).data_type(), &DataType::Boolean);
+    let found = regions(&plan);
+    assert_eq!(found.len(), 1);
     Ok(())
 }
 

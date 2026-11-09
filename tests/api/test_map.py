@@ -47,6 +47,18 @@ def test_a_map_writes_one_answer_per_document(session):
     assert question_text(tail).endswith(SUMMARY + turn[1] + "ANSWER:")
 
 
+@pytest.mark.parametrize("function", ["AI.MAP", "ai_map"])
+def test_an_unnamed_map_returns_each_answer_under_its_sql_name(session, function):
+    query = session.sql(
+        f"SELECT r.id, {function}(r.body, '{SUMMARY}') FROM reviews r")
+    oracle = Oracle(maps=lambda _spec, document: f"summary {document}")
+    table = finish(query, oracle).collect()
+    rows = zip(table.column(0).to_pylist(), table.column(1).to_pylist())
+    assert sorted(rows) == [(1, "summary 0"), (2, "summary 1"), (3, "summary 2")]
+    assert "map" in table.column_names[1].lower()
+    assert not table.column_names[1].startswith("__quail_")
+
+
 def test_a_map_without_a_limit_writes_up_to_256_tokens(session):
     query = session.sql(
         f"SELECT r.id, AI.MAP(r.body, '{SUMMARY}') AS summary FROM reviews r")
@@ -85,7 +97,6 @@ def test_a_map_after_a_classification_shares_its_pipeline(session):
 @pytest.mark.parametrize("sql, message", [
     (f"SELECT r.id FROM reviews r WHERE AI_MAP(r.body, '{SUMMARY}')",
      "not supported"),
-    (f"SELECT r.id, AI.MAP(r.body, '{SUMMARY}') FROM reviews r", "AS name"),
     (f"SELECT r.id, AI.MAP(r.body, '{SUMMARY}', 0) AS s FROM reviews r",
      "positive integer"),
 ])

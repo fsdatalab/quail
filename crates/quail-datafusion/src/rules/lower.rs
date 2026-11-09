@@ -291,6 +291,7 @@ fn stack_asked(
 struct Columns {
     /// (call, name) of each column call a SELECT list returns.
     selected: Vec<(Expr, String)>,
+    reserved: std::collections::BTreeSet<String>,
     /// How many columns took a name of their own.
     num_unnamed: usize,
     /// How many answers of tests took a name.
@@ -303,11 +304,13 @@ impl Columns {
     /// A name for the answer of an `AI.IF` or `AI.SCORE` test, and the
     /// test's number among the region's AI predicates.
     fn answer_name(&mut self) -> (String, usize) {
-        self.num_answers += 1;
-        (
-            format!("__quail_answer_{}", self.num_answers),
-            self.num_answers,
-        )
+        loop {
+            self.num_answers += 1;
+            let name = format!("__quail_answer_{}", self.num_answers);
+            if self.reserved.insert(name.clone()) {
+                return (name, self.num_answers);
+            }
+        }
     }
 
     /// The number of the next WHERE or ON.
@@ -320,8 +323,13 @@ impl Columns {
         if let Some((_, name)) = self.selected.iter().find(|(found, _)| found == call) {
             return name.clone();
         }
-        self.num_unnamed += 1;
-        format!("__quail_column_{}", self.num_unnamed)
+        loop {
+            self.num_unnamed += 1;
+            let name = format!("__quail_column_{}", self.num_unnamed);
+            if self.reserved.insert(name.clone()) {
+                return name;
+            }
+        }
     }
 }
 
@@ -332,7 +340,8 @@ fn selected_calls(plan: &LogicalPlan) -> Vec<(Expr, String)> {
         if let LogicalPlan::Projection(projection) = node {
             for expr in &projection.expr {
                 if let Expr::Alias(alias) = expr
-                    && column_call_kind(&alias.expr).is_some()
+                    && (column_call_kind(&alias.expr).is_some()
+                        || matches!(function_name(&alias.expr), Some("ai_filter")))
                 {
                     found.push((alias.expr.as_ref().clone(), alias.name.clone()));
                 }
@@ -409,7 +418,8 @@ fn added_column(plan: &LogicalPlan, call: &Expr) -> Option<String> {
     let mut name = None;
     let _ = plan.apply(|node| {
         if let Some(column) = as_node::<AiNode>(node)
-            && !column.is_predicate()
+            && (!column.is_predicate()
+                || (column.function() == "ai_filter" && column.filter.is_none()))
             && column.call == *call
         {
             name = Some(column.answer.clone());
@@ -671,6 +681,126 @@ fn lower_join(join: &Join, columns: &mut Columns) -> Result<Transformed<LogicalP
     )?))
 }
 
+/// Give a fallback call one document per row, even when its prompt reads
+/// several columns. The original question still refers to labeled documents.
+fn combine_prompt_documents(
+    prompt: &mut datafusion::logical_expr::expr::ScalarFunction,
+) -> Result<()> {
+    use datafusion::logical_expr::lit;
+    if prompt.args.len() <= 2 {
+        return Ok(());
+    }
+    let Some(Expr::Literal(value, _)) = prompt.args.first() else {
+        return Ok(()); // The binder reports a nonliteral template.
+    };
+    let Some(template) = value.try_as_str().flatten() else {
+        return Ok(());
+    };
+    quail_planner::prompts::check_placeholders(template, prompt.args.len() - 1)
+        .map_err(|error| datafusion::common::DataFusionError::Plan(error.to_string()))?;
+    let mut question = template.to_string();
+    let mut documents = Vec::new();
+    for (index, document) in prompt.args.iter().skip(1).enumerate() {
+        question = question.replace(&format!("{{{index}}}"), &format!("DOCUMENT {index}"));
+        documents.push(lit(format!("\n\nDOCUMENT {index}:\n")));
+        documents.push(document.clone());
+    }
+    prompt.args = vec![
+        lit(format!("{{0}}\n\n{question}")),
+        datafusion::functions::string::expr_fn::concat(documents),
+    ];
+    Ok(())
+}
+
+/// Compute document expressions in DataFusion before binding their model calls.
+/// Even a SELECT without FROM has one input row, which the region can identify.
+pub(crate) fn precompute_prompt_arguments(projection: Projection) -> Result<Projection> {
+    let mut computed: Vec<(Expr, String)> = Vec::new();
+    let mut compute = |argument: &mut Expr| {
+        if matches!(argument, Expr::Column(_) | Expr::OuterReferenceColumn(..)) {
+            return;
+        }
+        let name = match computed.iter().find(|(found, _)| found == argument) {
+            Some((_, name)) => name.clone(),
+            None => {
+                let mut index = computed.len();
+                let name = loop {
+                    let name = format!("__quail_argument_{index}");
+                    if !projection
+                        .input
+                        .schema()
+                        .has_column_with_unqualified_name(&name)
+                        && !computed.iter().any(|(_, found)| *found == name)
+                    {
+                        break name;
+                    }
+                    index += 1;
+                };
+                computed.push((argument.clone(), name.clone()));
+                name
+            }
+        };
+        *argument = Expr::Column(Column::from_name(name));
+    };
+    let exprs = projection
+        .expr
+        .iter()
+        .map(|expr| {
+            let mapped = expr
+                .clone()
+                .transform_down(|expr| {
+                    if !crate::functions::is_ai_call(&expr) {
+                        return Ok(Transformed::no(expr));
+                    }
+                    let Expr::ScalarFunction(mut call) = expr else {
+                        unreachable!()
+                    };
+                    let document_call = matches!(
+                        call.name(),
+                        "ai_classify"
+                            | "ai_extract"
+                            | "ai_extract_span"
+                            | "ai_map"
+                            | "ai_sae_features"
+                    );
+                    if let Some(argument) = call.args.first_mut() {
+                        if let Expr::ScalarFunction(prompt) = argument
+                            && prompt.name() == "prompt"
+                        {
+                            combine_prompt_documents(prompt)?;
+                            for document in prompt.args.iter_mut().skip(1) {
+                                compute(document);
+                            }
+                        } else if document_call {
+                            compute(argument);
+                        }
+                    }
+                    // Nested calls belong to the computed input, not this projection.
+                    Ok(Transformed::new(
+                        Expr::ScalarFunction(call),
+                        true,
+                        TreeNodeRecursion::Jump,
+                    ))
+                })?
+                .data;
+            mapped.alias_if_changed(expr.schema_name().to_string())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if computed.is_empty() {
+        return Ok(projection);
+    }
+    let mut input: Vec<Expr> = projection
+        .input
+        .schema()
+        .columns()
+        .into_iter()
+        .map(Expr::Column)
+        .collect();
+    input.extend(computed.into_iter().map(|(expr, name)| expr.alias(name)));
+    let input = LogicalPlan::Projection(Projection::try_new(input, projection.input)?);
+    Projection::try_new(exprs, Arc::new(input))
+}
+
 fn lower_projection(
     projection: &Projection,
     columns: &mut Columns,
@@ -678,12 +808,21 @@ fn lower_projection(
     let mut input = projection.input.as_ref().clone();
     let mut exprs = Vec::new();
     let mut changed = false;
-    for expr in &projection.expr {
+    for original in &projection.expr {
+        let named;
+        let expr = if crate::functions::is_ai_call(original) {
+            named = original.clone().alias(original.schema_name().to_string());
+            &named
+        } else {
+            original
+        };
         let Expr::Alias(alias) = expr else {
             exprs.push(expr.clone());
             continue;
         };
-        if !(column_call_kind(&alias.expr).is_some() || is_span_call(&alias.expr))
+        if !(column_call_kind(&alias.expr).is_some()
+            || is_span_call(&alias.expr)
+            || matches!(function_name(&alias.expr), Some("ai_filter")))
             || alias.relation.is_some()
             || alias.metadata.is_some()
         {
@@ -739,8 +878,19 @@ fn lower_projection(
 ///
 /// A rewritten operator's schema does not fit DataFusion's rules.
 pub fn lower_ai_calls(plan: LogicalPlan) -> Result<LogicalPlan> {
+    let mut reserved = std::collections::BTreeSet::new();
+    plan.apply(|node| {
+        reserved.extend(
+            node.schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().clone()),
+        );
+        Ok(TreeNodeRecursion::Continue)
+    })?;
     let mut columns = Columns {
         selected: selected_calls(&plan),
+        reserved,
         num_unnamed: 0,
         num_answers: 0,
         num_clauses: 0,

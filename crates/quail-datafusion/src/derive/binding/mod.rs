@@ -10,7 +10,7 @@ use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::common::Column;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::logical_expr::Expr;
-use quail_planner::error::{CompileError, compile_error};
+use quail_planner::error::CompileError;
 use quail_planner::expressions::repr_str;
 use quail_planner::operators::{Scan, ScanColumn, Schema};
 use quail_planner::physical::{ColumnRef, GetField, ModelCall, ValueExpression};
@@ -24,8 +24,8 @@ use select::{select_outputs, selected_calls};
 /// A condition and the selectivity its HINT gives, if any.
 pub(crate) type Hinted = (ValueExpression, Option<f64>);
 
-pub(crate) fn unsupported<T>(what: &str) -> Result<T, CompileError> {
-    Err(CompileError::unsupported(what))
+pub(crate) fn unsupported<T>(message: &str) -> Result<T, CompileError> {
+    Err(CompileError::unsupported(message))
 }
 
 /// Whether `expr` or an expression inside it is one `found` accepts.
@@ -89,7 +89,7 @@ impl Binder {
         schema: SchemaRef,
     ) -> Result<(), CompileError> {
         if self.provider(alias).is_some() {
-            return compile_error(format!("duplicate table alias {}", repr_str(alias)));
+            return unsupported("DataFusion must keep repeated table aliases in separate scopes.");
         }
         self.tables
             .push((alias.to_string(), provider.to_string(), schema));
@@ -108,21 +108,19 @@ impl Binder {
                     .filter(|(_, _, schema)| schema.field_with_name(&column.name).is_ok())
                     .collect();
                 if owners.len() != 1 {
-                    return compile_error(format!(
-                        "column {} is {}; qualify it with a table alias",
-                        repr_str(&column.name),
-                        if owners.is_empty() {
-                            "unknown"
-                        } else {
-                            "ambiguous"
-                        }
+                    return unsupported(&format!(
+                        "DataFusion must resolve column {} outside this model region.",
+                        repr_str(&column.name)
                     ));
                 }
                 owners[0].0.clone()
             }
         };
         let Some(provider) = self.provider(&alias) else {
-            return compile_error(format!("unknown table alias {}", repr_str(&alias)));
+            return unsupported(&format!(
+                "DataFusion must materialize table alias {}.",
+                repr_str(&alias)
+            ));
         };
         Ok(ColumnRef {
             alias,
@@ -175,7 +173,9 @@ impl Binder {
         if contains(expr, |inner| {
             function_name(inner).is_some_and(|name| name.starts_with("ai_") || name == "prompt")
         }) {
-            return compile_error(format!("{expr} is not a value expression"));
+            return unsupported(
+                "DataFusion must evaluate this expression outside the model region.",
+            );
         }
         self.computed(expr)
     }
@@ -207,7 +207,9 @@ impl Binder {
                     | Expr::Placeholder(_)
             )
         }) {
-            return compile_error(format!("{expr} is not a value expression"));
+            return unsupported(
+                "DataFusion must evaluate this expression outside the model region.",
+            );
         }
         crate::derive::expressions::expression(&expr, |column| {
             let reference = self.resolve_column(column)?;
@@ -233,8 +235,8 @@ impl Binder {
             .and_then(|(_, _, schema)| schema.field_with_name(&reference.column).ok())
             .map(|field| field.data_type().clone())
             .ok_or_else(|| {
-                CompileError::new(format!(
-                    "column {} has no type the planner knows",
+                CompileError::unsupported(format!(
+                    "DataFusion must resolve the type of column {} outside the model region.",
                     repr_str(&reference.name(true))
                 ))
             })

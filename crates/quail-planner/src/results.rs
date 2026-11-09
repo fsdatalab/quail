@@ -52,6 +52,7 @@ pub fn region_structs(found: &Operators) -> Vec<(String, Vec<(String, String)>)>
 
 /// Each region column a source expression computes, by name.
 pub fn source_columns(found: &Operators) -> Vec<(String, ValueExpression)> {
+    let answers = found.filter_answers();
     let projected = found
         .projection
         .columns
@@ -62,7 +63,12 @@ pub fn source_columns(found: &Operators) -> Vec<(String, ValueExpression)> {
         });
     let mut found: Vec<(String, ValueExpression)> = Vec::new();
     for expression in projected {
-        if column_references(expression).is_empty() {
+        let references = column_references(expression);
+        if references.is_empty()
+            || references.iter().any(|reference| {
+                answers.contains(&(reference.alias.as_str(), reference.column.as_str()))
+            })
+        {
             continue;
         }
         let name = column_name(expression, true);
@@ -92,6 +98,17 @@ pub fn answer_columns(found: &Operators) -> Vec<AnswerColumn> {
             None => columns.push(entry),
         }
     };
+    for (_, predicates) in &found.filters {
+        for predicate in predicates {
+            if let Some(name) = &predicate.answer {
+                put(
+                    name.clone(),
+                    crate::expressions::asked_call(&predicate.expression),
+                    true,
+                );
+            }
+        }
+    }
     for column in &found.classifies {
         let call = &column.call;
         put(column.name.clone(), call, true);

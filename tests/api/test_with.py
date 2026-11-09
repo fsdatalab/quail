@@ -10,7 +10,6 @@ import quail
 from quail.api import execute as execution
 from quail.api.config import EngineConfig
 from quail.catalog import DocumentProvider
-from quail.common.expressions import CompileError
 
 CONTRACTS = pa.table({
     "id": [1, 2, 3],
@@ -166,11 +165,17 @@ def test_a_cte_that_classifies_returns_the_columns_its_reader_names(session):
         "k.id": [1, 3], "k.kind": ["lease", "lease"]}
 
 
-def test_a_cte_read_through_a_join_that_reuses_the_readers_alias_is_refused(session):
-    with pytest.raises(CompileError, match="duplicate table alias 'c'"):
-        session.sql("""
-            WITH kept AS (
-                SELECT c.id, c.text FROM contracts c
-                WHERE AI.IF(PROMPT('keep {0}', c.text)))
-            SELECT k.id, c.text FROM kept k JOIN contracts c ON k.id = c.id
-        """)
+@pytest.mark.parametrize("accepted", [True, False])
+def test_a_cte_join_can_reuse_an_alias_from_the_ctes_scope(session, accepted):
+    query = session.sql("""
+        WITH kept AS (
+            SELECT c.id, c.text FROM contracts c
+            WHERE AI.IF(PROMPT('keep {0}', c.text)))
+        SELECT k.id AS contract_id, c.text AS contract_text
+        FROM kept k JOIN contracts c ON k.id = c.id ORDER BY k.id
+    """)
+    result, _ = run(query, Oracle(filters=lambda *_: accepted))
+    assert result.collect().to_pylist() == ([
+        {"contract_id": row["id"], "contract_text": row["text"]}
+        for row in CONTRACTS.to_pylist()
+    ] if accepted else [])

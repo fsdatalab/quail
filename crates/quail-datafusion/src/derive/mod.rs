@@ -69,8 +69,8 @@ pub fn derive_region(
     turn: &Turn,
     layout: &str,
 ) -> Result<(Operators, LogicalPlan), CompileError> {
-    let plan =
-        as_bound(region.plan.clone()).map_err(|error| CompileError::new(error.to_string()))?;
+    let plan = as_bound(region.plan.clone())
+        .map_err(|error| CompileError::unsupported(error.to_string()))?;
     if let Some(found) = crate::derive::similar::similar_calls(&plan)
         .into_iter()
         .find(|found| found.likeness == crate::derive::similar::Likeness::Spelling)
@@ -88,7 +88,7 @@ pub fn derive_region(
         .any(|predicate| predicate.alternative.is_some());
     if ored && operators.fetch.is_some() {
         // the executor counts the rows that pass among the rows it asks
-        return unsupported("a LIMIT over an OR of an AI filter and other tests");
+        return unsupported("LIMIT over an OR filter must run in DataFusion.");
     }
     Ok((operators, plan))
 }
@@ -210,6 +210,17 @@ fn derive_operators(
         .collect();
     let mut binder = Binder::new(turn, layout, &select);
     let relation = Relation::bind(&walk, &mut binder, &answers)?;
+    let select: Vec<Expr> = select
+        .iter()
+        .map(|expr| {
+            let bound = walk.filter_answers(expr, &mut binder);
+            if bound == *expr {
+                bound
+            } else {
+                bound.alias(expr.schema_name().to_string())
+            }
+        })
+        .collect();
     let Selected {
         columns,
         structs,
@@ -227,12 +238,12 @@ fn derive_operators(
         return Err(unplaced(plan));
     }
     if columns.is_empty() {
-        return compile_error("Project needs at least one column");
+        return unsupported("DataFusion must run a projection without output columns.");
     }
     if let Some(test) = assembly.conditions.rows.first() {
         // DataFusion runs a test of the result rows above the region
         return unsupported(&format!(
-            "the test {} of the result rows inside a model region",
+            "DataFusion must evaluate the result-row test {}.",
             condition_text(test)
         ));
     }
@@ -253,19 +264,18 @@ fn derive_operators(
         .collect();
     found.fetch = fetch;
     if found.fetch.is_some_and(|limit| limit <= 0) {
-        return compile_error("LIMIT must be a positive integer");
+        return unsupported("DataFusion must apply a non-positive LIMIT outside the model region.");
     }
     if allow_relational && quail_planner::plan_statistics::plan_prompts(&found).is_empty() {
-        return compile_error("the query has no AI predicate");
+        return unsupported("DataFusion must run this region because it has no model call.");
     }
     push_down_columns(&mut found, &walk, &assembly);
     Ok(found)
 }
 
 /// The refusal of a plan whose operators Quail's operators do not read.
-fn unplaced(plan: &LogicalPlan) -> CompileError {
-    CompileError::unsupported("the placement of these operators")
-        .with_context(plan.display_indent())
+fn unplaced(_plan: &LogicalPlan) -> CompileError {
+    CompileError::unsupported("These operators must run outside the model region.")
 }
 
 /// Values kept per table alias, in the order the aliases first appear.

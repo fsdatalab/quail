@@ -132,6 +132,9 @@ impl<'w, 'a> Assembly<'w, 'a> {
                         self.place_filters(id)?;
                     }
                 }
+                // Scores returned as values use the existing projected-score
+                // operator; this node keeps their SQL position during optimization.
+                Kind::Ai(node) if node.function() == "ai_score" => {}
                 Kind::Ai(node) => self.place_column(id, node)?,
                 _ => {}
             }
@@ -581,8 +584,9 @@ pub(super) fn push_down_columns(
                 columns
                     .iter()
                     .filter(|column| {
-                        !sources.contains(column)
-                            || valued.contains(&(alias.clone(), (*column).clone()))
+                        !answers.contains(&(alias.as_str(), column.as_str()))
+                            && (!sources.contains(column)
+                                || valued.contains(&(alias.clone(), (*column).clone())))
                     })
                     .cloned()
                     .collect()

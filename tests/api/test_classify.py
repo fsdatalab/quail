@@ -13,7 +13,7 @@ import quail
 # one token per word: refund=1, request=2, status=3, shipping=4
 from quail.api.config import EngineConfig
 from quail.catalog import DocumentProvider
-from quail.common.expressions import Alias, CompileError
+from quail.common.expressions import Alias
 from quail.physical import (
     AiClassify,
     AiJoin,
@@ -206,10 +206,17 @@ def test_sql_classifies_and_tests_labels(session):
         equal = session.sql(f"SELECT d.id FROM documents d WHERE {form}")
         (predicate,) = column_tests(operators_of(equal))
         assert predicate.labels == ("refund",)
-    for bad in (f"SELECT d.id, {call} FROM documents d",
-                f"SELECT d.id FROM documents d WHERE {call} IN (1)"):
-        with pytest.raises(CompileError):
-            session.sql(bad)
+    unnamed = session.sql(f"SELECT d.id, {call} FROM documents d ORDER BY d.id")
+    rows = finish(unnamed, Oracle(labels=lambda *_: "refund")).collect()
+    assert list(zip(*(column.to_pylist() for column in rows.columns))) == [
+        (7, "refund"), (9, "refund")]
+    assert "classify" in rows.column_names[1].lower()
+    assert not rows.column_names[1].startswith("__quail_")
+    numeric = session.sql(
+        "SELECT d.id FROM documents d WHERE "
+        "AI.CLASSIFY(PROMPT('Number {0}', d.body), ['1', '2']) IN (1) ORDER BY d.id")
+    # DataFusion owns SQL coercion; numeric label strings can be compared to numbers.
+    assert finish(numeric, Oracle(labels=lambda *_: "1")).to_rows() == [(7,), (9,)]
 
 
 def test_sql_classifies_the_rows_a_join_keeps(session, tmp_path):

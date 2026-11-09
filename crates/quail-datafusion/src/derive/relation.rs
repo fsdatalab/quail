@@ -123,8 +123,8 @@ impl Relation {
                 })
                 .count();
             if num_asked > 1 {
-                return compile_error(format!(
-                    "JOIN {} has {num_asked} AI predicates in ON; ask one question per JOIN",
+                return unsupported(&format!(
+                    "The {num_asked} model predicates in JOIN {} must run in separate regions.",
                     written.on.as_deref().unwrap_or_default()
                 ));
             }
@@ -195,8 +195,9 @@ impl Relation {
                         Some(binder.bind_condition(&rest)?)
                     }
                     None => {
-                        self.unplaced = true;
-                        return Ok(());
+                        return unsupported(
+                            "DataFusion must evaluate this condition over the model's Boolean answer.",
+                        );
                     }
                 }
             }
@@ -251,7 +252,7 @@ impl Relation {
         }
         if alternative.is_some() || guard.is_some() || answer.is_some() {
             return unsupported(&format!(
-                "{}, an OR of an AI join and other tests,",
+                "DataFusion must evaluate the disjunction {} over joined model results.",
                 walk.written(node.filter.as_ref().unwrap_or(&node.call), &[])
             ));
         }
@@ -280,11 +281,7 @@ impl Relation {
             let (call, labels, selectivity) = binder.bind_label_test(classify, &items, hint)?;
             let read = call_aliases(&call);
             if read.len() != 1 {
-                return compile_error(format!(
-                    "a filter on a label tests a one-document classification; this one \
-                     classifies pairs of {}",
-                    repr_tuple(&read)
-                ));
+                return unsupported("DataFusion must evaluate this label test over joined rows.");
             }
             push(&mut self.label_tests, &read[0], (call, labels, selectivity));
             return Ok(());
@@ -323,10 +320,7 @@ fn gate(
         [first, second] if first == inner => second.clone(),
         [first, second] if second == inner => first.clone(),
         _ => {
-            return compile_error(
-                "the EXISTS predicate must reference the inner provider and exactly one outer \
-                 provider",
-            );
+            return unsupported("DataFusion must evaluate this EXISTS over the model results.");
         }
     };
     if let Some(anchor) = anchor
@@ -396,19 +390,16 @@ fn join_spec(
         }
     }
     if !spec.on.is_empty() && aliases.len() != 2 {
-        return compile_error(format!(
-            "join conditions are supported on two-table AI predicates; this one names {}",
-            repr_tuple(aliases)
-        ));
+        return unsupported(
+            "DataFusion must evaluate join conditions involving more than two model inputs.",
+        );
     }
     for condition in &spec.on {
         let sides = [&condition.left, &condition.right].map(column_alias_of);
         if !sides.iter().all(|side| aliases.contains(side)) {
-            return compile_error(format!(
-                "join condition {} names a table the AI predicate over {} does not",
-                equality_text(condition),
-                repr_tuple(aliases)
-            ));
+            return unsupported(
+                "DataFusion must evaluate a join condition that reads other model inputs.",
+            );
         }
     }
     Ok(spec)
@@ -433,14 +424,12 @@ pub(super) fn check_joins(
             .iter()
             .any(|score| call_aliases(score).contains(alias))
         {
-            return compile_error(format!(
-                "JOIN {alias} ON {first} projects a pair AI.SCORE; a projected pair score runs \
-                 over CROSS JOIN, and an ON equality is supported when the score is compared \
-                 in ON"
-            ));
+            return unsupported(
+                "DataFusion must join the rows before this projected pair score is computed.",
+            );
         }
         return unsupported(&format!(
-            "JOIN {alias} ON {first} without an AI predicate over its pairs"
+            "JOIN {alias} ON {first} has no AI predicate over its pairs."
         ));
     }
     let mut predicates: Vec<BTreeSet<String>> = joins
@@ -467,7 +456,7 @@ pub(super) fn check_joins(
         .collect();
     if !uncovered.is_empty() {
         return unsupported(&format!(
-            "JOINed tables {} with no AI predicate over their pairs",
+            "Joined tables {} have no AI predicate over their pairs.",
             repr_list(&uncovered)
         ));
     }
@@ -488,9 +477,8 @@ pub(super) fn check_joins(
         .collect();
     if !disconnected.is_empty() {
         let disconnected: Vec<String> = disconnected.into_iter().cloned().collect();
-        return compile_error(format!(
-            "join predicates do not connect {} to the FROM table {}: the predicates' tables \
-             must form one connected graph with it",
+        return unsupported(&format!(
+            "DataFusion must join the disconnected model inputs {} to {}.",
             repr_list(&disconnected),
             repr_str(root)
         ));
@@ -521,9 +509,7 @@ pub(super) fn check_calls(
         )
         .collect();
     if scores.contains(&true) && scores.contains(&false) {
-        return compile_error(
-            "AI.SCORE cannot be mixed with generative AI predicates in one query",
-        );
+        return unsupported("Scores and generative model calls must run in separate regions.");
     }
     let asks = !(joins.is_empty()
         && filters.is_empty()
@@ -531,10 +517,7 @@ pub(super) fn check_calls(
         && projected.is_empty()
         && tested.is_empty());
     if !(allow_relational || asks) {
-        return compile_error(
-            "the query has no AI predicate; a plain scan belongs in the database the ids came \
-             from",
-        );
+        return unsupported("DataFusion must run this region because it has no model call.");
     }
     Ok(())
 }

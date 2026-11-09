@@ -20,7 +20,9 @@ use datafusion::arrow::array::{ArrayRef, Int64Array, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, Field, SchemaRef};
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::TreeNodeRecursion;
-use datafusion::common::{DFSchema, DFSchemaRef, DataFusionError, Result, internal_err};
+use datafusion::common::{
+    DFSchema, DFSchemaRef, DataFusionError, Result, TableReference, internal_err,
+};
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore};
@@ -42,7 +44,10 @@ pub const ROW_COLUMN: &str = "__quail_row";
 
 /// The field of [`ROW_COLUMN`].
 pub(crate) fn row_field() -> Field {
-    Field::new(ROW_COLUMN, DataType::Int64, false)
+    Field::new(ROW_COLUMN, DataType::Int64, false).with_metadata(HashMap::from([(
+        "quail.row_identity".to_string(),
+        "true".to_string(),
+    )]))
 }
 
 static NEXT_KEY: AtomicU64 = AtomicU64::new(0);
@@ -55,6 +60,8 @@ pub struct SharedInput {
     pub input: LogicalPlan,
     /// Whether the rows get [`ROW_COLUMN`].
     pub numbered: bool,
+    /// An opaque output scope for completed fallback values.
+    scope: Option<TableReference>,
     schema: DFSchemaRef,
 }
 
@@ -67,10 +74,22 @@ impl SharedInput {
     /// The input already has a column named [`ROW_COLUMN`].
     pub fn try_new(input: LogicalPlan, numbered: bool) -> Result<Self> {
         let key = NEXT_KEY.fetch_add(1, Ordering::Relaxed);
-        Self::with_key(key, input, numbered)
+        Self::with_key(key, input, numbered, None)
     }
 
-    fn with_key(key: u64, input: LogicalPlan, numbered: bool) -> Result<Self> {
+    /// Completed values in a new scope: SQL expressions consume these outputs,
+    /// not the identity columns in the region's internal restoring joins.
+    pub(super) fn scoped(input: LogicalPlan, scope: String) -> Result<Self> {
+        let key = NEXT_KEY.fetch_add(1, Ordering::Relaxed);
+        Self::with_key(key, input, false, Some(TableReference::bare(scope)))
+    }
+
+    fn with_key(
+        key: u64,
+        input: LogicalPlan,
+        numbered: bool,
+        scope: Option<TableReference>,
+    ) -> Result<Self> {
         let mut schema = input.schema().as_ref().clone();
         if numbered {
             let row = DFSchema::from_unqualified_fields(vec![row_field()].into(), HashMap::new())?;
@@ -79,10 +98,14 @@ impl SharedInput {
                 return internal_err!("the input already has a column {ROW_COLUMN}");
             }
         }
+        if let Some(scope) = &scope {
+            schema = schema.replace_qualifier(scope.clone());
+        }
         Ok(Self {
             key,
             input,
             numbered,
+            scope,
             schema: Arc::new(schema),
         })
     }
@@ -90,7 +113,10 @@ impl SharedInput {
 
 impl PartialEq for SharedInput {
     fn eq(&self, other: &Self) -> bool {
-        self.key == other.key && self.numbered == other.numbered && self.input == other.input
+        self.key == other.key
+            && self.numbered == other.numbered
+            && self.scope == other.scope
+            && self.input == other.input
     }
 }
 
@@ -100,6 +126,7 @@ impl Hash for SharedInput {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.key.hash(state);
         self.numbered.hash(state);
+        self.scope.hash(state);
     }
 }
 
@@ -139,7 +166,7 @@ impl UserDefinedLogicalNodeCore for SharedInput {
         let Ok([input]) = <[LogicalPlan; 1]>::try_from(inputs) else {
             return internal_err!("SharedInput reads one input");
         };
-        Self::with_key(self.key, input, self.numbered)
+        Self::with_key(self.key, input, self.numbered, self.scope.clone())
     }
 }
 

@@ -77,6 +77,16 @@ pub(super) fn precompute_plain_expressions(plan: LogicalPlan) -> Result<LogicalP
     if tables.is_empty() {
         return Ok(plan);
     }
+    let mut reserved = std::collections::BTreeSet::new();
+    plan.apply(|node| {
+        reserved.extend(
+            node.schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().clone()),
+        );
+        Ok(TreeNodeRecursion::Continue)
+    })?;
     // (table, expression, column name), in the order first seen
     let mut computed: Vec<(TableReference, Expr, String)> = Vec::new();
     let mut find = |expr: &Expr| {
@@ -99,7 +109,14 @@ pub(super) fn precompute_plain_expressions(plan: LogicalPlan) -> Result<LogicalP
                 return Ok(TreeNodeRecursion::Continue);
             }
             if !computed.iter().any(|(_, found, _)| found == inner) {
-                let name = format!("__quail_expr_{}", computed.len());
+                let mut index = computed.len();
+                let name = loop {
+                    let candidate = format!("__quail_expr_{index}");
+                    if reserved.insert(candidate.clone()) {
+                        break candidate;
+                    }
+                    index += 1;
+                };
                 computed.push((table, inner.clone(), name));
             }
             Ok(TreeNodeRecursion::Jump)
@@ -301,6 +318,10 @@ fn is_subquery_expr(expr: &Expr) -> bool {
 fn single_scan(plan: &LogicalPlan) -> Option<TableScan> {
     let mut scans = Vec::new();
     plan.apply(|node| {
+        // Shared rows have their own identity, not the source table's key.
+        if crate::extension::as_node::<super::shared::SharedInput>(node).is_some() {
+            return Ok(TreeNodeRecursion::Jump);
+        }
         if let LogicalPlan::TableScan(scan) = node {
             scans.push(scan.clone());
         }
@@ -337,7 +358,16 @@ pub(super) fn numbered(plan: &LogicalPlan) -> Vec<String> {
     let mut found = Vec::new();
     let _ = plan.apply(|node| {
         if let LogicalPlan::TableScan(scan) = node
-            && scan.source.schema().index_of(ROW_COLUMN).is_ok()
+            && scan
+                .source
+                .schema()
+                .field_with_name(ROW_COLUMN)
+                .is_ok_and(|field| {
+                    field
+                        .metadata()
+                        .get("quail.row_identity")
+                        .is_some_and(|value| value == "true")
+                })
         {
             found.push(scan.table_name.table().to_string());
         }

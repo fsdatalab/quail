@@ -46,4 +46,4 @@ pub mod stages;
 pub mod statistics;
 pub mod validation;
 
-pub use error::{CompileError, ErrorKind, Refusal, UNSUPPORTED, compile_error};
+pub use error::{CompileError, ErrorKind, Refusal, compile_error};

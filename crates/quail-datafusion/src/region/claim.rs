@@ -10,7 +10,7 @@ use datafusion::logical_expr::{Expr, LogicalPlan, Projection};
 use datafusion::optimizer::{
     Analyzer, Optimizer, OptimizerConfig, OptimizerContext, OptimizerRule,
 };
-use quail_planner::error::{CompileError, UNSUPPORTED};
+use quail_planner::error::CompileError;
 
 use super::ModelRegion;
 use super::inputs::{numbered, split_inputs};
@@ -61,7 +61,13 @@ impl OptimizerRule for ClaimModelRegions {
         config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
         if !calls_ai(&plan)? {
-            return Ok(Transformed::no(plan));
+            // Fallback columns may already be sealed by the analyzer.
+            let cleaned = drop_unread_probabilities(plan.clone())?;
+            return Ok(if cleaned == plan {
+                Transformed::no(plan)
+            } else {
+                Transformed::yes(cleaned)
+            });
         }
         let optimized =
             Optimizer::with_rules(self.rules.clone()).optimize(plan, config, |_, _| {})?;
@@ -163,6 +169,37 @@ fn claim_regions(plan: LogicalPlan, fetch: Option<usize>) -> Result<LogicalPlan>
     if !calls_ai(&plan)? {
         return Ok(plan);
     }
+    // Expression subqueries are not plan inputs. Claim their model work
+    // explicitly, including scalar subqueries that DataFusion keeps intact.
+    let plan = plan
+        .map_expressions(|expr| {
+            expr.transform_up(|expr| match expr {
+                Expr::ScalarSubquery(mut found) => {
+                    found.subquery =
+                        Arc::new(claim_regions(found.subquery.as_ref().clone(), None)?);
+                    Ok(Transformed::yes(Expr::ScalarSubquery(found)))
+                }
+                Expr::InSubquery(mut found) => {
+                    found.subquery.subquery = Arc::new(claim_regions(
+                        found.subquery.subquery.as_ref().clone(),
+                        None,
+                    )?);
+                    Ok(Transformed::yes(Expr::InSubquery(found)))
+                }
+                Expr::Exists(mut found) => {
+                    found.subquery.subquery = Arc::new(claim_regions(
+                        found.subquery.subquery.as_ref().clone(),
+                        None,
+                    )?);
+                    Ok(Transformed::yes(Expr::Exists(found)))
+                }
+                other => Ok(Transformed::no(other)),
+            })
+        })?
+        .data;
+    if !calls_ai(&plan)? {
+        return Ok(plan);
+    }
     let mut refused = None;
     if !kept_by_datafusion(&plan)? {
         let selected = select_list(plan.clone(), None)?;
@@ -204,7 +241,7 @@ fn claim_regions(plan: LogicalPlan, fetch: Option<usize>) -> Result<LogicalPlan>
         return plan_err!(
             "{}",
             refused.unwrap_or_else(|| format!(
-                "a model call in this operator {UNSUPPORTED}:\n{}",
+                "This operator cannot contain a model call:\n{}",
                 plan.display()
             ))
         );
@@ -217,6 +254,79 @@ fn claim_regions(plan: LogicalPlan, fetch: Option<usize>) -> Result<LogicalPlan>
         .map(|input| claim_regions(input, passed))
         .collect::<Result<Vec<_>>>()?;
     plan.with_new_exprs(plan.expressions(), inputs)
+}
+
+/// Check a refused placeholder trial against the real lowered inputs. Optimizer
+/// rewrites can move computed columns into those inputs, making the native plan
+/// bind even when the placeholder-only trial could not see them.
+pub(super) fn native_plan_fits(plan: &LogicalPlan, config: &ConfigOptions) -> bool {
+    let context = OptimizerContext::new_with_config_options(Arc::new(config.clone()));
+    let claimed = Analyzer::new()
+        .execute_and_check(plan.clone(), config, |_, _| {})
+        .and_then(|plan| {
+            Optimizer::with_rules(crate::rules::default_rules()).optimize(plan, &context, |_, _| {})
+        })
+        .and_then(|plan| claim_regions(plan, None));
+    let Ok(claimed) = claimed else { return false };
+    if calls_ai(&claimed).unwrap_or(true) {
+        return false;
+    }
+    !claimed
+        .exists(|node| {
+            Ok(as_node::<ModelRegion>(node)
+                .is_some_and(|region| derive_error(&region.plan).is_some()))
+        })
+        .unwrap_or(true)
+}
+
+/// Seal a fallback column before optimization can absorb the surrounding SQL
+/// expression into it again. Its rows are normal staged DataFusion inputs.
+pub(super) fn claim_isolated(
+    bound: LogicalPlan,
+    inputs: Vec<(String, LogicalPlan)>,
+    config: &ConfigOptions,
+) -> Result<LogicalPlan> {
+    let lowered = crate::lower_ai_calls(bound)?;
+    let coerced = Analyzer::new().execute_and_check(lowered, config, |_, _| {})?;
+    let context = OptimizerContext::new_with_config_options(Arc::new(config.clone()));
+    let optimized = Optimizer::with_rules(crate::rules::default_rules()).optimize(
+        coerced,
+        &context,
+        |_, _| {},
+    )?;
+    let bound = select_list(optimized, None)?;
+    let numbered_inputs = numbered(&bound);
+    let (bound, above) = lift_relational(bound)?;
+    let names = inputs
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    let (bound, back) = join_back(bound, &names)?;
+    if let Some(error) = derive_error(&bound) {
+        return plan_err!("{}", error.message());
+    }
+    let shared = back.inputs();
+    let mut region = ModelRegion::new(bound);
+    let mut read = Vec::new();
+    for (name, input) in inputs {
+        // Lowering's native trial optimizes a copy; these staged inputs still
+        // need those same rules before they can be claimed early.
+        let input = Analyzer::new().execute_and_check(input, config, |_, _| {})?;
+        let input = Optimizer::with_rules(crate::rules::default_rules()).optimize(
+            input,
+            &context,
+            |_, _| {},
+        )?;
+        let mut input = claim_regions(input, None)?;
+        let numbered = numbered_inputs.contains(&name);
+        if numbered || shared.contains(&name) {
+            input = extension_node(SharedInput::try_new(input, numbered)?);
+        }
+        read.push((name.clone(), input.clone()));
+        region.inputs.push(input);
+        region.input_names.push(name);
+    }
+    above.build(back.build(extension_node(region), &read)?)
 }
 
 /// The most rows `plan`'s operator reads from its input, when it is a
@@ -281,9 +391,11 @@ pub(super) fn kept_by_datafusion(plan: &LogicalPlan) -> Result<bool> {
 /// test of a feature list that is not unnested; DataFusion's own error
 /// would follow from the same query.
 pub(super) fn refusal(plan: &LogicalPlan, config: &ConfigOptions) -> Result<Option<String>> {
-    // a part that does not lower or optimize fails when its region plans
-    let Ok(lowered) = crate::lower_ai_calls(plan.clone()) else {
-        return Ok(None);
+    // The original SQL has already bound. Failure to construct a model region
+    // is a reason to isolate its calls, not permission to claim a broken plan.
+    let lowered = match crate::lower_ai_calls(plan.clone()) {
+        Ok(lowered) => lowered,
+        Err(error) => return Ok(Some(error.to_string())),
     };
     let coerced = match Analyzer::new().execute_and_check(lowered.clone(), config, |_, _| {}) {
         Ok(coerced) => coerced,
@@ -297,20 +409,27 @@ pub(super) fn refusal(plan: &LogicalPlan, config: &ConfigOptions) -> Result<Opti
                 .and_then(|placed| select_list(placed, None))
                 .and_then(|selected| lift_relational(selected).map(|(region, _)| region));
             return match placed.map(|placed| derive_error(&placed)) {
+                Ok(Some(error)) if error.is_unsupported() => Ok(Some(error.message().to_string())),
                 Ok(Some(error)) => plan_err!("{}", error.message()),
                 _ => Ok(None),
             };
         }
     };
     let context = OptimizerContext::new_with_config_options(Arc::new(config.clone()));
-    let Ok(optimized) =
-        Optimizer::with_rules(crate::rules::default_rules()).optimize(coerced, &context, |_, _| {})
-    else {
-        return Ok(None);
+    let optimized = match Optimizer::with_rules(crate::rules::default_rules()).optimize(
+        coerced,
+        &context,
+        |_, _| {},
+    ) {
+        Ok(optimized) => optimized,
+        Err(error) => return Ok(Some(error.to_string())),
     };
-    let selected = select_list(optimized, None)?;
-    let (region, _) = lift_relational(selected)?;
-    Ok(refusal_of(&region))
+    match select_list(optimized, None).and_then(lift_relational) {
+        Ok((region, _)) => Ok(refusal_of(&region)),
+        // SQL was already bound by DataFusion. A schema failure while moving
+        // its expressions is a planner limitation, not a user argument error.
+        Err(error) => Ok(Some(error.to_string())),
+    }
 }
 
 /// Quail's binder's error for `plan` as a region, if it has one.
@@ -442,7 +561,22 @@ pub(super) fn select_list(plan: LogicalPlan, needed: Option<Vec<Column>>) -> Res
 /// Whether any operator in the subtree is an `AiNode`, or calls an AI
 /// function in its expressions or in an EXISTS or IN subquery.
 pub(super) fn calls_ai(plan: &LogicalPlan) -> Result<bool> {
-    Ok(plan.exists(|node| Ok(as_node::<AiNode>(node).is_some()))? || calls_ai_function(plan)?)
+    plan.exists(|node| {
+        if as_node::<AiNode>(node).is_some() {
+            return Ok(true);
+        }
+        for expr in node.expressions() {
+            if expr.exists(|inner| match inner {
+                Expr::Exists(found) => calls_ai(&found.subquery.subquery),
+                Expr::InSubquery(found) => calls_ai(&found.subquery.subquery),
+                Expr::ScalarSubquery(found) => calls_ai(&found.subquery),
+                other => Ok(is_ai_call(other)),
+            })? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })
 }
 
 /// Whether any operator in the subtree, or an EXISTS or IN subquery in
@@ -457,6 +591,7 @@ pub(super) fn calls_ai_function(plan: &LogicalPlan) -> Result<bool> {
             let found = expr.exists(|inner| match inner {
                 Expr::Exists(exists) => calls_ai_function(&exists.subquery.subquery),
                 Expr::InSubquery(found) => calls_ai_function(&found.subquery.subquery),
+                Expr::ScalarSubquery(found) => calls_ai_function(&found.subquery),
                 other => Ok(is_ai_call(other)),
             })?;
             if found {

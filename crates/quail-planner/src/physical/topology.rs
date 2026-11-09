@@ -291,8 +291,14 @@ impl PhysicalNode {
                 // a filter that returns its answer adds it to the rows
                 let mut schema = of(alias);
                 schema.extend(node.attributes.answer.iter().cloned());
+                let mut returned = rows(format!("rows:{alias}"), schema.clone());
+                returned.answer = node.attributes.answer.as_ref().map(|name| AnswerOutput {
+                    kind: "filters".into(),
+                    name: name.clone(),
+                    columns: schema,
+                });
                 vec![
-                    rows(format!("rows:{alias}"), schema),
+                    returned,
                     output(
                         format!("filter_answers:{alias}"),
                         ValueType::FilterAnswers,

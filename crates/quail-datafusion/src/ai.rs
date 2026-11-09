@@ -226,10 +226,10 @@ impl AiNode {
         }
     }
 
-    /// Whether the call is a test the filter reads, `AI.IF` or
-    /// `AI.SCORE`, rather than a column the query reads.
+    /// Whether the call uses a predicate operator: every `AI.IF` (including
+    /// one that keeps all rows and returns its answer), or a tested `AI.SCORE`.
     pub fn is_predicate(&self) -> bool {
-        matches!(self.function(), "ai_filter" | "ai_score")
+        self.function() == "ai_filter" || (self.function() == "ai_score" && self.filter.is_some())
     }
 
     /// Whether the query wrote the call's term in a JOIN's ON.
@@ -531,6 +531,24 @@ mod tests {
             .unwrap();
         assert_eq!(rebuilt, node);
         assert_eq!(node.necessary_children_exprs(&[0]), Some(vec![vec![0, 1]]));
+    }
+
+    #[test]
+    fn scores_are_predicates_only_when_their_answer_is_tested() {
+        let mut node = AiNode::try_new(
+            Arc::new(reviews()),
+            ask("ai_score", "Relevance of {0}?"),
+            "score".into(),
+            vec![Field::new("score", DataType::Float64, true)],
+        )
+        .unwrap();
+        assert!(!node.is_predicate());
+        node.filter = Some(col("score").gt(lit(0.5)));
+        assert!(node.is_predicate());
+
+        let mut boolean = ai_filter("Is {0} kind?");
+        boolean.filter = None;
+        assert!(boolean.is_predicate());
     }
 
     #[test]

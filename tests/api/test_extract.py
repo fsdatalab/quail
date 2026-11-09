@@ -13,7 +13,6 @@ from helpers.sessions import TOKENIZER
 import quail
 from quail.api.config import EngineConfig
 from quail.catalog import DocumentProvider
-from quail.common.expressions import CompileError
 from quail.physical import (
     AiExtract,
     Filter,
@@ -418,13 +417,25 @@ def test_not_and_or_of_answers_run_after_the_extractions_they_read(session):
     assert [port.source.node_id for port in test.inputs] == [
         "ai-extract:1", "ai-extract:0"]
     assert kept(fields) == [1]
-    # a label and an answer in one condition are refused
-    with pytest.raises(CompileError, match="tests a label and another"):
-        session.sql(
-            "SELECT c.id, AI.CLASSIFY(c.text, ['lease', 'deed']) AS kind, "
-            f"AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease "
-            "FROM contracts c WHERE AI.CLASSIFY(c.text, ['lease', 'deed']) = 'lease' "
-            f"OR AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}})['ends'] IS NULL")
+
+
+@pytest.mark.parametrize("label", ["lease", "deed"])
+@pytest.mark.parametrize("answer", [None, "March 3, 2027"])
+def test_an_or_combines_a_label_and_an_extracted_answer(session, label, answer):
+    query = session.sql(
+        "SELECT c.id AS contract_id, "
+        "AI.CLASSIFY(c.text, ['lease', 'deed']) AS kind, "
+        f"AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease "
+        "FROM contracts c WHERE AI.CLASSIFY(c.text, ['lease', 'deed']) = 'lease' "
+        f"OR AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}})['ends'] IS NULL "
+        "ORDER BY c.id")
+    oracle = Oracle(labels=lambda *_: label, answers=lambda *_: answer)
+    rows = finish(query, oracle).collect()
+    expected = [
+        {"contract_id": identity, "kind": label, "lease": {"ends": answer}}
+        for identity in (1, 2)
+    ] if label == "lease" or answer is None else []
+    assert rows.to_pylist() == expected
 
 
 def test_an_extracted_tables_token_store_holds_each_tokens_characters(session):
@@ -439,8 +450,34 @@ def test_an_extracted_tables_token_store_holds_each_tokens_characters(session):
     assert len(view.character_offsets) == len(view)
 
 
-def test_a_span_column_reads_an_extraction_with_the_same_arguments(session):
-    with pytest.raises(CompileError, match="AI.EXTRACT_SPAN"):
-        session.sql("SELECT c.id, AI.EXTRACT(c.text, {'ends': 'When?'}) AS lease, "
-                    "AI.EXTRACT_SPAN(c.text, {'ends': 'Why?'}) AS lease_span "
-                    "FROM contracts c")
+@pytest.mark.parametrize("with_other_extraction", [False, True])
+def test_a_span_column_can_run_without_a_matching_extraction(
+        session, with_other_extraction):
+    other = ("AI.EXTRACT(c.text, {'ends': 'When?'}) AS lease, "
+             if with_other_extraction else "")
+    query = session.sql(
+        f"SELECT c.id AS contract_id, {other}"
+        "AI.EXTRACT_SPAN(c.text, {'ends': 'Why?'}) AS lease_span "
+        "FROM contracts c ORDER BY c.id")
+    questions = set()
+
+    def answer(spec, document):
+        questions.add(spec.question)
+        text = str(oracle.texts[spec.alias][document])
+        if "March" not in text:
+            return None
+        return "March 3, 2027" if spec.question == "When?" else "Rent"
+
+    oracle = Oracle(answers=answer)
+    rows = finish(query, oracle).collect()
+    start = LEASE.index("Rent")
+    expected = [
+        {"contract_id": 1,
+         "lease_span": {"ends": {"start": start, "end": start + len("Rent")}}},
+        {"contract_id": 2, "lease_span": {"ends": None}},
+    ]
+    if with_other_extraction:
+        expected[0]["lease"] = {"ends": "March 3, 2027"}
+        expected[1]["lease"] = {"ends": None}
+    assert rows.to_pylist() == expected
+    assert questions == ({"When?", "Why?"} if with_other_extraction else {"Why?"})

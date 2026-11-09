@@ -7,11 +7,10 @@ DataFusion runs works with AI functions in it.
 
 import pyarrow as pa
 import pytest
-from helpers.oracle import Oracle, finish
+from helpers.oracle import Oracle, finish, question_text
 from helpers.sessions import CONFIG, TOKENIZER
 
 import quail
-from quail.common.expressions import CompileError
 
 AI_IF = "AI_FILTER(PROMPT('q: {0}', r.body))"
 # the model keeps every review but r1
@@ -71,10 +70,12 @@ def test_an_or_of_two_model_calls_and_a_column_test_returns_the_rows_any_accepts
     assert [tuple(row.values()) for row in rows] == [("r0",), ("r2",)]
 
 
-def test_an_or_of_a_score_comparison_is_refused_with_its_reason(session):
+def test_an_or_of_a_score_comparison_runs_in_datafusion(session):
     score = "AI.SCORE(PROMPT('s: {0}', r.body)) > 0.5"
-    with pytest.raises(CompileError, match="an OR of a model call other than AI.IF"):
-        session.sql(f"SELECT r.id FROM reviews r WHERE {score} OR r.stars > 3")
+    query = session.sql(
+        f"SELECT r.id FROM reviews r WHERE {score} OR r.stars > 3 ORDER BY r.id")
+    rows = finish(query, ORACLE).collect().to_pylist()
+    assert [tuple(row.values()) for row in rows] == [("r0",), ("r2",)]
 
 
 def test_a_limit_above_a_datafusion_projection_stops_at_its_rows(session):
@@ -117,6 +118,119 @@ def test_an_ai_join_returns_each_matching_pair_once_with_both_tables_columns(
     rows = finish(query, oracle).to_rows()
     assert rows == [("r0", 5, "p0", "x"), ("r0", 5, "p1", "y"),
                     ("r2", 4, "p0", "x"), ("r2", 4, "p1", "y")]
+
+
+@pytest.mark.parametrize("join_type", ["LEFT", "RIGHT", "FULL"])
+@pytest.mark.parametrize("accepted", [True, False])
+def test_outer_ai_joins_preserve_unmatched_rows_after_the_complete_on_predicate(
+        session, join_type, accepted):
+    query = session.sql(
+        f"SELECT r.id, p.id FROM reviews r {join_type} JOIN products p "
+        "ON r.pid = p.id AND AI.IF(PROMPT('m {0} {1}', r.body, p.text))")
+    oracle = Oracle(joins=lambda node, assignment: accepted,
+                    filters=lambda alias, document, position: accepted)
+    rows = finish(query, oracle).to_rows()
+    expected = [("r0", "p0"), ("r1", "p1")] if accepted else []
+    if join_type in ("LEFT", "FULL"):
+        expected.extend([("r2", None)] if accepted else
+                        [("r0", None), ("r1", None), ("r2", None)])
+    if join_type in ("RIGHT", "FULL") and not accepted:
+        expected.extend([(None, "p0"), (None, "p1")])
+    assert sorted(rows, key=repr) == sorted(expected, key=repr)
+
+
+@pytest.mark.parametrize("join_type", ["INNER", "LEFT", "RIGHT", "FULL"])
+@pytest.mark.parametrize("first, second", [(True, True), (True, False),
+                                          (False, True), (False, False)])
+def test_a_join_requires_every_conjunctive_ai_on_predicate(
+        session, join_type, first, second):
+    query = session.sql(
+        f"SELECT r.id, p.id FROM reviews r {join_type} JOIN products p "
+        "ON r.pid = p.id "
+        "AND AI.IF(PROMPT('first {0} {1}', r.body, p.text)) "
+        "AND AI.IF(PROMPT('second {0} {1}', r.body, p.text))")
+
+    def answer(question):
+        assert ("first" in question) != ("second" in question)
+        return first if "first" in question else second
+
+    class ConjunctiveOracle(Oracle):
+        def _filter_answer(self, node, document):
+            return answer(question_text(node.question_token_ids))
+
+        def _join_answer(self, node, anchor_id, partner_ids):
+            return answer(question_text([*node.frame_token_ids, *node.tail_token_ids]))
+
+    rows = finish(query, ConjunctiveOracle()).to_rows()
+    accepted = first and second
+    expected = [("r0", "p0"), ("r1", "p1")] if accepted else []
+    if join_type in ("LEFT", "FULL"):
+        expected.extend([("r2", None)] if accepted else
+                        [("r0", None), ("r1", None), ("r2", None)])
+    if join_type in ("RIGHT", "FULL") and not accepted:
+        expected.extend([(None, "p0"), (None, "p1")])
+    assert sorted(rows, key=repr) == sorted(expected, key=repr)
+
+
+def test_a_full_ai_join_does_not_match_null_on_keys(session):
+    query = session.sql(
+        "SELECT r.id, p.id FROM reviews r FULL JOIN products p "
+        "ON NULLIF(r.pid, 'p0') = p.id "
+        "AND AI.IF(PROMPT('m {0} {1}', r.body, p.text))")
+    oracle = Oracle(joins=lambda node, assignment: True,
+                    filters=lambda alias, document, position: True)
+    rows = finish(query, oracle).to_rows()
+    expected = [("r0", None), ("r1", "p1"), ("r2", None), (None, "p0")]
+    assert sorted(rows, key=repr) == sorted(expected, key=repr)
+
+
+@pytest.mark.parametrize("join_type", ["LEFT", "RIGHT", "FULL"])
+@pytest.mark.parametrize("accepted", [True, False])
+def test_outer_ai_joins_preserve_duplicate_input_rows_and_null_columns(
+        session, join_type, accepted):
+    query = session.sql(
+        "SELECT l.body, r.body, l.tag, r.tag FROM "
+        "(SELECT 'same' AS body, CAST(NULL AS VARCHAR) AS tag FROM reviews) l "
+        f"{join_type} JOIN "
+        "(SELECT 'partner' AS body, CAST(NULL AS VARCHAR) AS tag FROM products) r "
+        "ON AI.IF(PROMPT('m {0} {1}', l.body, r.body))")
+    oracle = Oracle(joins=lambda node, assignment: accepted,
+                    filters=lambda alias, document, position: accepted)
+    rows = finish(query, oracle).to_rows()
+    expected = [("same", "partner", None, None)] * 6 if accepted else []
+    if not accepted and join_type in ("LEFT", "FULL"):
+        expected.extend([("same", None, None, None)] * 3)
+    if not accepted and join_type in ("RIGHT", "FULL"):
+        expected.extend([(None, "partner", None, None)] * 2)
+    assert sorted(rows, key=repr) == sorted(expected, key=repr)
+
+
+@pytest.mark.parametrize("join_type", ["LEFT", "RIGHT", "FULL"])
+@pytest.mark.parametrize("accepted", [True, False])
+def test_outer_ai_on_keeps_duplicate_keys_but_does_not_match_null_keys(
+        session, join_type, accepted):
+    # Neither side exposes its original unique id: matching and unmatched
+    # duplicates must retain their multiplicity rather than be deduplicated.
+    query = session.sql(
+        "SELECT l.body, r.body, l.key, r.key FROM "
+        "(SELECT 'same' AS body, CASE WHEN id = 'r2' THEN NULL ELSE 'key' END "
+        "AS key FROM reviews) l "
+        f"{join_type} JOIN "
+        "(SELECT 'partner' AS body, CASE WHEN id = 'p1' THEN NULL ELSE 'key' END "
+        "AS key FROM products) r "
+        "ON l.key = r.key AND AI.IF(PROMPT('m {0} {1}', l.body, r.body))")
+    oracle = Oracle(joins=lambda *_: accepted, filters=lambda *_: accepted)
+    rows = finish(query, oracle).to_rows()
+    expected = [("same", "partner", "key", "key")] * 2 if accepted else []
+    if join_type in ("LEFT", "FULL"):
+        expected.append(("same", None, None, None))
+        if not accepted:
+            expected.extend([("same", None, "key", None)] * 2)
+    if join_type in ("RIGHT", "FULL"):
+        expected.append((None, "partner", None, None))
+        if not accepted:
+            expected.append((None, "partner", None, "key"))
+    assert sorted(rows, key=repr) == sorted(expected, key=repr)
 
 
 def test_a_field_of_an_extracted_struct_is_selected_beside_a_joined_column(

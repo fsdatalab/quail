@@ -193,7 +193,12 @@ fn placeholders(template: &str) -> Vec<u64> {
     found
 }
 
-fn check_placeholders(template: &str, num_args: usize) -> Result<(), CompileError> {
+/// Validate that a prompt refers to every argument and no nonexistent argument.
+///
+/// # Errors
+///
+/// The numbered placeholders do not match the supplied arguments.
+pub fn check_placeholders(template: &str, num_args: usize) -> Result<(), CompileError> {
     let mut slots = placeholders(template);
     slots.sort_unstable();
     slots.dedup();
@@ -453,14 +458,6 @@ fn distinct_aliases(args: &[ValueExpression]) -> bool {
     aliases.len() == count
 }
 
-fn alias_list(args: &[ValueExpression]) -> String {
-    let aliases: Vec<String> = args
-        .iter()
-        .map(|argument| repr_str(&argument_alias(argument)))
-        .collect();
-    format!("[{}]", aliases.join(", "))
-}
-
 /// The classification fields every classification prompt records.
 struct Recipe {
     categories: Vec<String>,
@@ -535,9 +532,9 @@ pub fn bind_classify_prompt(
     }
     if args.len() == 2 {
         if !distinct_aliases(args) {
-            return compile_error(
-                "each placeholder of a classification of joined rows names a distinct table",
-            );
+            return Err(CompileError::unsupported(
+                "This classification must read a materialized document expression.",
+            ));
         }
         let question =
             render_classify_question(template, labels, descriptions, task_description, letters);
@@ -564,9 +561,13 @@ pub fn bind_classify_prompt(
         return Ok(bound);
     }
     if args.len() != 1 {
-        return compile_error(
-            "AI.CLASSIFY reads one document per row, or one from each side of a join",
-        );
+        return Err(if args.is_empty() {
+            CompileError::new("AI.CLASSIFY needs a document argument.")
+        } else {
+            CompileError::unsupported(
+                "This classification must read a materialized document expression.",
+            )
+        });
     }
     let (frame, template) = split_frame(template, SHARED_PRE)?;
     let (preamble, tail) = split_template(&template);
@@ -638,9 +639,9 @@ fn bind_option_classify_prompt(
     };
     if args.len() == 2 && layout.record_label.is_some() {
         if !distinct_aliases(args) {
-            return compile_error(
-                "each placeholder of a classification of joined rows names a distinct table",
-            );
+            return Err(CompileError::unsupported(
+                "This classification must read a materialized document expression.",
+            ));
         }
         let names = record_names(args);
         let question = with_task(python_strip(&name_records(template, &names)).to_string());
@@ -673,7 +674,13 @@ fn bind_option_classify_prompt(
         return Ok(bound);
     }
     if args.len() != 1 {
-        return compile_error("this model classifies one document per row, or one joined pair");
+        return Err(if args.is_empty() {
+            CompileError::new("AI.CLASSIFY needs a document argument.")
+        } else {
+            CompileError::unsupported(
+                "This classification must read a materialized document expression.",
+            )
+        });
     }
     let (_, canonical) = split_frame(template, layout.document_label)?;
     let (_, rest) = split_template(&canonical);
@@ -738,17 +745,21 @@ fn bind_choice_classify_prompt(
     recipe: Recipe,
 ) -> Result<Prompt, CompileError> {
     if !(1..=2).contains(&args.len()) {
-        return compile_error(
-            "AI.CLASSIFY reads one document per row, or one from each side of a join",
-        );
+        return Err(if args.is_empty() {
+            CompileError::new("AI.CLASSIFY needs a document argument.")
+        } else {
+            CompileError::unsupported(
+                "This classification must read a materialized document expression.",
+            )
+        });
     }
     let preamble = format!("{}{}", turn.0, layout.document_label);
     let (stored, mut question, frame, head, label_texts);
     if args.len() == 2 {
         if !distinct_aliases(args) {
-            return compile_error(
-                "each placeholder of a classification of joined rows names a distinct table",
-            );
+            return Err(CompileError::unsupported(
+                "This classification must read a materialized document expression.",
+            ));
         }
         stored = template.to_string();
         question = template.to_string();
@@ -808,7 +819,13 @@ pub fn bind_sae_features_prompt(
     turn: &Turn,
 ) -> Result<Prompt, CompileError> {
     if args.len() != 1 {
-        return compile_error("AI.SAE_FEATURES reads one document column");
+        return Err(if args.is_empty() {
+            CompileError::new("AI.SAE_FEATURES needs a document argument.")
+        } else {
+            CompileError::unsupported(
+                "This feature call must read a materialized document expression.",
+            )
+        });
     }
     check_placeholders(template, args.len())?;
     let (_, canonical) = split_frame(template, SHARED_PRE)?;
@@ -826,9 +843,8 @@ pub fn bind_sae_features_prompt(
 pub fn bind_score_prompt(template: &str, args: &[ValueExpression]) -> Result<Prompt, CompileError> {
     check_placeholders(template, args.len())?;
     if !distinct_aliases(args) {
-        return compile_error(format!(
-            "each AI.SCORE placeholder must name a distinct table, got aliases {}",
-            alias_list(args)
+        return Err(CompileError::unsupported(
+            "This score must read a materialized document expression.",
         ));
     }
     Ok(prompt(template.to_string(), args, "score"))
@@ -921,11 +937,8 @@ pub fn bind_join_prompt(
         );
     }
     if !distinct_aliases(args) {
-        return compile_error(format!(
-            "each join placeholder must name a distinct table (one document block per table), \
-             got aliases {}; to mention a table's document again, use its marker in the question \
-             text, not a second placeholder",
-            alias_list(args)
+        return Err(CompileError::unsupported(
+            "This model join must read materialized document expressions.",
         ));
     }
     let mut bound = prompt(template.to_string(), args, "join");
@@ -1022,5 +1035,37 @@ pub fn bind(
         "join" => bind_join_prompt(template, args, turn, &layout),
         "score" => bind_score_prompt(template, args),
         other => compile_error(format!("unknown prompt kind {}", repr_str(other))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::ErrorKind;
+    use crate::physical::ColumnRef;
+
+    fn document(name: &str) -> ValueExpression {
+        ValueExpression::ColumnRef(ColumnRef {
+            alias: "r".into(),
+            provider: "reviews".into(),
+            column: name.into(),
+        })
+    }
+
+    #[test]
+    fn malformed_templates_are_invalid_but_multi_document_storage_is_unsupported() {
+        let documents = [document("body"), document("title")];
+        let malformed = bind_score_prompt("Compare {0} and {2}", &documents).unwrap_err();
+        assert_eq!(malformed.kind(), ErrorKind::Invalid);
+        let shape = bind_score_prompt("Compare {0} and {1}", &documents).unwrap_err();
+        assert_eq!(shape.kind(), ErrorKind::Unsupported);
+        assert!(bind_score_prompt("Score {0}", &documents[..1]).is_ok());
+    }
+
+    #[test]
+    fn placeholder_validation_is_available_before_materialization() {
+        assert!(check_placeholders("Compare {0}, {1}, and {0}", 2).is_ok());
+        let error = check_placeholders("Compare {0} and {2}", 2).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Invalid);
     }
 }

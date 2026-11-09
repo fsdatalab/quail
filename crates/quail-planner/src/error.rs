@@ -2,11 +2,6 @@
 
 use std::fmt;
 
-/// The phrase every refusal of a query shape the binder does not read
-/// ends with: DataFusion runs such operators itself, around the model
-/// regions it claims.
-pub const UNSUPPORTED: &str = "is outside what Quail binds from DataFusion";
-
 /// A malformed query, unsupported region, or plan the configuration cannot run.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompileError {
@@ -34,10 +29,10 @@ impl CompileError {
         }
     }
 
-    /// A region shape the binder does not read, with [`UNSUPPORTED`] in its message.
-    pub fn unsupported(what: &str) -> Self {
+    /// A region shape DataFusion must run, with a concrete reason.
+    pub fn unsupported(message: impl Into<String>) -> Self {
         Self {
-            message: format!("{what} {UNSUPPORTED}"),
+            message: message.into(),
             refusal: None,
             kind: ErrorKind::Unsupported,
         }
@@ -139,8 +134,12 @@ mod tests {
 
     #[test]
     fn context_preserves_kind_and_message_format() {
-        let error = CompileError::unsupported("shape").with_context("plan");
-        assert_eq!(error.to_string(), format!("shape {UNSUPPORTED}:\nplan"));
+        let error = CompileError::unsupported("These operators must run outside the model region")
+            .with_context("plan");
+        assert_eq!(
+            error.to_string(),
+            "These operators must run outside the model region:\nplan"
+        );
         assert!(error.is_unsupported());
         assert_eq!(error.refusal(), None);
         assert_eq!(

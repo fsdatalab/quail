@@ -100,13 +100,30 @@ impl JoinBack {
         // a probe side by name, so two region columns of one name, such
         // as `r.id` and `p.id`, would send one table's ids to the other's
         // column (tests/integration/dynamic_filter.rs)
+        let mut used: BTreeSet<String> = region
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect();
+        let mut keys = std::collections::HashMap::new();
+        for joined in &joined {
+            let base = key_name(&joined.alias);
+            let mut name = base.clone();
+            let mut suffix = 0;
+            while !used.insert(name.clone()) {
+                suffix += 1;
+                name = format!("{base}_{suffix}");
+            }
+            keys.insert(joined.alias.clone(), name);
+        }
         let renamed = region
             .schema()
             .iter()
             .map(|(qualifier, field)| {
                 let column = Expr::Column(Column::new(qualifier.cloned(), field.name()));
                 match id_of(&joined, qualifier, field.name()) {
-                    Some(alias) => column.alias(key_name(alias)),
+                    Some(alias) => column.alias(&keys[alias]),
                     None => column,
                 }
             })
@@ -152,7 +169,7 @@ impl JoinBack {
                     table,
                     JoinType::Inner,
                     (
-                        vec![Column::from_name(key_name(&joined.alias))],
+                        vec![Column::from_name(&keys[&joined.alias])],
                         vec![Column::new(Some(joined.alias.clone()), &joined.key)],
                     ),
                     None,
@@ -276,9 +293,11 @@ pub(crate) fn join_back(
     }
     let unchanged_relation = relation == *root.input;
     for found in &joined {
-        let key = Expr::Column(Column::new(Some(found.alias.clone()), &found.key));
-        if !kept.contains(&key) {
-            kept.push(key);
+        let key = Column::new(Some(found.alias.clone()), &found.key);
+        // A projection can preserve the key through a qualified Alias. Test
+        // its output schema, not structural equality with a bare Column.
+        if !root.schema.has_column(&key) {
+            kept.push(Expr::Column(key));
         }
     }
     let unchanged = unchanged_relation && kept == root.expr;
@@ -298,7 +317,7 @@ pub(crate) fn join_back(
 fn readable(joined: &Joined, name: &str) -> bool {
     let schema = match &joined.source {
         Source::Named(scan) => source_as_provider(&scan.source).map(|provider| provider.schema()),
-        Source::Input(_) => return name != ROW_COLUMN,
+        Source::Input(_) => return true,
     };
     schema.is_ok_and(|schema| schema.index_of(name).is_ok())
 }
@@ -343,9 +362,6 @@ fn leaf(plan: &LogicalPlan, alias: &TableReference) -> Option<TableScan> {
 fn key_of(scan: &TableScan) -> Result<Option<String>> {
     let provider = source_as_provider(&scan.source)?;
     let schema = provider.schema();
-    if schema.index_of(ROW_COLUMN).is_ok() {
-        return Ok(Some(ROW_COLUMN.to_string()));
-    }
     let key = provider.constraints().and_then(|constraints| {
         constraints.iter().find_map(|constraint| match constraint {
             datafusion::common::Constraint::PrimaryKey(indices) if indices.len() == 1 => {
@@ -354,7 +370,18 @@ fn key_of(scan: &TableScan) -> Result<Option<String>> {
             _ => None,
         })
     });
-    Ok(key)
+    Ok(key.or_else(|| {
+        schema
+            .field_with_name(ROW_COLUMN)
+            .ok()
+            .filter(|field| {
+                field
+                    .metadata()
+                    .get("quail.row_identity")
+                    .is_some_and(|value| value == "true")
+            })
+            .map(|_| ROW_COLUMN.to_string())
+    }))
 }
 
 /// `plan` returning `alias.key` too: the table's scan reads it, and each

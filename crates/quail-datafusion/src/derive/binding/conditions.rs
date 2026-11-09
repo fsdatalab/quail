@@ -97,9 +97,7 @@ impl Binder {
             right,
         }) = term
         else {
-            return compile_error(format!(
-                "ON supports column = column and AI predicates, got {term}"
-            ));
+            return unsupported("DataFusion must evaluate this join condition.");
         };
         let equality = Equality {
             left: self.bind_value(left)?,
@@ -110,10 +108,9 @@ impl Binder {
             column_alias_of(&equality.right),
         ];
         if !sides.contains(&joined.to_string()) || sides[0] == sides[1] {
-            return compile_error(format!(
-                "JOIN {joined} ON {term} must relate {} to a table already in the query",
-                repr_str(joined)
-            ));
+            return unsupported(
+                "DataFusion must evaluate a join condition that does not connect its inputs.",
+            );
         }
         Ok(equality)
     }
@@ -160,9 +157,7 @@ impl Binder {
             })
         ) {
             // an OR of AI.IF calls and plain tests is an AiNode's filter
-            return unsupported(&format!(
-                "{term}, an OR of a model call other than AI.IF and other tests,"
-            ));
+            return unsupported(&format!("DataFusion must evaluate the disjunction {term}."));
         }
         let (node, anti) = match &term {
             Expr::Not(inner) => (inner.as_ref(), true),
@@ -172,26 +167,19 @@ impl Binder {
             return Ok(());
         }
         if anti {
-            return compile_error(format!(
-                "NOT is only supported as NOT EXISTS, got NOT {node}"
-            ));
+            return unsupported("DataFusion must evaluate NOT around this model call.");
         }
         if contains(&term, |inner| is_call(inner, "ai_classify")) {
-            return compile_error(
-                "AI.CLASSIFY in WHERE is tested with = 'label' or IN ('label', ...)",
-            );
+            return unsupported("DataFusion must evaluate this test of an AI.CLASSIFY result.");
         }
         if contains(&term, |inner| is_call(inner, "ai_extract")) {
-            return compile_error(
-                "an AI.EXTRACT call is not a predicate; test one of its fields, such as \
-                 AI.EXTRACT(...).end_date IS NOT NULL, or its AS name from SELECT",
-            );
+            return unsupported("DataFusion must evaluate this test of an extraction result.");
         }
         if score_comparison(&term).is_some() {
             self.bind_ai_score_test(&term, &["selectivity"], None)?;
         } else {
-            if contains(&term, |inner| is_call(inner, "ai_score")) {
-                return compile_error("AI.SCORE must be compared with <, <=, >, or >=");
+            if !is_call(&term, "ai_filter") {
+                return unsupported("DataFusion must evaluate this expression of a model result.");
             }
             self.bind_ai_filter_call(&term, &["selectivity", "anchor"], None)?;
         }
@@ -278,12 +266,11 @@ impl Binder {
                         })
                     }
                     _ => match column_call_kind(&node) {
-                        Some("extract") => {
-                            compile_error("test a field of AI.EXTRACT, such as lease.end_date")
-                        }
-                        Some("features") => compile_error(
-                            "AI.SAE_FEATURES returns a list; test IS NULL or IS NOT NULL, or \
-                             UNNEST it to test its fields",
+                        Some("extract") => unsupported(
+                            "DataFusion must evaluate this test of an extraction result.",
+                        ),
+                        Some("features") => unsupported(
+                            "DataFusion must evaluate this expression of an AI.SAE_FEATURES list.",
                         ),
                         Some(kind) => self.answer_column(&node, kind).map(Some),
                         None => self.extract_column(&node),
@@ -334,7 +321,9 @@ impl Binder {
     fn answer_name(&mut self, node: &Expr, call: &ModelCall) -> Result<String, CompileError> {
         let aliases = call_aliases(call);
         if aliases.len() != 1 {
-            return compile_error("a filter on a label tests a one-document classification");
+            return unsupported(
+                "DataFusion must evaluate this test of a model result over joined rows.",
+            );
         }
         let alias = aliases[0].clone();
         let name = self
@@ -381,18 +370,14 @@ impl Binder {
             })
             .map(|(name, selected)| (name.clone(), selected.clone()))
         else {
-            return compile_error(format!(
-                "{inner} in WHERE is not returned by SELECT; name it there and test it by its \
-                 AS name"
-            ));
+            return unsupported(
+                "DataFusion must evaluate this condition over the extraction result.",
+            );
         };
         let field = path[0].clone();
         let rest = &path[1..];
         if span && !(rest == ["start"] || rest == ["end"]) {
-            return compile_error(format!(
-                "{name}{SPAN_SUFFIX}.{field} reads a span; test its start or end, such as \
-                 {name}{SPAN_SUFFIX}.{field}.start"
-            ));
+            return unsupported("DataFusion must evaluate this expression of an extraction span.");
         }
         if !span && !rest.is_empty() {
             return compile_error(format!("{name}.{field} reads a field under an answer"));

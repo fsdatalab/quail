@@ -3,11 +3,15 @@
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from helpers.oracle import question_text
 from helpers.planning import compile_sql, placements, read_operators
+from helpers.sessions import CONFIG, TOKENIZER
 
+import quail
 from quail.api.compile import SQLDialect
 from quail.catalog import Catalog, DocumentProvider
 from quail.common.expressions import ColumnRef, CompileError
+from quail.physical import AiFilter, AiJoin
 
 
 def compile_operators(*args, **options):
@@ -210,10 +214,23 @@ def test_each_part_of_a_where_clause_goes_to_the_operator_that_tests_it(catalog)
     assert join.selectivity == 0.05
 
 
-def test_a_join_with_two_ai_predicates_in_its_on_is_refused(catalog):
-    with pytest.raises(CompileError, match="JOIN p has 2 AI predicates in ON; ask one"):
-        compile_sql("""
+def test_a_join_with_two_ai_predicates_in_its_on_plans_both_predicates(catalog):
+    with quail.Session(CONFIG, tokenizer=TOKENIZER) as session:
+        for name, provider in catalog.providers.items():
+            session.register(name, provider)
+        query = session.sql("""
             SELECT r.id FROM reviews r JOIN products p
             ON AI_FILTER(PROMPT('x {0} {1}', r.review, p.description))
             AND AI_FILTER(PROMPT('y {0} {1}', r.review, p.description))
-        """, catalog)
+        """)
+        questions = []
+        for region in query.regions():
+            for node in region.plan().nodes:
+                if isinstance(node, AiFilter):
+                    questions.append(question_text(node.question_token_ids))
+                elif isinstance(node, AiJoin):
+                    questions.append(question_text([
+                        *node.frame_token_ids, *node.tail_token_ids]))
+        assert len(questions) == 2
+        assert any("x" in question.split() for question in questions)
+        assert any("y" in question.split() for question in questions)

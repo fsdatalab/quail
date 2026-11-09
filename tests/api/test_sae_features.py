@@ -103,10 +103,14 @@ def test_feature_list_null_tests_keep_empty_lists(session, comparison, num_rows)
         .collect().num_rows == num_rows
 
 
-@pytest.mark.parametrize("test", ["{} = 'x'", "LENGTH({}) > 0"])
-def test_feature_lists_must_be_unnested_before_testing_their_fields(session, test):
+@pytest.mark.parametrize("test, reason", [
+    ("{} = 'x'", r"AI\.SAE_FEATURES returns a list, so use UNNEST"),
+    ("LENGTH({}) > 0", r"LENGTH needs text, so use array_length.*UNNEST"),
+])
+def test_feature_lists_reject_string_comparisons_and_string_length(
+        session, test, reason):
     features = "AI.SAE_FEATURES(PROMPT('Topic? {0}', r.body), {'pooling': 'last'})"
-    with pytest.raises(CompileError, match="UNNEST"):
+    with pytest.raises(CompileError, match=reason):
         session.sql(
             f"SELECT r.id, {features} AS features FROM reviews r "
             f"WHERE {test.format(features)}")

@@ -11,7 +11,7 @@ use datafusion::common::Column;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::utils::split_conjunction;
 use datafusion::logical_expr::{Expr, Join, JoinType, LogicalPlan};
-use quail_planner::error::{CompileError, compile_error};
+use quail_planner::error::CompileError;
 use std::collections::BTreeSet;
 
 /// `plan` with a SELECT list at its root: DataFusion removes one that
@@ -48,7 +48,7 @@ pub(super) struct Top<'a> {
 /// BY, or DISTINCT, which DataFusion runs above the region.
 pub(super) fn read_top(plan: &LogicalPlan) -> Result<Top<'_>, CompileError> {
     let LogicalPlan::Projection(projection) = plan else {
-        return unsupported("a region without a SELECT list");
+        return unsupported("A model region needs a SELECT list.");
     };
     Ok(Top {
         projection: projection.expr.clone(),
@@ -94,9 +94,8 @@ pub(super) fn refuse_grouped_input(relation: &LogicalPlan) -> Result<(), Compile
         |plan: &LogicalPlan| matches!(plan, LogicalPlan::Aggregate(_) | LogicalPlan::Window(_));
     if groups(relation) || matches!(relation, LogicalPlan::Filter(filter) if groups(&filter.input))
     {
-        return compile_error(
-            "a model call that reads the result of a GROUP BY or a window is not \
-             supported; read it from a CTE or FROM subquery instead",
+        return unsupported(
+            "DataFusion must compute grouped or windowed rows before the model reads them.",
         );
     }
     Ok(())
@@ -189,7 +188,10 @@ impl<'a> Walk<'a> {
             }
             LogicalPlan::Join(join) => {
                 if join.join_type != JoinType::Inner {
-                    self.refuse(unsupported(&format!("a {} JOIN", join.join_type)));
+                    self.refuse(unsupported(&format!(
+                        "A {} JOIN must run in DataFusion.",
+                        join.join_type
+                    )));
                 }
                 let left = self.visit(&join.left);
                 let right = self.visit(&join.right);
@@ -260,7 +262,7 @@ impl<'a> Walk<'a> {
             && self.get(inputs[1]).tables.len() != 1
         {
             self.refuse(unsupported(
-                "a JOIN of anything but one registered provider",
+                "A model join needs one registered provider on its right side.",
             ));
         }
         self.visits[id] = Some(Visit {

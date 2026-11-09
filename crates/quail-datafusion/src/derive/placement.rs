@@ -7,9 +7,9 @@ use super::relation::{JoinSpec, Relation, check_calls, check_joins};
 use super::walk::Walk;
 use super::{ByAlias, lookup, note, push};
 use crate::SPAN_SUFFIX;
-use quail_planner::error::{CompileError, compile_error};
+use quail_planner::error::CompileError;
 use quail_planner::expressions::{
-    aliased_call, call_aliases, column_name, column_references, condition_columns, condition_text,
+    aliased_call, call_aliases, column_name, column_references, condition_columns,
 };
 use quail_planner::operators::{ColumnTest, Operators, SemanticColumn};
 use quail_planner::physical::{ModelCall, ValueExpression};
@@ -60,10 +60,8 @@ fn place_conditions(
         let one_table = aliases.len() == 1;
         if one_table && owners.len() == 1 && owners.contains(&None) {
             if term.selectivity.is_some() {
-                return compile_error(format!(
-                    "HINT estimates a test of a label or an answer; {} tests a source column, \
-                     applied at the scan",
-                    condition_text(part)
+                return Err(CompileError::unsupported(
+                    "DataFusion must evaluate this hinted test of source columns.",
                 ));
             }
             push(
@@ -76,17 +74,13 @@ fn place_conditions(
             push(&mut placed.computed, &alias, term);
         } else {
             if kinds.contains("label") && owners.iter().flatten().count() > 1 {
-                return compile_error(format!(
-                    "{} tests a label and another operator's column; test them in separate \
-                     conditions",
-                    condition_text(part)
+                return Err(CompileError::unsupported(
+                    "DataFusion must evaluate this test of different model results.",
                 ));
             }
             if term.selectivity.is_some() {
-                return compile_error(format!(
-                    "HINT estimates a test that runs before a model call; {} runs on the result \
-                     rows, after every model call",
-                    condition_text(part)
+                return Err(CompileError::unsupported(
+                    "DataFusion must evaluate this hinted test of result rows.",
                 ));
             }
             placed.rows.push(term.condition);

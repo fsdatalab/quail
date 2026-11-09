@@ -117,9 +117,11 @@ pub fn expression(
     if let Some(error) = failed {
         return Err(error);
     }
-    let bytes = positional
-        .to_bytes()
-        .map_err(|error| CompileError::new(error.to_string()))?;
+    let bytes = positional.to_bytes().map_err(|_| {
+        CompileError::unsupported(
+            "DataFusion must evaluate this expression outside the model region.",
+        )
+    })?;
     Ok(Expression {
         encoded: base64::engine::general_purpose::STANDARD.encode(bytes),
         columns,

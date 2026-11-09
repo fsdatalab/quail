@@ -4,9 +4,9 @@
 use super::calls::{arguments, is_call};
 use super::conditions::has_ai_call;
 use super::{Binder, contains, unsupported};
-use crate::functions::{ai_function_name, column_call_kind};
+use crate::functions::{ai_function_name, column_call_kind, function_name};
 use datafusion::logical_expr::Expr;
-use quail_planner::error::{CompileError, compile_error};
+use quail_planner::error::CompileError;
 use quail_planner::expressions::{aliased_call, call_aliases, column_name, repr_list, repr_str};
 use quail_planner::physical::{Alias, ExtractStruct, ValueExpression};
 
@@ -25,15 +25,13 @@ pub(super) fn select_outputs(expressions: &[Expr]) -> Vec<(String, Expr)> {
     outputs
 }
 
-/// Each column-operator call a SELECT list names with AS, by its name.
+/// Each column-operator call a SELECT list returns, by its output name.
 pub(super) fn selected_calls(expressions: &[Expr]) -> Vec<(String, Expr)> {
     expressions
         .iter()
-        .filter_map(|expr| match expr {
-            Expr::Alias(alias) if column_call_kind(&alias.expr).is_some() => {
-                Some((alias.name.clone(), (*alias.expr).clone()))
-            }
-            _ => None,
+        .filter_map(|expr| {
+            let (inner, _) = unalias(expr);
+            column_call_kind(inner).map(|_| (output_name(expr), inner.clone()))
         })
         .collect()
 }
@@ -62,7 +60,9 @@ fn unalias(expr: &Expr) -> (&Expr, Option<&str>) {
     let automatic = names.last().is_some_and(|name| {
         *name == "count(*)"
             || name.split_once('(').is_some_and(|(function, _)| {
-                function.contains('.') && ai_function_name(function).is_some()
+                function.contains('.')
+                    && ai_function_name(function).is_some()
+                    && ai_function_name(function) == function_name(node)
             })
     });
     let written = if automatic {
@@ -99,31 +99,27 @@ impl Binder {
         let is_alias = |name: &str| self.provider(name).is_some();
         for found in structs {
             if is_alias(&found.name) {
-                return compile_error(format!(
-                    "output name {} is also a table alias; pick another AS name",
-                    repr_str(&found.name)
-                ));
+                return unsupported(
+                    "DataFusion must assign this output name because it also names a table.",
+                );
             }
         }
         for column in columns {
             let name = column_name(column, true);
             if let ValueExpression::Alias(_) = column {
                 if is_alias(&name) {
-                    return compile_error(format!(
-                        "output name {} is also a table alias; pick another AS name",
-                        repr_str(&name)
-                    ));
+                    return unsupported(
+                        "DataFusion must assign this output name because it also names a table.",
+                    );
                 }
                 if self
                     .tables
                     .iter()
                     .any(|(_, _, schema)| schema.field_with_name(&name).is_ok())
                 {
-                    return compile_error(format!(
-                        "output name {} is also a column of a table in the query; pick another \
-                         AS name",
-                        repr_str(&name)
-                    ));
+                    return unsupported(
+                        "DataFusion must assign this output name because it also names an input column.",
+                    );
                 }
             }
         }
@@ -137,8 +133,8 @@ impl Binder {
                 .iter()
                 .find(|(prompt, _)| *prompt == *call.prompt)
             {
-                return compile_error(format!(
-                    "the same AI expression is projected as {} and {}; project it once",
+                return unsupported(&format!(
+                    "DataFusion must project the repeated model result as {} and {}.",
                     repr_str(first),
                     repr_str(&name)
                 ));
@@ -170,22 +166,24 @@ impl Binder {
             spans: Vec::new(),
             output: Vec::new(),
         };
-        let mut extracts: Vec<(&str, Expr)> = Vec::new();
-        let mut spans: Vec<(&str, Expr)> = Vec::new();
+        let mut extracts: Vec<(String, Expr)> = Vec::new();
+        let mut spans: Vec<(String, Expr)> = Vec::new();
         for item in projection {
             let (node, alias) = unalias(item);
             let node = self.output_of(node).unwrap_or_else(|| node.clone());
+            let automatic = output_name(item);
+            let alias = alias.or_else(|| crate::is_ai_call(&node).then_some(automatic.as_str()));
             if is_call(&node, "ai_extract_span") {
                 let Some(alias) = alias else {
-                    return unsupported("AI.EXTRACT_SPAN without an AS name in SELECT");
+                    return unsupported("AI.EXTRACT_SPAN needs an AS name in SELECT.");
                 };
-                spans.push((alias, node));
+                spans.push((alias.to_string(), node));
                 continue;
             }
             if is_call(&node, "ai_extract")
                 && let Some(alias) = alias
             {
-                extracts.push((alias, node.clone()));
+                extracts.push((alias.to_string(), node.clone()));
             }
             for column in self.bind_select_item(&node, alias, &mut selected.structs)? {
                 selected.output.push(column_name(&column, true));
@@ -199,9 +197,8 @@ impl Binder {
                 .iter()
                 .find(|(_, extract)| arguments(extract) == arguments(&span));
             let Some((name, _)) = paired else {
-                return compile_error(format!(
-                    "AI.EXTRACT_SPAN(...) AS {alias} returns the answer positions of an \
-                     AI.EXTRACT in SELECT with the same arguments"
+                return unsupported(&format!(
+                    "The extraction for span output {alias} must run in a separate model region."
                 ));
             };
             selected.spans.push((*name).to_string());
@@ -210,8 +207,8 @@ impl Binder {
         unique.sort();
         unique.dedup();
         if unique.len() != selected.output.len() {
-            return compile_error(format!(
-                "projection names must be unique, got {}",
+            return unsupported(&format!(
+                "DataFusion must assign the repeated output names {}.",
                 repr_list(&selected.output)
             ));
         }
@@ -228,7 +225,7 @@ impl Binder {
                      function: &str|
          -> Result<Vec<ValueExpression>, CompileError> {
             let Some(alias) = alias else {
-                return unsupported(&format!("{function} without an AS name in SELECT"));
+                return unsupported(&format!("{function} needs an AS name in SELECT."));
             };
             Ok(vec![ValueExpression::Alias(Alias {
                 expression: Box::new(expression),
@@ -238,7 +235,7 @@ impl Binder {
         if is_call(node, "ai_score") {
             let call = self.bind_ai_value(node)?;
             if !(1..=2).contains(&call_aliases(&call).len()) {
-                return compile_error("projected AI.SCORE must reference one or two relations");
+                return unsupported("This score must run over a materialized input relation.");
             }
             return named(ValueExpression::ModelCall(call), "AI.SCORE");
         }
@@ -248,7 +245,7 @@ impl Binder {
         }
         if is_call(node, "ai_extract") {
             let Some(alias) = alias else {
-                return unsupported("AI.EXTRACT without an AS name in SELECT");
+                return unsupported("AI.EXTRACT needs an AS name in SELECT.");
             };
             let (found, members) = self.bind_ai_extract(node, alias)?;
             structs.push(found);
@@ -263,7 +260,7 @@ impl Binder {
             return named(ValueExpression::ModelCall(call), "AI.MAP");
         }
         if has_ai_call(node) || contains(node, |inner| column_call_kind(inner).is_some()) {
-            return unsupported("a model call inside a SELECT expression");
+            return unsupported("A model call cannot be nested in this SELECT expression.");
         }
         let value = self.bind_value(node)?;
         Ok(vec![match alias {

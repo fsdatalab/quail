@@ -102,16 +102,13 @@ pub(super) fn parse_options(
         return Ok(Options::default());
     };
     let Some(fields) = object_fields(node) else {
-        return compile_error(format!(
-            "the second AI operator argument must be an option object like \
-             {{'selectivity': 0.3}}, got {node}"
-        ));
+        return compile_error("AI options must be an object such as {'selectivity': 0.3}.");
     };
     let mut options = Options::default();
     for (key, value) in fields {
         if !allowed.contains(&key.as_str()) {
             return compile_error(format!(
-                "unknown option key {}; allowed: {}",
+                "Unknown option {} must be replaced with one of {}.",
                 repr_str(&key),
                 sorted_keys(allowed)
             ));
@@ -119,12 +116,12 @@ pub(super) fn parse_options(
         if key == "selectivity" {
             match (string_literal(value), number_of(value)) {
                 (None, Some(number)) => options.selectivity = Some(number),
-                _ => return compile_error("selectivity must be a number"),
+                _ => return compile_error("The selectivity option must be a number."),
             }
         } else {
             match string_literal(value) {
                 Some(text) => options.anchor = Some(text),
-                None => return compile_error("anchor must be a table alias string"),
+                None => return compile_error("The anchor option must be a table alias string."),
             }
         }
     }
@@ -139,12 +136,11 @@ impl Binder {
             .iter()
             .find(|(found, _)| *found == alias)
         {
-            Some((_, seen)) if seen != column => compile_error(format!(
-                "alias {} is referenced through two columns ({}, {}); predicates over one \
-                 table must share one document column so its KV is computed once",
-                repr_str(&alias),
-                repr_str(&column_name(seen, false)),
-                repr_str(&column_name(column, false))
+            Some((_, seen)) if seen != column => super::unsupported(&format!(
+                "Model calls reading {}.{} and {} must run in separate regions.",
+                alias,
+                column_name(seen, false),
+                column_name(column, false)
             )),
             Some(_) => Ok(()),
             None => {
@@ -154,6 +150,16 @@ impl Binder {
         }
     }
 
+    fn bind_document_value(&mut self, argument: &Expr) -> Result<ValueExpression, CompileError> {
+        let value = self.bind_value(argument)?;
+        if matches!(value, ValueExpression::Value(_)) {
+            return super::unsupported(
+                "DataFusion must compute this document expression before the model reads it.",
+            );
+        }
+        Ok(value)
+    }
+
     fn prompt_arguments(
         &mut self,
         prompt: &Expr,
@@ -161,17 +167,21 @@ impl Binder {
     ) -> Result<(String, Vec<ValueExpression>), CompileError> {
         if !is_call(prompt, "prompt") {
             return compile_error(format!(
-                "{}'s first argument must be PROMPT('template', columns...)",
-                function.to_uppercase()
+                "{} needs a PROMPT as its first argument.",
+                if function == "ai_filter" {
+                    "AI.IF".to_string()
+                } else {
+                    function.replacen("ai_", "AI.", 1).to_uppercase()
+                }
             ));
         }
         let args = arguments(prompt);
         let Some(template) = args.first().and_then(string_literal) else {
-            return compile_error("PROMPT's first argument must be a string template");
+            return compile_error("PROMPT needs a string template as its first argument.");
         };
         let mut references = Vec::new();
         for argument in &args[1..] {
-            references.push(self.bind_value(argument)?);
+            references.push(self.bind_document_value(argument)?);
         }
         Ok((template, references))
     }
@@ -207,9 +217,8 @@ impl Binder {
         }
         let join = join.unwrap_or(aliases.len() > 1);
         if function == "ai_score" && join && template.matches("{0}").count() != 1 {
-            return compile_error(
-                "an AI.SCORE pair prompt mentions {0} exactly once, as the place its document \
-                 is inserted; refer to it again in words",
+            return super::unsupported(
+                "This pair score must run over a materialized input relation.",
             );
         }
         let prompt = match classify {
@@ -257,18 +266,16 @@ impl Binder {
         join: Option<bool>,
     ) -> Result<(ModelCall, Options), CompileError> {
         if !is_call(term, "ai_filter") {
-            return compile_error(format!(
-                "only AI_FILTER(PROMPT(...)) predicates are supported here, got: {term}"
-            ));
+            return super::unsupported(
+                "DataFusion must evaluate this expression of a model result.",
+            );
         }
         let args = arguments(term);
         if args.is_empty() {
-            return compile_error(
-                "AI_FILTER's first argument must be PROMPT('template', columns...)",
-            );
+            return compile_error("AI.IF needs a PROMPT as its first argument.");
         }
         if args.len() > 2 {
-            return compile_error("AI_FILTER takes PROMPT and at most one option object");
+            return compile_error("AI.IF takes a PROMPT and at most one options object.");
         }
         let options = parse_options(args.get(1), allowed)?;
         let (prompt, _) = self.bind_ai_call(&args[0], "ai_filter", join, None)?;
@@ -284,24 +291,27 @@ impl Binder {
         join: Option<bool>,
     ) -> Result<(ScoreTest, Options), CompileError> {
         let Some((comparison, call, threshold)) = score_comparison(term) else {
-            return compile_error("AI.SCORE must be compared with <, <=, >, or >=");
+            return super::unsupported("DataFusion must evaluate this comparison of a score.");
         };
         let Some(value) = number_of(threshold).filter(|_| string_literal(threshold).is_none())
         else {
-            return compile_error("AI.SCORE threshold must be a number");
+            if !matches!(threshold, Expr::Literal(value, _) if !value.is_null()) {
+                return super::unsupported(
+                    "DataFusion must compare this score with the computed threshold.",
+                );
+            }
+            return compile_error("The AI.SCORE threshold must be a number.");
         };
         if !(0.0..=1.0).contains(&value) {
-            return compile_error("AI.SCORE threshold must be between 0 and 1");
+            return compile_error("The AI.SCORE threshold must be between 0 and 1.");
         }
         let args = arguments(call);
         if args.len() > 2 {
-            return compile_error("AI_SCORE takes PROMPT and at most one option object");
+            return compile_error("AI.SCORE takes a PROMPT and at most one options object.");
         }
         let options = parse_options(args.get(1), allowed)?;
         let Some(prompt) = args.first() else {
-            return compile_error(
-                "AI_SCORE's first argument must be PROMPT('template', columns...)",
-            );
+            return compile_error("AI.SCORE needs a PROMPT as its first argument.");
         };
         let (prompt, _) = self.bind_ai_call(prompt, "ai_score", join, None)?;
         let call = model_call(prompt, "score");
@@ -340,7 +350,9 @@ impl Binder {
             match string_literal(item) {
                 Some(text) => accepted.push(Value::String(text)),
                 None => {
-                    return compile_error("AI.CLASSIFY is compared with string literals");
+                    return super::unsupported(
+                        "DataFusion must compare this label with the other expression.",
+                    );
                 }
             }
         }
@@ -348,7 +360,9 @@ impl Binder {
         unique.sort_by_key(|value| value.to_string());
         unique.dedup();
         if unique.len() != accepted.len() {
-            return compile_error("a filter on a label lists a label twice");
+            return super::unsupported(
+                "DataFusion must evaluate a label test with repeated values.",
+            );
         }
         Ok((call, Value::Array(accepted), hint.or(options.selectivity)))
     }
@@ -356,7 +370,9 @@ impl Binder {
     fn bind_ai_classify(&mut self, node: &Expr) -> Result<(ModelCall, Options), CompileError> {
         let args = arguments(node);
         if args.len() < 2 {
-            return compile_error("AI.CLASSIFY takes a prompt and its categories");
+            return compile_error(
+                "AI.CLASSIFY needs a prompt or document column and its categories.",
+            );
         }
         let categories = match object_fields(&args[1]) {
             Some(fields) if fields.len() == 1 && fields[0].0 == "categories" => fields[0].1,
@@ -367,29 +383,31 @@ impl Binder {
         let (mut task, mut probabilities) = (String::new(), false);
         if let Some(config) = args.get(2) {
             let Some(fields) = object_fields(config) else {
-                return compile_error(format!(
-                    "AI.CLASSIFY's config is an object like {{'task_description': '...'}}, got \
-                     {config}"
-                ));
+                return compile_error("AI.CLASSIFY options must be an object.");
             };
             for (key, value) in fields {
                 match key.to_lowercase().as_str() {
                     "selectivity" => match (string_literal(value), number_of(value)) {
                         (None, Some(number)) => options.selectivity = Some(number),
-                        _ => return compile_error("selectivity must be a number"),
+                        _ => return compile_error("The selectivity option must be a number."),
                     },
                     "task_description" => match string_literal(value) {
                         Some(text) => task = text,
-                        None => return compile_error("task_description is a string"),
+                        None => {
+                            return compile_error("The task_description option must be a string.");
+                        }
                     },
                     "probabilities" => match value {
                         Expr::Literal(ScalarValue::Boolean(Some(flag)), _) => probabilities = *flag,
-                        _ => return compile_error("probabilities is true or false"),
+                        _ => {
+                            return compile_error(
+                                "The probabilities option must be true or false.",
+                            );
+                        }
                     },
                     other => {
                         return compile_error(format!(
-                            "unknown AI.CLASSIFY option {}; the options are selectivity, \
-                             task_description, and probabilities",
+                            "AI.CLASSIFY option {} must be selectivity, task_description, or probabilities.",
                             repr_str(other)
                         ));
                     }
@@ -401,7 +419,7 @@ impl Binder {
             self.bind_ai_call(&args[0], "ai_classify", Some(false), classify)?
         } else {
             // a bare document column uses the default instruction
-            let reference = self.bind_value(&args[0])?;
+            let reference = self.bind_document_value(&args[0])?;
             self.bind_prompt(
                 "{0}".to_string(),
                 vec![reference],
@@ -412,7 +430,7 @@ impl Binder {
         };
         if !(1..=2).contains(&aliases.len()) {
             return compile_error(
-                "AI.CLASSIFY reads one document column, or one from each side of a join",
+                "AI.CLASSIFY needs one document column or one from each side of a join.",
             );
         }
         let mut call = model_call(prompt, "label");
@@ -431,29 +449,27 @@ impl Binder {
         let args = arguments(node);
         if args.len() != 2 {
             return compile_error(
-                "AI.EXTRACT takes a document column and an object of field questions",
+                "AI.EXTRACT needs a document column and an object of field questions.",
             );
         }
-        let reference = self.bind_value(&args[0])?;
+        let reference = self.bind_document_value(&args[0])?;
         let Some(fields) = object_fields(&args[1]) else {
-            return compile_error(format!(
-                "AI.EXTRACT's second argument is an object of field questions such as \
-                 {{'ends': 'When does the lease end?'}}, got {}",
-                args[1]
-            ));
+            return compile_error(
+                "AI.EXTRACT needs an object of field questions as its second argument.",
+            );
         };
         let mut questions: Vec<(String, String)> = Vec::new();
         for (field, question) in fields {
             if questions.iter().any(|(found, _)| *found == field) {
                 return compile_error(format!(
-                    "AI.EXTRACT {} names {} twice",
+                    "AI.EXTRACT {} must not name field {} twice.",
                     repr_str(name),
                     repr_str(&field)
                 ));
             }
             let Some(question) = string_literal(question) else {
                 return compile_error(format!(
-                    "AI.EXTRACT field {} is a question string, got {question}",
+                    "AI.EXTRACT field {} needs a question string.",
                     repr_str(&field)
                 ));
             };
@@ -491,28 +507,22 @@ impl Binder {
         let args = arguments(node);
         if !(2..=3).contains(&args.len()) {
             return compile_error(
-                "AI.MAP takes a document column, an instruction string, and an optional answer \
-                 limit in tokens",
+                "AI.MAP takes a document column, an instruction string, and an optional token limit.",
             );
         }
         let Some(instruction) = string_literal(&args[1]) else {
-            return compile_error(format!(
-                "AI.MAP's second argument is an instruction string, got {}",
-                args[1]
-            ));
+            return compile_error("AI.MAP needs an instruction string as its second argument.");
         };
         let limit = match args.get(2) {
             None => DEFAULT_MAP_ANSWER_TOKENS,
             Some(found) => match literal_value(found).and_then(|value| value.as_i64()) {
                 Some(limit) if limit >= 0 => limit,
                 _ => {
-                    return compile_error(format!(
-                        "AI.MAP's answer limit is a whole number of tokens, got {found}"
-                    ));
+                    return compile_error("The AI.MAP token limit must be a positive integer.");
                 }
             },
         };
-        let reference = self.bind_value(&args[0])?;
+        let reference = self.bind_document_value(&args[0])?;
         let prompt = prompts::bind(
             "map",
             &instruction,
@@ -540,13 +550,13 @@ impl Binder {
         });
         let Some(pooling) = pooling.filter(|_| args.len() == 2) else {
             return compile_error(
-                "AI.SAE_FEATURES takes PROMPT(...) and pooling => 'last' or 'max'",
+                "AI.SAE_FEATURES needs a PROMPT and pooling set to 'last' or 'max'.",
             );
         };
         let (prompt, aliases) =
             self.bind_ai_call(&args[0], "ai_sae_features", Some(false), None)?;
         if aliases.len() != 1 {
-            return compile_error("AI.SAE_FEATURES reads one document column");
+            return compile_error("AI.SAE_FEATURES needs one document column.");
         }
         let mut call = model_call(prompt, "features");
         call.pooling = pooling;
@@ -572,10 +582,12 @@ impl Binder {
             return Ok(self.bind_ai_classify(node)?.0);
         }
         let args = arguments(node);
+        if args.len() > 2 {
+            return compile_error("AI.SCORE takes a PROMPT and at most one options object.");
+        }
+        parse_options(args.get(1), &["selectivity"])?;
         let Some(prompt) = args.first() else {
-            return compile_error(
-                "AI_SCORE's first argument must be PROMPT('template', columns...)",
-            );
+            return compile_error("AI.SCORE needs a PROMPT as its first argument.");
         };
         let (prompt, _) = self.bind_ai_call(prompt, "ai_score", None, None)?;
         Ok(model_call(prompt, "score"))
@@ -625,8 +637,8 @@ fn model_call(prompt: quail_planner::physical::Prompt, kind: &str) -> ModelCall 
 fn parse_categories(node: &Expr) -> Result<(Vec<String>, Vec<String>), CompileError> {
     if !is_call(node, "make_array") {
         return compile_error(
-            "AI.CLASSIFY categories are an ARRAY of labels, of (label, description) pairs, or \
-             of {'label': ..., 'description': ...} objects, or a registered label table's name",
+            "AI.CLASSIFY categories must be an array of labels, label-description pairs, or \
+             category objects, or a registered label table name.",
         );
     }
     let (mut labels, mut descriptions) = (Vec::new(), Vec::new());
@@ -652,19 +664,19 @@ fn parse_categories(node: &Expr) -> Result<(Vec<String>, Vec<String>), CompileEr
             match label {
                 Some((_, label)) if !unknown => (*label, description),
                 _ => {
-                    return compile_error(format!(
-                        "a category object has a label and an optional description, got {item}"
-                    ));
+                    return compile_error(
+                        "A category object must contain a label and may contain a description.",
+                    );
                 }
             }
         } else {
             return compile_error(format!(
-                "AI.CLASSIFY category {item} is not a label, a (label, description) pair, or a \
-                 category object"
+                "AI.CLASSIFY category {item} must be a label, a label-description pair, or a \
+                 category object."
             ));
         };
         let Some(label) = string_literal(label) else {
-            return compile_error("AI.CLASSIFY labels are string literals");
+            return compile_error("AI.CLASSIFY labels must be string literals.");
         };
         let description = match description {
             None => String::new(),
@@ -672,7 +684,9 @@ fn parse_categories(node: &Expr) -> Result<(Vec<String>, Vec<String>), CompileEr
             Some(found) => match string_literal(found) {
                 Some(text) => text,
                 None => {
-                    return compile_error("an AI.CLASSIFY description is a string literal or NULL");
+                    return compile_error(
+                        "An AI.CLASSIFY description must be a string literal or NULL.",
+                    );
                 }
             },
         };
@@ -683,4 +697,69 @@ fn parse_categories(node: &Expr) -> Result<(Vec<String>, Vec<String>), CompileEr
         descriptions.clear();
     }
     Ok((labels, descriptions))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::prelude::{col, lit};
+    use quail_planner::error::ErrorKind;
+
+    fn binder() -> Binder {
+        Binder::new(&(String::new(), String::new()), "default", &[])
+    }
+
+    fn call(name: &str, args: Vec<Expr>) -> Expr {
+        Expr::ScalarFunction(ScalarFunction::new_udf(
+            crate::rules::lower::quail_function(name),
+            args,
+        ))
+    }
+
+    #[test]
+    fn malformed_options_are_invalid_but_document_storage_limits_are_unsupported() {
+        let error = parse_options(Some(&lit(0.5)), &["selectivity"])
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ErrorKind::Invalid);
+        let mut binder = binder();
+        let document = |name: &str| {
+            ValueExpression::ColumnRef(ColumnRef {
+                alias: "r".into(),
+                provider: "reviews".into(),
+                column: name.into(),
+            })
+        };
+        binder.note_document_column(&document("body")).unwrap();
+        let error = binder.note_document_column(&document("title")).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn score_thresholds_outside_zero_to_one_are_invalid() {
+        let prompt = call("prompt", vec![lit("Is {0} relevant?"), col("r.body")]);
+        let score = call("ai_score", vec![prompt]);
+        for threshold in [-0.1, 1.1] {
+            let test = score.clone().gt(lit(threshold));
+            let error = binder()
+                .bind_ai_score_test(&test, &["selectivity"], None)
+                .err()
+                .unwrap();
+            assert_eq!(error.kind(), ErrorKind::Invalid);
+            assert!(error.message().contains("between 0 and 1"));
+        }
+    }
+
+    #[test]
+    fn projected_score_validates_options_and_arity() {
+        let prompt = call("prompt", vec![lit("Is {0} relevant?"), col("r.body")]);
+        let bad_options = call("ai_score", vec![prompt.clone(), lit(0.5)]);
+        let error = binder().bind_ai_value(&bad_options).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Invalid);
+        assert!(error.message().contains("options"));
+        let too_many = call("ai_score", vec![prompt, lit(0.5), lit(0.5)]);
+        let error = binder().bind_ai_value(&too_many).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Invalid);
+        assert!(error.message().contains("at most one"));
+    }
 }
