@@ -27,21 +27,22 @@ tagged_struct! {
 impl Schema {
     /// The schema's column names.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// The IPC bytes do not hold a schema.
-    pub fn names(&self) -> Vec<String> {
+    /// The payload is not base64 or its IPC bytes do not hold a schema.
+    pub fn names(&self) -> Result<Vec<String>, crate::error::CompileError> {
+        use crate::error::CompileError;
         use base64::Engine;
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(&self.ipc)
-            .expect("base64 schema bytes");
-        let schema =
-            arrow_ipc::convert::try_schema_from_ipc_buffer(&bytes).expect("an IPC schema message");
-        schema
+            .map_err(|error| CompileError::new(format!("invalid schema base64: {error}")))?;
+        let schema = arrow_ipc::convert::try_schema_from_ipc_buffer(&bytes)
+            .map_err(|error| CompileError::new(format!("invalid IPC schema: {error}")))?;
+        Ok(schema
             .fields()
             .iter()
             .map(|field| field.name().clone())
-            .collect()
+            .collect())
     }
 }
 

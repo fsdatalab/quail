@@ -11,7 +11,7 @@ use datafusion::common::Column;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::utils::split_conjunction;
 use datafusion::logical_expr::{Expr, Join, JoinType, LogicalPlan};
-use quail_planner::expressions::{CompileError, compile_error};
+use quail_planner::error::{CompileError, compile_error};
 use std::collections::BTreeSet;
 
 /// `plan` with a SELECT list at its root: DataFusion removes one that

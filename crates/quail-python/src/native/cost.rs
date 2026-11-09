@@ -131,6 +131,8 @@ impl CostModel {
 
     /// One device's GEMM rate for a precision.
     fn gemm_flops(&self, device: &str, precision: &str) -> PyResult<f64> {
+        let precision = serde_json::from_value(serde_json::json!(precision))
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
         Ok(self.device(device)?.gemm_flops(precision))
     }
 

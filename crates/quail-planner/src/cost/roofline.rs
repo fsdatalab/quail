@@ -1,7 +1,7 @@
 //! Each model component's time at the device's limits.
 
 use crate::cost::quantity::Quantity;
-use crate::cost::specs::DeviceSpec;
+use crate::cost::specs::{DeviceSpec, Precision};
 
 /// One model component's arithmetic and memory work.
 #[derive(Debug, Clone, PartialEq)]
@@ -9,7 +9,7 @@ pub struct CostComponent {
     pub name: &'static str,
     pub flops: Quantity,
     pub bytes_moved: Quantity,
-    pub precision: String,
+    pub precision: Precision,
     pub gemm: bool,
 }
 
@@ -37,9 +37,9 @@ impl ComponentLatency {
 /// Price one component against the device's limits.
 pub fn component_latency(component: CostComponent, device: &DeviceSpec) -> ComponentLatency {
     let bandwidth = if component.gemm {
-        device.gemm_flops(&component.precision)
+        device.gemm_flops(component.precision)
     } else {
-        device.arithmetic_bandwidth(&component.precision)
+        device.arithmetic_bandwidth(component.precision)
     };
     ComponentLatency {
         compute_seconds: &component.flops / bandwidth,

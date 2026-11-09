@@ -19,7 +19,7 @@ use serde_json::{Map, Value};
 use crate::classify::classify_statistics;
 use crate::columns::map_seconds;
 use crate::context::PlanningContext;
-use crate::expressions::CompileError;
+use crate::error::CompileError;
 use crate::plan_statistics::CorpusStats;
 use crate::prompts::prompt_layout;
 
@@ -225,6 +225,24 @@ impl PlanPricer {
         context: &PlanningContext,
         nodes: &[PhysicalNode],
     ) -> Result<(f64, Map<String, Value>), CompileError> {
+        // Graphs may arrive from Python rather than the planner. Costing reads
+        // each inference spec's document alias and head/tail token parts.
+        for node in nodes {
+            if matches!(
+                node,
+                PhysicalNode::AiScore(_)
+                    | PhysicalNode::AiClassify(_)
+                    | PhysicalNode::AiExtract(_)
+                    | PhysicalNode::AiMap(_)
+                    | PhysicalNode::AiSaeFeatures(_)
+            ) && (node.spec_aliases().is_empty() || node.prompt_token_parts().len() < 2)
+            {
+                return Err(CompileError::new(format!(
+                    "physical node {:?} needs a spec with aliases and head/tail prompt tokens",
+                    node.id()
+                )));
+            }
+        }
         let mut work = Work::default();
         let mut seconds = 0.0;
         let mut entries = Map::new();

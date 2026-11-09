@@ -18,10 +18,9 @@ use crate::classify::classify_statistics;
 use crate::columns::{ColumnSpec, column_spec};
 use crate::context::PlanningContext;
 use crate::costs::question_tokens;
+use crate::error::{CompileError, Refusal};
 use crate::expressions::asked_call;
-use crate::expressions::{
-    CompileError, Refusal, SPAN_SUFFIX, argument_alias, call_aliases, condition_columns, repr_str,
-};
+use crate::expressions::{SPAN_SUFFIX, argument_alias, call_aliases, condition_columns, repr_str};
 use crate::operators::{ColumnTest, Operators, SemanticColumn};
 use crate::pricing::PlanPricer;
 use crate::results::limit_node;
@@ -276,8 +275,12 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         })();
         let (ports, joins, score_pairs) = match emitted {
             Ok(found) => found,
-            Err(CompileError(_, Some(refusal), _)) => return Ok(Err(*refusal)),
-            Err(error) => return Err(error),
+            Err(error) => {
+                return match error.refusal() {
+                    Some(refusal) => Ok(Err(refusal.clone())),
+                    None => Err(error),
+                };
+            }
         };
         self.emit_result(&ports, &joins, score_pairs);
         self.finish().map(Ok)

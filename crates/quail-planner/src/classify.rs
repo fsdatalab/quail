@@ -14,7 +14,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::context::PlanningContext;
-use crate::expressions::{CompileError, Refusal, argument_alias, column_name, repr_str};
+use crate::error::{CompileError, Refusal};
+use crate::expressions::{argument_alias, column_name, repr_str};
 use crate::lowering::{
     Decoder, LoweredPrompt, Tokenizer, choice_token_parts, classify_prompt_tokens, lower_prompt,
     option_spellings,

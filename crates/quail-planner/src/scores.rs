@@ -9,7 +9,8 @@ use crate::cost::work::Work;
 use crate::physical::{Prompt, ScoreSpec};
 
 use crate::context::PlanningContext;
-use crate::expressions::{CompileError, argument_alias, column_name};
+use crate::error::CompileError;
+use crate::expressions::{argument_alias, column_name};
 use crate::lowering::{lower_prompt, score_query_template, score_token_parts};
 use crate::prompts::{bind_prompt, prompt_layout};
 use crate::statistics::{arena_capacity, pair_counts};

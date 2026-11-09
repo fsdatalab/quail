@@ -152,7 +152,7 @@ fn identified(name: &str, table: MemTable) -> Arc<IdentifiedTable> {
 }
 
 async fn context(settings: &[&str]) -> Result<SessionContext> {
-    let context = session_context(Arc::new(KeepsTwoReviews));
+    let context = session_context(Arc::new(KeepsTwoReviews))?;
     for setting in settings {
         context.sql(setting).await?.collect().await?;
     }

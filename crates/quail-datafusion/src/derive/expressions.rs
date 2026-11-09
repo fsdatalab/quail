@@ -29,7 +29,8 @@ use datafusion::logical_expr::{BinaryExpr, Cast, Expr, Like, Operator, TryCast};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::prelude::SessionContext;
 use datafusion_proto::bytes::Serializeable;
-use quail_planner::expressions::{CompileError, repr_float, repr_str};
+use quail_planner::error::CompileError;
+use quail_planner::expressions::{repr_float, repr_str};
 use quail_planner::physical::{ColumnRef, Expression, ValueExpression};
 
 /// Where a column's position starts and ends in an expression's text

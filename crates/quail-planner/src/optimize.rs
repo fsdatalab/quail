@@ -4,7 +4,7 @@
 use serde_json::{Map, Value};
 
 use crate::context::PlanningContext;
-use crate::expressions::{CompileError, Refusal};
+use crate::error::{CompileError, Refusal};
 use crate::graph::{PhysicalPlan, Planned, plan_region};
 use crate::operators::Operators;
 use crate::physical_rules::apply_plan_rules;

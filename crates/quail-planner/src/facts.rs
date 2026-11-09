@@ -28,7 +28,7 @@ use crate::plan_statistics::plan_prompts;
 /// - `prompts`: each table's AI.IF prompts in written order, each
 ///   join's prompt by written position, and each classification's
 ///   prompt and aliases by its output name.
-pub fn region_facts(found: &Operators) -> Value {
+pub fn region_facts(found: &Operators) -> Result<Value, crate::error::CompileError> {
     let mut value_columns: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut add = |alias: &str, column: &str| {
         let columns = value_columns.entry(alias.to_string()).or_default();
@@ -50,15 +50,16 @@ pub fn region_facts(found: &Operators) -> Value {
         .scans
         .iter()
         .map(|scan| {
-            (
+            Ok((
                 scan.alias.as_str(),
                 scan.schema
                     .as_ref()
                     .map(|schema| schema.names())
+                    .transpose()?
                     .unwrap_or_default(),
-            )
+            ))
         })
-        .collect();
+        .collect::<Result<_, crate::error::CompileError>>()?;
     for scan in &found.scans {
         for predicate in &scan.predicates {
             for reference in column_references(predicate) {
@@ -166,7 +167,7 @@ pub fn region_facts(found: &Operators) -> Value {
             )
         })
         .collect();
-    json!({
+    Ok(json!({
         "prompts": {"filters": filters, "joins": joins, "classifies": classifies},
         "asks_model": !plan_prompts(found).is_empty(),
         "stop_keys": found.stop_keys,
@@ -174,5 +175,5 @@ pub fn region_facts(found: &Operators) -> Value {
         "join_conditions": oriented,
         "scans": scans,
         "value_columns": value_columns,
-    })
+    }))
 }

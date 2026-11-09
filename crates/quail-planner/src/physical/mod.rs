@@ -43,6 +43,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn malformed_schema_payloads_return_errors() {
+        use crate::operators::Schema;
+        for (ipc, message) in [
+            ("not base64!", "invalid schema base64"),
+            ("", "invalid IPC schema"),
+            ("AAAAAA==", "invalid IPC schema"),
+        ] {
+            let schema = Schema { ipc: ipc.into() };
+            assert!(schema.names().unwrap_err().message().starts_with(message));
+        }
+    }
+
+    #[test]
     fn a_tagged_struct_reads_and_writes_its_tag() {
         let text = r#"{"type":"quail.physical.base.PortRef","node_id":"scan:r","port":"rows:r"}"#;
         let port: PortRef = serde_json::from_str(text).unwrap();

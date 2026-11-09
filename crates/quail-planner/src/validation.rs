@@ -8,8 +8,9 @@ use crate::cost::specs::{DeviceSpec, ModelSpec};
 use crate::physical::{Asked, Prompt, ValueExpression};
 
 use crate::context::PlanningContext;
+use crate::error::{CompileError, Refusal};
 use crate::expressions::asked_call;
-use crate::expressions::{CompileError, Refusal, aliased_call, call_aliases, repr_str};
+use crate::expressions::{aliased_call, call_aliases, repr_str};
 use crate::operators::Operators;
 use crate::prompts::prompt_layout;
 use crate::scores::prompt_aliases;

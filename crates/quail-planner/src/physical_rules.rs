@@ -12,7 +12,7 @@ use serde_json::{Map, Value};
 
 use crate::classify::classify_statistics;
 use crate::context::PlanningContext;
-use crate::expressions::CompileError;
+use crate::error::CompileError;
 use crate::graph::{PhysicalPlan, Planned};
 use crate::plan_statistics::{expected_rows_after_filters, plan_statistics};
 use crate::pricing::{expected_documents, head_tokens, pass_question_tokens, set_pass_tokens};
@@ -1162,8 +1162,12 @@ pub fn apply_plan_rules(
                 changed = true;
             }
             Ok(_) => {}
-            Err(CompileError(_, Some(refusal), _)) => return Ok(Err(*refusal)),
-            Err(error) => return Err(error),
+            Err(error) => {
+                return match error.refusal() {
+                    Some(refusal) => Ok(Err(refusal.clone())),
+                    None => Err(error),
+                };
+            }
         }
     }
     if !changed && settings == plan.settings {

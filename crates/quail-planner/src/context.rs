@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use crate::cost::specs::{DeviceSpec, ModelSpec};
 
-use crate::expressions::CompileError;
+use crate::error::CompileError;
 use crate::lowering::{Decoder, LoweredPrompt, PromptModel, Tokenizer, lower_prompt};
 use crate::operators::Operators;
 

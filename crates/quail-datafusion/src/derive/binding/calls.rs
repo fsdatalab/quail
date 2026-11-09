@@ -7,9 +7,8 @@ use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{Column, ScalarValue};
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
-use quail_planner::expressions::{
-    CompileError, column_alias_of, column_name, compile_error, explain_call, repr_str,
-};
+use quail_planner::error::{CompileError, compile_error};
+use quail_planner::expressions::{column_alias_of, column_name, explain_call, repr_str};
 use quail_planner::physical::{
     Alias, ColumnRef, ExtractStruct, ModelCall, ScoreTest, ValueExpression,
 };

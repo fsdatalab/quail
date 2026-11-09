@@ -10,8 +10,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::context::PlanningContext;
+use crate::error::{CompileError, Refusal};
 use crate::expressions::asked_call;
-use crate::expressions::{CompileError, Refusal, aliased_call, argument_alias, call_aliases};
+use crate::expressions::{aliased_call, argument_alias, call_aliases};
 use crate::graph::has_label;
 use crate::lowering::answer_ids;
 use crate::operators::{Operators, SemanticColumn};

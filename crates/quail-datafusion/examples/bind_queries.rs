@@ -57,7 +57,7 @@ async fn main() -> Result<()> {
     let dialect = arguments.get(2).cloned();
     let queries: serde_json::Value = serde_json::from_str(&text).unwrap();
     for query in queries.as_array().unwrap() {
-        let context = session_context(Arc::new(NoRows));
+        let context = session_context(Arc::new(NoRows))?;
         if let Some(dialect) = &dialect {
             context
                 .sql(&format!("SET datafusion.sql_parser.dialect = '{dialect}'"))

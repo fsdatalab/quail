@@ -9,8 +9,9 @@ use crate::cost::score::ScoreCost;
 use crate::physical::{Equality, FilterPredicate, Prompt};
 
 use crate::context::PlanningContext;
+use crate::error::{CompileError, compile_error};
 use crate::expressions::asked_call;
-use crate::expressions::{CompileError, argument_alias, column_name, compile_error};
+use crate::expressions::{argument_alias, column_name};
 use crate::lowering::LoweredPrompt;
 use crate::operators::SemanticJoin;
 use crate::scores::{prompt_aliases, score_statistics};

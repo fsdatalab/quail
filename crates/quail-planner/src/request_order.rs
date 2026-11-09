@@ -12,8 +12,9 @@ use serde::Serialize;
 
 use crate::context::PlanningContext;
 use crate::costs::{join_specs, prepare_filter_costs};
+use crate::error::CompileError;
 use crate::expressions::asked_call;
-use crate::expressions::{CompileError, repr_str};
+use crate::expressions::repr_str;
 use crate::graph::hash_join_nodes;
 use crate::operators::Operators;
 use crate::plan_statistics::CorpusStats;

@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use datafusion::arrow::array::{Int32Array, RecordBatch};
-use datafusion::arrow::compute::take;
+use datafusion::arrow::compute::{TakeOptions, take};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::memory::MemorySourceConfig;
@@ -88,9 +88,22 @@ fn write_frame(writer: &mut impl Write, bytes: &[u8]) -> Result<()> {
 fn read_frame(reader: &mut impl Read) -> Result<Vec<u8>> {
     let mut length = [0u8; 8];
     reader.read_exact(&mut length)?;
-    let mut bytes = vec![0u8; u64::from_le_bytes(length) as usize];
-    reader.read_exact(&mut bytes)?;
+    let length = u64::from_le_bytes(length);
+    // Do not allocate from an untrusted length before receiving its bytes.
+    let mut bytes = Vec::new();
+    reader.take(length).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != length {
+        return Err(failure("a stage frame ended before its declared length"));
+    }
     Ok(bytes)
+}
+
+fn header_count(header: &serde_json::Value, name: &str) -> Result<usize> {
+    header
+        .get(name)
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or_else(|| failure(format!("a stage header has no valid {name} count")))
 }
 
 fn table_bytes((schema, batches): &Table) -> Result<Vec<u8>> {
@@ -134,11 +147,12 @@ impl Server {
                 "stage {stage} failed on its GPU:\n{error}"
             )));
         }
-        let count = |name: &str| header[name].as_u64().unwrap_or(0);
-        let outputs = (0..count("outputs"))
+        let outputs = header_count(&header, "outputs")?;
+        let finished = header_count(&header, "finished")?;
+        let outputs = (0..outputs)
             .map(|_| read_table(&read_frame(&mut self.reader)?))
             .collect::<Result<Vec<_>>>()?;
-        let finished = (0..count("finished"))
+        let finished = (0..finished)
             .map(|_| read_frame(&mut self.reader))
             .collect::<Result<Vec<_>>>()?;
         Ok(Reply { outputs, finished })
@@ -193,13 +207,14 @@ impl StageListener {
         let connection = self.connection()?;
         let header: serde_json::Value =
             serde_json::from_slice(&read_frame(&mut connection.reader)?).map_err(failure)?;
-        let Some(stage) = header["stage"].as_u64() else {
+        if header.get("end").and_then(serde_json::Value::as_bool) == Some(true) {
             return Ok(None);
-        };
-        let inputs = (0..header["inputs"].as_u64().unwrap_or(0))
+        }
+        let stage = header_count(&header, "stage")?;
+        let inputs = (0..header_count(&header, "inputs")?)
             .map(|_| read_table(&read_frame(&mut connection.reader)?))
             .collect::<Result<Vec<_>>>()?;
-        Ok(Some((stage as usize, inputs)))
+        Ok(Some((stage, inputs)))
     }
 
     /// Send what a stage wrote: its outputs' rows and its finished rows.
@@ -293,6 +308,13 @@ impl Staged {
         })
         .await
         .map_err(failure)??;
+        if reply.outputs.len() != self.stages[stage].outputs.len() {
+            return Err(failure(format!(
+                "stage {stage} returned {} outputs, expected {}",
+                reply.outputs.len(),
+                self.stages[stage].outputs.len()
+            )));
+        }
         let report = Arc::clone(&self.report);
         let finished = reply.finished;
         tokio::task::spawn_blocking(move || {
@@ -339,7 +361,10 @@ impl Staged {
             }
             Some(from) => {
                 let wanted = (input.node_id.clone(), input.port.clone());
-                let output = self.stages[from]
+                let output = self
+                    .stages
+                    .get(from)
+                    .ok_or_else(|| failure(format!("stage {from} does not exist")))?
                     .outputs
                     .iter()
                     .position(|found| *found == wanted)
@@ -355,16 +380,26 @@ impl Staged {
                         .cloned()
                         .collect()
                 };
-                let schema = written
+                let tables = written
                     .iter()
-                    .map(|tables| &tables[output])
+                    .map(|tables| {
+                        tables.get(output).ok_or_else(|| {
+                            failure(format!("stage {from} returned no output {output}"))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let first = tables
+                    .first()
+                    .ok_or_else(|| failure("a stage has no output partitions"))?;
+                let schema = tables
+                    .iter()
                     .find(|(_, batches)| !rows(batches).is_empty())
-                    .unwrap_or(&written[0][output])
+                    .unwrap_or(first)
                     .0
                     .clone();
-                let partitions = written
+                let partitions = tables
                     .iter()
-                    .map(|tables| rows(&tables[output].1))
+                    .map(|(_, batches)| rows(batches))
                     .collect::<Vec<_>>();
                 (schema, partitions)
             }
@@ -420,7 +455,15 @@ fn keyed(
                 .into_iter()
                 .map(|batch| {
                     let mut columns = batch.columns().to_vec();
-                    columns.push(take(keys, batch.column(index).as_ref(), None)?);
+                    let ids = batch
+                        .columns()
+                        .get(index)
+                        .ok_or_else(|| failure(format!("the rows have no key column {alias}")))?;
+                    columns.push(take(
+                        keys,
+                        ids.as_ref(),
+                        Some(TakeOptions { check_bounds: true }),
+                    )?);
                     Ok(RecordBatch::try_new(Arc::clone(&keyed_schema), columns)?)
                 })
                 .collect::<Result<Vec<_>>>()
@@ -502,29 +545,44 @@ pub fn run_stages(
     servers: &[PathBuf],
     report: Report,
 ) -> Result<()> {
+    if !cut.is_empty() && servers.is_empty() {
+        return Err(failure("a stage has no GPU servers"));
+    }
     // each server waits for this connection, so a region that cannot
     // run still connects, then ends
     let servers = servers
         .iter()
         .map(|path| Ok(Arc::new(Mutex::new(Server::connect(path)?))))
         .collect::<Result<Vec<_>>>()?;
-    let scans: HashMap<String, (String, usize)> = graph
+    let scans = graph
         .nodes
         .iter()
         .filter_map(|node| match node {
-            PhysicalNode::Scan(scan) => Some((
-                scan.id.clone(),
-                (
-                    scan.attributes.alias.clone(),
-                    scan.attributes.num_documents as usize,
-                ),
-            )),
+            PhysicalNode::Scan(scan) => Some(scan),
             _ => None,
         })
-        .collect();
-    let num_documents = scans.values().cloned().collect();
-    let keys = match grouped_keys(groupings, &num_documents) {
-        Ok(keys) => keys,
+        .map(|scan| {
+            let count = i32::try_from(scan.attributes.num_documents)
+                .ok()
+                .filter(|count| *count >= 0)
+                .ok_or_else(|| {
+                    failure(format!(
+                        "scan {:?} has an invalid document count {}",
+                        scan.id, scan.attributes.num_documents
+                    ))
+                })?;
+            Ok((
+                scan.id.clone(),
+                (scan.attributes.alias.clone(), count as usize),
+            ))
+        })
+        .collect::<Result<HashMap<_, _>>>();
+    let (scans, keys) = match scans.and_then(|scans| {
+        let num_documents = scans.values().cloned().collect();
+        let keys = grouped_keys(groupings, &num_documents)?;
+        Ok((scans, keys))
+    }) {
+        Ok(found) => found,
         Err(error) => {
             for server in &servers {
                 let _ = server.lock().expect("the server lock").end();
@@ -562,4 +620,50 @@ pub fn run_stages(
         .unwrap_or_else(|_| Err(failure("the stages' thread panicked")));
     let ended = staged.end();
     ran.and(ended)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_frames_and_tables_return_errors() {
+        let length = u64::MAX.to_le_bytes();
+        assert!(read_frame(&mut length.as_slice()).is_err());
+        assert!(read_frame(&mut &[0u8; 3][..]).is_err());
+        assert!(read_table(b"not Arrow IPC").is_err());
+    }
+
+    #[test]
+    fn malformed_header_counts_return_errors() {
+        for header in [
+            serde_json::json!(null),
+            serde_json::json!({}),
+            serde_json::json!({"outputs": -1}),
+            serde_json::json!({"outputs": "one"}),
+        ] {
+            assert!(matches!(
+                header_count(&header, "outputs"),
+                Err(DataFusionError::Execution(_))
+            ));
+        }
+        assert_eq!(
+            header_count(&serde_json::json!({"outputs": 0}), "outputs").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn keyed_rows_reject_invalid_document_ids() {
+        let schema = Arc::new(Schema::new(vec![Field::new("r", DataType::Int32, false)]));
+        let keys = Int32Array::from(vec![0]);
+        for id in [-1, 1] {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from(vec![id]))],
+            )
+            .unwrap();
+            assert!(keyed(&schema, vec![vec![batch]], "r", &keys).is_err());
+        }
+    }
 }

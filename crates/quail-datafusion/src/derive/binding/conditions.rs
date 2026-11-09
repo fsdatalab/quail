@@ -12,9 +12,9 @@ use datafusion::common::{Column, ScalarValue};
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::utils::split_conjunction;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
+use quail_planner::error::{CompileError, compile_error};
 use quail_planner::expressions::{
-    CompileError, SPAN_SUFFIX, aliased_call, call_aliases, column_alias_of, column_name,
-    compile_error, repr_list, repr_str,
+    SPAN_SUFFIX, aliased_call, call_aliases, column_alias_of, column_name, repr_list, repr_str,
 };
 use quail_planner::physical::{Equality, ModelCall, ValueExpression};
 use serde_json::Value;

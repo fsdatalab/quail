@@ -167,6 +167,6 @@ fn an_expression_that_calls_a_hosts_function_is_refused_by_name() -> Result<()> 
     })
     .expect("the test encodes");
     let refused = PhysicalExpression::new(&encoded).expect_err("an unknown function");
-    assert!(refused.0.contains("quail_test_shout"), "{}", refused.0);
+    assert!(refused.message().contains("quail_test_shout"), "{refused}");
     Ok(())
 }

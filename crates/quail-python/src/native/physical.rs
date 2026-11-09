@@ -646,10 +646,22 @@ pub struct Tagged {
 
 impl Tagged {
     fn new(held: Held) -> PyResult<Self> {
-        let physical = match &held {
-            Held::Value(value) => physical_value(value)?,
-            Held::Node(_) => None,
-        };
+        let physical =
+            match &held {
+                Held::Value(value) => physical_value(value)?,
+                Held::Node(node) => {
+                    if let physical::PhysicalNode::AiScore(score) = node.as_ref()
+                        && score.attributes.spec.as_ref().is_some_and(|spec| {
+                            spec.state_tail_tokens != 0 && spec.aliases.is_empty()
+                        })
+                    {
+                        return Err(PyValueError::new_err(
+                            "an AiScore with state tail tokens requires an alias",
+                        ));
+                    }
+                    None
+                }
+            };
         Ok(Self {
             held,
             filled: AtomicBool::new(false),
@@ -671,6 +683,22 @@ fn asks_model(value: &physical::ValueExpression) -> bool {
     }
 }
 
+/// A column name for Python, rejecting unnamed model calls before the
+/// planner's column-name helper assumes the expression has a name.
+fn expression_name(expression: &physical::ValueExpression) -> PyResult<String> {
+    match expression {
+        physical::ValueExpression::ModelCall(_) => {
+            Err(PyValueError::new_err("a model call has no column name"))
+        }
+        physical::ValueExpression::GetField(field) => Ok(format!(
+            "{}.{}",
+            expression_name(&field.input)?,
+            field.field
+        )),
+        _ => Ok(quail_planner::expressions::column_name(expression, true)),
+    }
+}
+
 /// A value of a class DataFusion evaluates, built for evaluation; None
 /// for another value or one that asks the model.
 fn physical_value(value: &Value) -> PyResult<Option<PhysicalValue>> {
@@ -689,7 +717,7 @@ fn physical_value(value: &Value) -> PyResult<Option<PhysicalValue>> {
     }
     PhysicalValue::new(&expression)
         .map(Some)
-        .map_err(|error| PyValueError::new_err(error.0))
+        .map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
 /// Quail's `CompileError` with a message.
@@ -698,7 +726,10 @@ fn compile_error(py: Python<'_>, message: String) -> PyErr {
         .import(EXPRESSIONS)
         .and_then(|module| module.getattr("CompileError"))
     {
-        Ok(class) => PyErr::from_type(class.cast_into().expect("an exception type"), message),
+        Ok(class) => match class.cast_into() {
+            Ok(class) => PyErr::from_type(class, message),
+            Err(error) => PyTypeError::new_err(format!("an exception type: {error}")),
+        },
         Err(error) => error,
     }
 }
@@ -736,7 +767,7 @@ fn evaluate_rows<'py>(
     if batches.is_empty() {
         batches.push(RecordBatch::new_empty(schema));
     }
-    let found = py.detach(|| -> Result<ArrayRef, quail_planner::CompileError> {
+    let found = py.detach(|| -> Result<ArrayRef, quail_planner::error::CompileError> {
         let arrays = batches
             .iter()
             .map(|batch| built.evaluate(batch, qualified))
@@ -746,11 +777,11 @@ fn evaluate_rows<'py>(
         }
         let parts: Vec<&dyn Array> = arrays.iter().map(AsRef::as_ref).collect();
         datafusion::arrow::compute::concat(&parts)
-            .map_err(|error| quail_planner::CompileError::new(error.to_string()))
+            .map_err(|error| quail_planner::error::CompileError::new(error.to_string()))
     });
     match found {
         Ok(array) => crate::pyarrow::array_to_pyarrow(py, &array),
-        Err(error) => Err(compile_error(py, error.0)),
+        Err(error) => Err(compile_error(py, error.to_string())),
     }
 }
 
@@ -1178,16 +1209,18 @@ impl Tagged {
         let text = match class {
             "ColumnRef" | "GetField" | "Expression" => serde_json::from_value(value)
                 .ok()
-                .map(|expression| quail_planner::expressions::column_name(&expression, true)),
+                .map(|expression| expression_name(&expression))
+                .transpose()?,
             "Equality" => serde_json::from_value::<physical::Equality>(value)
                 .ok()
                 .map(|pair| {
-                    format!(
+                    Ok::<_, PyErr>(format!(
                         "{} = {}",
-                        quail_planner::expressions::column_name(&pair.left, true),
-                        quail_planner::expressions::column_name(&pair.right, true)
-                    )
-                }),
+                        expression_name(&pair.left)?,
+                        expression_name(&pair.right)?
+                    ))
+                })
+                .transpose()?,
             _ => None,
         };
         match text {
@@ -1471,7 +1504,7 @@ leaf_classes! {
             max_chars,
         };
         let decided = decide(&expression, answer, &answers)
-            .map_err(|error| compile_error(slf.py(), error.0))?;
+            .map_err(|error| compile_error(slf.py(), error.to_string()))?;
         Ok(match decided {
             Decision::True => "true",
             Decision::NotTrue => "not true",
@@ -1767,6 +1800,7 @@ impl PhysicalGraph {
 
     /// Return the nodes, each after all its inputs.
     fn topological_nodes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        self.validate(None)?;
         self.by_position(py, &physical::topological_nodes(&self.graph.nodes))
     }
 
@@ -1799,6 +1833,7 @@ impl PhysicalGraph {
         py: Python<'py>,
         completed: Vec<String>,
     ) -> PyResult<Bound<'py, PyDict>> {
+        self.validate(None)?;
         let pipelines = physical::build_pipelines(&self.graph.nodes, &completed);
         let found = PyDict::new(py);
         let groups = pipelines
@@ -1822,6 +1857,7 @@ impl PhysicalGraph {
         py: Python<'py>,
         completed: Vec<String>,
     ) -> PyResult<Bound<'py, PyFrozenSet>> {
+        self.validate(None)?;
         let pipelines = physical::build_pipelines(&self.graph.nodes, &completed);
         PyFrozenSet::new(py, physical::resident_inputs(&self.graph.nodes, &pipelines))
     }
@@ -1912,4 +1948,34 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(encode_plan_value, module)?)?;
     module.add_function(wrap_pyfunction!(input_ports, module)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_tagged_values_return_errors() {
+        let port = kind_of_class("PortRef");
+        assert!(canonical(port, serde_json::json!({"type": port.tag})).is_err());
+        assert!(
+            canonical(
+                port,
+                serde_json::json!({
+                    "type": port.tag, "node_id": [], "port": "rows:r"
+                })
+            )
+            .is_err()
+        );
+        let expression = kind_of_class("Expression");
+        assert!(
+            canonical(
+                expression,
+                serde_json::json!({
+                    "type": expression.tag, "encoded": 42, "columns": [], "types": [], "text": ""
+                })
+            )
+            .is_err()
+        );
+    }
 }

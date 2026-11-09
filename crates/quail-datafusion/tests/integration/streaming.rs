@@ -62,7 +62,7 @@ async fn the_first_batch_reaches_datafusion_before_the_region_finishes() -> Resu
     let (signal, read): (Sender<()>, Receiver<()>) = channel();
     let context = session_context(Arc::new(WaitsForTheReader {
         read: Mutex::new(Some(read)),
-    }));
+    }))?;
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
         Field::new("body", DataType::Utf8, false),
@@ -124,7 +124,7 @@ impl RegionRunner for PanicsAfterOneRow {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_runner_that_panics_fails_the_query() -> Result<()> {
-    let context = session_context(Arc::new(PanicsAfterOneRow));
+    let context = session_context(Arc::new(PanicsAfterOneRow))?;
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
         Field::new("body", DataType::Utf8, false),

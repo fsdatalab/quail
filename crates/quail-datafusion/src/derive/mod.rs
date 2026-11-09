@@ -37,7 +37,8 @@ mod walk;
 use datafusion::common::ScalarValue;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::logical_expr::{Expr, LogicalPlan};
-use quail_planner::expressions::{CompileError, compile_error, condition_text, projected_call};
+use quail_planner::error::{CompileError, compile_error};
+use quail_planner::expressions::{condition_text, projected_call};
 use quail_planner::operators::{Operators, Projection};
 use quail_planner::physical::Projected;
 use quail_planner::prompts::Turn;
@@ -263,9 +264,8 @@ fn derive_operators(
 
 /// The refusal of a plan whose operators Quail's operators do not read.
 fn unplaced(plan: &LogicalPlan) -> CompileError {
-    let mut error = CompileError::unsupported("the placement of these operators");
-    error.0 = format!("{}:\n{}", error.0, plan.display_indent());
-    error
+    CompileError::unsupported("the placement of these operators")
+        .with_context(plan.display_indent())
 }
 
 /// Values kept per table alias, in the order the aliases first appear.

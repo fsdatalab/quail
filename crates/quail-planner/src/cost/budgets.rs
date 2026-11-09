@@ -4,7 +4,7 @@
 //! Python mixes integers and floats here; each function keeps the type
 //! Python's result has, and `//` on floats rounds as CPython's does.
 
-use crate::cost::specs::{DeviceSpec, ModelSpec};
+use crate::cost::specs::{DeviceSpec, ModelSpec, Precision};
 
 /// Fraction of device memory the executor claims.
 pub const POOL_FRACTION: f64 = 0.95;
@@ -413,61 +413,39 @@ pub fn chunk_budget(model: &ModelSpec, device: &DeviceSpec) -> i64 {
     chunk_leaving_kv(model, device, budget)
 }
 
-fn precision_bytes(precision: &str) -> i64 {
-    match precision {
-        "fp8" => 1,
-        "bf16" => 2,
-        "fp32" => 4,
-        other => panic!("unsupported precision: {other}"),
-    }
-}
-
 /// (in dim, out dim, layers, precision) of each dense projection.
-fn projection_shapes(model: &ModelSpec) -> Vec<(i64, i64, i64, String)> {
+fn projection_shapes(model: &ModelSpec) -> Vec<(i64, i64, i64, Precision)> {
     let query_width = if model.attn_output_gate { 2 } else { 1 };
     let qkv_out = (query_width * model.num_q_heads + 2 * model.num_kv_heads) * model.d_head;
     let attention = model.attention_layers().len() as i64;
-    let precision = model.weight_precision.clone();
+    let precision = model.weight_precision;
     let mut shapes = vec![
-        (model.hidden, qkv_out, attention, precision.clone()),
+        (model.hidden, qkv_out, attention, precision),
         (
             model.num_q_heads * model.d_head,
             model.hidden,
             attention,
-            precision.clone(),
+            precision,
         ),
-        (
-            model.hidden,
-            model.ffn_width,
-            model.layers,
-            precision.clone(),
-        ),
-        (
-            model.intermediate(),
-            model.hidden,
-            model.layers,
-            precision.clone(),
-        ),
+        (model.hidden, model.ffn_width, model.layers, precision),
+        (model.intermediate(), model.hidden, model.layers, precision),
     ];
     let gdn = model.gdn_layers().len() as i64;
     if gdn != 0 {
         let key_width = model.gdn_key_heads * model.gdn_key_dim;
         let value_width = model.gdn_value_heads * model.gdn_value_dim;
-        let gdn_precision = model
-            .gdn_weight_precision
-            .clone()
-            .unwrap_or_else(|| precision.clone());
+        let gdn_precision = model.gdn_weight_precision.unwrap_or(precision);
         shapes.push((
             model.hidden,
             2 * key_width + 2 * value_width + 2 * model.gdn_value_heads,
             gdn,
-            gdn_precision.clone(),
+            gdn_precision,
         ));
         shapes.push((value_width, model.hidden, gdn, gdn_precision));
     }
     let short = model.short_conv_layers().len() as i64;
     if short != 0 {
-        shapes.push((model.hidden, 3 * model.hidden, short, precision.clone()));
+        shapes.push((model.hidden, 3 * model.hidden, short, precision));
         shapes.push((model.hidden, model.hidden, short, precision));
     }
     shapes
@@ -483,8 +461,8 @@ pub fn compute_knee(model: &ModelSpec, device: &DeviceSpec) -> Result<f64, Strin
     for (din, dout, layers, precision) in projection_shapes(model) {
         let share = layers as f64 / model.layers as f64;
         let params = share * din as f64 * dout as f64;
-        compute_seconds += 2.0 * params / device.gemm_flops(&precision);
-        weight_bytes += params * precision_bytes(&precision) as f64;
+        compute_seconds += 2.0 * params / device.gemm_flops(precision);
+        weight_bytes += params * precision.bytes() as f64;
         activation_bytes += share * (din + dout) as f64 * ACT_BYTES as f64;
     }
     let denominator = compute_seconds * device.hbm_bw - activation_bytes;
@@ -500,7 +478,7 @@ fn attention_time(model: &ModelSpec, device: &DeviceSpec, chunk: f64, context: f
     let flops = 4.0 * chunk * context * model.num_q_heads as f64 * model.d_head as f64;
     let moved = context * model.kappa() / layers
         + 2.0 * chunk * model.num_q_heads as f64 * model.d_head as f64 * ACT_BYTES as f64;
-    let compute = flops / device.arithmetic_bandwidth(&model.attention_precision);
+    let compute = flops / device.arithmetic_bandwidth(model.attention_precision);
     let memory = moved / device.hbm_bw;
     (if memory > compute { memory } else { compute }) * layers
 }

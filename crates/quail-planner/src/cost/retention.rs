@@ -30,7 +30,7 @@ pub fn retention_pages(arena_tokens: i64, chunk_tokens: i64, page_tokens: i64) -
 /// The model's ideal prefix computation coefficients.
 pub fn coefficients(model: &ModelSpec, device: &DeviceSpec, peak: bool) -> Coefficients {
     let (full, sliding) = attention_pair_flops(model);
-    let bandwidth = device.arithmetic_bandwidth(&model.attention_precision);
+    let bandwidth = device.arithmetic_bandwidth(model.attention_precision);
     let one_token = Work {
         tokens: Quantity::Scalar(1.0),
         ..Work::default()

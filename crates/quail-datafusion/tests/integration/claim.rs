@@ -44,7 +44,7 @@ fn text_table(columns: &[&str], rows: &[&[&str]]) -> Result<MemTable> {
 }
 
 fn context() -> Result<SessionContext> {
-    let context = session_context(Arc::new(NotRun));
+    let context = session_context(Arc::new(NotRun))?;
     // a region returns each review's id, its primary key
     let reviews = text_table(
         &["id", "body"],
@@ -80,7 +80,7 @@ fn regions(plan: &LogicalPlan) -> Vec<ModelRegion> {
     let turn = (String::new(), String::new());
     for region in &found {
         if let Err(error) = quail_datafusion::derive::derive_region(region, &turn, "ai-if") {
-            panic!("{}\n{}", region.plan.display_indent(), error.0);
+            panic!("{}\n{}", region.plan.display_indent(), error.message());
         }
     }
     found
@@ -90,6 +90,33 @@ use datafusion::common::tree_node::TreeNode;
 
 const FILTER_QUERY: &str = "SELECT r.id FROM reviews r \
     WHERE AI.IF(PROMPT('Does this review discuss the ending?\n\n{0}', r.body))";
+
+#[test]
+fn malformed_environment_options_return_errors() {
+    const CHILD: &str = "QUAIL_TEST_INVALID_SESSION_ENV";
+    if std::env::var_os(CHILD).is_some() {
+        let error = session_context(Arc::new(NotRun))
+            .err()
+            .expect("invalid environment");
+        assert!(error.to_string().contains("not-a-number"), "{error}");
+        return;
+    }
+    // Isolate the environment from parallel tests without mutating this process.
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "claim::malformed_environment_options_return_errors",
+        ])
+        .env(CHILD, "1")
+        .env("DATAFUSION_EXECUTION_TARGET_PARTITIONS", "not-a-number")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
 
 #[tokio::test]
 async fn a_filter_query_becomes_one_model_region() -> Result<()> {

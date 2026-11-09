@@ -16,8 +16,9 @@ use crate::classify::classify_seconds;
 use crate::columns::{ColumnSpec, column_spec};
 use crate::context::PlanningContext;
 use crate::costs::{CostCurve, prepare_filter_costs, question_tokens};
+use crate::error::CompileError;
 use crate::expressions::asked_call;
-use crate::expressions::{CompileError, call_aliases, repr_str};
+use crate::expressions::{call_aliases, repr_str};
 use crate::operators::{Operators, SemanticColumn};
 use crate::plan_statistics::{
     PlanStatistics, expected_rows_after_filters, filtered_before_joins, plan_statistics,
@@ -933,7 +934,7 @@ pub struct OperatorOrder {
     pub order_source: String,
 }
 
-pub use crate::expressions::Refusal;
+use crate::error::Refusal;
 
 /// The default stage order rule, as `default_order_rule`: (rule, source).
 pub fn default_order_rule(found: &Operators) -> (String, String) {

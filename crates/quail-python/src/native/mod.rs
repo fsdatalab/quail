@@ -106,7 +106,7 @@ impl NativeSession {
                     }
                     Err(error) => {
                         let unsupported = error.is_unsupported();
-                        (None, Some(error.0), unsupported)
+                        (None, Some(error.to_string()), unsupported)
                     }
                 });
             }
@@ -217,7 +217,7 @@ fn bind_prompt(
         layout,
     ) {
         Ok(prompt) => Ok((Some(serde_json::to_string(&prompt).map_err(invalid)?), None)),
-        Err(error) => Ok((None, Some(error.0))),
+        Err(error) => Ok((None, Some(error.to_string()))),
     }
 }
 
@@ -266,7 +266,7 @@ fn lowering_result<T: serde::Serialize>(
             ),
             None,
         )),
-        Err(error) => Ok((None, Some(error.0))),
+        Err(error) => Ok((None, Some(error.to_string()))),
     }
 }
 
@@ -337,7 +337,7 @@ fn model_answers<'py>(
         prompt_layout: spec.prompt_layout.clone(),
     };
     let tokens = python_tokenizer(py, &tokenizer);
-    let failed = |error: quail_planner::CompileError| PyRuntimeError::new_err(error.0);
+    let failed = |error: quail_planner::CompileError| PyRuntimeError::new_err(error.to_string());
     let (true_ids, false_ids) =
         quail_planner::lowering::answer_ids(&model, &tokens).map_err(failed)?;
     let offsets = quail_planner::lowering::answer_row_offsets(&model, &tokens).map_err(failed)?;
@@ -364,7 +364,7 @@ fn read_specs(kind: &str, directory: &str) -> PyResult<String> {
 #[pyfunction]
 fn prompt_layout(name: &str) -> PyResult<String> {
     let layout = quail_planner::prompts::prompt_layout(name)
-        .map_err(|error| PyValueError::new_err(error.0))?;
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
     serde_json::to_string(&layout).map_err(|error| PyRuntimeError::new_err(error.to_string()))
 }
 
@@ -517,6 +517,8 @@ fn plan_operator<'py>(
         "price" => {
             let pricer = read_pricer(&get("pricer"))?;
             let graph: quail_planner::physical::PhysicalGraph = json_value(get("graph"))?;
+            quail_planner::physical::validate_graph(&graph.nodes, &graph.root)
+                .map_err(PyValueError::new_err)?;
             lowering_result(pricer.price(&context, &graph.nodes).map(|(seconds, estimates)| {
                 serde_json::json!({"seconds": seconds, "estimates": estimates})
             }))
@@ -573,7 +575,7 @@ fn json_value<T: serde::de::DeserializeOwned>(found: serde_json::Value) -> PyRes
 }
 
 /// A refusal, as the test helpers compare it.
-fn refusal_fields(refusal: &quail_planner::search::Refusal) -> serde_json::Value {
+fn refusal_fields(refusal: &quail_planner::error::Refusal) -> serde_json::Value {
     serde_json::json!({"refusal": crate::planning::refusal_json(refusal)})
 }
 
@@ -590,8 +592,11 @@ fn token_batches(
     crate::pyarrow::from_pyarrow(table)?
         .iter()
         .map(|batch| {
-            let column =
-                datafusion::arrow::compute::cast(batch.column(0), &lists).map_err(arrow_error)?;
+            let column = batch
+                .columns()
+                .first()
+                .ok_or_else(|| PyValueError::new_err("a token table needs a column"))?;
+            let column = datafusion::arrow::compute::cast(column, &lists).map_err(arrow_error)?;
             Ok(column.as_list::<i64>().clone())
         })
         .collect()
@@ -917,7 +922,10 @@ impl NativeFinishedRows {
             let expression = serde_json::to_string(&expression)
                 .map_err(|error| PyValueError::new_err(error.to_string()))?;
             let values = one_batch(&evaluate.call1((&name, expression))?)?;
-            sources.insert(name, std::sync::Arc::clone(values.column(0)));
+            let column = values.columns().first().ok_or_else(|| {
+                PyValueError::new_err(format!("source {name} returned no column"))
+            })?;
+            sources.insert(name, std::sync::Arc::clone(column));
         }
         let rows = crate::finished::FinishedRows::new(&request, &sources)
             .map_err(PyValueError::new_err)?;
@@ -1029,7 +1037,9 @@ fn edit_graph(graph: &str, edit: &str) -> PyResult<(Option<String>, Option<Strin
 /// reads them from its operators, given as JSON.
 #[pyfunction]
 fn region_facts(operators: &str) -> PyResult<String> {
-    Ok(quail_planner::facts::region_facts(&read_operators(operators)?).to_string())
+    quail_planner::facts::region_facts(&read_operators(operators)?)
+        .map(|facts| facts.to_string())
+        .map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
 /// A region's operators, as JSON, that return at most `fetch` rows.
@@ -1058,7 +1068,7 @@ impl NativePlanner {
         Ok(Self {
             planner: std::sync::Arc::new(
                 crate::planning::Planner::new(std::path::Path::new(tokenizer_file))
-                    .map_err(|error| PyRuntimeError::new_err(error.0))?,
+                    .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
             ),
         })
     }
@@ -1086,7 +1096,7 @@ fn parse_expression<'py>(
                     .expect("an expression writes");
             Ok((Some(physical::to_python(py, &value)?), None))
         }
-        Err(error) => Ok((None, Some(error.0))),
+        Err(error) => Ok((None, Some(error.to_string()))),
     }
 }
 

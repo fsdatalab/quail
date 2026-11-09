@@ -19,7 +19,7 @@ use arrow::datatypes::DataType;
 use arrow::row::{RowConverter, SortField};
 use quail_datafusion::derive::expressions::PhysicalValue;
 use quail_planner::context::PlanningContext;
-use quail_planner::expressions::{CompileError, Refusal};
+use quail_planner::error::{CompileError, Refusal};
 use quail_planner::inputs::{HfTokenizer, PrefixIndex, TokenStore, TokenStoreWriter, last_tokens};
 use quail_planner::operators::Operators;
 use quail_planner::operators::{Scan, ScanColumn};

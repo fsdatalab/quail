@@ -12,9 +12,8 @@ use crate::physical::{ExtractSpec, MapSpec, ModelCall, Prompt, SaeFeaturesSpec};
 use serde::Serialize;
 
 use crate::context::PlanningContext;
-use crate::expressions::{
-    CompileError, Refusal, argument_alias, column_name, compile_error, repr_str,
-};
+use crate::error::{CompileError, Refusal, compile_error};
+use crate::expressions::{argument_alias, column_name, repr_str};
 use crate::lowering::read_slot_offsets;
 use crate::operators::SemanticColumn;
 use crate::prompts::prompt_layout;

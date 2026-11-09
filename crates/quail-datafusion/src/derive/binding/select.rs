@@ -6,9 +6,8 @@ use super::conditions::has_ai_call;
 use super::{Binder, contains, unsupported};
 use crate::functions::{ai_function_name, column_call_kind};
 use datafusion::logical_expr::Expr;
-use quail_planner::expressions::{
-    CompileError, aliased_call, call_aliases, column_name, compile_error, repr_list, repr_str,
-};
+use quail_planner::error::{CompileError, compile_error};
+use quail_planner::expressions::{aliased_call, call_aliases, column_name, repr_list, repr_str};
 use quail_planner::physical::{Alias, ExtractStruct, ValueExpression};
 
 /// Each output column name of a SELECT list and its expression, but a

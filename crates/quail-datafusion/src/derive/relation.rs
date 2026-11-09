@@ -7,9 +7,9 @@ use super::{ByAlias, push};
 use crate::ai::{AiNode, Semantics};
 use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::utils::split_conjunction;
+use quail_planner::error::{CompileError, compile_error};
 use quail_planner::expressions::{
-    CompileError, asked_call, call_aliases, column_alias_of, compile_error, equality_text,
-    repr_list, repr_str,
+    asked_call, call_aliases, column_alias_of, equality_text, repr_list, repr_str,
 };
 use quail_planner::physical::{Asked, Equality, FilterPredicate, ModelCall, ValueExpression};
 use serde_json::Value;

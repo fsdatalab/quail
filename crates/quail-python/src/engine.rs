@@ -109,7 +109,7 @@ impl Executor {
         let planner = tokenizer_file
             .map(|path| Planner::new(std::path::Path::new(&path)))
             .transpose()
-            .map_err(|error| DataFusionError::Plan(format!("CompileError: {}", error.0)))?
+            .map_err(|error| DataFusionError::Plan(format!("CompileError: {}", error.message())))?
             .map(Arc::new);
         Self::with_planner(engine, planner)
     }
@@ -286,7 +286,7 @@ impl Executor {
     fn request(&self, region: &ModelRegion) -> Result<(Operators, LogicalPlan)> {
         let (turn, layout) = &self.prompting;
         derive::derive_region(region, turn, layout)
-            .map_err(|error| DataFusionError::Plan(format!("CompileError: {}", error.0)))
+            .map_err(|error| DataFusionError::Plan(format!("CompileError: {}", error.message())))
     }
 
     /// Plan a region in Rust, or None when Python plans it: a region that
@@ -332,8 +332,8 @@ impl Executor {
                 },
             );
         }
-        let compile = |error: quail_planner::CompileError| {
-            DataFusionError::Plan(format!("CompileError: {}", error.0))
+        let compile = |error: quail_planner::error::CompileError| {
+            DataFusionError::Plan(format!("CompileError: {}", error.message()))
         };
         let (outcome, scans) = planner
             .plan(&operators, &tables, settings)
@@ -608,7 +608,7 @@ pub fn region_json(
     plan: &datafusion::logical_expr::LogicalPlan,
 ) -> Result<String> {
     let operators = crate::planning::operators_json(operators)
-        .map_err(|error| DataFusionError::Plan(format!("CompileError: {}", error.0)))?;
+        .map_err(|error| DataFusionError::Plan(format!("CompileError: {}", error.message())))?;
     // calls a typo apart; calls that differ only in spelling are refused
     let warnings: Vec<String> = quail_datafusion::derive::similar::similar_calls(plan)
         .iter()
@@ -688,7 +688,10 @@ fn in_source_order(
     let mut positions: HashMap<String, u64> = HashMap::new();
     let mut next = 0u64;
     for batch in python.column_rows(&key)? {
-        for value in texts(batch.column(0))? {
+        let column = batch.columns().first().ok_or_else(|| {
+            DataFusionError::Execution(format!("the Python provider returned no column {key}"))
+        })?;
+        for value in texts(column)? {
             if let Some(value) = value {
                 positions.entry(value).or_insert(next);
             }
@@ -878,5 +881,28 @@ impl TableProvider for PythonTable {
             }
         }
         Ok(MemorySourceConfig::try_new_exec(&partitions, schema, None)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+    #[test]
+    fn executor_rows_missing_a_required_column_return_an_error() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "answer",
+            DataType::Utf8,
+            true,
+        )]));
+        let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
+        let error = conform(batch, &["answer".into()], &schema).unwrap_err();
+        assert!(matches!(error, DataFusionError::Execution(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("without the region's column answer")
+        );
     }
 }

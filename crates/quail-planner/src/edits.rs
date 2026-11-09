@@ -41,6 +41,7 @@ pub enum Edit {
 /// The edit names a node or edge the graph does not have, removes a node
 /// that changes what the query means, or leaves an invalid graph.
 pub fn edit_graph(graph: &PhysicalGraph, edit: &Edit) -> Result<PhysicalGraph, String> {
+    validate_graph(graph)?;
     let edited = match edit {
         Edit::Insert { node, between } => insert(graph, node.as_ref().clone(), between)?,
         Edit::Remove { node_id } => remove(graph, node_id)?,
@@ -50,6 +51,7 @@ pub fn edit_graph(graph: &PhysicalGraph, edit: &Edit) -> Result<PhysicalGraph, S
             insert(&remove(graph, node_id)?, node, between)?
         }
     };
+    validate_graph(&edited)?;
     let edited = plan_kv_retention(&edited);
     validate_graph(&edited)?;
     Ok(edited)

@@ -15,7 +15,7 @@
 //! | [`derive`] | a region's operators, read from its DataFusion plan |
 //!
 //! ```ignore
-//! let context = quail_datafusion::session_context(runner);
+//! let context = quail_datafusion::session_context(runner)?;
 //! context.register_table("reviews", reviews)?;
 //! let rows = context
 //!     .sql("SELECT r.id FROM reviews r \
@@ -70,12 +70,15 @@ pub use rules::{LOGICAL_RULES, logical_rule};
 ///
 /// SQL is read in the Snowflake dialect, as Quail's `Session.sql`
 /// reads it; `SET datafusion.sql_parser.dialect` changes it.
-pub fn session_state(runner: Arc<dyn RegionRunner>) -> SessionState {
+///
+/// # Errors
+///
+/// A `DATAFUSION_*` environment option has an invalid value.
+pub fn session_state(runner: Arc<dyn RegionRunner>) -> Result<SessionState> {
     session_state_with_rules(
         runner,
         LOGICAL_RULES.iter().map(ToString::to_string).collect(),
     )
-    .expect("Quail's rules and functions register on a new session")
 }
 
 /// Build a DataFusion session state with Quail registered, whose
@@ -104,8 +107,12 @@ pub fn session_state_with_rules(
 }
 
 /// Build a DataFusion session context with Quail registered.
-pub fn session_context(runner: Arc<dyn RegionRunner>) -> SessionContext {
-    SessionContext::new_with_state(session_state(runner))
+///
+/// # Errors
+///
+/// A `DATAFUSION_*` environment option has an invalid value.
+pub fn session_context(runner: Arc<dyn RegionRunner>) -> Result<SessionContext> {
+    Ok(SessionContext::new_with_state(session_state(runner)?))
 }
 
 /// Build a DataFusion session context with Quail registered, whose

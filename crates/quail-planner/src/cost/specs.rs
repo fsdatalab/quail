@@ -37,14 +37,34 @@ pub struct SaeSpec {
     pub keep: i64,
 }
 
+/// Arithmetic precision used by a model component.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Precision {
+    Fp8,
+    Bf16,
+    Fp32,
+}
+
+impl Precision {
+    /// Bytes per element at this precision.
+    pub fn bytes(self) -> i64 {
+        match self {
+            Self::Fp8 => 1,
+            Self::Bf16 => 2,
+            Self::Fp32 => 4,
+        }
+    }
+}
+
 fn text(value: &str) -> String {
     value.to_string()
 }
-fn fp8() -> String {
-    text("fp8")
+fn fp8() -> Precision {
+    Precision::Fp8
 }
-fn bf16() -> String {
-    text("bf16")
+fn bf16() -> Precision {
+    Precision::Bf16
 }
 fn qwen3() -> String {
     text("qwen3")
@@ -97,9 +117,9 @@ pub struct ModelSpec {
     #[serde(default)]
     pub tied_head: bool,
     #[serde(default = "fp8")]
-    pub weight_precision: String,
+    pub weight_precision: Precision,
     #[serde(default = "bf16")]
-    pub attention_precision: String,
+    pub attention_precision: Precision,
     #[serde(default = "qwen3")]
     pub arch: String,
     #[serde(default = "generative")]
@@ -169,7 +189,7 @@ pub struct ModelSpec {
     #[serde(default)]
     pub gdn_value_dim: i64,
     #[serde(default)]
-    pub gdn_weight_precision: Option<String>,
+    pub gdn_weight_precision: Option<Precision>,
     #[serde(default)]
     pub conv_width: i64,
     #[serde(default)]
@@ -416,25 +436,20 @@ pub struct DeviceSpec {
 
 impl DeviceSpec {
     /// Arithmetic throughput for one component precision.
-    ///
-    /// # Panics
-    ///
-    /// The precision is not fp8, bf16, or fp32.
-    pub fn arithmetic_bandwidth(&self, precision: &str) -> f64 {
+    pub fn arithmetic_bandwidth(&self, precision: Precision) -> f64 {
         match precision {
-            "fp8" => self.fp8_flops,
-            "bf16" => self.bf16_flops,
-            "fp32" => self.fp32_flops,
-            other => panic!("unsupported precision: {other}"),
+            Precision::Fp8 => self.fp8_flops,
+            Precision::Bf16 => self.bf16_flops,
+            Precision::Fp32 => self.fp32_flops,
         }
     }
 
     /// Measured GEMM throughput, or the specification rate.
-    pub fn gemm_flops(&self, precision: &str) -> f64 {
+    pub fn gemm_flops(&self, precision: Precision) -> f64 {
         let measured = match precision {
-            "fp8" => self.mamf_fp8_flops,
-            "bf16" => self.mamf_bf16_flops,
-            _ => 0.0,
+            Precision::Fp8 => self.mamf_fp8_flops,
+            Precision::Bf16 => self.mamf_bf16_flops,
+            Precision::Fp32 => 0.0,
         };
         if measured != 0.0 {
             measured

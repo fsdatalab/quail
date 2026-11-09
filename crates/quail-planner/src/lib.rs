@@ -22,6 +22,7 @@ pub mod columns;
 pub mod context;
 pub mod costs;
 pub mod edits;
+pub mod error;
 pub mod explain;
 pub mod expressions;
 pub mod facts;
@@ -45,4 +46,4 @@ pub mod stages;
 pub mod statistics;
 pub mod validation;
 
-pub use expressions::CompileError;
+pub use error::{CompileError, ErrorKind, Refusal, UNSUPPORTED, compile_error};

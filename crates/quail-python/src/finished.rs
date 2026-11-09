@@ -19,7 +19,8 @@ use arrow::array::{
     RecordBatchOptions, StringArray, StructArray, new_null_array,
 };
 use arrow::compute::{
-    SortColumn, cast, concat_batches, interleave, is_not_null, lexsort_to_indices, take,
+    SortColumn, TakeOptions, cast, concat_batches, interleave, is_not_null, lexsort_to_indices,
+    take,
 };
 use arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
 use quail_planner::expressions::{
@@ -658,7 +659,12 @@ impl FinishedRows {
                     let ids: Int32Array = found.iter().map(|(ids, _)| ids[*alias]).collect();
                     (
                         name,
-                        take(values.as_ref(), &ids, None).map_err(arrow_error)?,
+                        take(
+                            values.as_ref(),
+                            &ids,
+                            Some(TakeOptions { check_bounds: true }),
+                        )
+                        .map_err(arrow_error)?,
                     )
                 }
                 Column::Answer {
@@ -819,6 +825,33 @@ mod tests {
 
     fn ids(values: Vec<i32>) -> ArrayRef {
         Arc::new(Int32Array::from(values))
+    }
+
+    #[test]
+    fn reported_document_ids_must_address_the_source() {
+        for id in [-1, 1] {
+            let relations = vec![Relation::new(
+                ("scan".into(), "rows:r".into()),
+                vec![0],
+                vec![],
+            )];
+            let mut rows = FinishedRows {
+                aliases: vec!["r".into()],
+                orders: join_orders(&relations),
+                relations,
+                columns: vec![Column::Source("r.value".into(), 0, ids(vec![42]))],
+                structs: Vec::new(),
+                fetch: None,
+                schema: None,
+                built: Vec::new(),
+                keys: Vec::new(),
+                pending: Vec::new(),
+            };
+            assert!(
+                rows.report("scan", "rows:r", &batch(vec![("r", ids(vec![id]))]))
+                    .is_err()
+            );
+        }
     }
 
     #[test]

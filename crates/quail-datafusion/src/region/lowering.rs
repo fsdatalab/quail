@@ -10,7 +10,7 @@ use datafusion::logical_expr::utils::{conjunction, split_conjunction};
 use datafusion::logical_expr::{
     Aggregate, Expr, Filter, LogicalPlan, LogicalPlanBuilder, Projection, Window,
 };
-use quail_planner::expressions::UNSUPPORTED;
+use quail_planner::error::UNSUPPORTED;
 
 use super::claim::{
     calls_ai, calls_ai_function, is_subquery, kept_by_datafusion, quail_plans, refusal, select_list,

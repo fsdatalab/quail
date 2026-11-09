@@ -7,7 +7,7 @@ use crate::cost::joins::PricedJoin;
 use crate::cost::statistics::AliasStats;
 
 use crate::context::PlanningContext;
-use crate::expressions::CompileError;
+use crate::error::CompileError;
 
 /// The planner's selectivity when the query gives none.
 pub const DEFAULT_SELECTIVITY: f64 = 0.2;

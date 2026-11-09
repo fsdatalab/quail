@@ -8,7 +8,8 @@ use std::collections::BTreeSet;
 use crate::physical::Prompt;
 use serde::{Deserialize, Serialize};
 
-use crate::expressions::{CompileError, argument_alias, compile_error, repr_str};
+use crate::error::{CompileError, compile_error};
+use crate::expressions::{argument_alias, repr_str};
 use crate::prompts::{Turn, bind_classify_prompt, bind_join_prompt, bind_prompt, prompt_layout};
 
 /// Text -> token ids, without special tokens.

@@ -10,7 +10,7 @@ use datafusion::logical_expr::{Expr, LogicalPlan, Projection};
 use datafusion::optimizer::{
     Analyzer, Optimizer, OptimizerConfig, OptimizerContext, OptimizerRule,
 };
-use quail_planner::expressions::{CompileError, UNSUPPORTED};
+use quail_planner::error::{CompileError, UNSUPPORTED};
 
 use super::ModelRegion;
 use super::inputs::{numbered, split_inputs};
@@ -297,7 +297,7 @@ pub(super) fn refusal(plan: &LogicalPlan, config: &ConfigOptions) -> Result<Opti
                 .and_then(|placed| select_list(placed, None))
                 .and_then(|selected| lift_relational(selected).map(|(region, _)| region));
             return match placed.map(|placed| derive_error(&placed)) {
-                Ok(Some(error)) => plan_err!("{}", error.0),
+                Ok(Some(error)) => plan_err!("{}", error.message()),
                 _ => Ok(None),
             };
         }
@@ -326,7 +326,7 @@ fn derive_error(plan: &LogicalPlan) -> Option<CompileError> {
 fn refusal_of(plan: &LogicalPlan) -> Option<String> {
     derive_error(plan)
         .filter(CompileError::is_unsupported)
-        .map(|error| error.0)
+        .map(|error| error.to_string())
 }
 
 /// The CTE name and body of a FROM subquery: `x` over the CTE `clauses`,

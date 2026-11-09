@@ -21,10 +21,10 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::context::PlanningContext;
+use crate::error::CompileError;
 use crate::expressions::asked_call;
 use crate::expressions::{
-    CompileError, SPAN_SUFFIX, aliased_call, call_aliases, condition_columns, condition_text,
-    repr_str,
+    SPAN_SUFFIX, aliased_call, call_aliases, condition_columns, condition_text, repr_str,
 };
 use crate::lowering::LoweredPrompt;
 use crate::operators::{Operators, SemanticColumn};

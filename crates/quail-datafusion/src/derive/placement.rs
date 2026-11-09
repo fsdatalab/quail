@@ -7,9 +7,9 @@ use super::relation::{JoinSpec, Relation, check_calls, check_joins};
 use super::walk::Walk;
 use super::{ByAlias, lookup, note, push};
 use crate::SPAN_SUFFIX;
+use quail_planner::error::{CompileError, compile_error};
 use quail_planner::expressions::{
-    CompileError, aliased_call, call_aliases, column_name, column_references, compile_error,
-    condition_columns, condition_text,
+    aliased_call, call_aliases, column_name, column_references, condition_columns, condition_text,
 };
 use quail_planner::operators::{ColumnTest, Operators, SemanticColumn};
 use quail_planner::physical::{ModelCall, ValueExpression};

@@ -9,9 +9,8 @@ use std::collections::BTreeMap;
 use crate::physical::{Prompt, ValueExpression};
 use serde_json::Value;
 
-use crate::expressions::{
-    CompileError, argument_alias, column_references, compile_error, repr_str,
-};
+use crate::error::{CompileError, compile_error};
+use crate::expressions::{argument_alias, column_references, repr_str};
 
 pub const SHARED_PRE: &str = "DOCUMENT:\n";
 const JOIN_QUESTION_SEP: &str = "\n\n";

@@ -910,6 +910,16 @@ pub fn value_type_name(value_type: ValueType) -> &'static str {
 pub fn validate_graph(nodes: &[PhysicalNode], root: &PortRef) -> Result<(), String> {
     let mut by_id: BTreeMap<&str, &PhysicalNode> = BTreeMap::new();
     for node in nodes {
+        if let PhysicalNode::AiScore(score) = node
+            && let Some(spec) = &score.attributes.spec
+            && spec.state_tail_tokens != 0
+            && spec.aliases.is_empty()
+        {
+            return Err(format!(
+                "physical node {:?} needs a score document alias",
+                node.id()
+            ));
+        }
         if by_id.insert(node.id(), node).is_some() {
             return Err(format!("duplicate physical node id {:?}", node.id()));
         }

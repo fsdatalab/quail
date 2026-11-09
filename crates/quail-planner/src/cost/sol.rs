@@ -34,7 +34,7 @@ pub fn compute_seconds(work: &Work, model: &ModelSpec, device: &DeviceSpec, peak
                 .iter()
                 .map(|component| {
                     component.flops.scalar().expect("summed work")
-                        / device.arithmetic_bandwidth(&component.precision)
+                        / device.arithmetic_bandwidth(component.precision)
                 }),
         );
     }

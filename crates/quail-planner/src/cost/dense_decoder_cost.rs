@@ -2,7 +2,7 @@
 
 use crate::cost::quantity::Quantity;
 use crate::cost::roofline::CostComponent;
-use crate::cost::specs::ModelSpec;
+use crate::cost::specs::{ModelSpec, Precision};
 use crate::cost::work::Work;
 
 /// vLLM's `FLA_CHUNK_SIZE`: tokens per chunk of the chunked gated delta rule.
@@ -88,15 +88,6 @@ pub fn attention_pair_flops(model: &ModelSpec) -> (i64, i64) {
     (full, sliding_flops)
 }
 
-fn precision_bytes(precision: &str) -> i64 {
-    match precision {
-        "fp8" => 1,
-        "bf16" => 2,
-        "fp32" => 4,
-        other => panic!("unsupported precision: {other}"),
-    }
-}
-
 /// The modeled decoder components, with a readout when `rows` is set.
 ///
 /// # Panics
@@ -126,14 +117,14 @@ pub fn dense_decoder_components(
             name: "attn_proj",
             flops: (2.0 * attn_proj as f64) * &work.tokens,
             bytes_moved: Quantity::Scalar(attn_proj as f64 * model.w_bytes * passes),
-            precision: model.weight_precision.clone(),
+            precision: model.weight_precision,
             gemm: true,
         },
         CostComponent {
             name: "mlp",
             flops: (2.0 * mlp as f64) * &work.tokens,
             bytes_moved: Quantity::Scalar(mlp_weight_params(model) as f64 * model.w_bytes * passes),
-            precision: model.weight_precision.clone(),
+            precision: model.weight_precision,
             gemm: true,
         },
         CostComponent {
@@ -142,7 +133,7 @@ pub fn dense_decoder_components(
                 + &(sliding_flops as f64 * &work.sliding_pairs),
             bytes_moved: &(model.kappa_full() * &(&work.kv_written + &work.kv_read))
                 + &(model.kappa_sliding() * &(&work.kv_written + &work.sliding_kv_read)),
-            precision: model.attention_precision.clone(),
+            precision: model.attention_precision,
             gemm: false,
         },
     ];
@@ -152,18 +143,17 @@ pub fn dense_decoder_components(
             name: "router",
             flops: (2.0 * router as f64) * &work.tokens,
             bytes_moved: Quantity::Scalar((2 * router) as f64 * passes),
-            precision: "bf16".to_string(),
+            precision: Precision::Bf16,
             gemm: true,
         });
     }
-    if separate_gdn != 0 {
-        let precision = model.gdn_weight_precision.clone().unwrap_or_default();
+    if let Some(precision) = model.gdn_weight_precision
+        && separate_gdn != 0
+    {
         components.push(CostComponent {
             name: "gdn_proj",
             flops: (2.0 * separate_gdn as f64) * &work.tokens,
-            bytes_moved: Quantity::Scalar(
-                (separate_gdn * precision_bytes(&precision)) as f64 * passes,
-            ),
+            bytes_moved: Quantity::Scalar((separate_gdn * precision.bytes()) as f64 * passes),
             precision,
             gemm: true,
         });
@@ -173,7 +163,7 @@ pub fn dense_decoder_components(
             name: "gdn_core",
             flops: gdn_core_flops_per_token(model) * &work.tokens,
             bytes_moved: Quantity::Scalar(0.0),
-            precision: "bf16".to_string(),
+            precision: Precision::Bf16,
             gemm: false,
         });
     }
@@ -183,7 +173,7 @@ pub fn dense_decoder_components(
             flops: Quantity::Scalar(0.0),
             bytes_moved: model.checkpoint_bytes() as f64
                 * &(&work.state_written + &work.state_read),
-            precision: "bf16".to_string(),
+            precision: Precision::Bf16,
             gemm: false,
         });
     }
@@ -192,7 +182,7 @@ pub fn dense_decoder_components(
             name: "conv",
             flops: conv_flops_per_token(model) * &work.tokens,
             bytes_moved: Quantity::Scalar(0.0),
-            precision: "fp32".to_string(),
+            precision: Precision::Fp32,
             gemm: false,
         });
     }
@@ -205,7 +195,7 @@ pub fn dense_decoder_components(
             flops: encode * &work.sae_encoded,
             bytes_moved: &Quantity::Scalar(encode * passes)
                 + &(&work.sae_encoded * (2.0 * model.hidden as f64 + 8.0 * sae.keep as f64)),
-            precision: "bf16".to_string(),
+            precision: Precision::Bf16,
             gemm: true,
         });
     }
@@ -225,7 +215,7 @@ fn readout(model: &ModelSpec, rows: f64, passes: f64, head_rows: i64) -> CostCom
             bytes_moved: Quantity::Scalar(
                 4.0 * (4 * width * hidden + 2 * width + 4 * hidden) as f64 * passes,
             ),
-            precision: "fp32".to_string(),
+            precision: Precision::Fp32,
             gemm: false,
         };
     }
@@ -239,7 +229,7 @@ fn readout(model: &ModelSpec, rows: f64, passes: f64, head_rows: i64) -> CostCom
         name: "readout",
         flops: Quantity::Scalar(head * rows),
         bytes_moved: Quantity::Scalar(head * passes),
-        precision: "bf16".to_string(),
+        precision: Precision::Bf16,
         gemm: true,
     }
 }

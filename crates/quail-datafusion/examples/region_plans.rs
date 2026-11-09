@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
     let text = std::fs::read_to_string(&arguments[1])?;
     let queries: serde_json::Value = serde_json::from_str(&text).unwrap();
     for query in queries.as_array().unwrap() {
-        let context = session_context(Arc::new(NoRows));
+        let context = session_context(Arc::new(NoRows))?;
         for (name, columns) in query["tables"].as_object().unwrap() {
             let fields: Vec<Field> = columns
                 .as_array()

@@ -2,105 +2,11 @@
 //! columns they read, their names and text, and the model calls they
 //! hold. DataFusion evaluates the values and conditions.
 
-use std::fmt;
-
+use crate::error::{CompileError, compile_error};
 use crate::physical::{
     Alias, Asked, ColumnRef, Equality, ExtractStruct, ModelCall, Projected, ValueExpression,
 };
 use serde_json::Value;
-
-/// The phrase every refusal of a query shape the binder does not read
-/// ends with: DataFusion runs such operators itself, around the model
-/// regions it claims.
-pub const UNSUPPORTED: &str = "is outside what Quail binds from DataFusion";
-
-/// A query that is malformed or outside the language, or a plan the
-/// configuration cannot run, with its refusal and its kind.
-#[derive(Debug, Clone, PartialEq)]
-pub struct CompileError(pub String, pub Option<Box<Refusal>>, pub ErrorKind);
-
-/// What a [`CompileError`] refuses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ErrorKind {
-    /// A query Quail cannot answer as written.
-    Invalid,
-    /// A region shape the binder does not read; DataFusion runs those
-    /// operators around a smaller region instead.
-    Unsupported,
-}
-
-impl CompileError {
-    /// An error with the message and no refusal.
-    pub fn new(message: impl Into<String>) -> Self {
-        CompileError(message.into(), None, ErrorKind::Invalid)
-    }
-
-    /// A region shape the binder does not read, with [`UNSUPPORTED`] in
-    /// its message.
-    pub fn unsupported(what: &str) -> Self {
-        CompileError(
-            format!("{what} {UNSUPPORTED}"),
-            None,
-            ErrorKind::Unsupported,
-        )
-    }
-
-    /// An error carrying a refusal; its message is the first reason.
-    pub fn refused(refusal: Refusal) -> Self {
-        CompileError(
-            refusal.reasons[0].clone(),
-            Some(Box::new(refusal)),
-            ErrorKind::Invalid,
-        )
-    }
-
-    /// Whether the error refuses a region shape DataFusion can run.
-    pub fn is_unsupported(&self) -> bool {
-        self.2 == ErrorKind::Unsupported
-    }
-}
-
-/// A plan the configuration cannot run within its limits, as `Refusal`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Refusal {
-    pub reasons: Vec<String>,
-    pub constraint: String,
-    pub needed: f64,
-    pub available: f64,
-    pub unit: String,
-}
-
-impl Refusal {
-    /// A refusal with one reason.
-    pub fn new(
-        reason: impl Into<String>,
-        constraint: &str,
-        needed: f64,
-        available: f64,
-        unit: &str,
-    ) -> Self {
-        Refusal {
-            reasons: vec![reason.into()],
-            constraint: constraint.to_string(),
-            needed,
-            available,
-            unit: unit.to_string(),
-        }
-    }
-}
-
-impl fmt::Display for CompileError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for CompileError {}
-
-/// Return a `CompileError` with the message.
-pub fn compile_error<T>(message: impl Into<String>) -> Result<T, CompileError> {
-    Err(CompileError::new(message))
-}
 
 pub const SPAN_SUFFIX: &str = "_span";
 pub const PROBABILITIES_SUFFIX: &str = "_probabilities";

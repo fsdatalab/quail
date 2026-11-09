@@ -33,7 +33,7 @@
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::expr::{InList, Like, ScalarFunction};
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
-use quail_planner::expressions::CompileError;
+use quail_planner::error::CompileError;
 use quail_planner::physical::Expression;
 
 /// What a condition is at a partial answer.
