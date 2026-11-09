@@ -5,8 +5,11 @@ Run from the repository root:
     uv run python demos/plan_walkthrough.py
 
 Three claims and three evidence passages live in memory. The tokenizer
-is a stand-in that counts bytes. The script does not execute inference.
+is the small one the tests use, so nothing is downloaded. The script
+does not execute inference.
 """
+
+from pathlib import Path
 
 import pyarrow as pa
 
@@ -15,6 +18,9 @@ from quail import EngineConfig
 from quail.explain import explain
 from quail.physical import Barrier
 from quail.physical.plan import PlanEditError
+
+# a tokenizer.json directory
+TOKENIZER = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "tokenizer"
 
 PERSON = "Is the claim in DOCUMENT {0} about a person?"
 SUPPORT = ("Does the passage in DOCUMENT {1} support the claim in "
@@ -55,9 +61,7 @@ def main():
         backend="quail",
         device="h100-sxm",
     )
-    with quail.Session(
-        config, tokenizer=lambda text: list(text.encode())
-    ) as session:
+    with quail.Session(config, tokenizer=TOKENIZER) as session:
         register_demo_data(session)
 
         print("=== SQL ===" + SQL)
@@ -78,7 +82,7 @@ def main():
         print("keep_kv before:", plan.graph.node("ai_filter:c").keep_kv,
               "after:", edited.graph.node("ai_filter:c").keep_kv)
         print(f"edited.estimated_seconds = {edited.estimated_seconds:.4f}")
-        print(explain(query.logical, edited))
+        print(explain(query.logical, query.operators, edited))
         print("remove gives back the same plan:",
               edited.remove("barrier:c") == plan)
 
