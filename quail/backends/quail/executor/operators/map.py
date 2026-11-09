@@ -254,11 +254,12 @@ def admission_metrics(stats) -> dict:
     """Headroom and per-pass work metrics of the map's run, for its first map.
 
     headroom_granted_pages is the mean headroom an admitted answer was
-    given; headroom_granted_share the share given any; and
+    given; headroom_granted_share the share given any;
     headroom_running_pages the mean headroom running answers held when
-    the curves were rebuilt. The pass_ metrics count rounds and the
-    tokens, attention pairs, and KV tokens read in them, with their SoL
-    seconds.
+    the curves were rebuilt; and headroom_partial_admissions the
+    admissions that committed only some of a document's waiting answers.
+    The pass_ metrics count rounds and the tokens, attention pairs, and KV
+    tokens read in them, with their SoL seconds.
     """
     granted = np.asarray(stats.get("headroom_granted", []), dtype=float)
     trace = stats.get("headroom_trace", [])
@@ -271,6 +272,7 @@ def admission_metrics(stats) -> dict:
         "headroom_running_pages": round(
             sum(entry[3] * entry[4] for entry in trace) / answers, 3)
         if answers else 0.0,
+        "headroom_partial_admissions": stats.get("headroom_partial_admissions", 0),
     }
     metrics["admission_s"] = round(stats.get("admission_s", 0.0), 3)
     for name, value in stats.get("pass_work", {}).items():

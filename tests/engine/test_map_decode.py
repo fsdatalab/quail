@@ -7,6 +7,7 @@ read its own prompt and answer so far at the right positions and
 wrote its KV where the next row reads it.
 """
 
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -19,6 +20,7 @@ from helpers.kv_checker import HashModel, Setup, chain, cpu_torch, make_arena
 from quail.backends.quail.executor.admission import pages_for
 from quail.backends.quail.executor.answer_admission import (
     HeadroomAdmission,
+    _allocate,
     admission_cost,
     allocate_headroom,
 )
@@ -517,8 +519,8 @@ def run_maps_under_eviction(monkeypatch, mode, num_maps, budget, lag, path):
     """Run maps over twelve documents in a 20-page pool.
 
     Returns:
-        The run's stats and the token model, after checking every answer
-        equals greedy decoding.
+        The run's stats, the token model, and each map's answers, after
+        checking every answer equals greedy decoding.
     """
     cpu_staging(monkeypatch)
     monkeypatch.setenv("QUAIL_ANSWER_ADMISSION", mode)
@@ -550,12 +552,14 @@ def run_maps_under_eviction(monkeypatch, mode, num_maps, budget, lag, path):
                budget, anchor_keys=keys, prefix_tree=tree, dependencies=dependencies,
                decoder=decoder, stats=stats, attention_mode=path,
                decode_cost=DecodeCost.from_specs(QWEN3_4B_FP8, DEVICES["h100-sxm"]))
+    answers = []
     for q, (tail, answer_limit) in enumerate(zip(tails, limits)):
         got = [answer.tolist() for answer in decoder.answers(q, maps._slots(q, ids))]
         assert got == [greedy(documents[a] + tail, answer_limit) for a in ids]
+        answers.append(got)
     assert not decoder.active
     assert not arena.accounting.owned
-    return stats, model
+    return stats, model, answers
 
 
 @pytest.mark.parametrize("mode,num_maps,budget,lag,path", [
@@ -564,13 +568,47 @@ def run_maps_under_eviction(monkeypatch, mode, num_maps, budget, lag, path):
 ])
 def test_headroom_admission_answers_equal_greedy_decoding_under_eviction(
         monkeypatch, mode, num_maps, budget, lag, path):
-    stats, model = run_maps_under_eviction(monkeypatch, mode, num_maps, budget,
-                                           lag, path)
+    stats, model, _ = run_maps_under_eviction(monkeypatch, mode, num_maps, budget,
+                                              lag, path)
     assert stats["answer_admission"] == mode
     work = stats["pass_work"]
     assert work["replay_tokens"] == stats["recomputed_tokens"]
     assert work["decode_rows"] == sum(len(slots) for slots in model.decode_slots)
     assert work["sol_s"] > 0
+
+
+def test_a_documents_answers_admitted_one_at_a_time_equal_greedy_decoding(
+        monkeypatch):
+    # twelve documents, three maps each: map 0 is the document's own slot
+    _, model, _ = run_maps_under_eviction(monkeypatch, "headroom", 3, 20, 2, "tree")
+    slots = np.vstack((np.arange(12), np.arange(12, 36).reshape(12, 2).T))
+    first_pass = {}
+    for index, decoding in enumerate(model.decode_slots):
+        for slot in decoding:
+            first_pass.setdefault(slot, index)
+    starts = [{first_pass[int(slot)] for slot in slots[:, document]}
+              for document in range(12)]
+    assert any(len(passes) > 1 for passes in starts)
+
+
+def test_a_headroom_trace_is_written_only_once_the_run_returns(monkeypatch, tmp_path):
+    monkeypatch.setenv("QUAIL_HEADROOM_TRACE", str(tmp_path))
+    arenas = []
+    built = make_arena
+
+    def kept_arena(setup):
+        arenas.append(built(setup))
+        return arenas[-1]
+
+    monkeypatch.setattr(__name__ + ".make_arena", kept_arena)
+    run_maps_under_eviction(monkeypatch, "headroom", 3, 20, 2, "tree")
+    assert not list(tmp_path.iterdir())
+    (arena,) = arenas
+    arena.write_trace_files()
+    (path,) = tmp_path.iterdir()
+    trace = json.loads(path.read_text())
+    assert trace["rebuilds"] and trace["page_tokens"] == 4
+    assert not arena.trace_files
 
 
 def headroom_admission(written=0, ended=(), expected_tokens=16, limit=32,
@@ -640,6 +678,46 @@ def test_headroom_that_pays_off_only_after_two_pages_is_taken_whole_or_not_at_al
     assert allocate_headroom(risk, 2).tolist() == [2, 0]
     assert allocate_headroom(risk, 1).tolist() == [0, 1]
     assert allocate_headroom(risk, 0).tolist() == [0, 0]
+
+
+def test_headroom_searched_from_a_nearby_price_matches_a_search_from_scratch():
+    rng = np.random.default_rng(3)
+    for _ in range(50):
+        # rows of falling risk, inf past each row's limit
+        risk = np.cumsum(-rng.exponential(1.0, size=(40, 17)), axis=1)
+        risk = risk - risk.min(axis=1, keepdims=True)
+        limits = rng.integers(4, 17, size=40)
+        risk[np.arange(17) > limits[:, None]] = np.inf
+        budget = int(rng.integers(0, 200))
+        chosen, price = _allocate(risk, budget)
+        assert price is not None and chosen.sum() <= budget
+        assert np.array_equal(allocate_headroom(risk, budget), chosen)
+        for hint in (price / 3, price, price * 3):
+            assert np.array_equal(_allocate(risk, budget, hint)[0], chosen)
+
+
+def test_the_quick_bound_never_exceeds_the_rebuild_seconds_admission_adds():
+    _, admission = headroom_admission(num_documents=60)
+    rng = np.random.default_rng(4)
+
+    def grids(rows):
+        risk = np.cumsum(-rng.exponential(1.0, size=(rows, 17)), axis=1)
+        risk = risk - risk.min(axis=1, keepdims=True)
+        risk[np.arange(17) > rng.integers(4, 17, size=rows)[:, None]] = np.inf
+        return risk
+
+    for _ in range(50):
+        admission.held_slots = np.arange(40)
+        admission.held_base = np.zeros(40, dtype=np.int64)
+        admission.held_risk = grids(40)
+        budget = int(rng.integers(20, 200))
+        admission._hold(admission._allocate_held(budget), budget)
+        candidate = grids(int(rng.integers(1, 5)))
+        left = budget - int(rng.integers(0, 20))
+        extra, _ = admission_cost(admission.held_risk, admission.held_pages,
+                                  candidate, left)
+        bound = admission._least_extra(admission._held_bound(), candidate, left)
+        assert bound <= extra + 1e-9
 
 
 def test_admitting_a_document_costs_the_rebuild_risk_it_pushes_onto_held_answers():

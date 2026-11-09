@@ -30,12 +30,24 @@ class DecodeCost:
                    model.kappa_sliding / device.hbm_bw,
                    model.checkpoint_bytes / device.hbm_bw)
 
-    def row_work(self, contexts, groups=None, shared=None):
-        """Count per-row work, assigning each shared read to one group member."""
+    def row_work(self, contexts, groups=None, shared=None, covered=None):
+        """Count per-row work, assigning each shared read to one group member.
+
+        Args:
+            contexts: Each row's context tokens.
+            groups: Each row's shared-read group, or None.
+            shared: Each row's leading tokens its group reads once.
+            covered: Each row's leading tokens a row outside contexts
+                already reads, which it does not read again; or None.
+        """
         contexts = np.asarray(contexts, dtype=float)
         window = self.recompute_cost.sliding_window
         sliding = np.minimum(contexts, window)
         reads, sliding_reads = contexts.copy(), sliding.copy()
+        if covered is not None:
+            covered = np.minimum(contexts, covered)
+            reads -= covered
+            sliding_reads -= np.maximum(0, covered - np.maximum(0, contexts - window))
         if groups is not None and len(contexts):
             _, firsts, inverse = np.unique(groups, return_index=True,
                                            return_inverse=True)

@@ -1,6 +1,5 @@
 """Run one stage list: admission, packed forward chunks, and answer readout."""
 
-import json
 import os
 import time
 from functools import partial
@@ -33,6 +32,9 @@ HEADROOM_TRACE_ENV = "QUAIL_HEADROOM_TRACE"
 
 def answer_admission_mode() -> str:
     """Return the answer admission QUAIL_ANSWER_ADMISSION names, headroom by default.
+
+    Either mode admits a document's answers together when they fit and
+    one at a time when they do not.
 
     - headroom=0: admit when the prompt fits; every answer's headroom is 0.
     - headroom: admit when the prompt and each answer's chosen headroom fit.
@@ -148,6 +150,8 @@ class StageExecutor:
         # per pass: its rows, and whether documents were still queued
         self.pass_rows = []
         self.pass_queued = []
+        # per pass that decodes, its decode rows
+        self.pass_decode_rows = []
         self.knee_rows = knee_rows
         self.recomputed_tokens = 0
         self.decode_cost = decode_cost
@@ -952,6 +956,8 @@ class StageExecutor:
         self._count_pass(part, chunk.tokens, decode, replays, reads)
         self.tokens += chunk.tokens
         self.pass_rows.append(chunk.tokens)
+        if decode is not None:
+            self.pass_decode_rows.append(len(decode.positions))
         self.pass_queued.append(bool(self.sched.pending or self.sched.waiting))
         if self.gpu_timing:
             e0 = self.torch.cuda.Event(enable_timing=True)
@@ -1020,6 +1026,7 @@ class StageExecutor:
                 self.answer_admission.refresh(
                     self.sched._stage, replays, self._replay_pages(replays),
                     self.arena.free_pages if self.paged else None)
+                self.answer_admission.order_waiting(self.sched.waiting)
                 self.admission_s += time.perf_counter() - started
             started = time.perf_counter()
             groups = self.sched.next_chunk(
@@ -1084,7 +1091,12 @@ class StageExecutor:
                 self.answer_admission, "trace", [])
             self.stats["headroom_granted"] = getattr(
                 self.answer_admission, "granted", [])
+            self.stats["headroom_partial_admissions"] = getattr(
+                self.answer_admission, "partial_admissions", 0)
             self.stats["pass_work"] = dict(self.pass_work)
+            if self.pass_decode_rows:
+                self.stats["pass_work"]["median_decode_rows"] = float(
+                    np.median(self.pass_decode_rows))
             self.stats["admission_s"] = self.admission_s
         # one indented line under the run's "done" line
         details = []
@@ -1121,14 +1133,13 @@ class StageExecutor:
             if curves and directory:
                 name = "".join(c if c.isalnum() else "_" for c in self.label)[:60]
                 path = os.path.join(directory, f"{time.time_ns()}-{name}.json")
-                with open(path, "w") as file:
-                    json.dump({
-                        "label": self.label,
-                        "page_tokens": self.arena.page_tokens,
-                        "rebuilds": self.answer_admission.trace,
-                        "granted": self.answer_admission.granted_at,
-                        "curves": {f"{q}:{b}": [round(float(v), 4)
-                                                for v in curve[::8]]
-                                   for (q, b), curve in curves.items()}}, file)
-                logger.info("%s: headroom trace saved to %s", self.label, path)
+                # written once the query's timing ends (write_trace_files)
+                self.arena.trace_files.append((path, {
+                    "label": self.label,
+                    "page_tokens": self.arena.page_tokens,
+                    "rebuilds": self.answer_admission.trace,
+                    "granted": self.answer_admission.granted_at,
+                    "curves": {f"{q}:{b}": [round(float(v), 4) for v in curve[::8]]
+                               for (q, b), curve in curves.items()}}))
+                logger.info("%s: headroom trace goes to %s", self.label, path)
         return self.sched.answers, self.spans, self.tokens
