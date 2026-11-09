@@ -669,7 +669,8 @@ def oracle_executor(oracle: Oracle, **report):
                               for alias, rows in request.source_rows.items()}
         payload = {
             "filter_limit": None, "columns": request.column_tables(),
-            "deduplicate": request.plan["settings"].get("deduplicate", {})}
+            "deduplicate": request.plan["settings"].get("deduplicate", {}),
+            "stages": request.plan["settings"].get("stages")}
         states = []
         for model in [oracle] if request.gpus == 1 else [
                 copy.copy(oracle) for _ in range(request.gpus)]:

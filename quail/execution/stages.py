@@ -10,10 +10,8 @@ rows it finished for the region's FinishedRows.
 
 from __future__ import annotations
 
-import json
 import traceback
 
-import _quail_native
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -27,19 +25,19 @@ from quail.physical import PhysicalGraph, PortRef, Scan, ValueType
 
 
 def serve_stages(server, context: ExecutionContext, graph: PhysicalGraph,
-                 wanted) -> dict:
+                 stages: list, wanted) -> dict:
     """Run each stage Rust sends until the region ends.
 
     Args:
         server: The ``StageServer`` listening for the region's stages.
         context: The region's execution context on this GPU.
         graph: The region's compute graph.
+        stages: The plan's stages, as its "stages" setting holds them.
         wanted: The (node, port) pairs the region's FinishedRows reads.
 
     Returns:
         Node id -> NodeResult, of Arrow tables, of each node this server ran.
     """
-    stages = json.loads(_quail_native.region_stages(graph.to_json()))
     wanted = {tuple(pair) for pair in wanted}
     results = {}
     while (request := server.next_stage()) is not None:
@@ -75,7 +73,7 @@ def run_stage(context: ExecutionContext, graph: PhysicalGraph, stage: dict,
     Args:
         context: The region's execution context on this GPU.
         graph: The region's compute graph.
-        stage: The stage, as ``region_stages`` writes it.
+        stage: The stage, as the plan's "stages" setting holds it.
         tables: Each stage input's rows, in the stage's input order.
         wanted: The (node, port) pairs the region's FinishedRows reads.
 

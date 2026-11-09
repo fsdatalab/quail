@@ -9,7 +9,7 @@
 //! whose type is not one of Quail's comes with its inputs, outputs, and
 //! fields, which its own Python class reports.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use quail_physical::{PhysicalNode, PortRef};
 use serde::Deserialize;
@@ -19,6 +19,7 @@ use crate::expressions::asked_call;
 use crate::expressions::{column_name, condition_text, repr_float, repr_str};
 use crate::operators::table_name;
 use crate::operators::{Operators, SemanticJoin};
+use crate::stages::Stage;
 use crate::statistics::{DEFAULT_SELECTIVITY, effective_selectivity};
 
 /// The mark beside a selectivity the planner assumed.
@@ -194,6 +195,17 @@ pub fn explain_text(request: &ExplainRequest) -> Result<String, String> {
         &physical.estimates,
     );
     lines.extend(tree.lines().map(|line| format!("  {line}")));
+    if physical.gpus > 1
+        && let Some(cut) = settings.get("stages")
+    {
+        let cut: Vec<Stage> =
+            serde_json::from_value((*cut).clone()).map_err(|error| error.to_string())?;
+        lines.extend(
+            stage_lines(&cut)
+                .into_iter()
+                .map(|line| format!("  {line}")),
+        );
+    }
     let passes = physical
         .estimates
         .iter()
@@ -228,7 +240,14 @@ pub fn explain_text(request: &ExplainRequest) -> Result<String, String> {
             ("model".to_string(), Shown::Text(physical.model.clone())),
             ("device".to_string(), Shown::Text(physical.device.clone())),
         ];
-        fields.extend(physical.shown_settings.iter().cloned());
+        // the stages have lines of their own under the tree
+        fields.extend(
+            physical
+                .shown_settings
+                .iter()
+                .filter(|(name, _)| name != "stages")
+                .cloned(),
+        );
         lines.extend(field_lines(&fields, 1));
         if physical.backend == "quail" {
             lines.push("  KV dtype=bf16".to_string());
@@ -1687,6 +1706,48 @@ fn physical_tree(
         lines.push(default_note());
     }
     lines.join("\n")
+}
+
+/// One line per stage of a plan on several GPUs: its nodes, its inputs
+/// split across the GPUs by its key's ids, its inputs collected once and
+/// sent whole to every GPU, and the stages it waits for.
+fn stage_lines(stages: &[Stage]) -> Vec<String> {
+    stages
+        .iter()
+        .enumerate()
+        .map(|(index, stage)| {
+            let named = |hashed: bool| -> Vec<String> {
+                stage
+                    .inputs
+                    .iter()
+                    .filter(|input| input.hashed == hashed)
+                    .map(|input| match input.stage {
+                        None => input.node_id.clone(),
+                        Some(_) => format!("{} {}", input.node_id, input.port),
+                    })
+                    .collect()
+            };
+            let mut parts = vec![format!("Stage {}: {}", index + 1, stage.nodes.join(" -> "))];
+            let (split, whole) = (named(true), named(false));
+            if !split.is_empty() {
+                parts.push(format!("split by {} id: {}", stage.key, split.join(", ")));
+            }
+            if !whole.is_empty() {
+                parts.push(format!("sent whole to every GPU: {}", whole.join(", ")));
+            }
+            let waits: BTreeSet<usize> = stage
+                .inputs
+                .iter()
+                .filter_map(|input| input.stage)
+                .collect();
+            if !waits.is_empty() {
+                let waits: Vec<String> = waits.iter().map(|from| (from + 1).to_string()).collect();
+                let noun = if waits.len() == 1 { "stage" } else { "stages" };
+                parts.push(format!("waits for {noun} {}", waits.join(", ")));
+            }
+            parts.join("; ")
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------- footers

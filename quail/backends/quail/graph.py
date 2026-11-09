@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import tempfile
 import time
@@ -164,7 +165,8 @@ def serve_region(state, payload, graph: PhysicalGraph, server, wanted) -> dict:
     torch, arena = state["gpu"].torch, state["gpu"].arena
     try:
         with torch.inference_mode():
-            results = serve_stages(server, context, compute_subgraph(graph), wanted)
+            results = serve_stages(server, context, compute_subgraph(graph),
+                                   payload["stages"], wanted)
         torch.cuda.synchronize()
     finally:
         for key in arena.resident_keys():
@@ -180,7 +182,8 @@ def execute_staged_graph(payload, graph: PhysicalGraph, gpus: int, serve,
     the region reports to one.
 
     Args:
-        payload: The query's runtime payload.
+        payload: The query's runtime payload, with the plan's stages
+            under "stages".
         graph: The region's graph.
         gpus: How many GPUs, one server each.
         serve: Callable(paths, wanted) that starts a server listening at
@@ -204,8 +207,8 @@ def execute_staged_graph(payload, graph: PhysicalGraph, gpus: int, serve,
         paths = [os.path.join(directory, f"gpu{index}.sock") for index in range(gpus)]
         results = serve(paths, wanted)
         try:
-            _quail_native.run_stages(compute.to_json(), stage_keys(graph, payload),
-                                     paths, report)
+            _quail_native.run_stages(compute.to_json(), json.dumps(payload["stages"]),
+                                     stage_groupings(graph, payload), paths, report)
         except BaseException:
             # the servers have ended; their failure is in this error
             with contextlib.suppress(Exception):
@@ -231,13 +234,12 @@ def _summed(values: list):
     return sum(values)
 
 
-def stage_keys(graph: PhysicalGraph, payload) -> dict:
-    """Each document's key, by alias, for a table hashed by more than its ids.
+def stage_groupings(graph: PhysicalGraph, payload) -> dict:
+    """Return, by alias, lists of each document's group for the stages' hash.
 
-    A stop key's group goes to one GPU, so its per-key stop sees the
-    whole group; copies of one text go with the copy that is asked. A
-    document's key is the smallest id it is grouped with, through
-    copies and groups alike.
+    One list holds each document's first copy of its text, one each stop
+    key's group numbers; Rust's ``run_stages`` keys a document by the
+    smallest id it is grouped with.
     """
     columns = payload.get("columns", {})
     scans = {node.alias: node.num_documents for node in graph.nodes
@@ -248,23 +250,7 @@ def stage_keys(graph: PhysicalGraph, payload) -> dict:
         if isinstance(node, AiFilter) and node.stop_key:
             groupings.setdefault(node.alias, []).append(
                 list(stop_keys(payload, node).of(range(scans[node.alias]))))
-    keys = {}
-    for alias, found in groupings.items():
-        parent = list(range(scans[alias]))
-
-        def root(document):
-            while parent[document] != document:
-                parent[document] = parent[parent[document]]
-                document = parent[document]
-            return document
-
-        for groups in found:
-            first = {}
-            for document, group in enumerate(groups):
-                left, right = root(document), root(first.setdefault(group, document))
-                parent[max(left, right)] = min(left, right)
-        keys[alias] = [root(document) for document in range(scans[alias])]
-    return keys
+    return groupings
 
 
 def graph_report(graph, result, wall, device, *, gpus=1, gpu_timing=False):

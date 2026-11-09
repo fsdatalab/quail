@@ -1,8 +1,5 @@
 """A region on several GPUs runs as stages, one partition per GPU."""
 
-import json
-
-import _quail_native
 import pyarrow as pa
 import pytest
 from helpers.oracle import Oracle, oracle_executor
@@ -13,7 +10,6 @@ import quail
 from bench.quailb import queries, register_tables
 from quail.api.config import EngineConfig
 from quail.api.execute import execute_query
-from quail.execution.runner import compute_subgraph
 
 TEXTS = ["No date", "June", "No date", "August"]
 
@@ -23,6 +19,22 @@ ANTI_JOIN = """
       AND NOT EXISTS (SELECT 1 FROM aspects a
                       WHERE AI_FILTER(PROMPT('match {0} {1}', r.body, a.aspect)))
 """
+
+
+# the stage lines of FEV-9's explain text on two GPUs
+FEV9_STAGES_TEXT = [
+    "  Stage 1: ai_filter:c1; split by c1 id: scan:c1",
+    "  Stage 2: ai_filter:e1 -> ai_join:e1 -> ai_join:e1:predicate:1; "
+    "split by e1 id: scan:e1; sent whole to every GPU: ai_filter:c1 rows:c1, "
+    "ai_filter:c2 rows:c2; waits for stages 1, 3",
+    "  Stage 3: ai_filter:c2; split by c2 id: scan:c2",
+    "  Stage 4: ai_filter:e2; split by e2 id: scan:e2",
+    "  Stage 5: barrier:c2 -> ai_join:c2; split by c2 id: ai_filter:c2 rows:c2; "
+    "sent whole to every GPU: ai_join:e1 join_answers:0, "
+    "ai_join:e1:predicate:1 join_answers:1, ai_filter:c1 rows:c1, "
+    "ai_join:e1:predicate:1 rows:e1, ai_filter:e2 rows:e2; "
+    "waits for stages 1, 2, 3, 4",
+]
 
 
 def _oracle():
@@ -86,35 +98,34 @@ def test_a_limit_on_two_gpus_returns_as_many_rows_each_a_row_without_it(tmp_path
         assert len(rows) == 3 and set(rows) <= set(every)
 
 
-@pytest.mark.parametrize("query_id,expected", [
-    # the reviews' filters run with their join; aspects go whole
-    ("IMDB-4", [("r", ["ai_filter:r", "ai_filter:r:0", "ai_join:r"],
-                 [("scan:a", False), ("scan:r", True)])]),
-    # each partner's filter is a stage; the barrier's stage hashes c2
-    # again and reads the join answers whole
-    ("FEV-9", [
-        ("c1", ["ai_filter:c1"], [("scan:c1", True)]),
-        ("e1", ["ai_filter:e1", "ai_join:e1", "ai_join:e1:predicate:1"],
-         [("ai_filter:c1", False), ("ai_filter:c2", False), ("scan:e1", True)]),
-        ("c2", ["ai_filter:c2"], [("scan:c2", True)]),
-        ("e2", ["ai_filter:e2"], [("scan:e2", True)]),
-        ("c2", ["barrier:c2", "ai_join:c2"],
-         [("ai_filter:c1", False), ("ai_filter:c2", True), ("ai_filter:e2", False),
-          ("ai_join:e1", False), ("ai_join:e1:predicate:1", False)])]),
-])
-def test_a_join_hashes_its_anchors_and_broadcasts_its_partners(
-        tmp_path, query_id, expected):
+def _planned(tmp_path, query_id):
+    """Return a QUAIL-B query's plan on two GPUs and its explain text."""
     standin_sets(tmp_path)
     with quail.Session(
         EngineConfig(gpus=2, model="qwen3-4b-fp8", device="h100-sxm"),
         tokenizer=TOKENIZER,
     ) as session:
         register_tables(session, tmp_path)
-        graph = compute_subgraph(queries(session)[query_id][1]().plan().graph)
-    stages = json.loads(_quail_native.region_stages(graph.to_json()))
+        query = queries(session)[query_id][1]()
+        return query.plan(), query.explain()
+
+
+def test_a_join_hashes_its_anchors_and_broadcasts_its_partners(tmp_path):
+    # IMDB-4: the reviews' filters run with their join; aspects go whole
+    stages = _planned(tmp_path, "IMDB-4")[0].settings["stages"]
     assert [(stage["key"], stage["nodes"],
              sorted({(spec["node_id"], spec["hashed"]) for spec in stage["inputs"]}))
-            for stage in stages] == expected
+            for stage in stages] == [
+        ("r", ["ai_filter:r", "ai_filter:r:0", "ai_join:r"],
+         [("scan:a", False), ("scan:r", True)])]
+
+
+def test_explain_on_two_gpus_shows_the_stages_the_run_reads(tmp_path):
+    # FEV-9: each partner's filter is a stage; the barrier's stage hashes
+    # c2 again and reads the join answers whole
+    text = _planned(tmp_path, "FEV-9")[1]
+    assert [line for line in text.splitlines()
+            if line.startswith("  Stage ")] == FEV9_STAGES_TEXT
 
 
 @pytest.fixture

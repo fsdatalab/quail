@@ -4,6 +4,7 @@ import json
 from collections import Counter
 from types import SimpleNamespace
 
+import _quail_native
 import numpy as np
 import pyarrow as pa
 import pytest
@@ -494,6 +495,7 @@ def test_extractions_on_several_gpus_keep_spans_and_free_kv(monkeypatch, gpus):
         "physical_plan": {
             "backend": "quail", "model": "qwen3-4b-fp8", "device": "h100-sxm",
             "gpus": gpus, "settings": {}, "graph": json.loads(graph.to_json())},
+        "stages": json.loads(_quail_native.region_stages(graph.to_json())),
     }
     states = [_execution_state(gpu, payload, registry) for gpu in gpu_states]
     result = execute_staged_graph(payload, graph, gpus,

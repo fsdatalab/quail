@@ -12,14 +12,17 @@
 //! partner's filters are a stage of their own, so they run once, not
 //! once per partition. A Barrier starts a stage, keyed by the next
 //! anchor, that reads the join answers so far whole.
+//!
+//! The planner cuts the stages once, into the plan's `stages` setting;
+//! explain prints them and the run reads them.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use quail_physical::{PhysicalGraph, PhysicalNode, PortRef, topological_nodes};
-use serde::Serialize;
+use quail_physical::{Location, PhysicalGraph, PhysicalNode, PortRef, topological_nodes};
+use serde::{Deserialize, Serialize};
 
 /// One port a stage reads from outside it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StageInput {
     pub node_id: String,
     pub port: String,
@@ -31,7 +34,7 @@ pub struct StageInput {
 }
 
 /// A run of nodes spread over the GPUs by the ids of one table.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stage {
     /// The alias whose ids pick each row's partition.
     pub key: String,
@@ -96,14 +99,35 @@ impl CutNode {
     }
 }
 
-/// Cut a graph's compute nodes into stages.
+/// Cut a graph's compute nodes, the nodes on the GPU executor or a
+/// backend and the nodes they read, into stages.
 ///
 /// # Errors
 ///
 /// A node reads a port no scan or stage writes.
 pub fn stages(graph: &PhysicalGraph) -> Result<Vec<Stage>, String> {
+    let by_id: BTreeMap<&str, &PhysicalNode> =
+        graph.nodes.iter().map(|node| (node.id(), node)).collect();
+    let mut pending: Vec<&str> = graph
+        .nodes
+        .iter()
+        .filter(|node| node.location() == Location::GpuExecutor || node.backend().is_some())
+        .map(PhysicalNode::id)
+        .collect();
+    let mut compute = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if compute.insert(id) {
+            pending.extend(
+                by_id[id]
+                    .inputs()
+                    .iter()
+                    .map(|input| input.source.node_id.as_str()),
+            );
+        }
+    }
     let nodes: Vec<CutNode> = topological_nodes(&graph.nodes)
         .into_iter()
+        .filter(|index| compute.contains(graph.nodes[*index].id()))
         .map(|index| CutNode::of(&graph.nodes[index]))
         .collect();
     cut(&nodes)

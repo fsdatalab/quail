@@ -1,7 +1,8 @@
 //! Run a region's stages on several GPUs, one DataFusion partition per
 //! GPU.
 //!
-//! [`quail_planner::stages`] cuts the region's graph into stages.
+//! [`quail_planner::stages`] cuts the region's graph into stages when
+//! the region is planned; this module runs the stages the plan holds.
 //! Partition p of every stage runs on the server of GPU p, a process
 //! that holds every document and the GPU's KV; this module sends it the
 //! stage's input rows and reads back the rows the stage writes, as Arrow
@@ -36,7 +37,7 @@ use datafusion::physical_plan::{ExecutionPlan, Partitioning, collect, common};
 use datafusion::prelude::SessionContext;
 use futures::future::{BoxFuture, FutureExt, Shared, try_join_all};
 use quail_physical::{PhysicalGraph, PhysicalNode};
-use quail_planner::stages::{Stage, stages};
+use quail_planner::stages::Stage;
 
 /// The column a keyed table's rows are hashed by, which no partition
 /// reads.
@@ -442,21 +443,62 @@ fn unkeyed(schema: &SchemaRef, batches: Vec<RecordBatch>) -> Result<Table> {
     Ok((schema, batches))
 }
 
-/// Run a region's stages on the servers at `servers`, one per GPU.
+/// Each document's key, by alias, for a table hashed by more than its
+/// ids.
 ///
-/// `graph` holds the region's compute nodes; `keys` gives, by alias,
-/// each document's key for a table whose rows go to a GPU by a key other
-/// than their id, such as a stop key. Each table a stage finishes goes
+/// `groupings` gives, by alias, lists of each document's group: a stop
+/// key's group goes to one GPU, so its per-key stop sees the whole
+/// group, and copies of one text go with the copy that is asked. A
+/// document's key is the smallest id it is grouped with, through every
+/// list alike.
+fn grouped_keys(
+    groupings: HashMap<String, Vec<Vec<i64>>>,
+    num_documents: &HashMap<String, usize>,
+) -> Result<HashMap<String, Int32Array>> {
+    fn root(parent: &mut [usize], mut document: usize) -> usize {
+        while parent[document] != document {
+            parent[document] = parent[parent[document]];
+            document = parent[document];
+        }
+        document
+    }
+    groupings
+        .into_iter()
+        .map(|(alias, lists)| {
+            let count = *num_documents
+                .get(&alias)
+                .ok_or_else(|| failure(format!("no scan reads {alias:?}")))?;
+            let mut parent: Vec<usize> = (0..count).collect();
+            for groups in lists {
+                let mut first: HashMap<i64, usize> = HashMap::new();
+                for (document, group) in groups.into_iter().enumerate().take(count) {
+                    let other = *first.entry(group).or_insert(document);
+                    let (left, right) = (root(&mut parent, document), root(&mut parent, other));
+                    parent[left.max(right)] = left.min(right);
+                }
+            }
+            let keys = (0..count).map(|document| root(&mut parent, document) as i32);
+            Ok((alias, Int32Array::from_iter_values(keys)))
+        })
+        .collect()
+}
+
+/// Run a region's stages, as the plan cut them, on the servers at
+/// `servers`, one per GPU.
+///
+/// `graph` holds the region's compute nodes; `groupings` gives, by
+/// alias, the groups [`grouped_keys`] reads for a table whose rows go to
+/// a GPU by a key other than their id. Each table a stage finishes goes
 /// to `report`, one at a time. Every server is told the region ended,
 /// whether or not it failed.
 ///
 /// # Errors
 ///
-/// The graph does not cut into stages, a server is unreachable, or a
-/// stage fails.
+/// A grouping names no scan, a server is unreachable, or a stage fails.
 pub fn run_stages(
     graph: &PhysicalGraph,
-    keys: HashMap<String, Vec<i32>>,
+    cut: Vec<Stage>,
+    groupings: HashMap<String, Vec<Vec<i64>>>,
     servers: &[PathBuf],
     report: Report,
 ) -> Result<()> {
@@ -466,16 +508,7 @@ pub fn run_stages(
         .iter()
         .map(|path| Ok(Arc::new(Mutex::new(Server::connect(path)?))))
         .collect::<Result<Vec<_>>>()?;
-    let cut = match stages(graph) {
-        Ok(cut) => cut,
-        Err(error) => {
-            for server in &servers {
-                let _ = server.lock().expect("the server lock").end();
-            }
-            return Err(DataFusionError::Plan(error));
-        }
-    };
-    let scans = graph
+    let scans: HashMap<String, (String, usize)> = graph
         .nodes
         .iter()
         .filter_map(|node| match node {
@@ -489,10 +522,16 @@ pub fn run_stages(
             _ => None,
         })
         .collect();
-    let keys = keys
-        .into_iter()
-        .map(|(alias, values)| (alias, Int32Array::from(values)))
-        .collect();
+    let num_documents = scans.values().cloned().collect();
+    let keys = match grouped_keys(groupings, &num_documents) {
+        Ok(keys) => keys,
+        Err(error) => {
+            for server in &servers {
+                let _ = server.lock().expect("the server lock").end();
+            }
+            return Err(error);
+        }
+    };
     let staged = Arc::new(Staged {
         stages: cut,
         servers,

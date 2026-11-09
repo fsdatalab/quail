@@ -156,14 +156,22 @@ class PhysicalPlan:
                 raise PlanEditError(message)
             found = json.loads(found)
             edited = PhysicalGraph.from_json(json.dumps(found["graph"]))
-            return replace(self, nodes=edited.nodes, root=edited.root,
-                           estimated_seconds=found["seconds"],
-                           estimates=_estimates(found["estimates"]))
+            return self._edited(edited, estimated_seconds=found["seconds"],
+                                estimates=_estimates(found["estimates"]))
         found, message = _quail_native.edit_graph(json.dumps(graph), json.dumps(edit))
         if message is not None:
             raise PlanEditError(message)
         edited = PhysicalGraph.from_json(found)
-        return replace(self, nodes=edited.nodes, root=edited.root, estimates={})
+        return self._edited(edited, estimates={})
+
+    def _edited(self, edited: PhysicalGraph, **fields) -> "PhysicalPlan":
+        """Return the plan with an edited graph and its stages cut again."""
+        settings = self.settings
+        if "stages" in settings:
+            settings = {**settings, "stages": json.loads(
+                _quail_native.region_stages(edited.to_json()))}
+        return replace(self, nodes=edited.nodes, root=edited.root,
+                       settings=settings, **fields)
 
     def insert(self, node, *, between: tuple) -> "PhysicalPlan":
         """Put node on the edge from producer to consumer.

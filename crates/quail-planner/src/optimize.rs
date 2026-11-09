@@ -16,7 +16,8 @@ pub struct Selected {
 }
 
 /// Plan each alternative, apply the physical rules, and select the
-/// cheapest, as `search_plan`. Ties go to the earlier alternative.
+/// cheapest, as `search_plan`. Ties go to the earlier alternative. On
+/// several GPUs, the selected plan's `stages` setting holds its stages.
 ///
 /// Each alternative is a plan's operators and the rewrites that produced
 /// the plan.
@@ -92,6 +93,13 @@ pub fn search_plan(
     };
     plan.settings
         .insert("candidates".into(), Value::Array(comparison));
+    if context.gpus > 1 && plan.backend == "quail" {
+        let graph = plan.envelope().graph;
+        let cut = crate::stages::stages(&graph).map_err(CompileError::new)?;
+        let cut =
+            serde_json::to_value(cut).map_err(|error| CompileError::new(error.to_string()))?;
+        plan.settings.insert("stages".into(), cut);
+    }
     Ok(Ok(Selected {
         plan,
         alternative: selected,

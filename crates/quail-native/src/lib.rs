@@ -1073,9 +1073,9 @@ fn parse_expression<'py>(
     }
 }
 
-/// Cut a region's compute graph, as JSON, into stages for several GPUs,
-/// as `quail_planner::stages::stages` cuts it; returns the stages as
-/// JSON.
+/// Cut a plan's graph, as JSON, into stages for several GPUs, as the
+/// planner cuts it into the plan's `stages` setting; returns the stages
+/// as JSON.
 #[pyfunction]
 fn region_stages(graph: &str) -> PyResult<String> {
     let graph: quail_physical::PhysicalGraph = from_json(graph)?;
@@ -1086,19 +1086,22 @@ fn region_stages(graph: &str) -> PyResult<String> {
 /// Run a region's stages on GPU servers, as `quail::stages::run_stages`
 /// runs them.
 ///
-/// `graph` is the region's compute graph as JSON; `keys` gives, by
-/// alias, each document's key for a table hashed by a key other than
-/// its ids; `servers` names each GPU's Unix socket; `report(data)` takes
-/// each finished table as Arrow IPC bytes.
+/// `graph` is the region's compute graph as JSON; `stages` is the plan's
+/// `stages` setting as JSON; `groupings` gives, by alias, lists of each
+/// document's group, for a table hashed by a key other than its ids;
+/// `servers` names each GPU's Unix socket; `report(data)` takes each
+/// finished table as Arrow IPC bytes.
 #[pyfunction]
 fn run_stages(
     py: Python<'_>,
     graph: &str,
-    keys: std::collections::HashMap<String, Vec<i32>>,
+    stages: &str,
+    groupings: std::collections::HashMap<String, Vec<Vec<i64>>>,
     servers: Vec<std::path::PathBuf>,
     report: Py<PyAny>,
 ) -> PyResult<()> {
     let graph: quail_physical::PhysicalGraph = from_json(graph)?;
+    let cut: Vec<quail_planner::stages::Stage> = from_json(stages)?;
     let report: quail::stages::Report = Box::new(move |table: Vec<u8>| {
         Python::attach(|py| {
             report.call1(py, (pyo3::types::PyBytes::new(py, &table),))?;
@@ -1106,7 +1109,7 @@ fn run_stages(
         })
         .map_err(|error| DataFusionError::External(Box::new(error)))
     });
-    py.detach(|| quail::stages::run_stages(&graph, keys, &servers, report))
+    py.detach(|| quail::stages::run_stages(&graph, cut, groupings, &servers, report))
         .map_err(python_error)
 }
 
