@@ -83,9 +83,11 @@ def record_model_result(node, result: NodeResult,
 def execution_context(state, payload, graph: PhysicalGraph) -> ExecutionContext:
     """Bind a query's inputs, retention, and runtimes to one GPU executor.
 
-    The arena is emptied first: nothing survives from the last query.
+    The arena is emptied first: nothing survives from the last query, and
+    trace files it left are written.
     """
     arena = state["gpu"].arena
+    arena.write_trace_files()
     for key in arena.resident_keys():
         arena.free_key(key)
     arena.reset_stats()
@@ -155,6 +157,7 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         result = GenericRunner().run(compute_subgraph(graph), context)
     torch.cuda.synchronize()
     wall = time.perf_counter() - started
+    arena.write_trace_files()
     for key in arena.resident_keys():
         arena.free_key(key)
     report = graph_report(graph, result, wall, state["device"],

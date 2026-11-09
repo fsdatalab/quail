@@ -1,6 +1,5 @@
 """Run one stage list: admission, packed forward chunks, and answer readout."""
 
-import json
 import os
 import time
 from functools import partial
@@ -1132,14 +1131,13 @@ class StageExecutor:
             if curves and directory:
                 name = "".join(c if c.isalnum() else "_" for c in self.label)[:60]
                 path = os.path.join(directory, f"{time.time_ns()}-{name}.json")
-                with open(path, "w") as file:
-                    json.dump({
-                        "label": self.label,
-                        "page_tokens": self.arena.page_tokens,
-                        "rebuilds": self.answer_admission.trace,
-                        "granted": self.answer_admission.granted_at,
-                        "curves": {f"{q}:{b}": [round(float(v), 4)
-                                                for v in curve[::8]]
-                                   for (q, b), curve in curves.items()}}, file)
-                logger.info("%s: headroom trace saved to %s", self.label, path)
+                # written once the query's timing ends (write_trace_files)
+                self.arena.trace_files.append((path, {
+                    "label": self.label,
+                    "page_tokens": self.arena.page_tokens,
+                    "rebuilds": self.answer_admission.trace,
+                    "granted": self.answer_admission.granted_at,
+                    "curves": {f"{q}:{b}": [round(float(v), 4) for v in curve[::8]]
+                               for (q, b), curve in curves.items()}}))
+                logger.info("%s: headroom trace goes to %s", self.label, path)
         return self.sched.answers, self.spans, self.tokens

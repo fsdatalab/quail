@@ -7,6 +7,7 @@ read its own prompt and answer so far at the right positions and
 wrote its KV where the next row reads it.
 """
 
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -588,6 +589,26 @@ def test_a_documents_answers_admitted_one_at_a_time_equal_greedy_decoding(
     starts = [{first_pass[int(slot)] for slot in slots[:, document]}
               for document in range(12)]
     assert any(len(passes) > 1 for passes in starts)
+
+
+def test_a_headroom_trace_is_written_only_once_the_run_returns(monkeypatch, tmp_path):
+    monkeypatch.setenv("QUAIL_HEADROOM_TRACE", str(tmp_path))
+    arenas = []
+    built = make_arena
+
+    def kept_arena(setup):
+        arenas.append(built(setup))
+        return arenas[-1]
+
+    monkeypatch.setattr(__name__ + ".make_arena", kept_arena)
+    run_maps_under_eviction(monkeypatch, "headroom", 3, 20, 2, "tree")
+    assert not list(tmp_path.iterdir())
+    (arena,) = arenas
+    arena.write_trace_files()
+    (path,) = tmp_path.iterdir()
+    trace = json.loads(path.read_text())
+    assert trace["rebuilds"] and trace["page_tokens"] == 4
+    assert not arena.trace_files
 
 
 def headroom_admission(written=0, ended=(), expected_tokens=16, limit=32,

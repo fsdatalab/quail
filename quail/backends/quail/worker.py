@@ -503,6 +503,8 @@ def _child_execute(state, sub) -> dict:
                 results[node.node_id] = context.runtimes[node.runtime_key].execute(
                     node, node_inputs, context)
     gpu.torch.cuda.synchronize()
+    # the parent times this pipeline's whole round, so the files fall inside it
+    gpu.arena.write_trace_files()
     if sub["final"]:
         for key in gpu.arena.resident_keys():
             gpu.arena.free_key(key)

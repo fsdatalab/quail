@@ -82,6 +82,8 @@ class KVArena:
         self.conv_state_shape = conv_state_shape
         self._build(num_pages, page_tokens, num_sliding_pages, num_state_slots)
         self.reset_stats()
+        # (path, JSON-ready payload) of trace files a query left to write
+        self.trace_files = []
 
     def bind_answers(self, group, keys):
         """Own the answer slots' full-attention layout for this execution."""
@@ -243,6 +245,15 @@ class KVArena:
         self.evicted_prefix_tokens = 0
         self.memory_trace = []
         self.events = []
+
+    def write_trace_files(self) -> None:
+        """Write the trace files queries left, then forget them."""
+        import json
+
+        for path, payload in self.trace_files:
+            with open(path, "w") as file:
+                file.write(json.dumps(payload))
+        self.trace_files = []
 
     def log_event(self, kind: str, **detail) -> None:
         """Record what the engine did, with the time it did it."""

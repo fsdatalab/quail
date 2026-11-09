@@ -58,6 +58,7 @@ def bare_arena(arena, pages):
     arena._trimmed = set()
     arena._refresh_rows = lambda *args: None
     arena.reset_stats()
+    arena.trace_files = []
     return arena
 
 
@@ -360,6 +361,9 @@ class FakeArena:
         return ()
 
     def reset_stats(self):
+        pass
+
+    def write_trace_files(self):
         pass
 
 
