@@ -305,11 +305,12 @@ impl ExecutionPlan for SharedInputExec {
                     reservation.try_grow(batch.get_array_memory_size())?;
                     batches.push(batch);
                 }
-                let batches = if numbered {
-                    with_positions(batches, &schema)?
-                } else {
-                    batches
-                };
+                if numbered {
+                    batches = with_positions(batches, &schema)?;
+                    // each batch now also holds its rows' positions
+                    let held: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
+                    reservation.try_resize(held)?;
+                }
                 *found = Some((batches, reservation));
             }
             let batches = found

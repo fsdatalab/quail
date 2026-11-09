@@ -8,8 +8,9 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::Session;
 use datafusion::common::config::ConfigOptions;
+use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion::common::{Result, internal_err};
+use datafusion::common::{DataFusionError, Result, internal_err};
 use datafusion::execution::context::QueryPlanner;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
@@ -307,26 +308,31 @@ impl ExecutionPlan for ModelRegionExec {
                 first.push(waiting);
             }
             let sender = builder.tx();
-            // the runner blocks while the region runs; Quail's hands the
-            // region to the thread that called DataFusion
-            builder.spawn_blocking(move || {
+            builder.spawn(async move {
                 // a region starts once each input has a batch or has ended:
                 // an input that is another region's rows then runs first, on
                 // the same thread
                 for waiting in first {
-                    let _ = futures::executor::block_on(waiting);
+                    let _ = waiting.await;
                 }
-                let batches = runner.run(&region, streams, fetch, &hint)?;
-                for batch in (Limited {
-                    batches,
-                    remaining: fetch,
-                }) {
-                    // the receiver is gone once DataFusion stops reading
-                    if sender.blocking_send(batch).is_err() {
-                        break;
+                // the runner blocks while the region runs; Quail's hands the
+                // region to the thread that called DataFusion
+                SpawnedTask::spawn_blocking(move || {
+                    let batches = runner.run(&region, streams, fetch, &hint)?;
+                    for batch in (Limited {
+                        batches,
+                        remaining: fetch,
+                    }) {
+                        // the receiver is gone once DataFusion stops reading
+                        if sender.blocking_send(batch).is_err() {
+                            break;
+                        }
                     }
-                }
-                Ok(())
+                    Ok(())
+                })
+                .join_unwind()
+                .await
+                .map_err(|error| DataFusionError::ExecutionJoin(Box::new(error)))?
             });
             builder.build()
         };

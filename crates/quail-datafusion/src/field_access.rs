@@ -50,28 +50,18 @@ impl ExprPlanner for StructFieldAccess {
     }
 }
 
-/// The keys of a path such as `['ends']['start']` or `ends.start`, or
-/// None when a step is not a quoted or bare name, such as `[0]`.
+/// The keys of a path written as single-quoted brackets, such as
+/// `['ends']['start']`, or None for any other path, such as `[0]`,
+/// `["ends"]`, or `ends.start`, which the next planner reads.
 fn path_keys(path: &str) -> Option<Vec<String>> {
     let mut keys = Vec::new();
-    let mut rest = path.trim();
+    let mut rest = path;
     while !rest.is_empty() {
-        if let Some(inner) = rest.strip_prefix('[') {
-            let quote = inner.chars().next().filter(|c| *c == '\'' || *c == '"')?;
-            let body = &inner[1..];
-            let end = body.find(quote)?;
-            keys.push(body[..end].to_string());
-            rest = body[end + 1..].strip_prefix(']')?;
-        } else {
-            rest = rest.strip_prefix('.').unwrap_or(rest);
-            let end = rest.find(['.', '[']).unwrap_or(rest.len());
-            let name = &rest[..end];
-            if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                return None;
-            }
-            keys.push(name.to_string());
-            rest = &rest[end..];
-        }
+        let inner = rest.strip_prefix("['")?;
+        let end = inner.find('\'')?;
+        let key = &inner[..end];
+        rest = inner[end + 1..].strip_prefix(']')?;
+        keys.push(key.to_string());
     }
     (!keys.is_empty()).then_some(keys)
 }
@@ -87,10 +77,8 @@ mod tests {
             path_keys("['ends']['start']"),
             Some(vec!["ends".into(), "start".into()])
         );
-        assert_eq!(
-            path_keys("ends.start"),
-            Some(vec!["ends".into(), "start".into()])
-        );
+        assert_eq!(path_keys("ends.start"), None);
+        assert_eq!(path_keys("[\"ends\"]"), None);
         assert_eq!(path_keys("[0]"), None);
         assert_eq!(path_keys("['it''s']"), None);
     }

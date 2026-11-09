@@ -23,10 +23,10 @@ use datafusion::logical_expr::{Extension, LogicalPlan, UserDefinedLogicalNode};
 use datafusion::optimizer::AnalyzerRule;
 use datafusion::physical_planner::ExtensionPlanner;
 
-use crate::{LowerAiCalls, StructFieldAccess};
 use crate::exec::{ModelRegionPlanner, QuailQueryPlanner, RegionRunner};
 use crate::functions::quail_functions;
 use crate::rules::{logical_rules, with_quail_rules};
+use crate::{LowerAiCalls, StructFieldAccess};
 
 /// Quail's additions to a DataFusion session: the AI functions, the
 /// planner of `value['field']` on a struct in Snowflake SQL, the rules

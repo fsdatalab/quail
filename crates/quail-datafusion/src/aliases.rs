@@ -4,8 +4,8 @@ use std::collections::HashSet;
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident,
-    ObjectName, OrderByExpr, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, Value,
+    Expr, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident, ObjectName,
+    OrderByExpr, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, Value,
     visit_expressions_mut,
 };
 

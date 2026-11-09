@@ -261,7 +261,8 @@ async fn a_classification_is_a_column_the_projection_reads() -> Result<()> {
 async fn a_test_of_a_label_is_absorbed_into_its_classifications_filter() -> Result<()> {
     let context = context()?;
     let query = "SELECT r.id, AI.CLASSIFY(PROMPT('Tone of {0}?', r.body), ['good', 'bad']) \
-        AS tone FROM reviews r WHERE tone = 'good'";
+        AS tone FROM reviews r \
+        WHERE AI.CLASSIFY(PROMPT('Tone of {0}?', r.body), ['good', 'bad']) = 'good'";
     let [region] =
         <[ModelRegion; 1]>::try_from(regions(&optimized(&context, query).await?)).unwrap();
     let plan = lines(&region.plan);
