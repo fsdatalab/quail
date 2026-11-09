@@ -2,269 +2,184 @@
 title: AI functions
 ---
 
-Use AI functions to filter and join documents, score answers, assign
-labels, extract text, write text answers, and read sparse autoencoder features. The examples use BigQuery syntax. See the
-[SQL reference](/docs/user-guide/sql) for dialect selection and a first query.
+Examples use `dialect="bq"` and require registered input tables.
+Choose a [model](/docs/user-guide/models) that supports the function.
 
 ## Functions
 
-Select a function to jump to its arguments, examples, and limits.
 Square brackets mark optional arguments.
 
-<div className="function-index">
-
-| Function | Description |
+| Function | Answer |
 | --- | --- |
-| [`PROMPT(template, column, ...)`](#prompt) | Combines instructions with document columns. |
-| [`AI.IF(prompt[, options])`](#aiif) | Keeps documents or pairs that satisfy a model question. |
-| [`AI.SCORE(prompt[, options])`](#aiscore) | Returns a score from 0 to 1 for a model question. |
-| [`AI.CLASSIFY(input, categories[, options])`](#aiclassify) | Assigns one of the supplied labels. |
-| [`AI.EXTRACT(input, questions)`](#aiextract) | Copies answers from a document and returns their positions. |
-| [`AI.MAP(input, instruction[, max_tokens])`](#aimap) | Writes a text answer for each document. |
-| [`AI.SAE_FEATURES(prompt, pooling)`](#aisae_features) | Returns the sparse autoencoder features of a prompt. |
-| [`HINT(condition, options)`](#planning-hints) | Sets the estimated pass fraction for a label or answer condition. |
-
-</div>
+| [`PROMPT(template, column, ...)`](#prompt) | Text for the model. |
+| [`AI.IF(prompt[, options])`](#aiif) | Boolean. |
+| [`AI.SCORE(prompt[, options])`](#aiscore) | Score from 0 to 1. |
+| [`AI.CLASSIFY(input, categories[, options])`](#aiclassify) | One supplied label. |
+| [`AI.EXTRACT(input, questions)`](#aiextract) | Struct of answers copied from the document. |
+| [`AI.EXTRACT_SPAN(input, questions)`](#answer-positions) | Struct of answer spans. |
+| [`AI.MAP(input, instruction[, max_tokens])`](#aimap) | Text answer. |
+| [`AI.SAE_FEATURES(prompt, options)`](#aisae_features) | List of features and strengths. |
+| [`HINT(condition, options)`](#planning-hints) | The condition's value, with a selectivity estimate for planning. |
 
 ## PROMPT
 
-`PROMPT` combines a question template with document column references.
-The placeholders `{0}`, `{1}`, and so on identify the columns in argument
-order.
+`PROMPT` inserts document columns into literal text. `{0}` refers to the
+first column argument, `{1}` to the second.
+E.g., `PROMPT('Does the review discuss the aspect? {0} {1}', r.body, a.aspect)`
+reads a review and an aspect.
 
-For a filter, the prompt references one column:
+Arguments can read struct fields or apply
+[text functions](/docs/user-guide/sql/sql-functions#column-expressions).
 
-```sql
-PROMPT('Does this review discuss the ending of the movie?\n\n{0}', r.body)
-```
+### Repeated calls
 
-For a join, the prompt references one column from each table:
+`WHERE` cannot read a `SELECT` alias. Repeat the AI call when a query
+both returns and filters its answer. Quail computes the repeated answer
+once within the model region.
 
-```sql
-PROMPT('Does the review discuss this aspect?\n\nReview: {0}\nAspect: {1}',
-       r.body, a.aspect)
-```
-
-Here `{0}` is the review and `{1}` is the aspect.
-
-A prompt argument can also read a struct field or apply a text function
-to a column. See [Column expressions](/docs/user-guide/sql/sql-functions#column-expressions).
+Keep the arguments identical. For calls with the same function, columns,
+and options, Quail rejects text that differs only in case, whitespace,
+or punctuation. Near-identical text with a small spelling change can
+raise `SimilarCallWarning`; those calls can produce different answers.
 
 ## AI.IF
 
-`AI.IF` takes a `PROMPT` and evaluates it on each row or each pair
-of rows. The model returns TRUE or FALSE.
+`AI.IF(prompt[, options])` returns `TRUE` or `FALSE`.
+`AI_FILTER` is its Snowflake spelling.
 
 ### Filtering
 
-Use `AI.IF` in a `WHERE` clause to filter rows:
+E.g., `reviews(id, body)` contains movie reviews. Keep reviews that
+mention a positive aspect and discuss the ending:
 
 ```sql
 SELECT r.id
 FROM reviews r
-WHERE AI.IF(PROMPT('Does this review mention a positive aspect?\n\n{0}', r.body))
-  AND AI.IF(PROMPT('Does this review discuss the ending?\n\n{0}', r.body))
+WHERE AI.IF(PROMPT('Does this review mention a positive aspect? {0}', r.body))
+  AND AI.IF(PROMPT('Does this review discuss the ending? {0}', r.body));
 ```
 
-Use `AND` to combine filters. All AI filters on one table must read the
-same document column.
+Filters on the same table alias must read the same document column.
+Use `AND` when every filter must pass.
 
-Use `OR` to keep a row that any of several tests accepts. The terms can
-be `AI.IF` calls and conditions that ask no model, in any number:
+E.g., if `reviews` also has a boolean `flagged` column, keep flagged
+reviews or reviews that mention a refund:
 
 ```sql
 SELECT r.id
 FROM reviews r
 WHERE r.flagged
-   OR AI.IF(PROMPT('Does this review mention a refund?\n\n{0}', r.body))
-   OR AI.IF(PROMPT('Does this review mention a delivery problem?\n\n{0}', r.body))
+   OR AI.IF(PROMPT('Does this review mention a refund? {0}', r.body));
 ```
 
-Quail asks each `AI.IF` only about the rows where no term before it is
-TRUE, in the order the query writes them, and asks the conditions that
-ask no model first. In the query above, the model reads a flagged review
-for neither question, and reads a review it says mentions a refund only
-once. The `OR` follows SQL: a row passes when one term is TRUE, so `NULL
-OR TRUE` passes and `NULL OR FALSE` does not. Every term of the `OR` must
-read the same one table; an `OR` with an `AI.IF` join, an `AI.SCORE`
-comparison, or a test of another function's answer is refused, and so is
-a `LIMIT` or `DISTINCT` over the query.
+- Quail checks ordinary conditions first. It skips the model when one is
+  `TRUE`.
+- With several `AI.IF` terms, Quail asks in written order until one is
+  `TRUE`.
+- Each term must read the same table. `OR` with an AI join or a score
+  comparison is unsupported.
 
 ### Joining
 
-Use `AI.IF` to join two tables with a natural language condition:
-
-```sql
-SELECT r.id, a.aspect
-FROM reviews r, aspects a
-WHERE AI.IF(PROMPT('Does the review discuss this aspect?\n\nReview: {0}\nAspect: {1}',
-                   r.body, a.aspect))
-```
-
-Add column comparisons in `ON` to restrict the pairs the model evaluates.
-For example, imagine that each claim has a `wiki_url` identifying its
-source passage in an `evidence` table:
+E.g., `claims(id, claim, wiki_url)` identifies passages in
+`evidence(id, text)`. Ask the model only about pairs with matching IDs:
 
 ```sql
 SELECT c.id, e.id
 FROM claims c
 JOIN evidence e
   ON c.wiki_url = e.id
- AND AI.IF(PROMPT('Does the passage support the claim?\n\nClaim: {0}\nPassage: {1}',
-                  c.claim, e.text))
+ AND AI.IF(PROMPT('Does the passage support the claim? {0} {1}', c.claim, e.text));
 ```
 
-The model evaluates only pairs where `c.wiki_url = e.id`.
+Omit the equality to let the model consider every claim–passage pair.
 
 ### EXISTS and NOT EXISTS
 
-`EXISTS` keeps a row if the subquery returns at least one match.
-`NOT EXISTS` keeps it if the subquery returns no matches.
-
-The following query finds reviews that discuss at least one aspect:
+E.g., return reviews that discuss at least one row in `aspects(id, aspect)`:
 
 ```sql
 SELECT r.id
 FROM reviews r
 WHERE EXISTS (
     SELECT 1 FROM aspects a
-    WHERE AI.IF(PROMPT('Does the review discuss this aspect?\n\nReview: {0}\nAspect: {1}',
-                       r.body, a.aspect)))
+    WHERE AI.IF(PROMPT('Does the review discuss this aspect? {0} {1}',
+                       r.body, a.aspect)));
 ```
 
-Use `NOT EXISTS` to find reviews that discuss none of the listed aspects:
-
-```sql
-SELECT r.id
-FROM reviews r
-WHERE NOT EXISTS (
-    SELECT 1 FROM aspects a
-    WHERE AI.IF(PROMPT('Does the review discuss this aspect?\n\nReview: {0}\nAspect: {1}',
-                       r.body, a.aspect)))
-```
-
-The subquery must be `SELECT 1 FROM <table> WHERE AI.IF(...)`.
-
-An `EXISTS` may also match on a key and ask about the subquery's table
-alone. The following query finds products with at least one review that
-mentions a defect:
-
-```sql
-SELECT p.sku
-FROM products p
-WHERE EXISTS (
-    SELECT 1 FROM reviews r
-    WHERE r.product = p.number
-      AND AI.IF(PROMPT('Does this review mention a defect?\n\n{0}', r.body)))
-```
-
-Quail runs it as `p.number IN (SELECT r.product FROM reviews r WHERE
-AI.IF(...))`, and stops asking about a product's reviews once one passes.
+Replace `EXISTS` with `NOT EXISTS` to keep reviews with no matching aspect.
 
 ### Options
 
-Both `AI.IF` and `AI_FILTER` accept an optional second argument with
-planning hints:
+Pass an object as the second argument.
+E.g., `{'selectivity': 0.3, 'anchor': 'c'}` for the join above.
 
-```sql
-AI.IF(PROMPT(...), {'selectivity': 0.3, 'anchor': 'r'})
-AI_FILTER(PROMPT(...), {'selectivity': 0.3, 'anchor': 'r'})
-```
-
-- **`selectivity`** estimates the fraction of rows or pairs that pass.
-  Quail uses it to choose filter and join order. The default is `0.2`,
-  meaning 20%. The hint does not change model answers.
-- **`anchor`** (joins only) sets the table alias whose document KV is
-  reused across pairs. This side is the *anchor*. If omitted, Quail
-  selects the anchor using estimated query time. See
-  [Joins](/docs/architecture/execution#joins).
+| Option | Meaning |
+| --- | --- |
+| `selectivity` | Fraction of documents or pairs expected to pass. Default: `0.2`. It changes planning, not answers. |
+| `anchor` | Join table alias whose document KV Quail reuses across pairs. Quail chooses it when omitted. |
 
 ## AI.SCORE
 
-Unlike `AI.IF`, which returns only TRUE or FALSE, `AI.SCORE(PROMPT(...))`
-returns a score between 0 and 1 as a `FLOAT64`. Higher scores indicate a
-stronger model preference for a positive answer to your question.
+`AI.SCORE(prompt[, options])` returns a `FLOAT64` from 0 to 1.
+Higher scores mean a stronger preference for a positive answer.
+A score of 0.75 does not mean the model is correct 75% of the time.
+Choose thresholds using labeled examples.
 
 ### Return scores
 
-For example, imagine a `documents` table where each row is a customer
-support request. Its `body` column contains the request text. The
-following query returns the score for whether each customer requests a
-refund:
+E.g., score refund requests in `documents(id, body)`:
 
 ```sql
 SELECT d.id,
        AI.SCORE(PROMPT('Does the customer request a refund? {0}', d.body))
            AS refund_score
-FROM documents d
+FROM documents d;
 ```
-
-A score in `SELECT` requires a column alias with `AS`.
 
 ### Filter rows
 
-Compare the score with `<`, `<=`, `>`, or `>=`. For the same support
-requests, the following query keeps rows with a refund score of at least
-0.75:
+Compare a score with `<`, `<=`, `>`, or `>=` and a threshold from 0 to 1.
+E.g., keep scores of at least 0.75:
 
 ```sql
 SELECT d.id
 FROM documents d
-WHERE AI.SCORE(
-    PROMPT('Does the customer request a refund? {0}', d.body),
-    {'selectivity': 0.1}
-) >= 0.75
+WHERE AI.SCORE(PROMPT('Does the customer request a refund? {0}', d.body),
+               {'selectivity': 0.1}) >= 0.75;
 ```
 
-Choose the threshold using labeled examples from your task. A score of
-0.75 does not establish that the model is correct 75% of the time.
-
-The optional `selectivity` hint estimates the fraction of rows that pass
-the comparison. It defaults to `0.2` and does not change the scores.
-See [Options](#options).
+`selectivity` estimates the fraction passing the comparison.
+It does not change scores.
 
 ### Join tables
 
-For example, imagine a `queries` table of search queries and a `documents`
-table of articles. The following query pairs each search query with
-articles whose relevance score is at least 0.8:
+E.g., match `queries(id, text)` to relevant `documents(id, body)`:
 
 ```sql
 SELECT q.id, d.id
 FROM queries q
 JOIN documents d ON AI.SCORE(
-    PROMPT('Is {1} relevant to {0}?', q.text, d.body)
-) >= 0.8
+    PROMPT('Is {1} relevant to {0}?', q.text, d.body)) >= 0.8;
 ```
 
-For a prompt that reads two documents, the template must contain `{0}`
-once. Refer to that document in words if you need to mention it again.
-
-To return a score for every pair without filtering, use `CROSS JOIN`
-and put `AI.SCORE` in `SELECT`.
+A two-document prompt must contain `{0}` exactly once.
+Use `CROSS JOIN` with `AI.SCORE` in `SELECT` to return unfiltered pair scores.
+A query cannot combine `AI.SCORE` with `AI.IF`.
 
 ### Model behavior
 
-All [supported models](/docs/user-guide/models) can run `AI.SCORE`:
-
-- Qwen3 rerankers are trained to score a document's relevance to a query.
-  For a prompt with two documents, the first is the query and the second
-  is the candidate document.
-- [Decision 2.0 Kai](/docs/user-guide/models#decision-20-kai-06b) returns
-  its probability of "Yes" when choosing between "Yes" and "No".
-- Qwen3 generative models and DiffusionGemma compare their scores for
-  TRUE and FALSE answers. Quail converts that comparison to a value
-  between 0 and 1.
-
-Quail computes a repeated score once when it appears in `SELECT` and a
-condition, or in several comparisons. A query cannot combine `AI.SCORE`
-with `AI.IF`.
+See [Models](/docs/user-guide/models) for supported configurations.
+Rerankers interpret the first prompt document as a search query.
+[Decision 2.0 Kai](/docs/user-guide/models#decision-20-kai-06b) returns its
+probability of Yes. The SAE model does not support scores.
 
 ## AI.CLASSIFY
 
-`AI.CLASSIFY` returns one of your supplied categories as a `STRING`.
-For example, imagine a `reviews` table with review text in `body`. The
-following query returns a sentiment label for each review:
+`AI.CLASSIFY(input, categories[, options])` returns a supplied label
+as a `STRING`.
+
+E.g., label each review in `reviews(id, body)`:
 
 ```sql
 SELECT r.id,
@@ -272,178 +187,102 @@ SELECT r.id,
 FROM reviews r;
 ```
 
-A classification in `SELECT` requires a column alias with `AS`. The call
-must be a separate item, rather than part of a larger expression.
-
 ### Arguments
 
-`AI.CLASSIFY(input, categories[, options])`
-
-| Argument | Type | Description |
+| Argument | Type | Meaning |
 | --- | --- | --- |
-| `input` | `STRING` column or `PROMPT` | The document to classify. Use `PROMPT` to add instructions or refer to two documents. |
-| `categories` | `ARRAY` or table name | 2 to 255 labels. Labels must not be empty or differ only in case. |
-| `options` | Object | Optional parameters listed below. |
+| `input` | Text column or `PROMPT` | One document, or a prompt over a document pair. |
+| `categories` | Array | At least two nonempty labels that differ when compared without case sensitivity. |
+| `options` | Object | Optional settings below. |
 
-Each category can have a description of up to 25 words. For example,
-`ARRAY[('refund', 'asks for money back'), ('praise', 'expresses approval')]`.
-If labels have the same score, Quail returns the first in the list.
-
-<details>
-<summary>Other category formats</summary>
-
-You can supply categories as objects:
-
-```sql
-ARRAY[{'label': 'refund', 'description': 'asks for money back'}, {'label': 'praise'}]
-```
-
-You can also use a registered table with a `label` column and optional
-`description` and integer `ordinal` columns. Quail sorts by `ordinal`
-if present, otherwise by label text.
-
-</details>
+Each label can have a description of at most 25 words.
+E.g., use `ARRAY[{'label': 'refund', 'description': 'asks for money back'}, {'label': 'praise'}]`.
+Quail also accepts `(label, description)` pairs in the array.
 
 ### Optional parameters
 
-Pass an object as the third argument, such as `{'probabilities': true}`.
-
-| Parameter | Default | Meaning |
+| Option | Default | Meaning |
 | --- | --- | --- |
-| `task_description` | Empty | Extra instructions, up to 50 words. |
-| `selectivity` | `0.2` | Estimated fraction of rows kept by a condition on the label. Does not change model answers. |
-| `probabilities` | `false` | Return each category's probability in `<name>_probabilities`, a `MAP<STRING, DOUBLE>`. |
+| `task_description` | Empty | Extra instructions. |
+| `selectivity` | `0.2` | Fraction expected to pass a filter on the label. |
+| `probabilities` | `false` | Add `<alias>_probabilities`, a map from labels to probabilities. |
 
-The probabilities sum to 1. They are available for individual documents;
-classifications of joined rows return labels only.
-
-Only a query whose result is the classification's own rows returns
-`<name>_probabilities`, beside the label in `SELECT`. When the label is
-only tested in `WHERE`, or SQL such as a `GROUP BY` runs above the
-classification, Quail computes no probabilities, and may then decode the
-label instead of scoring every category.
+Probabilities sum to 1. They are available for individual documents,
+not joined classifications. Quail returns them only when the query
+returns the classification's rows directly. It omits them when the label
+appears only in `WHERE` or DataFusion runs SQL above the classification.
 
 ### Query examples
 
 #### Filter by category
 
-Repeat the `AI.CLASSIFY` call in `WHERE` to filter by its label. SQL
-evaluates `WHERE` before `SELECT`, so `WHERE` cannot read the `AS` name.
-For example, the following query keeps negative or mixed reviews from the
-`reviews` table:
+E.g., return negative or mixed reviews. Repeat the call in `WHERE`;
+Quail classifies each review once:
 
 ```sql
 SELECT r.id,
-       AI.CLASSIFY(PROMPT('What sentiment does this review express? {0}', r.body),
-                   ARRAY['positive', 'negative', 'mixed']) AS sentiment
+       AI.CLASSIFY(r.body, ARRAY['positive', 'negative', 'mixed']) AS sentiment
 FROM reviews r
-WHERE AI.CLASSIFY(PROMPT('What sentiment does this review express? {0}', r.body),
-                  ARRAY['positive', 'negative', 'mixed']) IN ('negative', 'mixed');
+WHERE AI.CLASSIFY(r.body, ARRAY['positive', 'negative', 'mixed'])
+      IN ('negative', 'mixed');
 ```
 
-- Quail classifies each review once and uses the label for both the
-  filter and the result.
-- `=` keeps one category. Other comparisons raise `CompileError`.
-- A category that is not in the list matches no rows.
+Use `=` to keep one label. A label outside the supplied array matches
+no rows.
 
 #### Classify joined rows
 
-Use a `PROMPT` that refers to both documents to classify joined rows.
-For example, imagine a `reviews` table of movie reviews and an `aspects`
-table of subjects such as acting or plot. The following query finds the
-aspects each review discusses and classifies its sentiment about each
-matched aspect:
+E.g., classify a review's opinion about each matching aspect:
 
 ```sql
 SELECT r.id, a.aspect,
-       AI.CLASSIFY(
-           PROMPT('What is the opinion of the review about the aspect? {0} {1}',
-                  r.body, a.aspect),
-           ARRAY['positive', 'negative', 'mixed']) AS opinion
+       AI.CLASSIFY(PROMPT('What is the opinion about the aspect? {0} {1}',
+                          r.body, a.aspect),
+                   ARRAY['positive', 'negative', 'mixed']) AS opinion
 FROM reviews r
 JOIN aspects a ON AI.IF(
     PROMPT('Does the review discuss this aspect? {0} {1}', r.body, a.aspect));
 ```
 
-These limits apply:
-
-- The classification and its `AI.IF` join run on one GPU.
-- A `WHERE` condition cannot test the label of a joined row.
-- A query cannot classify joined rows and also use `AI.SCORE`.
-
-For labels computed before later filters, see
-[Classification answers](/docs/user-guide/results#classification-answers).
-For the scoring methods, see
-[Label scoring](/docs/architecture/execution#label-scoring).
+Joined classification requires one GPU and cannot use `AI.SCORE`.
+See [Classification answers](/docs/user-guide/results#classification-answers)
+to inspect labels that later filters remove.
 
 ## AI.EXTRACT
 
-`AI.EXTRACT` returns the answer to each of your questions, copied from
-a document. For example, imagine a `contracts` table
-with contract text in `text`. The following query returns the end date
-and the signer of each lease:
+`AI.EXTRACT(input, questions)` copies answers from one document.
+`input` is a text column. `questions` maps field names to question strings.
+The answer is a struct with a nullable `STRING` field per question.
+A field is null when the model finds no answer.
 
-```sql
-SELECT c.id,
-       AI.EXTRACT(c.text,
-                  {'end_date': 'When does the lease end?',
-                   'signer': 'Who signed the lease?'}) AS lease
-FROM contracts c;
-```
-
-The result is a struct with one `STRING` field for each question. A
-field is null when the document does not answer its question. For a
-contract with the text `Lease ends on March 3, 2027. Signed by Ana Ruiz.`,
-`lease` is `{"end_date": "March 3, 2027", "signer": "Ana Ruiz"}`.
-
-An extraction in `SELECT` requires a column alias with `AS`. The call
-must be a separate item, rather than part of a larger expression.
-
-### Arguments
-
-`AI.EXTRACT(input, questions)`
-
-| Argument | Type | Description |
-| --- | --- | --- |
-| `input` | `STRING` column | The document to read. |
-| `questions` | Object | Field names and their questions. Use one field to ask one question. |
-
-### Answer positions
-
-`AI.EXTRACT_SPAN` returns the position of each answer of the
-`AI.EXTRACT` call with the same arguments, as a struct with the same
-fields. Each field holds the `start` and `end` character positions of
-its answer. Quail reads both from the same extraction. For the contract
-above,
+E.g., extract the end date and signer from `contracts(id, text)`:
 
 ```sql
 SELECT c.id,
        AI.EXTRACT(c.text, {'end_date': 'When does the lease end?',
-                           'signer': 'Who signed it?'}) AS lease,
-       AI.EXTRACT_SPAN(c.text, {'end_date': 'When does the lease end?',
-                                'signer': 'Who signed it?'}) AS lease_span
+                           'signer': 'Who signed it?'}) AS lease
 FROM contracts c;
 ```
 
-returns `lease_span` as
-`{"end_date": {"start": 14, "end": 27}, "signer": {"start": 39, "end": 47}}`.
-In Python, `text[start:end]` returns the answer.
+### Answer positions
 
-Each question is a separate extraction. On the Quail backend, the
-questions about one document read the same document KV.
+`AI.EXTRACT_SPAN` takes the same arguments as `AI.EXTRACT`.
+It returns a struct with the same fields; each field contains `start`
+and `end` character positions. `end` excludes the character at that
+position, so Python's `text[start:end]` returns the answer.
 
-Quail asks only the questions whose fields the query reads. For
-example, a query that reads only `x.lease.signer` from a FROM subquery
-that extracts `end_date` and `signer` asks only the `signer` question,
-and `x.lease` then has the one field `signer`. A query that returns
-`lease` itself asks every question.
+E.g., return an answer and its span from the same extraction:
+
+```sql
+SELECT c.id,
+       AI.EXTRACT(c.text, {'end_date': 'When does the lease end?'}) AS lease,
+       AI.EXTRACT_SPAN(c.text, {'end_date': 'When does the lease end?'}) AS lease_span
+FROM contracts c;
+```
 
 ### Filter on answers
 
-Repeat the `AI.EXTRACT` call in `WHERE` and read a field with
-`['field']` to filter by an answer. For example, with the same
-`contracts` table, the following query keeps leases whose extracted end
-date contains "2027":
+E.g., return leases whose extracted end date contains "2027":
 
 ```sql
 SELECT c.id,
@@ -453,209 +292,119 @@ WHERE AI.EXTRACT(c.text, {'end_date': 'When does the lease end?'})['end_date']
       LIKE '%2027%';
 ```
 
-Quail extracts the answer once and uses it for both the filter and the
-result. Documents with no answer are excluded. Use `IS NULL` on the
-field to keep documents where no end date was found.
-
-Answer fields support the conditions listed in [WHERE and ON](/docs/user-guide/sql/sql-functions#where-and-on).
-You can also test an answer's position. For example,
-`AI.EXTRACT_SPAN(c.text, {...})['end_date']['start'] < 500` keeps
-answers that start within the document's first 500 characters.
-
-Quail may reorder a table's AI filters, classifications, and extractions
-to reduce estimated work. A condition on an answer runs after the
-extraction that produces it. Use a [planning hint](#planning-hints) to
-set the expected fraction of documents that pass, or pass
-`order="as_written"` to `session.sql()` to preserve the written order.
+Quail extracts each answer once. The filter excludes null answers.
+Use `IS NULL` to keep documents with no answer.
+Span fields support comparisons too.
 
 ### Limits
 
-- Use a model that supports `AI.EXTRACT`. See
-  [Supported models and GPUs](/docs/user-guide/models).
-- Filters on answers run on the Quail backend only.
-- `ORDER BY`, `DISTINCT`, and `GROUP BY` cannot use the result of an
-  extraction.
+Use a [model](/docs/user-guide/models) that supports extraction.
+Quail can reorder AI calls to reduce estimated work. Set
+`order="as_written"` in `session.sql()` to preserve written order.
 
 ## AI.MAP
 
-`AI.MAP` writes a text answer for each row, following your instruction.
-For example, imagine a `reviews` table with review text in `body`.
-The following query writes a one-sentence summary of each review:
+`AI.MAP(input, instruction[, max_tokens])` writes a `STRING` answer
+for each document. `input` is a text column; `instruction` is a string
+literal. `max_tokens` is a positive integer, with a default of 256.
+An answer ends when the model finishes or reaches this limit.
 
-```sql
-SELECT r.id,
-       AI.MAP(r.body, 'Summarize the review in one sentence.') AS summary
-FROM reviews r;
-```
-
-The result is a `STRING` column with one answer for each row. The model
-always picks its most likely next token, so the same document and
-instruction give the same answer. An answer ends when the model
-finishes or when it reaches the answer limit.
-
-A map in `SELECT` requires a column alias with `AS`, and the call must
-be a separate item. To change the answer, map in a
-[CTE](/docs/user-guide/sql/sql-functions#with), then change it in the
-outer query:
-
-```sql
-WITH m AS (
-    SELECT r.id,
-           AI.MAP(r.body, 'Summarize the review in one sentence.') AS summary
-    FROM reviews r
-)
-SELECT m.id, UPPER(m.summary) AS loud_summary
-FROM m;
-```
-
-### Arguments
-
-`AI.MAP(input, instruction[, max_tokens])`
-
-| Argument | Type | Description |
-| --- | --- | --- |
-| `input` | `STRING` column | The document to read. |
-| `instruction` | `STRING` literal | What to write about the document. |
-| `max_tokens` | Positive integer | The most tokens an answer can have. The default is 256. |
-
-### Several maps and other functions
-
-Each map in a query writes its own answer. On the Quail backend, the
-maps about one document read the same document KV. Maps also work with
-`AI.IF`, `AI.CLASSIFY`, and `AI.EXTRACT` on the same table. The
-following query summarizes only the negative reviews:
+E.g., summarize only negative reviews:
 
 ```sql
 SELECT r.id,
        AI.MAP(r.body, 'Summarize the review in one sentence.') AS summary
 FROM reviews r
-WHERE AI.IF(PROMPT('Is this review negative?\n\n{0}', r.body));
+WHERE AI.IF(PROMPT('Is this review negative? {0}', r.body));
 ```
-
-Quail writes answers only for the rows that pass the filter.
 
 ### Use answers in the query
 
-You can use a map's answer in `WHERE`, `ORDER BY`, `GROUP BY`, and
-`SELECT DISTINCT`, like any text column. The following query keeps
-reviews whose complaints mention the ending:
+A map answer works as a text column in SQL.
+E.g., return complaints that mention the ending:
 
 ```sql
 SELECT r.id,
        AI.MAP(r.body, 'List what the review complains about.') AS complaints
 FROM reviews r
-WHERE complaints ILIKE '%ending%';
+WHERE AI.MAP(r.body, 'List what the review complains about.') ILIKE '%ending%';
 ```
 
-Quail writes each answer once and uses it for both the condition and
-the result. Use a [planning hint](#planning-hints) to set the expected
-fraction of rows that pass.
+Quail writes each answer once and reuses it for the filter and result.
 
 ## AI.SAE_FEATURES
 
-`AI.SAE_FEATURES` returns the sparse autoencoder (SAE) features of a
-prompt. An SAE changes the model's hidden state for one token into many
-values, and most of these values are zero. Each nonzero value is a
-feature, with an ID and a strength. A feature ID has no name. To find
-what a feature means, read the documents where its strength is largest.
-The function does not generate text.
+`AI.SAE_FEATURES` returns sparse autoencoder (SAE) features of a prompt,
+not generated text. Each feature has an integer ID and a strength.
+Strengths are nonnegative activation values, not probabilities.
 
-For example, imagine a `tickets` table with the first message of each
-support conversation in `request`. The following query returns the
-features of each request:
+E.g., read features from `tickets(id, request)`:
 
 ```sql
 SELECT t.id,
-       AI.SAE_FEATURES(PROMPT('{0}\n\nWhat is the customer asking for?',
-                              t.request),
+       AI.SAE_FEATURES(PROMPT('{0}\n\nWhat is the customer asking for?', t.request),
                        {'pooling': 'last'}) AS intent
 FROM tickets t;
 ```
 
-The result is a list with one struct for each nonzero feature, from the
-strongest to the weakest. For the request `Hi, I need to cancel one of
-my flights booked on May 17.`, `intent` starts with
-`[{"feature": 7850, "strength": 2.01}, {"feature": 20512, "strength": 1.53}, ...]`.
-
-Strengths are nonnegative activation values, not probabilities. They can
-exceed 1 and are not normalized to sum to 1. A filter such as
-`strength > 1` uses an arbitrary cutoff; 1 has no special meaning.
-
-An `AI.SAE_FEATURES` call in `SELECT` requires a column alias with `AS`.
-The call must be a separate item, rather than part of a larger
-expression.
+The answer is a list of `{'feature': ID, 'strength': value}` structs,
+ordered from strongest to weakest. Feature IDs have no text labels.
+Inspect documents with high strengths to interpret a feature.
 
 ### Arguments
 
-`AI.SAE_FEATURES(prompt, {'pooling': 'last' | 'max'})`
-
-| Argument | Type | Description |
-| --- | --- | --- |
-| `prompt` | [`PROMPT`](#prompt) | The question and one document column. Quail puts the document before the question. |
-| `pooling` | `STRING` field of the options object | The tokens that give the features: `'last'` or `'max'`. |
+| Argument | Meaning |
+| --- | --- |
+| `prompt` | `PROMPT` over one document column. |
+| `options` | Object with `pooling` set to `'last'` or `'max'`. |
 
 ### Pooling
 
-- `'last'` uses the last token of the prompt. The question follows the
-  document, so the question changes these features. Use `'last'` to
-  read features about the question, e.g., the intent of a request.
-  The list has at most 100 features.
-- `'max'` uses the largest strength of each feature over all tokens of
-  the prompt. Most of these tokens are document tokens, so the features
-  describe the content of the document. The list can have thousands of
-  features.
+| Value | Features |
+| --- | --- |
+| `'last'` | Features of the prompt's last token; at most 100 with the supported SAE. The question follows the document. |
+| `'max'` | Maximum strength of each feature over all prompt tokens. The list can contain thousands of features. |
 
 ### Unnest the features
 
-Put the call in DataFusion's `UNNEST` in `SELECT` to get one row for
-each feature, as a struct with the fields `feature` and `strength`. The
-other columns repeat for each feature, and a row with no features gives
-no rows. Read the fields with `['feature']` and `['strength']` from a
-derived table, and use them in `SELECT`, `WHERE`, `GROUP BY`,
-`ORDER BY`, and aggregates.
+Use DataFusion's `UNNEST` in `SELECT`, not `FROM`.
+It returns one row per feature and repeats the other selected columns.
+An empty list contributes no rows.
 
-For example, with the same `tickets` table, the following query counts
-how many requests return each feature:
+E.g., count requests per feature:
 
 ```sql
 SELECT x.f['feature'] AS feature, COUNT(*) AS requests
-FROM (SELECT t.id,
-             UNNEST(AI.SAE_FEATURES(PROMPT('{0}\n\nWhat is the customer asking for?',
-                                           t.request),
-                                    {'pooling': 'last'})) AS f
-      FROM tickets t) x
+FROM (
+    SELECT t.id,
+           UNNEST(AI.SAE_FEATURES(
+               PROMPT('{0}\n\nWhat is the customer asking for?', t.request),
+               {'pooling': 'last'})) AS f
+    FROM tickets t
+) x
 GROUP BY x.f['feature']
 ORDER BY requests DESC;
 ```
 
 ### Limits
 
-- Use the `qwen3.5-2b-sae-bf16` model. See
-  [Supported models and GPUs](/docs/user-guide/models).
-- A query with `AI.SAE_FEATURES` cannot also use `AI.IF`, `AI.SCORE`,
-  `AI.CLASSIFY`, or `AI.EXTRACT`.
-- `ORDER BY`, `DISTINCT`, and `GROUP BY` cannot use the feature list.
-  Use the fields of an `UNNEST` instead.
-- Calls over the same documents share their KV. If any call uses
-  `'max'`, Quail also keeps the document features for the later calls.
-  It reads each question in full and does not share prefixes between
-  different documents, because KV does not contain the residual values
-  that `'max'` needs.
-
-For an application, see
-[Find customer intents in support conversations](/docs/demos/support-intents).
+Use `qwen3.5-2b-sae-bf16` in a separate session from other AI functions.
+Unnest the list before testing feature IDs or strengths.
+See [Find customer intents](/docs/demos/support-intents) for an application.
 
 ## Planning hints
 
-Use `HINT(condition, {'selectivity': fraction})` on a classification
-label, extracted answer, or map answer to estimate the fraction of documents that
-pass. Quail uses the estimate to choose the order of AI functions.
+`HINT(condition, {'selectivity': fraction})` estimates the fraction of
+documents that pass a test of an AI answer. The default is `0.2`.
+It changes planning, not which rows pass.
 
-For example, in the lease query above, replace the `WHERE` clause with:
+E.g., estimate that 40% of contracts have an extracted end date in 2027:
 
 ```sql
-WHERE HINT(lease.end_date LIKE '%2027%', {'selectivity': 0.4})
+SELECT c.id
+FROM contracts c
+WHERE HINT(
+    AI.EXTRACT(c.text, {'end_date': 'When does the lease end?'})['end_date']
+        LIKE '%2027%',
+    {'selectivity': 0.4});
 ```
-
-The hint estimates that 40% of documents pass. The default is 20%.
-A hint affects planning only; it does not change which rows pass.

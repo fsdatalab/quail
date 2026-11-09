@@ -2,255 +2,112 @@
 title: Custom Rules
 ---
 
-An optimizer rule changes a plan while preserving the query's result.
-Quail's rules are written in Rust:
+Quail implements its planning rules in Rust and registers them by name.
 
-- Logical rules are DataFusion `OptimizerRule`s that run over the
-  whole plan, Quail's `AiNode`s included: DataFusion's default rules
-  and Quail's. They are listed by name in `LOGICAL_RULES` and
-  `logical_rule` in
-  [`crates/quail-datafusion/src/rules.rs`](https://github.com/fsdatalab/quail/blob/main/crates/quail-datafusion/src/rules.rs).
-  `claim_model_regions` always runs after them.
-- Physical rules rewrite executable graphs and their settings, in
-  [`crates/quail-planner/src/physical_rules.rs`](https://github.com/fsdatalab/quail/blob/main/crates/quail-planner/src/physical_rules.rs).
-
-A session's registry lists the rules the planner applies, by name, and
-their order.
+- Logical optimizer rules implement DataFusion's `OptimizerRule` and
+  rewrite its logical plan, including `AiNode`s.
+- Physical rules rewrite a model region's physical plan or set values
+  the executor reads.
 
 ## Add a rule
 
-1. Write the rule in Rust. A logical rule implements DataFusion's
-   `OptimizerRule` and returns the rewritten plan, as `PushDownFilter`
-   does. A physical rule returns a replacement graph, or none to keep
-   the graph, and may add settings the executor reads.
-2. Add its name to the match in `logical_rule` or `apply_rule`. A
-   logical rule that moves operators around an `AiNode` follows the
-   node's `UserDefinedLogicalNodeCore` methods, which say which filters
-   and limits may move below it.
-3. Register the name.
+1. Implement the rewrite in Rust. A logical rule returns a rewritten
+   `LogicalPlan`. A physical rule returns a replacement graph, or `None`
+   when it only changes settings or makes no change.
+2. Add the name to `logical_rule` in
+   [rules.rs](https://github.com/fsdatalab/quail/blob/main/crates/quail-datafusion/src/rules.rs)
+   or `apply_rule` in
+   [physical_rules.rs](https://github.com/fsdatalab/quail/blob/main/crates/quail-planner/src/physical_rules.rs).
+3. Register a `LogicalRule(name)` with `register_logical_rule()`, or a
+   `PhysicalRule(name)` with `register_physical_rule()`. Pass the registry
+   to the session.
 
-Give each rule a unique name, shown in `explain()`. A logical rule's
-name is its `OptimizerRule::name()`, such as `push_down_distinct`. A
-physical rule uses `should_...` for yes/no decisions and `choose_...`
-to select an implementation.
+Use a unique name. Logical rules use `OptimizerRule::name()`.
+Physical rules use `should_...` for yes/no decisions or `choose_...` for
+implementation choices. Registering a name does not implement the rule.
 
-For example, imagine a session that should run every built-in rule and
-then a rule `should_skip_empty_tables` added to `physical_rules.rs`:
+To turn off a built-in rule, omit its name from the registry.
+E.g., create a session without limit pushdown into `AiNode`s:
 
 ```python
 import quail
-from quail.extensions import PhysicalRule
-
-registry = quail.ExtensionRegistry.with_built_ins()
-registry.register_physical_rule(PhysicalRule("should_skip_empty_tables"))
-session = quail.Session(config, registry=registry)
-```
-
-Registering an object that is not a `LogicalRule` or a `PhysicalRule`
-raises `TypeError`.
-
-A logical rule is turned off by leaving its name out of the registry.
-For example, imagine a test that checks a query returns the same rows
-with and without `push_down_limit_into_ai_nodes`, which makes a LIMIT
-the fetch of the `AiNode` below it:
-
-```python
 from quail.builtins import LOGICAL_RULES, built_in_registry
 
 rules = [name for name in LOGICAL_RULES if name != "push_down_limit_into_ai_nodes"]
-session = quail.Session(config, registry=built_in_registry(logical_rules=rules))
+registry = built_in_registry(logical_rules=rules)
+config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
+with quail.Session(config=config, registry=registry) as session:
+    pass
 ```
 
 ## Fetch rules
 
-An `AiNode`'s fetch keeps the first rows that pass its filter, of all
-rows or of each key, and lets the executor stop asking the model. A
-rule that sets a fetch follows two conditions:
+An `AiNode`'s fetch limits rows **after** its exact filter, globally or
+per key. Setting it too early changes query results.
 
-- The node's tests are its own filter first. A fetch counts rows after
-  the filter, and `absorb_into_ai_nodes` absorbs nothing into a node
-  with a fetch.
-- Only operators that keep one row per row are between the LIMIT or
-  DISTINCT and the node, and the node has no `HINT`.
+- Absorb answer tests before setting a fetch. `absorb_into_ai_nodes`
+  does not move tests into a node that already has one.
+- Do not move a later filter below a fetch unless it keeps or rejects
+  whole per-key groups.
+- Check intervening operators and `HINT` before pushing a limit into a node.
 
-`push_down_limit_into_ai_nodes` and `push_down_distinct`, in
-[`limit.rs`](https://github.com/fsdatalab/quail/blob/main/crates/quail-datafusion/src/limit.rs)
-and
-[`distinct.rs`](https://github.com/fsdatalab/quail/blob/main/crates/quail-datafusion/src/distinct.rs),
-are the built-in examples.
+See [limit.rs](https://github.com/fsdatalab/quail/blob/main/crates/quail-datafusion/src/limit.rs)
+and [distinct.rs](https://github.com/fsdatalab/quail/blob/main/crates/quail-datafusion/src/distinct.rs)
+for the built-in checks.
 
 ## Rewrites by number
 
-Each rewrite of an AI operator has a number. The operator is
-`AI(R; g, p, h, P, n)`, as
-[Logical plans](/docs/architecture/logical-plans) defines it. The table
-names the rule that makes each rewrite and when it applies.
+The table summarizes R1–R17. Conditions here identify the main safety
+constraints; the rule implementation defines every accepted plan shape.
 
-| Number | Rewrite | Rule | Condition |
-| --- | --- | --- | --- |
-| R1 | `σ_q(AI(R)) ⇒ AI(σ_q(R))` | Quail's region claim, then DataFusion's `push_down_filter` | `q` reads only columns of `R`, and the node has no fetch. Above a per-key fetch, only a test of the key columns moves. |
-| R2 | `σ_q(AI(R; p)) ⇒ AI(R; p ∧ q)` | `absorb_into_ai_nodes` | `q` tests the node's answer, and the node has no fetch. |
-| R3 | `σ_q(AI(R; h)) ⇒ σ_q(AI(R; h ∧ q))` | `push_down_hint_tests` | The filter is directly above a classification, extraction, map, or SAE features node of rows with no fetch; `q` is a term of the filter that reads a column the node adds and otherwise only the node's input, with no AI call. The filter stays. |
-| R4 | `σ_{a LIKE x}(AI_{extract(d)→a}(R)) ⇒ σ_{a LIKE x}(AI_{extract(d)→a}(σ_{d ILIKE '%s%'}(R)))` | `push_down_substring_prechecks` | The node is an extraction of rows with no fetch; its filter has a term `a.f LIKE x` or `ILIKE x`, not negated, with a literal pattern; `s` is the longest word of the longest literal run of `x`. The test of the answer stays. |
-| R5 | `π_Q(AI(R; P)) ⇒ π_Q(AI(R; P = Q[P]))`; `π_{a.f}(AI_{extract(d, {f, g})→a}(R)) ⇒ π_{a.f}(AI_{extract(d, {f})→a}(R))` | `push_down_projection_into_ai_nodes` | `Q` is a projection directly above a node of rows; the node keeps its answer, and drops each other added column `Q` does not read, such as an extraction's spans under a FROM subquery. An extraction asks only the fields the plan reads when every use of its answer and spans, through projections that pass them on or rename them, reads named fields; a use that reads the answer whole, or the query's result columns holding it, keeps every field. DataFusion's `optimize_projections` already prunes the input columns the node reads. |
-| R6 | `π_{B, (CASE WHEN c THEN a END)→z}(AI_{f→a}(R)) ⇒ π_{B, a→z}(AI_{f→a}(R; g = g ∧ c))`; an extraction keeps its `CASE`: `π_{B, (CASE WHEN c THEN e END)→z}(AI_{extract→e}(R)) ⇒ π_{B, (CASE WHEN c THEN e END)→z}(AI_{extract→e}(R; g = g ∧ c))` | `push_down_case_guards` | The node is a classification, extraction, map, or SAE features of rows with no filter, `HINT`, or fetch; the projection is directly above it; every item that reads an added column is `CASE WHEN c THEN <column> END` with the same `c`; `c` reads only columns of the one table the call reads. |
-| R7 | `AI_{f→b}(R; p = a ∨ b) ⇒ AI_{f→b}(R; g = (a IS NOT TRUE), p = a ∨ b)`; with earlier AI.IFs `b_1 … b_{k-1}` of the OR below, `AI_{f_j→b_j}(R) ⇒ AI_{f_j→b_j}(R; g = (a ∨ b_1 ∨ … ∨ b_{j-1}) IS NOT TRUE)` | `push_down_or_guards` | The node is an AI.IF of rows with no guard, `HINT`, or fetch, and returns none of the columns it adds; a term of its filter is an OR with the answer `b` as one term and no other term reads `b`; the other terms `a` read only columns of the one table the call reads, or are the answers `b_j` of AI.IF nodes below that return their answer and have no filter, guard, `HINT`, or fetch. |
-| R8 | `Limit_k(π(R)) ⇒ π(Limit_k(R))` | DataFusion's `push_down_limit`; `push_down_limit_into_ai_nodes` also reads through projections | The projection keeps one row per row. Over an `AiNode`, the LIMIT becomes the node's fetch (R9). |
-| R9 | `Limit_k(AI(R; n)) ⇒ AI(R; n = min(k, n))` | `push_down_limit_into_ai_nodes` | Only projections and aliases are between them, the node has no `HINT` and no per-key fetch, and `k > 0`. |
-| R10 | `Limit_{k,m}(AI(R; n)) ⇒ Limit_{k,m}(AI(R; n = min(k + m, n)))` | `push_down_limit_into_ai_nodes` | As R9, for a LIMIT with an OFFSET of `m`. |
-| R11 | `Limit_k(R ⊎ S) ⇒ Limit_k(Limit_k(R) ⊎ Limit_k(S))` | DataFusion's `push_down_limit`, then `push_down_limit_into_ai_nodes` | `⊎` is UNION ALL. Each branch's LIMIT becomes its `AiNode`'s fetch as R9 allows. |
-| R12 | `δ(π_K(AI(R))) ⇒ δ(π_K(AI(R; n = 1 per K)))` | `push_down_distinct` | `K` is input columns or a classification's label, and the node has no fetch. |
-| R13 | `S ⋉_{J=K} AI(R) ⇒ S ⋉_{J=K} AI(R; n = 1 per K)` | `push_down_semi_join_fetch` | `J = K` is the whole join condition, `K` are input columns of the node, each name once; only projections and aliases are between the join and the node; the node, and every `AiNode` below it, is an AI.IF over the same one table, with no join, fetch, `HINT`, or guard. |
-| R14 | `π_K(σ_{c ≥ k}(γ_{K; count(*)→c}(AI(R)))) ⇒ π_K(σ_{c ≥ k}(γ_{K; count(*)→c}(AI(R; n = k per K))))` | `push_down_count_threshold` | The HAVING is `COUNT(*) >= k`, `> k - 1`, or written the other way round, with `k` a positive integer; the GROUP BY keys `K` are columns; `count(*)` is the only aggregate and only the HAVING reads it; the node is under the GROUP BY as for R13. |
-| R15 | `TopK_{a↓,k}(AI(R; h)) ⇒ TopK_{a↓,k}(AI(R; h ∧ a ≥ t))` | DataFusion's `FilterPushdown` hands `ModelRegionExec` the top-k sort's dynamic filter as the region's hint | The node has no fetch (`n = ∞`) and each region row comes from one row of one table, with no join or stop key; `a` is never NULL; `t` is −∞ until the sort holds `k` rows, then the `k`-th largest `a` it holds, and rows with `a = t` stay. The region drops a row only when the test is not TRUE for every value its answers may take: an AI.SCORE answer lies between 0 and 1. |
-| R16 | `S ⋈_{J=K} AI(R; h) ⇒ S ⋈_{J=K} AI(R; h ∧ K ∈ π_J(S))` | DataFusion's `FilterPushdown` hands `ModelRegionExec` the hash join's dynamic filter as the region's hint | Inner equi-join with `S` the build side, complete before the region reads the hint, and the node with no fetch, as for R15; `K` is a column the region passes on from its table. NULL keys never match; the filter may keep a row whose key is absent, never drop one whose key is present. |
-| R17 | `AI_{f→b}(AI_{f→a}(R)) ⇒ π_{*, a→b}(AI_{f→a}(R))` | `merge_repeated_ai_calls` | Same call and guard, each column read by the name the lower node's input gives it; only filters, other `AiNode`s of the same rows, and the projections and aliases of derived tables and CTEs between them, the lower node's answer added to each projection that does not return it; no filter on the upper node across a derived table; no fetch on the upper node, each test of the upper node's answer already a test of the lower node's, and the lower node returns each column the upper one returns. The lowering already gives calls written the same way in one SELECT list and WHERE one node. |
+| Number | Rule | Change and conditions |
+| --- | --- | --- |
+| R1 | DataFusion `push_down_filter` | Move an input-only filter below an `AiNode` without a fetch. Above a per-key fetch, move only filters of key columns. |
+| R2 | `absorb_into_ai_nodes` | Add an answer test to the node's exact filter when the node has no fetch. |
+| R3 | `push_down_hint_tests` | Copy a directly preceding answer test into a column-producing node's hint test. Require no fetch; keep the original filter. |
+| R4 | `push_down_substring_prechecks` | Before extraction, test the document for literal text required by an answer's `LIKE` or `ILIKE` pattern. Require no fetch and a non-negated literal pattern; keep the answer test. |
+| R5 | `push_down_projection_into_ai_nodes` | Remove unused added columns and extraction questions. Keep all extraction fields when any use reads the whole struct. |
+| R6 | `push_down_case_guards` | Ask only where a `CASE WHEN` condition is TRUE. Every use of an added column must have the same condition over the call's table. Require no filter, `HINT`, or fetch. |
+| R7 | `push_down_or_guards` | Skip an `AI.IF` when other eligible `OR` terms already pass. Require no existing guard, `HINT`, or fetch. Preserve the OR's row selection. |
+| R8 | DataFusion `push_down_limit` | Move a limit through a projection that preserves row count. At an `AiNode`, apply R9 instead. |
+| R9 | `push_down_limit_into_ai_nodes` | Set a global fetch from a positive limit, through projections and aliases. Require no `HINT` or per-key fetch; keep the smaller existing limit. |
+| R10 | `push_down_limit_into_ai_nodes` | Fetch `LIMIT + OFFSET` rows under R9's conditions. Keep the outer limit and offset. |
+| R11 | DataFusion `push_down_limit` | Push limits into `UNION ALL` branches. R9 can then set each branch's AI fetch. Keep the outer limit. |
+| R12 | `push_down_distinct` | Fetch one passing row per selected input key or classification label. Require no fetch or `HINT`; keep `DISTINCT`. |
+| R13 | `push_down_semi_join_fetch` | Fetch one passing row per semi-join equality key. Require only unguarded `AI.IF` nodes over one table, without joins, fetches, or `HINT`. |
+| R14 | `push_down_count_threshold` | Fetch `k` passing rows per group for `HAVING COUNT(*) >= k`. Require positive `k`, column keys, no other aggregate or use of the count, and R13's AI restrictions. |
+| R15 | DataFusion dynamic filter | Let a top-k sort reject rows that cannot enter its result. Require no region fetch or stop keys, and enough known values or answer bounds to decide rejection. |
+| R16 | DataFusion dynamic filter | Let a hash join reject rows that cannot match its completed build side. Use the same region restrictions as R15. |
+| R17 | `merge_repeated_ai_calls` | Reuse an identical earlier call with the same guard across eligible filters or projections. Require no upper fetch and preserve every answer column and test. |
 
-R3 gives the node a hint test, which it may drop rows by; the filter
-above still decides which rows the query returns. R2 absorbs the same
-terms into the node's exact filter, and runs first, so in the default
-order R3 finds a term only when `absorb_into_ai_nodes` is turned off.
-Its practical role is small: the executor already stops a map's or
-extraction's answer by the region's exact tests of that answer alone
-(`should_stop_answers_early`), and reads a hint test the same way. See
-[Evaluation on partial answers](/docs/architecture/execution#evaluation-on-partial-answers).
+R3 normally has no remaining test after R2. Both exact tests and hint
+tests can [stop partial answers](/docs/architecture/execution#evaluation-on-partial-answers).
 
-R15 and R16 run while the query runs, not in the optimizer: the top-k
-sort and the hash join each make a dynamic filter, DataFusion pushes it
-down to `ModelRegionExec`, and the executor reads it again whenever it
-tightens; see
-[Runtime filters](/docs/architecture/physical-plans#runtime-filters).
-What R15 saves depends on what bounds an answer before the model gives
-it:
+R4 tests the longest word of the pattern's longest literal run, ignoring
+case. This avoids requiring whitespace to match the document exactly.
+R5 is safe because extraction asks each field's question separately.
+R6 keeps the outer `CASE` for extraction so an unasked row returns a
+NULL struct, not a struct of NULL fields.
 
-- AI.SCORE reads one readout per row, the model's probability of its
-  yes answer, so there is no partial answer to bound. A row not yet
-  asked may score anything from 0 to 1, and it can be skipped only
-  when the threshold `t` is 1, the largest score: once `k` rows score
-  1, a row that would tie at 1 and lose on the sort's next key, such
-  as a larger id, is skipped. Below 1 the threshold skips nothing.
-- A sort key the region passes on from its table, such as `ORDER BY
-  c.id LIMIT 20`, is known before the model runs, so every later row
-  past the threshold is skipped.
+R13 and R14 can return extra passing rows already in progress when a
+key reaches its threshold. The outer semi-join or count test still
+returns the same keys.
 
-R16 skips the rows whose join key is not among the build side's keys.
-In a query that joins a table back on its id above the region, the
-build side holds every id of the table, so nothing is skipped; a small
-build side, such as a short list of ids, skips most rows.
-
-R4 relies on `AI.EXTRACT` copying each answer from its document, so an
-answer is NULL or a substring of `d`. A decoded answer may differ from
-the document in case and whitespace, which `locate_span` forgives, so
-the precheck ignores case and reads one word of the pattern's literal
-text. `push_down_filter` then moves the precheck to the table, where
-DataFusion runs it before the model region.
-
-R5 relies on each field of an `AI.EXTRACT` being its own prompt: the
-document, then one question. Leaving out a field changes no other
-field's answer, and the questions left share the document's KV as
-before. For example, `SELECT x.id, x.e.w FROM (SELECT r.id,
-AI.EXTRACT(r.body, {'w': ..., 'v': ..., 'u': ...}) AS e FROM reviews r)
-x` asks only `w`, a third of the questions, and the answer struct `e`
-has the one field `w`. A query that returns `e`, or compares it whole,
-asks every question.
-
-For R6, the executor evaluates the guard over the rows a column
-operator reads, asks the model about the rows where it is TRUE, and
-gives every other row a NULL answer. A guarded operator runs in a
-pipeline of its own, and stock vLLM refuses a plan with a guard. An
-extraction is guarded the same way and keeps its `CASE` above it: its
-answer is a struct of one answer per question, the executor gives an
-unasked row a struct of NULL answers and NULL spans, and the `CASE`
-makes that row's answer NULL as a whole.
-
-The planner prices a guarded operator on the rows its guard passes: its
-expected rows are the rows it reads times the guard's estimated
-selectivity, in the cost model and in the speed of light estimate. The
-estimate is the one filters use: the default selectivity of 20% for a
-test, or the `selectivity` of an earlier AI.IF whose answer the guard
-reads; `x IS NOT TRUE` passes the rest of `x`'s rows, an AND the product
-of its terms', and an OR the rows any term passes. For example, R7's
-guard `r.flagged IS NOT TRUE` passes an estimated 80% of the rows.
-
-R7 starts from the lowering. `WHERE r.flagged OR AI.IF(...)` is one
-`AiNode` whose filter is `r.flagged OR b`, with the answer `b` in the
-call's place, and which returns none of its added columns; that is
-`σ_{a ∨ b}(AI_{f→b}(R))` once the OR is the node's filter. The rule
-guards the node with `r.flagged IS NOT TRUE`. The physical AI filter
-then carries the guard and the alternative `a`: the executor asks the
-model about the rows where the guard is TRUE, keeps those it answers
-TRUE, and passes each row where `a` is TRUE without asking. Without the
-rule, the filter asks every row and still passes the rows where `a` is
-TRUE. A guarded or ORed AI filter runs in a pipeline of its own, stock
-vLLM refuses it, and so does a region with a LIMIT or a DISTINCT stop
-key over it, since the executor counts survivors among the rows it
-asks. An OR of an AI.IF over two tables, an AI join, is refused.
-
-An OR of several AI.IF calls, such as `WHERE r.flagged OR AI.IF(q1) OR
-AI.IF(q2)`, lowers to one `AiNode` per call, in written order. Each but
-the last returns its answer `b_j` and drops no row; the last is the node
-whose filter is `r.flagged OR b_1 OR b_2`. The rule guards the first with
-`r.flagged IS NOT TRUE` and the second with `r.flagged IS NOT TRUE AND
-b_1 IS NOT TRUE`; with no plain term, the first is not guarded. The
-physical AI filter of an earlier call keeps every row and adds its
-answer column, TRUE or FALSE where it asked and NULL elsewhere; the last
-filter's guard and alternative read those columns. The planner keeps
-such a table's filters in written order. A later rule may reorder the
-calls by cost.
-
-R13 covers an uncorrelated `IN` subquery, such as `WHERE p.number IN
-(SELECT r.product FROM reviews r WHERE AI.IF(...))`: Quail lowers the
-subquery's AI calls as a part of its own, and DataFusion's
-`decorrelate_predicate_subquery` runs the `IN` as a semi-join above the
-subquery's model region. The executor stops a key's documents once one
-passes the table's AI filters, as for R12, and only in a region that
-asks one table's AI.IF filters and joins nothing; the rule's conditions
-are that region's. A correlated `EXISTS` whose AI calls read the
-subquery's table alone, with one equality of an outer and an inner
-column, is read as that `IN`: `WHERE EXISTS (SELECT 1 FROM reviews r
-WHERE r.product = p.number AND AI.IF(...))` runs as `WHERE p.number IN
-(SELECT r.product FROM reviews r WHERE AI.IF(...))`, and R13 applies.
-Both keep a product with a review of its number that passes; a filter
-drops an `IN` that is NULL as it drops an `EXISTS` that is FALSE, so
-only a WHERE term is read this way.
-
-R14 uses the same stop as R13 with `n = k`: the executor skips a key's
-remaining documents once `k` of them pass the table's AI filters. With
-more than one document of a key in flight, a few more than `k` may
-pass; the count threshold keeps the same keys either way. Explain shows
-`stop per key: <key> (the rest skipped once k survive)`.
-
-R1 needs no rule of its own. Quail moves each plain filter term to its
-table while it finds the model regions, before DataFusion's optimizer
-runs, so the term is below the `AiNode` once the node exists. Within
-the optimizer, an `AiNode`'s `prevent_predicate_push_down_columns`
-lets `push_down_filter` move such a term below the node.
+R15 and R16 act during execution rather than logical optimization.
+They reject a row only when its known columns and answer bounds prove
+it cannot pass. See [Runtime filters](/docs/architecture/physical-plans#runtime-filters).
 
 ## Rule order
 
-Rules run in registration order within each step:
+DataFusion runs logical rules in registration order. `claim_model_regions`
+always runs last. Quail then builds candidate physical plans and applies
+physical rules to each candidate before comparing estimated GPU time.
 
-1. DataFusion applies the logical rules to the whole plan, then
-   `claim_model_regions` claims each model region, and Quail reads the
-   region's operators from the result.
-2. Build an executable graph for each placement of the column
-   operators: the plan as placed, and each plan with a classification,
-   extraction, or map moved above a join.
-3. Apply the physical rules to each graph.
-4. Select the candidate with the lowest estimated time.
-
-If initial planning used estimated token lengths, the search runs again
-when exact tokens are available. See [Optimizer](/docs/architecture/optimizer)
-for the built-in rule order.
-
-A request backend, such as stock vLLM, is planned in Rust too: its
-`request_settings` say how it submits each operator, Rust lowers each
-placement to one request node, and the first placement it does not
-refuse is selected. The physical rules do not run on its plans.
+See [Optimizer](/docs/architecture/optimizer) for the built-in order.
 
 ## Test a rule
 
-Write a Rust unit test next to the rule for its rewrite, and a Python
-test that plans a query through a session and checks the plan or the
-rows it returns. See the
-[search tests](https://github.com/fsdatalab/quail/blob/main/tests/planner/test_search.py).
+Add a Rust unit test beside the rule to check its rewrite. Add a Python
+test through a session to check the returned rows. Include a case where
+the rule must not apply. See the
+[planner tests](https://github.com/fsdatalab/quail/blob/main/tests/planner/test_search.py).

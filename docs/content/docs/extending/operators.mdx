@@ -2,76 +2,71 @@
 title: Custom operators
 ---
 
-To implement a custom operator, build an `ExtensionNode` and write a
-runtime class. The node stores your operation's settings and declares its
-outputs. The *runtime* is the code that executes the node.
+Use an `ExtensionNode` to add an operator to a physical plan. Implement
+`NodeRuntime.execute()` to run it, then register that implementation.
+Registration alone does not add the node to queries.
 
-The example below defines an operator that keeps a table's first documents.
-After you write the runtime, register it and add the operator to a plan.
+## Build the node and the NodeRuntime
 
-## Build the node and the runtime
+An `ExtensionNode` declares its ports and stores its settings:
 
-Quail's own nodes, such as `Scan`, are Rust types that the planner, the
-executor, and `explain()` share. An extension's node is an `ExtensionNode`
-that carries what Quail cannot derive from its settings:
+| Field | Purpose |
+| --- | --- |
+| `type_name` | Selects the registered `NodeRuntime`. It must not use a built-in node's type name. |
+| `inputs` | Connects each `InputPort` to another node's `OutputPort` through a `PortRef`. |
+| `outputs` | Declares the names, value types, and schemas the operator returns. |
+| `location` | Defaults to `COORDINATOR`. Use `GPU_EXECUTOR` to run in the GPU process. |
+| Other keyword arguments | Store settings as attributes. Values must be scalar values or containers of scalar values. |
 
-- `type_name` identifies the node in a saved plan and selects the
-  registered runtime that executes it. It must not be one of Quail's.
-- `outputs` declares each output port with `OutputPort`: its name, value
-  type, and columns.
-- `location` specifies where the operator runs. `COORDINATOR`, the
-  default, runs it in the process that manages query execution.
-  `GPU_EXECUTOR` runs it in a GPU worker process.
-- Every other keyword argument is a setting, read back as an attribute.
-  A setting is a string, number, boolean, None, or a tuple, list, or
-  dictionary of them.
-
-```python
-from quail.physical import (
-    ExtensionNode, InputPort, OutputPort, PortRef, ValueType,
-)
-
-node = ExtensionNode(
-    "example.first_documents", "first:d",
-    inputs=(InputPort("input:0", ValueType.ROWS, PortRef("input:d", "rows:d")),),
-    outputs=(OutputPort("rows:d", ValueType.ROWS, schema=("d",)),),
-    alias="d", count=10)
-```
-
-An output *port* declares the name and value type of an output.
-Your runtime must return a value under each declared output name:
+E.g., this node keeps the first ten documents from the `rows:d` port of
+an upstream node `input:d`:
 
 ```python
 from quail.execution.metrics import NodeResult
+from quail.physical import (
+    ExtensionNode, InputPort, OutputPort, PortRef, ValueType,
+)
 
 
 class FirstDocumentsRuntime:
     def execute(self, node, inputs, context):
         rows = inputs["input:0"]
-        return NodeResult({f"rows:{node.alias}": rows[:node.count]})
+        kept = rows.take(range(min(len(rows), node.count)))
+        return NodeResult({f"rows:{node.alias}": kept})
+
+
+node = ExtensionNode(
+    "example.first_documents", "first:d",
+    inputs=(InputPort(
+        "input:0", ValueType.ROWS, PortRef("input:d", "rows:d"),
+        schema=("d",),
+    ),),
+    outputs=(OutputPort("rows:d", ValueType.ROWS, schema=("d",)),),
+    alias="d", count=10,
+)
 ```
 
-Implement `execute(node, inputs, context)` in the runtime class, and
-return a `NodeResult` with a value for each output port. See
-[`ScanRuntime`](https://github.com/fsdatalab/quail/blob/main/quail/execution/runtimes/relational.py)
-for a runtime of one of Quail's nodes.
+`execute(node, inputs, context)` must return a `NodeResult` with exactly
+one value for each declared output port. Connected ports must have
+compatible value types and schemas.
 
 ## Register the operator
 
-Create an [extension registry](/docs/extending#registration) with
-`ExtensionRegistry.with_built_ins()`. Register your runtime under the
-node's type name with
-`registry.register_runtime(FirstDocumentsRuntime(), key="example.first_documents")`.
-Pass the registry to the session.
+E.g., register the implementation under the node's `type_name`:
 
-Register the runtime in each process that executes the plan.
+```python
+from quail import ExtensionRegistry
+
+registry = ExtensionRegistry.with_built_ins()
+registry.register_runtime(FirstDocumentsRuntime(), key="example.first_documents")
+```
+
+Pass the registry to the session. Register the implementation in each
+process that executes the plan.
 
 ## Add the operator to a plan
 
-Registration does not add the operator to queries.
-Implement a [physical rule](/docs/extending/rules) that creates
-node instances and connects them to the physical plan.
-Register the rule or planner in the same registry.
-
-Use `PortRef` to connect an input to another node's output.
-The connected ports must have compatible value types and schemas.
+Insert the node through [plan editing](/docs/user-guide/editing-plans),
+or write a [physical rule](/docs/extending/rules) that inserts and connects
+it. See [ScanRuntime](https://github.com/fsdatalab/quail/blob/main/quail/execution/runtimes/relational.py)
+for a built-in `NodeRuntime` implementation.

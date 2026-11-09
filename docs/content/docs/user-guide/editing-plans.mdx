@@ -2,156 +2,95 @@
 title: Editing physical plans
 ---
 
-Quail chooses an execution plan for each query. Edit that plan when you
-want to test how a different execution schedule affects performance.
-
-For example, a query filters claims before joining them with evidence
-passages. The join can start as claims pass the filter. Adding a barrier
-makes the join wait until the filter finishes. You can compare the
-execution times of these two plans.
-
-The example below builds and prints both plans on the CPU. To measure
-their execution times, run them on a GPU with `query.run(plan=...)`.
-
-The full example is in
-[`demos/plan_walkthrough.py`][demoscript].
+Edit a physical plan to compare execution schedules without changing
+the query. Plan editing requires a local session and a query with one
+model region.
 
 ## Run the example
 
-```bash
-uv run python demos/plan_walkthrough.py
+E.g., insert a `Barrier` between a filter and a join.
+The example plans on the CPU; it downloads a tokenizer if necessary.
+Save it as `edit_plan.py` and run `python edit_plan.py`:
+
+```python
+import pyarrow as pa
+import quail
+from quail.physical import Barrier
+from quail.physical.plan import Refusal
+
+claims = pa.table({
+    "id": ["c1", "c2"],
+    "claim": ["Ada Lovelace was a mathematician.", "Paris is in France."],
+    "wiki_url": ["e1", "e2"],
+})
+evidence = pa.table({
+    "id": ["e1", "e2"],
+    "text": ["Ada Lovelace was an English mathematician.",
+             "Paris is the capital of France."],
+})
+config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
+with quail.Session(config=config) as session:
+    session.register("claims", quail.DocumentProvider.from_table(claims, id_col="id"))
+    session.register("evidence", quail.DocumentProvider.from_table(evidence, id_col="id"))
+    query = session.sql("""
+        SELECT c.id, e.id
+        FROM claims c
+        JOIN evidence e ON c.wiki_url = e.id
+          AND AI.IF(PROMPT('Does the passage support the claim? {0} {1}',
+                           c.claim, e.text), {'anchor': 'c'})
+        WHERE AI.IF(PROMPT('Is this claim about a person? {0}', c.claim))
+    """, dialect="bq")
+    print(query.explain(verbose=True))
+    plan = query.plan()
+    if isinstance(plan, Refusal):
+        raise quail.RefusalError(plan)
+    edited = plan.insert(
+        Barrier(node_id="barrier:c", next_anchor="c", aliases=("c",)),
+        between=("ai_filter:c", "ai_join:c"),
+    )
+    print("Original estimate:", plan.estimated_seconds)
+    print("Edited estimate:", edited.estimated_seconds)
+    assert edited.remove("barrier:c") == plan
 ```
 
 ## The query
 
-The example uses a small version of a
-[FEVER](https://fever.ai/) query from
-[QUAIL-B](/docs/contributing/benchmark). In FEVER, each claim is a
-factual statement and each evidence passage is a Wikipedia paragraph.
-The goal is to find which passages support which claims.
-
-The input contains three claims and three evidence passages. The query
-first keeps claims about a person. It then checks whether the evidence
-passages support those claims. A URL equality limits the pairs evaluated
-by the model.
-
-The script creates a session and registers both tables. It then writes
-this query in [SQL](/docs/user-guide/sql):
-
-```python
-PERSON = "Is the claim in DOCUMENT {0} about a person?"
-SUPPORT = (
-    "Does the passage in DOCUMENT {1} support the claim in "
-    "DOCUMENT {0}?"
-)
-
-query = session.sql(f"""
-SELECT c.id, e.id
-FROM claims c
-JOIN evidence e
-  ON c.evidence_wiki_url = e.id
- AND AI.IF(PROMPT('{SUPPORT}', c.claim, e.text))
-WHERE AI.IF(PROMPT('{PERSON}', c.claim))
-""", dialect="bq")
-```
-
-The condition `c.evidence_wiki_url = e.id` restricts which combinations
-of claims and evidence the model evaluates.
+The filter keeps claims about a person. The join asks whether the
+matching passage supports each claim. `c.wiki_url = e.id` restricts
+the pairs that the model reads. The `anchor` option selects `c` as the
+side whose KV the join reuses.
 
 ## Inspect the plan
 
-Call `query.explain()` to see the plan without executing it. The
-physical plan identifies each operator and its estimated work:
+`query.explain(verbose=True)` shows operator IDs and their connections.
+Use these IDs when editing another query; its IDs can differ.
 
-<Callout type="info">
 Time estimates assume peak GPU compute rates and memory bandwidth.
-They exclude CPU work and kernel launch time. Use `explain(analyze=True)`
-on a GPU to compare estimates with measured execution.
-</Callout>
-
-```text
-physical: backend=quail, model=qwen3-4b-fp8, gpus=1
-  KV=bf16, chunk budget=110,376 tokens
-
-                                                 est. rows  est. pass  est. time
-  AiJoin: anchor=c                                                     4.29 ms
-    KV: anchor=streamed from its filter, retain after join=no
-    join 1 full (c, e) over hash_join:c-e            0.6       20%*
-    AiFilter: c                                      0.6               2.39 ms
-      survivors stream into the join with KV pinned
-      predicate 1                                      3       20%*
-      Scan claims as c
-        tokens=306, mean_document_tokens=102
-    Scan evidence as e
-      tokens=4,506, mean_document_tokens=1,502
-    HashJoin: c.evidence_wiki_url = e.id
-```
-
-The line "survivors stream into the join with KV pinned" means a claim
-can enter the join as soon as it passes the filter. KV is the model's
-saved key and value vectors for the claim's tokens. The engine keeps
-that KV in GPU memory and reuses it when evaluating evidence passages.
+They are not measurements. On a GPU, use `query.run(plan=plan)` and
+`query.run(plan=edited)` to compare the two plans' reports.
 
 ## Insert a barrier
 
-Insert a `Barrier` to require the filter to finish over all claims before
-the join starts. The barrier collects the passing claim IDs, then supplies
-them to the join.
+Without the barrier, a claim can enter the join as soon as it passes
+the filter. `Barrier` waits until the filter finishes before supplying
+passing claims to the join.
 
-```python
-from quail.physical import Barrier
+The edit enables KV retention on the filter. Available GPU memory
+limits how much KV Quail retains. On several GPUs, the join waits for
+the filter on every GPU.
 
-plan = query.plan()
-edited = plan.insert(
-    Barrier(node_id="barrier:c", next_anchor="c", aliases=("c",)),
-    between=("ai_filter:c", "ai_join:c"),
-)
-```
-
-The barrier separates the filter and join into two pipelines. The edited
-plan sets `keep_kv=True` on the filter so passing claims' KV can be retained
-for the join. On several GPUs, the barrier also starts a new
-[stage](/docs/architecture/execution#multiple-gpus): the join starts once
-the filter has finished on every GPU, and each claim returns to the GPU
-that holds its KV. Retention is limited by available KV memory:
-
-```text
-      Barrier: next_anchor=c
-        AiFilter: c
-          retain KV for later joins
-```
-
-We can remove the barrier and get back the original plan:
-
-```python
-assert edited.remove("barrier:c") == plan
-```
-
-Only `Barrier` nodes can be removed. The removal of an
-LLM node raises an error:
-
-```text
-PlanEditError: 'ai_filter:c' is a AiFilter; removing it would change
-what the query means
-```
+`edited.remove("barrier:c")` restores the original plan.
+Only `Barrier` nodes can be removed.
 
 ## Plan editing API
 
-Start with `query.plan()` to inspect the plan without running inference.
-If planning returns a `Refusal`, resolve the reported constraint before
-editing it.
-
 | Method | Effect |
 | --- | --- |
-| `plan.insert(node, between=(producer_id, consumer_id))` | Insert a node on an existing edge. Its output must match the edge's value type. |
-| `plan.remove(node_id)` | Remove an eligible node and reconnect its consumers to its producer. |
-| `plan.move(node_id, between=(producer_id, consumer_id))` | Move an eligible node to another edge. |
-| `query.run(plan=edited)` | Execute the edited plan. |
+| `plan.insert(node, between=(producer_id, consumer_id))` | Insert a node on an existing connection. Its value type must match. |
+| `plan.remove(node_id)` | Remove a barrier and reconnect its consumers. |
+| `plan.move(node_id, between=(producer_id, consumer_id))` | Move a barrier to another connection. |
+| `query.run(plan=edited)` | Run the edited physical plan. |
 
-Each edit returns a new plan, validates port connections and cycles, and
-re-estimates the graph. An invalid edit raises `PlanEditError`.
-
-Only `Barrier` nodes can be removed. Quail rejects
-removal of a scan, model operator, or filter.
-
-[demoscript]: https://github.com/fsdatalab/quail/blob/main/demos/plan_walkthrough.py
+Each edit returns a new plan. Quail checks connections and cycles,
+then updates estimates when the plan has cost information.
+Invalid edits raise `PlanEditError`.

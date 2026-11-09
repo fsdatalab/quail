@@ -2,370 +2,209 @@
 title: Optimizer
 ---
 
-The optimizer chooses how Quail will execute a query. It starts with a
-logical plan, which describes the requested operations, and produces a
-physical plan, which specifies the executable operators and their settings.
-
-Quail makes planning decisions through optimizer rules and while building
-the physical plan. Some rules remove
-unnecessary work, such as loading columns the query does not use. Other
-rules compare alternatives using the [cost estimates](#cost-estimates)
-and choose the one with the lowest estimated GPU time.
-
-This page describes the built-in rules. See [Rules](/docs/extending/rules)
-to write and register an extension rule.
+Optimizer rules rewrite DataFusion's logical plan. Quail's planner then
+chooses a physical plan for each model region using estimated GPU time.
+Use `explain(verbose=True)` to inspect the choices and candidate costs.
 
 ## Planning process
 
-1. **Prepare statistics.** Read token counts, or estimate document lengths
-   from the first 1,024 documents while tokenization runs in the background.
-2. **Place column operators.** The region's operators arrive with each
-   operator on its table, where DataFusion's logical rules left it
-   (see [From SQL to a plan](/docs/architecture/logical-plans#from-sql-to-a-plan)),
-   and each scan loading only the columns the query uses. Each candidate
-   is that plan, or the plan with a classification, extraction, or map
-   moved above a join.
-3. **Compare plans.** Build each candidate and apply its execution settings,
-   including KV retention and prefix sharing. Choose the candidate with
-   the lowest estimated time. Keep the first candidate on a tie.
-4. **Update with exact tokens.** If the first search used estimated lengths,
-   repeat it after tokenization. Exact prefixes can change the chosen plan.
-   Explicitly edited physical plans preserve their edits and use `refine_plan`.
-5. **Execute.** Run the selected plan with its tokenized inputs.
+1. DataFusion and Quail apply logical optimizer rules, then Quail claims
+   model regions.
+2. Quail tokenizes each region's input documents and measures their
+   lengths and shared prefixes.
+3. The planner considers the operators' current placement and an
+   alternative that moves eligible answer-producing operators after joins.
+4. It builds a physical plan for each candidate and applies physical rules.
+5. It selects the lowest estimated GPU time. Ties keep the first candidate.
+
+See [planning.rs](https://github.com/fsdatalab/quail/blob/main/crates/quail/src/planning.rs)
+and [optimize.rs](https://github.com/fsdatalab/quail/blob/main/crates/quail-planner/src/optimize.rs).
 
 ## Cost estimates
 
-The *cost model* estimates GPU time from the computation and memory
-transfers a plan requires. It assumes peak GPU compute rates and memory
-bandwidth and excludes CPU work and kernel launch time.
-Use `explain(analyze=True)` to compare an estimate with measured execution.
-
-The model computes key and value vectors when it processes a token.
-Quail saves the vectors as *KV* for reuse in later requests.
-The cost model counts:
+The cost model estimates GPU computation and memory traffic. It counts:
 
 | Count | Meaning |
 | --- | --- |
-| Tokens | Token positions processed by the model. Processing a position again counts again. |
-| Attention pairs | Pairs of token positions compared by attention. |
-| KV writes | Token positions whose new KV is written to GPU memory. |
-| KV reads | Token positions whose saved KV is read from GPU memory. |
+| Tokens | Token positions the model processes, including repeated computation. |
+| Attention pairs | Token-position pairs attention compares. |
+| KV writes | Token positions whose new KV goes to GPU memory. |
+| KV reads | Token positions whose saved KV the model reads. |
 
-For example, imagine two questions about the same document. Keeping the
-document's KV lets the second question reuse it. The model processes the
-new question tokens and reads the saved KV without processing the document
-again.
+E.g., a second question that reuses document KV adds question tokens
+and KV reads, but does not process the document tokens again.
 
 ### The roofline model
 
-Model dimensions convert the counts into *floating point operations*
-(FLOPs) and bytes transferred. GPU specifications give operations per
-second and bytes transferred per second. Quail uses the larger of the
-computation and memory transfer times:
+Quail converts work into floating-point operations and bytes transferred.
+For each model component, it takes the larger of compute time and memory
+time, then sums those component times:
 
 ```text
-time_seconds = max(FLOPs / peak_FLOPs_per_second,
+time_seconds = max(FLOPs / operations_per_second,
                    bytes_transferred / bytes_per_second)
 ```
 
-The calculation is called the *roofline model*. Quail totals the work
-across layers for each part of the model calculation, applies the formula,
-and adds the resulting times.
+Compute rates depend on the operation's precision and the device
+specification. These estimates do not include CPU work or kernel launch
+time. Compare them with measurements from `explain(analyze=True)`.
 
-[Our blog post on filter cost estimates](https://fsdatalab.github.io/blog/ai-filter-cost-estimates/)
-explains the equations, GPU background, KV reuse, and filter ordering.
-Detailed explanations of join and classification costs are TBD.
+See [roofline.rs](https://github.com/fsdatalab/quail/blob/main/crates/quail-cost/src/roofline.rs)
+and the [filter cost explanation](https://fsdatalab.github.io/blog/ai-filter-cost-estimates/).
 
 ### Speed of light estimate
 
-`quail.speed_of_light_estimate` estimates query time under ideal execution
-conditions for comparison with measured runs. It assumes:
+`quail.speed_of_light_estimate` estimates ideal query time separately
+from the planner's chosen schedule. It assumes one GPU at peak compute
+rates and memory bandwidth, with unlimited KV capacity. By default,
+each distinct document prefix needs computation once.
 
-- One GPU running at peak compute rates and memory bandwidth.
-- Unlimited KV capacity. By default, each distinct document prefix is
-  computed once and reused.
-- No time spent on CPU work, scheduling, or kernel launches.
-- Rows that pass filters and joins are determined by answers supplied
-  by the caller, such as saved reference answers and classification labels.
-
-The estimate includes the work to process each question and confirm
-the supplied answer. Readout is the model's computation of output token
-scores from a hidden state.
-
-- For classification, it counts the question, label names, and answer
-  cue, plus one readout per document. The count is independent of the
-  optimizer's chosen [label scoring method](/docs/architecture/execution#label-scoring).
-- For extraction, it counts the question and one forward pass over the
-  reference answer, with one readout per answer token. Each answer span
-  includes a closing quote token. A missing answer uses only that token.
-- It excludes additional model passes used to find a label or extracted
-  answer during execution.
+- Caller-supplied answers determine which rows pass filters and joins.
+- The estimate counts the work to confirm those answers, not to search
+  for them. Classification uses one answer readout; extraction verifies
+  the reference answer in one forward pass.
+- It excludes CPU work, scheduling, and kernel launch time.
 
 Report the supplied answers and KV assumptions with the estimate.
-If a measured run produces different answers, it can evaluate different
-rows and perform different amounts of work.
+Different model answers can change which rows a measured run evaluates.
+See [sol.py](https://github.com/fsdatalab/quail/blob/main/quail/api/sol.py)
+for supported operations and arguments.
 
 ## Built-in rules
 
-Built-in rules run in the order below. Extension rules run after the
-built-in rules of the same kind, in registration order. Logical rules
-are DataFusion optimizer rules that run over the whole plan, Quail's
-`AiNode`s included; physical rules rewrite Quail's executable graphs.
+DataFusion's logical rules run over the whole plan, including `AiNode`s.
+Quail inserts its rules before `replace_distinct_aggregate` and runs
+`claim_model_regions` last. The table lists Quail's logical rules in order;
+[Rewrites by number](/docs/extending/rules#rewrites-by-number) gives their
+conditions.
 
-The logical rules are DataFusion's default rules, from
-`rewrite_set_comparison` to `optimize_projections`, with Quail's thirteen
-before `replace_distinct_aggregate`, which turns a DISTINCT into a
-GROUP BY. Each rewrite of an AI operator has a number, such as R1;
-[Rules](/docs/extending/rules#rewrites-by-number) gives each one's
-condition. The table lists
-Quail's rules and the DataFusion rules that most change a model
-region.
+| Rule | Change |
+| --- | --- |
+| `eliminate_distinct` | Remove a redundant `DISTINCT` when selected primary keys make rows unique. |
+| `place_ai_nodes` | Place AI calls at the tables they read. |
+| `absorb_into_ai_nodes` | Make tests of answers the node's exact filter (R2). |
+| `merge_repeated_ai_calls` | Reuse an identical earlier call's answer (R17). |
+| `push_down_distinct` | Stop after one passing row per selected key (R12). |
+| `push_down_limit_into_ai_nodes` | Give an eligible node a fetch, including `OFFSET` (R9–R10). |
+| `push_down_projection_into_ai_nodes` | Drop unused added columns and extraction fields (R5). |
+| `push_down_case_guards` | Ask only rows that need an answer in `CASE` (R6). |
+| `push_down_or_guards` | Skip `AI.IF` when earlier `OR` terms already pass (R7). |
+| `push_down_hint_tests` | Add an answer test as an early-rejection hint (R3). |
+| `push_down_substring_prechecks` | Test documents for text an extracted answer must contain (R4). |
+| `push_down_semi_join_fetch` | Stop after one passing row per semi-join key (R13). |
+| `push_down_count_threshold` | Stop after enough rows pass a count threshold per key (R14). |
 
-| Rule | Kind | Decision | Uses cost estimates |
-| --- | --- | --- | --- |
-| `simplify_expressions` | Logical | DataFusion's rule: fold constants and simplify tests. | No |
-| `eliminate_distinct` | Logical | Remove DISTINCT when the SELECT list returns every table's id column. | No |
-| `place_ai_nodes` | Logical | Move each model operator to the tables it reads and order each table's operators. | No |
-| `absorb_into_ai_nodes` | Logical | Make each test of an answer column the filter of the `AiNode` that adds it, when the node has no fetch (R2). | No |
-| `merge_repeated_ai_calls` | Logical | Make an AI operator read the answer of the same call below it, also across a derived table or CTE, so the model answers the call once (R17). | No |
-| `push_down_distinct` | Logical | Give the AI operator under a DISTINCT a fetch of one row per selected key: input columns, or a classification's label (R12). | No |
-| `push_down_limit_into_ai_nodes` | Logical | Make a LIMIT, with its OFFSET, the fetch of the AI operator whose rows it reads, through projections, when the node has no `HINT` (R9, R10). | No |
-| `push_down_projection_into_ai_nodes` | Logical | Make an AI operator return only its answer and the added columns the SELECT list above it reads, such as an extraction's spans, and an extraction ask only the fields the query reads (R5). | No |
-| `push_down_case_guards` | Logical | Make the test of a `CASE WHEN c THEN <answer> END` the guard of the classification, extraction, map, or SAE features below it, so the model is asked only where `c` is TRUE (R6). | No |
-| `push_down_or_guards` | Logical | Guard an AI.IF that is one term of an OR with the OR's other terms, so the model is asked only where they are not TRUE; in an OR of several AI.IFs, each only where the terms before it are not TRUE (R7). | No |
-| `push_down_hint_tests` | Logical | Make a test of an AI column's answer directly above its node, with no fetch, also the node's hint test, so the executor may stop answers the test rejects (R3). The default order absorbs such tests first (R2). | No |
-| `push_down_substring_prechecks` | Logical | Before an extraction whose answer a `LIKE` tests, keep only the documents that contain the pattern's literal text, ignoring case (R4). | No |
-| `push_down_semi_join_fetch` | Logical | Give the AI.IF filter on the subquery side of a semi-join, such as an `IN` subquery, one row per join key (R13). | No |
-| `push_down_count_threshold` | Logical | Give the AI.IF filter under `GROUP BY K HAVING COUNT(*) >= k` a fetch of `k` rows per key, when nothing else reads the count (R14). | No |
-| `decorrelate_predicate_subquery` | Logical | DataFusion's rule: run an IN or EXISTS subquery as a semi or anti join. | No |
-| `push_down_limit` | Logical | DataFusion's rule: move a LIMIT below operators that keep one row per row, but not below an AI operator. | No |
-| `push_down_filter` | Logical | DataFusion's rule: move plain filters to the scans. A filter of an AI operator's input columns moves below an operator with no fetch (R1). | No |
-| `optimize_projections` | Logical | DataFusion's rule: drop columns no operator reads. | No |
-| `claim_model_regions` | Logical | Run the rules above until the plan stops changing, then claim each model region. Always last. | No |
-| `should_push_down_limit` | Physical | Stop an eligible filter sequence once the region's fetch, or its LIMIT, of documents pass. | No |
-| `choose_classify_implementation` | Physical | Choose a classification's label scoring method. | Yes |
-| `should_retain_kv` | Physical | Keep selected document KV for later operators. | No |
-| `should_share_prefixes` | Physical | Reuse KV between documents with a shared prefix. | Yes |
-| `choose_attention_path` | Physical | Choose unified or tree attention for filters and joins. | Yes |
-| `should_stop_answers_early` | Physical | Give each map and extraction the region's exact tests of its answer alone, so the executor stops an answer once a test is decided on the tokens decoded so far. | No |
-
-The logical rules are listed in
-[`rules.rs`](https://github.com/fsdatalab/quail/blob/main/crates/quail-datafusion/src/rules.rs);
-the physical rules are in
-[`physical_rules.rs`](https://github.com/fsdatalab/quail/blob/main/crates/quail-planner/src/physical_rules.rs).
-
-The planner makes the cost-based choices described [below](#plan-choices).
-
-Each operator supplies its own prompt preparation, execution constraints,
-and costs. Score operators support both generative
-models and reranker models. Score joins preserve the document order in the
-model prompt. The executor reuses the first document's KV across its
-partners, so that document is the anchor.
-
-Call `explain(verbose=True)` to inspect physical settings, including
-`share_prefixes` and `attention`, and to list logical and physical rules
-and candidate costs.
+DataFusion supplies ordinary filter pushdown and projection pruning.
+See the complete [logical rule order](https://github.com/fsdatalab/quail/blob/main/crates/quail-datafusion/src/rules.rs).
 
 ## Plan choices
 
-The planner compares alternatives using estimated query work. Each
-candidate places the column operators differently. Physical construction
-chooses filter and join order for each candidate.
-
 ### Classification placement
 
-Physical planning considers when to classify a table's documents
-(`placements` in
-[`placements.rs`](https://github.com/fsdatalab/quail/blob/main/crates/quail-planner/src/placements.rs)).
-It also considers placements for extraction and AI.MAP.
-A classification that reads one table's document can run before or after
-joins involving that table. This differs from classifying a joined pair,
-where the classification reads both documents.
+The planner compares the current placement with a candidate that moves
+eligible classifications, extractions, and maps after joins.
 
-- Before the joins, classification evaluates every document that passes
-  the table's `AI.IF` filters. A condition on the label can reduce the
-  number of documents entering the joins.
-- After the joins, classification evaluates only documents that survive
-  those joins.
+- Before a join, a test of an answer can reduce join work.
+- After a join, the AI call processes only surviving documents.
 
-For example, imagine a query that classifies reviews by sentiment, keeps
-negative reviews, and joins them with movie aspects. Classifying first
-can save join work if few reviews are negative. Joining first can save
-classification work if few reviews match an aspect.
-
-The planner compares the estimated query times after applying physical
-rules to each candidate, including KV retention and prefix sharing.
-It keeps the written placement unless moving the maps after joins has a
-lower estimate.
+E.g., classifying reviews first saves join work when few labels pass.
+Joining first saves classification work when few reviews match.
+The planner compares candidates after applying physical rules.
 
 ### Filter order
 
-The planner chooses predicate order within a table.
-When a table has several model predicates, their order affects how much
-work the query does. *Selectivity* is the estimated fraction of rows
-that pass a predicate. A predicate that keeps fewer rows can reduce the work of later predicates.
+Selectivity is the fraction of documents or pairs expected to pass a
+filter. The planner uses selectivity and model costs to order filters.
 
-For `AI.IF`, the first predicate processes each full document. With KV rewind, later
-predicates process only their question tokens for documents that passed.
-The planner accounts for that difference when comparing orders.
+The first `AI.IF` question processes the document. Later questions can
+reuse its KV. The planner tries eligible first steps, orders subsequent
+steps by cost per rejected document, and compares total estimated time.
+Tests of a score that is already available need no model work.
 
-The planner tries each predicate first. It orders the remaining predicates
-by cost per rejected document and keeps the candidate with the lowest
-expected time. [Our blog post on filter cost estimates](https://fsdatalab.github.io/blog/ai-filter-cost-estimates/)
-gives the derivation for `AI.IF`.
-
-For `AI.SCORE`, the planner prices each prompt at the expected survivor count.
-It accounts for prefix reuse within a score evaluation. Later comparisons
-of a score already computed for those rows need no model work. The physical
-graph builder reads the chosen order and reuses the computed score column.
-
-Set `order="as_written"` to preserve predicate order.
+Set `order="as_written"` on `session.sql()` to preserve filter order.
 
 ### Join order
 
-The planner chooses the sequence and anchors of joins.
-The *anchor* is the side whose document KV stays in GPU memory while its pairs are
-evaluated. The *partner* is added after the anchor for each pair.
+The planner compares join sequences and anchor choices. An anchor's
+KV can serve several partners; each partner adds its tokens to the
+anchor's saved KV.
 
-A long anchor document can be processed once and reused for many partners.
-A long partner document must be processed for each anchor it pairs with.
-The planner considers this work along with filtering and KV retention.
+The search uses dynamic programming over plans in which each join adds
+one table. It tracks joined tables and retained KV, and removes
+alternatives that require no less work than another candidate.
+It ranks complete plans by estimated query time, including filters.
 
-The planner compares join orders and anchors by estimated time for the whole
-query, including filters. It considers only plans where each join adds
-one table to the preceding result.
-
-<details>
-<summary>How the planner searches join orders</summary>
-
-The search uses dynamic programming, following
-[Selinger et al. (1979)](https://doi.org/10.1145/582095.582099). It builds
-plans incrementally and keeps alternatives that might produce a cheaper
-complete query.
-
-- Each search state records the joined tables and which tables have KV
-  available in GPU memory.
-- For states with the same tables, it drops an alternative if another
-  requires no more work in any of the four counts: tokens, attention
-  pairs, KV writes, and KV reads.
-- It ranks complete plans by estimated query time, including filters.
-
-</details>
-
-An explicitly supplied anchor is preserved. With `order="as_written"`,
-the planner preserves join order and chooses only the unspecified anchors.
+An explicit anchor stays fixed. With `order="as_written"`, the planner
+preserves join order but can choose unspecified anchors.
 
 ## Physical rules
 
-Physical rules rewrite the execution graph and choose its settings.
-GPU settings also depend on the model, device, and available memory.
-DataFusion runs windows and aggregates on a region's rows, so no
-physical rule handles them.
+Physical rules run on each candidate in registration order. The built-in
+order is:
+
+| Rule | Change |
+| --- | --- |
+| `should_push_down_limit` | Set an early stop for eligible filters. |
+| `choose_classify_implementation` | Choose a label scoring method. |
+| `pack_set_passes` | Group questions for set-attention execution. |
+| `join_document_ends` | Retokenize document endings with the following prompt text for set attention. |
+| `should_retain_kv` | Schedule KV reuse across operators. |
+| `should_share_prefixes` | Enable prefix sharing when estimated savings exceed its costs. |
+| `choose_attention_path` | Choose unified or tree attention. |
+| `should_deduplicate` | Reuse answers for duplicate documents and restore their rows. |
+| `should_stop_answers_early` | Stop maps and extractions when answer tests are decided. |
+
+See [physical_rules.rs](https://github.com/fsdatalab/quail/blob/main/crates/quail-planner/src/physical_rules.rs)
+and [Custom Rules](/docs/extending/rules).
 
 ### Stop filters after enough rows pass
 
-`should_push_down_limit` lets the executor stop admitting documents once
-enough rows pass the query's AI filters. The rule requires a single
-pipeline and a final `Limit`. Joins and sorts prevent this
-optimization because they need more than the first passing documents.
+`should_push_down_limit` sets a filter limit when the physical plan has
+an eligible `Limit`, no join, and at most one pipeline. The executor
+can stop admitting documents once enough pass.
 
 ### Execution limits
 
-`build_physical_plan` sets two execution limits:
+The model and GPU specifications determine:
 
-- The *token budget* is the maximum number of new tokens in one forward
-  pass. Available GPU memory and kernel index limits determine this budget.
-- *KV capacity* is the number of KV pages that fit in GPU memory after
-  reserving memory for model weights and execution.
+- The **token budget**, which limits new tokens per forward pass.
+  Memory reservations and kernel index limits constrain it.
+- **KV capacity**, the pages available after weights and execution
+  memory reservations.
 
-See [Execution](/docs/architecture/execution#pipelines-and-batches) for
-how these limits affect batching.
+See [batching](/docs/architecture/execution#pipelines-and-batches).
 
 ### KV retention
 
-The `should_retain_kv` rule identifies document KV that later operators can
-reuse. A filter can retain the KV of passing documents for a later join anchored on that
-table. A join can retain anchor KV for a later join with the same anchors.
-
-The planner rule does not compare retention on versus off. The executor
-uses estimated savings to decide which KV to keep.
-
-Retained KV has a memory limit. When pages run out, the executor removes
-the KV with the lowest estimated future savings per page. An operator
-that later needs the removed KV must compute it again.
-
-See [KV retention](/docs/architecture/kv#kv-retention) for the priority
-calculation and execution behavior.
+`should_retain_kv` identifies prefixes that later operators can reuse.
+The executor decides which to keep within the retention capacity.
+When space runs out, it removes KV with the lowest estimated future
+savings per page. See [KV retention](/docs/architecture/kv#kv-retention).
 
 ### Label scoring
 
-The `choose_classify_implementation` rule compares supported classification methods and
-chooses the one with the lowest estimated GPU time. It considers the
-model, label tokens, requested output, and whether earlier operators
-already provide document KV.
-
-Decision 2.0 Kai uses its own scoring method, `decision_choice`, so the
-rule does not compare alternative methods for that model.
-See [Label scoring](/docs/architecture/execution#label-scoring) for how
-the methods select labels and their requirements.
+`choose_classify_implementation` compares supported methods using the
+model and label tokens. It accounts for requested probabilities and
+available document KV. See [label scoring](/docs/architecture/execution#label-scoring)
+for how methods differ.
 
 ### Prefix sharing
 
-The `should_share_prefixes` rule enables [prefix sharing](/docs/architecture/kv#prefix-sharing)
-when the estimated compute savings exceed the additional KV write time:
+`should_share_prefixes` compares the estimated compute savings from
+shared tokens with additional KV write time. An operator that already
+writes KV has no additional write cost. The rule counts complete pages
+and requires exact token sequences.
 
-```text
-saved_seconds = shared_tokens * 2 * model.params / device.fp8_flops
-write_seconds = total_tokens * model.kappa / device.hbm_bw
-```
-
-| Input | Meaning and unit |
-| --- | --- |
-| `shared_tokens` | Prefix token positions whose computation can be reused, counting complete KV pages only. |
-| `total_tokens` | Document token positions processed by the operator. |
-| `model.params` | Number of model parameters. The formula assumes about two floating-point operations per parameter per token. |
-| `device.fp8_flops` | Peak FP8 operations per second. |
-| `model.kappa` | KV bytes per token across all layers. |
-| `device.hbm_bw` | GPU memory bandwidth in bytes per second. |
-
-If the operator already writes KV, the additional write time is zero.
-Joins and classifications already write their document KV.
-
-The comparison excludes sorting, scheduling, attention, and recomputation
-when shared KV is unavailable. Prefix matching requires token sequences,
-so the rule can make its final decision after tokenization finishes.
+The comparison excludes sorting and scheduling costs. It also excludes
+recomputation when shared KV is unavailable. See [prefix sharing](/docs/architecture/kv#prefix-sharing).
 
 ### Attention path
 
-The `choose_attention_path` rule chooses between the unified and tree attention
-paths described in [Execution](/docs/architecture/execution#attention-paths).
-It compares their estimated time for requests that read the same prefix.
-For `r` requests, each with `q` new tokens and a shared prefix of `s` tokens,
-it compares:
+`choose_attention_path` compares unified and tree attention for requests
+that read a shared prefix. Tree attention groups those reads but adds
+work to combine partial attention values. Ties choose unified attention.
 
-```text
-unified_seconds = r * attention_seconds(q, s)
-tree_seconds = attention_seconds(r * q, s) + merge_seconds
-```
-
-`attention_seconds(q, s)` estimates the compute and memory time for the
-new tokens to attend to the saved prefix, summed across layers.
-`merge_seconds` estimates the memory time to read two partial attention
-outputs and write the combined output.
-
-- For joins, the inputs are estimated partners per anchor, tokens per
-  partner, and mean anchor length.
-- For filters, the rule compares paths for each group of documents
-  sharing a parent prefix. It chooses the path preferred by the most
-  reused tokens. Ties choose unified attention.
-- Tree attention supports BF16 and FP8 weights. It requires at least
-  two billion parameters, excluding embeddings and output layers, and
-  no extra answer positions. Other configurations use unified attention.
-
-The current comparison uses the FP8 compute rate for attention, although
-the kernel runs in BF16. It therefore underestimates attention compute
-time on an H100. It also excludes kernel launch time. These limits apply
-to the path comparison, rather than the main roofline attention estimate.
-
-The implementation is
-[`cheaper_attention_path`](https://github.com/fsdatalab/quail/blob/main/quail/common/budgets.py).
+The comparison uses the model's attention precision and device bandwidth.
+It excludes kernel launch time. Models that do not support tree attention
+use unified attention. See [attention paths](/docs/architecture/execution#attention-paths)
+and [cheaper_attention_path](https://github.com/fsdatalab/quail/blob/main/crates/quail-cost/src/budgets.rs).

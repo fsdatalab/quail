@@ -2,21 +2,13 @@
 title: Custom data sources
 ---
 
-A *table provider* supplies table data to Quail as Arrow record batches.
-Implement `TableProvider` when your source needs its own reader.
-For Arrow tables, Parquet, Arrow IPC, and Hugging Face datasets, use the
-[built-in providers](/docs/user-guide/sessions#registering-tables).
+Implement `TableProvider` to read a custom source as Arrow record batches.
+For supported file formats, use a
+[built-in provider](/docs/user-guide/sessions#registering-tables).
 
 ## Implement a provider
 
-Quail saves tokenized document text for reuse in later queries.
-A *content identity* is a string that identifies the version of the data
-used to produce those tokens. If the data changes, the identity must change
-so Quail reads and tokenizes the updated data.
-
-For example, imagine that an application stores reviews as Python
-dictionaries with `id` and `body` fields. The following provider keeps a
-fixed snapshot of those rows and reads requested columns in batches:
+E.g., this provider reads a fixed snapshot of review dictionaries:
 
 ```python
 from uuid import uuid4
@@ -45,8 +37,8 @@ class RowsProvider(TableProvider):
 
     def statistics(self):
         return TableStatistics(
-            row_count=self._table.num_rows,
-            byte_count=self._table.nbytes,
+            num_rows=self._table.num_rows,
+            num_bytes=self._table.nbytes,
         )
 
     def scan(self, request: ScanRequest):
@@ -60,7 +52,7 @@ class RowsProvider(TableProvider):
 
 ## Register the provider
 
-With an existing session, register the provider as a table:
+E.g., with an existing local `session`:
 
 ```python
 session.register("reviews", RowsProvider([
@@ -69,19 +61,15 @@ session.register("reviews", RowsProvider([
 ]))
 ```
 
-The table name `reviews` is available to SQL queries.
-
 ## Requirements
 
-- `content_identity()` must change when the values, row order, or schema
-  change. The example gives each fixed snapshot a distinct identity.
-  If the reviews change, pass the updated rows to a new `RowsProvider`.
-- `scan()` must return the requested columns, respect the row limit,
-  and keep batches within `request.batch_rows`.
-- Apply supported scan filters before the row limit. Reject unsupported
-  filters instead of ignoring them.
-- For sources that do not fit in memory, read the source in batches.
-  The example keeps its source table in memory.
+- Change `content_identity()` when values, row order, or schema change.
+  Quail uses this identity to reuse tokenized documents. For this example,
+  create a new provider when the reviews change.
+- Return the requested columns and respect `request.limit`.
+- Keep each batch within `request.batch_rows`.
+- Apply scan filters before the row limit. Reject filters you cannot apply.
+- Read large sources in batches rather than keeping them all in memory.
 
-See [`quail/catalog/providers.py`](https://github.com/fsdatalab/quail/blob/main/quail/catalog/providers.py)
-for the interface and built-in implementations.
+See the [provider interface](https://github.com/fsdatalab/quail/blob/main/quail/catalog/providers.py)
+for types and built-in implementations.

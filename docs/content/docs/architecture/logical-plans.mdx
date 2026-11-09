@@ -2,436 +2,165 @@
 title: Logical plans
 ---
 
-A logical plan describes the operations a query requests and the data they
-read. It does not specify GPU batches or attention settings. Quail's
-logical plan is DataFusion's `LogicalPlan`: DataFusion binds a query, and
-its optimizer rules place Quail's AI operators in it as `AiNode`s (see
-[From SQL to a plan](#from-sql-to-a-plan)). Quail then reads each model
-region's operators from that plan, and the
-[optimizer](/docs/architecture/optimizer) prices the physical choices
-and builds a physical plan.
-
-This page describes the plan for contributors working on query syntax,
-validation, or optimizer rules.
+Quail uses DataFusion's `LogicalPlan`, with an `AiNode` for each AI call.
+DataFusion and Quail apply optimizer rules to this plan before Quail
+claims model regions. GPU settings belong to each region's
+[physical plan](/docs/architecture/physical-plans).
 
 ## Plan structure
 
-The plan is a tree of DataFusion's operators. Each node represents an
-operation, and its children are the operations that supply its inputs.
-Data flows from the scans toward the root.
+The logical plan is a tree. A node reads the rows its children produce.
 
-For example, imagine a query that classifies reviews by sentiment and
-returns only negative reviews:
+E.g., for a registered `reviews` table with `id` and `body` columns,
+this query returns negative reviews:
 
 ```sql
-SELECT r.id, AI.CLASSIFY(r.body, ARRAY['positive', 'negative']) AS sentiment
+SELECT r.id,
+       AI.CLASSIFY(r.body, ARRAY['positive', 'negative']) AS sentiment
 FROM reviews r
-WHERE sentiment = 'negative'
+WHERE AI.CLASSIFY(r.body, ARRAY['positive', 'negative']) = 'negative';
 ```
 
-Its logical plan, as the first half of `explain()` prints it, is:
+`WHERE` cannot read the `SELECT` alias. Quail reuses the identical AI
+call, so the model classifies each review once.
+
+The optimized plan has this structure, before Quail claims the model region:
 
 ```text
-Projection: r.id, sentiment
-  AiNode: sentiment = ai_classify(r.body, make_array(Utf8("positive"), Utf8("negative"))), filter: sentiment = Utf8("negative")
-    SubqueryAlias: r
-      TableScan: reviews projection=[id, body]
+Projection: id, sentiment
+  AiNode: classify body; keep sentiment = 'negative'
+    TableScan: reviews
 ```
-
-The `AiNode` calls the model and adds the label column `sentiment`,
-then keeps the rows whose label passes its filter. The filter tests the
-column without calling the model again. `Projection`, `SubqueryAlias`,
-and `TableScan` are DataFusion's own operators.
 
 ### AiNode
 
-An `AiNode` (`crates/quail-datafusion/src/ai.rs`) asks the model one
-AI call `f` about each row of its input `R`, and adds the call's answer
-as the column `a`:
-
-```text
-AI(R; g, p, h, P, n) = π_P(Limit_n(σ_p(π_{*, f_g → a}(R))))
-f_g = CASE WHEN g THEN f END
-```
-
-- `g`, the guard, says which rows the model is asked about. The
-  executor asks about the rows where `g` is TRUE and answers NULL for
-  the rest.
-- `p`, the filter, is an exact test of the input's columns and `a`.
-- `h`, the hint, is the query's inexact `HINT` options, such as
-  `{'selectivity': 0.4}`, and the hint test: the node may drop rows
-  where it is not TRUE. A node with a hint test has no fetch, and the
-  filter the test came from stays above it.
-- `P`, the projection, names the added columns the node returns.
-- `n`, the fetch, keeps the first rows: of all rows, or of each key.
-
-The call's function names the node's kind: `ai_filter` (`AI.IF`),
-`ai_score`, `ai_classify`, `ai_extract`, `ai_map`, or
-`ai_sae_features`. The plan's text writes a line break in a prompt
-literal as `\n`, so each node stays on one line.
-
-## From SQL to a plan
-
-DataFusion parses and binds the SQL. Quail's analyzer rule
-`lower_ai_calls` runs first. It finds each part of the query that
-Quail plans: the operators that call the model, with the filters and
-joins below them (`crates/quail-datafusion/src/claim.rs`). DataFusion
-keeps the operators above that part, such as GROUP BY, windows, ORDER
-BY, LIMIT, and DISTINCT, and moves their AI calls into the part's
-SELECT list.
-The rule then lowers each AI call in the part into one `AiNode`
-(`crates/quail-datafusion/src/lower.rs`):
-
-- An AI.IF filter is an `AiNode` whose filter is `a` and which returns
-  only its input's columns. A comparison of an AI.SCORE is the same,
-  with the comparison as the filter.
-- An OR of one AI.IF and terms that ask no model, such as
-  `r.flagged OR AI.IF(...)`, is an `AiNode` whose filter is the OR with
-  `a` in the call's place. With several AI.IFs, each but the last is an
-  `AiNode` that returns its answer and drops no row, in written order,
-  and the last reads those answers as terms of its filter.
-- An AI.IF over two tables is an `AiNode` over their join. An EXISTS
-  or NOT EXISTS over a model call is an `AiNode` over the join with
-  semi or anti semantics: it returns the outer rows.
-- A classification, extraction, SAE feature list, or map is an
-  `AiNode` that returns its answer column. A test of that column is
-  first a plain DataFusion `Filter` above it.
-
-For example, imagine a query that joins reviews to products on an
-AI.IF, keeps negative reviews with another AI.IF, and keeps reviews
-with more than 3 stars. DataFusion binds it with every test in one
-`Filter` above the join. Lowering turns the two model tests into
-`AiNode`s, still where the query wrote them:
-
-```text
-Filter: r.stars > 3
-  AiNode: AI.IF('This review is negative', r.body)
-    AiNode: AI.IF('Review {0} discusses product {1}', r.body, p.text)
-      Inner Join: r.asin = p.asin
-        TableScan: reviews as r
-        TableScan: products as p
-```
-
-DataFusion's optimizer then runs over the whole plan, `AiNode`s
-included: its own rules, such as `SimplifyExpressions`,
-`PushDownFilter`, `PushDownLimit`, decorrelation, and
-`OptimizeProjections`, with Quail's rules among them
-(`crates/quail-datafusion/src/rules.rs`). `PlaceAiNodes` moves each
-node to the tables it reads, as `PushDownFilter` does for plain
-filters, and orders each table's operators the way the executor reads
-them. `AbsorbIntoAiNodes` makes each test of an answer column the
-filter of the `AiNode` that adds the column. `MergeRepeatedAiCalls`
-makes a node with the same call as a node below it read that node's
-answer, so the model answers the call once. `PushDownFilter` and
-`OptimizeProjections` place the plain filters and prune unread
-columns:
-
-```text
-AiNode: AI.IF('Review {0} discusses product {1}', r.body, p.text)
-  Inner Join: r.asin = p.asin
-    AiNode: AI.IF('This review is negative', r.body)
-      Filter: r.stars > 3
-        TableScan: reviews as r
-    TableScan: products as p
-```
-
-Two rules give an `AiNode` a fetch, so the executor can stop asking
-the model once enough rows pass. Each runs only on a node with no fetch
-and no hint, after the tests of its answer are its own filter, since a
-fetch counts the rows that pass the filter:
-
-- `PushDownLimitIntoAiNodes` makes a LIMIT the fetch of the `AiNode`
-  below it, when only projections are between them:
-  `Limit_k(AI(R)) ⇒ AI(R; n = k)`. A LIMIT with an OFFSET of `m` stays
-  and fetches `k + m` rows: `Limit_{k,m}(AI(R)) ⇒ Limit_{k,m}(AI(R; n = k + m))`.
-  An ORDER BY with a LIMIT is not one: it reads every row.
-- `PushDownDistinct` gives the `AiNode` under a DISTINCT a fetch of one
-  row per value of the selected columns `K`:
-  `δ(π_K(AI(R))) ⇒ δ(π_K(AI(R; n = 1 per K)))`. `K` is columns of the
-  node's input, or the node's answer alone, such as a classification's
-  label. It reads a DISTINCT before and after DataFusion turns it into a
-  GROUP BY, so a filter on `K` above the DISTINCT does not stop it.
-
-`EliminateDistinct` removes a DISTINCT when the SELECT list returns
-each table's id column.
-
-Each `AiNode` tells DataFusion's rules what they may do around it:
-
-- A filter of the input's columns moves below a node with no fetch.
-  Above a fetch it stays, since limiting rows before a test is not
-  limiting them after; only a test of a per-key fetch's key columns
-  moves, as it keeps or drops each key's rows whole.
-- A test of the answer stays above the node, and `AbsorbIntoAiNodes`
-  makes it the node's filter only when the node has no fetch.
-- A LIMIT does not move below a node; it becomes the node's fetch.
-- Projection pruning keeps the columns the node's call, filter, tests,
-  and per-key fetch read.
-
-The last optimizer rule, `claim_model_regions`, runs the rules before
-it until the plan stops changing, then replaces each part that holds
-`AiNode`s with one `ModelRegion`: the `AiNode`s and the operators that
-run with them on the GPU. These are the row-at-a-time expressions
-between AI calls, the joins the AI operators need, and the scans. A
-part DataFusion computes for the region, such as a table's plain
-filters or a CTE that groups rows, becomes one of the region's inputs.
-
-The region returns one row per surviving document, or per surviving
-tuple of a join: the id column of each table it reads, and the
-answers of its AI calls. A table's id column is its primary key; an
-input without one, such as a CTE that groups rows, gets
-`__quail_row`, each row's position among the input's rows. DataFusion
-runs the rest of the part above the region
-(`crates/quail-datafusion/src/lift.rs` and `join_back.rs`):
-
-- for each table whose other columns the SELECT list reads, an inner
-  join of the region's rows with the table on its id, which adds those
-  columns back. The join does not keep the region's row order;
-  only an ORDER BY sets the order of the result. The join
-  reads a region input through the same `SharedInput` as the region,
-  so DataFusion computes the input's rows once; it scans an identified
-  table the region reads by name again;
-- each test of the result rows: a test of more than one table's
-  columns, which needs every model call's answer first;
-- the SELECT list's expressions other than its columns and model calls;
-- every ORDER BY, LIMIT, OFFSET, DISTINCT, GROUP BY, and window.
-
-A LIMIT stops the model early only through a fetch. Either the rules
-above made it the fetch of the region's last `AiNode`, or it sits
-directly above the region with only projections between, and the
-region gets it as its own fetch (`ModelRegion: fetch=k`). An ORDER BY
-with a LIMIT reads every row the region returns.
-
-Finally, `derive` (`crates/quail-datafusion/src/derive.rs`) reads the
-region's operators from the optimized plan. It walks the plan once,
-children first and the left input before the right. Each AI call's
-prompt and each condition is bound in the order the query wrote them
-(`binding.rs`), from each `AiNode`'s call, written place, and tests.
-Each column operator takes its SELECT alias or a name of its own, and
-each condition is placed at a table's scan, after the operator that
-computes the columns it reads. Then `derive`
-writes the region's `Operators` in the plan's order: each `AiNode` is
-one AI filter, AI join, gate, or column operator where the rules left
-it.
-The physical planner reads only these operators. A region whose shape
-the operators cannot hold is refused when it is claimed, and DataFusion
-runs that part of the query itself.
-
-Which implementation runs an operator, such as a classification's label
-scoring method or whether a classification runs before or after a
-join, is a physical choice. The [optimizer](/docs/architecture/optimizer)
-prices those choices.
-
-## Operators
-
-`Operators` (`crates/quail-planner/src/operators.rs`) holds a region's
-operators, grouped by kind, in the order the query wrote them. They
-cross into Python as JSON (`Query.operators`).
+An [AiNode](https://github.com/fsdatalab/quail/blob/main/crates/quail-datafusion/src/ai.rs)
+stores one AI call and the operations that apply to its answer:
 
 | Field | Meaning |
 | --- | --- |
-| `scans` | Each table the region reads: its provider, alias, document column, the columns its operators read, and its regular predicates. |
-| `filters` | Each table's AI.IF and AI.SCORE predicates, with their selectivity hints. |
-| `joins` | Each AI join or EXISTS gate: its predicate, semantics (`full`, `exists`, or `anti`), selectivity, anchor, and the ON equalities below it. |
-| `classifies`, `extracts`, `sae_features`, `maps` | Each column operator: its model call, its answer column, and whether it runs above a join. |
-| `column_filters` | Each table's tests of answer columns, such as `sentiment IN ('negative')`. |
-| `projection` | The columns the region returns, the id column of each table and the answers, with each extraction's struct columns. |
-| `fetch` | The most rows the region returns: the fetch of its last `AiNode`, or of a LIMIT directly above it, with its OFFSET. The executor stops once that many rows pass. |
-| `stop_keys` | Each table's per-key fetch, when the region asks only that table's AI.IF filters. |
+| `call` | The AI call. |
+| `guard` | Ask the model only for rows where this condition is TRUE. |
+| `filter` | Keep rows where this exact condition on input columns and answers is TRUE. |
+| `hint`, `hint_test` | Planning options and a test the executor may use to reject rows early. The original filter remains above a hint test. |
+| `projection` | The added columns the node returns. |
+| `fetch` | Keep the first rows globally, or the first rows for each key. |
+| `semantics` | Return passing rows, or the outer rows that have a match (`Semi`) or no match (`Anti`). |
 
-A query joining three or more tables has one join for each binary
-join. A classification may read one document or both documents of a
-joined pair. DataFusion tests the label of a joined pair on the rows
-the region returns.
+An `AI.IF` filter tests its own answer and need not return that answer
+column. A classification adds a label column. An `AI.IF` join reads two
+tables below the node.
 
-ORDER BY, LIMIT, DISTINCT, GROUP BY, HAVING, and windows have no
-operator here: DataFusion runs them on the rows a model region returns, or computes them as a region's
-input. For example, a CTE that numbers a filter's survivors with
-`ROW_NUMBER()`, read by a second AI filter, becomes two regions: the
-first filter, then DataFusion's window, then the second filter, which
-reads the window's rows as a table named by the CTE.
+## From SQL to a plan
+
+1. **Parse and bind.** DataFusion resolves the SQL against the session's
+   tables and functions.
+2. **Lower AI calls.** Quail's `lower_ai_calls` analyzer rule creates
+   `AiNode`s. Tests of answer columns initially remain DataFusion filters.
+3. **Rewrite the plan.** DataFusion moves ordinary filters toward scans
+   and removes unused columns. Quail places AI calls at the tables they
+   read, absorbs tests of answers, and merges repeated AI calls.
+4. **Claim model regions.** `claim_model_regions` runs the preceding
+   optimizer rules until the plan stops changing. It replaces connected
+   AI work with `ModelRegion` nodes.
+5. **Read region operators.** `derive` converts each model region into
+   `Operators`, which Quail's planner uses to choose a physical plan.
+
+An `AiNode` tells DataFusion which rewrites preserve its behavior:
+
+- Input-only filters can move below a node without a fetch.
+- A fetch prevents later filters from moving below it. A filter of a
+  per-key fetch's key columns can still move because it keeps or drops
+  each key's rows together.
+- A `LIMIT` does not move below an `AiNode`. Eligible limits become its fetch.
+- Projection pruning retains every column the call or its conditions read.
+
+DataFusion can compute a model region's input, including an aggregate
+or a window in a CTE. A query with AI calls on both sides of that operation
+has separate model regions.
+
+A model region returns table IDs and AI answers. DataFusion joins other
+requested table columns back on their IDs. For inputs without a primary
+key, Quail adds `__quail_row`. A `SharedInput` lets the region and this
+join read the same computed input without recomputing it.
+
+DataFusion runs the remaining SQL above the region. Only `ORDER BY`
+sets the result order. An eligible `LIMIT` becomes a fetch and can stop
+model work early; `ORDER BY ... LIMIT` must consider the region's rows
+for its top-k sort.
+
+See [optimizer rules](/docs/architecture/optimizer#built-in-rules) for
+individual rewrites and their conditions.
+
+## Operators
+
+[Operators](https://github.com/fsdatalab/quail/blob/main/crates/quail-planner/src/operators.rs)
+describes the work inside one model region:
+
+| Fields | Contents |
+| --- | --- |
+| `scans` | Tables, document columns, and input conditions. |
+| `filters`, `joins` | AI filters and joins, with selectivity and join settings. |
+| `classifies`, `extracts`, `sae_features`, `maps` | AI calls that add answer columns. |
+| `column_filters` | Tests of those answers. |
+| `projection` | Table IDs and answers the region returns. |
+| `fetch`, `stop_keys` | Global or per-key row limits. |
+
+DataFusion runs aggregates and windows outside model regions; they have
+no operator in this structure.
 
 ## Expressions
 
-Expressions describe the values an operator reads, computes, or tests.
-The planner reasons about columns and model calls; DataFusion computes
-every other value and every condition.
+Quail identifies model calls and their column references. DataFusion
+computes other expressions, including tests of answers on the CPU.
 
-| Expression | Value |
-| --- | --- |
-| `ColumnRef(alias, provider, column)` | A reference to a table column. |
-| `GetField(input, field)` | A field read from a struct. |
-| `Expression(encoded, columns, types, text)` | A value or condition DataFusion computes for each row, such as `length(r.body) < 40`. |
-| `ModelCall(prompt, kind, labels, descriptions)` | An AI operation. The kind is `boolean`, `score`, `label`, `extract`, `features`, or `map`. |
-| `ScoreTest(call, test)` | An `AI.SCORE` call compared with a threshold. |
-| `Alias(expression, name)` | An expression returned under a specified column name. |
+An `Expression` stores an encoded DataFusion expression with its column
+references and Arrow types. Each process builds its physical expression
+once when it reads the plan. `expression.evaluate(rows)` then evaluates
+it over Arrow columns. A column with the wrong type raises `CompileError`.
 
-An `Expression` holds DataFusion's logical expression, encoded with
-datafusion-proto. It reads its columns by position: `columns[i]` names
-the column it reads as `#i`, so the planner can rename a column, such as
-the score column a score filter reads, without DataFusion. `types[i]` is
-that column's Arrow type, as Arrow writes it, such as `Int64` or
-`Struct("start": Int32, "end": Int32)`. The binder takes it from the
-table's schema, or from the answer's type for an answer column: `Utf8`
-for a label, a map's text, or an extracted answer, `Float64` for a score.
-`text` is how `explain()` shows the expression, with `{i}` for
-`columns[i]`.
-
-For example, `LENGTH(r.details.body) < 40` reads the `details` column of
-`reviews` as `r`. Its expression has `columns` `[r.details]`, `types`
-`[Struct("body": Utf8)]` when `body` is its one field, and the text
-`character_length({0}.body) < 40`.
-
-The encoded form exists only to cross a process boundary, such as a plan
-sent to a GPU worker or to Quail Server's client. A process that reads a
-plan builds each expression once, when it makes the Python object: it
-decodes the expression and builds DataFusion's physical expression over
-the columns' types, applying DataFusion's type coercion then. The object
-holds the built expression, and `expression.evaluate(rows)` only reads
-the columns and evaluates it. It takes a pyarrow table, record batch, or
-an object that reads columns with `column(name)`, and returns a pyarrow
-array over the same buffers: a condition gives booleans, null where SQL's
-three-valued logic leaves a row unknown. Pass `qualified=True` for
-result rows, which name each column with its table alias.
-
-Evaluation reads each column by name. A dotted name the rows do not hold
-reads a struct field, as result rows hold an extraction's answers, and a
-field of a null struct reads as null. A dictionary column reads as its
-values, as result rows hold labels. A column whose type is not the one
-the plan gives raises `CompileError`; Quail does not rebuild the
-expression for the rows. `ColumnRef`, `GetField`, and `Alias` objects
-have the same `evaluate` method. Python reads only an expression's
-`references`, the columns it gathers for it.
-
-The operators use these expressions as follows:
-
-- A scan's `column` specifies the text to tokenize: a source column or
-  a struct field of one. Its `predicates` are conditions on the
-  table's own columns.
-- A filter or join tests a boolean `ModelCall`, or a `ScoreTest`.
-- A column filter tests a label, extracted answer, or answer position
-  with a condition that reads the answer's column. The condition does
-  not call the model again. A test of a label that is `IN` a list of
-  labels also keeps the labels, which the planner reads.
-- The projection's columns specify the returned values and their names.
+See [expressions.rs](https://github.com/fsdatalab/quail/blob/main/crates/quail-datafusion/src/expressions.rs).
 
 ## Prompt binding
 
-Prompt binding converts a user's template and column references into the
-layout the model receives. Quail places document text before the question
-so questions about the same document can reuse its KV. KV is the key and
-value vectors saved for previously processed tokens.
-
-A template is therefore not treated as a plain string substitution.
-For example, `PROMPT('Does {0} praise the acting?', r.body)` identifies
-`r.body` as the document, but Quail sends that document before the question.
+Quail converts a prompt and its document references into the model's
+prompt layout. It places the document before the question so later
+questions can reuse the document's KV. `PROMPT(...)` is not plain string
+substitution.
 
 ### Filters
 
-A bound filter prompt contains, in order:
+A filter prompt places the document after its heading, followed by the
+question and answer cue.
 
-1. A document heading.
-2. The document text.
-3. The task instruction and question.
-4. The answer cue.
-
-For example, for a review with body "The acting was excellent.", this
-call:
-
-```sql
-PROMPT('Does this review praise the acting? {0}', r.body)
-```
-
-uses this layout:
-
-```text
-DOCUMENT:
-The acting was excellent.
-You are performing a data processing task.
-Evaluate TRUE or FALSE for the following question:
-Does this review praise the acting?
-ANSWER:
-```
+E.g., for the question "Does this review praise the acting?", Quail
+places the review text before the TRUE/FALSE instruction and question.
 
 ### Joins
 
-The join layout places the anchor document first. The anchor is the side
-whose KV remains available while Quail evaluates its partners.
-
-The prompt contains, in order:
-
-1. A heading and the anchor document.
-2. The anchor frame, which identifies the anchor and states the question.
-3. A heading and the partner document.
-4. The answer cue.
-
-The frame is fixed for all partners of an anchor. In the Quail executor,
-the first partner heading is also stored with that frame, once per anchor.
-Each pair then adds its partner document and answer cue. See
-[Join execution](/docs/architecture/execution#joins).
+A join puts the anchor document first. The anchor is the document whose
+KV stays available while Quail evaluates its partners. A fixed question
+follows the anchor; each pair then adds the partner document and answer
+cue. See [Joins](/docs/architecture/execution#joins).
 
 ### Classification
 
-A classification prompt includes the document, question, and allowed
-categories. Quail prepares both category text and letter choices when
-one distinct token is available for each letter. The
-[label scoring rule](/docs/architecture/optimizer#label-scoring) chooses
-which version to use.
-
-For example, suppose `reviews.body` contains "The acting was excellent."
-This call supplies two sentiment categories:
-
-```sql
-AI.CLASSIFY(
-    PROMPT('What sentiment does this review express? {0}', r.body),
-    ARRAY['positive', 'negative'])
-```
-
-The version with letter choices has this layout before model chat
-formatting is added:
-
-```text
-DOCUMENT:
-The acting was excellent.
-
-Answer with the letter of exactly one of the categories below for the following question: What sentiment does this review express?
-
-Categories:
-- A: positive
-- B: negative
-ANSWER:
-```
-
-The document precedes the question and category list, so another question
-can reuse the same document KV. When the model selects A, Quail returns
-the category text `positive` in the result column.
+A classification prompt includes the allowed labels after the document.
+The [label scoring method](/docs/architecture/execution#label-scoring)
+determines whether Quail scores label tokens or letters that represent
+the labels. Quail returns the label text, not its letter.
 
 ### Tokenization
 
-Quail tokenizes documents separately from fixed prompt text. The executor
-joins the token sequences without tokenizing the complete text again.
-This lets it reuse document tokens across queries. A bound prompt is
-text. The planner lowers it once per query with the session's
-tokenizer (`quail.physical.lowering.lower_prompt`, which calls the Rust planner), and the
-lowered prompt holds the fixed token IDs and counts the cost model and
-the executor read.
+Quail tokenizes documents separately from fixed prompt text and joins
+the token sequences. This permits reuse of document tokens across queries.
 
-For a score over one document, the input is:
-
-```python
-tokenize(before_document) + tokenize(document) + tokenize(after_document)
-```
-
-Separate tokenization can produce different tokens from tokenizing the
-complete string. A token can span the boundary between fixed text and
-the document, such as a space and the first word. Splitting at that
-boundary prevents the combination and can change model scores.
-
-When comparing implementations, use identical token IDs to compare model
-execution. A comparison against an implementation that tokenizes the
-complete string also measures the effect of tokenization.
+Separate tokenization prevents a token from crossing the boundary
+between fixed text and a document. For set attention, `join_document_ends`
+retokenizes document endings with the following prompt text. Use identical
+token IDs when comparing model implementations.
 
 ## Logical rules
 
-Logical rules rewrite the plan before physical planning. See the
-[optimizer](/docs/architecture/optimizer#built-in-rules) for the built-in rules
-and [Rules](/docs/extending/rules) for the extension interface.
+See [Optimizer](/docs/architecture/optimizer#built-in-rules) for the
+built-in rules and [Custom Rules](/docs/extending/rules) to add one.

@@ -4,113 +4,66 @@ title: Quickstart
 
 ## Install
 
-Install [quail-engine from PyPI](https://pypi.org/project/quail-engine/).
-Install the `quail-engine` package. In Python, import `quail`.
+Quail requires Python 3.12 and a
+[supported CUDA GPU](/docs/user-guide/models).
+Install `quail-engine`; import it as `quail`:
 
 ```bash
 uv pip install quail-engine
 ```
 
-Quail requires Python 3.12 and a CUDA GPU (local or on
-[Modal](/docs/user-guide/models#no-local-gpu-use-modal)).
-
 ## Run an AI filter
 
-This example filters the 100,000 movie reviews in the
+E.g., filter the 100,000 reviews in the
 [Stanford IMDB dataset](https://huggingface.co/datasets/stanfordnlp/imdb)
-on an H100 SXM, keeping reviews that mention a positive aspect of the
-movie.
+on an H100 SXM. Keep reviews that mention a positive aspect of the movie:
 
 ```python
-import pyarrow as pa, pyarrow.dataset as ds
+import pyarrow as pa
 import quail
 from datasets import concatenate_datasets, load_dataset
 
 imdb = load_dataset("stanfordnlp/imdb")
 all_reviews = concatenate_datasets([imdb["train"], imdb["test"], imdb["unsupervised"]])
-reviews = ds.dataset(pa.table({
-    "id": pa.array(f"review-{i}" for i in range(len(all_reviews))),
+reviews = pa.table({
+    "id": [f"review-{i}" for i in range(len(all_reviews))],
     "body": all_reviews.data.table.column("text"),
-}))
+})
 
 config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
 with quail.Session(config=config) as session:
-    session.register("reviews", quail.DocumentProvider.from_dataset(reviews, id_col="id"))
-    result = session.sql("""
-        SELECT r.id
-        FROM reviews r
-        WHERE AI.IF(PROMPT(
-            'Does this review mention a positive aspect of the movie?\n\n{0}',
-            r.body))
-    """, dialect="bq").run()
-    table = result.collect()
-    print(table)
-```
-
-`session.register()` makes the dataset available under a SQL name.
-`AI.IF` evaluates the prompt on each review. The model returns
-TRUE or FALSE, and Quail returns the rows where the answer is TRUE.
-
-The output is a PyArrow table with the matching rows:
-
-```
-pyarrow.Table
-r.id: string
-----
-r.id: [["review-0","review-3","review-7",...]]
-```
-
-## See the plan and measured cost
-
-Call `explain(analyze=True)` to run the query and print the plan
-together with measured time, token counts, and GPU cost:
-
-```python
-with quail.Session(config=config) as session:
-    session.register("reviews", quail.DocumentProvider.from_dataset(reviews, id_col="id"))
+    session.register("reviews", quail.DocumentProvider.from_table(reviews, id_col="id"))
     query = session.sql("""
         SELECT r.id
         FROM reviews r
         WHERE AI.IF(PROMPT(
-            'Does this review mention a positive aspect of the movie?\n\n{0}',
+            'Does this review mention a positive aspect of the movie? {0}',
             r.body))
     """, dialect="bq")
-    print(query.explain(analyze=True))
+    result = query.run()
+    print(result.collect())
+    print(result.explain())
 ```
 
-The output shows the logical and physical plan, followed by the
-measured totals:
+`register()` makes the table available in SQL. `AI.IF` keeps rows when
+the model answers `TRUE`. `collect()` returns their IDs in a `pyarrow.Table`.
 
-```
-run:
-  query time   52.3 s (model startup excluded)
-  startup      14.1 s (cold)
-  throughput   34,600 documents/second over 100,000 input documents
-  tokens       8,123,456 fresh
-  GPU cost     $0.0574 per query (1 GPU at $3.9492/hour, startup excluded)
-```
+## See the plan and measured cost
 
-The GPU cost line is the query runtime in hours multiplied by the
-number of GPUs and the
-[Modal H100 hourly price](https://modal.com/pricing) (\$3.9492/hour).
-Startup is excluded from both query time and cost. A 100K-document
-filter on Qwen3 4B typically costs a few cents per query.
+The example prints the measured plan with `result.explain()`.
+Use `query.explain()` before `run()` to inspect estimates without
+running the model. `query.explain(analyze=True)` runs the query again.
+
+Read query time and token counts from `result.report`.
+See [Metrics](/docs/user-guide/metrics) to calculate GPU cost.
 
 ## Write more queries
 
-See the [SQL reference](/docs/user-guide/sql) for joins, scores,
-classification, extraction, and the other functions you can use in
-`session.sql()`.
+See the [SQL reference](/docs/user-guide/sql) for other AI functions.
+[Running queries](/docs/user-guide/sessions) covers table registration
+and session reuse.
 
 ## Running on Modal
 
-If you do not have a local GPU, you can run queries on Modal.
-See [No local GPU? Use Modal](/docs/user-guide/models#no-local-gpu-use-modal)
-for how to set up the function, volumes, and caches.
-
-Modal bills per second of GPU time. An H100 costs \$3.9492/hour.
-A single AI filter over 100K documents on Qwen3 4B takes roughly
-a minute of GPU time, so one query costs about \$0.05 to \$0.07.
-Model startup adds 10 to 30 seconds on a cold start; subsequent
-queries on a warm function skip that. Use `explain(analyze=True)`
-to see the exact cost of any query.
+Without a local GPU, use the complete
+[Modal example](/docs/user-guide/models#no-local-gpu-use-modal).

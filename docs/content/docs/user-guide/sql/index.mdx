@@ -2,76 +2,54 @@
 title: SQL reference
 ---
 
-AI-SQL extends standard SQL with functions that call a language model
-during query execution. You can filter rows, join tables, score documents,
-assign labels, and extract answers using natural language instructions.
+DataFusion parses, plans, and runs SQL. Quail runs AI calls on the GPU
+in model regions. Queries without AI calls run in DataFusion.
 
 <Cards>
   <Card title="AI functions" href="/docs/user-guide/sql/ai-functions"
-        description="Filter and join documents, score answers, classify rows, and extract text." />
+        description="Arguments, answers, and limits for each AI function." />
   <Card title="SQL functions" href="/docs/user-guide/sql/sql-functions"
-        description="Text functions, conditions, aggregates, windows, and query clauses." />
+        description="SQL clauses and expressions around AI calls." />
 </Cards>
 
 ## Write a query
 
-For example, suppose you registered a `reviews` table with columns `id`
-and `body`. This query returns IDs of reviews that discuss the movie's
-ending:
+E.g., register a `reviews` table with IDs in `id` and text in `body`.
+This query returns IDs of reviews that discuss the ending:
 
 ```sql
 SELECT r.id
 FROM reviews r
-WHERE AI.IF(PROMPT('Does this review discuss the ending of the movie?\n\n{0}', r.body))
+WHERE AI.IF(PROMPT('Does this review discuss the ending? {0}', r.body));
 ```
 
-The model reads each review and returns TRUE or FALSE. Quail keeps
-the rows where the answer is TRUE.
-
-Quail supports Snowflake and BigQuery syntax:
-
-```python
-session.sql(text, dialect="snowflake")  # AI_FILTER syntax
-session.sql(text, dialect="bq")         # AI.IF syntax
-```
-
-The query above uses the BigQuery dialect (`dialect="bq"`).
+Pass SQL text to `session.sql(text, dialect="bq")` for BigQuery syntax.
+Use `dialect="snowflake"` for Snowflake syntax, the default.
+`AI_FILTER` is the Snowflake spelling of `AI.IF`.
 
 ## SQL around the model's work
 
-Quail runs the operators that call the model, and the operators that
-change how much the model reads: the filters and joins below a model
-call, and a LIMIT or DISTINCT that can stop the model early. Together
-they are one model region. DataFusion runs the rest of the query on
-the region's rows: GROUP BY, HAVING, windows, ORDER BY without a LIMIT,
-and anything else.
+A *model region* contains AI calls and the operators Quail runs with
+them. DataFusion runs the rest of the query.
 
-For example, this query classifies the reviews that pass a filter and
-counts them by label:
+E.g., classify reviews with more than three stars and count each label:
 
-```python
-query = session.sql("""
-    SELECT AI.CLASSIFY(PROMPT('Tone? {0}', r.body), ['good', 'bad']) AS tone,
-           COUNT(*) AS n
-    FROM reviews r
-    WHERE r.stars > 3
-    GROUP BY tone
-    ORDER BY n DESC
-""")
-query.collect()
+```sql
+SELECT AI.CLASSIFY(PROMPT('Tone? {0}', r.body), ['good', 'bad']) AS tone,
+       COUNT(*) AS reviews
+FROM reviews r
+WHERE r.stars > 3
+GROUP BY tone
+ORDER BY reviews DESC;
 ```
 
-The region scans `reviews` with `r.stars > 3` and classifies each
-review. DataFusion groups the labels, counts them, and sorts the
-groups. `query.explain()` shows DataFusion's plan, with the region as
-one `ModelRegion` node, and then the region's plan. `query.plan()` is
-the region's physical plan.
+The model reads only reviews that pass `r.stars > 3`.
+DataFusion groups and sorts the labels that the model region returns.
 
-A query with two model regions, such as a UNION of two AI filters, is
-a `DataFusionQuery`. It has the methods of a `Query`. `plan()` gives
-each region's physical plan, and `explain()` gives DataFusion's plan,
-then each region's.
+`query.explain()` shows the plans.
+`query.plan()` returns one physical plan per model region.
+For a query with several model regions, it returns a tuple of plans.
 
-A CTE or FROM subquery whose body groups or windows rows that a later
-model call reads is computed by DataFusion between two model regions:
-the second region reads its rows as a table named by the CTE.
+Use a [CTE](/docs/user-guide/sql/sql-functions#with) or a `FROM` subquery
+when an AI call needs to read an aggregate or window value.
+DataFusion computes those values before the next model region reads them.

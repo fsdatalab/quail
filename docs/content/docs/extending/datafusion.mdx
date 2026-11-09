@@ -2,102 +2,96 @@
 title: Quail from Rust
 ---
 
-`quail::Session` runs SQL with AI functions from a Rust program. It is
-the same session Python's `quail.Session` runs queries with.
-DataFusion runs every operator outside the model regions. Quail's
-executor, the `quail` Python package, plans and runs each region in a
-Python interpreter embedded in your process.
+Quail adds AI functions to DataFusion through one extension:
+
+- `quail_datafusion::QuailExtension` registers AI functions and optimizer
+  rules. It hands each model region to a `RegionRunner`.
+- `quail::Executor` implements `RegionRunner`. It plans model regions
+  and runs them on Quail's GPU executor through an embedded Python interpreter.
+- `quail::Session` is the shortcut: a DataFusion session with that
+  extension and executor, plus a blocking `sql()` method.
+  Python's `quail.Session` uses it.
+
+DataFusion runs SQL outside model regions. The GPU executor requires
+Python even when the application is Rust.
+
+Use `quail::Session` unless you need to extend an existing DataFusion
+session. E.g., given a DataFusion table provider containing reviews:
 
 ```rust
 use std::sync::Arc;
+use datafusion::arrow::array::RecordBatch;
+use datafusion::catalog::TableProvider;
+use datafusion::common::Result;
 
-let config = quail::EngineConfig::new("qwen3-4b-fp8", "h100-sxm");
-let session = quail::Session::new(&config)?;
-session.register_table("reviews", Arc::new(reviews))?;
-let batches = session.sql(
-    "SELECT r.id FROM reviews r \
-     WHERE AI.IF(PROMPT('Is this review negative? {0}', r.body))",
-)?;
+fn negative_reviews(reviews: Arc<dyn TableProvider>) -> Result<Vec<RecordBatch>> {
+    let config = quail::EngineConfig::new("qwen3-4b-fp8", "h100-sxm");
+    let session = quail::Session::new(&config)?;
+    session.register_table("reviews", reviews)?;
+    session.sql(
+        "SELECT r.id FROM reviews r \
+         WHERE AI.IF(PROMPT('Is this review negative? {0}', r.body))",
+    )
+}
 ```
 
-- `Session::new` starts Python and imports `quail` from the virtual
-  environment `VIRTUAL_ENV` names. Install the package there with
-  `uv pip install quail-engine`.
-- Your program links libpython. Set `PYO3_PYTHON` to the environment's
-  Python when you build, and put its library directory on
-  `LD_LIBRARY_PATH` or the binary's rpath.
-- `sql` blocks until the query finishes, and each model region runs on
-  the calling thread. Call it outside an async runtime, or from
-  `spawn_blocking`.
-- A model region reads a table you register as rows DataFusion scans.
-  Tables registered from Python stay with the Python provider, which
-  keeps their token counts between queries.
+The provider must expose `id` and `body` columns. `Session::sql()` blocks;
+call it outside an async runtime or from `spawn_blocking`.
+
+The embedded interpreter must be able to import `quail`. Install the
+package in the virtual environment selected by `VIRTUAL_ENV`. Build
+with `PYO3_PYTHON` set to its Python executable and make libpython
+available through `LD_LIBRARY_PATH` or the binary's rpath.
 
 ## Quail in your own DataFusion session
 
-`QuailExtension` adds Quail to a DataFusion `SessionState` you already
-have, with a runner of your own for the model regions:
+Register the same extension and executor on your `SessionState`.
+E.g., this function adds Quail to a supplied state:
 
 ```rust
-let state = SessionStateBuilder::new().with_default_features().build();
-let state = QuailExtension::new(runner).register(state)?;
-let context = SessionContext::new_with_state(state);
+use std::sync::Arc;
+use datafusion::common::Result;
+use datafusion::execution::context::SessionState;
+use quail_datafusion::QuailExtension;
+
+fn add_quail(state: SessionState) -> Result<SessionState> {
+    let config = quail::EngineConfig::new("qwen3-4b-fp8", "h100-sxm");
+    let executor = Arc::new(quail::Executor::open(&config)?);
+    QuailExtension::new(executor).register(state)
+}
 ```
 
-`runner` implements `RegionRunner`: it takes one model region, the rows
-of the region's inputs, and an optional row limit, and returns the
-region's rows as a stream of Arrow batches: the id column of each
-table the region reads and the answers. The region runs only the
-model work and the operators it needs; DataFusion joins the tables'
-other columns back on their ids, then runs the sorts, limits,
-aggregates, unnests, and the rest of the SELECT list above
-`ModelRegionExec`. `quail::Session` uses a
-runner that calls Quail's Python executor.
+Use the returned state to create a DataFusion `SessionContext`.
+Its SQL API plans and runs the query as usual.
+
+A different `RegionRunner` can replace `Executor`, such as a test
+implementation. The interface receives a model region and input streams,
+plus a fetch and dynamic-filter hints. It returns Arrow batches of
+model-region rows.
 
 ## What `register` adds
 
-- The AI functions, under their internal names (`ai_filter`,
-  `ai_classify`, ...) and their SQL names (`AI.IF`, `AI.CLASSIFY`,
-  `ai.classify`, ...).
-- One analyzer rule, ahead of the session's own: `lower_ai_calls`
-  turns each AI call in a part of the query Quail plans into an
-  `AiNode`.
-- Quail's optimizer rules among the session's own, before
-  `replace_distinct_aggregate`, so DataFusion's rules optimize the
-  plan around each `AiNode`; and `claim_model_regions` last, which
-  gathers the `AiNode`s and the operators around them into
-  `ModelRegion` nodes. `with_logical_rules` names the rule list
-  instead.
-- A query planner that plans each `ModelRegion` as a
-  `ModelRegionExec`, and each `SharedInput`, a region input that the
-  join above the region reads too, as a `SharedInputExec` that
-  computes its rows once.
+- AI functions under their SQL and internal names.
+- The `lower_ai_calls` analyzer rule before the host's analyzer rules.
+- Quail's logical optimizer rules among DataFusion's, with
+  `claim_model_regions` last.
+- A query planner for `ModelRegionExec` and `SharedInputExec`.
 
-A session with its own `QueryPlanner` calls `register_rules` instead,
-and adds `extension_planner()` to the extension planners its planner
-passes to `DefaultPhysicalPlanner`.
+`with_logical_rules()` selects a rule list explicitly. If the host has
+its own `QueryPlanner`, call `register_rules()` to keep it and add
+`extension_planner()` to its `DefaultPhysicalPlanner` extensions.
 
 ## SQL
 
-`context.sql` plans Quail's SQL; there is no separate entry point.
-`register` adds, beside the AI functions and rules:
+The extension also registers struct field access and regular expression
+function rewrites. In the Snowflake dialect, `REGEXP_LIKE` and `RLIKE`
+match the whole value.
 
-- `StructFieldAccess`, an `ExprPlanner` that plans Snowflake's
-  `value['field']` on a struct, such as `AI.EXTRACT(...)['ends']`, as
-  `get_field`.
-- `SnowflakeRegexpLike`, a `FunctionRewrite` that makes `REGEXP_LIKE`
-  and `RLIKE` match the whole value when the session reads Snowflake
-  SQL, and `regexp_like` under the names `rlike` and `regexp_contains`.
-
-The SQL is DataFusion's: `WHERE` cannot read a `SELECT` alias, so a
-query repeats the AI call, which Quail asks the model once for; and
-`UNNEST` goes in `SELECT`, with DataFusion's `Unnest` above the region.
+DataFusion's SQL rules apply: `WHERE` cannot read a `SELECT` alias, and
+`UNNEST` goes in `SELECT`. Repeat an identical AI call in `WHERE` to reuse
+its answer. See [SQL](/docs/user-guide/sql) for syntax.
 
 ## From datafusion-python
 
-datafusion-python can load UDFs and table providers from another
-library, and a query planner through `datafusion-ffi`'s
-`FFI_QueryPlanner`. It cannot load analyzer or logical optimizer
-rules. A Quail planner for datafusion-python would lower the AI calls
-and claim the regions inside its query planner, after the session's own
-optimizer has run. That is not built yet.
+Use [quail.Session](/docs/user-guide/sessions) from Python. Quail does
+not provide a datafusion-python extension.

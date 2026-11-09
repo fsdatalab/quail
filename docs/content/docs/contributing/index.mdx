@@ -2,157 +2,99 @@
 title: Overview
 ---
 
-Here we explain how to report a bug or submit a change to Quail.
-
 ## Report a bug
 
-If you find a bug, please
-[open an issue](https://github.com/fsdatalab/quail/issues).
-Include:
+[Open an issue](https://github.com/fsdatalab/quail/issues) with:
 
 - A minimal example that reproduces the bug.
 - The expected behavior and what happened.
-- The Quail version or commit. For an inference error, include the model,
-  device, and backend configuration.
+- The Quail version or commit. For an AI call error, include the
+  `EngineConfig`.
 
 ## Prepare the repository
 
-Quail requires Python 3.12 and a Rust toolchain ([rustup](https://rustup.rs)):
-the planner is a Rust module, `_quail_native`, that `uv sync` builds with
-maturin. Clone the repository and install the development dependencies:
+Install [uv](https://docs.astral.sh/uv/) and
+[rustup](https://rustup.rs). Linux x86_64 also requires clang and lld.
+Quail uses Python 3.12.
+
+E.g., clone the repository and build the development installation:
 
 ```bash
 git clone https://github.com/fsdatalab/quail.git
 cd quail
-uv sync --frozen
+tools/build.sh
 ```
 
-The development dependencies include
-[quail-b](https://github.com/fsdatalab/quail-bench).
-You need access to that repository to install them.
-
-`uv sync` builds the module with Cargo's dev profile. The first build
-compiles DataFusion and Arrow, optimized, and takes many minutes; later
-builds recompile only Quail's crates. Each clone or git worktree has its
-own `target/` directory, so each starts with that first build. To share
-one build across worktrees, point Cargo at one target directory, either
-in your shell:
-
-```bash
-export CARGO_TARGET_DIR="$HOME/.cache/quail-target"
-```
-
-or in a Cargo config above your worktrees, such as
-`~/.cargo/config.toml`:
-
-```toml
-[build]
-target-dir = "/Users/you/.cache/quail-target"
-```
-
-Cargo locks the directory, so two worktrees building at once take turns.
+The script runs `uv sync --frozen` with the repository's pinned Rust
+toolchain. Keep the same Cargo home and `target/` directory between
+builds so Cargo can reuse compiled dependencies. See
+[`AGENTS.md`](https://github.com/fsdatalab/quail/blob/main/AGENTS.md#building)
+for build troubleshooting.
 
 ## Make a change
 
-For a new feature or a substantial change, open an issue to discuss the
-approach before implementation.
-Include the tests and documentation needed to check and use your change.
+Discuss substantial changes in an issue before implementation.
+Include tests and documentation with the change.
 
 | Path | Contents |
 | --- | --- |
-| `quail/api/` | `Session`, `Query`, and running a query in this process. |
-| `quail/catalog/` | Table providers and the tokenized inputs of a session. |
-| `crates/quail-planner/`, `quail/physical/` | A region's operators and physical planning (Rust), and physical plan definitions. |
-| `crates/` | SQL parsing and binding on DataFusion, the Rust planner, and the cost model, built into the `_quail_native` module. |
-| `quail/specs/` | Model and device specifications. The cost model is in `crates/quail-cost/`. |
-| `quail/execution/` | The runner and the CPU operators. |
-| `quail/backends/` | The Quail inference engine. |
-| `quail/baselines/` | The stock vLLM backends the benchmark compares against. |
-| `quail/remote/`, `quail/server/` | The client and server of Quail Server. |
-| `quail/deploy/` | The Modal images. |
-| `bench/` | The QUAIL-B runner, outside the wheel. |
-| `tests/`, `experiments/` | CPU tests and Modal GPU scripts. |
-| `docs/`, `demos/` | Documentation and examples. |
+| `quail/api/` | `Session` and `Query` |
+| `quail/catalog/` | Table providers |
+| `crates/quail-datafusion/` | SQL support and model regions in DataFusion |
+| `crates/quail-planner/` | Physical planning |
+| `crates/quail-cost/` | Cost model |
+| `quail/physical/` | Python physical plan definitions |
+| `quail/backends/quail/` | GPU executor |
+| `quail/specs/` | Model and device specifications |
+| `quail/remote/`, `quail/server/` | Quail Server client and server |
+| `tests/`, `experiments/` | CPU tests and GPU experiments |
+| `docs/`, `demos/` | Documentation and examples |
 
-Each package imports only the packages below it in the list in
-`pyproject.toml` under `[tool.importlinter]`; `uv run lint-imports`
-checks that.
-
-The planner runs in Rust: `NativePlanner.plan` reads each region's
-operators, as `crates/quail-datafusion/src/derive.rs` derives them from
-DataFusion's plan, then rewrites, searches, and prices them, for
-Quail's backend and for the request backends. Python reads the plan it returns
-(`quail.physical.plan.plan_from_json`) and runs it.
-`quail.speed_of_light_estimate` calls the Rust estimate with the
-caller's oracles.
-
-`PhysicalPlan` and `Refusal` are in `quail/physical/plan.py`,
-`EngineConfig` in `quail/api/config.py`, and the rule names a registry
-lists in `quail/extensions.py`.
-
-To add an AI operator, add its planning to `crates/quail-planner` and
-its node to `quail/physical`.
-
-For module names, follow the [Google Python naming guidance](https://google.github.io/styleguide/pyguide.html#316-naming).
-Use descriptive `snake_case` names and avoid unfamiliar abbreviations.
-Keep related classes and functions together. Choose the name from the
-module's responsibility, such as `model_loading.py` or `admission.py`.
-
-The Quail backend separates its entry point from lowering and execution:
-
-| Path under `quail/backends/quail/` | Responsibility |
-| --- | --- |
-| `backend.py` | Implement the backend interface and report supported configurations. |
-| `lowering.py` | Lower one candidate and bind its runtime prompts. |
-| `executor/runtime.py` | Bind loaded model and query state, then dispatch execution. |
-| `executor/model_loading.py` | Resolve model files and load weights. |
-| `executor/admission.py` | Admit requests within token and KV budgets. |
-
-See [Architecture](/docs/architecture) for the query execution flow.
-See [Extending Quail](/docs/extending) for the extension interfaces.
+Follow the writing and naming rules in
+[`AGENTS.md`](https://github.com/fsdatalab/quail/blob/main/AGENTS.md).
+See [Architecture](/docs/architecture) for query execution and
+[Extending Quail](/docs/extending) for extension interfaces.
 
 ## Check the change
 
 ### Code checks
 
-Run these commands from the repository root:
+E.g., run the CPU checks from the repository root:
 
 ```bash
-uv run ruff check quail bench tests experiments tools
+uv run ruff check quail bench calibrate tests experiments tools
 uv run python tools/check_long_strings.py
+uv run python tools/check_names.py
 uv run vulture
 uv run lint-imports
-uv run pytest -q
+uv run --no-sync pytest -q
 ```
 
-All four checks must pass before pushing. These checks do not require a GPU.
+Rebuild with `tools/build.sh` after Rust edits. Also run
+`cargo test --workspace --locked`,
+`cargo clippy --workspace --all-targets --locked`, and `cargo fmt --check`.
 
-For changes to model execution, run the relevant GPU tests.
-The script
+For model execution changes, use
 [`experiments/run_gpu_tests.py`](https://github.com/fsdatalab/quail/blob/main/experiments/run_gpu_tests.py)
-runs these tests on Modal.
-For performance changes, use the [benchmark guide](/docs/contributing/benchmark).
+to run the relevant tests on Modal.
+For performance changes, follow the [benchmark guide](/docs/contributing/benchmark).
 
 ### Documentation checks
 
-Install the documentation dependencies and start the site:
+Follow [the writing guide](https://github.com/fsdatalab/quail/blob/main/docs/writing-style.md).
+E.g., install dependencies and start the local site:
 
 ```bash
 pnpm --dir docs install --frozen-lockfile
 pnpm --dir docs dev
 ```
 
-Open [the local site](http://localhost:3000/quail).
-Check the changed pages, then run:
-
-```bash
-pnpm --dir docs types:check
-pnpm --dir docs build
-```
+Check the changed pages at [the local site](http://localhost:3000/quail).
+Then run `pnpm --dir docs types:check` and `pnpm --dir docs build`.
 
 ## Submit a pull request
 
-Describe the problem, what your change does, and why.
-List the checks you ran and their results.
-For a performance change, include the configurations, measurements, and
-saved result paths. State any remaining limitations.
+Explain the problem and how the change fixes it.
+List the checks you ran and their results. State what remains unverified.
+For performance changes, include configurations and measurements with
+links to the saved results.

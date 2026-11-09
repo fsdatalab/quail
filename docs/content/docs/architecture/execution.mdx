@@ -2,357 +2,184 @@
 title: Execution
 ---
 
-Quail executes the operators selected by the physical plan. The CPU
-coordinates their inputs and outputs. The GPU performs model inference.
-
-Quail can ask several questions about a document without processing the
-whole document again for each question. See
-[Physical plans](/docs/architecture/physical-plans) for an example plan.
+Quail's executor runs a physical plan for one model region. The GPU
+computes AI answers; the CPU coordinates operators and tests answer
+columns. DataFusion runs SQL outside the model region.
 
 ## Operator scheduling
 
 ### The runner
 
-The *runner* coordinates the operators in the plan. It runs an operator
-when the operator's required inputs are available.
-
-- Model operators, such as classification, use the GPU.
-- Operations that test computed labels use Apache Arrow on the CPU.
-- Rust builds the region's rows from the operators' outputs: the id
-  column of each table and the answers.
-- DataFusion runs the relational operators above the region, such as
-  ORDER BY, LIMIT, DISTINCT, and GROUP BY, on the region's rows, and
-  joins each table's other columns back on its id. The region hands
-  DataFusion its rows while it runs; see
-  [Streaming the region's rows](#streaming-the-regions-rows).
-- Compatible operators can pass documents to one another before they
-  finish processing the whole input table.
+`GenericRunner` runs an operator when its inputs are available. It can
+combine compatible operators into a pipeline. Each operator returns a
+`NodeResult` with its output values and measurements.
 
 ### Pipelines and batches
 
-A *pipeline* is a group of operators that can pass documents to one
-another before they finish processing the whole input table.
-*KV* is the key and value vectors saved for tokens the model has already
-processed. Quail can keep a document's KV available as it passes through
-the pipeline.
+**Pipelining** passes a document to the next operator without waiting
+for every document to finish. Compatible operators reuse its KV.
 
-For example, imagine a `reviews` table containing review text. A query
-first keeps reviews that discuss the acting, then classifies their
-sentiment, then keeps negative reviews. In a pipeline:
+E.g., a review that passes an `AI.IF` filter can immediately enter a
+classification in the same pipeline. Classification adds its question
+tokens to the saved document KV. A CPU filter then tests the label.
 
-1. A review reaches classification as soon as it passes the first filter.
-2. Classification reuses the review's KV and adds the sentiment question.
-3. The CPU tests the returned label and keeps the review if it is negative.
+A batch can contain requests from different pipeline stages. Each
+forward pass processes the batch's new tokens. **Token-based admission**
+limits new work by:
 
-A *model request* is the model computation needed for one document or
-pair at one stage of execution. A *batch* combines model requests that
-can be processed together. Requests from different pipeline stages can
-share a batch.
+- The token budget: the maximum new token positions in a forward pass.
+- Available KV memory: the space for active documents and their requests.
 
-A *forward pass* processes a batch's new tokens through the model,
-using any saved KV. The CPU prepares the next batch while the GPU
-processes the current batch.
+For paged execution, a document prefix that exceeds the token budget
+can span several forward passes. Quail reserves its KV pages before
+starting. Other documents wait until the shared prefix is complete
+before reading it. A document that cannot fit the KV capacity fails.
 
-Quail limits each batch by token count and available KV memory:
+A set-attention model processes each request as one unpaged sequence;
+the request must fit one forward pass. See
+[supported models](/docs/user-guide/models) for model-specific behavior.
 
-- The *token budget* limits how many new token positions a forward pass
-  can process. Shorter requests allow more documents to fit in a batch.
-- The *KV budget* limits the GPU memory used for saved KV. Long documents
-  can fill that memory before the token budget is reached.
-
-A document whose prefix and first request exceed the token budget is
-written over several forward passes, as vLLM's chunked prefill does. It
-reserves its KV pages when admitted, and each pass writes the next piece
-of its prefix into those pages, reading the pieces before it. Its first
-request runs in the pass after the last piece. Documents that borrow its
-prefix wait for that pass. On a hybrid model each piece starts from the
-recurrent state the previous piece saved. Only a document whose KV does
-not fit the whole KV budget fails, with an error that names it. A model
-under set attention runs every request as one unpaged sequence, so a
-document there must fit one forward pass.
-
-An operator that requires all its input rows ends a pipeline. Later
-operators wait until those rows are available.
-
-On one GPU, a `RegionExecution` runs each pipeline, and each model
-operator alone, through the same loop. Each physical node, or group of
-consecutive nodes of one kind, is a `ModelOperator`. The region pushes
-documents into the first operator. When a document leaves an
-operator's stages, the region settles it there; a kept document goes
-on to the next operator. After each forward pass the region takes the
-rows each operator finished. Once the loop ends, it closes each
-operator, which returns its nodes' results. A score of pairs and
-extractions alone use their own prompt layout. Every other chain reads
-one document table: the first node's prompt head with each document,
-keyed by alias and document id, under one prefix tree.
-
-Under set attention each request is a *pass*: one unpaged sequence of
-a state, a document and the text after it, then the questions asked of
-it. A `SetChain` runs each step (a pass group, a join, or a
-classification of a join's pairs) as one `StageExecutor` over the
-step's passes, which asks each pass at its own stage only. A step runs
-once the step before it has answered, because a step asks only the
-rows the steps before it kept.
+An operator that requires all its input rows ends a pipeline.
 
 ### Reading the region's input
 
-`ModelRegionExec` reads every row of each input the region reads, then
-plans the region once over all of them and runs that plan once. The
-planner sees every document's length, and KV and prefix sharing span
-the whole input. For example, a score over 200,000 reviews is one plan
-and one run over 200,000 rows, not four runs of 65,536 rows or fewer.
-
-A region starts once each of its inputs has ended, so a region whose
-input is another region's rows runs after that region has finished, on
-the same thread.
+Quail reads each input to its end before planning the model region.
+The planner measures all document lengths and shared prefixes, rather
+than planning each Arrow batch separately. A model region that reads
+another region's rows waits for that input to finish.
 
 ### Streaming the region's rows
 
-A row of the region is final once the region's last step, one operator
-or one pipeline, has produced it. Every earlier step has finished by
-then. So the runner sends rows on as the last step reports them:
+Operators report completed rows to `FinishedRows`. Quail constructs a
+model-region row once every operator that contributes to it has
+reported its part. Quail sends each completed row to DataFusion once.
 
-- A filter, score, or classification that is the last step reports
-  each forward pass's finished documents. Rust builds those documents'
-  rows from the last step's outputs for them and the earlier steps'
-  whole outputs, and `ModelRegionExec` hands them to DataFusion at once.
-- A join reports each anchor's true pairs once they are answered. A
-  lone anti-join reports each anchor that matched nothing once it
-  settles, and a classification of a join's pairs reports each
-  anchor's pairs once it settles.
-- Under set attention each step of a pipeline reports its rows when
-  the step finishes, while later steps run.
-- Any other last step, such as an extraction, a map, or an operator
-  with a guard, sends its rows when it finishes.
-- A region with a fetch sends its rows once every row is in, so Rust
-  can keep its first rows.
-- A row is sent once: when the step finishes, the runner sends only
-  the rows it has not sent.
+Reporting frequency depends on the operator. Some report after each
+forward pass; others report when they finish. Guards and document
+deduplication delay reports until Quail restores the original row IDs.
+DataFusion can process completed rows while the GPU continues.
 
-For example, imagine `SELECT r.id, AI.SCORE(...) AS score FROM reviews
-r ORDER BY score DESC LIMIT 25`. DataFusion's top-k sort reads each
-forward pass's scored reviews while the GPU scores the next ones.
-
-The thread that called DataFusion runs each region, as before, and
-DataFusion's workers run the operators above it, so they read the
-region's rows while the region runs. Rows come in the order they
-finish. Only an ORDER BY sets the order of the result.
+Only `ORDER BY` sets the result order. A region's fetch keeps the first
+rows Quail constructs. See
+[FinishedRows](https://github.com/fsdatalab/quail/blob/main/crates/quail/src/finished.rs).
 
 ## Query operations
 
 ### Filters
 
-A model filter can ask several TRUE or FALSE questions about each document.
-Quail processes the document and the first question together. A document
-that fails a question stops there. A document that passes continues to the
-next question.
-
-After each answer, Quail removes the question's KV and keeps the document's
-KV. Removing the added KV while keeping the document's KV is called
-*KV rewind*. The next question reuses the document's KV.
-
-A passing document can reach a later operator in the same pipeline without
-waiting for the filter to finish over the rest of the table.
-See [KV](/docs/architecture/kv) for how Quail stores and reuses KV.
+An `AI.IF` filter asks TRUE or FALSE questions. A document that fails
+stops; a document that passes can continue to the next question.
+**KV rewind** removes the question's KV while preserving the document's
+KV for reuse. See [KV](/docs/architecture/kv).
 
 ### Joins
 
-A model join evaluates a question about a pair of documents. The planner
-chooses one side as the *anchor*, whose document KV remains available
-while Quail evaluates documents from the other side. A document from the
-other side is a *partner*.
+A join asks about a pair of documents. The planner chooses an **anchor**
+whose KV stays available while Quail evaluates **partners** from the
+other table.
 
-For example, imagine joining a `reviews` table with an `aspects` table.
-Each aspect describes a subject such as acting or plot. The join asks
-whether each review discusses each aspect. If reviews are the anchors,
-Quail processes a review and the fixed join instructions once, then reuses
-that KV when evaluating its aspects. The result contains review and
-aspect pairs for which the model answers TRUE.
+E.g., when joining reviews to aspects, a review can be the anchor.
+Quail processes the review once, then adds each aspect's tokens to ask
+whether the review discusses it. The join keeps pairs that answer TRUE.
 
-Several partners can be evaluated in the same batch. Each partner uses
-the anchor's KV and its own tokens. Partners do not use one another's tokens.
-
-An anchor that passes a filter in the same pipeline can enter the join
-with its document KV already available. A later join can also reuse that
-KV if the plan keeps it. See [KV retention](/docs/architecture/kv#kv-retention).
+Several partners can share a batch. They read the anchor's KV, not one
+another's tokens. A compatible filter before the join can supply anchor
+KV. [KV retention](/docs/architecture/kv#kv-retention) can preserve it
+for later joins.
 
 ### Evaluation on partial answers
 
-A map or an extraction writes its answer one token at a time. When the
-region tests that answer, Quail decides the test on the tokens decoded
-so far and stops the answer once the test is settled.
+Quail can stop a map or extraction before it completes an answer when
+a filter's outcome cannot change:
 
-- `w` is the answer's text so far.
-- `C(w)` is the set of complete answers still possible. A map's answer
-  goes on with any text within its answer limit. An extraction copies a
-  span of its document, so its answer goes on only with the text that
-  follows a place where the document holds `w`. Before its first token,
-  an extraction may still answer NULL, which means it found nothing.
-- A test is *decided TRUE* at `w` when it is TRUE for every answer in
-  `C(w)`, and *decided not TRUE* when it is FALSE or NULL for every one.
-  Otherwise it is *undecided*. Undecided is a state of the executor, not
-  a NULL.
+- Reject the row when every possible completion makes a test FALSE or NULL.
+- Keep the row when every exact test must be TRUE, but stop the answer
+  only if nothing else reads it.
+- Otherwise, continue the answer. An undecided test is not SQL NULL.
 
-The physical rule `should_stop_answers_early` gives each map and
-extraction the region's exact tests that read its answer alone. The
-executor stops an answer, and frees its KV, once one of them, or one of
-the node's hint tests (R3), is decided not TRUE: the region would drop
-the row. When nothing else reads the answer, it also stops once every
-exact test is decided TRUE: the region keeps the row whatever the rest
-of the answer says. The answer keeps its text so far, which is itself
-in `C(w)`, so the region's filter gives it the value it was decided to
-have.
+E.g., for a registered `reviews` table with `id` and `body` columns:
 
-For example, imagine `SELECT r.id FROM reviews r WHERE
-LEFT(AI.MAP(r.body, 'Is it kind?'), 3) = 'yes'`. An answer that starts
-with `n` is decided not TRUE after one token. An answer that starts
-with `yes` is decided TRUE after it, and the map stops there, since the
-SELECT list does not read the answer.
+```sql
+SELECT r.id
+FROM reviews r
+WHERE LEFT(AI.MAP(r.body, 'Is the review kind? Answer yes or no.'), 3) = 'yes';
+```
 
-The decision runs in Rust, on DataFusion's expression of the test
-(`crates/quail-datafusion/src/partial.rs`). It reads these shapes of
-the answer `a` with literals, and AND, OR, NOT, and `IS [NOT] TRUE` or
-`FALSE` of them:
+An answer starting with `n` cannot pass. An answer starting with `yes`
+already passes, and this query does not need the remaining text.
 
-- `a LIKE 'x%'`, `a LIKE 'x'`, `STARTS_WITH(a, 'x')`,
-  `LEFT(a, k) = 'x'`, and `SUBSTR(a, 1, k) = 'x'`;
-- `a = 'x'`, `a <> 'x'`, and `a IN ('x', ...)`;
-- `a IS NULL` and `a IS NOT NULL`;
-- `LENGTH(a)` or `CHARACTER_LENGTH(a)` compared with an integer.
+Quail recognizes literal prefix tests and comparisons with answer text.
+It also handles null tests and integer comparisons with answer length.
+It combines these through SQL boolean operators. Unsupported expressions
+wait for the complete answer. An extraction's possible completions must
+continue a span of its document.
 
-The executor does not bound how many characters a map's remaining
-tokens may add, so a length test of a map's answer is decided only once
-the text so far passes the bound, or once the answer ends. Any other part stays
-undecided until the answer is complete, and the
-region's filter then tests the answer as usual. Parts are decided one at
-a time, so a test that reads the answer twice may be decided later than
-it could be, never wrongly. A classification needs none of this: it
-scores its labels. A test of an AI.SCORE needs an upper bound on the
-score, which Quail does not compute yet.
+See [partial.rs](https://github.com/fsdatalab/quail/blob/main/crates/quail-datafusion/src/partial.rs)
+for supported expression forms.
 
 ### Classification
 
-Classification assigns one of the supplied labels to each input row.
-It can run in a pipeline and reuse document KV from preceding operators.
-The selected scoring method determines whether classification needs one
-or several forward passes.
+Classification can reuse document KV from earlier operators in a
+compatible pipeline. Its scoring method determines how it evaluates labels.
 
 #### Label scoring
 
-*Label scoring* determines how the model selects one of the supplied
-classification labels. For Qwen3 generative models, the
-[optimizer selects a method](/docs/architecture/optimizer#label-scoring)
-using estimated GPU time. The methods can return different labels because
-they score the choices differently.
+The planner compares supported methods using estimated GPU time.
+Methods can return different labels because they score choices differently.
 
-For example, imagine classifying customer messages as `refund` or `praise`.
-The generative models can select between these labels in three ways:
-
-| Method | How it selects a label | Requirement |
+| Method | Label selection | Requirement |
 | --- | --- | --- |
-| `letters` | Give each label a distinct letter in the prompt, then compare the model's scores for those letters. | Each letter must be one token. |
-| `trie_tree` | Score each label's token sequence and choose the highest sequence probability. Labels with common starting tokens share computation. | [Tree attention](#attention-paths) must be available. |
-| `trie_decode` | Choose the allowed token with the highest score at each step until a label is complete. Only tokens that continue a supplied label are allowed. | No label's token sequence can be the start of another label's token sequence. |
+| `letters` | Score one letter per label. | Each letter is one token. |
+| `trie_tree` | Score all label token sequences and choose the highest sequence probability. | Tree attention is available. |
+| `trie_decode` | Choose the highest-scoring allowed token at each step. | No label token sequence starts another; no extra answer positions or requested probabilities. |
 
-A *trie* is a tree of token sequences in which common starting tokens are
-stored together. `trie_tree` evaluates every label sequence.
-`trie_decode` follows one sequence, so it can choose a different label
-from the one with the highest probability for its complete sequence.
-
-For example, suppose `refund` has two tokens. The first has probability
-0.8, and the second has probability 0.6 after the first. The sequence
-probability is 0.48. If the single token label `praise` has probability
-0.3, `trie_tree` selects `refund`.
-
-Additional requirements apply:
-
-- `trie_decode` requires a model without extra answer positions and a
-  classification that does not reuse document KV from an earlier operator.
-- Requesting probabilities excludes `trie_decode`, because it does not
-  score every label.
-- Classifications of joined pairs use `letters` for generative models.
-- DiffusionGemma uses `letters` with its extra answer positions. See
-  [DiffusionGemma](/docs/user-guide/models#diffusiongemma) for configuration.
-
-Decision 2.0 Kai uses `decision_choice`. It scores each supplied label
-as an option and selects the option with the highest score. The model
-processes all options in one request. It can also return label
-probabilities for classifications of individual documents.
+A trie stores common starting tokens together. `trie_decode` follows
+one sequence, so it need not select the most probable complete label.
+Model-specific methods include `decision_choice` and `set_choice`;
+see [models](/docs/user-guide/models).
 
 #### Classifying joined rows
 
-Classification can also read both documents of a joined pair. It runs
-in the join's pipeline, on one GPU, and classifies only pairs that the
-join kept. It reuses the anchor's KV when processing each pair.
+A classification can read both documents of a joined pair. It evaluates
+only pairs the join keeps and can reuse the anchor's KV. Generative
+pair classification uses `letters`.
 
 ## GPU execution
 
 ### Attention paths
 
-During *attention*, the model combines information from the current token
-and earlier tokens. A *prefix* is the token sequence at the start of a
-request. Quail supports two attention paths for filters and joins:
+A prefix is the token sequence at the start of a request. Quail supports
+two attention paths:
 
-- *Unified attention* processes a request's saved prefix and new tokens
-  in one attention call.
-- *Tree attention* processes shared prefixes in one call and each
-  request's own tokens in another. Quail combines the two results.
+- **Unified attention** processes saved prefix KV and new tokens in one call.
+- **Tree attention** processes shared prefixes separately from each request's
+  own tokens, then combines the partial values.
 
-Tree attention groups requests that use the same saved KV. Grouping can
-reduce memory reads, but the additional call and combination take time.
-The [planner compares those costs](/docs/architecture/optimizer#attention-path)
-when choosing a path.
-
-Tree attention supports BF16 and FP8 weights. Quail enables it for models
-with at least two billion parameters, excluding embeddings and output
-layers. Smaller models use unified attention. DiffusionGemma also uses
-unified attention because it requires extra answer positions. See
-[Supported models](/docs/user-guide/models).
+Tree attention can reduce repeated KV reads, but its extra call and
+combination take time. The planner [compares these costs](/docs/architecture/optimizer#attention-path).
+It permits tree attention for models with at least two billion dense
+parameters, no recurrent state layers, and no extra answer positions.
 
 ### Multiple GPUs
 
-On several GPUs, a region runs as *stages*, with one DataFusion
-partition per GPU. A stage is a run of operators whose rows are spread
-over the GPUs by the ids of one table, the stage's *key*: partition p
-runs on GPU p, over the rows whose key id hashes to p. Each document's
-question, and each pair's, is asked once, on one GPU.
+Quail supports up to eight GPUs on one host. Each GPU holds a complete
+model copy; Quail does not divide weights between GPUs.
 
-- A table's filters run in the stage of the join anchored on it, so a
-  surviving anchor enters the join with its KV on the GPU that read it.
-- A partner's filters are a stage of their own. Their survivors go
-  whole to every partition of the join's stage once that stage has
-  finished.
-- A `Barrier` starts a stage keyed by the next anchor. It reads the
-  join answers so far whole, and the next anchors hashed by their ids,
-  so an anchor whose filter kept its KV reaches the GPU that holds it.
-- A table with a stop key, or with copies of one text, is hashed by
-  the smallest id it is grouped with, so a per-key stop sees its whole
-  group and a text is asked once.
+The planner divides a model region into **stages**, with one DataFusion
+partition per GPU. Each stage uses one table's document IDs as its key.
+DataFusion hashes those IDs to assign rows to GPUs.
 
-DataFusion moves the rows between stages. A hashed input goes through a
-`RepartitionExec` on the key's ids; a whole input goes through a
-`CoalescePartitionsExec`, collected once. A stage's partition starts
-once its inputs have ended. Each GPU has its own process, which holds
-every document, the model, and the GPU's KV for the region; Rust sends
-it a stage's input rows and reads back the rows the stage writes, as
-Arrow IPC over a Unix socket.
+- Filters run with the join anchored on their table, so surviving
+  anchors keep their KV on the same GPU.
+- Partner filters run in separate stages. Their surviving rows go to
+  every partition that needs them.
+- A `Barrier` starts a stage keyed by the next anchor. DataFusion moves
+  rows between stages; a stage starts after its inputs finish.
+- Documents with identical text or the same per-key stop group stay
+  together when partitioning requires it.
 
-For example, FEV-9 filters claims c1 and c2 and evidence e1 and e2,
-joins e1 with c1 and with c2, then joins c2 with e2. On two GPUs it
-runs five stages:
-
-| Stage key | Operators | Inputs |
-|---|---|---|
-| c1 | c1's filter | c1, hashed |
-| e1 | e1's filter and both joins with e1 | e1 hashed; c1's and c2's survivors whole |
-| c2 | c2's filter, which keeps its survivors' KV | c2, hashed |
-| e2 | e2's filter | e2, hashed |
-| c2 | the barrier and the join of c2 with e2 | c2's survivors hashed; the join answers and e2's survivors whole |
-
-Hashing balances document counts, not tokens. Stages ready at once on
-one GPU run one after the other, not in the same forward passes. A LIMIT
-without ORDER BY stops each GPU at the limit, so a run may ask more
-documents than one GPU would, and may return other rows.
-
-Quail supports up to eight GPUs on one host. Each GPU holds all model
-weights; the weights are not divided between GPUs.
+Hashing balances document counts, not token counts. Ready stages on
+one GPU run sequentially. With a limit, each GPU can admit documents
+before other GPUs reach that limit, so multiple GPUs can ask more
+questions than one GPU. Without `ORDER BY`, they can return different
+qualifying rows.

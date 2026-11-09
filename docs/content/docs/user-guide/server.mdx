@@ -2,48 +2,35 @@
 title: Quail Server
 ---
 
-Quail provides an HTTP server for submitting SQL queries and retrieving
-results. You can connect with the Python `Session` API.
+Quail Server accepts SQL over HTTP. Submit queries through the Python
+`Session` API and retrieve them later by ID.
 
 ## Start the server
 
-On a machine with a [supported GPU](/docs/user-guide/models), install
-Quail with the `server` extra and start it:
+On a machine with a [supported GPU](/docs/user-guide/models):
 
 ```bash
 uv pip install "quail-engine[server]"
 quail-server
 ```
 
-The server listens on `127.0.0.1:8642` and uses GPU 0 by default.
-It saves inputs and results in `~/.quail/server`.
-The first query loads its model. Later queries can reuse it.
-
-Use `quail-server --help` to see the configuration options.
+Defaults: `127.0.0.1:8642`, one GPU, and data in `~/.quail/server`.
+The first query loads its model; later queries can reuse it.
+Use `quail-server --help` for configuration options.
 
 ### Connect from another machine
 
-To connect from another machine, set an access token and start the
-server with `--host 0.0.0.0`:
+Set `QUAIL_SERVER_TOKEN` to an access token on both machines.
+Start the server with `quail-server --host 0.0.0.0`.
 
-```bash
-export QUAIL_SERVER_TOKEN='replace-with-your-token'
-quail-server --host 0.0.0.0
-```
-
-Set the same `QUAIL_SERVER_TOKEN` on the machine running your Python
-program.
-
-Use `http://<host>:8642` on a trusted private network. On an untrusted
-network, use an HTTPS reverse proxy to encrypt the token and query data.
+Use `http://<host>:8642` only on a trusted private network.
+On an untrusted network, use an HTTPS reverse proxy to encrypt the token
+and query data.
 
 ## Submit a query
 
-Install `quail-engine` on the machine running your Python program.
-Pass the server URL as `endpoint` when you create a session.
-
-For example, the table below has movie review IDs in `id` and text in
-`body`. The query selects reviews that discuss the movie's ending:
+Install `quail-engine` on the client and pass the server URL as `endpoint`.
+E.g., submit a filter over two reviews:
 
 ```python
 import pyarrow as pa
@@ -57,10 +44,7 @@ config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
 endpoint = "http://127.0.0.1:8642"
 
 with quail.Session(config=config, endpoint=endpoint) as session:
-    session.register(
-        "reviews",
-        quail.DocumentProvider.from_table(reviews, id_col="id"),
-    )
+    session.register("reviews", quail.DocumentProvider.from_table(reviews, id_col="id"))
     query = session.sql("""
         SELECT r.id
         FROM reviews r
@@ -68,45 +52,43 @@ with quail.Session(config=config, endpoint=endpoint) as session:
     """, dialect="bq")
     run = query.submit()
     print(run.id)
-
     for status in run.watch():
         print(status.state)
-
     result = run.result()
     print(result.collect().to_pydict())
 ```
 
-`submit()` returns after the server saves the query. Save `run.id`
-to retrieve it later. `run.result()` waits for completion and downloads
-the result.
-
-Use `query.collect()` instead if you only need the rows and want to wait
-for them.
+`submit()` returns after the server saves the query. Save `run.id`.
+The query continues after the client exits.
+`run.result()` waits for completion and downloads the result.
+Use `query.collect()` when you only need rows and want to wait for them.
 
 ### Send input tables
 
-Quail uploads tables registered with `from_table`, `from_parquet`,
-`from_ipc`, or `from_dataset`. Identical files are uploaded only once.
-For `from_hf`, the server downloads the dataset at the commit selected
-when you register it.
-
-Server sessions accept SQL queries and these table providers.
-Custom providers and edited plans require a local session.
+- Quail uploads `from_table`, `from_parquet`, `from_ipc`, and
+  `from_dataset` inputs. It uploads identical files only once.
+- For `from_hf`, the server downloads the Hugging Face data at the commit
+  selected during registration.
+- Custom providers and edited physical plans require a local session.
 
 ## Inspect a query
 
 ### Read its status
 
-Use `run.status()` for the current status or `run.watch()` for updates,
-as shown above. A query passes through `queued`, `planning`, and `running`.
-It ends as `succeeded`, `failed`, `interrupted`, or `cancelled`.
+`run.status()` returns the current status. `run.watch()` yields updates.
 
-The status includes `phase` with a description of the current activity
-and `progress` with execution counts. Either can be `None` before an update.
+| States | Meaning |
+| --- | --- |
+| `queued`, `planning`, `running` | The query has not finished. |
+| `succeeded` | Results are available. |
+| `failed`, `interrupted`, `cancelled` | The query ended without a result. |
+
+`status.phase` describes the current activity. `status.progress` holds
+execution counts. Either can be `None` before an update.
 
 ### Read its plan and metrics
 
-Read the plan after the server finishes planning:
+E.g., inspect the plan after planning finishes:
 
 ```python
 status = run.status()
@@ -114,80 +96,62 @@ if status.plan is not None:
     print(status.plan["text"])
 ```
 
-After execution, read the measured plan and report:
-
-```python
-result = run.result()
-print(result.explain())
-print(result.report)
-```
-
-`query.explain()` is unavailable on a server session. See
-[Query results and plans](/docs/user-guide/results) to read the plan
-and [Metrics](/docs/user-guide/metrics) for report fields.
+After execution, use `result.explain()` and `result.report`.
+`query.explain()` is unavailable on a server session.
+See [Query results and plans](/docs/user-guide/results) and
+[Metrics](/docs/user-guide/metrics).
 
 ### Inspect it in a browser
 
-Open `http://<host>:8642/` to list recent queries. Open
-`http://<host>:8642/queries/<query_id>` to inspect one query's status,
-progress, plan, errors, and the first 20 result rows.
-The page updates while the query runs.
-
-If you set `QUAIL_SERVER_TOKEN` when starting the server, enter the same
-token when the browser page asks for it.
+Open `http://<host>:8642/` to list recent queries.
+Open `http://<host>:8642/queries/<query_id>` for one query's plan and status,
+including a preview of its first 20 result rows.
+Enter `QUAIL_SERVER_TOKEN` when the page asks for it.
 
 ## Reconnect to a query
 
-Create another session with the same endpoint and retrieve the query
-using its saved ID. You do not need to register the tables again:
+E.g., reconnect with the ID from the submission above. Table registration
+is not necessary:
 
 ```python
+query_id = run.id
 with quail.Session(config=config, endpoint=endpoint) as session:
-    run = session.get_run("<saved-query-id>")
-    result = run.result()
-    print(result.collect().to_pydict())
+    saved = session.get_run(query_id)
+    print(saved.result().collect().to_pydict())
 ```
 
-You can set `query_id` in `submit()` if you need to retry a submission
-after losing its response. The same ID returns the existing query only
-if the SQL, inputs, configuration, and timeout match. Otherwise, the
-server raises `QueryIdConflictError`.
+To retry a submission after losing the HTTP reply, reuse its `query_id`
+in `submit()`. The server returns the existing query only if its SQL,
+inputs, configuration, and timeout match. Otherwise it reports
+`QueryIdConflictError`.
 
 ## Stop a query or handle a failure
 
-Call `run.cancel()` to cancel a query.
-
-Set `timeout_s` in `submit()` to limit execution time. The timer starts
-when the query leaves the queue. The default is 1,000 seconds.
-Use `quail-server --help` to see the timeout settings.
-
-If the query ends without success, `run.result()` raises `QueryFailedError`.
-Read `run.status().error` for the reason.
+- Call `run.cancel()` to cancel.
+- Set `timeout_s` in `submit()` to limit time after the query leaves
+  the queue. The default is 1,000 seconds.
+- If the query does not succeed, `run.result()` raises `QueryFailedError`.
+  Read `run.status().error` for the reason.
 
 After a server restart, queued queries resume. Queries that were planning
-or running become `interrupted` and must be submitted again with a new ID.
+or running become `interrupted`; submit them again with a new ID.
 Keep the server data directory to retain completed results.
 
 ## Run the server on Modal
 
-Use a repository checkout and an authenticated Modal CLI to deploy
-Quail Server on one H100 in the `quail-engine` app.
-
-Create the access token secret before deployment:
+From a repository checkout with an authenticated Modal CLI, create the
+`quail-server-token` secret with `QUAIL_SERVER_TOKEN`. Include `HF_TOKEN`
+if the server needs gated model weights. Then deploy:
 
 ```bash
-modal secret create quail-server-token QUAIL_SERVER_TOKEN='replace-with-your-token'
 modal deploy -m quail.server.modal_app 2>&1 | tee server-deploy.log
 ```
 
-Set the same `QUAIL_SERVER_TOKEN` in your Python program's environment.
-Pass the endpoint URL printed by `modal deploy` to `Session`.
-For DiffusionGemma, include `HF_TOKEN` in the secret so the server can
-download its weights.
+The default deployment uses one H100 in the `quail-engine` app.
+Pass the printed endpoint URL to `Session` and set the same
+`QUAIL_SERVER_TOKEN` on the client.
 
-Inputs and results are saved on the `quail-results` volume under
-`/results/quail-server/`. After a restart, query status is restored from
-the latest saved database copy. Recent updates can be lost.
-
-The container stops after 15 idle minutes. The next request starts
-another container, and its first query loads the model again.
+Inputs and results live on `quail-results` under `/results/quail-server/`.
+A restart restores the latest saved database copy; recent status updates
+can be lost. The container stops after 15 idle minutes.
+Its replacement loads the model on the next query.

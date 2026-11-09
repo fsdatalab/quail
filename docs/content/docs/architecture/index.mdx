@@ -2,48 +2,28 @@
 title: Overview
 ---
 
-Quail converts a SQL query into a plan, executes the plan, and
-returns the results. A plan describes the operations needed to answer
-the query.
+DataFusion parses, plans, and runs SQL. Quail plans and runs each
+**model region**: the AI calls and the operators that run with them
+on the GPU.
 
 ## How Quail executes a query
 
-For example, imagine a `reviews` table with review identifiers in `id`
-and review text in `body`. A query classifies each review as positive or
-negative and returns the identifiers and labels of negative reviews.
-Quail processes this query in five steps:
+1. **Build the logical plan.** DataFusion binds the SQL. Quail represents
+   each AI call with an `AiNode` in that plan.
+2. **Apply optimizer rules.** DataFusion and Quail rewrite the plan.
+   Quail then groups AI calls and their required operators into model regions.
+3. **Choose a physical plan for each model region.** Quail's planner
+   compares operator orders and GPU settings using estimated GPU time.
+4. **Run the query.** DataFusion supplies each model region's inputs.
+   Quail returns the region's rows to DataFusion for the remaining SQL
+   operations.
+5. **Read the results.** `query.run()` returns a `QueryResult`.
+   `result.collect()` returns its rows as an Arrow table.
 
-<Mermaid minWidth={720} chart={`%%{init: {"flowchart": {"rankSpacing": 20, "nodeSpacing": 15, "padding": 10}}}%%
-flowchart LR
-    logical["Build logical plan"]
-    optimize["Optimize plan"]
-    physical["Build physical plan"]
-    execute["Execute plan"]
-    collect["Collect rows"]
-    logical --> optimize --> physical --> execute --> collect
-`} />
-
-1. **Build the logical plan.** The logical plan describes the requested
-   operations and their inputs. For this query, those operations are
-   classification, filtering by label, and selecting result columns.
-   See [Logical plans](/docs/architecture/logical-plans).
-2. **Optimize the plan.** The optimizer applies rules that remove
-   unnecessary work or compare ways to execute the query. When a rule
-   compares execution time, it uses an estimate of GPU time.
-   See [Optimizer](/docs/architecture/optimizer) for the rules and estimates.
-3. **Build the physical plan.** The physical plan selects the operators
-   that will execute the query and records their settings. An operator
-   performs one part of the query. For this query, separate operators
-   identify the input reviews, classify them, test their labels, and
-   select the result columns. See [Physical plans](/docs/architecture/physical-plans).
-4. **Execute the plan.** Quail runs each operator when its input is
-   available. The model classifies the reviews on the GPU. The CPU tests
-   the labels and selects result columns. See
-   [Execution](/docs/architecture/execution).
-5. **Read the results.** Execution returns a `QueryResult` with timing
-   and token counts. Calling `collect()` reads its result rows into an
-   Arrow table. In this example, each result row contains a review
-   identifier and the label `negative`. See [Results](/docs/user-guide/results).
-
-For how Quail stores and reuses model data in GPU memory, see
-[KV](/docs/architecture/kv).
+| Read about | Page |
+| --- | --- |
+| AI calls in DataFusion's plan | [Logical plans](/docs/architecture/logical-plans) |
+| Plan search and cost estimates | [Optimizer](/docs/architecture/optimizer) |
+| Model-region operators and settings | [Physical plans](/docs/architecture/physical-plans) |
+| Scheduling and GPU batches | [Execution](/docs/architecture/execution) |
+| Reusing attention key-value state | [KV](/docs/architecture/kv) |

@@ -2,7 +2,8 @@
 title: Supported models and GPUs
 ---
 
-Set `model` to the model you want to run and `device` to your GPU type.
+Set `model` and `device` in `EngineConfig`. Each model copy must fit
+on one GPU.
 
 ## Models
 
@@ -24,22 +25,11 @@ Set `model` to the model you want to run and `device` to your GPU type.
 | d1-2B, FP8 weights | `"d1-2b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT` |
 | Qwen3.5 2B Base with Qwen-Scope SAE | `"qwen3.5-2b-sae-bf16"` | BF16 | `AI.SAE_FEATURES` |
 
-*FP8* is an 8 bit floating point format. *BF16* is a 16 bit floating point
-format. All listed models store KV in BF16.
+Models that support `AI.EXTRACT` also support `AI.EXTRACT_SPAN`.
+FP8 uses 8-bit floating point weights; BF16 uses 16-bit floating point.
 
-Caveats for d1-2B:
-
-- No `AI.MAP`.
-- `AI.SCORE` over one table only.
-- Joins cost more tokens than on Qwen3.
-- Answers can shift when questions share a pass.
-- `"d1-2b-fp8"` is quantized by Quail at load, not by Liquid; check its answers.
-
-`AI.IF` supports filters and joins. `AI.SCORE` returns a score, and
-`AI.CLASSIFY` assigns a label. `AI.EXTRACT` copies an answer from a
-document, and `AI.MAP` writes one. `AI.SAE_FEATURES` returns the sparse
-autoencoder features of a prompt. See the
-[SQL reference](/docs/user-guide/sql) for examples.
+For d1-2B, `AI.SCORE` reads one table only. Quail quantizes the
+`d1-2b-fp8` weights at load time; Liquid does not publish this FP8 checkpoint.
 
 ## GPUs
 
@@ -50,11 +40,12 @@ autoencoder features of a prompt. See the
 | NVIDIA B200 | `"b200"` |
 | NVIDIA RTX PRO 6000 Blackwell Server Edition | `"rtx-pro-6000-blackwell-server"` |
 
-L40S does not support DiffusionGemma, Qwen3.5, or Qwen3.8.
+L40S does not support DiffusionGemma or the Qwen3.5, Qwen3.6, and
+Qwen3.8 models. Planning also checks whether the model fits in GPU memory.
 
 ## Configure a session
 
-For example, to run Qwen3 4B on one H100 SXM:
+E.g., configure Qwen3 4B on one H100 SXM:
 
 ```python
 import quail
@@ -62,114 +53,63 @@ import quail
 config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
 ```
 
-Pass `config` to `quail.Session`. Quail downloads the model weights
-when they are not already available.
+Pass `config` to `quail.Session`. Quail downloads missing model files.
 
 ### Use multiple GPUs
 
-Set `gpus` to 1, 2, 4, or 8 GPUs on one machine. The default is one.
-Each GPU holds a complete model copy and processes part of the input.
-Quail does not split a model's weights across GPUs.
-
-```python
-config = quail.EngineConfig(
-    model="qwen3-4b-fp8",
-    device="h100-sxm",
-    gpus=4,
-)
-```
+Set `gpus` to 1, 2, 4, or 8 on one machine. The default is 1.
+Each GPU holds a complete model copy; Quail does not split its weights.
+E.g., add `gpus=4` to the configuration above.
 
 ## DiffusionGemma
 
-DiffusionGemma uses the
-`RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic` checkpoint.
-Set `HF_TOKEN` before running it because access to the weights is gated.
+DiffusionGemma uses
+[`RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic`](https://huggingface.co/RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic).
+Set `HF_TOKEN` with access to its gated weights.
 
-For `AI.CLASSIFY` and `AI.SCORE`, `canvas_draws` limits the number of
-attempts per document. The default is four. Quail can make additional
-attempts when the first answer's probabilities are spread across labels.
-It averages the probabilities from those attempts.
-
-Set `canvas_draws=1` to use one attempt per document:
-
-```python
-config = quail.EngineConfig(
-    model="diffusion-gemma-26b-a4b-fp8",
-    device="h100-sxm",
-    canvas_draws=1,
-)
-```
-
-Classification of joined rows always uses one attempt.
-The setting does not change `AI.IF` execution.
+For `AI.CLASSIFY` and one-table `AI.SCORE`, `canvas_draws` limits attempts
+per document. The default is 4. If the first attempt is uncertain,
+Quail makes more attempts and averages their probabilities.
+Set `canvas_draws=1` in `EngineConfig` to use one attempt.
+Joined classifications always use one attempt. `AI.IF` ignores this setting.
 
 ## Decision 2.0 Kai 0.6B
 
-[Decision 2.0 Kai 0.6B](https://huggingface.co/vllm-sr/Decision-2.0-Kai-0.6B)
-is a model from the vLLM Semantic Router team. It is fine tuned from
-Qwen3 0.6B to score supplied answers and return their probabilities in
-one forward pass.
+[Decision 2.0 Kai](https://huggingface.co/vllm-sr/Decision-2.0-Kai-0.6B)
+scores supplied answers:
 
-Quail uses the model for these functions:
+| Function | Answer |
+| --- | --- |
+| `AI.IF` | Selects between Yes and No. |
+| `AI.SCORE` | Probability of Yes when choosing between Yes and No. |
+| `AI.CLASSIFY` | Supplied label with the highest score. |
 
-- `AI.IF` selects between "Yes" and "No" for a filter or join condition.
-- `AI.SCORE` returns the probability of "Yes" for that condition.
-- `AI.CLASSIFY` selects the supplied label with the highest score.
+Check scores against labeled examples before choosing a threshold.
 
-```python
-config = quail.EngineConfig(
-    model="decision-2.0-kai-0.6b-bf16",
-    device="h100-sxm",
-)
-```
+## Qwen3 rerankers
 
-Use the existing SQL query syntax. Quail prepares the prompt
-for the model.
-
-*Calibration* describes how closely predicted probabilities match
-observed answer frequencies. Check calibration on labeled examples from
-your task before choosing a score threshold.
-
-See the vLLM Semantic Router team's
-[blog post introducing decision models](https://vllm-sr.ai/blog/decision-models/)
-for the approach. The post covers Decision 1.0; the
-[Kai 2.0 model card](https://huggingface.co/vllm-sr/Decision-2.0-Kai-0.6B)
-describes the model supported here.
+The rerankers support `AI.SCORE` only. With two prompt documents, the
+first is the search query and the second is the candidate document.
 
 ## Qwen3.5 2B Base with Qwen-Scope SAE
 
-The `qwen3.5-2b-sae-bf16` model serves `AI.SAE_FEATURES` only. Quail
-loads layers 0 to 11 of the 24 layers of
-[Qwen3.5-2B-Base](https://huggingface.co/Qwen/Qwen3.5-2B-Base). The
-sparse autoencoder (SAE) is the Qwen-Scope
-[`Qwen/SAE-Res-Qwen3.5-2B-Base-W32K-L0_100`](https://huggingface.co/Qwen/SAE-Res-Qwen3.5-2B-Base-W32K-L0_100)
-SAE for layer 11. The SAE reads the residual stream after layer 11. It
-has 32,768 features and keeps the 100 strongest features of each token.
-
-The model has no layers after layer 11, so it cannot answer `AI.IF`,
-`AI.SCORE`, `AI.CLASSIFY`, or `AI.EXTRACT`. Use another model in a
-separate session for these functions.
-
-```python
-config = quail.EngineConfig(
-    model="qwen3.5-2b-sae-bf16",
-    device="h100-sxm",
-)
-```
+`qwen3.5-2b-sae-bf16` supports only `AI.SAE_FEATURES`.
+It uses the layer-11
+[Qwen-Scope SAE](https://huggingface.co/Qwen/SAE-Res-Qwen3.5-2B-Base-W32K-L0_100)
+with 32,768 features and keeps the 100 strongest features per token.
+Use a separate session with another model for other AI functions.
 
 ## No local GPU? Use Modal
 
-You can run Quail in a [Modal](https://modal.com) GPU function.
-Install Modal and authenticate on the machine that submits the function:
+Install [Modal](https://modal.com) and authenticate on the client:
 
 ```bash
 uv pip install modal==1.5.4
 modal setup
 ```
 
-For example, the program below selects movie reviews that praise the
-acting. Save it as `run_quail.py`. It runs on one H100 and saves model
-weights and compiled kernels on Modal volumes for later runs.
+E.g., save this program as `run_quail.py`. It filters two reviews on an
+H100 and saves model files and compiled kernels on Modal volumes:
 
 ```python
 import modal
@@ -208,10 +148,8 @@ def run_query():
         session.register("reviews", quail.DocumentProvider.from_table(
             reviews, id_col="id"))
         result = session.sql("""
-            SELECT r.id
-            FROM reviews r
-            WHERE AI.IF(
-                PROMPT('Does this review praise the acting? {0}', r.body))
+            SELECT r.id FROM reviews r
+            WHERE AI.IF(PROMPT('Does this review praise the acting? {0}', r.body))
         """, dialect="bq").run()
         return result.collect(), result.report
 
@@ -224,26 +162,23 @@ def main():
     print(report)
 ```
 
-The example installs Quail 0.1.0 in the GPU image.
-Collect the rows inside the session before returning from the function.
-
 ### Run and retrieve the result
 
 ```bash
 modal run --detach run_quail.py 2>&1 | tee run_quail.log
 ```
 
-Keep the function call ID printed in the log. If you disconnect, retrieve
-the result with that ID:
+Keep the function call ID from the log.
+E.g., retrieve the rows after a disconnect:
 
 ```python
-rows, report = modal.FunctionCall.from_id("fc-...").get()
-```
+import modal
 
-The example returns rows and a report. To save them on a Modal volume,
-write them to its mounted path and call `volume.commit()` in the function.
+call_id = input("Function call ID from run_quail.log: ")
+rows, report = modal.FunctionCall.from_id(call_id).get()
+print(rows.to_pylist())
+```
 
 ## Add a model or device
 
-See [Custom models and GPUs](/docs/extending/models) to register another
-model or device.
+See [Custom models and GPUs](/docs/extending/models).

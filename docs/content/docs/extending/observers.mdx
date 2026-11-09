@@ -2,22 +2,13 @@
 title: Observers
 ---
 
-An *execution observer* is an extension that receives each operator's
-result. You can implement an observer when Quail's standard query report
-does not contain the information you need. The observer can read operator
-outputs and metrics, then add its own report to the query result.
-
-Here we show how to implement an observer, register it with a session,
-and read its report.
-
-Quail calls observers after model execution, while it prepares the query
-result. These calls do not provide progress updates
-during GPU execution.
+An `ExecutionObserver` reads operator measurements and adds a report to
+the query result. Quail calls it after model execution, not for progress
+updates during GPU execution.
 
 ## Implement the observer
 
-The example below records operator IDs and includes them in a report.
-You can define a class with `name`, `after_node()`, and `report()`:
+E.g., this observer records the IDs of operators whose outputs Quail returns:
 
 ```python
 class CompletedOperators:
@@ -33,21 +24,19 @@ class CompletedOperators:
         return {"node_ids": self.node_ids}
 ```
 
-- `name` identifies the observer's report in the query result.
+- `name` identifies the report.
 - `after_node(node, result)` receives a physical node and its `NodeResult`.
-  You can read the outputs and metrics from `result`.
-  Do not change the operator's outputs.
-- `report()` returns a dictionary with the values you want to include in
-  the query report.
+  Read its outputs and metrics without changing them.
+- `report()` returns a mapping of report values.
 
-See the
-[`ExecutionObserver` interface](https://github.com/fsdatalab/quail/blob/main/quail/execution/runner.py).
+See the [interface](https://github.com/fsdatalab/quail/blob/main/quail/execution/runner.py).
 
 ## Register the observer
 
-Register the class with the [extension registry](/docs/extending#registration).
-Quail creates a new instance for each query, so values collected for one
-query do not appear in the next query's report.
+Register a factory, such as the class above. Quail creates fresh observers
+when it prepares each model region's result.
+
+E.g., create a session with this observer:
 
 ```python
 import quail
@@ -60,15 +49,9 @@ session = quail.Session(config=config, registry=registry)
 
 ## Read the report
 
-Create a query with this session. After running it, call
-`result.observer()` with the observer class to read its report:
+For a query with one model region, call
+`result.observer(CompletedOperators)` after `query.run()`. For queries
+with several model regions, each region's report appears under
+`result.report["regions"]`. Close the session when you finish.
 
-```python
-result = query.run()
-print(result.observer(CompletedOperators))
-session.close()
-```
-
-The report contains the `node_ids` list returned by `report()`.
-For Quail's standard execution measurements, see
-[Metrics](/docs/user-guide/metrics).
+See [Metrics](/docs/user-guide/metrics) for Quail's standard measurements.

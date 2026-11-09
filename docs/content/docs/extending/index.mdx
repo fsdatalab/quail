@@ -2,46 +2,33 @@
 title: Overview
 ---
 
-Quail is an extensible query engine. This section explains how to
-implement extensions and use them in a session.
+Choose an extension interface for the change you need:
 
 ## Extension types
 
 | Task | Guide |
 | --- | --- |
 | Read tables from another storage system. | [Custom data sources](/docs/extending/table-providers) |
-| Add a model or GPU specification, or implement another model architecture. | [Custom models and GPUs](/docs/extending/models) |
-| Add a query operation. | [Custom operators](/docs/extending/operators) |
-| Change query planning decisions. | [Custom Rules](/docs/extending/rules) |
-| Run code after an operator finishes. | [Observers](/docs/extending/observers) |
+| Add a checkpoint or GPU specification. | [Custom models and GPUs](/docs/extending/models) |
+| Add an operator to a physical plan. | [Custom operators](/docs/extending/operators) |
+| Change planning decisions. | [Custom Rules](/docs/extending/rules) |
+| Add a report from operator measurements. | [Observers](/docs/extending/observers) |
+| Use Quail from Rust or an existing DataFusion session. | [Quail from Rust](/docs/extending/datafusion) |
 
 ## Registration
 
-An *extension registry* holds the implementations available to a session.
-Use `ExtensionRegistry.with_built_ins()` to create a registry containing
-Quail's included implementations.
+`ExtensionRegistry` holds the implementations available to a session.
 
-To add an extension:
-
-1. Implement the interface described in its guide.
-2. Register the implementation with the appropriate `register_*` method,
-   such as `register_model()` or `register_observer()`.
+1. Create a registry with `ExtensionRegistry.with_built_ins()`.
+2. Add your implementation with its `register_*` method.
 3. Pass the registry to `Session(config=config, registry=registry)`.
 
-Each guide includes an example of implementation and registration.
-Registration does not load model weights or run inference. A duplicate
-name within the same extension type raises `ValueError`.
-
-Data sources use `session.register(name, provider)` directly.
-See [Custom data sources](/docs/extending/table-providers).
+Registration does not load model weights. Duplicate registrations raise
+`ValueError`. Data sources instead use `session.register(name, provider)`.
 
 ## Extension modules
 
-A Python package can register its extensions through a
-`register_quail_extension(registry)` function. The function receives the
-registry and calls the registration methods for the package's extensions.
-
-Call `registry.load_extension(module_name)` to import the module and run
-its registration function. The module must be importable in the process
-that creates the registry. Loading the same module into the same registry
-twice raises `ValueError`.
+A package can expose `register_quail_extension(registry)` to register
+its extensions. Call `registry.load_extension(module_name)` to import
+that module and run the function. The module must be importable in that
+process. Loading it twice into the same registry raises `ValueError`.

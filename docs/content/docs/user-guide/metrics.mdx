@@ -2,35 +2,31 @@
 title: Metrics
 ---
 
-Quail records execution time, row counts, and token counts for each query.
-The report includes totals for the query and measurements for individual
-operators in its plan.
+Read `result.report` for measurements from a completed run.
+Use [`result.explain()`](/docs/user-guide/results#measure-the-plan)
+to compare operator measurements with estimates.
 
 ## Read a query report
 
-Call `query.run()` to execute a query. The returned `QueryResult` has a
-`report` containing the measurements from that run.
-
-For example, imagine a `reviews` table registered on `session`, with
-review IDs in `id` and review text in `body`. Run a filter and read its
-execution time and token count:
+E.g., with the `reviews` table from
+[Running queries](/docs/user-guide/sessions) registered on an open session:
 
 ```python
 query = session.sql("""
-    SELECT r.id
-    FROM reviews r
+    SELECT r.id FROM reviews r
     WHERE AI.IF(PROMPT('Does this review discuss the ending? {0}', r.body))
 """, dialect="bq")
-
 result = query.run()
 report = result.report
-print("Query time in seconds:", report["wall_s"])
-print("Model startup time in seconds:", report["boot_s"])
-print("Tokens computed:", report["fresh_tokens"])
+print("Model region execution seconds:", report["wall_s"])
+print("Model startup seconds:", report["boot_s"])
+print("Token positions computed:", report["fresh_tokens"])
 ```
 
-To compare measurements with the plan's estimates, use
-[`result.explain()`](/docs/user-guide/results#measure-the-plan).
+For a query with one model region, the report contains that region's
+measurements and a separate `datafusion_s` field. For several model
+regions, read each report in `result.report["regions"]`.
+A query without AI calls has no model region report.
 
 ## Query totals
 
@@ -38,90 +34,70 @@ To compare measurements with the plan's estimates, use
 
 | Field | Meaning |
 | --- | --- |
-| `wall_s` | Query execution time in seconds. Excludes model startup and result collection. |
-| `boot_s` | Model startup time in seconds, including loading weights and preparing GPU kernels. |
-| `worker_total_s` | Time in seconds from calling `run()` until it returns. Includes planning, input preparation, model startup, and preparing the result. Excludes result collection. |
-| `boot_kind` | `"cold"` when the model or kernels needed preparation; `"warm"` when they were already ready. |
+| `wall_s` | Model region execution seconds, excluding model startup and result collection. |
+| `boot_s` | Model startup seconds. |
+| `worker_total_s` | Seconds spent running the model region, including startup and result preparation. Excludes DataFusion work outside the region. |
+| `datafusion_s` | Seconds outside the model region, including SQL planning and surrounding operators. Available for one-region queries. |
+| `boot_kind` | `"cold"` if the model or kernels need preparation; `"warm"` otherwise. |
 
-To inspect startup time, read `report["boot"]`.
-It includes `load_model_s` for loading weights, `arena_s` for allocating
-KV memory, and `warm_kernels_s` for preparing kernels. Each is in seconds.
+`report["boot"]` breaks startup into `load_model_s`, `arena_s`, and
+`warm_kernels_s`: weight loading, KV allocation, and kernel preparation.
 
 ### Token counts
 
-A *fresh token* is a token position computed by the model rather than
-read from saved KV. Computing the same position again counts again.
-
 | Field | Meaning |
 | --- | --- |
-| `fresh_tokens` | Total token positions computed by the model. |
-| `cached_tokens` | Total token positions read from KV, when available. |
+| `fresh_tokens` | Token positions computed by the model. Recomputing a position counts again. |
+| `cached_tokens` | Token positions read from saved KV, when available. |
 
-`fresh_tokens` counts model computation. It does not count every token
-in every prompt when the model reuses KV.
+`fresh_tokens` does not count every token in every prompt when Quail
+reuses KV. Do not treat it as total input tokens.
 
 ## Operator metrics
 
-`report["node_metrics"]` contains measurements for each physical operator.
-The keys are the operator IDs shown by `explain(verbose=True)`.
-For example, `"ai_filter:r"` identifies a model filter on table alias `r`.
-
-```python
-for operator_id, metrics in report["node_metrics"].items():
-    print(operator_id, metrics["input_rows"], metrics["output_rows"])
-```
+`report["node_metrics"]` maps operator IDs to measurements.
+`explain(verbose=True)` shows the IDs.
 
 | Field | Meaning |
 | --- | --- |
 | `wall_s` | Operator time in seconds. |
-| `input_rows` | Rows or pairs received by the operator. |
-| `output_rows` | Rows or pairs returned by the operator. |
-| `evaluated_documents` | Documents evaluated by a model filter, score, or classification operator. |
-| `evaluated_document_pairs` | Document pairs evaluated by a model join or classification operator. |
-| `fresh_tokens`, `cached_tokens` | Token counts for the operator, with the same definitions as the query totals. |
+| `input_rows`, `output_rows` | Rows or pairs received and returned. |
+| `evaluated_documents` | Documents evaluated by the model. |
+| `evaluated_document_pairs` | Document pairs evaluated by the model. |
+| `fresh_tokens`, `cached_tokens` | Operator token counts, as defined above. |
 
-The available measurements depend on the operator.
-Use the query's `wall_s` for total execution time rather than adding
-operator times.
+Available measurements depend on the operator. Do not add operator
+times to calculate elapsed query time.
 
-## Filter and join predicates
+## Filters and joins
 
-`report["stages"]` records measurements for individual filter and join
-predicates. A *predicate* is a condition that keeps or removes rows.
-A query with several `AI.IF` conditions can have several stage records
-for one model filter operator.
-
-*Selectivity* is the fraction of documents or pairs that pass a predicate.
-Compare the estimated and measured fractions to see whether a predicate
-kept more input than expected.
+`report["stages"]` holds measurements for individual `AI.IF` filters
+and joins. A single operator can have several entries.
 
 | Field | Meaning |
 | --- | --- |
 | `op` | `"filter"` or `"join"`. |
-| `written_position` | Predicate position in the query, starting at zero. `explain()` displays positions starting at one. |
-| `provided_selectivity` | Selectivity supplied in the query, or `None` if omitted. |
-| `observed_selectivity` | Measured fraction of documents or pairs that passed. |
-| `evaluated` | Documents evaluated by a filter predicate. |
-| `tuples` | Document pairs evaluated by a join predicate. |
+| `written_position` | Zero-based position in the query. `explain()` displays positions from one. |
+| `provided_selectivity` | Selectivity supplied in SQL, or `None`. |
+| `observed_selectivity` | Fraction of evaluated documents or pairs that pass. |
+| `evaluated` | Documents evaluated by a filter. |
+| `tuples` | Pairs evaluated by a join. |
 | `alias` | Table alias for a filter. |
 | `anchor`, `partners` | Table aliases for a join. |
 
-Use `written_position` to match a record to its condition in the query.
 The execution order can differ from the written order.
-Score and classification measurements are in `node_metrics`.
+Score and classification measurements appear in `node_metrics`.
 
 ## GPU cost
 
-Compute GPU cost from query time, GPU count, and the hourly price per GPU.
-For an H100 query, use Quail's configured H100 price:
+E.g., estimate GPU cost for the model region in the query above:
 
 ```python
-from quail.specs import H100_USD_PER_HOUR
-
+hourly_price = query.session.device.usd_per_hour
 gpus = query.session.config.gpus
-cost_usd = (report["wall_s"] / 3600) * gpus * H100_USD_PER_HOUR
-print("GPU cost in dollars:", cost_usd)
+cost_usd = report["wall_s"] / 3600 * gpus * hourly_price
+print("Model region GPU cost in dollars:", cost_usd)
 ```
 
-The calculation excludes model startup and result collection.
-Use the hourly price for your device when running on another GPU type.
+This uses Quail's configured hourly price. It excludes model startup
+and DataFusion work outside the region, so it is not the full rental bill.

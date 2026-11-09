@@ -2,208 +2,102 @@
 title: Physical plans
 ---
 
-A physical plan specifies which operators execute a query, what data each
-operator receives, and what data it produces. An operator performs one
-part of the query, such as classifying reviews or selecting result columns.
-SQL functions describe what a query requests. Physical operators
-specify how Quail executes that work.
-The plan also records execution settings, such as the
-[attention path](/docs/architecture/execution#attention-paths) used by a model operator.
-
-The [optimizer](/docs/architecture/optimizer) builds the physical plan
-from a logical plan. The logical plan describes the requested operations.
-The physical plan specifies how Quail executes them.
+Quail's physical plan describes one model region: its operators,
+their input and output ports, and GPU settings. DataFusion's plan
+contains a `ModelRegionExec` for the region and runs the SQL around it.
 
 ## Execute a review query
 
-For example, imagine a `reviews` table with an `id` column for review
-identifiers and a `body` column for review text. This query classifies
-each review as positive or negative and returns only negative reviews:
+E.g., for a registered `reviews` table with `id` and `body` columns:
 
 ```sql
 SELECT r.id,
-       AI.CLASSIFY(
-           PROMPT('What sentiment does this review express? {0}', r.body),
-           ARRAY['positive', 'negative']) AS sentiment
+       AI.CLASSIFY(r.body, ARRAY['positive', 'negative']) AS sentiment
 FROM reviews r
-WHERE AI.CLASSIFY(
-    PROMPT('What sentiment does this review express? {0}', r.body),
-    ARRAY['positive', 'negative']) IN ('negative');
+WHERE AI.CLASSIFY(r.body, ARRAY['positive', 'negative']) = 'negative';
 ```
 
-Before execution, Quail tokenizes the review text. During execution,
-it identifies each review by its row position in the input table,
-starting at zero. Quail calls this position a document ID. It is separate
-from the value in `reviews.id`.
-
-Quail uses three operators to execute this query. Each box
-represents an operator. Each arrow shows the data passed between operators.
+Quail runs the identical classification once and uses its answer in
+both `SELECT` and `WHERE`.
 
 <Mermaid chart={`flowchart TD
     scan["Scan"]
     classify["AiClassify"]
     filter["Filter"]
-    rows["region rows"]
+    rows["Model-region rows"]
     scan -->|Document IDs| classify
     classify -->|Document IDs and labels| filter
-    filter -->|Document IDs and labels of negative reviews| rows
+    filter -->|Passing rows| rows
 `} />
 
-1. **Scan** returns the document IDs for the `reviews` input.
-2. **AiClassify** receives these IDs and uses the model to classify the
-   corresponding reviews. It produces a table of document IDs and labels.
-3. **Filter** reads that table and keeps the document IDs whose label is
-   `negative`. This comparison runs on the CPU.
+- `Scan` supplies document IDs: zero-based positions in the region's input,
+  not the values in `reviews.id`.
+- `AiClassify` asks the model for a label for each document.
+- `Filter` tests the labels on the CPU and keeps negative reviews.
 
-The region's rows are built from the operators' outputs, not by an
-operator: one row per surviving document, or per surviving tuple of an
-AI join, with the id column of each table, here `reviews.id`, and each
-answer the SELECT list reads, here the label. Rust joins the surviving
-documents, each full join's true pairs, and each answer table on
-document IDs (`quail::results::region_rows`). A query that also reads
-another column of `reviews`, such as `title`, gets it from DataFusion,
-which joins `reviews` back on `id` above the region.
+Quail builds the model region's rows from the surviving document IDs
+and answers. It returns the source `reviews.id` values with the labels.
+If the query also requests `reviews.body`, DataFusion joins that column
+back on `id` above the model region.
 
-The `SELECT` and `WHERE` expressions use the same classification output.
-Quail does not classify each review again for the `SELECT` expression.
-
-The arrows show which inputs each operator needs. Compatible operators
-can pass batches to each other before they finish processing all rows.
-See [Execution](/docs/architecture/execution#pipelines-and-batches) for
-how Quail groups and schedules these operators.
+Compatible operators pass documents to the next operator before they
+finish the entire input. See [pipelining](/docs/architecture/execution#pipelines-and-batches).
 
 ## Operators above the region
 
-DataFusion runs the relational operators on the rows a model region
-returns, so they are not in Quail's physical plan: ORDER BY, LIMIT and
-OFFSET, DISTINCT, GROUP BY, [window functions](/docs/user-guide/sql/sql-functions#window-functions),
-each `UNNEST`, each test of more than one table's columns, and the
-SELECT list's expressions. They reuse the region's AI outputs and do not
-call the model again.
+DataFusion runs operations outside the model region, including:
 
-A LIMIT stops the model early only when it becomes the region's fetch:
-with no ORDER BY, DISTINCT, or other row filter between the LIMIT and
-the AI operator it reads. An ORDER BY with a LIMIT is a top-k sort,
-DataFusion's `SortExec` with a fetch, over every row the region returns.
+- `ORDER BY`, `LIMIT`, and `OFFSET`.
+- `DISTINCT`, aggregates, and window functions.
+- `UNNEST` in the `SELECT` list.
+- Remaining expressions over the region's rows.
 
-For example, `explain()` of a query that scores filtered sales calls
-and keeps the top 25 starts with DataFusion's physical plan, then the
-region's:
+These operations read AI answers without asking the model again.
+An eligible `LIMIT` becomes the region's fetch and can stop model work
+early. A top-k sort cannot use a fixed fetch to take only the first rows;
+it must consider every row that can enter the top k.
 
-```text
-DataFusion:
-SortExec: TopK(fetch=25), expr=[commit_score@1 DESC NULLS LAST, id@0 ASC NULLS LAST], preserve_partitioning=[false]
-  ModelRegionExec: hint=[DynamicFilter [ empty ]]
-    FilterExec: deal_stage@1 = Negotiation, projection=[id@0, transcript@2]
-      DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
-```
-
-`ModelRegionExec` runs the region. Its inputs below it are the rows
-DataFusion computes for it, here the calls in the Negotiation stage.
-It returns one stream of the region's rows, which DataFusion reads
-while the region runs: each forward pass's finished rows when the
-region's last operator is a filter, score, or classification, and
-otherwise its rows once that operator finishes. With several GPUs, the
-region runs as stages, one partition per GPU (see
-[Multiple GPUs](/docs/architecture/execution#multiple-gpus)), and each
-row is sent once the stage that completes it finishes on its GPU.
-
-`hint=[...]` lists the dynamic filters the operators above hand the
-region; see [Runtime filters](#runtime-filters).
-
-When the SELECT list reads a table's columns besides its id,
-DataFusion joins the table back above the region. For example, a query
-that returns each review's `stars` beside a classification:
-
-```text
-DataFusion:
-HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(__quail_key_r@0, id@0)], projection=[id@2, stars@1, kind@3]
-  CoalescePartitionsExec
-    ProjectionExec: expr=[id@0 as __quail_key_r, stars@1 as stars]
-      DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
-  RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
-    ModelRegionExec
-```
-
-DataFusion plans the join with its default settings: it splits the
-region's rows across partitions and picks the join's build side from
-the statistics it has. When DataFusion computes a table's rows for the
-region, the join reads them through the same `SharedInputExec` as the
-region, so they are computed once.
+`ModelRegionExec` receives inputs from DataFusion and returns Arrow
+batches as the model region completes rows. If DataFusion computes an
+input that the join above also reads, `SharedInputExec` computes it once.
+See [streaming](/docs/architecture/execution#streaming-the-regions-rows)
+and [multiple GPUs](/docs/architecture/execution#multiple-gpus).
 
 ### Runtime filters
 
-A top-k sort and a hash join each make a *dynamic filter*: a test of
-the rows below them that they tighten while the query runs. A top-k
-sort's test passes only rows that would enter its top k once it holds
-k rows; a hash join's passes only rows whose key is among its build
-side's keys once that side is complete. DataFusion pushes each one down
-to the operators below that can use it.
+DataFusion's top-k sorts and hash joins can send **dynamic filters** to
+`ModelRegionExec`. These filters tighten as DataFusion reads rows.
+Quail can skip model work for rows that cannot pass them. The operator
+above the region still applies the filter.
 
-`ModelRegionExec` takes these filters as the region's hint: a row
-where the test is not TRUE leaves the query above anyway, so the
-region may drop it before asking the model. The operators above still
-apply the test. The region uses the hint when its rows each come from
-one row of one table, with no join, fetch, or stop key:
+Quail disables these hints when the model region has a fetch or per-key
+stop. For other regions:
 
-- A test that reads only columns the region passes on from that table,
-  such as an id, is decided for each row before the model runs. A test
-  of an AI.SCORE answer is decided only when every score from 0 to 1
-  gives the same result (R15).
-- Before planning, the region drops the input rows the hint rejects
-  as it is then. A table the region reads by name keeps its rows.
-- While the region runs, the executor reads the hint again before it
-  admits each document to a first filter, a score, or a
-  classification, and skips a document the hint now rejects. The
-  test tightens as DataFusion reads the region's rows, which stream
-  out as they finish. A score or classification asks all its rows in
-  one run, so its prefix sharing spans every row.
-- The region starts when DataFusion first reads it. A hash join reads
-  its probe side once its build side is complete, so the join's filter
-  is final before the region reads it.
+- A filter on an input column can reject a row before model execution.
+- A filter on an unknown AI answer rejects a row only if every possible
+  answer fails. For `AI.SCORE`, Quail uses bounds of 0 and 1.
+- The executor reads updated hints before admitting documents. A hint
+  saves no work if the region finishes before DataFusion can tighten it.
 
-For example, `SELECT c.id FROM contracts c WHERE AI.IF(...) ORDER BY
-c.id LIMIT 20` asks the filter in id order; once 20 contracts pass and
-reach the sort, every later contract has a larger id and is skipped.
-With an extraction after the filter, as in CUAD-15, the region's last
-step is a pipeline, which sends its rows when it finishes, so the sort
-holds no rows while the region runs and the hint skips nothing.
+E.g., a top-k sort by descending score cannot reject an unscored row
+merely because the current threshold is 0.9. That row could score 1.
+At a threshold of 1, a secondary sort key can rule out rows that would
+lose even if they score 1.
 
-Of the QUAIL-B check queries, two plans take a hint, and both show
-`ModelRegionExec: hint=[DynamicFilter [ empty ]]` under their top-k
-sort:
-
-| Query | Region and operators above | What the hint can skip |
-| --- | --- | --- |
-| SALES-5 | A score of the calls in the Negotiation stage, then a top 25 by score, then id | A call not yet scored, once 25 calls score 1 and the call's id is past the 25th of them (R15). Below a threshold of 1, nothing. |
-| CUAD-15 | A filter and an extraction in one pipeline, then a top 20 by id | Nothing while the region runs: the pipeline sends its rows when it finishes, so the sort holds no rows until then. |
-
-IMDB-2, IMDB-4, FEV-9, and IMDB-15 run their joins inside the region,
-as model joins, so no hash join sits above the region and their plans
-do not change. Of the other QUAIL-B plans, ten take a hint: REL-AGENT-4
-and WRENCH-2 from a top-k sort directly above the region, and eight
-from the hash join that joins a table back on its id. That join's
-build side holds every id of the table, or of the rows a relational
-filter keeps, so it skips only the rows that filter rejects.
-
-Only an ORDER BY sets the order of the result rows. Without one, the
-rows can come back in any order, and a LIMIT returns any of the rows
-that qualify.
+See [RegionHint](https://github.com/fsdatalab/quail/blob/main/crates/quail-datafusion/src/region_hint.rs).
+Without `ORDER BY`, rows can arrive in any order.
 
 ## Inspect the plan
 
-Call `query.explain()` to inspect the plan without running model inference.
-The output shows the operators, their execution settings, and estimated work.
+Call `query.explain()` to inspect operators and estimated work without
+running model inference. Use `verbose=True` to include execution settings
+and candidate costs.
 
 ## Editing a plan
 
-Call `query.plan()` to get a plan that you can edit before execution.
-Each edit returns a new plan. You can execute it with
-`query.run(plan=edited)`.
+`query.plan()` returns a physical plan. Each edit returns a new plan;
+run it with `query.run(plan=edited)`. An edited plan applies to a query
+with one model region.
 
-See [Editing physical plans](/docs/user-guide/editing-plans) for a complete
-example that inspects a plan, inserts an operator, and removes it.
-
-To implement an operator, see
-[Custom operators](/docs/extending/operators). That guide explains how
-operator classes declare their inputs, outputs, and execution code.
+See [Editing physical plans](/docs/user-guide/editing-plans) for an example
+or [Custom operators](/docs/extending/operators) to implement a node.

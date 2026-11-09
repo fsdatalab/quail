@@ -2,86 +2,30 @@
 title: SQL functions
 ---
 
-Use SQL functions and clauses to process rows alongside
-[AI functions](/docs/user-guide/sql/ai-functions). Quail supports text
-expressions, conditions, grouping, sorting, and windows. Every query
-must include an AI function.
+DataFusion runs SQL around Quail's model regions. This includes queries
+without AI calls. Use DataFusion's
+[SQL reference](https://datafusion.apache.org/user-guide/sql/index.html)
+for ordinary SQL syntax; this page covers its use with AI functions.
 
-Examples use BigQuery syntax unless the example specifies another dialect.
-See the [SQL reference](/docs/user-guide/sql) for dialect selection.
-
-## Functions and query clauses
-
-Select a row to jump to its syntax and examples. The entries follow the
-same order as the sections below.
-
-<div className="function-index">
-
-| Function or clause | Description |
-| --- | --- |
-| [`SELECT`, `FROM`](#select-from-join-limit) | Selects columns from a registered table. |
-| [`JOIN`, `CROSS JOIN`](#joins) | Forms document pairs for an AI condition. |
-| [`EXISTS`, `NOT EXISTS`](#exists-and-not-exists) | Keeps rows with a match, or with no matches. |
-| [`WHERE`, `ON`](#where-and-on) | Filters rows and restricts join pairs. |
-| [`ORDER BY`](#order-by) | Sorts result rows. |
-| [`SELECT DISTINCT`](#select-distinct) | Removes duplicate result rows. |
-| [`LIMIT`](#select-from-join-limit) | Returns at most the requested number of rows. |
-| [`OFFSET`](#offset) | Skips rows before applying a limit. |
-| [`LENGTH(column)`](#lengthcolumn) | Counts characters in a text value. |
-| [`LOWER(column)`](#lowercolumn) | Converts text to lowercase. |
-| [`UPPER(column)`](#uppercolumn) | Converts text to uppercase. |
-| [`TRIM(column)`](#trimcolumn) | Removes whitespace at both ends of the text. |
-| [`column LIKE pattern`](#column-like-pattern) | Matches a SQL text pattern. |
-| [`column ILIKE pattern`](#column-ilike-pattern) | Matches a SQL text pattern without case sensitivity. |
-| [`CONTAINS_SUBSTR(column, text)`](#contains_substrcolumn-text) | Finds text without case sensitivity (BigQuery). |
-| [`CONTAINS(column, text)`](#containscolumn-text) | Finds text with case sensitivity (Snowflake). |
-| [`STARTS_WITH(column, text)`](#starts_withcolumn-text) | Tests the start of a value. Snowflake uses `STARTSWITH`. |
-| [`ENDS_WITH(column, text)`](#ends_withcolumn-text) | Tests the end of a value. Snowflake uses `ENDSWITH`. |
-| [`REGEXP_CONTAINS(column, pattern)`](#regexp_containscolumn-pattern) | Finds a regular expression match anywhere in the value (BigQuery). |
-| [`REGEXP_LIKE(column, pattern)`](#regexp_likecolumn-pattern) | Matches a regular expression against the whole value (Snowflake). |
-| [`GROUP BY`, `HAVING`](#group-by-and-having) | Groups rows and filters aggregate results. |
-| [`COUNT(*)`](#count) | Counts rows. |
-| [`COUNT(column)`](#countcolumn) | Counts values that are not null. |
-| [`COUNT(DISTINCT column)`](#countdistinct-column) | Counts distinct values that are not null. |
-| [`SUM(column)`](#sumcolumn) | Adds values. |
-| [`AVG(column)`](#avgcolumn) | Computes the average. |
-| [`MIN(column)`](#mincolumn) | Returns the smallest value. |
-| [`MAX(column)`](#maxcolumn) | Returns the largest value. |
-| [`ROW_NUMBER() OVER (...)`](#row_number-over-) | Numbers rows within each partition, starting at 1. |
-| [`LAG(column) OVER (...)`](#lagcolumn-over-) | Reads the preceding row's value. |
-| [`LEAD(column) OVER (...)`](#leadcolumn-over-) | Reads the following row's value. |
-| [`SUM(column) OVER (...)`](#sumcolumn-over-) | Computes the running sum through the current row. |
-| [`COUNT(*) OVER (...)`](#count-over-) | Counts rows through the current row. |
-| [`COUNT(column) OVER (...)`](#countcolumn-over-) | Counts non-null values through the current row. |
-
-</div>
+Examples use `dialect="bq"` unless stated otherwise.
+Register the input tables before running them.
 
 ## SQL clauses
 
 ### SELECT, FROM, JOIN, LIMIT
 
-Quail supports these SQL clauses with the following limits:
-
-- **`SELECT`** lists columns, [column expressions](#column-expressions),
-  `AI.SCORE`, `AI.CLASSIFY`, or `AI.EXTRACT` outputs, and
-  [window functions](#window-functions). Use `AS` to name a result
-  column. AI outputs and window functions require a name. `*` expands
-  to all table columns.
-- **`FROM`** names a registered table or a [CTE](#with), with an
-  optional alias.
-- **`JOIN`** and `CROSS JOIN` are supported. Outer joins (`LEFT`,
-  `RIGHT`, `FULL`) are not.
-- **`LIMIT`** takes a positive integer.
+| Clause | Use |
+| --- | --- |
+| `SELECT` | Return columns or expressions. Use `AS` to give computed columns a name. |
+| `FROM` | Read a registered table, CTE, or subquery. |
+| `JOIN` | Combine rows; see [Joins](#joins). |
+| `LIMIT` | Return at most this many rows. `LIMIT 0` returns no rows without running the model. |
 
 ### WITH
 
-`WITH` defines a common table expression (CTE), which a later query
-in the same statement can read as a table. A subquery in `FROM`
-works the same way.
-
-For example, imagine a `contracts` table with columns `id` and `text`.
-This query scores whether each contract's termination clause lets the
-tenant terminate early:
+Use a common table expression (CTE) when an AI call reads another call's
+answer. E.g., extract a contract clause, then score that clause rather
+than the full contract. The `contracts` table has `id` and `text` columns:
 
 ```sql
 WITH clauses AS (
@@ -91,95 +35,48 @@ WITH clauses AS (
 )
 SELECT x.id,
        AI.SCORE(PROMPT('Can the tenant terminate early? {0}', x.clause.terms)) AS score
-FROM clauses x
+FROM clauses x;
 ```
 
-In this example, the CTE `clauses` first extracts the termination
-clause of each contract. Then the main query scores each extracted
-clause, so the model reads the clause instead of the full contract.
-
-In a CTE, give each computed column an `AS` name so that a later
-query can read it.
-
-Limits: `WITH RECURSIVE` is not supported. A CTE can read registered
-tables and the CTEs defined before it.
+A `FROM` subquery serves the same purpose. Use a CTE or subquery when
+an AI call must read a value from `GROUP BY` or a window calculation.
 
 ### Joins
 
-Use `JOIN` or `CROSS JOIN` to form document pairs for an AI condition.
-A join must include an AI function. Column comparisons in `ON` can
-restrict the pairs sent to the model. See
-[AI join examples](/docs/user-guide/sql/ai-functions#joining).
+Use `AI.IF` in `ON` for a [join](/docs/user-guide/sql/ai-functions#joining).
+Add column comparisons to restrict the pairs that the model reads.
+DataFusion also supports ordinary joins around model regions, including
+outer joins. Not every join needs an AI call.
 
 ### EXISTS and NOT EXISTS
 
-Use `EXISTS` to keep a row with at least one AI match. Use `NOT EXISTS`
-to keep a row with no AI matches. The subquery must have the form
-`SELECT 1 FROM <table> WHERE AI.IF(...)`. See the
-[query examples](/docs/user-guide/sql/ai-functions#exists-and-not-exists).
+Use `EXISTS` to keep rows with at least one match.
+Use `NOT EXISTS` to keep rows with none.
+See [AI examples](/docs/user-guide/sql/ai-functions#exists-and-not-exists).
 
 ### WHERE and ON
 
-`WHERE` keeps rows that satisfy the given conditions. `ON` specifies
-which rows to join. Both support the following conditions on table columns:
+`WHERE` and `ON` accept DataFusion expressions. Filters that read one
+input table run before AI calls that read those rows.
 
-| Condition | SQL |
-| --- | --- |
-| Compare with a value | `=`, `<>`, `<`, `<=`, `>`, `>=` |
-| Match a value in a list | `IN (...)` |
-| Keep null values | `IS NULL` |
-| Keep non-null values | `IS NOT NULL` |
-| Compare two columns of a table | `r.stars > r.min_stars` |
-| Keep rows where a boolean is true | `r.verified`, `STARTS_WITH(r.lang, 'en')` |
+**`WHERE` cannot read a `SELECT` alias.** Repeat the AI call to test its
+answer; Quail computes the repeated answer once.
+See [Filter by category](/docs/user-guide/sql/ai-functions#filter-by-category)
+and [Filter on answers](/docs/user-guide/sql/ai-functions#filter-on-answers).
 
-Values can be numbers, strings, or booleans. Either side of a comparison
-can be an [expression](#column-expressions), such as
-`ABS(r.stars - r.expected) <= 1`. `IN` requires a non-empty
-list of constant values. Combine conditions with `AND`.
-Comparisons exclude null values. Use `IS NULL` to keep them.
-
-For example, imagine a `reviews` table with columns `id`, `body`, `year`,
-and `stars`. Return IDs of reviews from 2024 with at least four stars
-that mention shipping:
-
-```sql
-SELECT r.id
-FROM reviews r
-WHERE r.year = 2024
-  AND r.stars >= 4
-  AND AI.IF(PROMPT('Does the review mention shipping? {0}', r.body))
-```
-
-Quail checks the year and rating before evaluating `AI.IF`.
-
-A condition in `ON` filters the table containing the referenced column.
-In `ON`, `=` between two tables' columns, or expressions of them such as
-`LOWER(r.lang) = l.code`, is a join key. In `WHERE`, a
-comparison of two tables' columns filters the joined rows; the tables still
-need a join key or an AI predicate in `ON`. See
-[Joining](/docs/user-guide/sql/ai-functions#joining).
-
+- Comparisons exclude null values. Use `IS NULL` to keep them.
+- Combine ordinary conditions with `AND`, `OR`, or `NOT`.
+- `OR` with AI calls has [additional limits](/docs/user-guide/sql/ai-functions#filtering).
 
 ### ORDER BY
 
-`ORDER BY` sorts result rows by columns or
-[column expressions](#column-expressions). Only `ORDER BY` sets the
-order of the result rows: without it, rows can come back in any order,
-and the order can differ between runs. A `LIMIT` without `ORDER BY`
-returns any of the rows that qualify, up to the limit. To sort by a score or
-classification label or window output, use its `AS` name. AI calls cannot appear
-directly in `ORDER BY`.
-Sorting columns need not appear in `SELECT`, except when using
-`SELECT DISTINCT`.
+Only `ORDER BY` specifies result order. Without it, rows can appear in
+any order, including when the query has `LIMIT`.
+Use `ASC` or `DESC` for direction and `NULLS FIRST` or `NULLS LAST` for
+explicit null placement.
 
-The default direction is `ASC`. Use `DESC` for descending order.
-`NULLS FIRST` or `NULLS LAST` overrides the dialect's default null placement:
-
-- BigQuery puts nulls first for `ASC` and last for `DESC`.
-- Snowflake puts nulls last for `ASC` and first for `DESC`.
-
-For example, imagine a `documents` table with customer messages in `body`.
-This query returns ten documents with the highest refund-request scores:
+E.g., return the ten highest refund scores from `documents(id, body)`.
+Use the ID to order rows with equal scores:
 
 ```sql
 SELECT d.id,
@@ -187,36 +84,30 @@ SELECT d.id,
            AS refund_score
 FROM documents d
 ORDER BY refund_score DESC NULLS LAST, d.id ASC
-LIMIT 10
+LIMIT 10;
 ```
-
-The example query uses `d.id ASC` to order documents with equal scores by ID.
 
 ### SELECT DISTINCT
 
-`SELECT DISTINCT` removes duplicate rows by comparing all selected
-columns. Quail removes duplicates before sorting and applying `OFFSET`
-or `LIMIT`. Every sorting column must appear in `SELECT`.
+`SELECT DISTINCT` removes duplicate result rows. A sorting expression
+must appear in the selected columns when the query uses `DISTINCT`.
 
 ### OFFSET
 
-`OFFSET n` skips `n` rows after sorting and before applying `LIMIT`.
-The count must be an integer greater than or equal to zero. Use `ORDER BY`
-to specify which rows to skip. Without an explicit order, the skipped
-rows can differ between runs.
-
-Sorting or removing duplicates prevents `LIMIT` from stopping AI
-evaluation early. An offset greater than zero has the same effect.
+`OFFSET n` skips `n` rows before applying `LIMIT`.
+Use `ORDER BY` if you need to control which rows it skips.
+Sorting and aggregation can require more model work than the final
+row limit suggests. Inspect `query.explain()` rather than assuming that
+`LIMIT` limits AI calls.
 
 ## Column expressions
 
-Use a dotted path to read a field of a struct column, such as
-`r.details.body`. Text functions can read text columns
-or fields within a struct.
+Use a dotted path for a struct field, such as `p.details.body`.
+DataFusion's
+[scalar functions](https://datafusion.apache.org/user-guide/sql/scalar_functions.html)
+work in expressions, including document arguments to `PROMPT`.
 
-For example, imagine a `pages` table with an `id` column and a `details`
-struct containing a `body` field. Return the IDs and text lengths of
-pages that discuss shipping:
+E.g., a `pages` table has `id` and a `details` struct with a `body` field:
 
 ```sql
 SELECT p.id, LENGTH(p.details.body) AS body_length
@@ -225,339 +116,109 @@ WHERE AI.IF(PROMPT('Does the page discuss shipping? {0}', p.details.body))
 ORDER BY body_length;
 ```
 
-- Struct fields and text functions work in `PROMPT`, `ON`, `WHERE`,
-  `SELECT`, `ORDER BY`, `GROUP BY`, and aggregate arguments.
-- Use `AS` to name a result column. Without `AS`, Quail uses the expression
-  text, such as `length(p.details.body)`.
-- Functions can nest and take literals in every clause, such as
-  `LOWER(TRIM(p.details.body))` or `ABS(r.stars - 3)`.
-- An expression can call any of DataFusion's scalar functions; see
-  [Scalar functions](#scalar-functions).
-
-For example, the function entries below use a review row where `r.body`
-is `' Great Film '`, including the spaces at both ends.
-
-### `LENGTH(column)`
-
-Counts characters, including spaces.
-
-`LENGTH(r.body)` returns `12`.
-
-### `LOWER(column)`
-
-Converts text to lowercase and preserves spaces.
-
-`LOWER(r.body)` returns `' great film '`.
-
-### `UPPER(column)`
-
-Converts text to uppercase and preserves spaces.
-
-`UPPER(r.body)` returns `' GREAT FILM '`.
-
-### `TRIM(column)`
-
-Removes whitespace at both ends of the text.
-
-`TRIM(r.body)` returns `'Great Film'`.
+Functions can nest. E.g., `LOWER(TRIM(p.details.body))` removes surrounding
+spaces and converts the text to lowercase.
 
 ### Scalar functions
 
-An expression can call any of
-[DataFusion's scalar functions](https://datafusion.apache.org/user-guide/sql/scalar_functions.html),
-such as `ABS`, `REVERSE`, `SUBSTR`, or `REGEXP_LIKE`, with their SQL
-meaning. DataFusion evaluates them: a plain test or column runs before the
-model reads a row, and a test of a model's answer, such as
-`SPLIT_PART(lease.ends, ' ', 1) = 'March'`, runs as each answer settles. `WHERE` takes the same expressions as `SELECT`: a
-function that returns a boolean, such as `STARTS_WITH(r.body, 'Great')`,
-is a condition by itself.
+DataFusion evaluates scalar expressions. A test of an AI answer runs
+after that answer is available.
 
-For example, return the reviews whose star rating is within one of 4:
+E.g., restrict reviews to ratings within one star of 4:
 
 ```sql
 SELECT r.id, ABS(r.stars - 4) AS gap
 FROM reviews r
-WHERE AI.IF(PROMPT('Is the review positive? {0}', r.body))
-  AND ABS(r.stars - 4) <= 1;
+WHERE ABS(r.stars - 4) <= 1
+  AND AI.IF(PROMPT('Is the review positive? {0}', r.body));
 ```
-
-An aggregate or window function, such as `SUM` or `ROW_NUMBER`, reads more
-than one row, so Quail refuses it in an expression; use `GROUP BY` for an
-aggregate.
 
 ## Text conditions
 
-Each condition tests a text column against a constant string or pattern.
-Text function names differ between BigQuery and Snowflake.
+| Expression | Meaning |
+| --- | --- |
+| `value LIKE pattern` | Case-sensitive match; `%` matches any text and `_` matches one character. |
+| `value ILIKE pattern` | The same match without case sensitivity. |
+| `REGEXP_CONTAINS(value, pattern)` in BigQuery | Regular expression match anywhere in the value. |
+| `REGEXP_LIKE(value, pattern)` in BigQuery | Regular expression match anywhere in the value. |
+| `REGEXP_LIKE(value, pattern)` in Snowflake | Regular expression match against the whole value. |
+| `RLIKE(value, pattern)` in Snowflake | Alias for `REGEXP_LIKE`. |
 
-- Text conditions exclude null values. Use `NOT` to negate a text
-  condition, such as `NOT CONTAINS_SUBSTR(r.body, 'shipping')`.
-  Negated conditions also exclude null values.
-- To compare text length or change case before a comparison, use a
-  [column expression](#column-expressions), such as `LENGTH(r.body) < 40`
-  or `LOWER(r.body) = 'shipping'`.
-- Text conditions also work on [extracted answers](/docs/user-guide/sql/ai-functions#filter-on-answers).
-  Classification labels support only `=` and `IN`.
+E.g., for `r.body = 'Great Film'`, Snowflake's
+`REGEXP_LIKE(r.body, 'Film')` is false;
+`REGEXP_LIKE(r.body, '.*Film.*')` is true.
 
-For example, the entries below use a review row where `r.body` is
-`'Great Film'`.
-
-### `column LIKE pattern`
-
-Matches text with case sensitivity. `%` matches any text; `_` matches one character.
-
-`r.body LIKE '%Film%'` returns `TRUE`.
-
-### `column ILIKE pattern`
-
-Uses the same patterns as `LIKE` and ignores case.
-
-`r.body ILIKE '%film%'` returns `TRUE`.
-
-### `CONTAINS_SUBSTR(column, text)`
-
-Finds the supplied text anywhere in the value, ignoring case.
-
-`CONTAINS_SUBSTR(r.body, 'film')` returns `TRUE`.
-
-Use this function in the BigQuery dialect.
-
-### `CONTAINS(column, text)`
-
-Finds the supplied text anywhere in the value, with case sensitivity.
-
-`CONTAINS(r.body, 'film')` returns `FALSE`.
-
-Use this function in the Snowflake dialect.
-
-### `STARTS_WITH(column, text)`
-
-Tests whether the value begins with the supplied text, with case sensitivity.
-
-`STARTS_WITH(r.body, 'Great')` returns `TRUE`.
-
-In Snowflake, use `STARTSWITH(r.body, 'Great')`.
-
-### `ENDS_WITH(column, text)`
-
-Tests whether the value ends with the supplied text, with case sensitivity.
-
-`ENDS_WITH(r.body, 'Film')` returns `TRUE`.
-
-In Snowflake, use `ENDSWITH(r.body, 'Film')`.
-
-### `REGEXP_CONTAINS(column, pattern)`
-
-Finds a regular expression match anywhere in the value.
-
-`REGEXP_CONTAINS(r.body, 'Film')` returns `TRUE`.
-
-Use this function in the BigQuery dialect.
-
-### `REGEXP_LIKE(column, pattern)`
-
-Requires a regular expression match against the whole value.
-
-`REGEXP_LIKE(r.body, 'Film')` returns `FALSE`.
-
-Use this function in the Snowflake dialect, where `RLIKE(column,
-pattern)` is an alias. In the BigQuery dialect, `REGEXP_LIKE` is
-DataFusion's function, which finds a match anywhere in the value, as
-`REGEXP_CONTAINS` does.
-
-Use `REGEXP_LIKE(r.body, '.*Film.*')` to match "Film" anywhere in the value.
+Use `RLIKE(value, pattern)`, not the removed `value RLIKE pattern`
+or `value REGEXP pattern` operators.
+Text conditions also work on
+[extracted answers](/docs/user-guide/sql/ai-functions#filter-on-answers).
 
 ## GROUP BY and HAVING
 
-`GROUP BY` groups rows by columns or [column expressions](#column-expressions).
-To group by a score or classification label, use its `AS` name.
-Return grouping columns and aggregate results in `SELECT`, and give
-each aggregate an `AS` name.
+DataFusion groups the rows that model regions return.
+Use `HAVING` to filter the groups.
 
-`HAVING` filters groups by comparing an aggregate with a number. Refer
-to the aggregate by its name or write the function call. Combine
-conditions with `AND`.
-
-For example, imagine a `reviews` table with review text in `body` and
-numeric ratings in `stars`. Return the count and average rating for
-each sentiment, keeping sentiments with more than ten reviews:
+E.g., count reviews by sentiment and keep labels with more than ten
+reviews. The `reviews` table has review text in `body`:
 
 ```sql
-SELECT AI.CLASSIFY(PROMPT('What is the sentiment of this review? {0}', r.body),
+SELECT AI.CLASSIFY(PROMPT('What is the sentiment? {0}', r.body),
                    ['positive', 'negative', 'mixed']) AS sentiment,
-       COUNT(*) AS review_count,
-       AVG(r.stars) AS avg_stars
+       COUNT(*) AS review_count
 FROM reviews r
 GROUP BY sentiment
-HAVING review_count > 10
-ORDER BY review_count DESC
+HAVING COUNT(*) > 10
+ORDER BY review_count DESC;
 ```
-
-Quail classifies every review before computing the counts and averages.
-Adding `LIMIT` reduces the number of returned groups, not the reviews
-that Quail classifies.
 
 ### Aggregate functions
 
-DataFusion runs `GROUP BY`, `HAVING`, and the aggregates on the rows
-the model region returns, so every DataFusion aggregate function works.
-The entries below are the common ones. Functions that take a column
-ignore null values. The column can contain stored values or AI outputs.
-An aggregate can also take an AI call directly, such as
-`AVG(AI.SCORE(...))`. Without `GROUP BY`, aggregates operate on all
-rows that pass `WHERE`.
-
-For example, the aggregate entries below use a group of four reviews
-whose `r.stars` values are `2`, `5`, `5`, and `NULL`.
-
-#### `COUNT(*)`
-
-Counts every row in the group.
-
-`COUNT(*)` returns `4`.
-
-#### `COUNT(column)`
-
-Counts values that are not null.
-
-`COUNT(r.stars)` returns `3`.
-
-#### `COUNT(DISTINCT column)`
-
-Counts each distinct non-null value once.
-
-`COUNT(DISTINCT r.stars)` returns `2`.
-
-#### `SUM(column)`
-
-Adds the non-null values.
-
-`SUM(r.stars)` returns `12`.
-
-#### `AVG(column)`
-
-Computes the average of the non-null values.
-
-`AVG(r.stars)` returns `4.0`.
-
-#### `MIN(column)`
-
-Returns the smallest non-null value.
-
-`MIN(r.stars)` returns `2`.
-
-#### `MAX(column)`
-
-Returns the largest non-null value.
-
-`MAX(r.stars)` returns `5`.
+Use DataFusion's
+[aggregate functions](https://datafusion.apache.org/user-guide/sql/aggregate_functions.html)
+on stored columns or AI answers. An aggregate can read an AI call
+directly. Without `GROUP BY`, it reads all rows that pass `WHERE`.
 
 ## Window functions
 
-Window functions add values computed from related result rows, such as
-the previous row's label or a running total. Each input row remains a
-separate result row. A partition is the group of rows used for each
-calculation.
+DataFusion computes windows over rows that model regions return.
+A window adds a value without combining its input rows into one row.
 
-Write `function(...) OVER (...) AS name` in `SELECT`:
-
-- `PARTITION BY` groups rows for the calculation. Without it, all
-  result rows belong to one partition.
-- `ORDER BY` inside `OVER` orders rows within each partition. Include
-  a unique key when ties would make the previous or next row ambiguous.
-- The query's outer `ORDER BY` sets the returned row order. It can use
-  a window output's `AS` name.
-
-For example, imagine a `steps` table with one row per agent step.
-It has columns `id`, `run_id`, `step_index`, `cost`, and `text`, with
-unique step indexes within each run. Classify each step, return the
-previous step's label, and compute the running cost within each run:
+E.g., the `steps` table has text and a unique `step_index` within each
+`run_id`. Classify each step and return the preceding step's label:
 
 ```sql
-SELECT s.id,
-       AI.CLASSIFY(
-           PROMPT('What does the agent do here?\n\n{0}', s.text),
-           ['plan', 'act', 'reflect']) AS kind,
-       LAG(kind) OVER (
-           PARTITION BY s.run_id ORDER BY s.step_index) AS previous,
-       SUM(s.cost) OVER (
-           PARTITION BY s.run_id ORDER BY s.step_index) AS running_cost
-FROM steps s
-ORDER BY s.run_id, s.step_index;
+WITH classified AS (
+    SELECT s.id, s.run_id, s.step_index,
+           AI.CLASSIFY(PROMPT('What does the agent do here? {0}', s.text),
+                       ['plan', 'act', 'reflect']) AS kind
+    FROM steps s
+)
+SELECT c.id, c.kind,
+       LAG(c.kind) OVER (
+           PARTITION BY c.run_id ORDER BY c.step_index) AS previous
+FROM classified c
+ORDER BY c.run_id, c.step_index;
 ```
 
-The first step in each run has a null `previous` value. Later steps use
-the label already computed for the preceding row. The window calculation
-does not call the model again. A window can read a source column or an
-AI output defined earlier in `SELECT`.
+The first step in each run has a null `previous` value.
+The window reads existing labels; it does not call the model again.
 
 ### Supported functions
 
-DataFusion runs windows on the rows the model region returns, so every
-DataFusion window function and frame works. The entries below are the
-common ones. `SUM` returns null while every value so far is null. `LAG`
-and `LEAD` preserve null values in the neighboring row. Rows with null
-partition keys belong to the same partition.
-
-For example, the window entries below use one run with `s.cost` values
-`2`, `NULL`, and `5`, in `s.step_index` order. Each expression uses
-`OVER (PARTITION BY s.run_id ORDER BY s.step_index)`. Results are listed
-in step order.
-
-#### `ROW_NUMBER() OVER (...)`
-
-Numbers rows within the partition, starting at 1.
-
-`ROW_NUMBER() OVER (PARTITION BY s.run_id ORDER BY s.step_index)` returns `1, 2, 3`.
-
-#### `LAG(column) OVER (...)`
-
-Reads the preceding row, or returns null for the first row.
-
-`LAG(s.cost) OVER (PARTITION BY s.run_id ORDER BY s.step_index)` returns `NULL, 2, NULL`.
-
-#### `LEAD(column) OVER (...)`
-
-Reads the following row, or returns null for the last row.
-
-`LEAD(s.cost) OVER (PARTITION BY s.run_id ORDER BY s.step_index)` returns `NULL, 5, NULL`.
-
-#### `SUM(column) OVER (...)`
-
-Adds values through the current row, treating null as zero.
-
-`SUM(s.cost) OVER (PARTITION BY s.run_id ORDER BY s.step_index)` returns `2, 2, 7`.
-
-#### `COUNT(*) OVER (...)`
-
-Counts every row through the current row.
-
-`COUNT(*) OVER (PARTITION BY s.run_id ORDER BY s.step_index)` returns `1, 2, 3`.
-
-#### `COUNT(column) OVER (...)`
-
-Counts non-null values through the current row.
-
-`COUNT(s.cost) OVER (PARTITION BY s.run_id ORDER BY s.step_index)` returns `1, 1, 2`.
+Use DataFusion's
+[window functions](https://datafusion.apache.org/user-guide/sql/window_functions.html)
+and window frames. `ORDER BY` inside `OVER` controls the calculation;
+the query's outer `ORDER BY` controls returned row order.
 
 ### Window limits
 
-- A window runs after the AI functions it reads, so a `LIMIT` above it
-  does not stop model evaluation early.
-- A window whose result a later AI function reads goes in a CTE or
-  FROM subquery. DataFusion computes it between the two model regions.
+A later AI call cannot read a window value in the same `SELECT`.
+Put the window calculation in a CTE or `FROM` subquery instead.
 
 ## Unsupported SQL
 
-Quail runs the operators that call the model and those that change
-what the model reads; DataFusion runs the rest, so SQL that DataFusion
-runs also runs with AI functions in it. For example, a `LEFT JOIN`, an
-`INTERSECT`, a scalar subquery, or a query with no AI function at all
-runs in DataFusion around the model regions. These are refused:
-
-- `OR` between an AI function and another test. Put the disjunction
-  inside one prompt's text instead.
-- An AI function that reads the result of a `GROUP BY` or a window in
-  the same `SELECT`. Read it from a CTE instead.
-
-Using any of these raises `quail.common.expressions.CompileError`.
+Quail checks AI calls and their restrictions within model regions.
+DataFusion checks the surrounding SQL.
+See [AI functions](/docs/user-guide/sql/ai-functions) for function-specific
+limits and [Refusals](/docs/user-guide/results#refusals) for configuration
+errors.

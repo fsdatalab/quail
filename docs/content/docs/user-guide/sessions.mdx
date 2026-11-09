@@ -2,97 +2,67 @@
 title: Running queries
 ---
 
-Every Quail query runs inside a session. The session loads the model,
-compiles GPU kernels, and tokenizes your documents. Multiple queries
-on the same session reuse the loaded model and tokenized documents.
+A session holds your model configuration and registered tables.
+Reuse it for queries over the same inputs.
 
 ## Creating a session
 
-```python
-import quail
-
-config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
-with quail.Session(config=config) as session:
-    ...
-```
-
-`gpus` defaults to 1.
-
-The session is a context manager. Collect result rows before closing it:
-result collection reads from the session's temporary files. Those files
-must fit on local disk. `Session.close()` waits for background tokenization
-and removes the temporary files.
+Set `model` and `device` in `EngineConfig`. Neither has a default.
+`gpus` defaults to 1. See [Models and GPUs](/docs/user-guide/models)
+for supported values.
 
 ## Registering tables
 
-Register each input table before writing a query. The name you
-register becomes the SQL table name.
-
-```python
-session.register("reviews", quail.DocumentProvider.from_dataset(reviews, id_col="id"))
-session.register("aspects", quail.DocumentProvider.from_table(aspects, id_col="id"))
-```
-
-You can register as many tables as you need. These are the available
-`DocumentProvider` factories:
+`session.register(name, provider)` makes a table available under `name`
+in SQL. Each provider requires an `id_col`.
 
 | Factory | Source |
 | --- | --- |
 | `DocumentProvider.from_table(table, id_col)` | In-memory Arrow table |
 | `DocumentProvider.from_parquet(path, id_col)` | Parquet file or directory |
 | `DocumentProvider.from_ipc(path, id_col)` | Arrow IPC file |
-| `DocumentProvider.from_dataset(dataset, id_col)` | Any `pyarrow.dataset.Dataset` |
-| `DocumentProvider.from_hf(dataset, id_col)` | Hugging Face dataset |
-
-Every provider needs an `id_col` that identifies each document.
+| `DocumentProvider.from_dataset(dataset, id_col)` | `pyarrow.dataset.Dataset` |
+| `DocumentProvider.from_hf(dataset, id_col)` | Hugging Face repository name; optional `split`, `config`, and `revision` |
 
 ## Running queries
 
-Once tables are registered, run SQL queries with `session.sql()`. You
-can run multiple queries on the same session.
+E.g., register two reviews and filter them:
 
 ```python
-result_1 = session.sql("""
-    SELECT r.id FROM reviews r
-    WHERE AI.IF(PROMPT('Is this review positive?\n\n{0}', r.body))
-""", dialect="bq").collect()
+import pyarrow as pa
+import quail
 
-result_2 = session.sql("""
-    SELECT r.id, a.aspect FROM reviews r, aspects a
-    WHERE AI.IF(PROMPT('Does the review discuss this aspect?\n\n{0}\n\n{1}',
-                       r.body, a.aspect))
-""", dialect="bq").collect()
+reviews = pa.table({
+    "id": ["r1", "r2"],
+    "body": ["The acting was excellent.", "The plot was confusing."],
+})
+config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
+with quail.Session(config=config) as session:
+    session.register("reviews", quail.DocumentProvider.from_table(reviews, id_col="id"))
+    rows = session.sql("""
+        SELECT r.id FROM reviews r
+        WHERE AI.IF(PROMPT('Is this review positive? {0}', r.body))
+    """, dialect="bq").collect()
+    print(rows)
 ```
 
-The first query loads the model onto the GPU. Later queries on the
-same session reuse that model, the compiled kernels, and the tokenized
-documents. `sql()` returns a [`Query`](/docs/user-guide/results#read-the-results).
+`sql()` returns a [`Query`](/docs/user-guide/results#read-the-results).
+`collect()` runs it and returns an Arrow table. Use `run()` instead
+when you also need the plan and metrics.
 
 ## Running on Quail Server
 
-Pass a [Quail Server](/docs/user-guide/server) URL as `endpoint`.
-`sql()` then returns a
-[`RemoteQuery`](/docs/user-guide/server#submit-a-query). Submitted queries
-continue after the client exits. Another client can retrieve the saved
-record by its query id.
+Pass `endpoint` to submit queries to
+[Quail Server](/docs/user-guide/server).
+E.g., replace the session line above with
+`with quail.Session(config=config, endpoint="http://127.0.0.1:8642") as session:`.
 
-```python
-with quail.Session(config=config, endpoint="http://127.0.0.1:8642") as session:
-    ...
-```
-
-Remote queries use SQL. The server compiles and plans them when execution
-starts. After submission, read the plan from
-`run.status().plan["text"]`.
+`sql()` returns a [`RemoteQuery`](/docs/user-guide/server#submit-a-query).
+Accepted queries continue after the client exits. Save the query ID
+from `submit()` to retrieve the query from another client.
 
 ## Multiple GPUs
 
-Set `gpus` to use more than one GPU. Each GPU holds one complete
-model copy.
-
-```python
-config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm", gpus=4)
-```
-
-See [Supported models and GPUs](/docs/user-guide/models) for the
-full list of configurations.
+Set `gpus` in `EngineConfig`. Each GPU holds a complete model copy.
+E.g., replace the configuration above with
+`quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm", gpus=4)`.
