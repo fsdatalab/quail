@@ -8,7 +8,6 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::Session;
 use datafusion::common::config::ConfigOptions;
-use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{Result, internal_err};
 use datafusion::execution::context::QueryPlanner;
@@ -22,13 +21,16 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::filter_pushdown::{
     ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
 };
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::stream::{
+    RecordBatchReceiverStreamBuilder, RecordBatchStreamAdapter,
+};
 use datafusion::physical_plan::{
     ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
     PlanProperties, ReplaceChildrenOptions,
 };
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
-use futures::channel::{mpsc, oneshot};
+use futures::SinkExt;
+use futures::channel::oneshot;
 use futures::{StreamExt, stream};
 
 use crate::region::ModelRegion;
@@ -266,84 +268,91 @@ impl ExecutionPlan for ModelRegionExec {
         let inputs = self.inputs.clone();
         let fetch = self.fetch;
         let hint = self.hint.clone();
-        let (sender, receiver) = mpsc::unbounded::<Result<RecordBatch>>();
+        let schema = Arc::clone(&self.schema);
         // the region starts when DataFusion first reads it: a hash join
         // reads its probe side once its build side, and so its filter, is
         // complete
         let start = move || {
-            SpawnedTask::spawn(async move {
-                // each input's batches go to a channel the runner reads; the
-                // tasks live as long as this one
-                let mut readers = Vec::new();
-                let mut streams: Vec<InputStream> = Vec::new();
-                let mut first = Vec::new();
-                for (name, input) in region.input_names.iter().zip(inputs) {
-                    let (batches, received) = std::sync::mpsc::channel();
-                    let (arrived, waiting) = oneshot::channel::<()>();
-                    let context = Arc::clone(&context);
-                    readers.push(SpawnedTask::spawn(async move {
-                        let mut arrived = Some(arrived);
-                        match execute_stream(input, context) {
-                            Ok(mut found) => {
-                                while let Some(batch) = found.next().await {
-                                    if batches.send(batch).is_err() {
-                                        break;
-                                    }
-                                    if let Some(arrived) = arrived.take() {
-                                        let _ = arrived.send(());
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                let _ = batches.send(Err(error));
-                            }
-                        }
-                    }));
-                    streams.push((name.clone(), Box::new(received.into_iter())));
-                    first.push(waiting);
-                }
-                // a region starts once each input has a batch or has ended: an
-                // input that is another region's rows then runs first, on the
-                // same thread
-                for waiting in first {
-                    let _ = waiting.await;
-                }
-                // the runner blocks while the region runs; Quail's hands the
-                // region to the thread that called DataFusion
-                let run = SpawnedTask::spawn_blocking(move || {
-                    let batches = match runner.run(&region, streams, fetch, &hint) {
-                        Ok(batches) => batches,
+            // the builder's stream reports a failed or panicked task as an
+            // error, and dropping the stream stops the tasks
+            let mut builder = RecordBatchReceiverStreamBuilder::new(schema, BUFFERED_BATCHES);
+            let mut streams: Vec<InputStream> = Vec::new();
+            let mut first = Vec::new();
+            for (name, input) in region.input_names.iter().zip(inputs) {
+                let (mut batches, received) =
+                    futures::channel::mpsc::channel::<Result<RecordBatch>>(BUFFERED_BATCHES);
+                let (arrived, waiting) = oneshot::channel::<()>();
+                let context = Arc::clone(&context);
+                builder.spawn(async move {
+                    let mut arrived = Some(arrived);
+                    let mut found = match execute_stream(input, context) {
+                        Ok(found) => found,
                         Err(error) => {
-                            let _ = sender.unbounded_send(Err(error));
-                            return;
+                            let _ = batches.send(Err(error)).await;
+                            return Ok(());
                         }
                     };
-                    for batch in (Limited {
-                        batches,
-                        remaining: fetch,
-                    }) {
-                        // the receiver is gone once DataFusion stops reading
-                        if sender.unbounded_send(batch).is_err() {
-                            return;
+                    while let Some(batch) = found.next().await {
+                        // the runner stopped reading this input
+                        if batches.send(batch).await.is_err() {
+                            break;
+                        }
+                        if let Some(arrived) = arrived.take() {
+                            let _ = arrived.send(());
                         }
                     }
+                    Ok(())
                 });
-                let _ = run.join().await;
-                drop(readers);
-            })
-        };
-        // the task lives as long as the stream: dropping the stream ends it
-        let batches =
-            stream::once(async move { (receiver, start()) }).flat_map(|(receiver, task)| {
-                stream::unfold((receiver, task), |(mut receiver, task)| async move {
-                    let batch = receiver.next().await?;
-                    Some((batch, (receiver, task)))
-                })
+                streams.push((name.clone(), Box::new(BlockingReceiver(received))));
+                first.push(waiting);
+            }
+            let sender = builder.tx();
+            // the runner blocks while the region runs; Quail's hands the
+            // region to the thread that called DataFusion
+            builder.spawn_blocking(move || {
+                // a region starts once each input has a batch or has ended:
+                // an input that is another region's rows then runs first, on
+                // the same thread
+                for waiting in first {
+                    let _ = futures::executor::block_on(waiting);
+                }
+                let batches = runner.run(&region, streams, fetch, &hint)?;
+                for batch in (Limited {
+                    batches,
+                    remaining: fetch,
+                }) {
+                    // the receiver is gone once DataFusion stops reading
+                    if sender.blocking_send(batch).is_err() {
+                        break;
+                    }
+                }
+                Ok(())
             });
+            builder.build()
+        };
+        let batches = stream::once(async move { start() }).flatten();
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&self.schema),
             batches,
         )))
+    }
+}
+
+/// How many batches each channel into and out of a region holds before
+/// its sender waits.
+const BUFFERED_BATCHES: usize = 2;
+
+/// One region input's batches, read on a thread that may block.
+///
+/// The thread that runs a region may be inside the tokio runtime, where
+/// tokio's blocking receive panics, so this waits with `futures`' executor.
+struct BlockingReceiver(futures::channel::mpsc::Receiver<Result<RecordBatch>>);
+
+impl Iterator for BlockingReceiver {
+    type Item = Result<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        futures::executor::block_on(self.0.next())
     }
 }
 

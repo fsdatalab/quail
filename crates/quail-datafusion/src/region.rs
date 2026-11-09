@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::fmt;
 
-use datafusion::common::{DFSchemaRef, Result};
+use datafusion::common::{DFSchemaRef, Result, internal_err};
 use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore};
 
 /// Connected logical model work that Quail plans as one unit.
@@ -76,7 +76,15 @@ impl UserDefinedLogicalNodeCore for ModelRegion {
         Ok(())
     }
 
-    fn with_exprs_and_inputs(&self, _exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> Result<Self> {
+    fn with_exprs_and_inputs(&self, exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> Result<Self> {
+        if !exprs.is_empty() || inputs.len() != self.inputs.len() {
+            return internal_err!(
+                "ModelRegion has no expressions and {} inputs, got {} and {}",
+                self.inputs.len(),
+                exprs.len(),
+                inputs.len()
+            );
+        }
         Ok(Self {
             inputs,
             ..self.clone()
