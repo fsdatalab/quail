@@ -14,7 +14,7 @@ use quail_cost::quantity::{Quantity, numpy_sum};
 use quail_cost::specs::{DeviceSpec, ModelSpec, read_devices, read_models};
 use quail_cost::statistics::AliasStats;
 use quail_cost::work::Work;
-use quail_cost::{budgets, packing, sol};
+use quail_cost::{packing, sol};
 
 /// A number, or a list of numbers, from Python.
 fn quantity(value: &Bound<'_, PyAny>) -> PyResult<Quantity> {
@@ -134,7 +134,7 @@ impl CostModel {
         Ok(self.device(device)?.gemm_flops(precision))
     }
 
-    /// `quail.common.sol.unrounded_seconds`.
+    /// `sol::unrounded_seconds`.
     fn unrounded_seconds(
         &self,
         work: &Bound<'_, PyDict>,
@@ -151,40 +151,6 @@ impl CostModel {
             chunk_tokens,
             rows,
             head_rows,
-        ))
-    }
-
-    /// `arena_pages`; raises ValueError where Python's does.
-    #[pyo3(signature = (model, device, chunk_tokens=None, mean_document_tokens=None))]
-    fn arena_pages(
-        &self,
-        model: &str,
-        device: &str,
-        chunk_tokens: Option<i64>,
-        mean_document_tokens: Option<f64>,
-    ) -> PyResult<(i64, i64)> {
-        budgets::arena_pages(
-            self.model(model)?,
-            self.device(device)?,
-            chunk_tokens,
-            mean_document_tokens,
-        )
-        .map_err(PyValueError::new_err)
-    }
-
-    /// `checkpoint_slots`.
-    fn checkpoint_slots(
-        &self,
-        model: &str,
-        device: &str,
-        chunk_tokens: i64,
-        kv_pages: i64,
-    ) -> PyResult<i64> {
-        Ok(budgets::checkpoint_slots(
-            self.model(model)?,
-            self.device(device)?,
-            chunk_tokens,
-            kv_pages,
         ))
     }
 
@@ -208,7 +174,7 @@ impl CostModel {
         Ok(fields)
     }
 
-    /// `choose_pass_groups`; raises ValueError where Python's does.
+    /// `packing::choose_pass_groups`; raises ValueError on its error.
     #[allow(clippy::too_many_arguments)]
     fn choose_pass_groups(
         &self,
