@@ -1,9 +1,13 @@
 name: CI
 
+# Manual only: run it from the Actions tab or `gh workflow run ci.yml
+# --ref <branch>`. Run the checks locally before pushing (AGENTS.md).
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   checks:
