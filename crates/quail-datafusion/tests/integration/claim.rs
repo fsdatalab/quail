@@ -6,7 +6,7 @@ use datafusion::common::{Constraint, Constraints, Result, exec_err};
 use datafusion::datasource::MemTable;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
-use quail_datafusion::{ModelRegion, RegionRunner, session_context, sql};
+use quail_datafusion::{ModelRegion, RegionRunner, session_context};
 
 /// A runner for planning tests, which never run a region. Execution is
 /// covered end to end in `tests/api/test_session_context.py`.
@@ -62,7 +62,7 @@ fn context() -> Result<SessionContext> {
 }
 
 async fn optimized(context: &SessionContext, query: &str) -> Result<LogicalPlan> {
-    sql(context, query).await?.into_optimized_plan()
+    context.sql(query).await?.into_optimized_plan()
 }
 
 /// Each model region of a plan, each checked to derive its operators.
@@ -261,7 +261,8 @@ async fn a_classification_is_a_column_the_projection_reads() -> Result<()> {
 async fn a_test_of_a_label_is_absorbed_into_its_classifications_filter() -> Result<()> {
     let context = context()?;
     let query = "SELECT r.id, AI.CLASSIFY(PROMPT('Tone of {0}?', r.body), ['good', 'bad']) \
-        AS tone FROM reviews r WHERE tone = 'good'";
+        AS tone FROM reviews r \
+        WHERE AI.CLASSIFY(PROMPT('Tone of {0}?', r.body), ['good', 'bad']) = 'good'";
     let [region] =
         <[ModelRegion; 1]>::try_from(regions(&optimized(&context, query).await?)).unwrap();
     let plan = lines(&region.plan);

@@ -14,12 +14,16 @@ use datafusion::logical_expr::{
     Volatility,
 };
 
+/// The suffix of the column that holds an extraction's answer
+/// positions, `AI.EXTRACT_SPAN`, as in Quail's `SPAN_SUFFIX`.
+pub const SPAN_SUFFIX: &str = "_span";
+
 /// The AI functions, by their internal names.
 ///
 /// SQL may also write `AI.IF` for `ai_filter`, and `AI.<name>` or
 /// `ai.<name>` for every other `ai_<name>`; see [`ai_function_name`].
-/// `ai_extract_span` is the answer positions of an `ai_extract`; see
-/// [`crate::add_extract_spans`].
+/// `ai_extract_span` is the answer positions of an `ai_extract` with the
+/// same arguments, which the same model run answers.
 pub const AI_FUNCTION_NAMES: [&str; 7] = [
     "ai_filter",
     "ai_score",
@@ -56,10 +60,6 @@ enum FunctionKind {
     SaeFeatures,
     Prompt,
     Hint,
-    /// The `WHERE` test recording an `UNNEST`; see [`crate::take_unnests`].
-    Unnest,
-    /// A field of an unnested list's element.
-    UnnestField,
 }
 
 /// One Quail function: an AI function, `PROMPT`, or `HINT`.
@@ -106,15 +106,12 @@ impl ScalarUDFImpl for QuailFunction {
 
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
         match self.kind {
-            FunctionKind::If | FunctionKind::Hint | FunctionKind::Unnest => Ok(DataType::Boolean),
+            FunctionKind::If | FunctionKind::Hint => Ok(DataType::Boolean),
             FunctionKind::Score => Ok(DataType::Float64),
             FunctionKind::Classify | FunctionKind::Map | FunctionKind::Prompt => Ok(DataType::Utf8),
             FunctionKind::SaeFeatures => Ok(sae_features_type()),
             FunctionKind::Extract | FunctionKind::ExtractSpan => {
                 plan_err!("{}'s type depends on its questions argument", self.name)
-            }
-            FunctionKind::UnnestField => {
-                plan_err!("{}'s type depends on its list and field", self.name)
             }
         }
     }
@@ -123,7 +120,6 @@ impl ScalarUDFImpl for QuailFunction {
         let data_type = match self.kind {
             FunctionKind::Extract => extract_type(args.arg_fields, DataType::Utf8)?,
             FunctionKind::ExtractSpan => extract_type(args.arg_fields, span_type())?,
-            FunctionKind::UnnestField => unnest_field_type(&args)?,
             _ => self.return_type(&[])?,
         };
         Ok(Arc::new(Field::new(self.name, data_type, true)))
@@ -134,25 +130,6 @@ impl ScalarUDFImpl for QuailFunction {
             "{} runs only inside a model region; ClaimModelRegions did not claim it",
             self.name
         )
-    }
-}
-
-/// The type of one field of an unnested list's element: the list, the
-/// list's name, and the field's name are the arguments.
-fn unnest_field_type(args: &ReturnFieldArgs) -> Result<DataType> {
-    let field = match args.scalar_arguments.get(2) {
-        Some(Some(datafusion::common::ScalarValue::Utf8(Some(name)))) => name.clone(),
-        _ => return plan_err!("an unnested field is named by a string literal"),
-    };
-    match args.arg_fields.first().map(|found| found.data_type()) {
-        Some(DataType::List(item)) => match item.data_type() {
-            DataType::Struct(fields) => match fields.iter().find(|found| found.name() == &field) {
-                Some(found) => Ok(found.data_type().clone()),
-                None => plan_err!("the unnested list has no field {field}"),
-            },
-            other => Ok(other.clone()),
-        },
-        _ => plan_err!("UNNEST reads a list"),
     }
 }
 
@@ -207,8 +184,6 @@ pub fn quail_functions() -> Vec<Arc<ScalarUDF>> {
         ("ai_sae_features", FunctionKind::SaeFeatures),
         ("prompt", FunctionKind::Prompt),
         ("hint", FunctionKind::Hint),
-        (crate::unnest::UNNEST_TEST, FunctionKind::Unnest),
-        (crate::unnest::UNNEST_FIELD, FunctionKind::UnnestField),
     ]
     .into_iter()
     .map(|(name, kind)| Arc::new(ScalarUDF::new_from_impl(QuailFunction::new(name, kind))))
@@ -249,75 +224,5 @@ pub(crate) fn column_call_kind(expr: &Expr) -> Option<&'static str> {
         "ai_map" => Some("map"),
         "ai_sae_features" => Some("features"),
         _ => None,
-    }
-}
-
-/// Write each `{'key': value, ...}` literal outside quotes as
-/// `named_struct('key', value, ...)`.
-///
-/// DataFusion reads the brace literal in the Snowflake dialect only;
-/// the front end also takes it in BigQuery SQL, as the questions of an
-/// `AI.EXTRACT`.
-pub fn brace_structs(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len());
-    // per open brace, the parentheses opened inside it
-    let mut braces: Vec<usize> = Vec::new();
-    let mut quote: Option<char> = None;
-    let mut chars = sql.chars().peekable();
-    while let Some(c) = chars.next() {
-        if let Some(open) = quote {
-            out.push(c);
-            if c == open {
-                if chars.peek() == Some(&open) {
-                    out.push(chars.next().expect("a doubled quote"));
-                } else {
-                    quote = None;
-                }
-            }
-            continue;
-        }
-        match c {
-            '\'' | '"' | '`' => {
-                quote = Some(c);
-                out.push(c);
-            }
-            '{' => {
-                braces.push(0);
-                out.push_str("named_struct(");
-            }
-            '}' if !braces.is_empty() => {
-                braces.pop();
-                out.push(')');
-            }
-            '(' => {
-                if let Some(depth) = braces.last_mut() {
-                    *depth += 1;
-                }
-                out.push(c);
-            }
-            ')' => {
-                if let Some(depth) = braces.last_mut() {
-                    *depth = depth.saturating_sub(1);
-                }
-                out.push(c);
-            }
-            ':' if braces.last() == Some(&0) => out.push(','),
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-#[cfg(test)]
-mod brace_tests {
-    use super::brace_structs;
-
-    #[test]
-    fn a_brace_literal_becomes_a_named_struct_outside_quotes() {
-        assert_eq!(
-            brace_structs("AI.EXTRACT(c.text, {'terms': 'Why: {0}?', 'n': f(a, b)})"),
-            "AI.EXTRACT(c.text, named_struct('terms', 'Why: {0}?', 'n', f(a, b)))"
-        );
-        assert_eq!(brace_structs("SELECT 'it''s {x}'"), "SELECT 'it''s {x}'");
     }
 }

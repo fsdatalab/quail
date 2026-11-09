@@ -1,12 +1,26 @@
 name: CI
 
+# CI runs when asked: add the label `run-ci` to a pull request (remove
+# and add it again to rerun after new pushes), mark a draft ready for
+# review, or start it from the Actions tab or with `gh workflow run
+# ci.yml --ref <branch>`. Run the checks locally before pushing
+# (AGENTS.md).
 on:
-  push:
-    branches: [main]
+  pull_request:
+    types: [labeled, ready_for_review]
   workflow_dispatch:
 
 jobs:
   checks:
+    if: >
+      github.event_name == 'workflow_dispatch'
+      || github.event.action == 'ready_for_review'
+      || github.event.label.name == 'run-ci'
+    # a new run of the same pull request or branch cancels the one running;
+    # a skipped run, such as for another label, cancels nothing
+    concurrency:
+      group: ci-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

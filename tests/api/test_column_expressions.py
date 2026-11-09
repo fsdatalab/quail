@@ -57,5 +57,13 @@ def test_select_order_and_group_take_expressions(session):
         "GROUP BY r.details.kind ORDER BY r.details.kind")
     assert _run(grouped, executor).to_rows() == [("a", 2), ("b", 1)]
     distinct = session.sql(
-        f"SELECT DISTINCT r.details.kind {FILTERED} ORDER BY r.details.kind")
+        f"SELECT DISTINCT r.details.kind {FILTERED} ORDER BY 1")
     assert _run(distinct, executor).to_rows() == [("a",), ("b",)]
+
+
+def test_a_struct_field_is_named_by_its_path_and_an_alias_as_written(session):
+    executor = make_executor({"r": {"q:": [1, 1, 1]}})
+    rows = _run(session.sql(
+        f'SELECT r.details.body, r.details.kind AS "a[b]" {FILTERED} ORDER BY 1'),
+        executor)
+    assert rows.columns == ["r.details.body", "a[b]"]

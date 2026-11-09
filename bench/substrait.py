@@ -100,7 +100,7 @@ def query_sql(info: PlanInfo, selectivity=None) -> str:
     for item in info.sae_features:
         outputs[item.output] = (
             f"AI.SAE_FEATURES({prompt(item.prompt, item.relation)}, "
-            f"pooling => {sql_string(item.pooling)})")
+            f"{{'pooling': {sql_string(item.pooling)}}})")
     for item in info.maps:
         outputs[item.output] = (
             f"AI.MAP({document(item.relation)}, "
@@ -125,9 +125,14 @@ def query_sql(info: PlanInfo, selectivity=None) -> str:
     selected = list(dict.fromkeys(field(name) for name in info.select))
 
     def tested(name: str) -> str:
-        """Name an output SELECT computes; otherwise write its call."""
+        """Write the call that computes an output; otherwise name the column.
+
+        SQL reads SELECT's aliases only in GROUP BY, HAVING, and ORDER BY,
+        so WHERE and an aggregate's argument repeat the call; the planner
+        asks the model once for both.
+        """
         name = field(name)
-        return outputs[name] if name in outputs and name not in selected else name
+        return outputs.get(name, name)
 
     measures = {}
     if info.aggregate is not None:

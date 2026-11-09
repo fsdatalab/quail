@@ -15,7 +15,8 @@
 //!    one AI filter, AI join, gate, or column operator.
 //!
 //! The engine plans each region from these operators, and a region whose
-//! shape they cannot hold is refused with [`UNSUPPORTED`] in the message.
+//! shape they cannot hold is refused with an unsupported
+//! [`CompileError`].
 //!
 //! For example, `SELECT r.id, AI.CLASSIFY(...) AS sentiment FROM reviews
 //! r WHERE AI.IF(...)` plans as an `AiNode` adding `sentiment` over an
@@ -34,9 +35,9 @@ use quail_physical::{
     Asked, ColumnRef, Equality, FilterPredicate, ModelCall, Projected, ValueExpression,
 };
 use quail_planner::expressions::{
-    CompileError, UNSUPPORTED, aliased_call, asked_call, asked_refs, call_aliases, call_refs,
-    column_alias_of, column_name, column_references, compile_error, condition_columns,
-    condition_text, equality_refs, equality_text, projected_call, repr_list, repr_str, value_refs,
+    CompileError, aliased_call, asked_call, asked_refs, call_aliases, call_refs, column_alias_of,
+    column_name, column_references, compile_error, condition_columns, condition_text,
+    equality_refs, equality_text, projected_call, repr_list, repr_str, value_refs,
 };
 use quail_planner::operators::{
     ColumnTest, Operators, Projection, Scan, SemanticColumn, SemanticJoin, source_columns,
@@ -60,8 +61,10 @@ use serde_json::Value;
 ///
 /// # Errors
 ///
-/// The region uses SQL outside Quail's language; a message that
-/// contains [`UNSUPPORTED`] names a shape DataFusion can run instead.
+/// The region uses SQL outside Quail's language; an unsupported error
+/// ([`CompileError::is_unsupported`]) names a shape DataFusion can run
+/// instead. Two calls that differ only in their texts' spelling are
+/// refused.
 pub fn derive_region(
     region: &ModelRegion,
     turn: &Turn,
@@ -69,6 +72,12 @@ pub fn derive_region(
 ) -> Result<(Operators, LogicalPlan), CompileError> {
     let plan =
         as_bound(region.plan.clone()).map_err(|error| CompileError::new(error.to_string()))?;
+    if let Some(found) = crate::similar::similar_calls(&plan)
+        .into_iter()
+        .find(|found| found.likeness == crate::similar::Likeness::Spelling)
+    {
+        return compile_error(found.message());
+    }
     let mut operators = derive_operators(&plan, turn, layout)?;
     if let Some(fetch) = region.fetch {
         operators = operators.limited(fetch as i64);
@@ -203,7 +212,10 @@ fn derive_operators(
     let mut binder = Binder::new(turn, layout, &select);
     let relation = Relation::bind(&walk, &mut binder, &answers)?;
     let Selected {
-        columns, structs, ..
+        columns,
+        structs,
+        spans,
+        ..
     } = binder.bind_select(&select)?;
     binder.validate_query(&columns, &structs)?;
     let unplaced_term = relation.unplaced;
@@ -228,6 +240,7 @@ fn derive_operators(
     found.projection = Projection {
         columns: columns.iter().cloned().map(Projected::Expression).collect(),
         structs,
+        spans,
     };
     found.projections = found
         .projection
@@ -252,10 +265,9 @@ fn derive_operators(
 
 /// The refusal of a plan whose operators Quail's operators do not read.
 fn unplaced(plan: &LogicalPlan) -> CompileError {
-    CompileError::new(format!(
-        "the placement of these operators {UNSUPPORTED}:\n{}",
-        plan.display_indent()
-    ))
+    let mut error = CompileError::unsupported("the placement of these operators");
+    error.0 = format!("{}:\n{}", error.0, plan.display_indent());
+    error
 }
 
 /// `plan` with a SELECT list at its root: DataFusion removes one that
@@ -994,10 +1006,6 @@ impl Relation {
             relation.bind_asked(walk, binder, id, node)?;
         }
         for term in walk.where_terms(answers) {
-            if crate::functions::function_name(&term) == Some(crate::UNNEST_TEST) {
-                // DataFusion unnests a list column the region returns
-                return unsupported("an UNNEST of a list that is not a model call's answer");
-            }
             relation.bind_where_term(binder, &term)?;
         }
         Ok(relation)

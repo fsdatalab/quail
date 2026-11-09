@@ -4,8 +4,8 @@
 //! Before DataFusion's optimizer, [`lower_regions`] finds each part of a
 //! query that Quail can plan and lowers its AI calls into `AiNode`s
 //! there ([`crate::LowerAiCalls`]). It walks the plan from the root.
-//! DataFusion keeps each `Aggregate`, `Window`, `Sort`, `Limit`, and
-//! `Distinct`, each AI call of theirs moved into a `Projection` below
+//! DataFusion keeps each `Aggregate`, `Window`, `Sort`, `Limit`,
+//! `Distinct`, and `Unnest`, each AI call of theirs moved into a `Projection` below
 //! them under a name they then read; and a `Projection`, `Filter`, or
 //! `SubqueryAlias` that calls no AI function above one of those. The
 //! first other operator whose whole subtree Quail can plan, and which
@@ -50,7 +50,7 @@ use crate::join_back::join_back;
 use crate::lift::lift_relational;
 use crate::region::ModelRegion;
 use crate::shared::{ROW_COLUMN, SharedInput, row_field};
-use quail_planner::expressions::UNSUPPORTED;
+use quail_planner::expressions::{CompileError, UNSUPPORTED};
 
 /// The name of [`ClaimModelRegions`], which runs after every other
 /// optimizer rule.
@@ -715,6 +715,7 @@ fn kept_by_datafusion(plan: &LogicalPlan) -> Result<bool> {
             | LogicalPlan::Sort(_)
             | LogicalPlan::Limit(_)
             | LogicalPlan::Distinct(_)
+            | LogicalPlan::Unnest(_)
     ) {
         return Ok(true);
     }
@@ -732,14 +733,11 @@ fn kept_by_datafusion(plan: &LogicalPlan) -> Result<bool> {
     })
 }
 
-/// The outermost AI calls in `expr`, each once; an unnested field counts
-/// whole, with the AI call it reads.
+/// The outermost AI calls in `expr`, each once.
 fn ai_calls(expr: &Expr) -> Result<Vec<Expr>> {
     let mut calls: Vec<Expr> = Vec::new();
     expr.apply(|inner| {
-        let unnested = matches!(inner, Expr::ScalarFunction(call)
-            if call.name() == crate::UNNEST_FIELD && inner.exists(|e| Ok(is_ai_call(e)))?);
-        if unnested || is_ai_call(inner) {
+        if is_ai_call(inner) {
             if !calls.contains(inner) {
                 calls.push(inner.clone());
             }
@@ -843,7 +841,7 @@ fn refusal(plan: &LogicalPlan, config: &ConfigOptions) -> Result<Option<String>>
                 .and_then(|placed| select_list(placed, None))
                 .and_then(|selected| lift_relational(selected).map(|(region, _)| region));
             return match placed.map(|placed| derive_error(&placed)) {
-                Ok(Some(error)) => plan_err!("{error}"),
+                Ok(Some(error)) => plan_err!("{}", error.0),
                 _ => Ok(None),
             };
         }
@@ -860,19 +858,19 @@ fn refusal(plan: &LogicalPlan, config: &ConfigOptions) -> Result<Option<String>>
 }
 
 /// Quail's binder's error for `plan` as a region, if it has one.
-fn derive_error(plan: &LogicalPlan) -> Option<String> {
+fn derive_error(plan: &LogicalPlan) -> Option<CompileError> {
     // the chat turn and layout change the prompts, not what Quail reads
     let turn: quail_planner::prompts::Turn = (String::new(), String::new());
     let region = ModelRegion::new(plan.clone());
-    crate::derive::derive_region(&region, &turn, "ai-if")
-        .err()
-        .map(|error| error.0)
+    crate::derive::derive_region(&region, &turn, "ai-if").err()
 }
 
 /// Quail's refusal of `plan`, a region's operators after DataFusion's
 /// optimizer, when the refusal is of a shape DataFusion can run instead.
 fn refusal_of(plan: &LogicalPlan) -> Option<String> {
-    derive_error(plan).filter(|error| error.contains(UNSUPPORTED))
+    derive_error(plan)
+        .filter(CompileError::is_unsupported)
+        .map(|error| error.0)
 }
 
 /// `plan` with each term of its filter that is a correlated `EXISTS` of

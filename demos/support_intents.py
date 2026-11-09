@@ -33,11 +33,12 @@ import pyarrow.parquet as pq
 MODEL = "qwen3.5-2b-sae-bf16"
 DEVICE = "h100-sxm"
 FEATURES_SQL = r"""
-SELECT t.id, intent.feature, intent.strength
-FROM conversations t,
-     UNNEST(AI.SAE_FEATURES(PROMPT('{0}\n\nWhat is the customer asking for?',
-                                   t.request),
-                            pooling => 'last')) AS intent
+SELECT x.id, x.intent['feature'] AS feature, x.intent['strength'] AS strength
+FROM (SELECT t.id,
+             UNNEST(AI.SAE_FEATURES(
+                 PROMPT('{0}\n\nWhat is the customer asking for?', t.request),
+                 {'pooling': 'last'})) AS intent
+      FROM conversations t) x
 """
 # Features kept per request after weighting.
 TOP_PER_REQUEST = 3

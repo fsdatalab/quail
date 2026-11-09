@@ -190,8 +190,9 @@ def test_fev9_executes_bound_and_edited_join_nodes_without_the_optimizer(
         assert edited_result.collect().to_pylist() == rows.to_pylist() == FEV9_ROWS
 
 
-TOPIC_SQL = ("AI.CLASSIFY(PROMPT('What is {0} about?', c.claim), "
-             "['science', 'sport']) AS topic")
+TOPIC_CALL = ("AI.CLASSIFY(PROMPT('What is {0} about?', c.claim), "
+              "['science', 'sport'])")
+TOPIC_SQL = f"{TOPIC_CALL} AS topic"
 PLAUSIBLE_SQL = ("AI_FILTER(PROMPT('Is {0} plausible?', c.claim), "
                  "{'selectivity': 0.9})")
 
@@ -220,7 +221,7 @@ def test_classification_runs_beside_filters_and_joins(monkeypatch):
               ON AI_FILTER(PROMPT('Does {{1}} support {{0}}?', c.claim, e.text),
                            {{'selectivity': 0.5}})
             WHERE {PLAUSIBLE_SQL}
-              AND HINT(topic IN ('science'), {{'selectivity': 0.5}})
+              AND HINT({TOPIC_CALL} IN ('science'), {{'selectivity': 0.5}})
         """)
         plan = query.plan()
         # the label test rejects half the claims and the filter a tenth,

@@ -154,7 +154,9 @@ def test_copies_of_a_text_on_several_gpus_are_asked_once(contracts):
 def test_an_extraction_after_a_test_on_several_gpus_reads_the_survivors(contracts):
     query = contracts.sql(
         "SELECT c.id, AI.EXTRACT(c.text, {'ends': 'When does it end?'}) AS lease "
-        "FROM contracts c WHERE lease.ends IS NOT NULL", order="as_written")
+        "FROM contracts c "
+        "WHERE AI.EXTRACT(c.text, {'ends': 'When does it end?'})['ends'] IS NOT NULL",
+        order="as_written")
     oracle = Oracle(answers=[None if text == "No date" else text for text in TEXTS])
     result = execute_query(query, physical_executor=oracle_executor(oracle))
     assert result.collect().column("c.id").to_pylist() == [1, 3]

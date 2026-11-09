@@ -187,6 +187,10 @@ pub struct Projection {
     /// Value expressions and Aliases.
     pub columns: Vec<Projected>,
     pub structs: Vec<ExtractStruct>,
+    /// The structs whose answer positions the SELECT list also returns,
+    /// as `AI.EXTRACT_SPAN(...) AS <struct>_span`, each after its struct.
+    #[serde(default)]
+    pub spans: Vec<String>,
 }
 
 /// The operators of one plan, in the order the plan was written.

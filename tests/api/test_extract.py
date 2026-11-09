@@ -46,7 +46,9 @@ def test_score_and_extract_return_both_columns(session, monkeypatch, filtered):
         "March 3, 2027" if document == 0 else None))
     query = session.sql(
         "SELECT c.id, AI.SCORE(PROMPT('Is this a lease? {0}', c.text)) AS score, "
-        f"AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease FROM contracts c "
+        f"AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease, "
+        f"AI.EXTRACT_SPAN(c.text, {{'ends': '{QUESTION}'}}) AS lease_span "
+        "FROM contracts c "
         + ("WHERE AI.SCORE(PROMPT('Is this a lease? {0}', c.text)) > 0.15"
            if filtered else ""))
     result = finish(query, oracle)
@@ -202,9 +204,10 @@ def test_request_backend_runs_the_fields_of_a_document_together():
 def test_stock_vllm_plans_and_runs_an_extraction(monkeypatch):
     session = request_tests._session(
         "stock_vllm", contracts={"id": ["a", "b", "c", "d"], "text": TEXTS})
+    fields = f"c.text, {{'ends': '{QUESTION}', 'term': 'How long is the term?'}}"
     query = session.sql(
-        f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}', "
-        f"'term': 'How long is the term?'}}) AS lease FROM contracts c")
+        f"SELECT c.id, AI.EXTRACT({fields}) AS lease, "
+        f"AI.EXTRACT_SPAN({fields}) AS lease_span FROM contracts c")
     boot = {"client": _PhraseClient(), "sampling_params": object(),
             "capacity": request_tests.CAPACITY}
     monkeypatch.setattr(
@@ -245,7 +248,7 @@ def test_stock_vllm_extracts_every_row_a_top_k_reads(monkeypatch):
             boot, {"kind": "cold", "boot_s": 0.1}))
     # the region extracts every row; DataFusion sorts them and keeps two
     rows = request_tests._run_stock_vllm(session, query).collect()
-    assert rows.column_names == ["c.id", "lease", "lease_span"]
+    assert rows.column_names == ["c.id", "lease"]
     leases = dict(zip(rows.column("c.id").to_pylist(),
                       rows.column("lease").to_pylist(), strict=True))
     assert len(leases) == 4
@@ -254,8 +257,10 @@ def test_stock_vllm_extracts_every_row_a_top_k_reads(monkeypatch):
     session.close()
 
 
-STRUCT_SQL = ("SELECT c.id, AI.EXTRACT(c.text, {'ends': '" + QUESTION
-              + "', 'rent': 'What is the rent?'}) AS lease FROM contracts c")
+STRUCT_FIELDS = ("c.text, {'ends': '" + QUESTION
+                 + "', 'rent': 'What is the rent?'}")
+STRUCT_SQL = (f"SELECT c.id, AI.EXTRACT({STRUCT_FIELDS}) AS lease, "
+              f"AI.EXTRACT_SPAN({STRUCT_FIELDS}) AS lease_span FROM contracts c")
 
 
 def _struct_answers():
@@ -293,12 +298,13 @@ def _answers_executor(answers):
 def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):
     from quail.api.execute import execute_query
 
+    fields = f"c.text, {{'ends': '{QUESTION}', 'rent': 'How much?'}}"
+    lease, span = f"AI.EXTRACT({fields})", f"AI.EXTRACT_SPAN({fields})"
     tests = " AND ".join(f"HINT({test}, {{'selectivity': 0.5}})" for test in (
-        "lease.ends IS NOT NULL", "lease.ends ILIKE '%march%'",
-        "lease_span.ends.start < 20", "LENGTH(lease.rent) < 20"))
+        f"{lease}['ends'] IS NOT NULL", f"{lease}['ends'] ILIKE '%march%'",
+        f"{span}['ends']['start'] < 20", f"LENGTH({lease}['rent']) < 20"))
     query = session.sql(
-        f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}', "
-        f"'rent': 'How much?'}}) AS lease FROM contracts c WHERE {tests}")
+        f"SELECT c.id, {lease} AS lease FROM contracts c WHERE {tests}")
     # each test follows its field's extraction
     found = operators_of(query)
     assert [column.name for column in found.extracts] == ["lease.ends", "lease.rent"]
@@ -346,9 +352,10 @@ def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):
     assert passed[("c", 0)].column("answer").to_pylist() == [True, False]
     assert passed[("c", 2)].column("answer").to_pylist() == [True]
     # a negated text test drops the null answer as SQL does
+    lease = f"AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}})"
     negated = session.sql(
-        f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease "
-        "FROM contracts c WHERE NOT (lease.ends LIKE 'March%')")
+        f"SELECT c.id, {lease} AS lease "
+        f"FROM contracts c WHERE NOT ({lease}['ends'] LIKE 'March%')")
     (test,) = column_tests(operators_of(negated))
     assert str(test.condition) == "NOT (c.lease.ends like 'March%')"
     result = execute_query(negated, physical_executor=_answers_executor(
@@ -360,9 +367,10 @@ def test_a_datafusion_function_arrow_compute_lacks_tests_an_answer(session):
     from quail.api.execute import execute_query
 
     # SPLIT_PART is DataFusion's; Arrow compute has no such function
+    lease = f"AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}})"
     query = session.sql(
-        f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease "
-        "FROM contracts c WHERE SPLIT_PART(lease.ends, ' ', 1) = 'March'")
+        f"SELECT c.id, {lease} AS lease "
+        f"FROM contracts c WHERE SPLIT_PART({lease}['ends'], ' ', 1) = 'March'")
     (test,) = column_tests(operators_of(query))
     assert str(test.condition) == "split_part(c.lease.ends, ' ', 1) = 'March'"
     result = execute_query(query, physical_executor=_answers_executor(
@@ -372,8 +380,11 @@ def test_a_datafusion_function_arrow_compute_lacks_tests_an_answer(session):
 def test_not_and_or_of_answers_run_after_the_extractions_they_read(session):
     from quail.api.execute import execute_query
 
-    head = (f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}', "
-            f"'rent': 'How much?'}}) AS lease FROM contracts c WHERE ")
+    fields = f"c.text, {{'ends': '{QUESTION}', 'rent': 'How much?'}}"
+    lease, span = f"AI.EXTRACT({fields})", f"AI.EXTRACT_SPAN({fields})"
+    head = f"SELECT c.id, {lease} AS lease FROM contracts c WHERE "
+    ends, rent = f"{lease}['ends']", f"{lease}['rent']"
+    start = f"{span}['ends']['start']"
 
     def placed(query):
         found = operators_of(query)
@@ -385,22 +396,22 @@ def test_not_and_or_of_answers_run_after_the_extractions_they_read(session):
         return result.collect().column("c.id").to_pylist()
 
     # one extraction's answer and span: the Filter follows the extraction
-    one = session.sql(head + "NOT (lease.ends IS NULL OR lease_span.ends.start < 0)")
+    one = session.sql(head + f"NOT ({ends} IS NULL OR {start} < 0)")
     assert placed(one) == [
         ("extraction", "c.lease.ends IS NOT NULL"),
         ("extraction", "NOT (c.lease.ends_span.start < 0)")]
-    one = session.sql(head + "lease.ends IS NULL OR lease_span.ends.start >= 0")
+    one = session.sql(head + f"{ends} IS NULL OR {start} >= 0")
     assert placed(one) == [
         ("extraction", "c.lease.ends IS NULL OR c.lease.ends_span.start >= 0")]
     assert kept(one) == [1, 2]
     # an answer and a source column, or two extractions: after the last
     # extraction read, each other column read by document ID
-    mixed = session.sql(head + "NOT (lease.ends IS NULL AND c.id = 2)")
+    mixed = session.sql(head + f"NOT ({ends} IS NULL AND c.id = 2)")
     # DataFusion computes the source column's test, c.id = 2
     assert placed(mixed) == [
         ("extraction", "c.lease.ends IS NOT NULL OR NOT (c.__quail_expr_0)")]
     assert kept(mixed) == [1]
-    fields = session.sql(head + "lease.ends = 'x' OR lease.rent IS NOT NULL")
+    fields = session.sql(head + f"{ends} = 'x' OR {rent} IS NOT NULL")
     assert placed(fields) == [
         ("extraction", "c.lease.ends = 'x' OR c.lease.rent IS NOT NULL")]
     (test,) = [node for node in fields.plan().nodes if isinstance(node, Filter)]
@@ -412,7 +423,8 @@ def test_not_and_or_of_answers_run_after_the_extractions_they_read(session):
         session.sql(
             "SELECT c.id, AI.CLASSIFY(c.text, ['lease', 'deed']) AS kind, "
             f"AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease "
-            "FROM contracts c WHERE kind = 'lease' OR lease.ends IS NULL")
+            "FROM contracts c WHERE AI.CLASSIFY(c.text, ['lease', 'deed']) = 'lease' "
+            f"OR AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}})['ends'] IS NULL")
 
 
 def test_an_extracted_tables_token_store_holds_each_tokens_characters(session):
@@ -425,3 +437,10 @@ def test_an_extracted_tables_token_store_holds_each_tokens_characters(session):
     view = scan.tokens[0]
     assert view.character_offsets is not None
     assert len(view.character_offsets) == len(view)
+
+
+def test_a_span_column_reads_an_extraction_with_the_same_arguments(session):
+    with pytest.raises(CompileError, match="AI.EXTRACT_SPAN"):
+        session.sql("SELECT c.id, AI.EXTRACT(c.text, {'ends': 'When?'}) AS lease, "
+                    "AI.EXTRACT_SPAN(c.text, {'ends': 'Why?'}) AS lease_span "
+                    "FROM contracts c")

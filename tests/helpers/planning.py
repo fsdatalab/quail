@@ -161,7 +161,7 @@ def compile_sql(sql, catalog, dialect="snowflake", model=QWEN3_4B_FP8):
                         getattr(provider, "id_col", None) or None)
     (region,), _ = native.region_plans(sql, tuple(model.turn), model.prompt_layout,
                                        DATAFUSION_DIALECTS[dialect])
-    found, message = region
+    found, message, _ = region
     if message is not None:
         raise CompileError(message)
     return json.loads(found)["operators"]

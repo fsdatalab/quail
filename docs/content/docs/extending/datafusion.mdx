@@ -77,18 +77,21 @@ A session with its own `QueryPlanner` calls `register_rules` instead,
 and adds `extension_planner()` to the extension planners its planner
 passes to `DefaultPhysicalPlanner`.
 
-## What needs Quail's `sql()`
+## SQL
 
-`quail_datafusion::sql` rewrites the parsed statement before
-DataFusion plans it. A plain `context.sql` skips these rewrites, so the
-following need Quail's `sql()`:
+`context.sql` plans Quail's SQL; there is no separate entry point.
+`register` adds, beside the AI functions and rules:
 
-- A `WHERE` that reads a `SELECT` alias of an AI call, such as `WHERE
-  sentiment = 'negative'`.
-- The `<name>_span` column next to each `AI.EXTRACT(...) AS <name>`.
-- `UNNEST` of a list an AI function returns.
-- Named arguments, such as `pooling => 'last'`.
-- BigQuery `{'key': value}` struct literals.
+- `StructFieldAccess`, an `ExprPlanner` that plans Snowflake's
+  `value['field']` on a struct, such as `AI.EXTRACT(...)['ends']`, as
+  `get_field`.
+- `SnowflakeRegexpLike`, a `FunctionRewrite` that makes `REGEXP_LIKE`
+  and `RLIKE` match the whole value when the session reads Snowflake
+  SQL, and `regexp_like` under the names `rlike` and `regexp_contains`.
+
+The SQL is DataFusion's: `WHERE` cannot read a `SELECT` alias, so a
+query repeats the AI call, which Quail asks the model once for; and
+`UNNEST` goes in `SELECT`, with DataFusion's `Unnest` above the region.
 
 ## From datafusion-python
 

@@ -277,7 +277,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         })();
         let (ports, joins, score_pairs) = match emitted {
             Ok(found) => found,
-            Err(CompileError(_, Some(refusal))) => return Ok(Err(*refusal)),
+            Err(CompileError(_, Some(refusal), _)) => return Ok(Err(*refusal)),
             Err(error) => return Err(error),
         };
         self.emit_result(&ports, &joins, score_pairs);

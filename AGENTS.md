@@ -63,6 +63,43 @@ CI runs these on every pull request. Run them before pushing:
   variable whose name describes a type it does not hold. `--inventory`
   lists what the code defines, for finding such names by hand.
 
+## Building
+
+Use one Rust toolchain, Cargo home, and dependency feature set. A fresh
+sandbox without matching build artifacts needs one cold dependency
+build (about 20 minutes on 4 cores). A matching cache can avoid it.
+Quail source edits still require compiling and linking Quail itself.
+
+- Install rustup and uv first; Linux x86_64 also needs clang and lld.
+  Run `tools/build.sh` from any shell. It prefers
+  `${CARGO_HOME:-$HOME/.cargo}/bin`, uses `rust-toolchain.toml`, prints
+  the selected compiler and paths, and runs `uv sync --frozen`.
+  Rustup downloads the pinned compiler if needed. The script does not
+  change global tool links or Cargo configuration.
+- Keep that Cargo home and `target/` between commands. Maturin must not
+  install another Rust/Cargo home: `MATURIN_NO_INSTALL_RUST` makes a
+  missing compiler fail early. Do not delete caches to fix rebuilds.
+- `uv sync` builds the editable extension with the dev profile. Cargo's
+  test profile inherits dev; `cargo test --profile dev` is unnecessary.
+  Use `cargo test --workspace --locked`,
+  `cargo clippy --workspace --all-targets --locked`, and
+  `cargo fmt --check` for Rust checks. Building a narrow `-p` selection
+  can change Arrow's features (notably `ffi`) and rebuild DataFusion.
+  Check/clippy also need metadata-only artifacts distinct from a full
+  build. Embedded-Python tests and the extension may rebuild PyO3 and
+  Quail for their different linking requirements.
+- After a successful native build, run `.venv/bin/python -m pytest`
+  or `uv run --no-sync pytest` to test without an implicit build.
+  Rebuild after Rust edits. `uv run --frozen pytest` synchronizes first
+  and may rebuild the extension when its tracked source/config changes.
+- If DataFusion unexpectedly recompiles, stop changing build settings
+  and inspect the existing logs/fingerprints first. Compare compiler,
+  Cargo home, features, rustflags, and target directory. Capture
+  `CARGO_LOG=cargo::core::compiler::fingerprint=info` on the next
+  necessary build if the cause remains unclear. Do not launch extra
+  full builds merely to test caching. sccache is optional, not a
+  substitute for keeping these inputs stable.
+
 ## Tests
 
 - An end-to-end test answers the model from `tests/helpers/oracle.py`:

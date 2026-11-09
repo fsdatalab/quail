@@ -295,7 +295,7 @@ impl PythonRunner {
             (None, inputs.as_slice())
         };
         let schema = Arc::clone(region.plan.schema());
-        let names = quail_column_names(&schema);
+        let names = quail_column_names(&region.plan);
         let sink = RegionSink {
             rows: rows.clone(),
             names: names.clone(),
@@ -483,9 +483,16 @@ pub fn region_json(
 ) -> Result<String> {
     let operators = crate::planning::operators_json(operators)
         .map_err(|error| DataFusionError::Plan(format!("CompileError: {}", error.0)))?;
+    // calls a typo apart; calls that differ only in spelling are refused
+    let warnings: Vec<String> = quail_datafusion::similar::similar_calls(plan)
+        .iter()
+        .filter(|found| found.likeness == quail_datafusion::similar::Likeness::Typo)
+        .map(quail_datafusion::similar::Similar::message)
+        .collect();
     Ok(serde_json::json!({
         "operators": operators,
         "logical": plan.display_indent().to_string(),
+        "warnings": warnings,
     })
     .to_string())
 }

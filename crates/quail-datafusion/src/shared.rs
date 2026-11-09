@@ -21,9 +21,11 @@ use datafusion::arrow::datatypes::{DataType, Field, SchemaRef};
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{DFSchema, DFSchemaRef, DataFusionError, Result, internal_err};
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore};
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
+use datafusion::physical_plan::execute_stream;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::filter_pushdown::{FilterDescription, FilterPushdownPhase};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -32,7 +34,7 @@ use datafusion::physical_plan::{
     PlanProperties, ReplaceChildrenOptions,
 };
 use futures::lock::Mutex as AsyncMutex;
-use futures::stream;
+use futures::{StreamExt, stream};
 
 /// The id column of a region input without one: each row's position
 /// among the input's rows, from zero.
@@ -103,7 +105,8 @@ impl Hash for SharedInput {
 
 impl PartialOrd for SharedInput {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.key.cmp(&other.key))
+        // nodes have no meaningful order; this agrees with `Eq`
+        (self == other).then_some(std::cmp::Ordering::Equal)
     }
 }
 
@@ -140,8 +143,9 @@ impl UserDefinedLogicalNodeCore for SharedInput {
     }
 }
 
-/// The rows of one shared input, once its first reader has computed them.
-type Rows = AsyncMutex<Option<Vec<RecordBatch>>>;
+/// The rows of one shared input, once its first reader has computed
+/// them, with the memory they hold reserved from the query's pool.
+type Rows = AsyncMutex<Option<(Vec<RecordBatch>, MemoryReservation)>>;
 
 /// The rows of one shared input, as each of its readers holds them.
 pub(crate) type SharedRows = Arc<Rows>;
@@ -292,14 +296,27 @@ impl ExecutionPlan for SharedInputExec {
         let batches = async move {
             let mut found = rows.lock().await;
             if found.is_none() {
-                let batches = datafusion::physical_plan::collect(input, context).await?;
-                *found = Some(if numbered {
-                    with_positions(batches, &schema)?
-                } else {
-                    batches
-                });
+                let reservation =
+                    MemoryConsumer::new("SharedInputExec").register(context.memory_pool());
+                let mut input = execute_stream(input, context)?;
+                let mut batches = Vec::new();
+                while let Some(batch) = input.next().await {
+                    let batch = batch?;
+                    reservation.try_grow(batch.get_array_memory_size())?;
+                    batches.push(batch);
+                }
+                if numbered {
+                    batches = with_positions(batches, &schema)?;
+                    // each batch now also holds its rows' positions
+                    let held: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
+                    reservation.try_resize(held)?;
+                }
+                *found = Some((batches, reservation));
             }
-            let batches = found.clone().unwrap_or_default();
+            let batches = found
+                .as_ref()
+                .map(|(batches, _)| batches.clone())
+                .unwrap_or_default();
             Ok::<_, DataFusionError>(stream::iter(batches.into_iter().map(Ok)))
         };
         let batches = futures::TryStreamExt::try_flatten(stream::once(batches));

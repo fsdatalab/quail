@@ -327,7 +327,8 @@ label instead of scoring every category.
 
 #### Filter by category
 
-Use the classification's `AS` name in `WHERE` to filter by its label.
+Repeat the `AI.CLASSIFY` call in `WHERE` to filter by its label. SQL
+evaluates `WHERE` before `SELECT`, so `WHERE` cannot read the `AS` name.
 For example, the following query keeps negative or mixed reviews from the
 `reviews` table:
 
@@ -336,14 +337,14 @@ SELECT r.id,
        AI.CLASSIFY(PROMPT('What sentiment does this review express? {0}', r.body),
                    ARRAY['positive', 'negative', 'mixed']) AS sentiment
 FROM reviews r
-WHERE sentiment IN ('negative', 'mixed');
+WHERE AI.CLASSIFY(PROMPT('What sentiment does this review express? {0}', r.body),
+                  ARRAY['positive', 'negative', 'mixed']) IN ('negative', 'mixed');
 ```
 
+- Quail classifies each review once and uses the label for both the
+  filter and the result.
 - `=` keeps one category. Other comparisons raise `CompileError`.
 - A category that is not in the list matches no rows.
-- You can also repeat the `AI.CLASSIFY` call in `WHERE`. Quail evaluates
-  the classification once and uses its label for both the filter and
-  the result.
 
 #### Classify joined rows
 
@@ -409,10 +410,22 @@ must be a separate item, rather than part of a larger expression.
 
 ### Answer positions
 
-Quail also returns the position of each answer in a second struct. Its
-name is the alias followed by `_span`, and it has the same fields. Each
-field holds the `start` and `end` character positions of its answer.
-For the contract above, `lease_span` is
+`AI.EXTRACT_SPAN` returns the position of each answer of the
+`AI.EXTRACT` call with the same arguments, as a struct with the same
+fields. Each field holds the `start` and `end` character positions of
+its answer. Quail reads both from the same extraction. For the contract
+above,
+
+```sql
+SELECT c.id,
+       AI.EXTRACT(c.text, {'end_date': 'When does the lease end?',
+                           'signer': 'Who signed it?'}) AS lease,
+       AI.EXTRACT_SPAN(c.text, {'end_date': 'When does the lease end?',
+                                'signer': 'Who signed it?'}) AS lease_span
+FROM contracts c;
+```
+
+returns `lease_span` as
 `{"end_date": {"start": 14, "end": 27}, "signer": {"start": 39, "end": 47}}`.
 In Python, `text[start:end]` returns the answer.
 
@@ -427,25 +440,27 @@ and `x.lease` then has the one field `signer`. A query that returns
 
 ### Filter on answers
 
-Use the extraction's `AS` name to filter by an answer field in `WHERE`.
-For example, with the same `contracts` table, the following query keeps
-leases whose extracted end date contains "2027":
+Repeat the `AI.EXTRACT` call in `WHERE` and read a field with
+`['field']` to filter by an answer. For example, with the same
+`contracts` table, the following query keeps leases whose extracted end
+date contains "2027":
 
 ```sql
 SELECT c.id,
        AI.EXTRACT(c.text, {'end_date': 'When does the lease end?'}) AS lease
 FROM contracts c
-WHERE lease.end_date LIKE '%2027%';
+WHERE AI.EXTRACT(c.text, {'end_date': 'When does the lease end?'})['end_date']
+      LIKE '%2027%';
 ```
 
 Quail extracts the answer once and uses it for both the filter and the
-result. Documents with no answer are excluded. Use
-`lease.end_date IS NULL` to keep documents where no end date was found.
+result. Documents with no answer are excluded. Use `IS NULL` on the
+field to keep documents where no end date was found.
 
 Answer fields support the conditions listed in [WHERE and ON](/docs/user-guide/sql/sql-functions#where-and-on).
 You can also test an answer's position. For example,
-`lease_span.end_date.start < 500` keeps answers that start within the
-document's first 500 characters.
+`AI.EXTRACT_SPAN(c.text, {...})['end_date']['start'] < 500` keeps
+answers that start within the document's first 500 characters.
 
 Quail may reorder a table's AI filters, classifications, and extractions
 to reduce estimated work. A condition on an answer runs after the
@@ -553,7 +568,7 @@ features of each request:
 SELECT t.id,
        AI.SAE_FEATURES(PROMPT('{0}\n\nWhat is the customer asking for?',
                               t.request),
-                       pooling => 'last') AS intent
+                       {'pooling': 'last'}) AS intent
 FROM tickets t;
 ```
 
@@ -572,12 +587,12 @@ expression.
 
 ### Arguments
 
-`AI.SAE_FEATURES(prompt, pooling => 'last' | 'max')`
+`AI.SAE_FEATURES(prompt, {'pooling': 'last' | 'max'})`
 
 | Argument | Type | Description |
 | --- | --- | --- |
 | `prompt` | [`PROMPT`](#prompt) | The question and one document column. Quail puts the document before the question. |
-| `pooling` | `STRING` | The tokens that give the features: `'last'` or `'max'`. |
+| `pooling` | `STRING` field of the options object | The tokens that give the features: `'last'` or `'max'`. |
 
 ### Pooling
 
@@ -592,39 +607,26 @@ expression.
 
 ### Unnest the features
 
-Put the call in `UNNEST` in `FROM` to get one row for each feature. The
-rows have the columns `f.feature` and `f.strength`, where `f` is the
-`AS` name. The other columns repeat for each feature. Use these columns
-in `SELECT`, `WHERE`, `GROUP BY`, `ORDER BY`, and aggregates. To give a
-field another name in the result, write `f.feature AS feature_id` in
-`SELECT`. `WHERE` uses the original name.
+Put the call in DataFusion's `UNNEST` in `SELECT` to get one row for
+each feature, as a struct with the fields `feature` and `strength`. The
+other columns repeat for each feature, and a row with no features gives
+no rows. Read the fields with `['feature']` and `['strength']` from a
+derived table, and use them in `SELECT`, `WHERE`, `GROUP BY`,
+`ORDER BY`, and aggregates.
 
 For example, with the same `tickets` table, the following query counts
 how many requests return each feature:
 
 ```sql
-SELECT f.feature, COUNT(*) AS requests
-FROM tickets t,
-     UNNEST(AI.SAE_FEATURES(PROMPT('{0}\n\nWhat is the customer asking for?',
-                                   t.request),
-                            pooling => 'last')) AS f
-GROUP BY f.feature
+SELECT x.f['feature'] AS feature, COUNT(*) AS requests
+FROM (SELECT t.id,
+             UNNEST(AI.SAE_FEATURES(PROMPT('{0}\n\nWhat is the customer asking for?',
+                                           t.request),
+                                    {'pooling': 'last'})) AS f
+      FROM tickets t) x
+GROUP BY x.f['feature']
 ORDER BY requests DESC;
 ```
-
-To read two lists, use one of these forms:
-
-- `UNNEST(a, b) AS u(f, g)` puts the lists side by side. Row `i` has
-  element `i` of each list. If one list is shorter, its fields are null
-  in the rows after its end.
-- `UNNEST(a) AS f, UNNEST(b) AS g` gives each pair of elements, one from
-  each list.
-
-A `WHERE` test of a feature field compares the field with literals.
-Use a comma or `CROSS JOIN` before `UNNEST`. A row with no features
-then gives no rows. To keep that row with null fields, write
-`LEFT JOIN UNNEST(...) AS f ON TRUE`. Other joins, other `ON` conditions,
-`USING`, and `WITH ORDINALITY` are not supported.
 
 ### Limits
 
@@ -634,7 +636,6 @@ then gives no rows. To keep that row with null fields, write
   `AI.CLASSIFY`, or `AI.EXTRACT`.
 - `ORDER BY`, `DISTINCT`, and `GROUP BY` cannot use the feature list.
   Use the fields of an `UNNEST` instead.
-- `UNNEST` reads `AI.SAE_FEATURES` calls only.
 - Calls over the same documents share their KV. If any call uses
   `'max'`, Quail also keeps the document features for the later calls.
   It reads each question in full and does not share prefixes between

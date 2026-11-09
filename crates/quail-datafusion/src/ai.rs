@@ -43,7 +43,7 @@ use std::hash::Hash;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::Field;
-use datafusion::common::{DFSchema, DFSchemaRef, Result, plan_err};
+use datafusion::common::{DFSchema, DFSchemaRef, Result, internal_err, plan_err};
 use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore};
 
 /// Which rows an [`AiNode`] returns.
@@ -321,9 +321,8 @@ impl AiNode {
 
 impl PartialOrd for AiNode {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        // DataFusion orders nodes only to compare plans; the printed node
-        // decides
-        format!("{self:?}").partial_cmp(&format!("{other:?}"))
+        // nodes have no meaningful order; this agrees with `Eq`
+        (self == other).then_some(Ordering::Equal)
     }
 }
 
@@ -447,23 +446,26 @@ impl UserDefinedLogicalNodeCore for AiNode {
         write!(f, "{}", text.replace('\r', "\\r").replace('\n', "\\n"))
     }
 
-    fn with_exprs_and_inputs(
-        &self,
-        exprs: Vec<Expr>,
-        mut inputs: Vec<LogicalPlan>,
-    ) -> Result<Self> {
+    fn with_exprs_and_inputs(&self, exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> Result<Self> {
+        let Ok([input]) = <[LogicalPlan; 1]>::try_from(inputs) else {
+            return internal_err!("AiNode reads one input");
+        };
         // a rule that rewrites an expression may alias it to keep its name;
         // the node's schema does not name its expressions
         let mut exprs = exprs.into_iter().map(|expr| match expr {
             Expr::Alias(alias) => *alias.expr,
             other => other,
         });
-        let mut node = self.clone();
-        node.input = Arc::new(inputs.remove(0));
-        node.call = exprs.next().expect("the node's call");
-        if self.guard.is_some() {
-            node.guard = exprs.next();
+        let (Some(call), guard, None) = (exprs.next(), exprs.next(), exprs.next()) else {
+            return internal_err!("AiNode has its call and an optional guard");
+        };
+        if guard.is_some() != self.guard.is_some() {
+            return internal_err!("AiNode's guard was added or removed");
         }
+        let mut node = self.clone();
+        node.input = Arc::new(input);
+        node.call = call;
+        node.guard = guard;
         node.checked()
     }
 }

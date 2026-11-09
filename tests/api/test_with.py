@@ -94,7 +94,8 @@ def test_a_cte_runs_once_however_many_times_it_is_read(session):
     query = session.sql("""
         WITH clauses AS (
             SELECT c.id,
-                   AI.EXTRACT(c.text, {'terms': 'What is the termination clause?'})
+                   AI.EXTRACT(c.text,
+                              STRUCT('What is the termination clause?' AS terms))
                        AS clause
             FROM contracts c
         ),

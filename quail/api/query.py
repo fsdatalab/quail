@@ -4,16 +4,16 @@ from __future__ import annotations
 
 import json
 import time
+import warnings
 from dataclasses import asdict, replace
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import _quail_native
 import pyarrow as pa
 
-from quail.api.compile import READ_AS_SQL
 from quail.api.execute import execute_query
 from quail.api.region_inputs import input_scans
-from quail.common.expressions import CompileError
+from quail.common.expressions import CompileError, SimilarCallWarning
 from quail.common.pairs import FIRST_DOCUMENT, columns_key
 from quail.common.tokens import ScanInput, TokenStore
 from quail.execution.finished import finished_table
@@ -151,9 +151,12 @@ class Query:
                 from quail.api.compile import compile_message
 
                 raise CompileError(compile_message(error, self.text)) from None
-            for _, message in bound:
-                if message is not None and READ_AS_SQL not in message:
+            for region, message, unsupported in bound:
+                # DataFusion runs the operators of a shape Quail does not read
+                if message is not None and not unsupported:
                     raise CompileError(message)
+                for warning in json.loads(region).get("warnings", []) if region else []:
+                    warnings.warn(warning, SimilarCallWarning, stacklevel=3)
             self._bound = bound
         return self._whole
 
@@ -174,7 +177,7 @@ class Query:
         if len(self._bound) != 1:
             raise AttributeError(
                 f"the query has {len(self._bound)} model regions; use regions()")
-        ((found, message),) = self._bound
+        ((found, message, _),) = self._bound
         if message is not None:
             region = self._region()
             return {"operators": region.operators, "logical": region.logical}

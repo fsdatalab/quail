@@ -79,10 +79,11 @@ impl NativeSession {
 
     /// Derive each model region of a query's operators from its plan.
     ///
-    /// Returns one (the region as JSON, None) or (None, CompileError
-    /// message) per region, and whether one region is the whole query.
-    /// The region's JSON holds `operators`, its operators as JSON text,
-    /// and `logical`, DataFusion's plan of the region. `turn` and
+    /// Returns one (the region as JSON, None, false) or (None, CompileError
+    /// message, whether DataFusion runs that shape instead) per region,
+    /// and whether one region is the whole query. The region's JSON holds
+    /// `operators`, its operators as JSON text, `logical`, DataFusion's
+    /// plan of the region, and `warnings`, such as two calls a typo apart. `turn` and
     /// `layout` are the model's chat-turn text and prompt layout.
     #[allow(clippy::type_complexity)]
     #[pyo3(signature = (query, turn, layout, dialect=None))]
@@ -93,15 +94,20 @@ impl NativeSession {
         turn: (String, String),
         layout: &str,
         dialect: Option<String>,
-    ) -> PyResult<(Vec<(Option<String>, Option<String>)>, bool)> {
+    ) -> PyResult<(Vec<(Option<String>, Option<String>, bool)>, bool)> {
         py.detach(|| {
             let plan = self.session.optimized_plan(query, dialect.as_deref())?;
             let whole = matches!(&plan, LogicalPlan::Extension(_));
             let mut derived = Vec::new();
             for region in self.session.regions(query, dialect.as_deref())? {
                 derived.push(match derive::derive_region(&region, &turn, layout) {
-                    Ok((operators, plan)) => (Some(quail::region_json(&operators, &plan)?), None),
-                    Err(error) => (None, Some(error.0)),
+                    Ok((operators, plan)) => {
+                        (Some(quail::region_json(&operators, &plan)?), None, false)
+                    }
+                    Err(error) => {
+                        let unsupported = error.is_unsupported();
+                        (None, Some(error.0), unsupported)
+                    }
                 });
             }
             Ok::<_, DataFusionError>((derived, whole))

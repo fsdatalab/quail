@@ -94,3 +94,60 @@ async fn the_first_batch_reaches_datafusion_before_the_region_finishes() -> Resu
     assert!(stream.next().await.is_none());
     Ok(())
 }
+
+/// Stands in for an executor that yields one row, then panics.
+#[derive(Debug)]
+struct PanicsAfterOneRow;
+
+impl RegionRunner for PanicsAfterOneRow {
+    fn run(
+        &self,
+        region: &ModelRegion,
+        _inputs: Vec<InputStream>,
+        _fetch: Option<usize>,
+        _hint: &quail_datafusion::RegionHint,
+    ) -> Result<RegionBatches> {
+        let schema = Arc::new(region.plan.schema().as_arrow().clone());
+        let columns = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let column: Arc<dyn Array> = Arc::new(StringArray::from(vec!["0"]));
+                datafusion::arrow::compute::cast(&column, field.data_type())
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let first = RecordBatch::try_new(Arc::clone(&schema), columns)?;
+        let rest = std::iter::from_fn(|| panic!("the executor failed"));
+        Ok(Box::new(std::iter::once(Ok(first)).chain(rest)))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_runner_that_panics_fails_the_query() -> Result<()> {
+    let context = session_context(Arc::new(PanicsAfterOneRow));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("body", DataType::Utf8, false),
+    ]));
+    let reviews = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(vec!["r1", "r2"])),
+            Arc::new(StringArray::from(vec!["Too slow.", "Lovely."])),
+        ],
+    )?;
+    let reviews = MemTable::try_new(schema, vec![vec![reviews]])?.with_constraints(
+        Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]),
+    );
+    context.register_table(
+        "reviews",
+        Arc::new(IdentifiedTable::new(Arc::new(reviews), "reviews")),
+    )?;
+    let frame = context
+        .sql("SELECT r.id FROM reviews r WHERE ai_filter(prompt('Negative? {0}', r.body))")
+        .await?;
+    // the stream re-raises the runner's panic on the reading task
+    let collected = tokio::spawn(frame.collect()).await;
+    assert!(collected.is_err_and(|error| error.is_panic()));
+    Ok(())
+}

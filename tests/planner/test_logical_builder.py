@@ -14,8 +14,8 @@ TABLES = {
     "contracts": pa.table({"id": ["c0"], "text": ["Lease ends 2027."]}),
 }
 
-CLASSIFY = ("AI.CLASSIFY(PROMPT('q5: {0}', r.body), "
-            "['positive', 'negative']) AS sentiment")
+SENTIMENT = "AI.CLASSIFY(PROMPT('q5: {0}', r.body), ['positive', 'negative'])"
+CLASSIFY = f"{SENTIMENT} AS sentiment"
 
 REFUSED = {
     "a score beside a generative filter": (
@@ -23,7 +23,7 @@ REFUSED = {
         "AND AI.SCORE(PROMPT('q2: {0}', r.body)) > 0.5",
         "AI.SCORE cannot be mixed with generative AI predicates"),
     "a label filter on an unknown label": (
-        f"SELECT r.id, {CLASSIFY} FROM reviews r WHERE sentiment = 'mixed'",
+        f"SELECT r.id, {CLASSIFY} FROM reviews r WHERE {SENTIMENT} = 'mixed'",
         r"lists \['mixed'\], which are not among its labels"),
 }
 

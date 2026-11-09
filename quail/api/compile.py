@@ -20,10 +20,6 @@ class SQLDialect(StrEnum):
     BQ = "bq"
 
 
-# the end of a refusal of a region shape Quail's operators do not read;
-# such a region reaches Quail as SQL text
-READ_AS_SQL = "is outside what Quail binds from DataFusion"
-
 # a dialect -> DataFusion's name for it
 DATAFUSION_DIALECTS = {"snowflake": "Snowflake", "bq": "BigQuery"}
 

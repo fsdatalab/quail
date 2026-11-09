@@ -1,6 +1,6 @@
 logical:
-  Projection: c.id, contract, contract_span
-    AiNode: contract = ai_extract(c.text, named_struct(Utf8("audit_rights"), Utf8("Does a party have the right to  audit the books, records, or physical locations of the counterparty to ensure compliance with the contract?")))
+  Projection: c.id, contract
+    AiNode: contract = ai_extract(c.text, named_struct(Utf8("audit_rights"), Utf8("Does a party have the right to  audit the books, records, or physical locations of the counterparty to ensure compliance with the contract?"))), returns: [contract]
       AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("{0}\n\nDoes a party have the right to  audit the books, records, or physical locations of the counterparty to ensure compliance with the contract?"), c.text), named_struct(Utf8("selectivity"), Float64(0.36525612472160357))), filter: __quail_answer_1, returns: []
         SubqueryAlias: c
           TableScan: contracts projection=[id, text]

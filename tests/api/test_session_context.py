@@ -47,10 +47,11 @@ QUERIES = {
     "IMDB-11 classify":
         "SELECT r.id, AI.CLASSIFY(PROMPT('q5: {0}', r.body), "
         "['positive', 'negative', 'mixed']) AS sentiment FROM reviews r",
-    "IMDB-15 classify filtered by its alias":
+    "IMDB-15 classify filtered by the same call":
         "SELECT r.id, AI.CLASSIFY(PROMPT('q5: {0}', r.body), "
         "['positive', 'negative', 'mixed']) AS sentiment FROM reviews r "
-        "WHERE sentiment IN ('negative', 'mixed')",
+        "WHERE AI.CLASSIFY(PROMPT('q5: {0}', r.body), "
+        "['positive', 'negative', 'mixed']) IN ('negative', 'mixed')",
     "CUAD-1 extract":
         "SELECT c.id, AI.EXTRACT(c.text, {'end': 'q6: When does it end?'}) "
         "AS lease FROM contracts c",
@@ -144,8 +145,10 @@ def test_session_sql_runs_a_query_that_needs_sql_around_its_model_region(context
 
 
 def test_an_extraction_returns_and_filters_on_its_answer_positions(context):
-    text = ("SELECT c.id, AI.EXTRACT(c.text, {'end': 'q6: When does it end?'}) "
-            "AS lease FROM contracts c WHERE lease_span.end.start < 15")
+    fields = "c.text, {'end': 'q6: When does it end?'}"
+    text = (f"SELECT c.id, AI.EXTRACT({fields}) AS lease, "
+            f"AI.EXTRACT_SPAN({fields}) AS lease_span FROM contracts c "
+            f"WHERE AI.EXTRACT_SPAN({fields})['end']['start'] < 15")
     expected = finish(context.session.sql(text), ORACLE).collect()
     table = context.sql(text)
     assert table.column_names == ["c.id", "lease", "lease_span"]
@@ -412,3 +415,17 @@ def test_a_top_k_over_a_join_skips_the_anchors_past_its_threshold():
     # t1 and t2 are past the top row
     assert sorted(set(asked)) == [0]
     context.session.close()
+
+
+def test_a_region_that_reads_another_regions_rows_runs_after_it(context):
+    # the CTE's LIMIT runs in DataFusion between the two regions, so the
+    # second region reads the first one's rows; both run on the thread
+    # that called DataFusion, the first to its end before the second
+    text = ("WITH kept AS (SELECT r.id, r.body FROM reviews r "
+            "WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) ORDER BY r.id LIMIT 2) "
+            "SELECT r.id FROM kept r WHERE AI_FILTER(PROMPT('q2: {0}', r.body)) "
+            "ORDER BY r.id")
+    assert len(context.region_plans(text)) == 2
+    # q1 keeps r0, r2, and r3, and the LIMIT r0 and r2; the oracle answers
+    # q2 by each document's position in the second region's input, 1 and 1
+    assert _rows(context.sql(text)) == [("r0",), ("r2",)]

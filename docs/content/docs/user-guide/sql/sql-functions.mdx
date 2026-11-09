@@ -360,10 +360,10 @@ Requires a regular expression match against the whole value.
 
 `REGEXP_LIKE(r.body, 'Film')` returns `FALSE`.
 
-Use this function in the Snowflake dialect. `RLIKE(column, pattern)`,
-`column RLIKE pattern`, and `column REGEXP pattern` are aliases. In the
-BigQuery dialect, `REGEXP_LIKE` is DataFusion's function, which finds a
-match anywhere in the value, as `REGEXP_CONTAINS` does.
+Use this function in the Snowflake dialect, where `RLIKE(column,
+pattern)` is an alias. In the BigQuery dialect, `REGEXP_LIKE` is
+DataFusion's function, which finds a match anywhere in the value, as
+`REGEXP_CONTAINS` does.
 
 Use `REGEXP_LIKE(r.body, '.*Film.*')` to match "Film" anywhere in the value.
 

@@ -179,8 +179,9 @@ def _classification_prompt(query):
 
 def test_classifications_and_label_filters_price_like_filters(tmp_path):
     with _session(tmp_path) as sess:
-        tone = (f"AI.CLASSIFY(PROMPT({_quoted(CLASSIFY)}, r.body), "
-                "['good', 'bad']) AS tone")
+        tone_call = (f"AI.CLASSIFY(PROMPT({_quoted(CLASSIFY)}, r.body), "
+                     "['good', 'bad'])")
+        tone = f"{tone_call} AS tone"
         query = sess.sql(f"SELECT r.id, {tone} FROM reviews r")
         lowered = quail.lower_prompt(_classification_prompt(query), sess.tokenizer)
         tail, preamble = lowered.tail_tokens, lowered.preamble_tokens
@@ -197,7 +198,7 @@ def test_classifications_and_label_filters_price_like_filters(tmp_path):
             f"SELECT r.id, a.id, {tone} FROM reviews r JOIN aspects a "
             f"ON AI_FILTER(PROMPT({_quoted(JOIN)}, r.body, a.aspect)) "
             f"WHERE AI_FILTER(PROMPT({_quoted(FILTER)}, r.body)) "
-            "AND tone IN ('good')")
+            f"AND {tone_call} IN ('good')")
         question = quail.lower_prompt(_filter_prompt(query, "r"),
                                       sess.tokenizer).tail_tokens
         estimate = quail.speed_of_light_estimate(

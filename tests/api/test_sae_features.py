@@ -30,7 +30,7 @@ def session():
 
 
 FEATURES = ("AI.SAE_FEATURES(PROMPT('{0}\\n\\nWhat is this review about?', "
-            "r.body), pooling => 'last')")
+            "r.body), {'pooling': 'last'})")
 
 
 def test_features_run_returns_the_lists_and_the_answer_table(session):
@@ -47,7 +47,8 @@ def test_features_run_returns_the_lists_and_the_answer_table(session):
     assert answers.num_rows == 3
 
 
-UNNEST = f"UNNEST({FEATURES}) AS f"
+# one row per feature, as DataFusion's UNNEST in SELECT writes it
+ROWS = f"(SELECT r.id, UNNEST({FEATURES}) AS f FROM reviews r) x"
 
 
 def _unnest_oracle():
@@ -59,67 +60,53 @@ def _unnest_oracle():
 
 def test_unnest_groups_rows_by_feature(session):
     query = session.sql(
-        f"SELECT f.feature, COUNT(*) AS n, MAX(f.strength) AS top "
-        f"FROM reviews r, {UNNEST} GROUP BY f.feature ORDER BY n DESC")
+        "SELECT x.f['feature'] AS feature, COUNT(*) AS n, "
+        f"MAX(x.f['strength']) AS top FROM {ROWS} "
+        "GROUP BY x.f['feature'] ORDER BY n DESC")
     rows = finish(query, _unnest_oracle()).collect()
-    assert rows.to_pylist()[0] == {"f.feature": 100, "n": 3, "top": 0.5}
-    assert sorted(row["f.feature"] for row in rows.to_pylist()) == [0, 1, 2, 100]
+    assert rows.to_pylist()[0] == {"feature": 100, "n": 3, "top": 0.5}
+    assert sorted(row["feature"] for row in rows.to_pylist()) == [0, 1, 2, 100]
 
 
 def test_not_and_or_of_unnested_fields_and_source_columns_filter_rows(session):
     # feature 100 has strength 0.5 in every document; document d has
     # feature d at strength d + 1
     fields = session.sql(
-        f"SELECT r.id, f.feature FROM reviews r, {UNNEST} "
-        f"WHERE NOT (f.strength < 1 OR f.feature = 100) ORDER BY r.id")
+        f"SELECT x.id, x.f['feature'] AS feature FROM {ROWS} "
+        "WHERE NOT (x.f['strength'] < 1 OR x.f['feature'] = 100) ORDER BY x.id")
     assert finish(fields, _unnest_oracle()).collect().to_pylist() == [
-        {"r.id": 7, "f.feature": 0}, {"r.id": 9, "f.feature": 1},
-        {"r.id": 11, "f.feature": 2}]
+        {"x.id": 7, "feature": 0}, {"x.id": 9, "feature": 1},
+        {"x.id": 11, "feature": 2}]
     mixed = session.sql(
-        f"SELECT f.feature FROM reviews r, {UNNEST} "
-        f"WHERE f.strength > 2 OR r.id = 7 ORDER BY f.feature")
+        f"SELECT x.f['feature'] AS feature FROM {ROWS} "
+        "WHERE x.f['strength'] > 2 OR x.id = 7 ORDER BY feature")
     assert finish(mixed, _unnest_oracle()).collect().to_pylist() == [
-        {"f.feature": 0}, {"f.feature": 2}, {"f.feature": 100}]
+        {"feature": 0}, {"feature": 2}, {"feature": 100}]
 
 
 def test_datafusion_unnests_the_feature_lists_the_region_returns(session):
-    query = session.sql(f"SELECT r.id, f.feature FROM reviews r, {UNNEST}")
-    explained = query.explain()
-    assert "UnnestExec" in explained
-    assert "output=__quail_column_1" in explained
+    query = session.sql(f"SELECT r.id, UNNEST({FEATURES}) AS f FROM reviews r")
+    assert "UnnestExec" in query.explain()
     rows = finish(query, _unnest_oracle()).collect()
-    assert rows.column_names == ["r.id", "f.feature"]
-    assert sorted(rows.to_pylist(), key=lambda row: tuple(row.values())) == [
-        {"r.id": 7, "f.feature": 0}, {"r.id": 7, "f.feature": 100},
-        {"r.id": 9, "f.feature": 1}, {"r.id": 9, "f.feature": 100},
-        {"r.id": 11, "f.feature": 2}, {"r.id": 11, "f.feature": 100}]
+    assert rows.column_names == ["r.id", "f"]
+    assert sorted((row["r.id"], row["f"]["feature"]) for row in rows.to_pylist()) == [
+        (7, 0), (7, 100), (9, 1), (9, 100), (11, 2), (11, 100)]
+
+
 @pytest.mark.parametrize("comparison, num_rows", [("IS NULL", 0), ("IS NOT NULL", 3)])
 def test_feature_list_null_tests_keep_empty_lists(session, comparison, num_rows):
+    features = "AI.SAE_FEATURES(PROMPT('Topic? {0}', r.body), {'pooling': 'last'})"
     query = session.sql(
-        "SELECT r.id, AI.SAE_FEATURES(PROMPT('Topic? {0}', r.body), "
-        "pooling => 'last') AS features FROM reviews r "
-        f"WHERE features {comparison}")
+        f"SELECT r.id, {features} AS features FROM reviews r "
+        f"WHERE {features} {comparison}")
     assert finish(query, Oracle(features=lambda spec, document: []))\
         .collect().num_rows == num_rows
 
 
-@pytest.mark.parametrize("test", ["features = 'x'", "LENGTH(features) > 0"])
+@pytest.mark.parametrize("test", ["{} = 'x'", "LENGTH({}) > 0"])
 def test_feature_lists_must_be_unnested_before_testing_their_fields(session, test):
+    features = "AI.SAE_FEATURES(PROMPT('Topic? {0}', r.body), {'pooling': 'last'})"
     with pytest.raises(CompileError, match="UNNEST"):
         session.sql(
-            "SELECT r.id, AI.SAE_FEATURES(PROMPT('Topic? {0}', r.body), "
-            "pooling => 'last') AS features FROM reviews r "
-            f"WHERE {test}")
-
-
-
-
-def test_a_left_join_unnest_keeps_a_row_with_no_features(session):
-    query = session.sql(
-        f"SELECT r.id, f.feature FROM reviews r "
-        f"LEFT JOIN UNNEST({FEATURES}) AS f ON TRUE ORDER BY r.id")
-    oracle = Oracle(features=lambda spec, document: (
-        [] if document == 1 else [{"feature": document, "strength": 1.0}]))
-    assert finish(query, oracle).collect().to_pylist() == [
-        {"r.id": 7, "f.feature": 0}, {"r.id": 9, "f.feature": None},
-        {"r.id": 11, "f.feature": 2}]
+            f"SELECT r.id, {features} AS features FROM reviews r "
+            f"WHERE {test.format(features)}")

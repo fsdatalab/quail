@@ -116,10 +116,11 @@ def _end_dates(session, sql) -> tuple[list, int]:
     return sorted(row["l.id"] for row in result.to_pylist()), len(asked)
 
 
-@pytest.mark.parametrize("test", ["e.year LIKE '%2027%'", "e.year ILIKE '20_7'"])
+@pytest.mark.parametrize("test", ["{} LIKE '%2027%'", "{} ILIKE '20_7'"])
 def test_an_extraction_tested_with_like_reads_only_documents_with_its_literal(test):
-    sql = ("SELECT l.id, AI_EXTRACT(l.text, {'year': 'When does it end?'}) AS e "
-           f"FROM leases l WHERE {test}")
+    call = "AI_EXTRACT(l.text, {'year': 'When does it end?'})"
+    year = call + "['year']"
+    sql = f"SELECT l.id, {call} AS e FROM leases l WHERE {test.format(year)}"
     on = _leases_session(LOGICAL_RULES)
     off = _leases_session([name for name in LOGICAL_RULES if name != SUBSTRING_RULE])
     found = [_end_dates(session, sql) for session in (on, off)]
@@ -128,5 +129,5 @@ def test_an_extraction_tested_with_like_reads_only_documents_with_its_literal(te
     assert found[0][0] == found[1][0] == ["c0", "c2", "c4"]
     # LIKE '%2027%' needs "2027", and ILIKE '20_7' needs "20": the model
     # reads the documents that contain it
-    num_read = {"e.year LIKE '%2027%'": 3, "e.year ILIKE '20_7'": 4}[test]
+    num_read = {"{} LIKE '%2027%'": 3, "{} ILIKE '20_7'": 4}[test]
     assert (found[0][1], found[1][1]) == (num_read, 5)

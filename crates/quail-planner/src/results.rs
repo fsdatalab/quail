@@ -21,7 +21,8 @@ pub type AnswerColumn = (String, Vec<String>, String, Value, bool);
 /// The columns of a region's rows, in order, before struct packing.
 ///
 /// Each SELECT list column, then a label's probabilities and an
-/// extraction's spans after the column they belong to.
+/// extraction's spans, when the SELECT list returns them, after the
+/// column they belong to.
 pub fn region_columns(found: &Operators) -> Vec<String> {
     let mut columns = Vec::new();
     for column in &found.projection.columns {
@@ -31,7 +32,11 @@ pub fn region_columns(found: &Operators) -> Vec<String> {
             if call.probabilities {
                 columns.push(format!("{name}{PROBABILITIES_SUFFIX}"));
             }
-            if call.kind == "extract" {
+            let spanned = found.projection.spans.iter().any(|spanned| {
+                name.strip_prefix(spanned.as_str())
+                    .is_some_and(|rest| rest.starts_with('.'))
+            });
+            if call.kind == "extract" && spanned {
                 columns.push(format!("{name}{SPAN_SUFFIX}"));
             }
         }
@@ -42,7 +47,7 @@ pub fn region_columns(found: &Operators) -> Vec<String> {
 /// The struct columns of a region's rows: (struct column, [(field,
 /// member column)]).
 pub fn region_structs(found: &Operators) -> Vec<(String, Vec<(String, String)>)> {
-    packing(&found.projection.structs)
+    packing(&found.projection.structs, &found.projection.spans)
 }
 
 /// Each region column a source expression computes, by name.

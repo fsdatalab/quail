@@ -1,184 +1,126 @@
 //! Regular expression tests as each SQL dialect means them.
 //!
-//! DataFusion's `regexp_like` finds a match anywhere in the value. In
-//! Snowflake, `REGEXP_LIKE`, `RLIKE`, and the `RLIKE` and `REGEXP`
-//! operators match the whole value, so [`anchor_snowflake_regexps`]
-//! anchors each pattern at both ends. BigQuery's `REGEXP_CONTAINS` finds
-//! a match anywhere, as `regexp_like` does, so
-//! [`bigquery_regexp_contains`] only renames it.
+//! DataFusion's `regexp_like` finds a match anywhere in the value, as
+//! BigQuery's `REGEXP_CONTAINS` does. Snowflake's `REGEXP_LIKE` and
+//! `RLIKE` match the whole value. [`regexp_functions`] registers
+//! `regexp_like` under the names `rlike` and `regexp_contains` too, and
+//! [`SnowflakeRegexpLike`] anchors the pattern of each call at both ends
+//! of the value when the session reads Snowflake SQL.
 //!
-//! For example, in Snowflake SQL `REGEXP_LIKE(r.lang, 'e.')` becomes
+//! For example, in Snowflake SQL `REGEXP_LIKE(r.lang, 'e.')` tests
 //! `regexp_like(r.lang, '\A(?:e.)\z')`: it keeps `en` and rejects `eng`.
 
-use std::ops::ControlFlow;
+use std::sync::Arc;
 
-use sqlparser::ast::{
-    BinaryOperator, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
-    FunctionArguments, Ident, ObjectName, Statement, UnaryOperator, Value, visit_expressions_mut,
-};
+use datafusion::common::tree_node::Transformed;
+use datafusion::common::{DFSchema, Result, ScalarValue};
+use datafusion::config::{ConfigOptions, Dialect};
+use datafusion::functions::regex::regexp_like;
+use datafusion::logical_expr::expr::ScalarFunction;
+use datafusion::logical_expr::expr_rewriter::FunctionRewrite;
+use datafusion::logical_expr::{BinaryExpr, Expr, Operator, ScalarUDF, lit};
 
 /// What a pattern is wrapped in to match the whole value. `\A` and `\z`
 /// match only at the value's ends, whatever the `m` flag says.
 const ANCHOR_START: &str = "\\A(?:";
 const ANCHOR_END: &str = ")\\z";
 
-/// Whether `function` is named `name`, unqualified, in any case.
-fn named(function: &Function, name: &str) -> bool {
-    matches!(&function.name.0[..], [part] if part.to_string().eq_ignore_ascii_case(name))
+/// DataFusion's `regexp_like`, also named `rlike` and `regexp_contains`.
+pub(crate) fn regexp_functions() -> Arc<ScalarUDF> {
+    Arc::new(
+        regexp_like()
+            .as_ref()
+            .clone()
+            .with_aliases(["rlike", "regexp_contains"]),
+    )
 }
 
-/// The second argument of a call written with unnamed arguments.
-fn pattern_argument(function: &mut Function) -> Option<&mut Expr> {
-    let FunctionArguments::List(list) = &mut function.args else {
-        return None;
-    };
-    match list.args.get_mut(1) {
-        Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(pattern))) => Some(pattern),
-        _ => None,
+/// Anchors the pattern of each `regexp_like` call at both ends of the
+/// value when the session's SQL dialect is Snowflake.
+#[derive(Debug, Default)]
+pub struct SnowflakeRegexpLike;
+
+impl FunctionRewrite for SnowflakeRegexpLike {
+    fn name(&self) -> &str {
+        "snowflake_regexp_like"
+    }
+
+    fn rewrite(
+        &self,
+        expr: Expr,
+        _schema: &DFSchema,
+        config: &ConfigOptions,
+    ) -> Result<Transformed<Expr>> {
+        if !matches!(config.sql_parser.dialect, Dialect::Snowflake) {
+            return Ok(Transformed::no(expr));
+        }
+        let Expr::ScalarFunction(ScalarFunction { func, mut args }) = expr else {
+            return Ok(Transformed::no(expr));
+        };
+        if func.name() != "regexp_like" || args.len() < 2 {
+            return Ok(Transformed::no(Expr::ScalarFunction(ScalarFunction {
+                func,
+                args,
+            })));
+        }
+        args[1] = anchored(args[1].clone());
+        Ok(Transformed::yes(Expr::ScalarFunction(ScalarFunction {
+            func,
+            args,
+        })))
     }
 }
 
 /// `pattern` anchored at both ends of the value: a string literal
 /// rewritten, any other pattern concatenated, so a null stays null.
 fn anchored(pattern: Expr) -> Expr {
-    if let Expr::Value(value) = &pattern
-        && let Value::SingleQuotedString(text) = &value.value
-    {
-        return Expr::value(Value::SingleQuotedString(format!(
-            "{ANCHOR_START}{text}{ANCHOR_END}"
-        )));
+    if let Expr::Literal(ScalarValue::Utf8(Some(text)), _) = &pattern {
+        return lit(format!("{ANCHOR_START}{text}{ANCHOR_END}"));
     }
-    let concat = |left: Expr, right: Expr| Expr::BinaryOp {
-        left: Box::new(left),
-        op: BinaryOperator::StringConcat,
-        right: Box::new(right),
+    let concat = |left: Expr, right: Expr| {
+        Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(left),
+            Operator::StringConcat,
+            Box::new(right),
+        ))
     };
-    Expr::Nested(Box::new(concat(
-        concat(
-            Expr::value(Value::SingleQuotedString(ANCHOR_START.to_string())),
-            pattern,
-        ),
-        Expr::value(Value::SingleQuotedString(ANCHOR_END.to_string())),
-    )))
-}
-
-/// The call `regexp_like(value, pattern)`.
-fn regexp_like(value: Expr, pattern: Expr) -> Expr {
-    let argument = |expr: Expr| FunctionArg::Unnamed(FunctionArgExpr::Expr(expr));
-    Expr::Function(Function {
-        name: ObjectName::from(vec![Ident::new("regexp_like")]),
-        uses_odbc_syntax: false,
-        parameters: FunctionArguments::None,
-        args: FunctionArguments::List(FunctionArgumentList {
-            duplicate_treatment: None,
-            args: vec![argument(value), argument(pattern)],
-            clauses: Vec::new(),
-        }),
-        filter: None,
-        null_treatment: None,
-        over: None,
-        within_group: Vec::new(),
-    })
-}
-
-/// Anchor the pattern of each `REGEXP_LIKE` and `RLIKE` call and each
-/// `RLIKE` and `REGEXP` test, which match the whole value in Snowflake,
-/// and write each as DataFusion's `regexp_like`.
-pub fn anchor_snowflake_regexps(statement: &mut Statement) {
-    let _ = visit_expressions_mut(statement, |expr| {
-        match expr {
-            Expr::Function(function)
-                if named(function, "regexp_like") || named(function, "rlike") =>
-            {
-                if let Some(pattern) = pattern_argument(function) {
-                    *pattern = anchored(pattern.clone());
-                    function.name = ObjectName::from(vec![Ident::new("regexp_like")]);
-                }
-            }
-            Expr::RLike {
-                negated,
-                expr: value,
-                pattern,
-                ..
-            } => {
-                let test = regexp_like(value.as_ref().clone(), anchored(pattern.as_ref().clone()));
-                *expr = if *negated {
-                    Expr::UnaryOp {
-                        op: UnaryOperator::Not,
-                        expr: Box::new(test),
-                    }
-                } else {
-                    test
-                };
-            }
-            _ => {}
-        }
-        ControlFlow::<()>::Continue(())
-    });
-}
-
-/// Write each `REGEXP_CONTAINS` call, which finds a match anywhere in
-/// BigQuery, as DataFusion's `regexp_like`, which does too.
-pub fn bigquery_regexp_contains(statement: &mut Statement) {
-    let _ = visit_expressions_mut(statement, |expr| {
-        if let Expr::Function(function) = expr
-            && named(function, "regexp_contains")
-        {
-            function.name = ObjectName::from(vec![Ident::new("regexp_like")]);
-        }
-        ControlFlow::<()>::Continue(())
-    });
+    concat(concat(lit(ANCHOR_START), pattern), lit(ANCHOR_END))
 }
 
 #[cfg(test)]
 mod tests {
-    use datafusion::sql::parser::DFParserBuilder;
-    use sqlparser::dialect::{BigQueryDialect, SnowflakeDialect};
+    use datafusion::logical_expr::col;
 
     use super::*;
 
-    fn rewritten(sql: &str, snowflake: bool) -> String {
-        let dialect: Box<dyn sqlparser::dialect::Dialect> = if snowflake {
-            Box::new(SnowflakeDialect {})
-        } else {
-            Box::new(BigQueryDialect {})
-        };
-        let mut statements = DFParserBuilder::new(sql)
-            .with_dialect(dialect.as_ref())
-            .build()
+    fn rewritten(dialect: Dialect, pattern: Expr) -> String {
+        let mut config = ConfigOptions::new();
+        config.sql_parser.dialect = dialect;
+        let call = regexp_functions().call(vec![col("a"), pattern]);
+        SnowflakeRegexpLike
+            .rewrite(call, &DFSchema::empty(), &config)
             .unwrap()
-            .parse_statements()
-            .unwrap();
-        let datafusion::sql::parser::Statement::Statement(statement) =
-            statements.front_mut().unwrap()
-        else {
-            panic!("a SQL statement")
-        };
-        if snowflake {
-            anchor_snowflake_regexps(statement);
-        } else {
-            bigquery_regexp_contains(statement);
-        }
-        statement.to_string()
+            .data
+            .to_string()
     }
 
     #[test]
     fn a_snowflake_regexp_matches_the_whole_value() {
         assert_eq!(
-            rewritten("SELECT a FROM t WHERE REGEXP_LIKE(a, 'e.', 'i')", true),
-            r"SELECT a FROM t WHERE regexp_like(a, '\A(?:e.)\z', 'i')"
+            rewritten(Dialect::Snowflake, lit("e.")),
+            r#"regexp_like(a, Utf8("\A(?:e.)\z"))"#
         );
         assert_eq!(
-            rewritten("SELECT a FROM t WHERE a NOT RLIKE b", true),
-            r"SELECT a FROM t WHERE NOT regexp_like(a, ('\A(?:' || b || ')\z'))"
+            rewritten(Dialect::Snowflake, col("b")),
+            r#"regexp_like(a, Utf8("\A(?:") || b || Utf8(")\z"))"#
         );
     }
 
     #[test]
-    fn a_bigquery_regexp_contains_matches_anywhere() {
+    fn another_dialects_regexp_matches_anywhere() {
         assert_eq!(
-            rewritten("SELECT a FROM t WHERE REGEXP_CONTAINS(a, 'e')", false),
-            "SELECT a FROM t WHERE regexp_like(a, 'e')"
+            rewritten(Dialect::BigQuery, lit("e.")),
+            r#"regexp_like(a, Utf8("e."))"#
         );
     }
 }
