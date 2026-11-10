@@ -217,6 +217,48 @@ impl AiNode {
         Ok(self)
     }
 
+    /// Whether the node can take `term`, a test that reads its answer,
+    /// into its filter. A test it does not accept stays a `Filter` above
+    /// the node, which DataFusion runs on the answers.
+    ///
+    /// An `AI.IF` takes one test: its answer `b`; for a call that reads
+    /// one table, also `NOT b` or an OR of `b` with other `AI.IF`
+    /// answers and tests of that table. Any other call takes a test of
+    /// its own answers and its input's columns, not one that reads
+    /// another call's answer.
+    pub fn accepts_test(&self, term: &Expr) -> bool {
+        let one_table = self
+            .call
+            .column_refs()
+            .iter()
+            .filter_map(|column| column.relation.as_ref())
+            .collect::<HashSet<_>>()
+            .len()
+            == 1;
+        if self.function() != "ai_filter" {
+            let own = |column: &&datafusion::common::Column| {
+                column.relation.is_some() || self.is_field(&column.name)
+            };
+            return term.column_refs().iter().all(own);
+        }
+        if self.filter.is_some() {
+            return false;
+        }
+        match self.answer_term(term) {
+            Some(negated) => one_table || !negated,
+            None => {
+                let mut tested = self.clone();
+                tested.filter = Some(term.clone());
+                one_table
+                    && crate::rules::or_guards::or_parts(&tested).is_some_and(|parts| {
+                        parts.plain.is_none_or(|plain| {
+                            crate::rules::guards::reads_call_table(&plain, self)
+                        })
+                    })
+            }
+        }
+    }
+
     /// Whether the node can take a fetch, a number of passing rows after
     /// which the executor stops asking the model.
     ///

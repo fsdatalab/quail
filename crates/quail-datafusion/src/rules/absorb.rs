@@ -5,8 +5,10 @@
 //! an answer, such as `sentiment IN ('negative')` or a test of an
 //! extraction's field, in a `Filter` right above the `AiNode` that adds
 //! the answer. The rule moves
-//! each such term into the node's filter, `σ_q(AI(R; p)) ⇒ AI(R; p ∧ q)`,
-//! keeping the terms in the order they stood. A node with a fetch keeps
+//! each such term the node accepts ([`AiNode::accepts_test`]) into the
+//! node's filter, `σ_q(AI(R; p)) ⇒ AI(R; p ∧ q)`, keeping the terms in the
+//! order they stood. A term the node does not accept stays in the
+//! `Filter`, and DataFusion runs it on the answers. A node with a fetch keeps
 //! the `Filter` above it: limiting the rows before the test is not the
 //! same as limiting them after.
 //!
@@ -197,19 +199,24 @@ fn absorb(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
         .iter()
         .map(|field| field.name().clone())
         .collect();
-    let (tests, kept): (Vec<Expr>, Vec<Expr>) = split_conjunction(&filter.predicate)
-        .into_iter()
-        .cloned()
-        .partition(|term| {
-            term.column_refs()
-                .iter()
-                .any(|column| column.relation.is_none() && answers.contains(&column.name))
-        });
-    if tests.is_empty() {
+    let reads_answer = |term: &Expr| {
+        term.column_refs()
+            .iter()
+            .any(|column| column.relation.is_none() && answers.contains(&column.name))
+    };
+    // the node takes each test it accepts; the rest stay in the Filter
+    let mut absorbed = node.clone();
+    let mut kept = Vec::new();
+    for term in split_conjunction(&filter.predicate) {
+        if reads_answer(term) && absorbed.accepts_test(term) {
+            absorbed.filter = conjunction(absorbed.filter.take().into_iter().chain([term.clone()]));
+        } else {
+            kept.push(term.clone());
+        }
+    }
+    if absorbed.filter == node.filter {
         return Ok(Transformed::no(plan));
     }
-    let mut absorbed = node.clone();
-    absorbed.filter = conjunction(absorbed.filter.take().into_iter().chain(tests));
     let mut plan = LogicalPlan::Extension(Extension {
         node: Arc::new(absorbed.checked()?),
     });
