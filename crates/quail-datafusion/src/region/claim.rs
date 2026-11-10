@@ -561,16 +561,9 @@ fn is_quail_operator(plan: &LogicalPlan) -> bool {
     matches!(
         plan,
         LogicalPlan::Projection(_)
-            | LogicalPlan::Filter(_)
-            | LogicalPlan::Window(_)
-            | LogicalPlan::Aggregate(_)
-            | LogicalPlan::Sort(_)
             | LogicalPlan::Join(_)
-            | LogicalPlan::Limit(_)
-            | LogicalPlan::Distinct(_)
             | LogicalPlan::SubqueryAlias(_)
             | LogicalPlan::TableScan(_)
-            | LogicalPlan::Unnest(_)
     ) || as_node::<AiNode>(plan).is_some()
 }
 
