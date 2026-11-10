@@ -237,6 +237,15 @@ fn claim_regions(plan: LogicalPlan, fetch: Option<usize>) -> Result<LogicalPlan>
     if !calls_ai(&plan)? {
         return Ok(plan);
     }
+    if ai_only()
+        && let Some((chain, restore)) = isolate_chain(&plan)?
+    {
+        let claimed = claim_regions(chain, fetch)?;
+        return Ok(LogicalPlan::Projection(Projection::try_new(
+            restore,
+            Arc::new(claimed),
+        )?));
+    }
     let mut refused = None;
     if !kept_by_datafusion(&plan)? {
         let selected = select_list(plan.clone(), None)?;
@@ -388,6 +397,9 @@ fn passed_fetch(plan: &LogicalPlan, fetch: Option<usize>) -> Option<usize> {
 pub(super) fn kept_by_datafusion(plan: &LogicalPlan) -> Result<bool> {
     if as_node::<AiNode>(plan).is_some() {
         return Ok(false);
+    }
+    if ai_only() {
+        return Ok(true);
     }
     // these run in DataFusion with their AI calls moved below them
     if matches!(
@@ -682,4 +694,71 @@ pub(super) fn is_subquery(expr: &Expr) -> bool {
         Expr::InSubquery(_) | Expr::ScalarSubquery(_) => true,
         _ => false,
     }
+}
+
+/// SPIKE: whether regions hold AI operators only.
+fn ai_only() -> bool {
+    std::env::var("QUAIL_AI_ONLY").is_ok()
+}
+
+static NEXT_ROWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// SPIKE: the run of `AiNode`s at `plan`'s root over its input as an
+/// opaque relation DataFusion computes, and the columns that restore the
+/// run's own names. None for an AI join or a run already over such a
+/// relation.
+fn isolate_chain(plan: &LogicalPlan) -> Result<Option<(LogicalPlan, Vec<Expr>)>> {
+    let mut nodes = Vec::new();
+    let mut bottom = plan;
+    while let Some(node) = as_node::<AiNode>(bottom) {
+        nodes.push(node);
+        bottom = node.input.as_ref();
+    }
+    if nodes.is_empty() || matches!(bottom, LogicalPlan::Join(_)) {
+        return Ok(None);
+    }
+    if let LogicalPlan::SubqueryAlias(alias) = bottom
+        && as_node::<SharedInput>(alias.input.as_ref()).is_some()
+    {
+        return Ok(None);
+    }
+    let columns = bottom.schema().columns();
+    let renamed: Vec<Expr> = columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| Expr::Column(column.clone()).alias(format!("column_{index}")))
+        .collect();
+    let number = NEXT_ROWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let input = datafusion::logical_expr::LogicalPlanBuilder::from(bottom.clone())
+        .project(renamed)?
+        .build()?;
+    let input = extension_node(SharedInput::try_new(input, false)?);
+    let mut input = datafusion::logical_expr::LogicalPlanBuilder::from(input)
+        .alias(format!("__quail_rows_{number}"))?
+        .build()?;
+    let replacements = input.schema().columns();
+    let remap = |expr: Expr| -> Result<Expr> {
+        Ok(expr
+            .transform_up(|expr| {
+                if let Expr::Column(column) = &expr
+                    && let Some(index) = columns.iter().position(|found| found == column)
+                {
+                    return Ok(Transformed::yes(Expr::Column(replacements[index].clone())));
+                }
+                Ok(Transformed::no(expr))
+            })?
+            .data)
+    };
+    for node in nodes.iter().rev() {
+        input = extension_node(node.map_expressions(&remap)?.with_input(input)?);
+    }
+    let restore = plan
+        .schema()
+        .iter()
+        .zip(input.schema().columns())
+        .map(|((qualifier, field), column)| {
+            Expr::Column(column).alias_qualified(qualifier.cloned(), field.name())
+        })
+        .collect();
+    Ok(Some((input, restore)))
 }
