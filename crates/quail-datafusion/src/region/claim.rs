@@ -724,6 +724,9 @@ fn isolate_chain(plan: &LogicalPlan) -> Result<Option<(LogicalPlan, Vec<Expr>)>>
     {
         return Ok(None);
     }
+    if std::env::var("QUAIL_DEBUG").is_ok() {
+        eprintln!("WRAP bottom:\n{}", bottom.display_indent());
+    }
     let columns = bottom.schema().columns();
     let renamed: Vec<Expr> = columns
         .iter()
@@ -783,6 +786,18 @@ fn is_table(plan: &LogicalPlan) -> bool {
                 })
                 .unwrap_or(true)
                 && is_table(&filter.input)
+        }
+        LogicalPlan::Projection(projection) => {
+            !projection.expr.iter().any(|expr| {
+                expr.exists(|inner| {
+                    Ok(is_ai_call(inner)
+                        || matches!(
+                            inner,
+                            Expr::Exists(_) | Expr::InSubquery(_) | Expr::ScalarSubquery(_)
+                        ))
+                })
+                .unwrap_or(true)
+            }) && is_table(&projection.input)
         }
         _ => false,
     }
