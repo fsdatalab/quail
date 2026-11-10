@@ -1,43 +1,19 @@
-//! The DISTINCT rules of a model region: `EliminateDistinct` and
-//! [`distinct_fetches`], a fetch step of [`crate::Derive`].
+//! The `EliminateDistinct` optimizer rule: a `DISTINCT` that removes no
+//! row is dropped.
 //!
-//! - `EliminateDistinct` removes the region's outermost `DISTINCT`, the
-//!   one under its LIMIT, ORDER BY, and outer SELECT list, when it removes
-//!   no row: the SELECT list returns every table's id column, which each
-//!   table declares as its primary key.
-//! - [`distinct_fetches`] gives the `AiNode` under a `DISTINCT` a fetch of
-//!   one row per value of the selected columns `K`:
-//!
-//!   ```text
-//!   δ(π_K(AI(R))) ⇒ δ(π_K(AI(R; n = 1 per K)))
-//!   ```
-//!
-//!   `K` is columns of the node's input, or the node's answer alone: a
-//!   `DISTINCT` over a classification's label stops once each label has
-//!   a row. The `DISTINCT` stays: it removes the rows the executor
-//!   returns before it stops a key. The node has no fetch and no `HINT`
-//!   yet: its tests are its own filter first, as a fetch counts rows
-//!   after them. A plain filter between the SELECT list and the node is
-//!   a WHERE term under the `DISTINCT`, so it moves below the node.
-//!   No other filter moves below the node afterwards, unless it reads
-//!   only the key columns ([`AiNode`]'s
-//!   `prevent_predicate_push_down_columns`).
-//!
-//! The rule reads a `DISTINCT` as written or as the GROUP BY that
-//! DataFusion's `replace_distinct_aggregate` makes of it. So a filter on
-//! `K` above a `DISTINCT`, which commutes with it and moves below it
-//! as DataFusion rewrites the `DISTINCT`, does not stop the rule.
+//! The rule removes the outermost `DISTINCT`, the one under the query's
+//! LIMIT, ORDER BY, and outer SELECT list, when the SELECT list returns
+//! every table's id column, which each table declares as its primary
+//! key. It reads a `DISTINCT` as written or as the GROUP BY that
+//! DataFusion's `replace_distinct_aggregate` makes of it.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::common::{Column, Constraint, Result};
-use datafusion::logical_expr::{Aggregate, Distinct, Expr, Filter, LogicalPlan, Projection};
+use datafusion::common::{Constraint, Result};
+use datafusion::logical_expr::{Aggregate, Distinct, Expr, LogicalPlan, Projection};
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
-
-use crate::ai::{AiNode, Fetch, Semantics};
-use crate::extension::{as_node, extension_node};
 
 /// Remove a region's `DISTINCT` when it removes no row, as the module
 /// explains.
@@ -60,21 +36,6 @@ impl OptimizerRule for EliminateDistinct {
     }
 }
 
-/// Give the `AiNode` under each `DISTINCT` a fetch of one row per value
-/// of the `DISTINCT` columns, as the module explains.
-pub(super) fn distinct_fetches(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
-    plan.transform_up(|node| {
-        let Some(input) = distinct_input(&node) else {
-            return Ok(Transformed::no(node));
-        };
-        let Some(keyed) = with_per_key_fetch(input)? else {
-            return Ok(Transformed::no(node));
-        };
-        let rebuilt = node.with_new_exprs(node.expressions(), vec![keyed])?;
-        Ok(Transformed::yes(rebuilt))
-    })
-}
-
 /// Whether an `Aggregate` is a `DISTINCT`: it groups by each of its
 /// input's columns, in order, and computes nothing else.
 ///
@@ -88,114 +49,6 @@ pub(crate) fn is_distinct(aggregate: &Aggregate) -> bool {
         .map(Expr::Column)
         .collect();
     aggregate.aggr_expr.is_empty() && aggregate.group_expr == columns
-}
-
-/// The input of a `DISTINCT`, written as one or as a GROUP BY.
-fn distinct_input(plan: &LogicalPlan) -> Option<&LogicalPlan> {
-    match plan {
-        LogicalPlan::Distinct(Distinct::All(input)) => Some(input),
-        LogicalPlan::Aggregate(aggregate) if is_distinct(aggregate) => Some(&aggregate.input),
-        _ => None,
-    }
-}
-
-/// `input`, a `DISTINCT`'s input, with the per-key fetch on its
-/// `AiNode` and the plain filters above the node moved below it; None
-/// when the module's conditions do not hold.
-fn with_per_key_fetch(input: &LogicalPlan) -> Result<Option<LogicalPlan>> {
-    let (selected, mut below): (Vec<Expr>, &LogicalPlan) = match input {
-        LogicalPlan::Projection(projection) => (projection.expr.clone(), &projection.input),
-        other => (
-            other
-                .schema()
-                .columns()
-                .into_iter()
-                .map(Expr::Column)
-                .collect(),
-            other,
-        ),
-    };
-    let mut filters: Vec<Expr> = Vec::new();
-    while let LogicalPlan::Filter(filter) = below {
-        filters.push(filter.predicate.clone());
-        below = &filter.input;
-    }
-    let Some(node) = as_node::<AiNode>(below) else {
-        return Ok(None);
-    };
-    if node.semantics != Semantics::Rows || node.fetch.is_some() || !node.accepts_fetch() {
-        return Ok(None);
-    }
-    let reads_answer = |expr: &Expr| {
-        expr.column_refs().iter().any(|column| {
-            column.relation.is_none()
-                && node.fields.iter().any(|field| field.name() == &column.name)
-        })
-    };
-    if filters.iter().any(reads_answer) {
-        return Ok(None);
-    }
-    let Some(key) = stop_key(node, &selected) else {
-        return Ok(None);
-    };
-    let mut lowered = node.input.as_ref().clone();
-    for predicate in filters.into_iter().rev() {
-        lowered = LogicalPlan::Filter(Filter::try_new(predicate, Arc::new(lowered))?);
-    }
-    let mut keyed = node.with_input(lowered)?;
-    keyed.fetch = Some(Fetch::PerKey { key, n: 1 });
-    let keyed = extension_node(keyed.checked()?);
-    Ok(Some(match input {
-        LogicalPlan::Projection(projection) => LogicalPlan::Projection(Projection::try_new(
-            projection.expr.clone(),
-            Arc::new(keyed),
-        )?),
-        _ => keyed,
-    }))
-}
-
-/// The names of the selected columns, when they are columns of the
-/// node's input, each name once there, or the node's returned answer
-/// alone.
-fn stop_key(node: &AiNode, selected: &[Expr]) -> Option<Vec<String>> {
-    let columns: Vec<&Column> = selected
-        .iter()
-        .map(|expr| match expr {
-            Expr::Column(column) => Some(column),
-            Expr::Alias(alias) => match alias.expr.as_ref() {
-                Expr::Column(column) => Some(column),
-                _ => None,
-            },
-            _ => None,
-        })
-        .collect::<Option<_>>()?;
-    let returns_answer = node
-        .returned_fields()
-        .iter()
-        .any(|field| field.name() == &node.answer);
-    if let [column] = columns.as_slice()
-        && column.relation.is_none()
-        && column.name == node.answer
-        && returns_answer
-    {
-        return Some(vec![node.answer.clone()]);
-    }
-    let input = node.input.schema();
-    let mut key: Vec<String> = Vec::new();
-    for column in columns {
-        let named = input
-            .fields()
-            .iter()
-            .filter(|field| field.name() == &column.name)
-            .count();
-        if !input.has_column(column) || named != 1 {
-            return None;
-        }
-        if !key.contains(&column.name) {
-            key.push(column.name.clone());
-        }
-    }
-    (!key.is_empty()).then_some(key)
 }
 
 /// Replace the outermost `DISTINCT` with what `edit` returns for its

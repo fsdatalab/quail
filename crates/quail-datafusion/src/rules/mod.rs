@@ -15,7 +15,7 @@
 pub(crate) mod derive;
 pub(crate) mod distinct;
 pub(crate) mod guards;
-pub(crate) mod keyed;
+
 pub(crate) mod lower;
 pub(crate) mod or_guards;
 pub(crate) mod placement;
