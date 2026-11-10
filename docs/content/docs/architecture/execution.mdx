@@ -116,8 +116,13 @@ possible completions must continue a span of its document.
 When those forms leave a test undecided and few complete answers are
 still possible, DataFusion evaluates the test on each one. This decides
 any expression of the answer, such as `answer LIKE '%2027%'`, for an
-extraction with few places left to copy from. Any other expression waits
-for the complete answer.
+extraction with few places left to copy from.
+
+For a map's open-ended text, DataFusion's `PruningPredicate` reads the
+test against the range of strings that start with the text so far, as
+it reads a Parquet column's least and greatest values. That decides
+comparisons such as `answer < 'M'`. Any other expression waits for the
+complete answer.
 
 See [partial.rs](https://github.com/fsdatalab/quail/blob/main/crates/quail-datafusion/src/partial.rs)
 for supported expression forms.

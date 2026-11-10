@@ -37,10 +37,14 @@ use std::sync::{Arc, OnceLock};
 
 use datafusion::arrow::array::{ArrayRef, AsArray, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::common::pruning::PruningStatistics;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column, DFSchema, ScalarValue};
 use datafusion::logical_expr::expr::{InList, Like, ScalarFunction};
+use datafusion::logical_expr::simplify::SimplifyContext;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
+use datafusion::optimizer::simplify_expressions::ExprSimplifier;
+use datafusion::physical_optimizer::pruning::PruningPredicateBuilder;
 use datafusion::prelude::SessionContext;
 use quail_planner::error::CompileError;
 use quail_planner::physical::Expression;
@@ -50,6 +54,70 @@ const MAX_LISTED: usize = 1024;
 
 /// The column that holds each listed answer.
 const LISTED: &str = "answer";
+
+/// The schema of a batch of answers: the one column [`LISTED`].
+fn answer_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![Field::new(LISTED, DataType::Utf8, true)]))
+}
+
+/// The session whose functions and type rules plan a test of an answer.
+fn context() -> &'static SessionContext {
+    static CONTEXT: OnceLock<SessionContext> = OnceLock::new();
+    CONTEXT.get_or_init(SessionContext::new)
+}
+
+/// The least string greater than every string that starts with `text`:
+/// `text` with its last character that has a successor raised by one,
+/// and nothing after it. None when no character has one.
+fn after(text: &str) -> Option<String> {
+    let mut characters: Vec<char> = text.chars().collect();
+    while let Some(last) = characters.pop() {
+        let next = (u32::from(last) + 1..=u32::from(char::MAX)).find_map(char::from_u32);
+        if let Some(next) = next {
+            characters.push(next);
+            return Some(characters.into_iter().collect());
+        }
+    }
+    None
+}
+
+/// The answers that start with a text, as the range of strings
+/// `PruningPredicate` reads: one container of rows.
+struct Range {
+    least: String,
+    /// None when no string bounds the answers from above.
+    greatest: Option<String>,
+}
+
+impl PruningStatistics for Range {
+    fn min_values(&self, _column: &Column) -> Option<ArrayRef> {
+        Some(Arc::new(StringArray::from(vec![Some(self.least.clone())])))
+    }
+
+    fn max_values(&self, _column: &Column) -> Option<ArrayRef> {
+        Some(Arc::new(StringArray::from(vec![self.greatest.clone()])))
+    }
+
+    fn num_containers(&self) -> usize {
+        1
+    }
+
+    fn null_counts(&self, _column: &Column) -> Option<ArrayRef> {
+        None
+    }
+
+    fn row_counts(&self) -> Option<ArrayRef> {
+        None
+    }
+
+    fn contained(
+        &self,
+        _column: &Column,
+        _values: &std::collections::HashSet<ScalarValue>,
+    ) -> Option<datafusion::arrow::array::BooleanArray> {
+        None
+    }
+}
 
 /// What a condition is at a partial answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -419,16 +487,9 @@ impl<F: Fn(&Expr) -> bool> Reader<'_, F> {
         }
     }
 
-    /// Which values `expr` gives the complete answers still possible,
-    /// each one evaluated by DataFusion; None when the answers are too
-    /// many to list ([`Completions::listed`]), `expr` reads a column that
-    /// is not the answer, or DataFusion does not evaluate it.
-    fn evaluated(&self, expr: &Expr) -> Option<Possible> {
-        let mut answers: Vec<Option<String>> =
-            self.answers.listed()?.into_iter().map(Some).collect();
-        if self.answers.may_be_null {
-            answers.push(None);
-        }
+    /// `expr` reading the answer as the column [`LISTED`]; None when it
+    /// reads any other column.
+    fn over_answer(&self, expr: &Expr) -> Option<Expr> {
         let mut other = false;
         let read = expr
             .clone()
@@ -444,16 +505,69 @@ impl<F: Fn(&Expr) -> bool> Reader<'_, F> {
             })
             .ok()?
             .data;
-        if other {
+        (!other).then_some(read)
+    }
+
+    /// Which values `expr` can give an answer that starts with the text
+    /// so far, as DataFusion's `PruningPredicate` decides from the
+    /// least and greatest such texts: whether `expr` can be TRUE, and
+    /// whether its negation can. None when the answer is complete,
+    /// `expr` reads a column that is not the answer, or DataFusion does
+    /// not plan it.
+    ///
+    /// Every answer that continues the text sorts from the text itself
+    /// up to the text with its last character raised by one, so a test a
+    /// range of strings cannot pass, such as `a = 'x'` or `a < 'x'`, is
+    /// decided for a map's open-ended answer. A shape the predicate does
+    /// not read counts as possible.
+    fn ranged(&self, expr: &Expr) -> Option<Possible> {
+        if self.answers.complete {
             return None;
         }
-        let field = Field::new(LISTED, DataType::Utf8, true);
-        let schema = Arc::new(Schema::new(vec![field]));
+        let read = self.over_answer(expr)?;
+        let schema = answer_schema();
+        let fields = DFSchema::try_from(Arc::clone(&schema)).ok()?;
+        let range = Range {
+            least: self.answers.prefix.clone(),
+            greatest: after(&self.answers.prefix),
+        };
+        let possible = |expr: Expr| -> Option<bool> {
+            let physical = context().create_physical_expr(expr, &fields).ok()?;
+            let predicate = PruningPredicateBuilder::new()
+                .with_file_schema(Arc::clone(&schema))
+                .try_build(physical)
+                .ok()?;
+            predicate.prune(&range).ok()?.first().copied()
+        };
+        let simplify = SimplifyContext::builder()
+            .with_schema(Arc::new(fields.clone()))
+            .build();
+        // the simplifier moves a NOT into the comparison it negates
+        let negated = ExprSimplifier::new(simplify)
+            .simplify(Expr::Not(Box::new(read.clone())))
+            .ok()?;
+        Some(Possible {
+            t: possible(read)?,
+            f: possible(negated)?,
+            n: self.answers.may_be_null,
+        })
+    }
+
+    /// Which values `expr` gives the complete answers still possible,
+    /// each one evaluated by DataFusion; None when the answers are too
+    /// many to list ([`Completions::listed`]), `expr` reads a column that
+    /// is not the answer, or DataFusion does not evaluate it.
+    fn evaluated(&self, expr: &Expr) -> Option<Possible> {
+        let mut answers: Vec<Option<String>> =
+            self.answers.listed()?.into_iter().map(Some).collect();
+        if self.answers.may_be_null {
+            answers.push(None);
+        }
+        let read = self.over_answer(expr)?;
+        let schema = answer_schema();
         let column: ArrayRef = Arc::new(StringArray::from(answers));
         let batch = RecordBatch::try_new(Arc::clone(&schema), vec![column]).ok()?;
-        static CONTEXT: OnceLock<SessionContext> = OnceLock::new();
-        let physical = CONTEXT
-            .get_or_init(SessionContext::new)
+        let physical = context()
             .create_physical_expr(read, &DFSchema::try_from(schema).ok()?)
             .ok()?;
         let values = physical
@@ -552,11 +666,17 @@ pub fn decide_expr(
     let mut found = reader.possible(expr);
     // the shapes above ignore that two parts read one answer, and read
     // any other shape as any value: a short list of answers settles both
-    if found.t
-        && (found.f || found.n)
-        && let Some(listed) = reader.evaluated(expr)
-    {
-        found = listed;
+    if found.t && (found.f || found.n) {
+        if let Some(listed) = reader.evaluated(expr) {
+            found = listed;
+        } else if let Some(ranged) = reader.ranged(expr) {
+            // both readings hold, so a value either rules out is out
+            found = Possible {
+                t: found.t && ranged.t,
+                f: found.f && ranged.f,
+                n: found.n && ranged.n,
+            };
+        }
     }
     if !found.t {
         Decision::NotTrue
@@ -732,6 +852,25 @@ mod tests {
     }
 
     #[test]
+    fn a_range_of_strings_decides_a_comparison_of_open_ended_text() {
+        // every answer that starts with "N" sorts after "Mz" and before "O"
+        let before = col("a").lt(lit("Mz"));
+        assert_eq!(at(&before, &text("N")), Decision::NotTrue);
+        assert_eq!(at(&col("a").gt(lit("Mz")), &text("N")), Decision::True);
+        assert_eq!(at(&before, &text("M")), Decision::Undecided);
+        // a NOT is read as the comparison it negates
+        assert_eq!(at(&!before.clone(), &text("N")), Decision::True);
+        // an answer that may be NULL is not certainly TRUE
+        let nullable = Completions {
+            may_be_null: true,
+            ..text("N")
+        };
+        assert_eq!(at(&col("a").gt(lit("Mz")), &nullable), Decision::Undecided);
+        assert_eq!(after("ab"), Some("ac".into()));
+        assert_eq!(after(""), None);
+    }
+
+    #[test]
     fn a_combination_is_decided_from_its_parts() {
         let test = col("a")
             .like(lit("Mar%"))
@@ -743,7 +882,9 @@ mod tests {
         let mixed = col("a").like(lit("Mar%")).and(col("b"));
         assert_eq!(at(&mixed, &text("Mar")), Decision::Undecided);
         assert_eq!(at(&mixed, &text("Jan")), Decision::NotTrue);
+        // a pattern with a wildcard inside is read by its literal start
         let other = col("a").like(lit("M_r%"));
-        assert_eq!(at(&other, &text("Jan")), Decision::Undecided);
+        assert_eq!(at(&other, &text("Jan")), Decision::NotTrue);
+        assert_eq!(at(&other, &text("Mar")), Decision::Undecided);
     }
 }
