@@ -3,8 +3,9 @@
 derive gives the AI filter on an IN subquery's side of a semi-join one
 row per join key (R13), and so to a correlated EXISTS whose AI filter
 reads the subquery's table alone. It gives the AI filter under HAVING
-COUNT(*) >= k k rows per group key (R14). Each test runs a query with the rule on and off, checks that both
-return the same rows, and counts the documents the model read.
+COUNT(*) >= k k rows per group key (R14). Each test runs a query with
+derive's fetch on and off, checks that both return the same rows, and
+counts the documents the model read.
 """
 
 import pyarrow as pa
