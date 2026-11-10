@@ -104,6 +104,18 @@ pub struct WrittenTest {
     pub clause: usize,
 }
 
+fn filters_on_or(node: &AiNode) -> bool {
+    crate::rules::or_guards::or_terms(node).is_some()
+}
+
+/// Whether an `AiNode` in `plan` filters on an OR.
+pub(crate) fn any_filters_on_or(plan: &LogicalPlan) -> bool {
+    datafusion::common::tree_node::TreeNode::exists(plan, |below| {
+        Ok(crate::extension::as_node::<AiNode>(below).is_some_and(filters_on_or))
+    })
+    .unwrap_or(false)
+}
+
 /// One AI call over the rows of its input, as `AiNode`; the module
 /// explains each part.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -203,6 +215,17 @@ impl AiNode {
             },
         };
         Ok(self)
+    }
+
+    /// Whether the node can take a fetch, a number of passing rows after
+    /// which the executor stops asking the model.
+    ///
+    /// A node with a `HINT` cannot: the hint's options estimate the rows
+    /// of its test. A node that filters on an OR cannot, nor can a node
+    /// above one: the executor counts the rows the model passes, not the
+    /// rows the OR's other terms pass.
+    pub fn accepts_fetch(&self) -> bool {
+        self.hint.is_none() && !filters_on_or(self) && !any_filters_on_or(&self.input)
     }
 
     /// Whether `term` is the node's answer column or its `NOT`, and which:

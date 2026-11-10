@@ -86,9 +86,11 @@ pub fn derive_region(
         .iter()
         .flat_map(|(_, predicates)| predicates)
         .any(|predicate| predicate.alternative.is_some());
+    // `AiNode::accepts_fetch` keeps a fetch off a region with an OR filter
     if ored && operators.fetch.is_some() {
-        // the executor counts the rows that pass among the rows it asks
-        return unsupported("LIMIT over an OR filter must run in DataFusion.");
+        return Err(CompileError::new(
+            "internal error: a model region has a fetch and an OR filter",
+        ));
     }
     Ok((operators, plan))
 }

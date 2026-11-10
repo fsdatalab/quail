@@ -276,7 +276,7 @@ fn with_key_fetch(plan: &LogicalPlan, keys: &[Column], n: usize) -> Result<Optio
             let Some(node) = as_node::<AiNode>(plan) else {
                 return Ok(None);
             };
-            if !stops_per_key(node) {
+            if !stops_per_key(node) || !node.accepts_fetch() {
                 return Ok(None);
             }
             let input = node.input.schema();

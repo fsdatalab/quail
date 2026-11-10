@@ -249,6 +249,25 @@ def test_a_negated_ai_filter_runs_in_one_model_region(shape):
         session.close()
 
 
+def test_a_limit_over_an_or_filter_stays_above_the_region():
+    session = quail.Session(CONFIG, tokenizer=TOKENIZER)
+    oracle = Oracle(filters={"r": {"q1:": [1, 0, 1, 0]}})
+    oracle.catalog = session.catalog
+    context = quail.SessionContext(session, physical_executor=oracle_executor(oracle))
+    context.register("r", quail.DocumentProvider.from_table(R, id_col="id"))
+    query = f"SELECT r.id FROM r WHERE {PREDICATE} OR r.stars > 3 LIMIT 10"
+    try:
+        plans = context.sql("EXPLAIN " + query)
+        logical = plans.column("plan").to_pylist()[
+            plans.column("plan_type").to_pylist().index("logical_plan")]
+        # DataFusion limits the rows; the region keeps the OR and its skipping
+        assert "Limit:" in logical and "SharedInput" not in logical
+        assert sorted(context.sql(query).column(0).to_pylist()) == ["r0", "r2", "r3"]
+        assert ("r", 3) not in oracle.asked
+    finally:
+        session.close()
+
+
 @pytest.mark.parametrize("negated", [False, True])
 def test_an_ai_filter_that_is_also_selected_asks_the_model_once(negated):
     session = quail.Session(CONFIG, tokenizer=TOKENIZER)

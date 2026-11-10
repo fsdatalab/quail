@@ -252,7 +252,8 @@ fn claim_regions(plan: LogicalPlan, fetch: Option<usize>) -> Result<LogicalPlan>
                 let mut region = ModelRegion::new(bound);
                 // a fetch counts the rows the region returns, not the
                 // rows a lifted test or UNNEST keeps of them
-                region.fetch = fetch.filter(|_| above.keeps_rows());
+                region.fetch = fetch
+                    .filter(|_| above.keeps_rows() && !crate::ai::any_filters_on_or(&region.plan));
                 let shared = back.inputs();
                 let mut read = Vec::new();
                 for (name, input) in inputs {

@@ -17,7 +17,8 @@
 //!
 //! - another operator is between them, such as a filter, a join, a sort,
 //!   or a `DISTINCT`, which can change how many rows there are;
-//! - the node has a `HINT`, whose options estimate the rows of its test;
+//! - the node does not accept a fetch ([`AiNode::accepts_fetch`]): it has
+//!   a `HINT`, or it or a node below it filters on an OR;
 //! - the node has a per-key fetch, which `Fetch` cannot combine with a
 //!   global one;
 //! - the `LIMIT` keeps no row, which DataFusion's `eliminate_limit`
@@ -102,7 +103,7 @@ fn with_fetch(plan: &LogicalPlan, rows: usize) -> Result<Option<(LogicalPlan, bo
                 return Ok(None);
             };
             let rows = match &node.fetch {
-                _ if node.hint.is_some() => return Ok(None),
+                _ if !node.accepts_fetch() => return Ok(None),
                 Some(Fetch::PerKey { .. }) => return Ok(None),
                 Some(Fetch::Global(found)) if *found <= rows => {
                     return Ok(Some((plan.clone(), false)));

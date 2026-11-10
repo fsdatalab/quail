@@ -136,7 +136,7 @@ fn with_per_key_fetch(input: &LogicalPlan) -> Result<Option<LogicalPlan>> {
     let Some(node) = as_node::<AiNode>(below) else {
         return Ok(None);
     };
-    if node.semantics != Semantics::Rows || node.fetch.is_some() || node.hint.is_some() {
+    if node.semantics != Semantics::Rows || node.fetch.is_some() || !node.accepts_fetch() {
         return Ok(None);
     }
     let reads_answer = |expr: &Expr| {
