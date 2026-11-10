@@ -342,6 +342,10 @@ fn unit_spared(steps: &[TableStep], unit: &[usize]) -> f64 {
     }
 }
 
+/// The most units [`order_steps`] tries every order of. Past it, the
+/// search takes each next unit by rank.
+const MAX_EXACT_UNITS: usize = 10;
+
 /// Where a sequence of steps stands: the rows that reach the next step,
 /// the last step, and the prompts already scored.
 #[derive(Clone)]
@@ -357,9 +361,13 @@ struct Reached {
 /// Choose an order using costs at each expected survivor count, as
 /// `order_filters_indexed` with the steps' own residency rule.
 ///
-/// The search places units: a step, or the terms of one OR together. It
-/// tries each unit first and then takes the unit of the lowest rank,
-/// its seconds over the fraction of rows it spares the steps after it
+/// The search places units: a step, or the terms of one OR together.
+/// With at most [`MAX_EXACT_UNITS`] units it finds the order of the
+/// fewest seconds: a unit's seconds depend only on the units before it
+/// and the step right before it, so it keeps the cheapest way to reach
+/// each such pair (Selinger et al., 1979). With more units it tries
+/// each unit first and then takes the unit of the lowest rank, its
+/// seconds over the fraction of rows it spares the steps after it
 /// (Hellerstein and Stonebraker, 1993). The terms of an OR run in the
 /// order of their own rank, seconds over the fraction of rows a term
 /// passes, and the OR ranks as one filter that passes the rows any
@@ -469,6 +477,41 @@ pub fn order_steps(
         ordered: Vec::new(),
         seconds: 0.0,
     };
+    if units.len() <= MAX_EXACT_UNITS {
+        // every order, by the units placed and the step placed last:
+        // what a unit costs next depends on nothing else
+        let full = (1usize << units.len()) - 1;
+        let mut reached: Vec<HashMap<usize, Reached>> = vec![HashMap::new(); full + 1];
+        let cheaper = |found: &Reached, other: &Reached| {
+            (found.seconds, &found.ordered) < (other.seconds, &other.ordered)
+        };
+        for placed in 0..full {
+            let from: Vec<Reached> = if placed == 0 {
+                vec![start.clone()]
+            } else {
+                reached[placed].values().cloned().collect()
+            };
+            for before in &from {
+                for (number, unit) in units.iter().enumerate() {
+                    let first = placed == 0;
+                    if placed & (1 << number) != 0 || (first && !starters.contains(&unit)) {
+                        continue;
+                    }
+                    let (next, _) = after_unit(before, unit)?;
+                    let last = next.previous.expect("a placed step");
+                    let known = &mut reached[placed | (1 << number)];
+                    if known.get(&last).is_none_or(|found| cheaper(&next, found)) {
+                        known.insert(last, next);
+                    }
+                }
+            }
+        }
+        let best = reached[full]
+            .values()
+            .reduce(|found, other| if cheaper(other, found) { other } else { found })
+            .expect("a starter");
+        return Ok(best.ordered.clone());
+    }
     let mut best: Option<Reached> = None;
     for first in starters {
         let (mut reached, _) = after_unit(&start, first)?;

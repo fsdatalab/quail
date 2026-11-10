@@ -122,8 +122,11 @@ Selectivity is the fraction of documents or pairs expected to pass a
 filter. The planner uses selectivity and model costs to order filters.
 
 The first `AI.IF` question processes the document. Later questions can
-reuse its KV. The planner tries eligible first steps, orders subsequent
-steps by cost per rejected document, and compares total estimated time.
+reuse its KV. With up to ten filters on a table, the planner finds the
+order of the least estimated time: a filter's time depends only on the
+filters before it and the one right before it, so the planner keeps the
+cheapest way to reach each such pair. With more filters, it tries each
+filter first and then takes the next by cost per rejected document.
 Tests of a score that is already available need no model work.
 
 Set `order="as_written"` on `session.sql()` to preserve filter order.
