@@ -100,16 +100,20 @@ fn unhint(expr: &Expr) -> (Expr, Option<Expr>) {
 /// Whether a term is a comparison of an `AI.SCORE` call.
 fn is_score_test(term: &Expr) -> bool {
     matches!(term, Expr::BinaryExpr(binary)
-        if matches!(
-            binary.op,
-            Operator::Eq
-                | Operator::NotEq
-                | Operator::Lt
-                | Operator::LtEq
-                | Operator::Gt
-                | Operator::GtEq
-        ) && (function_name(&binary.left) == Some("ai_score")
-            || function_name(&binary.right) == Some("ai_score")))
+    if matches!(
+        binary.op,
+        Operator::Eq
+            | Operator::NotEq
+            | Operator::Lt
+            | Operator::LtEq
+            | Operator::Gt
+            | Operator::GtEq
+    ) && match (function_name(&binary.left), function_name(&binary.right)) {
+        // the other side is a value DataFusion computes for each row
+        (Some("ai_score"), _) => !binary.right.exists(|found| Ok(crate::is_ai_call(found))).unwrap_or(true),
+        (_, Some("ai_score")) => !binary.left.exists(|found| Ok(crate::is_ai_call(found))).unwrap_or(true),
+        _ => false,
+    })
 }
 
 /// The `AI.IF` calls of a term that asks the model nothing else and has

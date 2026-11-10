@@ -158,9 +158,7 @@ impl Extracted {
                                 Expr::ScalarSubquery(found)
                             })
                         }
-                        Expr::Exists(mut found)
-                            if found.subquery.outer_ref_columns.is_empty() =>
-                        {
+                        Expr::Exists(mut found) if found.subquery.outer_ref_columns.is_empty() => {
                             lowered(&found.subquery.subquery, self, columns).map(|body| {
                                 found.subquery.subquery = body;
                                 Expr::Exists(found)
@@ -192,6 +190,31 @@ impl Extracted {
         if let Some(error) = failed {
             return Err(error);
         }
+        // VALUES has no input: each row is a SELECT list over one empty row
+        if let LogicalPlan::Values(values) = &plan {
+            let mut rows = Vec::new();
+            for row in &values.values {
+                let exprs: Vec<Expr> = row
+                    .iter()
+                    .zip(values.schema.iter())
+                    .map(|(expr, (qualifier, field))| {
+                        expr.clone()
+                            .alias_qualified(qualifier.cloned(), field.name())
+                    })
+                    .collect();
+                let one = LogicalPlanBuilder::empty(true).project(exprs)?.build()?;
+                rows.push(self.lower(one, columns)?);
+            }
+            let mut rows = rows.into_iter();
+            let Some(first) = rows.next() else {
+                return Ok(plan);
+            };
+            let mut union = LogicalPlanBuilder::from(first);
+            for row in rows {
+                union = union.union(row)?;
+            }
+            return union.build();
+        }
         self.num_inputs += 1;
         if let Some(join) = super::join::lower_outer_join(&plan, self.num_inputs, |input| {
             self.lower(input, columns)
@@ -205,14 +228,16 @@ impl Extracted {
             .map(|input| self.lower(input, columns))
             .collect::<Result<Vec<_>>>()?;
         let plan = plan.with_new_exprs(plan.expressions(), inputs)?;
+        let plan = self.lower_arguments(plan, columns)?;
         // an operator that is no filter, inner join, or SELECT list reads
         // its calls from a SELECT list below it
         let plan = match plan {
-            LogicalPlan::Aggregate(_) | LogicalPlan::Window(_) | LogicalPlan::Sort(_) => self
-                .extract(plan, false)?
-                .data
-                .map_children(|child| crate::rules::lower::lower_node(child, columns))?
-                .data,
+            LogicalPlan::Aggregate(_) | LogicalPlan::Window(_) | LogicalPlan::Sort(_) => {
+                self.extract(plan, false)?
+                    .data
+                    .map_children(|child| crate::rules::lower::lower_node(child, columns))?
+                    .data
+            }
             plan => crate::rules::lower::lower_node(plan, columns)?.data,
         };
         // a call inside a larger expression is read from a SELECT list below
@@ -223,12 +248,71 @@ impl Extracted {
                 .any(|expr| expr.exists(|inner| Ok(is_ai_call(inner))).unwrap_or(false));
         if nested && matches!(plan, LogicalPlan::Filter(_) | LogicalPlan::Projection(_)) {
             return Ok(self
-                .extract(plan, false)?
+                .extract_calls(plan, false, true)?
                 .data
                 .map_children(|child| crate::rules::lower::lower_node(child, columns))?
                 .data);
         }
         Ok(plan)
+    }
+
+    /// `plan` with each AI call that is an argument of another read as
+    /// a column of a SELECT list below it, innermost first.
+    fn lower_arguments(
+        &mut self,
+        mut plan: LogicalPlan,
+        columns: &mut crate::rules::lower::Columns,
+    ) -> Result<LogicalPlan> {
+        loop {
+            if plan.inputs().len() != 1 {
+                return Ok(plan);
+            }
+            let mut inner: Vec<Expr> = Vec::new();
+            for expr in plan.expressions() {
+                expr.apply(|outer| {
+                    let Expr::ScalarFunction(call) = outer else {
+                        return Ok(TreeNodeRecursion::Continue);
+                    };
+                    if !is_ai_call(outer) {
+                        return Ok(TreeNodeRecursion::Continue);
+                    }
+                    for argument in &call.args {
+                        argument.apply(|found| {
+                            let innermost = is_ai_call(found)
+                                && matches!(found, Expr::ScalarFunction(call)
+                                if !call.args.iter().any(|argument| {
+                                    argument.exists(|deeper| Ok(is_ai_call(deeper))).unwrap_or(true)
+                                }));
+                            if innermost && !inner.contains(found) {
+                                inner.push(found.clone());
+                            }
+                            Ok(TreeNodeRecursion::Continue)
+                        })?;
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })?;
+            }
+            if inner.is_empty() {
+                return Ok(plan);
+            }
+            let input = plan.inputs()[0].clone();
+            let named = self.name(inner, input.schema());
+            let mut exprs: Vec<Expr> = input
+                .schema()
+                .columns()
+                .into_iter()
+                .map(Expr::Column)
+                .collect();
+            exprs.extend(named.iter().map(|(call, name)| call.clone().alias(name)));
+            let below = LogicalPlan::Projection(Projection::try_new(exprs, Arc::new(input))?);
+            let below = crate::rules::lower::lower_node(below, columns)?.data;
+            let exprs = plan
+                .expressions()
+                .iter()
+                .map(|expr| read_calls(expr, &named))
+                .collect::<Result<Vec<_>>>()?;
+            plan = plan.with_new_exprs(exprs, vec![below])?;
+        }
     }
 
     fn fresh_call(&mut self) -> String {
@@ -261,6 +345,17 @@ impl Extracted {
     /// Move each AI call of an `Aggregate`, `Window`, or `Sort` into a
     /// `Projection` below it.
     fn extract(&mut self, node: LogicalPlan, seal: bool) -> Result<Transformed<LogicalPlan>> {
+        self.extract_calls(node, seal, false)
+    }
+
+    /// [`Self::extract`]; with `whole`, also a SELECT list's items that
+    /// are a call and nothing else.
+    fn extract_calls(
+        &mut self,
+        node: LogicalPlan,
+        seal: bool,
+        whole: bool,
+    ) -> Result<Transformed<LogicalPlan>> {
         if !matches!(
             node,
             LogicalPlan::Aggregate(_)
@@ -275,7 +370,8 @@ impl Extracted {
         for expr in node.expressions() {
             // a SELECT list item that is a model call already sits where
             // a region reads it
-            if matches!(node, LogicalPlan::Projection(_))
+            if !whole
+                && matches!(node, LogicalPlan::Projection(_))
                 && ai_calls(&expr)?.first() == Some(expr.clone().unalias_nested().data).as_ref()
             {
                 continue;

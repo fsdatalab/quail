@@ -748,7 +748,10 @@ fn isolate_chain(plan: &LogicalPlan) -> Result<Option<(LogicalPlan, Vec<Expr>)>>
         nodes.push(node);
         bottom = node.input.as_ref();
     }
-    if nodes.is_empty() || matches!(bottom, LogicalPlan::Join(_)) || is_table(bottom) {
+    let Some(lowest) = nodes.last() else {
+        return Ok(None);
+    };
+    if is_ai_join(lowest, bottom) || is_table(bottom) {
         return Ok(None);
     }
     if let LogicalPlan::SubqueryAlias(alias) = bottom
@@ -822,7 +825,16 @@ fn is_table(plan: &LogicalPlan) -> bool {
         }
         Ok(TreeNodeRecursion::Continue)
     });
-    num_scans == 1 && !calls_ai(plan).unwrap_or(true)
+    // the region reads a table by its alias, which names its columns
+    let mut top = plan;
+    while let LogicalPlan::Filter(filter) = top {
+        top = filter.input.as_ref();
+    }
+    matches!(
+        top,
+        LogicalPlan::SubqueryAlias(_) | LogicalPlan::TableScan(_)
+    ) && num_scans == 1
+        && !calls_ai(plan).unwrap_or(true)
 }
 
 /// One model region for the run of `AiNode`s at `plan`'s root, or the
@@ -832,12 +844,21 @@ fn claim_run(
     fetch: Option<usize>,
     needed: Option<Vec<Column>>,
 ) -> Result<std::result::Result<LogicalPlan, String>> {
-    let selected = select_list(plan.clone(), needed)?;
-    let (bound, inputs, _) = split_inputs(selected)?;
-    let numbered_inputs = numbered(&bound);
-    let (bound, above) = lift_relational(bound)?;
-    let names: Vec<String> = inputs.iter().map(|(name, _)| name.clone()).collect();
-    let (bound, back) = join_back(bound, &names)?;
+    // a run the claim cannot shape into a region is refused like one the
+    // binder cannot read
+    let shaped = (|| {
+        let selected = select_list(plan.clone(), needed)?;
+        let (bound, inputs, _) = split_inputs(selected)?;
+        let numbered_inputs = numbered(&bound);
+        let (bound, above) = lift_relational(bound)?;
+        let names: Vec<String> = inputs.iter().map(|(name, _)| name.clone()).collect();
+        let (bound, back) = join_back(bound, &names)?;
+        Ok::<_, datafusion::common::DataFusionError>((bound, inputs, numbered_inputs, above, back))
+    })();
+    let (bound, inputs, numbered_inputs, above, back) = match shaped {
+        Ok(shaped) => shaped,
+        Err(error) => return Ok(Err(error.strip_backtrace())),
+    };
     if !quail_plans(&bound)? {
         return Ok(Err(format!(
             "This operator cannot contain a model call:\n{}",
@@ -900,7 +921,8 @@ fn simpler_run(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
         && node.hint.is_none()
         && node.hint_test.is_none()
         && node.fetch.is_none()
-        && node.projection.is_none();
+        && node.projection.is_none()
+        && node.tests.is_empty();
     if plain {
         return computed_arguments(node);
     }
@@ -911,6 +933,7 @@ fn simpler_run(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
     stripped.hint_test = None;
     stripped.fetch = None;
     stripped.projection = None;
+    stripped.tests = Vec::new();
     let mut above = extension_node(stripped.checked()?);
     if let Some(filter) = &node.filter {
         above = LogicalPlan::Filter(datafusion::logical_expr::Filter::try_new(
@@ -961,4 +984,21 @@ fn computed_arguments(node: &AiNode) -> Result<Option<LogicalPlan>> {
         columns,
         Arc::new(lowered),
     )?)))
+}
+
+/// Whether `node` over `input` is an AI join or gate: its call reads both
+/// sides of an inner join, which the region pairs itself.
+fn is_ai_join(node: &AiNode, input: &LogicalPlan) -> bool {
+    let LogicalPlan::Join(join) = input else {
+        return false;
+    };
+    if node.semantics != crate::ai::Semantics::Rows {
+        return true;
+    }
+    if join.join_type != datafusion::logical_expr::JoinType::Inner {
+        return false;
+    }
+    let read = node.call.column_refs();
+    let reads = |side: &LogicalPlan| read.iter().any(|column| side.schema().has_column(column));
+    reads(&join.left) && reads(&join.right)
 }
