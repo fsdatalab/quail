@@ -122,7 +122,20 @@ fn number_regions(plan: LogicalPlan) -> Result<LogicalPlan> {
 /// test reads, or one in a region below operators DataFusion runs,
 /// scores its labels without the probabilities readout.
 fn drop_unread_probabilities(plan: LogicalPlan) -> Result<LogicalPlan> {
-    let whole = as_node::<ModelRegion>(&plan).is_some();
+    // a projection that only passes columns on is removed by the
+    // optimizer run that follows the claim
+    let mut root = &plan;
+    while let LogicalPlan::Projection(projection) = root {
+        if !projection
+            .expr
+            .iter()
+            .all(|expr| matches!(expr.clone().unalias_nested().data, Expr::Column(_)))
+        {
+            break;
+        }
+        root = projection.input.as_ref();
+    }
+    let whole = as_node::<ModelRegion>(root).is_some();
     plan.transform_up(|node| {
         let Some(region) = as_node::<ModelRegion>(&node) else {
             return Ok(Transformed::no(node));
