@@ -1,6 +1,7 @@
 """Edited-plan scope and per-region ANALYZE results, without a GPU."""
 
 import re
+
 import pyarrow as pa
 import pytest
 from helpers.oracle import Oracle, oracle_executor

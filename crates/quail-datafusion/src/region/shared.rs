@@ -77,13 +77,6 @@ impl SharedInput {
         Self::with_key(key, input, numbered, None)
     }
 
-    /// Completed values in a new scope: SQL expressions consume these outputs,
-    /// not the identity columns in the region's internal restoring joins.
-    pub(super) fn scoped(input: LogicalPlan, scope: String) -> Result<Self> {
-        let key = NEXT_KEY.fetch_add(1, Ordering::Relaxed);
-        Self::with_key(key, input, false, Some(TableReference::bare(scope)))
-    }
-
     fn with_key(
         key: u64,
         input: LogicalPlan,

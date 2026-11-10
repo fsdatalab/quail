@@ -5,12 +5,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::catalog::Session;
-use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, Result, ScalarValue, plan_err};
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::{Expr, LogicalPlan, Projection};
-use datafusion::optimizer::{Analyzer, Optimizer, OptimizerContext};
+use datafusion::optimizer::Optimizer;
 use quail_planner::error::CompileError;
 
 use super::ModelRegion;
@@ -67,9 +66,6 @@ pub fn claim_model_regions(plan: LogicalPlan, session: &dyn Session) -> Result<L
             return Ok(LogicalPlan::Analyze(analyze));
         }
         _ => {}
-    }
-    if std::env::var("QUAIL_DEBUG").is_ok() {
-        eprintln!("CLAIM:\n{}", plan.display_indent());
     }
     if !calls_ai(&plan)? {
         // the analyzer has already made a fallback column's region
@@ -366,79 +362,6 @@ fn claim_needed(
     plan.with_new_exprs(plan.expressions(), inputs)
 }
 
-/// Check a refused placeholder trial against the real lowered inputs. Optimizer
-/// rewrites can move computed columns into those inputs, making the native plan
-/// bind even when the placeholder-only trial could not see them.
-pub(super) fn native_plan_fits(plan: &LogicalPlan, config: &ConfigOptions) -> bool {
-    let context = OptimizerContext::new_with_config_options(Arc::new(config.clone()));
-    let claimed = Analyzer::new()
-        .execute_and_check(plan.clone(), config, |_, _| {})
-        .and_then(|plan| {
-            Optimizer::with_rules(crate::rules::default_rules()).optimize(plan, &context, |_, _| {})
-        })
-        .and_then(|plan| claim_regions(plan, None));
-    let Ok(claimed) = claimed else { return false };
-    if calls_ai(&claimed).unwrap_or(true) {
-        return false;
-    }
-    !claimed
-        .exists(|node| {
-            Ok(as_node::<ModelRegion>(node)
-                .is_some_and(|region| derive_error(&region.plan).is_some()))
-        })
-        .unwrap_or(true)
-}
-
-/// Seal a fallback column before optimization can absorb the surrounding SQL
-/// expression into it again. Its rows are normal staged DataFusion inputs.
-pub(super) fn claim_isolated(
-    bound: LogicalPlan,
-    inputs: Vec<(String, LogicalPlan)>,
-    config: &ConfigOptions,
-) -> Result<LogicalPlan> {
-    let lowered = crate::lower_ai_calls(bound)?;
-    let coerced = Analyzer::new().execute_and_check(lowered, config, |_, _| {})?;
-    let context = OptimizerContext::new_with_config_options(Arc::new(config.clone()));
-    let optimized = Optimizer::with_rules(crate::rules::default_rules()).optimize(
-        coerced,
-        &context,
-        |_, _| {},
-    )?;
-    let bound = select_list(optimized, None)?;
-    let numbered_inputs = numbered(&bound);
-    let (bound, above) = lift_relational(bound)?;
-    let names = inputs
-        .iter()
-        .map(|(name, _)| name.clone())
-        .collect::<Vec<_>>();
-    let (bound, back) = join_back(bound, &names)?;
-    if let Some(error) = derive_error(&bound) {
-        return plan_err!("{}", error.message());
-    }
-    let shared = back.inputs();
-    let mut region = ModelRegion::new(bound);
-    let mut read = Vec::new();
-    for (name, input) in inputs {
-        // Lowering's native trial optimizes a copy; these staged inputs still
-        // need those same rules before they can be claimed early.
-        let input = Analyzer::new().execute_and_check(input, config, |_, _| {})?;
-        let input = Optimizer::with_rules(crate::rules::default_rules()).optimize(
-            input,
-            &context,
-            |_, _| {},
-        )?;
-        let mut input = claim_regions(input, None)?;
-        let numbered = numbered_inputs.contains(&name);
-        if numbered || shared.contains(&name) {
-            input = extension_node(SharedInput::try_new(input, numbered)?);
-        }
-        read.push((name.clone(), input.clone()));
-        region.inputs.push(input);
-        region.input_names.push(name);
-    }
-    above.build(back.build(extension_node(region), &read)?)
-}
-
 /// The most rows `plan`'s operator reads from its input, when it is a
 /// `Limit`, or passes `fetch` on from above without changing the rows.
 fn passed_fetch(plan: &LogicalPlan, fetch: Option<usize>) -> Option<usize> {
@@ -455,107 +378,12 @@ fn passed_fetch(plan: &LogicalPlan, fetch: Option<usize>) -> Option<usize> {
     }
 }
 
-/// Whether DataFusion runs this operator, as the module explains: a
-/// `DISTINCT` past DataFusion's optimizer is an `Aggregate`.
-pub(super) fn kept_by_datafusion(plan: &LogicalPlan) -> Result<bool> {
-    if as_node::<AiNode>(plan).is_some() {
-        return Ok(false);
-    }
-    // these run in DataFusion with their AI calls moved below them
-    if matches!(
-        plan,
-        LogicalPlan::Aggregate(_)
-            | LogicalPlan::Window(_)
-            | LogicalPlan::Sort(_)
-            | LogicalPlan::Limit(_)
-            | LogicalPlan::Distinct(_)
-            | LogicalPlan::Unnest(_)
-    ) {
-        return Ok(true);
-    }
-    for expr in plan.expressions() {
-        if expr.exists(|inner| Ok(is_ai_call(inner)))? {
-            return Ok(false);
-        }
-    }
-    Ok(match plan {
-        LogicalPlan::Projection(_) | LogicalPlan::Filter(_) | LogicalPlan::SubqueryAlias(_) => {
-            let input = plan.inputs()[0];
-            calls_ai(input)? && kept_by_datafusion(input)?
-        }
-        _ => false,
-    })
-}
-
-/// Quail's refusal of `plan` as a region, when the refusal is of a shape
-/// DataFusion can run instead; any other refusal is the query's error,
-/// reported when the region is planned.
-///
-/// The trial lowers `plan`, coerces its types, and runs the default
-/// optimizer rules over it ([`crate::rules::default_rule_names`]), as the
-/// session would.
-///
-/// # Errors
-///
-/// Type coercion fails and Quail's binder names the cause, such as a
-/// test of a feature list that is not unnested; DataFusion's own error
-/// would follow from the same query.
-pub(super) fn refusal(plan: &LogicalPlan, config: &ConfigOptions) -> Result<Option<String>> {
-    // The original SQL has already bound. Failure to construct a model region
-    // is a reason to isolate its calls, not permission to claim a broken plan.
-    let lowered = match crate::lower_ai_calls(plan.clone()) {
-        Ok(lowered) => lowered,
-        Err(error) => return Ok(Some(error.to_string())),
-    };
-    let coerced = match Analyzer::new().execute_and_check(lowered.clone(), config, |_, _| {}) {
-        Ok(coerced) => coerced,
-        Err(_) => {
-            let rules = crate::rules::QUAIL_RULES
-                .iter()
-                .map(|name| crate::rules::logical_rule(name))
-                .collect::<Result<Vec<_>>>()?;
-            let placed = Optimizer::with_rules(rules)
-                .optimize(lowered, &OptimizerContext::new(), |_, _| {})
-                .and_then(|placed| select_list(placed, None))
-                .and_then(|selected| lift_relational(selected).map(|(region, _)| region));
-            return match placed.map(|placed| derive_error(&placed)) {
-                Ok(Some(error)) if error.is_unsupported() => Ok(Some(error.message().to_string())),
-                Ok(Some(error)) => plan_err!("{}", error.message()),
-                _ => Ok(None),
-            };
-        }
-    };
-    let context = OptimizerContext::new_with_config_options(Arc::new(config.clone()));
-    let optimized = match Optimizer::with_rules(crate::rules::default_rules()).optimize(
-        coerced,
-        &context,
-        |_, _| {},
-    ) {
-        Ok(optimized) => optimized,
-        Err(error) => return Ok(Some(error.to_string())),
-    };
-    match select_list(optimized, None).and_then(lift_relational) {
-        Ok((region, _)) => Ok(refusal_of(&region)),
-        // SQL was already bound by DataFusion. A schema failure while moving
-        // its expressions is a planner limitation, not a user argument error.
-        Err(error) => Ok(Some(error.to_string())),
-    }
-}
-
 /// Quail's binder's error for `plan` as a region, if it has one.
 fn derive_error(plan: &LogicalPlan) -> Option<CompileError> {
     // the chat turn and layout change the prompts, not what Quail reads
     let turn: quail_planner::prompts::Turn = (String::new(), String::new());
     let region = ModelRegion::new(plan.clone());
     crate::derive::derive_region(&region, &turn, "ai-if").err()
-}
-
-/// Quail's refusal of `plan`, a region's operators after DataFusion's
-/// optimizer, when the refusal is of a shape DataFusion can run instead.
-fn refusal_of(plan: &LogicalPlan) -> Option<String> {
-    derive_error(plan)
-        .filter(CompileError::is_unsupported)
-        .map(|error| error.to_string())
 }
 
 /// The CTE name and body of a FROM subquery: `x` over the CTE `clauses`,
@@ -886,7 +714,7 @@ fn claim_run(
         } else {
             selected
         };
-        let (bound, inputs, _) = split_inputs(selected)?;
+        let (bound, inputs) = split_inputs(selected)?;
         let numbered_inputs = numbered(&bound);
         let (bound, above) = lift_relational(bound)?;
         let names: Vec<String> = inputs.iter().map(|(name, _)| name.clone()).collect();

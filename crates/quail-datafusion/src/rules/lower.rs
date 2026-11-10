@@ -71,8 +71,8 @@ impl AnalyzerRule for LowerAiCalls {
         "lower_ai_calls"
     }
 
-    fn analyze(&self, plan: LogicalPlan, config: &ConfigOptions) -> Result<LogicalPlan> {
-        crate::region::claim::lower_regions(plan, config)
+    fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
+        crate::region::claim::lower_regions(plan)
     }
 }
 
@@ -857,8 +857,7 @@ fn lower_projection(
                     .schema()
                     .iter()
                     .any(|(qualifier, _)| qualifier.is_some_and(|found| found.table() == name));
-                let name = if names_table
-                    || input.schema().has_column_with_unqualified_name(&name)
+                let name = if names_table || input.schema().has_column_with_unqualified_name(&name)
                 {
                     columns.unnamed()
                 } else {
