@@ -851,8 +851,15 @@ fn lower_projection(
                     columns.reserved.insert(alias.name.clone());
                     alias.name.clone()
                 };
-                // a name the input already has goes to the SELECT list alone
-                let name = if input.schema().has_column_with_unqualified_name(&name) {
+                // a name the input already has, as a column or a table, goes
+                // to the SELECT list alone
+                let names_table = input
+                    .schema()
+                    .iter()
+                    .any(|(qualifier, _)| qualifier.is_some_and(|found| found.table() == name));
+                let name = if names_table
+                    || input.schema().has_column_with_unqualified_name(&name)
+                {
                     columns.unnamed()
                 } else {
                     name

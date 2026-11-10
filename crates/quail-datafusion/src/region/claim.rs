@@ -905,8 +905,8 @@ fn claim_run(
 /// A plan that returns the rows of the run of `AiNode`s at `plan`'s root
 /// and asks less of one region, or None when there is nothing simpler.
 ///
-/// A run of several nodes gives up its top node, which becomes a run of
-/// its own over the others' rows. A single node gives up its options: its
+/// A run of several nodes gives up its hint tests, and then its top
+/// node, which becomes a run of its own over the others' rows. A single node gives up its options: its
 /// filter and fetch become a `Filter` and `Limit` above it, and its
 /// guard, hint, and hint test, which only save work, are dropped. A node
 /// with no options has its arguments computed below it.
@@ -922,6 +922,23 @@ fn simpler_run(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
         )?))
     };
     if as_node::<AiNode>(node.input.as_ref()).is_some() {
+        // a hint test only saves work, and one that reads another call's
+        // answer is the usual reason a run of several calls is refused
+        let mut nodes = Vec::new();
+        let mut bottom = plan;
+        while let Some(found) = as_node::<AiNode>(bottom) {
+            nodes.push(found);
+            bottom = found.input.as_ref();
+        }
+        if nodes.iter().any(|found| found.hint_test.is_some()) {
+            let mut run = bottom.clone();
+            for found in nodes.iter().rev() {
+                let mut found = (*found).clone();
+                found.hint_test = None;
+                run = extension_node(found.with_input(run)?);
+            }
+            return Ok(Some(run));
+        }
         let below = pass_on(node.input.as_ref())?;
         return Ok(Some(extension_node(node.with_input(below)?)));
     }

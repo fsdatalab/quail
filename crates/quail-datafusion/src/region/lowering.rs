@@ -73,7 +73,14 @@ pub(crate) fn lower_regions(plan: LogicalPlan, config: &ConfigOptions) -> Result
         Ok(TreeNodeRecursion::Continue)
     })?;
     let mut columns = crate::rules::lower::Columns::of(&plan)?;
-    extracted.lower(plan, &mut columns)
+    if std::env::var("QUAIL_DEBUG").is_ok() {
+        eprintln!("LOWER IN:\n{}", plan.display_indent());
+    }
+    let lowered = extracted.lower(plan, &mut columns)?;
+    if std::env::var("QUAIL_DEBUG").is_ok() {
+        eprintln!("LOWER OUT:\n{}", lowered.display_indent());
+    }
+    Ok(lowered)
 }
 
 /// Remove the name DataFusion gives an AI call written by a dotted
@@ -518,7 +525,14 @@ impl Extracted {
                             && !input.has_column_with_unqualified_name(name)
                     })
                     .map(|(_, name)| name.clone());
-                let name = named.unwrap_or_else(|| self.fresh_call());
+                let name = named.unwrap_or_else(|| {
+                    let mut name = self.fresh_call();
+                    // a span column is its extraction's answer name with the suffix
+                    if crate::functions::function_name(&call) == Some("ai_extract_span") {
+                        name.push_str(crate::SPAN_SUFFIX);
+                    }
+                    name
+                });
                 self.used.push(name.clone());
                 (call, name)
             })
