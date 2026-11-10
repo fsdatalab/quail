@@ -31,7 +31,7 @@ use crate::search::{
     resident_after,
 };
 use crate::statistics::{
-    arena_capacity, effective_selectivity, pair_counts, predicate_asked_fraction, row_selectivity,
+    RowFlow, arena_capacity, effective_selectivity, pair_counts, predicate_asked_fraction,
 };
 use crate::validation::{
     columns_above_joins, has_score, is_score, score_projections, validate_query,
@@ -432,7 +432,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
             }
         }
         let mut port = port;
-        let mut expected_rows = expected_rows;
+        let mut flow = RowFlow::new(expected_rows);
         // the scores SELECT returns follow the score predicates, before
         // the classifications and extractions read the rows
         let mut scores_pending = kinds.contains(ASK) && self.scoring.is_some();
@@ -441,9 +441,16 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
             let kind = steps[run[0]].kind;
             let resident =
                 previous.is_some_and(|previous| resident_after(&steps[previous], &steps[run[0]]));
+            let expected_rows = flow.rows();
             if kind != ASK && scores_pending {
                 port = self.emit_projected_scores(alias, expected_rows, port)?;
                 scores_pending = false;
+            }
+            // the rows each step of the run asks about
+            let mut asked = Vec::new();
+            for index in run {
+                asked.push(flow.asked(steps[*index].or_term.as_ref()));
+                steps[*index].pass(&mut flow, &steps[index + 1..]);
             }
             if kind == ASK {
                 let positions: Vec<usize> = run
@@ -457,7 +464,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                     self.emit_scores(alias, &positions, expected_rows, port)?
                 } else {
                     let followed = *run.last().expect("a step") != steps.len() - 1;
-                    self.emit_filter(alias, &positions, expected_rows, port, followed)?
+                    self.emit_filter(alias, &positions, &asked, port, followed)?
                 };
             } else {
                 let columns: Vec<SemanticColumn> = run
@@ -474,13 +481,10 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                     .collect();
                 port = self.emit_columns(alias, expected_rows, port, &columns, resident)?;
             }
-            for index in run {
-                expected_rows *= steps[*index].selectivity;
-            }
             previous = run.last().copied();
         }
         if scores_pending {
-            port = self.emit_projected_scores(alias, expected_rows, port)?;
+            port = self.emit_projected_scores(alias, flow.rows(), port)?;
         }
         Ok(port)
     }
@@ -504,19 +508,18 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
     }
 
     /// Append a run of the alias's AI filters in their chosen order, as
-    /// `emit_filter`.
+    /// `emit_filter`; `asked` holds the rows each asks about.
     fn emit_filter(
         &mut self,
         alias: &str,
         positions: &[usize],
-        expected_rows: f64,
+        asked: &[f64],
         port: PortRef,
         followed: bool,
     ) -> Result<PortRef, CompileError> {
         let order = self.filter_order(alias).to_vec();
-        let mut surviving = expected_rows;
         let mut port = port;
-        for position in positions {
+        for (position, asked) in positions.iter().zip(asked) {
             let predicate = self.filters_of(alias)[*position].clone();
             let ask_id = if Some(position) == order.first() {
                 format!("ai_filter:{alias}")
@@ -549,7 +552,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                     preamble_tokens: lowered.preamble_token_ids.len() as i64,
                     selectivity: predicate.selectivity,
                     // a guarded filter asks the model about its guard's rows alone
-                    expected_rows: round_one(surviving * predicate_asked_fraction(&predicate)),
+                    expected_rows: round_one(asked * predicate_asked_fraction(&predicate)),
                     question_token_ids: Vec::new(),
                     document_head: lowered.preamble_token_ids.clone(),
                     share_prefixes: false,
@@ -574,7 +577,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                     short_circuit: predicate.short_circuit,
                 },
             )));
-            surviving *= row_selectivity(&predicate);
             port = port_of(&ask_id, format!("rows:{alias}"));
         }
         Ok(port)

@@ -25,8 +25,8 @@ use crate::plan_statistics::{
 };
 use crate::scores::score_join_work;
 use crate::statistics::{
-    DEFAULT_SELECTIVITY, cross_tuples, effective_selectivity, predicate_asked_fraction,
-    surviving_documents, thin,
+    DEFAULT_SELECTIVITY, OrTerm, RowFlow, cross_tuples, effective_selectivity,
+    predicate_asked_fraction, surviving_documents, thin,
 };
 
 pub const ASK: &str = "ask";
@@ -95,11 +95,39 @@ pub fn column_seconds(
 pub struct TableStep {
     pub kind: &'static str,
     pub key: StepKey,
+    /// The fraction of the rows it asks about that it passes.
     pub selectivity: f64,
+    /// Its place in an OR, for an AI filter that is a term of one.
+    pub or_term: Option<OrTerm>,
     pub first: StepCost,
     pub later: StepCost,
     pub reuse_key: Option<Prompt>,
     pub document_head: Vec<i64>,
+}
+
+impl TableStep {
+    /// Whether no step of `later` is a term of this step's OR.
+    pub fn is_last_of_or<'a>(&self, later: impl IntoIterator<Item = &'a TableStep>) -> bool {
+        let name = |step: &TableStep| step.or_term.as_ref().map(|term| term.disjunction.clone());
+        !later.into_iter().any(|step| name(step) == name(self))
+    }
+
+    /// The rows `flow` holds once this step has run before `later`.
+    pub fn pass<'a>(&self, flow: &mut RowFlow, later: impl IntoIterator<Item = &'a TableStep>) {
+        let last = self.is_last_of_or(later);
+        flow.pass(self.selectivity, self.or_term.as_ref(), last);
+    }
+
+    /// The fraction of the rows this step asks about that the steps
+    /// after it need not: the rows a filter drops, or the rows a
+    /// short-circuit term of an OR passes.
+    fn spared(&self) -> f64 {
+        match &self.or_term {
+            Some(term) if term.short_circuit => self.selectivity,
+            Some(_) => 0.0,
+            None => 1.0 - self.selectivity,
+        }
+    }
 }
 
 /// Whether a step reads the KV the step before it left.
@@ -169,6 +197,7 @@ pub fn table_steps(
             kind: ASK,
             key: StepKey::Position(*position),
             selectivity: cost.selectivity,
+            or_term: OrTerm::of(&predicates[*position]),
             first: StepCost::Curve(cost.first),
             later: StepCost::Curve(cost.later),
             reuse_key: cost.reuse_key,
@@ -243,6 +272,7 @@ pub fn table_steps(
             kind: column_step_kind(&call.kind),
             key: StepKey::Name(column.name.clone()),
             selectivity: survival,
+            or_term: None,
             first,
             later,
             reuse_key: None,
@@ -311,7 +341,9 @@ pub fn order_steps(
     for first in starters {
         let mut ordered = vec![first];
         let mut total = cost(first, count, true)?;
-        let mut expected = count * steps[first].selectivity;
+        let mut flow = RowFlow::new(count);
+        let others = || indices.iter().filter(|index| **index != first);
+        steps[first].pass(&mut flow, others().map(|index| &steps[*index]));
         let mut scored: Vec<Prompt> = steps[first].reuse_key.iter().cloned().collect();
         let mut remaining: Vec<usize> = indices
             .iter()
@@ -328,20 +360,21 @@ pub fn order_steps(
                     .as_ref()
                     .is_some_and(|key| scored.contains(key));
                 let fresh = !resident_after(&steps[previous], step);
+                let asked = flow.asked(step.or_term.as_ref());
                 let seconds = if reused {
                     0.0
                 } else {
-                    cost(index, if expected > 0.0 { expected } else { 1.0 }, fresh)?
+                    cost(index, if asked > 0.0 { asked } else { 1.0 }, fresh)?
                 };
-                let rejected = 1.0 - step.selectivity;
-                let rank = if rejected > 0.0 {
-                    seconds / rejected
+                let spared = step.spared();
+                let rank = if spared > 0.0 {
+                    seconds / spared
                 } else if seconds == 0.0 {
                     0.0
                 } else {
                     f64::INFINITY
                 };
-                let candidate = (rank, index, if expected > 0.0 { seconds } else { 0.0 });
+                let candidate = (rank, index, if asked > 0.0 { seconds } else { 0.0 });
                 if choice
                     .as_ref()
                     .is_none_or(|found| (candidate.0, candidate.1) < (found.0, found.1))
@@ -353,11 +386,11 @@ pub fn order_steps(
             total += seconds;
             ordered.push(selected);
             previous = selected;
-            expected *= steps[selected].selectivity;
             if let Some(key) = &steps[selected].reuse_key {
                 scored.push(key.clone());
             }
             remaining.retain(|index| *index != selected);
+            steps[selected].pass(&mut flow, remaining.iter().map(|index| &steps[*index]));
         }
         if best
             .as_ref()
@@ -961,7 +994,7 @@ pub fn filter_works(
     for (alias, predicates) in &found.filters {
         let stats = statistics.stats[alias];
         let prefix = Quantity::Scalar(statistics.pre as f64 + stats.mean_document_tokens());
-        let mut count = stats.num_documents as f64;
+        let mut flow = RowFlow::new(stats.num_documents as f64);
         let mut total = Work::default();
         let mut previous: Option<&TableStep> = None;
         let steps = step_orders
@@ -969,7 +1002,7 @@ pub fn filter_works(
             .find(|(owner, _)| owner == alias)
             .map(|(_, steps)| steps.as_slice())
             .unwrap_or(&[]);
-        for step in steps {
+        for (index, step) in steps.iter().enumerate() {
             if step.kind == ASK
                 && let StepKey::Position(position) = step.key
                 && statistics.asks_of(alias).contains(&position)
@@ -985,10 +1018,11 @@ pub fn filter_works(
                 } else {
                     scan(&prefix, &question, model.sliding_window)
                 };
-                let asked = count * predicate_asked_fraction(&predicates[position]);
+                let asked = flow.asked(step.or_term.as_ref())
+                    * predicate_asked_fraction(&predicates[position]);
                 total = &total + &(&operation * asked);
             }
-            count *= step.selectivity;
+            step.pass(&mut flow, &steps[index + 1..]);
             previous = Some(step);
         }
         works.push((alias.clone(), total));

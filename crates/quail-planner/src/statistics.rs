@@ -17,21 +17,99 @@ pub fn effective_selectivity(selectivity: Option<f64>) -> f64 {
     selectivity.unwrap_or(DEFAULT_SELECTIVITY)
 }
 
-/// The fraction of the rows an AI filter reads that the filters after
-/// it still work on: every row for a filter that returns its answer; for
-/// a term of an OR that asks only the rows no earlier term passed, the
-/// rows it does not pass; every row for any other term of an OR; else
-/// its selectivity.
+/// The fraction of the rows an AI filter reads that it passes: every row
+/// for a filter that returns its answer, else its selectivity.
 pub fn row_selectivity(predicate: &crate::physical::FilterPredicate) -> f64 {
-    let passing = effective_selectivity(predicate.selectivity);
     if predicate.answer.is_some() {
         1.0
-    } else if predicate.short_circuit {
-        1.0 - passing
-    } else if predicate.disjunction.is_some() {
-        1.0
     } else {
-        passing
+        effective_selectivity(predicate.selectivity)
+    }
+}
+
+/// An AI filter's place in an OR of several `AI.IF` calls.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrTerm {
+    /// The OR's name.
+    pub disjunction: String,
+    /// Whether the filter asks only the rows no earlier term passed.
+    pub short_circuit: bool,
+}
+
+impl OrTerm {
+    /// The place of `predicate` in an OR, when it is a term of one.
+    pub fn of(predicate: &crate::physical::FilterPredicate) -> Option<Self> {
+        Some(Self {
+            disjunction: predicate.disjunction.clone()?,
+            short_circuit: predicate.short_circuit,
+        })
+    }
+}
+
+/// The rows of one table that reach each of its steps, as the planner
+/// estimates them while the steps run in order.
+///
+/// A step that is no term of an OR passes its selectivity of the rows.
+/// The terms of an OR pass `1 - (1 - p_1)...(1 - p_k)` of them together,
+/// for terms that pass `p_i` each, independently (Selinger et al., 1979).
+/// The rows leave at the OR's last term, in whatever order the terms
+/// run and whatever other steps run between them; until then the flow
+/// keeps the fraction of the rows no term has passed, which is all a
+/// short-circuit term asks about.
+#[derive(Debug, Clone)]
+pub struct RowFlow {
+    rows: f64,
+    /// By OR, the fraction of the rows no term has passed yet.
+    undecided: BTreeMap<String, f64>,
+}
+
+impl RowFlow {
+    /// The flow of a table with `rows` rows, before any step.
+    pub fn new(rows: f64) -> Self {
+        Self {
+            rows,
+            undecided: BTreeMap::new(),
+        }
+    }
+
+    /// The rows that reach the next step.
+    pub fn rows(&self) -> f64 {
+        self.rows
+    }
+
+    /// This flow with `rows` reaching the next step, for a caller that
+    /// reads them from the step's input.
+    pub fn with_rows(mut self, rows: f64) -> Self {
+        self.rows = rows;
+        self
+    }
+
+    /// The rows the next step asks the model about, when it is `term`
+    /// of an OR or no term of one.
+    pub fn asked(&self, term: Option<&OrTerm>) -> f64 {
+        match term {
+            Some(term) if term.short_circuit => {
+                self.rows * self.undecided.get(&term.disjunction).unwrap_or(&1.0)
+            }
+            _ => self.rows,
+        }
+    }
+
+    /// Move past a step that passes `selectivity` of the rows it asks.
+    ///
+    /// `last` says whether the step is the last term of its OR to run.
+    pub fn pass(&mut self, selectivity: f64, term: Option<&OrTerm>, last: bool) {
+        let Some(term) = term else {
+            self.rows *= selectivity;
+            return;
+        };
+        let undecided =
+            self.undecided.remove(&term.disjunction).unwrap_or(1.0) * (1.0 - selectivity);
+        if last {
+            self.rows *= 1.0 - undecided;
+        } else {
+            self.undecided.insert(term.disjunction.clone(), undecided);
+        }
     }
 }
 
@@ -147,4 +225,56 @@ pub fn arena_capacity(context: &PlanningContext, chunk: i64) -> Result<i64, Comp
     let (full, _) = arena_pages(&context.model, &context.device, Some(chunk), longest)
         .map_err(CompileError::new)?;
     Ok(full * context.device.page_tokens)
+}
+
+#[cfg(test)]
+mod row_flow_tests {
+    use super::{OrTerm, RowFlow};
+
+    fn term() -> OrTerm {
+        OrTerm {
+            disjunction: "or".into(),
+            short_circuit: true,
+        }
+    }
+
+    #[test]
+    fn an_or_passes_the_rows_any_term_passes_whatever_runs_between_its_terms() {
+        // (a OR b) AND c over 100 rows, run as a, c, b: a and b pass 20%
+        // each and c keeps half
+        let mut flow = RowFlow::new(100.0);
+        assert_eq!(flow.asked(Some(&term())), 100.0);
+        flow.pass(0.2, Some(&term()), false);
+        assert_eq!(flow.rows(), 100.0);
+        flow.pass(0.5, None, false);
+        // b asks the 40 of the 50 rows left that a did not pass
+        assert!((flow.asked(Some(&term())) - 40.0).abs() < 1e-9);
+        flow.pass(0.2, Some(&term()), true);
+        // 10 rows a passed and 8 rows b passed
+        assert!((flow.rows() - 18.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_rows_an_or_passes_do_not_depend_on_the_order_of_its_terms() {
+        let run = |first: f64, second: f64| {
+            let mut flow = RowFlow::new(100.0);
+            flow.pass(first, Some(&term()), false);
+            flow.pass(second, Some(&term()), true);
+            flow.rows()
+        };
+        // 1 - 0.9 * 0.5
+        assert!((run(0.1, 0.5) - 55.0).abs() < 1e-9);
+        assert!((run(0.5, 0.1) - 55.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_term_that_does_not_short_circuit_asks_every_row() {
+        let every = OrTerm {
+            short_circuit: false,
+            ..term()
+        };
+        let mut flow = RowFlow::new(100.0);
+        flow.pass(0.2, Some(&every), false);
+        assert_eq!(flow.asked(Some(&every)), 100.0);
+    }
 }

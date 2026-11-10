@@ -15,7 +15,7 @@ use crate::expressions::asked_call;
 use crate::expressions::repr_str;
 use crate::lowering::LoweredPrompt;
 use crate::operators::Operators;
-use crate::statistics::effective_selectivity;
+use crate::statistics::{OrTerm, RowFlow, effective_selectivity, row_selectivity};
 
 /// One table's document count and token sums, as `CorpusStats`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -262,12 +262,25 @@ pub fn expected_rows_after_filters(
         .map(|(alias, stats)| (alias.clone(), stats.num_documents as f64))
         .collect();
     for ((alias, predicates), (_, flags)) in found.filters.iter().zip(&found.filters_before_joins) {
-        for (predicate, before_joins) in predicates.iter().zip(flags) {
-            if *before_joins {
-                *expected.get_mut(alias).expect("a table") *=
-                    crate::statistics::row_selectivity(predicate);
-            }
+        let rows = expected.get_mut(alias).expect("a table");
+        let before: Vec<_> = predicates
+            .iter()
+            .zip(flags)
+            .filter(|(_, before_joins)| **before_joins)
+            .map(|(predicate, _)| predicate)
+            .collect();
+        let mut flow = RowFlow::new(*rows);
+        for (index, predicate) in before.iter().enumerate() {
+            let last = !before[index + 1..]
+                .iter()
+                .any(|later| later.disjunction == predicate.disjunction);
+            flow.pass(
+                row_selectivity(predicate),
+                OrTerm::of(predicate).as_ref(),
+                last,
+            );
         }
+        *rows = flow.rows();
     }
     for (alias, tests) in &found.column_filters {
         for test in tests.iter().filter(|test| test.before_joins) {

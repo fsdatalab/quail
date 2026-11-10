@@ -130,6 +130,7 @@ pub fn request_order(
                 kind: "filter",
                 key: StepKey::Position(position),
                 selectivity: cost.selectivity,
+                or_term: None,
                 first: StepCost::Curve(cost.first),
                 later: StepCost::Curve(cost.later),
                 reuse_key: cost.reuse_key,

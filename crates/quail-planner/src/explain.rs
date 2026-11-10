@@ -20,7 +20,7 @@ use crate::expressions::{column_name, condition_text, repr_float, repr_str};
 use crate::operators::table_name;
 use crate::operators::{Operators, SemanticJoin};
 use crate::stages::Stage;
-use crate::statistics::{DEFAULT_SELECTIVITY, effective_selectivity};
+use crate::statistics::{DEFAULT_SELECTIVITY, OrTerm, RowFlow, effective_selectivity};
 
 /// The mark beside a selectivity the planner assumed.
 const DEFAULT_MARK: &str = "*";
@@ -989,6 +989,8 @@ impl Graph {
     /// The planner's estimated rows on each output port.
     fn estimated_rows(&self) -> HashMap<(String, String), Option<f64>> {
         let mut rows: HashMap<(String, String), Option<f64>> = HashMap::new();
+        // by table, the rows its AI filters have passed so far
+        let mut flows: HashMap<String, RowFlow> = HashMap::new();
         for index in self.topological() {
             let node = &self.nodes[index];
             let inputs: Vec<Option<f64>> = node
@@ -1007,11 +1009,27 @@ impl Graph {
                         .expected_rows
                         .unwrap_or(scan.attributes.num_documents as f64),
                 ),
-                Some(PhysicalNode::AiFilter(filter)) => inputs
-                    .first()
-                    .copied()
-                    .flatten()
-                    .map(|value| value * effective_selectivity(filter.attributes.selectivity)),
+                Some(PhysicalNode::AiFilter(filter)) => {
+                    inputs.first().copied().flatten().map(|value| {
+                        let filter = &filter.attributes;
+                        let term = filter.disjunction.as_ref().map(|name| OrTerm {
+                            disjunction: name.clone(),
+                            short_circuit: filter.short_circuit,
+                        });
+                        let passing = match filter.answer {
+                            Some(_) => 1.0,
+                            None => effective_selectivity(filter.selectivity),
+                        };
+                        let mut flow = flows
+                            .remove(&filter.alias)
+                            .unwrap_or_else(|| RowFlow::new(value))
+                            .with_rows(value);
+                        flow.pass(passing, term.as_ref(), filter.closes_disjunction);
+                        let passed = flow.rows();
+                        flows.insert(filter.alias.clone(), flow);
+                        passed
+                    })
+                }
                 Some(PhysicalNode::Limit(limit)) => {
                     single.map(|value| value.min(limit.attributes.count as f64))
                 }
