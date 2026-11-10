@@ -275,6 +275,18 @@ def test_an_ai_filter_runs_below_an_outer_join_on_the_side_it_keeps(join, kept):
         session.close()
 
 
+def test_a_test_of_two_calls_answers_runs_above_one_region(constant_model):
+    context, _ = constant_model
+    query = REGION_BOUNDARY_QUERIES["OR mixes classification and extraction results"]
+    plans = context.sql("EXPLAIN " + query)
+    physical = plans.column("plan").to_pylist()[
+        plans.column("plan_type").to_pylist().index("physical_plan")]
+    # both calls run in one region; DataFusion tests their answers above it
+    assert physical.count("ModelRegionExec") == 1
+    assert "SharedInputExec" not in physical and "FilterExec" in physical
+    assert sorted(context.sql(query).column(0).to_pylist()) == ["r0", "r1", "r2", "r3"]
+
+
 def test_a_limit_over_an_or_filter_stays_above_the_region():
     session = quail.Session(CONFIG, tokenizer=TOKENIZER)
     oracle = Oracle(filters={"r": {"q1:": [1, 0, 1, 0]}})

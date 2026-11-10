@@ -6,7 +6,8 @@
 //! which run in DataFusion on the rows the region returns:
 //!
 //! - each test of the result rows: a test of more than one table's
-//!   columns, which needs every model call's answer first;
+//!   columns, or of more than one model call's answers, which needs
+//!   every model call's answer first;
 //! - the SELECT list's expressions, other than its columns and model
 //!   calls.
 //!
@@ -20,7 +21,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use datafusion::common::tree_node::TreeNode;
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column, Result};
 use datafusion::logical_expr::utils::{conjunction, split_conjunction};
 use datafusion::logical_expr::{Expr, JoinType, LogicalPlan, LogicalPlanBuilder, Projection};
@@ -74,6 +75,7 @@ impl Above {
 ///
 /// A rebuilt operator does not plan.
 pub(crate) fn lift_relational(plan: LogicalPlan) -> Result<(LogicalPlan, Above)> {
+    let plan = inline_computed_columns(plan)?;
     let LogicalPlan::Projection(root) = &plan else {
         return Ok((plan, Above::default()));
     };
@@ -154,9 +156,91 @@ fn with_a_column(plan: LogicalPlan) -> Result<LogicalPlan> {
     )?))
 }
 
-/// The tables each `AiNode` answer column belongs to: those its call
-/// reads.
-fn answer_tables(plan: &LogicalPlan) -> BTreeMap<String, BTreeSet<String>> {
+/// `plan` with each value a `Projection` computes between the SELECT
+/// list and the `AiNode`s written where the `Filter` or `Projection`
+/// above reads it; the lower projection then passes columns only.
+///
+/// DataFusion's `extract_leaf_expressions` moves a field access such as
+/// `answer['field']` out of a filter into a projection below it. The
+/// operators above a region read the region's columns, so the value is
+/// computed with them.
+fn inline_computed_columns(plan: LogicalPlan) -> Result<LogicalPlan> {
+    plan.transform_down(|above| {
+        if !matches!(above, LogicalPlan::Projection(_) | LogicalPlan::Filter(_)) {
+            return Ok(Transformed::no(above));
+        }
+        let LogicalPlan::Projection(below) = above.inputs()[0] else {
+            return Ok(Transformed::no(above));
+        };
+        let plain = |expr: &Expr| !expr.exists(|inner| Ok(is_ai_call(inner))).unwrap_or(true);
+        let computed: Vec<(String, Expr)> = below
+            .expr
+            .iter()
+            .zip(below.schema.fields())
+            .filter(|(expr, _)| !matches!(expr, Expr::Column(_)) && plain(expr))
+            .map(|(expr, field)| (field.name().clone(), expr.clone().unalias()))
+            .collect();
+        if computed.is_empty() || computed.len() != below.expr.len() - passed(below) {
+            return Ok(Transformed::no(above));
+        }
+        // the columns the lower projection passes, then those its values read
+        let mut columns: Vec<Expr> = below
+            .expr
+            .iter()
+            .filter(|expr| matches!(expr, Expr::Column(_)))
+            .cloned()
+            .collect();
+        for (_, value) in &computed {
+            for column in value.column_refs() {
+                let column = Expr::Column(column.clone());
+                if !columns.contains(&column) {
+                    columns.push(column);
+                }
+            }
+        }
+        let input =
+            LogicalPlan::Projection(Projection::try_new(columns, Arc::clone(&below.input))?);
+        let exprs = above
+            .expressions()
+            .into_iter()
+            .map(|expr| {
+                let name = expr.schema_name().to_string();
+                let read = expr.transform_up(|found| match &found {
+                    Expr::Column(column) if column.relation.is_none() => Ok(
+                        match computed.iter().find(|(name, _)| *name == column.name) {
+                            Some((_, value)) => Transformed::yes(value.clone()),
+                            None => Transformed::no(found),
+                        },
+                    ),
+                    _ => Ok(Transformed::no(found)),
+                })?;
+                // a SELECT list item keeps its name
+                Ok(match (&above, read.transformed) {
+                    (LogicalPlan::Projection(_), true) => read.data.alias_if_changed(name)?,
+                    _ => read.data,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Transformed::yes(above.with_new_exprs(exprs, vec![input])?))
+    })
+    .map(|inlined| inlined.data)
+}
+
+/// How many items of a projection are columns.
+fn passed(projection: &Projection) -> usize {
+    projection
+        .expr
+        .iter()
+        .filter(|expr| matches!(expr, Expr::Column(_)))
+        .count()
+}
+
+/// By answer column, the answer of the `AiNode` that adds it and the
+/// tables that node's call reads.
+type Answers = BTreeMap<String, (String, BTreeSet<String>)>;
+
+/// Each `AiNode` answer column of a plan.
+fn answer_tables(plan: &LogicalPlan) -> Answers {
     let mut found = BTreeMap::new();
     let _ = plan.apply(|node| {
         if let Some(ai) = as_node::<AiNode>(node) {
@@ -167,7 +251,7 @@ fn answer_tables(plan: &LogicalPlan) -> BTreeMap<String, BTreeSet<String>> {
                 .filter_map(|column| column.relation.as_ref().map(|table| table.to_string()))
                 .collect();
             for field in &ai.fields {
-                found.insert(field.name().clone(), tables.clone());
+                found.insert(field.name().clone(), (ai.answer.clone(), tables.clone()));
             }
         }
         Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
@@ -176,9 +260,9 @@ fn answer_tables(plan: &LogicalPlan) -> BTreeMap<String, BTreeSet<String>> {
 }
 
 /// Whether a test runs on the result rows: a test of more than one
-/// table's columns that calls no model and has no subquery, other than a
-/// join's key.
-fn is_row_test(term: &Expr, answers: &BTreeMap<String, BTreeSet<String>>, join_key: bool) -> bool {
+/// table's columns, or of more than one model call's answers, that calls
+/// no model and has no subquery, other than a join's key.
+fn is_row_test(term: &Expr, answers: &Answers, join_key: bool) -> bool {
     let special = term
         .exists(|inner| {
             Ok(is_quail_call(inner)
@@ -192,15 +276,21 @@ fn is_row_test(term: &Expr, answers: &BTreeMap<String, BTreeSet<String>>, join_k
         return false;
     }
     let mut tables: BTreeSet<String> = BTreeSet::new();
+    let mut calls: BTreeSet<&str> = BTreeSet::new();
     for column in term.column_refs() {
         match &column.relation {
             Some(table) => {
                 tables.insert(table.to_string());
             }
-            None => tables.extend(answers.get(&column.name).cloned().unwrap_or_default()),
+            None => {
+                if let Some((owner, read)) = answers.get(&column.name) {
+                    calls.insert(owner);
+                    tables.extend(read.iter().cloned());
+                }
+            }
         }
     }
-    tables.len() > 1
+    tables.len() > 1 || calls.len() > 1
 }
 
 /// Whether a term is `a.x = b.y`, an equality of two tables' columns.
@@ -218,7 +308,7 @@ fn is_column_equality(term: &Expr) -> bool {
 /// several tables below it stays.
 fn take_row_tests(
     plan: LogicalPlan,
-    answers: &BTreeMap<String, BTreeSet<String>>,
+    answers: &Answers,
     fixed: bool,
     lifted: &mut Vec<Expr>,
 ) -> Result<LogicalPlan> {
