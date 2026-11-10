@@ -830,37 +830,15 @@ fn isolate_chain(plan: &LogicalPlan) -> Result<Option<(LogicalPlan, Vec<Expr>)>>
     Ok(Some((input, restore)))
 }
 
-/// SPIKE: whether `plan` is one table under plain filters and aliases,
-/// which a region reads as an input by itself.
+/// SPIKE: whether `plan` reads one table and calls no model, which a
+/// region reads as an input by itself, with the table's id column.
 fn is_table(plan: &LogicalPlan) -> bool {
-    match plan {
-        LogicalPlan::TableScan(_) => true,
-        LogicalPlan::SubqueryAlias(alias) => is_table(&alias.input),
-        LogicalPlan::Filter(filter) => {
-            !filter
-                .predicate
-                .exists(|inner| {
-                    Ok(is_ai_call(inner)
-                        || matches!(
-                            inner,
-                            Expr::Exists(_) | Expr::InSubquery(_) | Expr::ScalarSubquery(_)
-                        ))
-                })
-                .unwrap_or(true)
-                && is_table(&filter.input)
+    let mut num_scans = 0;
+    let _ = plan.apply(|node| {
+        if matches!(node, LogicalPlan::TableScan(_)) {
+            num_scans += 1;
         }
-        LogicalPlan::Projection(projection) => {
-            !projection.expr.iter().any(|expr| {
-                expr.exists(|inner| {
-                    Ok(is_ai_call(inner)
-                        || matches!(
-                            inner,
-                            Expr::Exists(_) | Expr::InSubquery(_) | Expr::ScalarSubquery(_)
-                        ))
-                })
-                .unwrap_or(true)
-            }) && is_table(&projection.input)
-        }
-        _ => false,
-    }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    num_scans == 1 && !calls_ai(plan).unwrap_or(true)
 }
