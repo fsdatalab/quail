@@ -873,6 +873,9 @@ fn claim_run(
     // binder cannot read
     let shaped = (|| {
         let selected = select_list(plan.clone(), needed)?;
+        // DataFusion computes each expression of one table's columns as a
+        // column of that table's input
+        let selected = super::inputs::precompute_plain_expressions(selected)?;
         let (bound, inputs, _) = split_inputs(selected)?;
         let numbered_inputs = numbered(&bound);
         let (bound, above) = lift_relational(bound)?;
