@@ -6,7 +6,7 @@ use super::walk::{Answer, Kind, Walk};
 use super::{ByAlias, push};
 use crate::ai::{AiNode, Semantics};
 use datafusion::logical_expr::Expr;
-use datafusion::logical_expr::utils::split_conjunction;
+use datafusion::logical_expr::utils::{conjunction, split_conjunction};
 use quail_planner::error::{CompileError, compile_error};
 use quail_planner::expressions::{
     asked_call, call_aliases, column_alias_of, equality_text, repr_list, repr_str,
@@ -41,6 +41,22 @@ pub(super) struct Relation {
     /// The answer of each AI filter that keeps every row, and its
     /// selectivity hint, for the guards that read it.
     answers: Vec<(String, Option<f64>)>,
+    /// By answer, the `AI.IF` nodes that are terms of an OR.
+    or_terms: BTreeMap<String, OrTerm>,
+}
+
+/// One `AI.IF` term of an OR.
+#[derive(Clone, Default)]
+struct OrTerm {
+    /// The OR's terms that ask no model, if it has any.
+    plain: Option<Expr>,
+    /// Whether the OR reads the call's answer as `NOT`.
+    negated: bool,
+    /// The OR's name, when it has more than one `AI.IF`.
+    disjunction: Option<String>,
+    /// Whether the OR's last call is guarded on another call's answer:
+    /// each call then asks only the rows no earlier call passed.
+    short_circuit: bool,
 }
 
 /// Whether a term is `a.x = b.y`, an equality of two tables' columns.
@@ -92,6 +108,38 @@ impl Relation {
             }
             if !equalities.is_empty() {
                 relation.equalities.insert(0, (joined, equalities));
+            }
+        }
+        for id in walk.ids() {
+            let Kind::Ai(node) = &walk.get(id).kind else {
+                continue;
+            };
+            let Some(parts) = crate::rules::or_guards::or_parts(node)
+                .filter(|_| node.function() == "ai_filter" && node.semantics == Semantics::Rows)
+            else {
+                continue;
+            };
+            // the OR is named by its last call's answer
+            let disjunction = (!parts.others.is_empty()).then(|| node.answer.clone());
+            let short_circuit = node.guard.as_ref().is_some_and(|guard| {
+                guard.column_refs().iter().any(|column| {
+                    parts
+                        .others
+                        .iter()
+                        .any(|(answer, _)| *answer == column.name)
+                })
+            });
+            let own = (node.answer.clone(), parts.negated);
+            for (answer, negated) in parts.others.into_iter().chain([own]) {
+                relation.or_terms.insert(
+                    answer,
+                    OrTerm {
+                        plain: parts.plain.clone(),
+                        negated,
+                        disjunction: disjunction.clone(),
+                        short_circuit,
+                    },
+                );
             }
         }
         let mut asked: Vec<(usize, &AiNode)> = walk
@@ -177,37 +225,57 @@ impl Relation {
             self.joins.insert(id, spec);
             return Ok(());
         }
-        // an AI.IF in an OR passes the rows where the OR's other terms are TRUE
+        // an AI.IF in an OR passes the rows where the OR's plain terms are TRUE
         let filter = node
             .filter
             .as_ref()
             .filter(|_| node.function() == "ai_filter");
-        let (alternative, negated) = match filter {
-            Some(filter) if node.answer_term(filter).is_some() => {
-                (None, node.answer_term(filter) == Some(true))
-            }
-            Some(_) => match crate::rules::or_guards::or_terms(node) {
-                Some((rest, negated)) => {
-                    let rest = walk.filter_answers(&rest, binder);
-                    (Some(binder.bind_condition(&rest)?), negated)
-                }
+        let term = match (filter, self.or_terms.get(&node.answer)) {
+            (_, Some(term)) => term.clone(),
+            (Some(filter), None) => match node.answer_term(filter) {
+                Some(negated) => OrTerm {
+                    negated,
+                    ..OrTerm::default()
+                },
                 None => {
                     return unsupported(
                         "DataFusion must evaluate this condition over the model's Boolean answer.",
                     );
                 }
             },
-            _ => (None, false),
+            (None, None) => OrTerm::default(),
         };
-        let guard = match &node.guard {
-            Some(guard) => {
-                let guard = walk.filter_answers(guard, binder);
-                Some(binder.bind_condition(&guard)?)
-            }
+        let OrTerm {
+            plain,
+            negated,
+            disjunction,
+            short_circuit,
+        } = term;
+        let in_or = plain.is_some() || disjunction.is_some();
+        let alternative = match &plain {
+            Some(plain) => Some(binder.bind_condition(&walk.written(plain, &[]))?),
             None => None,
         };
-        let answer =
-            (node.function() == "ai_filter" && node.filter.is_none()).then(|| node.answer.clone());
+        // a guard on another call's answer is the OR's short circuit
+        let guard = node.guard.as_ref().and_then(|guard| {
+            conjunction(
+                split_conjunction(guard)
+                    .into_iter()
+                    .filter(|term| {
+                        !term
+                            .column_refs()
+                            .iter()
+                            .any(|column| self.or_terms.contains_key(&column.name))
+                    })
+                    .cloned(),
+            )
+        });
+        let guard = match &guard {
+            Some(guard) => Some(binder.bind_condition(&walk.written(guard, &[]))?),
+            None => None,
+        };
+        let answer = (node.function() == "ai_filter" && node.filter.is_none() && !in_or)
+            .then(|| node.answer.clone());
         let (predicate, options) = if node.function() == "ai_score" {
             let answer = Answer {
                 name: node.answer.clone(),
@@ -247,11 +315,13 @@ impl Relation {
                 answer,
                 guard_selectivity,
                 negated,
+                disjunction,
+                short_circuit,
             };
             push(&mut self.filters, &read[0], filter);
             return Ok(());
         }
-        if alternative.is_some() || guard.is_some() || answer.is_some() || negated {
+        if in_or || guard.is_some() || answer.is_some() || negated {
             return unsupported(&format!(
                 "DataFusion must evaluate {} over joined model results.",
                 walk.written(node.filter.as_ref().unwrap_or(&node.call), &[])

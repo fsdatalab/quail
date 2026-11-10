@@ -227,10 +227,10 @@ tagged_struct! {
         /// The condition that says which documents the model is asked
         /// about; None asks about every document.
         guard: Option<ValueExpression>,
-        /// The other terms of an OR the predicate is one term of: a
-        /// document where it is TRUE passes whatever the model answers,
-        /// and a document the guard leaves out passes only then. None
-        /// for a predicate that is not in an OR.
+        /// The terms of an OR the predicate is one term of that ask no
+        /// model: a document where it is TRUE passes whatever the model
+        /// answers, and the model is not asked about it. None for a
+        /// predicate that is not in an OR, or whose OR has no such term.
         alternative: Option<ValueExpression>,
         /// The column the predicate adds with its answer, when it keeps
         /// every row it reads instead of dropping the rows it rejects:
@@ -244,6 +244,13 @@ tagged_struct! {
         /// when the model answers no, and `selectivity` is the fraction
         /// of documents that do.
         negated: bool = default,
+        /// The name of the OR the predicate is one term of, when the OR
+        /// has other `AI.IF` terms: a document passes the OR when any
+        /// term passes it, in whatever order the terms run.
+        disjunction: Option<String>,
+        /// Whether the predicate asks the model only about the documents
+        /// no earlier term of its OR passed.
+        short_circuit: bool = default,
     }
 }
 

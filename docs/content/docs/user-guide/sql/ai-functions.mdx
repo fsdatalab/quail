@@ -88,8 +88,10 @@ WHERE r.flagged
 ```
 
 For eligible same-input `AI.IF` disjunctions, Quail checks ordinary
-conditions first and skips model calls once a term is `TRUE`. It can also
-stop after the first passing AI term.
+conditions first and skips model calls once a term is `TRUE`. With
+several `AI.IF` terms, the planner picks their order by cost, as it does
+for `AND`, and each call is asked only about the rows no earlier term
+passed.
 
 Other disjunctions, including score comparisons and predicates over joined
 inputs, use the [SQL fallback](/docs/user-guide/sql/sql-functions#unsupported-sql)

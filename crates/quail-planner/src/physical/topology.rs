@@ -288,9 +288,13 @@ impl PhysicalNode {
             }
             PhysicalNode::AiFilter(node) => {
                 let alias = &node.attributes.alias;
-                // a filter that returns its answer adds it to the rows
+                // a filter that returns its answer adds it to the rows, and
+                // a term of an OR its column until the OR's last term
                 let mut schema = of(alias);
                 schema.extend(node.attributes.answer.iter().cloned());
+                if !node.attributes.closes_disjunction {
+                    schema.extend(node.attributes.disjunction.iter().cloned());
+                }
                 let mut returned = rows(format!("rows:{alias}"), schema.clone());
                 returned.answer = node.attributes.answer.as_ref().map(|name| AnswerOutput {
                     kind: "filters".into(),
@@ -531,10 +535,12 @@ impl PhysicalNode {
     }
 
     /// Whether the executor runs the node in a pipeline of its own: a
-    /// node with a guard, an AI filter with an alternative, or an AI
-    /// filter that returns its answer.
+    /// node with a guard, an AI filter of an OR, or an AI filter that
+    /// returns its answer.
     pub fn runs_alone(&self) -> bool {
-        self.guard().is_some() || self.alternative().is_some() || self.answer().is_some()
+        let ored = matches!(self, PhysicalNode::AiFilter(node)
+            if node.attributes.disjunction.is_some());
+        self.guard().is_some() || self.alternative().is_some() || self.answer().is_some() || ored
     }
 
     /// The column an AI filter that keeps every row adds with its

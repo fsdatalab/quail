@@ -204,6 +204,18 @@ physical_nodes! {
         /// Whether a document passes when the model answers no.
         #[serde(default)]
         negated: bool,
+        /// The column that holds whether a term of the filter's OR has
+        /// passed each row, which the filter writes.
+        #[serde(default)]
+        disjunction: Option<String>,
+        /// Whether the filter asks the model only about the rows where
+        /// that column is not TRUE.
+        #[serde(default)]
+        short_circuit: bool,
+        /// Whether the filter is the last term of its OR to run: it
+        /// returns the rows a term passed, without the column.
+        #[serde(default)]
+        closes_disjunction: bool,
     }
     /// An `AI.SCORE` call.
     AiScore(AiScoreAttributes) = "quail.ai_score" {

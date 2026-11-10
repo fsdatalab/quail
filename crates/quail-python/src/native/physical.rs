@@ -139,7 +139,8 @@ static KINDS: &[Kind] = &[
             "stop_key" = EMPTY, "pass_group" = Some("-1"), "state_tail_tokens" = ZERO,
             "question_header_token_ids" = EMPTY, "document_ends" = EMPTY,
             "num_key_survivors" = Some("1"), "guard" = NONE, "alternative" = NONE,
-            "answer" = NONE, "negated" = NO),
+            "answer" = NONE, "negated" = NO, "disjunction" = NONE,
+            "short_circuit" = NO, "closes_disjunction" = NO),
     },
     Kind {
         class: "AiScore",
@@ -382,7 +383,7 @@ static KINDS: &[Kind] = &[
         node: false,
         fields: fields!(; "expression" = REQUIRED, "selectivity" = NONE, "guard" = NONE,
             "alternative" = NONE, "answer" = NONE, "guard_selectivity" = NONE,
-            "negated" = NO),
+            "negated" = NO, "disjunction" = NONE, "short_circuit" = NO),
     },
     Kind {
         class: "Equality",

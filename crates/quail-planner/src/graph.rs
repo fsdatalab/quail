@@ -527,6 +527,15 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                 .context
                 .lowered(&asked_call(&predicate.expression).prompt)?;
             let model = &self.context.model;
+            // whether a term of the predicate's OR runs after it
+            let later_term = order
+                .iter()
+                .skip_while(|found| *found != position)
+                .skip(1)
+                .any(|found| {
+                    predicate.disjunction.is_some()
+                        && self.filters_of(alias)[*found].disjunction == predicate.disjunction
+                });
             self.nodes.push(PhysicalNode::AiFilter(tagged_node(
                 &ask_id,
                 std::slice::from_ref(&port),
@@ -560,6 +569,9 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                     alternative: predicate.alternative.clone(),
                     answer: predicate.answer.clone(),
                     negated: predicate.negated,
+                    closes_disjunction: predicate.disjunction.is_some() && !later_term,
+                    disjunction: predicate.disjunction.clone(),
+                    short_circuit: predicate.short_circuit,
                 },
             )));
             surviving *= row_selectivity(&predicate);

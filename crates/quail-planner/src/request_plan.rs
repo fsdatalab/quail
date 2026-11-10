@@ -249,7 +249,10 @@ fn refusal(
     }
     let ored = found.filters.iter().flat_map(|(_, predicates)| predicates);
     if ored.clone().any(|predicate| {
-        predicate.guard.is_some() || predicate.alternative.is_some() || predicate.answer.is_some()
+        predicate.guard.is_some()
+            || predicate.alternative.is_some()
+            || predicate.answer.is_some()
+            || predicate.disjunction.is_some()
     }) {
         return Ok(refuse(
             format!("an AI filter in an OR runs on the Quail backend only, not {backend}"),

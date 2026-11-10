@@ -196,6 +196,15 @@ def test_an_or_of_two_ai_filters_asks_the_second_only_where_the_first_is_not_tru
     assert everything[1:] == ([0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5])
 
 
+def test_the_planner_runs_the_term_of_an_or_that_passes_more_rows_first():
+    often = "AI_FILTER(PROMPT('long: {0}', r.body), {'selectivity': 0.9})"
+    sql = f"SELECT r.id FROM reviews r WHERE {KIND} OR {often}"
+    rows, kind, long = _ors_rows_and_questions(LOGICAL_RULES, sql, {0, 3}, {2, 3, 4})
+    assert rows == ["r0", "r2", "r3", "r4"]
+    # the second call written runs first; the first is asked where it said no
+    assert (kind, long) == ([0, 1, 5], [0, 1, 2, 3, 4, 5])
+
+
 def test_an_or_of_a_column_and_two_ai_filters_asks_each_where_no_earlier_term_is_true():
     sql = f"SELECT r.id FROM reviews r WHERE r.long OR {KIND} OR {LONG}"
     off = [name for name in LOGICAL_RULES if name != OR_RULE]
@@ -204,7 +213,9 @@ def test_an_or_of_a_column_and_two_ai_filters_asks_each_where_no_earlier_term_is
     # r0, r3, r5 are long: TRUE OR NULL is TRUE. r2's long is NULL and both
     # AI.IFs say no: NULL OR FALSE OR FALSE is NULL, and the row is dropped
     assert on[0] == everything[0] == ["r0", "r1", "r3", "r4", "r5"]
-    assert on[1:] == ([1, 2, 4], [1, 2])
+    # the planner picks which AI.IF runs first; the other is asked only
+    # where the first said no
+    assert on[1:] in (([1, 2, 4], [1, 2]), ([2, 4], [1, 2, 4]))
     assert everything[1:] == ([0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5])
 
 
@@ -213,8 +224,10 @@ def test_the_plans_show_the_guards_of_an_or_of_two_ai_filters(sessions):
         f"SELECT r.id FROM reviews r WHERE r.long OR {KIND} OR {LONG}")
     assert "guard: r.long IS NOT TRUE AND __quail_answer_1 IS NOT TRUE" in query.logical
     physical = query.explain()
-    assert "keeps every row and returns its answer as __quail_answer_1" in physical
-    assert "passes each row where r.long OR r.__quail_answer_1" in physical
+    assert "keeps every row for the later terms of its OR" in physical
+    assert "asks only the rows no earlier term of its OR passed" in physical
+    assert "returns the rows a term of its OR passed" in physical
+    assert "passes each row where r.long" in physical
 
 
 def test_stock_vllm_refuses_an_or_of_a_column_and_an_ai_filter():

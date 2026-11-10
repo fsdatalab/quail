@@ -272,19 +272,6 @@ pub fn label_calls(found: &Operators) -> Vec<(crate::physical::ModelCall, String
     calls
 }
 
-/// The order rule of one table's steps: as written when an AI filter of
-/// the table returns its answer, as a later filter's guard reads it;
-/// else `rule`.
-pub fn table_rule<'a>(found: &Operators, alias: &str, rule: &'a str) -> &'a str {
-    let answers = found
-        .filters
-        .iter()
-        .filter(|(owner, _)| owner == alias)
-        .flat_map(|(_, predicates)| predicates)
-        .any(|predicate| predicate.answer.is_some());
-    if answers { "as_written" } else { rule }
-}
-
 /// Choose an order using costs at each expected survivor count, as
 /// `order_filters_indexed` with the steps' own residency rule.
 ///
@@ -1045,7 +1032,7 @@ pub fn choose_operator_order(
         }
         let ordered = order_steps(
             &steps,
-            table_rule(found, &table.alias, &rule),
+            &rule,
             statistics.stats[&table.alias].num_documents as f64,
             context,
         )?;

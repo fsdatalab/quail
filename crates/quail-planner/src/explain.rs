@@ -1168,6 +1168,18 @@ impl TreeRows<'_> {
                 condition_text(alternative)
             ));
         }
+        if let PhysicalNode::AiFilter(filter) = known
+            && filter.attributes.disjunction.is_some()
+        {
+            if filter.attributes.short_circuit {
+                details.push("asks only the rows no earlier term of its OR passed".to_string());
+            }
+            details.push(if filter.attributes.closes_disjunction {
+                "returns the rows a term of its OR passed".to_string()
+            } else {
+                "keeps every row for the later terms of its OR".to_string()
+            });
+        }
         if matches!(known, PhysicalNode::AiFilter(filter) if filter.attributes.negated) {
             details.push("passes each row where the model answers no".to_string());
         }

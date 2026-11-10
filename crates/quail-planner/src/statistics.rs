@@ -17,13 +17,21 @@ pub fn effective_selectivity(selectivity: Option<f64>) -> f64 {
     selectivity.unwrap_or(DEFAULT_SELECTIVITY)
 }
 
-/// The fraction of the rows an AI filter reads that it passes on: every
-/// row for a filter that returns its answer, else its selectivity.
+/// The fraction of the rows an AI filter reads that the filters after
+/// it still work on: every row for a filter that returns its answer; for
+/// a term of an OR that asks only the rows no earlier term passed, the
+/// rows it does not pass; every row for any other term of an OR; else
+/// its selectivity.
 pub fn row_selectivity(predicate: &crate::physical::FilterPredicate) -> f64 {
+    let passing = effective_selectivity(predicate.selectivity);
     if predicate.answer.is_some() {
         1.0
+    } else if predicate.short_circuit {
+        1.0 - passing
+    } else if predicate.disjunction.is_some() {
+        1.0
     } else {
-        effective_selectivity(predicate.selectivity)
+        passing
     }
 }
 

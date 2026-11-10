@@ -104,6 +104,9 @@ mod tests {
                 alternative: None,
                 answer: None,
                 negated: false,
+                disjunction: None,
+                short_circuit: false,
+                closes_disjunction: false,
             },
         });
         let map = PhysicalNode::AiMap(Node {
@@ -129,6 +132,9 @@ mod tests {
             "alternative",
             "answer",
             "negated",
+            "disjunction",
+            "short_circuit",
+            "closes_disjunction",
             "stop_tests",
             "stop_when_true",
             "hint_tests",

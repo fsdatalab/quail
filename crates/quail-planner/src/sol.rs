@@ -31,7 +31,7 @@ use crate::operators::{Operators, SemanticColumn};
 use crate::plan_statistics::plan_prompts;
 use crate::search::{
     ASK, StepKey, StepPricing, default_order_rule, label_calls, order_steps, resident_after,
-    table_rule, table_steps,
+    table_steps,
 };
 use crate::statistics::predicate_asked_fraction;
 
@@ -523,6 +523,8 @@ struct Estimate<'a, 'c> {
     decode_passes: i64,
     map_passes: BTreeMap<(String, i64), i64>,
     max_pooling: BTreeSet<String>,
+    /// By OR, the rows a term has passed so far.
+    decided: BTreeMap<String, BTreeSet<i64>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -855,12 +857,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
                 .expect("rows")
                 .1
                 .clone();
-            let ordered: Vec<usize> = order_steps(
-                &steps,
-                table_rule(self.found, &alias, &rule),
-                live.len() as f64,
-                self.context,
-            )?;
+            let ordered: Vec<usize> = order_steps(&steps, &rule, live.len() as f64, self.context)?;
             let mut rows = live;
             let mut reached: Option<Vec<Vec<i64>>> = None;
             if self.inputs.stop_groups.contains_key(&alias)
@@ -892,10 +889,14 @@ impl<'a, 'c> Estimate<'a, 'c> {
                 let (passed, stage_work, asked) = match &step.key {
                     StepKey::Position(position) => {
                         let predicate = &predicates[*position];
+                        let closes = !ordered[place + 1..].iter().any(|later| {
+                            matches!(&steps[*later].key, StepKey::Position(other)
+                                if predicates[*other].disjunction == predicate.disjunction)
+                        });
                         let (passed, work) = self.ask_stage(
                             &alias,
                             predicate,
-                            *position,
+                            (*position, closes),
                             &rows,
                             first,
                             &mut stages,
@@ -942,38 +943,53 @@ impl<'a, 'c> Estimate<'a, 'c> {
         &mut self,
         alias: &str,
         predicate: &crate::physical::FilterPredicate,
-        position: usize,
+        (position, closes): (usize, bool),
         rows: &[i64],
         first: bool,
         stages: &mut Vec<Map<String, Value>>,
     ) -> Result<(Vec<i64>, Work), CompileError> {
         let prompt = &asked_call(&predicate.expression).prompt;
         let tail = self.lower(prompt)?.tail_token_ids.len() as i64;
-        let work = self.question_work(alias, rows, tail, first);
-        // a filter that returns its answer keeps every row; the filter in
-        // an OR after it passes a row any AI.IF of the OR accepts, and
-        // the estimate leaves out the OR's plain terms
-        let ored: Vec<Prompt> = if predicate.alternative.is_some() {
-            self.found
-                .filters
+        let asked: Vec<i64> = match predicate
+            .disjunction
+            .as_ref()
+            .filter(|_| predicate.short_circuit)
+            .and_then(|name| self.decided.get(name))
+        {
+            Some(decided) => rows
                 .iter()
-                .filter(|(owner, _)| owner == alias)
-                .flat_map(|(_, predicates)| predicates)
-                .filter(|earlier| earlier.answer.is_some())
-                .map(|earlier| (*asked_call(&earlier.expression).prompt).clone())
-                .collect()
-        } else {
-            Vec::new()
+                .copied()
+                .filter(|row| !decided.contains(row))
+                .collect(),
+            None => rows.to_vec(),
         };
+        let work = self.question_work(alias, &asked, tail, first);
+        // a filter that returns its answer keeps every row. A term of an
+        // OR asks the rows no earlier term passed and keeps every row
+        // until the OR's last term, which returns the rows a term
+        // passed; the estimate leaves out the OR's plain terms
         let mut passed = Vec::new();
-        for row in rows {
-            let mut passes = predicate.answer.is_some()
-                || self.passes(prompt, &[(alias, *row)])? != predicate.negated;
-            for asked in &ored {
-                passes = passes || self.passes(asked, &[(alias, *row)])?;
+        match &predicate.disjunction {
+            Some(name) => {
+                let mut decided = self.decided.remove(name).unwrap_or_default();
+                for row in rows {
+                    if !decided.contains(row)
+                        && self.passes(prompt, &[(alias, *row)])? != predicate.negated
+                    {
+                        decided.insert(*row);
+                    }
+                }
+                passed.extend(rows.iter().filter(|row| !closes || decided.contains(row)));
+                self.decided.insert(name.clone(), decided);
             }
-            if passes {
-                passed.push(*row);
+            None => {
+                for row in rows {
+                    if predicate.answer.is_some()
+                        || self.passes(prompt, &[(alias, *row)])? != predicate.negated
+                    {
+                        passed.push(*row);
+                    }
+                }
             }
         }
         stages.push(stage(
@@ -1488,6 +1504,7 @@ pub fn speed_of_light_estimate(
         decode_passes: 0,
         map_passes: BTreeMap::new(),
         max_pooling,
+        decided: BTreeMap::new(),
     };
     let (survivors, filter_work, filter_stages) = estimate.run_filters()?;
     let resident: BTreeSet<String> = filter_stages

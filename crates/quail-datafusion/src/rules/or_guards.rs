@@ -42,6 +42,13 @@
 //!
 //! The executor's AI filter asks the model about the rows where the
 //! guard is TRUE and passes each row where `a` is TRUE without asking.
+//!
+//! The guards are written in the order the query wrote the calls, but
+//! the calls depend on no order: the planner orders the calls of one OR
+//! by cost, as it orders ANDed filters, and the executor asks each call
+//! only about the rows no call of the OR before it passed. The binder
+//! reads a guard on another call's answer as that instruction
+//! ([`OrParts`]).
 
 use std::sync::Arc;
 
@@ -105,6 +112,60 @@ pub(crate) fn or_terms(node: &AiNode) -> Option<(Expr, bool)> {
             .any(|term| node.answer_term(term) == Some(true));
         found = disjunction(others.into_iter().cloned()).map(|rest| (rest, negated));
     }
+    found
+}
+
+/// The parts of the OR an `AI.IF` node filters on.
+pub(crate) struct OrParts {
+    /// The terms that ask no model, as one OR; None when it has none.
+    pub(crate) plain: Option<Expr>,
+    /// The answer of each other `AI.IF` of the OR, and whether the OR
+    /// reads it as `NOT`.
+    pub(crate) others: Vec<(String, bool)>,
+    /// Whether the OR reads the node's own answer as `NOT`.
+    pub(crate) negated: bool,
+}
+
+/// The parts of the OR `node` filters on, when its filter is one, as the
+/// module describes.
+pub(crate) fn or_parts(node: &AiNode) -> Option<OrParts> {
+    let (rest, negated) = or_terms(node)?;
+    let answers = answers_below(&node.input);
+    let mut plain = Vec::new();
+    let mut others = Vec::new();
+    for term in split_binary(&rest, Operator::Or) {
+        let (read, reversed) = match term {
+            Expr::Not(inner) => (inner.as_ref(), true),
+            other => (other, false),
+        };
+        match read.try_as_col() {
+            Some(column) if column.relation.is_none() && answers.contains(&column.name) => {
+                others.push((column.name.clone(), reversed));
+            }
+            _ => plain.push(term.clone()),
+        }
+    }
+    Some(OrParts {
+        plain: disjunction(plain),
+        others,
+        negated,
+    })
+}
+
+/// The answers of the `AI.IF` nodes in `plan` that return their answer
+/// and drop no row: the other `AI.IF`s of an OR.
+fn answers_below(plan: &LogicalPlan) -> Vec<String> {
+    let mut found = Vec::new();
+    let _ = plan.apply(|below| {
+        if let Some(asked) = as_node::<AiNode>(below)
+            && asked.semantics == Semantics::Rows
+            && asked.function() == "ai_filter"
+            && asked.filter.is_none()
+        {
+            found.push(asked.answer.clone());
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
     found
 }
 

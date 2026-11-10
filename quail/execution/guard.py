@@ -1,11 +1,14 @@
 """Ask a guarded model node about its guard's rows alone.
 
 A guarded column node answers NULL for every other row. An AI filter in
-an OR also passes each row where the OR's other terms, its alternative,
-are TRUE, whether or not it asked the model about that row. An AI filter
-that returns its answer keeps every row it reads and adds the answer
-column: TRUE or FALSE where it asked, NULL elsewhere. A guard or an
-alternative may read an earlier filter's answer from the rows.
+an OR passes each row where the OR's plain terms, its alternative, are
+TRUE, whether or not it asked the model about that row. When the OR has
+several AI filters, the rows carry whether a term has passed them in
+the OR's column, in whatever order the filters run, until the OR's last
+filter returns the rows a term passed. A short-circuit filter asks only
+the rows no earlier one passed.
+An AI filter that returns its answer keeps every row it reads and adds
+the answer column: TRUE or FALSE where it asked, NULL elsewhere.
 """
 
 from __future__ import annotations
@@ -30,8 +33,10 @@ class Guarded:
         node: The guarded column node or AI filter.
         port: The name of its rows input.
         rows: The rows it read.
-        asked: Whether its guard is TRUE for each row it read.
-        passes: For an AI filter, whether its alternative is TRUE for
+        asked: Whether the model is asked about each row it read: its
+            guard is TRUE, and for a short-circuit filter no earlier
+            term of its OR passed the row.
+        passes: For an AI filter, whether a term of its OR has passed
             each row it read; all false for any other node.
     """
 
@@ -57,7 +62,9 @@ class Guarded:
         if isinstance(self.node, AiFilter):
             if self.node.answer is not None:
                 return self._answered(result)
-            return self._filtered(result)
+            if self.node.disjunction is None or self.node.closes_disjunction:
+                return self._filtered(result)
+            return self._undecided(result)
         port = self.node.rows_port
         answered = result.outputs[port]
         alias = self.node.spec.aliases[0]
@@ -89,8 +96,25 @@ class Guarded:
                           output_rows=rows.num_rows)
         return NodeResult({**result.outputs, port: rows}, metrics)
 
+    def _undecided(self, result: NodeResult) -> NodeResult:
+        """Keep every row read, with whether a term of the OR has passed it."""
+        alias = self.node.alias
+        port = f"rows:{alias}"
+        survivors = result.outputs[port].ids[alias] if isinstance(
+            result.outputs[port], Rows) else result.outputs[port]
+        passed = pc.is_in(self.rows.ids[alias], value_set=survivors)
+        decided = pc.or_(self.passes, pc.and_(self.asked, passed))
+        name = self.node.disjunction
+        values = self.rows.values
+        if name in values.column_names:
+            values = values.drop_columns([name])
+        rows = Rows(self.rows.ids, values.append_column(name, decided))
+        metrics = replace(result.metrics, input_rows=self.rows.num_rows,
+                          output_rows=rows.num_rows)
+        return NodeResult({**result.outputs, port: rows}, metrics)
+
     def _filtered(self, result: NodeResult) -> NodeResult:
-        """Keep the asked rows that passed and the rows the alternative passes."""
+        """Keep the asked rows that passed and the rows a term of the OR passed."""
         alias = self.node.alias
         port = f"rows:{alias}"
         survivors = result.outputs[port].ids[alias] if isinstance(
@@ -119,7 +143,8 @@ def guarded(node, inputs: dict, context) -> Guarded | None:
     guard = getattr(node, "guard", None)
     alternative = getattr(node, "alternative", None)
     answer = getattr(node, "answer", None)
-    if guard is None and alternative is None and answer is None:
+    disjunction = getattr(node, "disjunction", None)
+    if guard is None and alternative is None and answer is None and disjunction is None:
         return None
     (port,) = [port.name for port in node.inputs]
     alias = node.alias if isinstance(node, AiFilter) else node.spec.aliases[0]
@@ -129,15 +154,19 @@ def guarded(node, inputs: dict, context) -> Guarded | None:
     everyone = pa.array([True] * rows.num_rows, pa.bool_())
     asked = everyone if guard is None else accepts(guard, read)
     passes = (pc.invert(everyone) if alternative is None
-              else accepts(alternative, read))
+              else pc.fill_null(accepts(alternative, read), False))
+    if disjunction in rows.column_names:
+        earlier = pc.fill_null(rows.column(disjunction), False)
+        passes = pc.or_(passes, earlier)
+        if node.short_circuit:
+            asked = pc.and_(pc.fill_null(asked, False), pc.invert(earlier))
     return Guarded(node, port, rows, asked, passes)
 
 
 def _read(node, rows: Rows, alias: str, context, conditions) -> pa.Table:
     """Return the columns the conditions read, one row per row read.
 
-    A column is an earlier filter's answer the rows carry, or a column of
-    the alias's table.
+    A column is a value the rows carry, or a column of the alias's table.
     """
     names = {ref.column for condition in conditions
              for ref in condition.references}
