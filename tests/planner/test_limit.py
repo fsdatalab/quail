@@ -1,6 +1,6 @@
 """A LIMIT as the fetch of the AI operator whose rows it reads.
 
-push_down_limit_into_ai_nodes makes a LIMIT, with its OFFSET, the fetch
+derive makes a LIMIT, with its OFFSET, the fetch
 of the AiNode below it. Each test runs a query with the rule on and off
 and checks that both return rows the query allows: without ORDER BY, a
 LIMIT of n returns any n of the qualifying rows.
@@ -12,9 +12,9 @@ from helpers.oracle import Oracle, finish
 from helpers.sessions import CONFIG, TOKENIZER
 
 import quail
-from quail.builtins import LOGICAL_RULES, built_in_registry
+from quail.builtins import LOGICAL_RULES, built_in_registry, logical_rules_without
 
-RULE = "derive"
+RULE = "derive.fetch"
 REVIEWS = pa.table({
     "id": ["r0", "r1", "r2", "r3", "r4", "r5"],
     "stars": [5, 2, 4, 1, 5, 3],
@@ -39,7 +39,7 @@ def _session(rules) -> quail.Session:
 @pytest.fixture
 def sessions():
     on = _session(LOGICAL_RULES)
-    off = _session([name for name in LOGICAL_RULES if name != RULE])
+    off = _session(logical_rules_without(RULE))
     yield on, off
     on.close()
     off.close()

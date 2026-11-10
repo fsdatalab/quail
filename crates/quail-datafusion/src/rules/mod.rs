@@ -2,7 +2,7 @@
 //!
 //! DataFusion's optimizer runs its own rules over the whole plan, each
 //! `AiNode` included, with Quail's rules among them. [`default_rule_names`]
-//! gives the default order: DataFusion's default rules, with Quail's eleven
+//! gives the default order: DataFusion's default rules, with Quail's four
 //! before `replace_distinct_aggregate`, which turns a `DISTINCT` into a
 //! GROUP BY. [`crate::claim_model_regions`] claims the model regions of
 //! the plan the optimizer leaves, before physical planning.
@@ -29,25 +29,18 @@ use datafusion::common::{Result, plan_err};
 use datafusion::optimizer::{Optimizer, OptimizerRule};
 
 /// Quail's own rules, in the order they run.
-pub const QUAIL_RULES: [&str; 11] = [
+pub const QUAIL_RULES: [&str; 4] = [
     "eliminate_distinct",
     "derive",
     "place_ai_nodes",
     "merge_repeated_ai_calls",
-    "push_down_distinct",
-    "push_down_projection_into_ai_nodes",
-    "push_down_case_guards",
-    "push_down_or_guards",
-    "push_down_substring_prechecks",
-    "push_down_semi_join_fetch",
-    "push_down_count_threshold",
 ];
 
 /// The rule Quail's rules run before.
 const QUAIL_RULES_BEFORE: &str = "replace_distinct_aggregate";
 
 #[cfg(test)]
-const EXPECTED_DEFAULT_RULES: [&str; 36] = [
+const EXPECTED_DEFAULT_RULES: [&str; 29] = [
     "rewrite_set_comparison",
     "optimize_unions",
     "unions_to_filter",
@@ -56,13 +49,6 @@ const EXPECTED_DEFAULT_RULES: [&str; 36] = [
     "derive",
     "place_ai_nodes",
     "merge_repeated_ai_calls",
-    "push_down_distinct",
-    "push_down_projection_into_ai_nodes",
-    "push_down_case_guards",
-    "push_down_or_guards",
-    "push_down_substring_prechecks",
-    "push_down_semi_join_fetch",
-    "push_down_count_threshold",
     "replace_distinct_aggregate",
     "eliminate_join",
     "decorrelate_predicate_subquery",
@@ -90,19 +76,8 @@ fn quail_rule(name: &str) -> Option<Arc<dyn OptimizerRule + Send + Sync>> {
     Some(match name {
         "eliminate_distinct" => Arc::new(crate::rules::distinct::EliminateDistinct),
         "place_ai_nodes" => Arc::new(crate::rules::placement::PlaceAiNodes),
-        "derive" => Arc::new(crate::rules::derive::Derive),
+        name if name.starts_with("derive") => Arc::new(crate::rules::derive::Derive::named(name)?),
         "merge_repeated_ai_calls" => Arc::new(crate::rules::repeated::MergeRepeatedAiCalls),
-        "push_down_distinct" => Arc::new(crate::rules::distinct::PushDownDistinct),
-        "push_down_projection_into_ai_nodes" => {
-            Arc::new(crate::rules::projection::PushDownProjectionIntoAiNodes)
-        }
-        "push_down_case_guards" => Arc::new(crate::rules::guards::PushDownCaseGuards),
-        "push_down_substring_prechecks" => {
-            Arc::new(crate::rules::substring::PushDownSubstringPrechecks)
-        }
-        "push_down_semi_join_fetch" => Arc::new(crate::rules::keyed::PushDownSemiJoinFetch),
-        "push_down_count_threshold" => Arc::new(crate::rules::keyed::PushDownCountThreshold),
-        "push_down_or_guards" => Arc::new(crate::rules::or_guards::PushDownOrGuards),
         _ => return None,
     })
 }

@@ -1,4 +1,4 @@
-//! The `PushDownOrGuards` optimizer rule: an AI test in an OR is asked
+//! A guard step of [`crate::Derive`]: an AI test in an OR is asked
 //! only where the rest of the OR is not TRUE.
 //!
 //! A filter `a OR b` keeps every row where `a` is TRUE, whatever `b` is.
@@ -56,7 +56,6 @@ use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, Result};
 use datafusion::logical_expr::utils::{conjunction, disjunction, split_binary, split_conjunction};
 use datafusion::logical_expr::{Expr, LogicalPlan, Operator};
-use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
 use crate::ai::{AiNode, Semantics};
 use crate::extension::{as_node, extension_node};
@@ -64,21 +63,8 @@ use crate::rules::guards::reads_call_table;
 
 /// Guard the AI call that is one term of an OR with the other terms, as
 /// the module explains.
-#[derive(Debug, Default)]
-pub struct PushDownOrGuards;
-
-impl OptimizerRule for PushDownOrGuards {
-    fn name(&self) -> &str {
-        "push_down_or_guards"
-    }
-
-    fn rewrite(
-        &self,
-        plan: LogicalPlan,
-        _config: &dyn OptimizerConfig,
-    ) -> Result<Transformed<LogicalPlan>> {
-        plan.transform_up(push_down_or)
-    }
+pub(super) fn or_guards(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
+    plan.transform_up(push_down_or)
 }
 
 /// The terms of an `AI.IF` node's filter OR other than its answer `b`,
@@ -263,7 +249,6 @@ mod tests {
     use datafusion::datasource::provider_as_source;
     use datafusion::logical_expr::expr::ScalarFunction;
     use datafusion::logical_expr::{LogicalPlanBuilder, col, lit};
-    use datafusion::optimizer::{Optimizer, OptimizerContext};
 
     use super::*;
 
@@ -303,11 +288,7 @@ mod tests {
     }
 
     fn pushed(plan: LogicalPlan) -> String {
-        Optimizer::with_rules(vec![Arc::new(PushDownOrGuards)])
-            .optimize(plan, &OptimizerContext::new(), |_, _| {})
-            .unwrap()
-            .display_indent()
-            .to_string()
+        or_guards(plan).unwrap().data.display_indent().to_string()
     }
 
     #[test]

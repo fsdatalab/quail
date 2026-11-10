@@ -1,9 +1,9 @@
 """DataFusion's DISTINCT rules in a model region.
 
-EliminateDistinct drops a DISTINCT that removes no row; PushDownDistinct
+EliminateDistinct drops a DISTINCT that removes no row; derive
 gives the AI operator under a DISTINCT a fetch of one row per value of
 the selected columns. The tests of rows run each query with
-push_down_distinct on and off and check that both return the same rows.
+derive's fetch on and off and check that both return the same rows.
 """
 
 
@@ -13,7 +13,7 @@ from helpers.oracle import Oracle, finish
 from helpers.sessions import CONFIG, TOKENIZER
 
 import quail
-from quail.builtins import LOGICAL_RULES, built_in_registry
+from quail.builtins import LOGICAL_RULES, built_in_registry, logical_rules_without
 
 REVIEWS = pa.table({"id": ["r0", "r1"], "stars": [5, 2], "body": ["good", "slow"]})
 
@@ -68,7 +68,7 @@ def _keyed_session(rules) -> quail.Session:
 def sessions():
     on = _keyed_session(LOGICAL_RULES)
     off = _keyed_session(
-        [name for name in LOGICAL_RULES if name != "push_down_distinct"])
+        logical_rules_without("derive.fetch"))
     yield on, off
     on.close()
     off.close()

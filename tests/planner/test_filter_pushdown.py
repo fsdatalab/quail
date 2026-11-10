@@ -14,7 +14,7 @@ from helpers.oracle import Oracle, finish
 from helpers.sessions import CONFIG, TOKENIZER
 
 import quail
-from quail.builtins import LOGICAL_RULES, built_in_registry
+from quail.builtins import LOGICAL_RULES, built_in_registry, logical_rules_without
 
 RULE = "push_down_filter"
 REVIEWS = pa.table({
@@ -37,7 +37,7 @@ def _session(rules) -> quail.Session:
 @pytest.fixture
 def sessions():
     on = _session(LOGICAL_RULES)
-    off = _session([name for name in LOGICAL_RULES if name != RULE])
+    off = _session(logical_rules_without(RULE))
     yield on, off
     on.close()
     off.close()
@@ -90,8 +90,8 @@ def test_a_filter_above_a_classification_runs_before_the_model(sessions):
 
 
 # R4: an extraction whose answer must contain a literal reads only the
-# documents that contain it (push_down_substring_prechecks)
-SUBSTRING_RULE = "push_down_substring_prechecks"
+# documents that contain it (derive's filters)
+SUBSTRING_RULE = "derive.filters"
 LEASES = pa.table({
     "id": ["c0", "c1", "c2", "c3", "c4"],
     "text": ["Ends in 2027.", "Ends in 2026.", "2027 start", "No date.",
@@ -125,7 +125,7 @@ def test_an_extraction_tested_with_like_reads_only_documents_with_its_literal(te
     year = call + "['year']"
     sql = f"SELECT l.id, {call} AS e FROM leases l WHERE {test.format(year)}"
     on = _leases_session(LOGICAL_RULES)
-    off = _leases_session([name for name in LOGICAL_RULES if name != SUBSTRING_RULE])
+    off = _leases_session(logical_rules_without(SUBSTRING_RULE))
     found = [_end_dates(session, sql) for session in (on, off)]
     on.close()
     off.close()

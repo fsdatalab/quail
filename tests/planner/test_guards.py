@@ -1,10 +1,10 @@
 """A guarded AI call asks the model only where its guard is TRUE.
 
 An AI operator's guard g says which rows the model is asked about; every
-other row's answer is NULL. push_down_case_guards makes the test of a
+other row's answer is NULL. derive makes the test of a
 CASE that reads the answer the guard (R6). Each test runs a query with
 the rule on and off, checks that both return the same rows, and counts
-the questions the model answered. push_down_or_guards guards an AI
+the questions the model answered. derive also guards an AI
 filter in an OR with the OR's other terms (R7); in an OR of several AI
 filters, each is asked only where the terms before it are not TRUE.
 """
@@ -16,11 +16,11 @@ from helpers.sessions import CONFIG, TOKENIZER
 
 import quail
 from quail.api.config import EngineConfig
-from quail.builtins import LOGICAL_RULES, built_in_registry
+from quail.builtins import LOGICAL_RULES, built_in_registry, logical_rules_without
 from quail.physical import AiClassify, AiFilter
 from quail.physical.plan import Refusal
 
-CASE_RULE = "push_down_case_guards"
+CASE_RULE = "derive.guard"
 REVIEWS = pa.table({
     "id": ["r0", "r1", "r2", "r3", "r4", "r5"],
     "body": ["b0", "b1", "b2", "b3", "b4", "b5"],
@@ -40,7 +40,7 @@ def _session(rules) -> quail.Session:
 @pytest.fixture
 def sessions():
     on = _session(LOGICAL_RULES)
-    off = _session([name for name in LOGICAL_RULES if name != CASE_RULE])
+    off = _session(logical_rules_without(CASE_RULE))
     yield on, off
     on.close()
     off.close()
@@ -110,7 +110,7 @@ def test_stock_vllm_refuses_a_guarded_classification():
     assert plan.constraint == "guard_needs_quail_backend"
 
 
-OR_RULE = "push_down_or_guards"
+OR_RULE = "derive.guard"
 KIND = "AI_FILTER(PROMPT('kind: {0}', r.body))"
 
 
@@ -132,7 +132,7 @@ def _or_rows_and_questions(rules, sql) -> tuple[list, list]:
 
 def test_an_or_of_a_column_and_an_ai_filter_asks_only_where_the_column_is_not_true():
     sql = f"SELECT r.id FROM reviews r WHERE r.long OR {KIND}"
-    off = [name for name in LOGICAL_RULES if name != OR_RULE]
+    off = logical_rules_without(OR_RULE)
     on_rows, on_asked = _or_rows_and_questions(LOGICAL_RULES, sql)
     off_rows, off_asked = _or_rows_and_questions(off, sql)
     # r0, r3, r5 are long; of the rest, r2 and r4 are kind
@@ -144,7 +144,7 @@ def test_an_or_with_a_null_column_asks_the_model_about_the_null_row():
     sql = f"SELECT r.id FROM reviews r WHERE {KIND} OR (r.long AND r.id <> 'r0')"
     on_rows, on_asked = _or_rows_and_questions(LOGICAL_RULES, sql)
     off_rows, _ = _or_rows_and_questions(
-        [name for name in LOGICAL_RULES if name != OR_RULE], sql)
+        logical_rules_without(OR_RULE), sql)
     assert on_rows == off_rows == ["r0", "r2", "r3", "r4", "r5"]
     assert on_asked == [0, 1, 2, 4]
 
@@ -187,7 +187,7 @@ def _ors_rows_and_questions(rules, sql, kind, long) -> tuple[list, list, list]:
 
 def test_an_or_of_two_ai_filters_asks_the_second_only_where_the_first_is_not_true():
     sql = f"SELECT r.id FROM reviews r WHERE {KIND} OR {LONG}"
-    off = [name for name in LOGICAL_RULES if name != OR_RULE]
+    off = logical_rules_without(OR_RULE)
     on = _ors_rows_and_questions(LOGICAL_RULES, sql, {0, 3}, {2, 3, 4})
     everything = _ors_rows_and_questions(off, sql, {0, 3}, {2, 3, 4})
     assert on[0] == everything[0] == ["r0", "r2", "r3", "r4"]
@@ -227,7 +227,7 @@ def test_an_or_ranks_as_one_filter_among_the_filters_beside_it(
 
 def test_an_or_of_a_column_and_two_ai_filters_asks_each_where_no_earlier_term_is_true():
     sql = f"SELECT r.id FROM reviews r WHERE r.long OR {KIND} OR {LONG}"
-    off = [name for name in LOGICAL_RULES if name != OR_RULE]
+    off = logical_rules_without(OR_RULE)
     on = _ors_rows_and_questions(LOGICAL_RULES, sql, {4}, {1})
     everything = _ors_rows_and_questions(off, sql, {4}, {1})
     # r0, r3, r5 are long: TRUE OR NULL is TRUE. r2's long is NULL and both
@@ -282,7 +282,7 @@ def test_an_ai_filter_in_an_or_is_priced_on_the_rows_where_the_rest_is_not_true(
     sql = f"SELECT r.id FROM reviews r WHERE r.long OR {KIND}"
     (guarded,) = [node for node in sessions[0].sql(sql).plan().nodes
                   if isinstance(node, AiFilter)]
-    unguarded = _session([name for name in LOGICAL_RULES if name != OR_RULE])
+    unguarded = _session(logical_rules_without(OR_RULE))
     (everything,) = [node for node in unguarded.sql(sql).plan().nodes
                      if isinstance(node, AiFilter)]
     unguarded.close()

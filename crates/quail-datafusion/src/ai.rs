@@ -34,7 +34,7 @@
 //! node as its `UserDefinedLogicalNodeCore` methods allow; each method
 //! says which rewrites keep the node's meaning. A LIMIT or DISTINCT above
 //! the node becomes its fetch (`Derive`,
-//! `PushDownDistinct`).
+//! `Derive`).
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -808,7 +808,7 @@ mod tests {
             .build()
             .unwrap();
         let distinct =
-            Optimizer::with_rules(vec![Arc::new(crate::rules::distinct::PushDownDistinct)])
+            Optimizer::with_rules(vec![Arc::new(crate::rules::derive::Derive::default())])
                 .optimize(plan, &OptimizerContext::new(), |_, _| {})
                 .unwrap()
                 .display_indent()

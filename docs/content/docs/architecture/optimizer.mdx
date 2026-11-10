@@ -82,18 +82,22 @@ conditions.
 | Rule | Change |
 | --- | --- |
 | `eliminate_distinct` | Remove a redundant `DISTINCT` when selected primary keys make rows unique. |
-| `absorb_into_ai_nodes` | Make tests of answers the node's exact filter (R2). An `AI.IF` in `WHERE` becomes a filter here. |
+| `derive` | Give each AI operator what the operators above it need of it. |
 | `place_ai_nodes` | Place AI calls at the tables they read. |
-| `merge_repeated_ai_calls` | Reuse an identical earlier call's answer (R17). |
-| `push_down_distinct` | Stop after one passing row per selected key (R12). |
-| `push_down_limit_into_ai_nodes` | Give an eligible node a fetch, including `OFFSET` (R9–R10). |
-| `push_down_projection_into_ai_nodes` | Drop unused added columns and extraction fields (R5). |
-| `push_down_case_guards` | Ask only rows that need an answer in `CASE` (R6). |
-| `push_down_or_guards` | Skip `AI.IF` when earlier `OR` terms already pass (R7). |
-| `push_down_hint_tests` | Add an answer test as an early-rejection hint (R3). |
-| `push_down_substring_prechecks` | Test documents for text an extracted answer must contain (R4). |
-| `push_down_semi_join_fetch` | Stop after one passing row per semi-join key (R13). |
-| `push_down_count_threshold` | Stop after enough rows pass a count threshold per key (R14). |
+| `merge_repeated_ai_calls` | Reuse an identical earlier call's answer. |
+
+`derive` sets four options on an `AiNode`:
+
+| Option | From | Effect |
+| --- | --- | --- |
+| filters | A test of the node's answer in a `Filter` above | The node drops the rows that fail, and the test leaves the `Filter`. |
+| fetch | A `LIMIT`, or the keys of a `DISTINCT`, a semi-join, or `HAVING COUNT(*) >= k` | The node stops once enough rows pass, in all or for each key. |
+| projection | The columns and extraction fields read above | The node returns, and asks, only those. |
+| guard | A `CASE` condition, or the other terms of an `OR` | The node does not ask the rows whose answer nothing reads. |
+
+A test or a limit reaches its node through the operators between them
+that return the same rows, such as a SELECT list or a CTE's alias. E.g.,
+a test of a map's answer written outside a CTE is the map's own filter.
 
 DataFusion supplies ordinary filter pushdown and projection pruning.
 See the complete [logical rule order](https://github.com/fsdatalab/quail/blob/main/crates/quail-datafusion/src/rules.rs).

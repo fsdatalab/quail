@@ -46,14 +46,93 @@ use super::repeated::{through_alias, through_projection};
 use crate::ai::{AiNode, Fetch, Semantics};
 use crate::extension::{as_node, extension_node};
 
-/// Give each `AiNode` the filters and fetch the operators above it
-/// need of it, as the module explains.
+/// One kind of option [`Derive`] sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeriveOption {
+    /// The rows a node drops: tests of its answer, and a document test
+    /// an extraction's answer implies.
+    Filters,
+    /// How many rows are enough: a `LIMIT`, or one or `k` rows for each
+    /// key of a `DISTINCT`, a semi-join, or a count threshold.
+    Fetch,
+    /// The added columns and extraction fields a node returns.
+    Projection,
+    /// The rows a node need not ask about: those a `CASE` does not read
+    /// its answer for, or another term of an OR already passes.
+    Guard,
+}
+
+impl DeriveOption {
+    const ALL: [Self; 4] = [Self::Filters, Self::Fetch, Self::Projection, Self::Guard];
+
+    /// The name of the rule that derives this option alone.
+    pub const fn rule_name(self) -> &'static str {
+        match self {
+            Self::Filters => "derive.filters",
+            Self::Fetch => "derive.fetch",
+            Self::Projection => "derive.projection",
+            Self::Guard => "derive.guard",
+        }
+    }
+}
+
+/// Give each `AiNode` what the operators above it need of it, as the
+/// module explains: every option, or `only` one.
 #[derive(Debug, Default)]
-pub struct Derive;
+pub struct Derive {
+    only: Option<DeriveOption>,
+}
+
+impl Derive {
+    /// The rule that derives `option` and no other. A session lists such
+    /// rules in place of `derive` to leave an option out.
+    pub fn only(option: DeriveOption) -> Self {
+        Self { only: Some(option) }
+    }
+
+    /// The rule named `name`: `derive`, or one option's own.
+    pub fn named(name: &str) -> Option<Self> {
+        if name == "derive" {
+            return Some(Self::default());
+        }
+        DeriveOption::ALL
+            .into_iter()
+            .find(|option| option.rule_name() == name)
+            .map(Self::only)
+    }
+}
+
+/// A step of the rule: the option it derives and its rewrite.
+type Step = (
+    DeriveOption,
+    fn(LogicalPlan) -> Result<Transformed<LogicalPlan>>,
+);
+
+/// The steps in the order they run. A later step reads what an earlier
+/// one set: a fetch follows the filters, and a guard follows both.
+const STEPS: [Step; 10] = [
+    // a subquery's filters reach its nodes where the query wrote them,
+    // before DataFusion makes the subquery a join
+    (DeriveOption::Filters, |plan| {
+        plan.transform_up_with_subqueries(filter_down)
+    }),
+    (DeriveOption::Projection, drop_unread_answers),
+    (DeriveOption::Fetch, super::distinct::distinct_fetches),
+    (DeriveOption::Fetch, |plan| plan.transform_down(fetch_down)),
+    (DeriveOption::Projection, super::projection::projections),
+    (DeriveOption::Guard, super::guards::case_guards),
+    (DeriveOption::Guard, super::or_guards::or_guards),
+    (DeriveOption::Filters, super::substring::substring_prechecks),
+    (DeriveOption::Fetch, super::keyed::semi_join_fetches),
+    (DeriveOption::Fetch, super::keyed::count_thresholds),
+];
 
 impl OptimizerRule for Derive {
     fn name(&self) -> &str {
-        "derive"
+        match self.only {
+            Some(option) => option.rule_name(),
+            None => "derive",
+        }
     }
 
     fn rewrite(
@@ -61,15 +140,16 @@ impl OptimizerRule for Derive {
         plan: LogicalPlan,
         _config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
-        // a subquery's filters reach its nodes where the query wrote
-        // them, before DataFusion makes the subquery a join
-        let filtered = plan.transform_up_with_subqueries(filter_down)?;
-        let fetched = filtered.data.transform_down(fetch_down)?;
-        let dropped = drop_unread_answers(fetched.data)?;
-        Ok(Transformed::new_transformed(
-            dropped.data,
-            filtered.transformed || fetched.transformed || dropped.transformed,
-        ))
+        let mut plan = plan;
+        let mut changed = false;
+        for (option, step) in STEPS {
+            if self.only.is_none_or(|only| only == option) {
+                let done = step(plan)?;
+                changed |= done.transformed;
+                plan = done.data;
+            }
+        }
+        Ok(Transformed::new_transformed(plan, changed))
     }
 }
 
@@ -405,7 +485,7 @@ mod tests {
     }
 
     fn pushed(plan: LogicalPlan) -> String {
-        Optimizer::with_rules(vec![Arc::new(Derive)])
+        Optimizer::with_rules(vec![Arc::new(Derive::default())])
             .optimize(plan, &OptimizerContext::new(), |_, _| {})
             .unwrap()
             .display_indent()

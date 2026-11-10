@@ -9,7 +9,7 @@ from helpers.sessions import CONFIG, TOKENIZER, _run, make_executor
 
 import quail
 from quail.api.config import EngineConfig
-from quail.builtins import LOGICAL_RULES, built_in_registry
+from quail.builtins import LOGICAL_RULES, built_in_registry, logical_rules_without
 
 
 def _session(tmp_path, tokenizer=TOKENIZER):
@@ -141,7 +141,7 @@ def test_a_full_join_offers_its_classification_and_test_above_the_join():
 
 # R5, π_Q(AI(R; P)) ⇒ π_Q(AI(R; P = Q[P])): an AI operator returns the
 # added columns the SELECT list above it reads
-PROJECTION_RULE = "push_down_projection_into_ai_nodes"
+PROJECTION_RULE = "derive.projection"
 EXTRACTED = pa.table({"id": ["r0", "r1", "r2"], "body": ["ab x", "cd", "ab y"]})
 
 
@@ -158,7 +158,7 @@ def test_an_extraction_under_a_select_list_returns_only_the_columns_it_reads():
            "AS e FROM reviews r) x")
     found = []
     for rules in (LOGICAL_RULES,
-                  [name for name in LOGICAL_RULES if name != PROJECTION_RULE]):
+                  logical_rules_without(PROJECTION_RULE)):
         session = _extract_session(rules)
         query = session.sql(sql)
         node = next(line for line in query.logical.splitlines() if "AiNode" in line)
@@ -189,7 +189,7 @@ def test_an_extraction_asks_only_the_fields_the_query_reads():
            f"AI_EXTRACT(r.body, {questions}) AS e FROM reviews r) x")
     found = []
     for rules in (LOGICAL_RULES,
-                  [name for name in LOGICAL_RULES if name != PROJECTION_RULE]):
+                  logical_rules_without(PROJECTION_RULE)):
         session = _extract_session(rules)
         asked = []
 

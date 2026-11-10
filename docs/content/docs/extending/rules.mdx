@@ -27,13 +27,16 @@ Physical rules use `should_...` for yes/no decisions or `choose_...` for
 implementation choices. Registering a name does not implement the rule.
 
 To turn off a built-in rule, omit its name from the registry.
-E.g., create a session without limit pushdown into `AiNode`s:
+`derive` sets four options; `logical_rules_without` also takes one of
+`derive.filters`, `derive.fetch`, `derive.projection`, and
+`derive.guard` to leave that option out.
+E.g., create a session whose `AiNode`s take no fetch:
 
 ```python
 import quail
-from quail.builtins import LOGICAL_RULES, built_in_registry
+from quail.builtins import built_in_registry, logical_rules_without
 
-rules = [name for name in LOGICAL_RULES if name != "push_down_limit_into_ai_nodes"]
+rules = logical_rules_without("derive.fetch")
 registry = built_in_registry(logical_rules=rules)
 config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
 with quail.Session(config=config, registry=registry) as session:
@@ -45,8 +48,8 @@ with quail.Session(config=config, registry=registry) as session:
 An `AiNode`'s fetch limits rows **after** its exact filter, globally or
 per key. Setting it too early changes query results.
 
-- Absorb answer tests before setting a fetch. `absorb_into_ai_nodes`
-  does not move tests into a node that already has one.
+- Take answer tests before setting a fetch. `derive` does not move
+  tests into a node that already has one.
 - Do not move a later filter below a fetch unless it keeps or rejects
   whole per-key groups.
 - Check intervening operators and `HINT` before pushing a limit into a node.
@@ -57,31 +60,29 @@ for the built-in checks.
 
 ## Rewrites by number
 
-The table summarizes R1–R17. Conditions here identify the main safety
+The table summarizes the rewrites by number; R3 is no longer used. Conditions here identify the main safety
 constraints; the rule implementation defines every accepted plan shape.
 
 | Number | Rule | Change and conditions |
 | --- | --- | --- |
 | R1 | DataFusion `push_down_filter` | Move an input-only filter below an `AiNode` without a fetch. Above a per-key fetch, move only filters of key columns. |
-| R2 | `absorb_into_ai_nodes` | Add an answer test to the node's exact filter when the node has no fetch. An `AI.IF` node whose answer no operator above reads then returns no column. |
-| R3 | `push_down_hint_tests` | Copy a directly preceding answer test into a column-producing node's hint test. Require no fetch; keep the original filter. |
-| R4 | `push_down_substring_prechecks` | Before extraction, test the document for literal text required by an answer's `LIKE` or `ILIKE` pattern. Require no fetch and a non-negated literal pattern; keep the answer test. |
-| R5 | `push_down_projection_into_ai_nodes` | Remove unused added columns and extraction questions. Keep all extraction fields when any use reads the whole struct. |
-| R6 | `push_down_case_guards` | Ask only where a `CASE WHEN` condition is TRUE. Every use of an added column must have the same condition over the call's table. Require no filter, `HINT`, or fetch. |
-| R7 | `push_down_or_guards` | Skip an `AI.IF` when other eligible `OR` terms already pass. Require no existing guard, `HINT`, or fetch. Preserve the OR's row selection. |
+| R2 | `derive` (filters) | Add an answer test above the node, through SELECT lists and aliases, to its exact filter when the node has no fetch. An `AI.IF` node whose answer no operator above reads then returns no column. |
+| R4 | `derive` (filters) | Before extraction, test the document for literal text required by an answer's `LIKE` or `ILIKE` pattern. Require no fetch and a non-negated literal pattern; keep the answer test. |
+| R5 | `derive` (projection) | Remove unused added columns and extraction questions. Keep all extraction fields when any use reads the whole struct. |
+| R6 | `derive` (guard) | Ask only where a `CASE WHEN` condition is TRUE. Every use of an added column must have the same condition over the call's table. Require no filter, `HINT`, or fetch. |
+| R7 | `derive` (guard) | Skip an `AI.IF` when other eligible `OR` terms already pass. Require no existing guard, `HINT`, or fetch. Preserve the OR's row selection. |
 | R8 | DataFusion `push_down_limit` | Move a limit through a projection that preserves row count. At an `AiNode`, apply R9 instead. |
-| R9 | `push_down_limit_into_ai_nodes` | Set a global fetch from a positive limit, through projections and aliases. Require no `HINT` or per-key fetch; keep the smaller existing limit. |
-| R10 | `push_down_limit_into_ai_nodes` | Fetch `LIMIT + OFFSET` rows under R9's conditions. Keep the outer limit and offset. |
+| R9 | `derive` (fetch) | Set a global fetch from a positive limit, through projections and aliases. Require no `HINT` or per-key fetch; keep the smaller existing limit. |
+| R10 | `derive` (fetch) | Fetch `LIMIT + OFFSET` rows under R9's conditions. Keep the outer limit and offset. |
 | R11 | DataFusion `push_down_limit` | Push limits into `UNION ALL` branches. R9 can then set each branch's AI fetch. Keep the outer limit. |
-| R12 | `push_down_distinct` | Fetch one passing row per selected input key or classification label. Require no fetch or `HINT`; keep `DISTINCT`. |
-| R13 | `push_down_semi_join_fetch` | Fetch one passing row per semi-join equality key. Require only unguarded `AI.IF` nodes over one table, without joins, fetches, or `HINT`. |
-| R14 | `push_down_count_threshold` | Fetch `k` passing rows per group for `HAVING COUNT(*) >= k`. Require positive `k`, column keys, no other aggregate or use of the count, and R13's AI restrictions. |
+| R12 | `derive` (fetch) | Fetch one passing row per selected input key or classification label. Require no fetch or `HINT`; keep `DISTINCT`. |
+| R13 | `derive` (fetch) | Fetch one passing row per semi-join equality key. Require only unguarded `AI.IF` nodes over one table, without joins, fetches, or `HINT`. |
+| R14 | `derive` (fetch) | Fetch `k` passing rows per group for `HAVING COUNT(*) >= k`. Require positive `k`, column keys, no other aggregate or use of the count, and R13's AI restrictions. |
 | R15 | DataFusion dynamic filter | Let a top-k sort reject rows that cannot enter its result. Require no region fetch or stop keys, and enough known values or answer bounds to decide rejection. |
 | R16 | DataFusion dynamic filter | Let a hash join reject rows that cannot match its completed build side. Use the same region restrictions as R15. |
 | R17 | `merge_repeated_ai_calls` | Reuse an identical earlier call with the same guard across eligible filters or projections. Require no upper fetch and preserve every answer column and test. |
 
-R3 normally has no remaining test after R2. Both exact tests and hint
-tests can [stop partial answers](/docs/architecture/execution#evaluation-on-partial-answers).
+Exact tests can [stop partial answers](/docs/architecture/execution#evaluation-on-partial-answers).
 
 R4 tests the longest word of the pattern's longest literal run, ignoring
 case. This avoids requiring whitespace to match the document exactly.

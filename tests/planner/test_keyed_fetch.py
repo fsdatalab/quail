@@ -1,10 +1,9 @@
 """An AI filter stops each key once the operator above has enough rows.
 
-push_down_semi_join_fetch gives the AI filter on an IN subquery's side
-of a semi-join one row per join key (R13), and so to a correlated EXISTS
-whose AI filter reads the subquery's table alone; push_down_count_threshold
-gives the AI filter under HAVING COUNT(*) >= k k rows per group key
-(R14). Each test runs a query with the rule on and off, checks that both
+derive gives the AI filter on an IN subquery's side of a semi-join one
+row per join key (R13), and so to a correlated EXISTS whose AI filter
+reads the subquery's table alone. It gives the AI filter under HAVING
+COUNT(*) >= k k rows per group key (R14). Each test runs a query with the rule on and off, checks that both
 return the same rows, and counts the documents the model read.
 """
 
@@ -14,10 +13,10 @@ from helpers.oracle import Oracle, finish
 from helpers.sessions import CONFIG, TOKENIZER
 
 import quail
-from quail.builtins import LOGICAL_RULES, built_in_registry
+from quail.builtins import LOGICAL_RULES, built_in_registry, logical_rules_without
 
-SEMI_JOIN_RULE = "push_down_semi_join_fetch"
-COUNT_RULE = "push_down_count_threshold"
+SEMI_JOIN_RULE = "derive.fetch"
+COUNT_RULE = "derive.fetch"
 # two reviews of each product; the model passes r0 to r3
 REVIEWS = pa.table({
     "id": [f"r{index}" for index in range(6)],
@@ -41,7 +40,7 @@ def _session(rules, reviews=REVIEWS) -> quail.Session:
 def _rows_and_read(rule, sql, reviews=REVIEWS, passing=(0, 1, 2, 3)) -> list:
     """Return, with the rule on and off, the rows, sorted, and the documents read."""
     found = []
-    for rules in (LOGICAL_RULES, [name for name in LOGICAL_RULES if name != rule]):
+    for rules in (LOGICAL_RULES, logical_rules_without(rule)):
         session = _session(rules, reviews)
         read = []
 

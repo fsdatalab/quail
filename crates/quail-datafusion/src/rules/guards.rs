@@ -1,4 +1,4 @@
-//! The `PushDownCaseGuards` optimizer rule: a `CASE` that reads an AI
+//! A guard step of [`crate::Derive`]: a `CASE` that reads an AI
 //! answer only when a test of the input passes becomes the node's guard.
 //!
 //! An `AiNode`'s guard `g` says which rows the model is asked about; the
@@ -40,28 +40,14 @@ use datafusion::common::{Column, Result};
 use datafusion::logical_expr::expr::Case;
 use datafusion::logical_expr::utils::split_conjunction;
 use datafusion::logical_expr::{Expr, LogicalPlan, Projection};
-use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
 use crate::ai::{AiNode, Semantics};
 use crate::extension::{as_node, extension_node};
 
 /// Make each `CASE` test above a column node the node's guard, as the
 /// module explains.
-#[derive(Debug, Default)]
-pub struct PushDownCaseGuards;
-
-impl OptimizerRule for PushDownCaseGuards {
-    fn name(&self) -> &str {
-        "push_down_case_guards"
-    }
-
-    fn rewrite(
-        &self,
-        plan: LogicalPlan,
-        _config: &dyn OptimizerConfig,
-    ) -> Result<Transformed<LogicalPlan>> {
-        plan.transform_up(push_down_case)
-    }
+pub(super) fn case_guards(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
+    plan.transform_up(push_down_case)
 }
 
 fn push_down_case(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
@@ -247,7 +233,6 @@ mod tests {
     use datafusion::datasource::provider_as_source;
     use datafusion::logical_expr::expr::ScalarFunction;
     use datafusion::logical_expr::{LogicalPlanBuilder, col, lit, when};
-    use datafusion::optimizer::{Optimizer, OptimizerContext};
 
     use super::*;
 
@@ -284,11 +269,7 @@ mod tests {
     }
 
     fn pushed(plan: LogicalPlan) -> String {
-        Optimizer::with_rules(vec![Arc::new(PushDownCaseGuards)])
-            .optimize(plan, &OptimizerContext::new(), |_, _| {})
-            .unwrap()
-            .display_indent()
-            .to_string()
+        case_guards(plan).unwrap().data.display_indent().to_string()
     }
 
     #[test]

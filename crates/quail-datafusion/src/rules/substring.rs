@@ -1,4 +1,4 @@
-//! The `PushDownSubstringPrechecks` optimizer rule: an extraction whose
+//! A filter step of [`crate::Derive`]: an extraction whose
 //! answer must contain a literal reads only the documents that contain
 //! it.
 //!
@@ -30,28 +30,14 @@ use datafusion::common::{Result, ScalarValue};
 use datafusion::logical_expr::expr::Like;
 use datafusion::logical_expr::utils::split_conjunction;
 use datafusion::logical_expr::{Expr, Filter, LogicalPlan};
-use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
 use crate::ai::{AiNode, Semantics};
 use crate::extension::{as_node, extension_node};
 
 /// Test each extraction's document for the literal its answer's `LIKE`
 /// needs, as the module explains.
-#[derive(Debug, Default)]
-pub struct PushDownSubstringPrechecks;
-
-impl OptimizerRule for PushDownSubstringPrechecks {
-    fn name(&self) -> &str {
-        "push_down_substring_prechecks"
-    }
-
-    fn rewrite(
-        &self,
-        plan: LogicalPlan,
-        _config: &dyn OptimizerConfig,
-    ) -> Result<Transformed<LogicalPlan>> {
-        plan.transform_up(precheck)
-    }
+pub(super) fn substring_prechecks(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
+    plan.transform_up(precheck)
 }
 
 fn precheck(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {

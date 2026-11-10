@@ -13,7 +13,7 @@ from helpers.oracle import Oracle, finish
 from helpers.sessions import CONFIG, TOKENIZER
 
 import quail
-from quail.builtins import LOGICAL_RULES, built_in_registry
+from quail.builtins import LOGICAL_RULES, built_in_registry, logical_rules_without
 from quail.common.expressions import CompileError, SimilarCallWarning
 
 RULE = "merge_repeated_ai_calls"
@@ -35,7 +35,7 @@ def _session(rules) -> quail.Session:
 @pytest.fixture
 def sessions():
     on = _session(LOGICAL_RULES)
-    off = _session([name for name in LOGICAL_RULES if name != RULE])
+    off = _session(logical_rules_without(RULE))
     yield on, off
     on.close()
     off.close()

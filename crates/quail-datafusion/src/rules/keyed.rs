@@ -1,7 +1,7 @@
-//! Optimizer rules that give an AI filter a per-key fetch where the
+//! Fetch steps of [`crate::Derive`] that give an AI filter a per-key fetch where the
 //! operator above needs only a few rows of each key.
 //!
-//! `PushDownSemiJoinFetch`: a semi-join keeps each row of its left input
+//! [`semi_join_fetches`]: a semi-join keeps each row of its left input
 //! that has one matching row on its right. When the right input is an AI
 //! filter's rows and the join condition is `J = K`, with `K` input
 //! columns of the AI filter, one passing row of each `K` is enough
@@ -14,7 +14,7 @@
 //! This covers `IN` and `EXISTS` subqueries that DataFusion's
 //! `decorrelate_predicate_subquery` writes as a semi-join.
 //!
-//! `PushDownCountThreshold`: a `HAVING COUNT(*) >= k` over a GROUP BY
+//! [`count_thresholds`]: a `HAVING COUNT(*) >= k` over a GROUP BY
 //! `K` keeps the keys with at least `k` rows. When the rows are an AI
 //! filter's, and nothing else reads the count, `k` passing rows of each
 //! key are enough (R14):
@@ -39,28 +39,14 @@ use datafusion::common::{Column, Result};
 use datafusion::logical_expr::{
     Expr, JoinType, LogicalPlan, Operator, Projection, SubqueryAlias, expr::BinaryExpr,
 };
-use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
 use crate::ai::{AiNode, Fetch, Semantics};
 use crate::extension::{as_node, extension_node};
 
 /// Give the AI filter on a semi-join's right side one row per join key,
 /// as the module explains.
-#[derive(Debug, Default)]
-pub struct PushDownSemiJoinFetch;
-
-impl OptimizerRule for PushDownSemiJoinFetch {
-    fn name(&self) -> &str {
-        "push_down_semi_join_fetch"
-    }
-
-    fn rewrite(
-        &self,
-        plan: LogicalPlan,
-        _config: &dyn OptimizerConfig,
-    ) -> Result<Transformed<LogicalPlan>> {
-        plan.transform_up(semi_join_fetch)
-    }
+pub(super) fn semi_join_fetches(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
+    plan.transform_up(semi_join_fetch)
 }
 
 fn semi_join_fetch(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
@@ -101,21 +87,8 @@ fn semi_join_fetch(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
 
 /// Give the AI filter under a count threshold `k` rows per group key, as
 /// the module explains.
-#[derive(Debug, Default)]
-pub struct PushDownCountThreshold;
-
-impl OptimizerRule for PushDownCountThreshold {
-    fn name(&self) -> &str {
-        "push_down_count_threshold"
-    }
-
-    fn rewrite(
-        &self,
-        plan: LogicalPlan,
-        _config: &dyn OptimizerConfig,
-    ) -> Result<Transformed<LogicalPlan>> {
-        plan.transform_up(count_threshold)
-    }
+pub(super) fn count_thresholds(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
+    plan.transform_up(count_threshold)
 }
 
 fn count_threshold(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {

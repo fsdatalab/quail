@@ -1,4 +1,4 @@
-//! The `PushDownProjectionIntoAiNodes` optimizer rule: an `AiNode` returns
+//! The projection step of [`crate::Derive`]: an `AiNode` returns
 //! only the added columns the projection above it reads, and an
 //! extraction asks only the fields the query reads.
 //!
@@ -46,7 +46,6 @@ use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{
     Expr, ExprSchemable, LogicalPlan, Projection, UserDefinedLogicalNodeCore,
 };
-use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
 use crate::SPAN_SUFFIX;
 use crate::ai::{AiNode, Fetch, Semantics};
@@ -58,25 +57,12 @@ use crate::rules::lower::quail_function;
 /// Make each `AiNode` under a projection return only the added columns
 /// the projection reads, and each extraction ask only the fields the
 /// query reads, as the module explains.
-#[derive(Debug, Default)]
-pub struct PushDownProjectionIntoAiNodes;
-
-impl OptimizerRule for PushDownProjectionIntoAiNodes {
-    fn name(&self) -> &str {
-        "push_down_projection_into_ai_nodes"
-    }
-
-    fn rewrite(
-        &self,
-        plan: LogicalPlan,
-        _config: &dyn OptimizerConfig,
-    ) -> Result<Transformed<LogicalPlan>> {
-        let pushed = plan.transform_up(push_down)?;
-        let transformed = pushed.transformed;
-        let mut pruned = prune_extract_fields(pushed.data)?;
-        pruned.transformed |= transformed;
-        Ok(pruned)
-    }
+pub(super) fn projections(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
+    let pushed = plan.transform_up(push_down)?;
+    let transformed = pushed.transformed;
+    let mut pruned = prune_extract_fields(pushed.data)?;
+    pruned.transformed |= transformed;
+    Ok(pruned)
 }
 
 fn push_down(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
@@ -450,7 +436,6 @@ mod tests {
     use datafusion::datasource::empty::EmptyTable;
     use datafusion::datasource::provider_as_source;
     use datafusion::logical_expr::{LogicalPlanBuilder, col, lit};
-    use datafusion::optimizer::{Optimizer, OptimizerContext};
 
     use super::*;
 
@@ -508,11 +493,7 @@ mod tests {
     }
 
     fn pushed(plan: LogicalPlan) -> String {
-        Optimizer::with_rules(vec![Arc::new(PushDownProjectionIntoAiNodes)])
-            .optimize(plan, &OptimizerContext::new(), |_, _| {})
-            .unwrap()
-            .display_indent()
-            .to_string()
+        projections(plan).unwrap().data.display_indent().to_string()
     }
 
     #[test]

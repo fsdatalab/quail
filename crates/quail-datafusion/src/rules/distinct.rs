@@ -1,11 +1,11 @@
 //! The DISTINCT rules of a model region: `EliminateDistinct` and
-//! `PushDownDistinct`.
+//! [`distinct_fetches`], a fetch step of [`crate::Derive`].
 //!
 //! - `EliminateDistinct` removes the region's outermost `DISTINCT`, the
 //!   one under its LIMIT, ORDER BY, and outer SELECT list, when it removes
 //!   no row: the SELECT list returns every table's id column, which each
 //!   table declares as its primary key.
-//! - `PushDownDistinct` gives the `AiNode` under a `DISTINCT` a fetch of
+//! - [`distinct_fetches`] gives the `AiNode` under a `DISTINCT` a fetch of
 //!   one row per value of the selected columns `K`:
 //!
 //!   ```text
@@ -62,30 +62,17 @@ impl OptimizerRule for EliminateDistinct {
 
 /// Give the `AiNode` under each `DISTINCT` a fetch of one row per value
 /// of the `DISTINCT` columns, as the module explains.
-#[derive(Debug, Default)]
-pub struct PushDownDistinct;
-
-impl OptimizerRule for PushDownDistinct {
-    fn name(&self) -> &str {
-        "push_down_distinct"
-    }
-
-    fn rewrite(
-        &self,
-        plan: LogicalPlan,
-        _config: &dyn OptimizerConfig,
-    ) -> Result<Transformed<LogicalPlan>> {
-        plan.transform_up(|node| {
-            let Some(input) = distinct_input(&node) else {
-                return Ok(Transformed::no(node));
-            };
-            let Some(keyed) = with_per_key_fetch(input)? else {
-                return Ok(Transformed::no(node));
-            };
-            let rebuilt = node.with_new_exprs(node.expressions(), vec![keyed])?;
-            Ok(Transformed::yes(rebuilt))
-        })
-    }
+pub(super) fn distinct_fetches(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
+    plan.transform_up(|node| {
+        let Some(input) = distinct_input(&node) else {
+            return Ok(Transformed::no(node));
+        };
+        let Some(keyed) = with_per_key_fetch(input)? else {
+            return Ok(Transformed::no(node));
+        };
+        let rebuilt = node.with_new_exprs(node.expressions(), vec![keyed])?;
+        Ok(Transformed::yes(rebuilt))
+    })
 }
 
 /// Whether an `Aggregate` is a `DISTINCT`: it groups by each of its
