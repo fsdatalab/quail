@@ -249,6 +249,32 @@ def test_a_negated_ai_filter_runs_in_one_model_region(shape):
         session.close()
 
 
+@pytest.mark.parametrize("join,kept", [
+    ("r LEFT JOIN u ON r.id = u.id", [("r0", None), ("r2", "y")]),
+    ("u RIGHT JOIN r ON r.id = u.id", [("r0", None), ("r2", "y")]),
+])
+def test_an_ai_filter_runs_below_an_outer_join_on_the_side_it_keeps(join, kept):
+    session = quail.Session(CONFIG, tokenizer=TOKENIZER)
+    oracle = Oracle(filters={"r": {"q1:": [1, 0, 1, 0]}})
+    oracle.catalog = session.catalog
+    context = quail.SessionContext(session, physical_executor=oracle_executor(oracle))
+    context.register("r", quail.DocumentProvider.from_table(R, id_col="id"))
+    context.register("u", quail.DocumentProvider.from_table(U, id_col="id"))
+    query = f"SELECT r.id, u.name FROM {join} WHERE {PREDICATE}"
+    try:
+        plans = context.sql("EXPLAIN " + query)
+        physical = plans.column("plan").to_pylist()[
+            plans.column("plan_type").to_pylist().index("physical_plan")]
+        # the model reads the table's rows, not the joined rows DataFusion computes
+        assert "ModelRegionExec" in physical and "SharedInputExec" not in physical
+        table = context.sql(query)
+        rows = list(zip(*(column.to_pylist() for column in table.columns)))
+        assert sorted(rows, key=repr) == sorted(kept, key=repr)
+        assert sorted(oracle.asked) == [("r", row) for row in range(4)]
+    finally:
+        session.close()
+
+
 def test_a_limit_over_an_or_filter_stays_above_the_region():
     session = quail.Session(CONFIG, tokenizer=TOKENIZER)
     oracle = Oracle(filters={"r": {"q1:": [1, 0, 1, 0]}})

@@ -10,7 +10,9 @@
 //!   would limit different rows.
 //! - An AI filter or AI column of one table, and a test of one table's
 //!   answers, move through joins, AI joins, other filters, windows, and
-//!   projections that only pass columns, down to the table.
+//!   projections that only pass columns, down to the table. Through an
+//!   outer, semi, or anti join they move only on the side whose rows
+//!   the join returns ([`preserved_sides`]).
 //! - An AI join or `EXISTS` gate, and an AI column of joined rows, move
 //!   to the lowest join whose inputs hold every table they read; a
 //!   classification of joined rows stays above the AI join of the same
@@ -28,7 +30,7 @@ use std::sync::Arc;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, Result};
 use datafusion::logical_expr::utils::{conjunction, split_conjunction};
-use datafusion::logical_expr::{Expr, Filter, LogicalPlan, Projection};
+use datafusion::logical_expr::{Expr, Filter, JoinType, LogicalPlan, Projection};
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
 use crate::ai::{AiNode, Semantics};
@@ -223,6 +225,27 @@ fn join_sides(plan: &LogicalPlan) -> Option<(BTreeSet<String>, BTreeSet<String>)
     }
 }
 
+/// Whether a join returns every row of its left and of its right input
+/// that its condition does not drop for the other side's sake: the
+/// sides a filter or column of that side alone moves below. It is
+/// DataFusion's `lr_is_preserved` (`push_down_filter.rs`), which
+/// `PushDownFilter` uses for a plain filter and does not export.
+///
+/// An outer join adds rows of NULLs for its other side, where a node
+/// above the join would read a NULL document, so nothing moves there.
+fn preserved_sides(join_type: JoinType) -> (bool, bool) {
+    match join_type {
+        JoinType::Inner => (true, true),
+        JoinType::Left | JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark => {
+            (true, false)
+        }
+        JoinType::Right | JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark => {
+            (false, true)
+        }
+        JoinType::Full => (false, false),
+    }
+}
+
 /// Move `node` one operator down when its input does not need it above.
 fn push_down(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     let Some(moving) = mover(&node) else {
@@ -238,71 +261,71 @@ fn push_down(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
             .iter()
             .any(|expr| !expr_answers(expr).is_disjoint(&moving.added))
     };
-    let moved = match &input {
-        LogicalPlan::Join(join) if join.join_type == datafusion::logical_expr::JoinType::Inner => {
-            let (left, right) = (plan_tables(&join.left), plan_tables(&join.right));
-            if moving.tables.is_subset(&left) {
-                let below = with_input(&node, join.left.as_ref().clone())?;
-                Some(input.with_new_exprs(
-                    input.expressions(),
-                    vec![below, join.right.as_ref().clone()],
-                )?)
-            } else if moving.tables.is_subset(&right) {
-                let below = with_input(&node, join.right.as_ref().clone())?;
-                Some(
-                    input.with_new_exprs(
+    let moved =
+        match &input {
+            LogicalPlan::Join(join) => {
+                let (left, right) = (plan_tables(&join.left), plan_tables(&join.right));
+                let (keeps_left, keeps_right) = preserved_sides(join.join_type);
+                if keeps_left && moving.tables.is_subset(&left) {
+                    let below = with_input(&node, join.left.as_ref().clone())?;
+                    Some(input.with_new_exprs(
+                        input.expressions(),
+                        vec![below, join.right.as_ref().clone()],
+                    )?)
+                } else if keeps_right && moving.tables.is_subset(&right) {
+                    let below = with_input(&node, join.right.as_ref().clone())?;
+                    Some(input.with_new_exprs(
                         input.expressions(),
                         vec![join.left.as_ref().clone(), below],
-                    )?,
-                )
-            } else {
-                None
+                    )?)
+                } else {
+                    None
+                }
             }
-        }
-        LogicalPlan::Extension(_) if ai_join(&input).is_some() => {
-            let join = ai_join(&input).expect("an AI join");
-            let sides = join_sides(&join.input);
-            let fits = sides.is_some_and(|(left, right)| {
-                moving.tables.is_subset(&left) || moving.tables.is_subset(&right)
-            });
-            // a classification of joined rows reads the pairs the join keeps
-            let same_pair = moving.pairs && expr_tables(&join.call, &[]) == moving.tables;
-            if fits && !same_pair {
-                let below = with_input(&node, join.input.as_ref().clone())?;
-                Some(with_input(&input, below)?)
-            } else {
-                None
+            LogicalPlan::Extension(_) if ai_join(&input).is_some() => {
+                let join = ai_join(&input).expect("an AI join");
+                let sides = join_sides(&join.input);
+                let fits = sides.is_some_and(|(left, right)| {
+                    moving.tables.is_subset(&left) || moving.tables.is_subset(&right)
+                });
+                // a classification of joined rows reads the pairs the join keeps
+                let same_pair = moving.pairs && expr_tables(&join.call, &[]) == moving.tables;
+                if fits && !same_pair {
+                    let below = with_input(&node, join.input.as_ref().clone())?;
+                    Some(with_input(&input, below)?)
+                } else {
+                    None
+                }
             }
-        }
-        LogicalPlan::Filter(filter) => {
-            let answers = plan_answers(&filter.input);
-            let below_tables = expr_tables(&filter.predicate, &answers);
-            // a test of the same table's answers belongs to the table's stack
-            if reads_added(&input) || (!moving.pairs && below_tables == moving.tables) {
-                None
-            } else {
-                let below = with_input(&node, filter.input.as_ref().clone())?;
-                Some(with_input(&input, below)?)
+            LogicalPlan::Filter(filter) => {
+                let answers = plan_answers(&filter.input);
+                let below_tables = expr_tables(&filter.predicate, &answers);
+                // a test of the same table's answers belongs to the table's stack
+                if reads_added(&input) || (!moving.pairs && below_tables == moving.tables) {
+                    None
+                } else {
+                    let below = with_input(&node, filter.input.as_ref().clone())?;
+                    Some(with_input(&input, below)?)
+                }
             }
-        }
-        LogicalPlan::Projection(projection)
-            if projection
-                .expr
-                .iter()
-                .all(|expr| matches!(expr, Expr::Column(_))) =>
-        {
-            let below = with_input(&node, projection.input.as_ref().clone())?;
-            let mut exprs = projection.expr.clone();
-            for name in &moving.added {
-                exprs.push(Expr::Column(Column::from_name(name.clone())));
+            LogicalPlan::Projection(projection)
+                if projection
+                    .expr
+                    .iter()
+                    .all(|expr| matches!(expr, Expr::Column(_))) =>
+            {
+                let below = with_input(&node, projection.input.as_ref().clone())?;
+                let mut exprs = projection.expr.clone();
+                for name in &moving.added {
+                    exprs.push(Expr::Column(Column::from_name(name.clone())));
+                }
+                Some(LogicalPlan::Projection(Projection::try_new(
+                    exprs,
+                    Arc::new(below),
+                )?))
             }
-            Some(LogicalPlan::Projection(Projection::try_new(
-                exprs,
-                Arc::new(below),
-            )?))
-        }
-        _ => None,
-    };
+            _ => None,
+        };
     Ok(match moved {
         Some(plan) => Transformed::new(plan, true, TreeNodeRecursion::Stop),
         None => Transformed::no(node),
