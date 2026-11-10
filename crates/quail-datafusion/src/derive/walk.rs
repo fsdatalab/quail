@@ -106,8 +106,6 @@ pub(super) struct Visit<'a> {
     pub(super) inputs: Vec<usize>,
     /// The id of the operator it is the input of.
     pub(super) parent: Option<usize>,
-    /// The ids of the operators above it, outermost first.
-    pub(super) ancestors: Vec<usize>,
     /// The aliases of the tables it reads, in scan order.
     pub(super) tables: Vec<String>,
     /// Whether an AI join or gate is at or below it.
@@ -122,8 +120,6 @@ pub(super) struct Walk<'a> {
     /// The ids, children first.
     order: Vec<usize>,
     pub(super) tables: Vec<Table>,
-    /// The ids of the operators being visited, outermost first.
-    stack: Vec<usize>,
     /// (alias, its columns' expressions) of each derived table the
     /// binder merges into the query that reads it.
     merged: Vec<(String, Vec<(String, Expr)>)>,
@@ -135,7 +131,6 @@ impl<'a> Walk<'a> {
     pub(super) fn visit(&mut self, plan: &'a LogicalPlan) -> usize {
         let id = self.visits.len();
         self.visits.push(None);
-        self.stack.push(id);
         let (kind, inputs) = match plan {
             LogicalPlan::Projection(projection) => {
                 (Kind::PassThrough, vec![self.visit(&projection.input)])
@@ -176,7 +171,6 @@ impl<'a> Walk<'a> {
                 }
             },
         };
-        self.stack.pop();
         for input in &inputs {
             if let Some(visit) = self.visits[*input].as_mut() {
                 visit.parent = Some(id);
@@ -218,7 +212,6 @@ impl<'a> Walk<'a> {
             kind,
             inputs,
             parent: None,
-            ancestors: self.stack.clone(),
             tables,
             ai_join,
         });

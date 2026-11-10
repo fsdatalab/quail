@@ -1,7 +1,7 @@
-//! Name column operators and place conditions where their columns exist.
-//! Put tests of answers on each table's operator stack.
+//! Place conditions where their columns exist: at a table's scan, after
+//! the column operator whose answer they read, or on the result rows.
 
-use super::assemble::{Assembly, StackItem};
+use super::assemble::Assembly;
 use super::binding::{Binder, check_labels};
 use super::relation::{JoinSpec, Relation, check_calls, check_joins};
 use super::walk::Walk;
@@ -166,43 +166,34 @@ impl<'w, 'a> Assembly<'w, 'a> {
             joins,
             conditions,
             found: Operators::default(),
-            stacks: Vec::new(),
+            placed: Vec::new(),
             noted: Vec::new(),
-            join_on: BTreeMap::new(),
-            columns_at: BTreeMap::new(),
         })
     }
-    /// Each table's tests of answers, on its stack, and the operators'
-    /// column filters.
+    /// Each table's tests of answers, as its operators' column filters:
+    /// a test follows the last column operator whose answer it reads.
     pub(super) fn place_tests(&mut self) -> Option<()> {
-        let mut stacks = std::mem::take(&mut self.stacks);
-        for (alias, stack) in &mut stacks {
-            for (index, term) in lookup(&self.conditions.computed, alias).iter().enumerate() {
-                let position = self.test_position(stack, &term.condition);
-                stack.insert(position, StackItem::Test(index));
-                note(&mut self.noted, alias);
+        for scan in &self.found.scans {
+            if !lookup(&self.conditions.computed, &scan.alias).is_empty() {
+                note(&mut self.noted, &scan.alias);
             }
         }
         for alias in &self.noted {
-            let stack = lookup(&stacks, alias);
             let computed = lookup(&self.conditions.computed, alias);
             let mut tests: Vec<(usize, &SemanticColumn)> = Vec::new();
-            for (at, item) in stack.iter().enumerate() {
-                let StackItem::Test(index) = item else {
-                    continue;
-                };
-                let read = condition_columns(&computed[*index].condition);
-                let producer = stack[..at].iter().rev().find_map(|below| match below {
-                    StackItem::Column(kind, position) => {
-                        let column = self.column(kind, *position);
-                        let adds = column.added_columns();
-                        adds.iter()
+            for (index, term) in computed.iter().enumerate() {
+                let read = condition_columns(&term.condition);
+                let producer = lookup(&self.placed, alias)
+                    .iter()
+                    .rev()
+                    .map(|(kind, position)| self.column(kind, *position))
+                    .find(|column| {
+                        column
+                            .added_columns()
+                            .iter()
                             .any(|name| read.contains(name))
-                            .then_some(column)
-                    }
-                    _ => None,
-                })?;
-                tests.push((*index, producer));
+                    })?;
+                tests.push((index, producer));
             }
             if tests.is_empty() {
                 continue;
@@ -226,61 +217,6 @@ impl<'w, 'a> Assembly<'w, 'a> {
                 .column_filters
                 .push((alias.clone(), column_tests));
         }
-        self.stacks = stacks;
         Some(())
-    }
-
-    /// Where on a stack a test of answers goes: right above the lowest
-    /// operator after which every answer column it reads is added, and
-    /// above the tests placed before it; a test that reads no answer
-    /// column goes right above the first extraction, SAE feature, or map.
-    fn test_position(&self, stack: &[StackItem], condition: &ValueExpression) -> usize {
-        let reads: BTreeSet<String> = condition_columns(condition)
-            .into_iter()
-            .filter(|column| self.stack_columns(stack).contains(column))
-            .collect();
-        let mut top = stack.len();
-        while let Some(StackItem::Column(..)) = top.checked_sub(1).map(|at| &stack[at]) {
-            let below = &stack[..top - 1];
-            let descends = if reads.is_empty() {
-                self.has_answer_column(below)
-            } else {
-                reads.is_subset(&self.stack_columns(below))
-            };
-            if !descends {
-                break;
-            }
-            top -= 1;
-        }
-        top
-    }
-
-    /// The answer columns the column operators of a stack add, down to its
-    /// AI filters.
-    fn stack_columns(&self, stack: &[StackItem]) -> BTreeSet<String> {
-        let mut found = BTreeSet::new();
-        for item in stack.iter().rev() {
-            match item {
-                StackItem::Column(kind, position) => {
-                    found.extend(self.column(kind, *position).added_columns());
-                }
-                StackItem::Test(_) => {}
-                StackItem::Filters => break,
-            }
-        }
-        found
-    }
-
-    /// Whether the top of a stack, or an operator below it, is an
-    /// extraction, SAE feature, or map column.
-    fn has_answer_column(&self, stack: &[StackItem]) -> bool {
-        for item in stack.iter().rev() {
-            match item {
-                StackItem::Column(kind, _) if *kind != "label" => return true,
-                StackItem::Filters => return false,
-                _ => {}
-            }
-        }
-        false
     }
 }

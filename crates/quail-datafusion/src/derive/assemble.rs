@@ -12,21 +12,8 @@ use quail_planner::expressions::{
     asked_call, asked_refs, call_aliases, call_refs, column_references, equality_refs, value_refs,
 };
 use quail_planner::operators::{Operators, Scan, SemanticColumn, SemanticJoin, source_columns};
-use quail_planner::physical::{
-    ColumnRef, Equality, FilterPredicate, ModelCall, Projected, ValueExpression,
-};
+use quail_planner::physical::{ColumnRef, FilterPredicate, ModelCall, Projected, ValueExpression};
 use std::collections::{BTreeMap, BTreeSet};
-
-/// One operator on a table's stack, lowest first.
-#[derive(Debug, Clone)]
-pub(super) enum StackItem {
-    /// The table's AI filters.
-    Filters,
-    /// A column operator: its kind and position in its list.
-    Column(&'static str, usize),
-    /// A test of answers: its position in the table's tests.
-    Test(usize),
-}
 
 /// The region's operators: the bound terms, named, and placed where the
 /// plan holds them.
@@ -39,14 +26,11 @@ pub(super) struct Assembly<'w, 'a> {
     pub(super) joins: BTreeMap<usize, JoinSpec>,
     pub(super) conditions: PlacedConditions,
     pub(super) found: Operators,
-    /// Each table's stack, by alias, in scan order.
-    pub(super) stacks: ByAlias<StackItem>,
+    /// alias -> the column operators of that table, as (kind, position
+    /// in its list), in the plan's order.
+    pub(super) placed: ByAlias<(&'static str, usize)>,
     /// The aliases whose AI filters or tests are placed, in order.
     pub(super) noted: Vec<String>,
-    /// The ON equalities placed on each join's id.
-    pub(super) join_on: BTreeMap<usize, Vec<Equality>>,
-    /// The column operators placed at each AI column's id: (kind, position).
-    pub(super) columns_at: BTreeMap<usize, Vec<(&'static str, usize)>>,
 }
 
 impl<'w, 'a> Assembly<'w, 'a> {
@@ -111,7 +95,6 @@ impl<'w, 'a> Assembly<'w, 'a> {
                         predicates: lookup(&self.conditions.scans, alias).to_vec(),
                         ..self.binder.scan(alias)
                     });
-                    self.stacks.push((alias.clone(), Vec::new()));
                 }
                 Kind::Ai(node) if node.is_predicate() || node.semantics != Semantics::Rows => {
                     if !self.is_table_filter(id) {
@@ -177,7 +160,6 @@ impl<'w, 'a> Assembly<'w, 'a> {
             }
         }
         note(&mut self.noted, &alias);
-        push(&mut self.stacks, &alias, StackItem::Filters);
         Some(())
     }
 
@@ -194,7 +176,6 @@ impl<'w, 'a> Assembly<'w, 'a> {
             Kind::Join(_) => spec.on.clone(),
             _ => Vec::new(),
         };
-        self.join_on.insert(input, on.clone());
         let mut outer = input;
         while let Kind::Join(_) = &self.walk.get(outer).kind {
             outer = self.input(outer, 0)?;
@@ -259,7 +240,7 @@ impl<'w, 'a> Assembly<'w, 'a> {
                 below = self.walk.get(below).inputs[0];
             }
             let above_joins = self.walk.get(below).ai_join;
-            for (at, found) in run {
+            for (_, found) in run {
                 let guard = self.bound_guard(found)?;
                 let (_, columns) = self.bound_columns(found)?;
                 for (call, name) in columns {
@@ -273,11 +254,6 @@ impl<'w, 'a> Assembly<'w, 'a> {
                             .as_ref()
                             .map(|found| crate::rules::guards::guard_selectivity(found, &[])),
                     });
-                    let position = self.found.classifies.len() - 1;
-                    self.columns_at
-                        .entry(at)
-                        .or_default()
-                        .push(("label", position));
                 }
             }
             return Some(());
@@ -299,11 +275,7 @@ impl<'w, 'a> Assembly<'w, 'a> {
                     .map(|found| crate::rules::guards::guard_selectivity(found, &[])),
             });
             let position = list.len() - 1;
-            self.columns_at
-                .entry(id)
-                .or_default()
-                .push((kind, position));
-            push(&mut self.stacks, &alias, StackItem::Column(kind, position));
+            push(&mut self.placed, &alias, (kind, position));
         }
         Some(())
     }
@@ -328,216 +300,117 @@ impl<'w, 'a> Assembly<'w, 'a> {
     }
 }
 
-/// The columns each table's operators read, by alias, in first use
-/// order, as Quail's scans load them.
-#[derive(Default)]
-struct Needed {
-    by_alias: BTreeMap<String, Vec<String>>,
-}
-
-impl Needed {
-    fn add(&mut self, references: Vec<ColumnRef>) {
-        for reference in references {
-            let columns = self.by_alias.entry(reference.alias).or_default();
-            if !columns.contains(&reference.column) {
-                columns.push(reference.column);
-            }
-        }
-    }
-
-    fn remove(&mut self, alias: &str, added: &[String]) {
-        if let Some(columns) = self.by_alias.get_mut(alias) {
-            columns.retain(|name| !added.contains(name));
-        }
-    }
-}
-
-/// Each scan's columns: the column values the operators above it read,
-/// nearest the result first.
-pub(super) fn push_down_columns(
-    found: &mut Operators,
-    walk: &Walk<'_>,
-    assembly: &Assembly<'_, '_>,
-) {
-    // a guard may read an earlier AI filter's answer, which no table holds
-    let unread = found.clone();
-    let answers = unread.filter_answers();
-    let mut valued: BTreeSet<(String, String)> = BTreeSet::new();
-    let mut top = Needed::default();
-    for column in &found.projection.columns {
-        if let Projected::Expression(expression) = column {
-            top.add(value_refs(expression));
-        }
-    }
-    let mut value = |references: Vec<ColumnRef>| {
-        for reference in references {
-            valued.insert((reference.alias, reference.column));
-        }
-    };
-    // the columns the region returns or computes
-    for column in &found.projection.columns {
-        if let Projected::Expression(expression) = column {
-            value(value_refs(expression));
-        }
-    }
-    for on in assembly.join_on.values() {
-        for equality in on {
-            value(equality_refs(equality));
-        }
-    }
-    for scan in &found.scans {
-        for predicate in &scan.predicates {
-            value(column_references(predicate));
-        }
-    }
-    for column in found.extracts.iter().chain(&found.maps) {
-        value(call_refs(&column.call));
-    }
-    let guards: Vec<ColumnRef> = found
+/// Set each scan's columns: the values of its table that the region's
+/// operators read, the SELECT list's first, then each join's, column
+/// operator's, test's, and filter's.
+///
+/// A scan loads its document column as a value only when an operator
+/// reads the value, not only its tokens.
+pub(super) fn set_scan_columns(found: &mut Operators) {
+    // an AI filter's answer and a column operator's columns are computed,
+    // not loaded
+    let read = found.clone();
+    let answers = read.filter_answers();
+    let added: BTreeSet<String> = read
+        .columns()
+        .flat_map(|column| column.added_columns())
+        .collect();
+    let guards: Vec<ColumnRef> = read
         .columns()
         .filter_map(|column| column.guard.as_ref())
-        .chain(found.filters.iter().flat_map(|(_, predicates)| {
+        .chain(read.filters.iter().flat_map(|(_, predicates)| {
             predicates
                 .iter()
                 .flat_map(|predicate| predicate.guard.iter().chain(&predicate.alternative))
         }))
         .flat_map(column_references)
-        .filter(|reference| {
-            !answers.contains(&(reference.alias.as_str(), reference.column.as_str()))
+        .collect();
+    let selected: Vec<ColumnRef> = read
+        .projection
+        .columns
+        .iter()
+        .filter_map(|column| match column {
+            Projected::Expression(expression) => Some(value_refs(expression)),
+            Projected::Name(_) => None,
         })
+        .flatten()
         .collect();
-    value(guards.clone());
-    let scan_ids: Vec<usize> = walk
-        .ids()
-        .filter(|id| matches!(walk.get(*id).kind, Kind::Scan(_)))
-        .collect();
-    for (index, scan_id) in scan_ids.iter().enumerate() {
-        let alias = found.scans[index].alias.clone();
-        let stack = &assembly.stacks[index].1;
-        let mut needed = Needed {
-            by_alias: top.by_alias.clone(),
-        };
-        let ancestors = &walk.get(*scan_id).ancestors;
-        let mut joined_run: Vec<SemanticColumn> = Vec::new();
-        let flush = |needed: &mut Needed, run: &mut Vec<SemanticColumn>| {
-            for column in run.drain(..).rev() {
-                needed.add(call_refs(&column.call));
-                let owner = call_aliases(&column.call)
-                    .into_iter()
-                    .next()
-                    .unwrap_or_default();
-                needed.remove(&owner, &column.added_columns());
-            }
-        };
-        for id in ancestors {
-            if *id == *scan_id {
-                continue;
-            }
-            let visit = walk.get(*id);
-            let on_stack = match &visit.kind {
-                Kind::Ai(node) => {
-                    let tables = walk.call_tables(&node.call);
-                    tables.len() < 2 && tables.contains(&alias) && node.semantics == Semantics::Rows
-                }
-                _ => false,
-            };
-            if on_stack {
-                continue;
-            }
-            if let Some(columns) = assembly.columns_at.get(id)
-                && walk
-                    .call_tables(match &visit.kind {
-                        Kind::Ai(node) => &node.call,
-                        _ => unreachable!("a column at an AI node"),
-                    })
-                    .len()
-                    == 2
-            {
-                for (kind, position) in columns {
-                    joined_run.push(assembly.column(kind, *position).clone());
-                }
-                continue;
-            }
-            flush(&mut needed, &mut joined_run);
-            if let Some(spec) = assembly.joins.get(id) {
-                needed.add(asked_refs(&spec.predicate));
-            }
-            if let Some(on) = assembly.join_on.get(id) {
-                for equality in on {
-                    needed.add(equality_refs(equality));
-                }
-            }
-            if let Some(columns) = assembly.columns_at.get(id) {
-                for (kind, position) in columns.iter().rev() {
-                    let column = assembly.column(kind, *position).clone();
-                    needed.add(call_refs(&column.call));
-                    let owner = call_aliases(&column.call)
-                        .into_iter()
-                        .next()
-                        .unwrap_or_default();
-                    needed.remove(&owner, &column.added_columns());
-                }
-            }
+    // the references that read a column's value
+    let mut valued: Vec<ColumnRef> = selected.clone();
+    valued.extend(
+        read.joins
+            .iter()
+            .flat_map(|join| &join.on)
+            .flat_map(equality_refs),
+    );
+    valued.extend(
+        read.scans
+            .iter()
+            .flat_map(|scan| &scan.predicates)
+            .flat_map(column_references),
+    );
+    valued.extend(
+        read.extracts
+            .iter()
+            .chain(&read.maps)
+            .flat_map(|column| call_refs(&column.call)),
+    );
+    valued.extend(guards.iter().cloned());
+    let mut needed: Vec<ColumnRef> = selected;
+    for join in read.joins.iter().rev() {
+        needed.extend(asked_refs(&join.predicate));
+        needed.extend(join.on.iter().flat_map(equality_refs));
+    }
+    let columns: Vec<&SemanticColumn> = read.columns().collect();
+    needed.extend(
+        read.column_filters
+            .iter()
+            .flat_map(|(_, tests)| tests)
+            .flat_map(|test| column_references(&test.condition)),
+    );
+    needed.extend(
+        columns
+            .iter()
+            .rev()
+            .flat_map(|column| call_refs(&column.call)),
+    );
+    for (_, predicates) in &read.filters {
+        for predicate in predicates {
+            needed.extend(asked_refs(&predicate.expression));
         }
-        flush(&mut needed, &mut joined_run);
-        let computed = lookup(&assembly.conditions.computed, &alias);
-        for item in stack.iter().rev() {
-            match item {
-                StackItem::Filters => {
-                    if let Some((_, predicates)) =
-                        found.filters.iter().find(|(found, _)| *found == alias)
-                    {
-                        for predicate in predicates {
-                            needed.add(asked_refs(&predicate.expression));
-                        }
-                    }
-                }
-                StackItem::Column(kind, position) => {
-                    let column = assembly.column(kind, *position).clone();
-                    needed.add(call_refs(&column.call));
-                    needed.remove(&alias, &column.added_columns());
-                }
-                StackItem::Test(index) => {
-                    needed.add(column_references(&computed[*index].condition));
-                }
-            }
-        }
-        let scan = &found.scans[index];
-        for predicate in &scan.predicates {
-            needed.add(column_references(predicate));
-        }
-        // a per-key fetch groups the documents by its key's values
-        if let Some(key) = found.stop_keys.get(&alias) {
-            let columns = needed.by_alias.entry(alias.clone()).or_default();
-            for column in key {
-                if !columns.contains(column) {
-                    columns.push(column.clone());
-                }
-            }
-        }
-        // a guard reads its columns' values where its operator runs
-        for reference in guards.iter().filter(|reference| reference.alias == alias) {
-            let columns = needed.by_alias.entry(alias.clone()).or_default();
-            if !columns.contains(&reference.column) {
-                columns.push(reference.column.clone());
-            }
-        }
+    }
+    for scan in &mut found.scans {
+        let alias = scan.alias.clone();
         let sources = source_columns(&scan.column);
-        let columns: Vec<String> = needed
-            .by_alias
-            .get(&alias)
-            .map(|columns| {
-                columns
+        let mut names: Vec<String> = Vec::new();
+        let references = needed
+            .iter()
+            .chain(
+                scan.predicates
                     .iter()
-                    .filter(|column| {
-                        !answers.contains(&(alias.as_str(), column.as_str()))
-                            && (!sources.contains(column)
-                                || valued.contains(&(alias.clone(), (*column).clone())))
-                    })
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default();
-        found.scans[index].columns = columns;
+                    .flat_map(column_references)
+                    .collect::<Vec<_>>()
+                    .iter(),
+            )
+            .filter(|reference| reference.alias == alias)
+            .map(|reference| reference.column.clone())
+            .collect::<Vec<_>>();
+        let keys = read.stop_keys.get(&alias).cloned().unwrap_or_default();
+        let guarded = guards
+            .iter()
+            .filter(|reference| reference.alias == alias)
+            .map(|reference| reference.column.clone());
+        for name in references.into_iter().chain(keys).chain(guarded) {
+            let computed =
+                added.contains(&name) || answers.contains(&(alias.as_str(), name.as_str()));
+            let loaded = !sources.contains(&name)
+                || valued
+                    .iter()
+                    .any(|reference| reference.alias == alias && reference.column == name);
+            if !computed && loaded && !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        scan.columns = names;
     }
 }

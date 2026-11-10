@@ -45,7 +45,7 @@ use quail_planner::operators::{Operators, Projection};
 use quail_planner::physical::Projected;
 use quail_planner::prompts::Turn;
 
-use self::assemble::{Assembly, push_down_columns};
+use self::assemble::{Assembly, set_scan_columns};
 use self::binding::{Binder, Selected, output_name, unsupported};
 use self::relation::Relation;
 use self::walk::{Walk, read_fetch, read_top, with_select_list};
@@ -266,7 +266,7 @@ fn derive_operators(
     if found.fetch.is_some_and(|limit| limit <= 0) {
         return unsupported("DataFusion must apply a non-positive LIMIT outside the model region.");
     }
-    push_down_columns(&mut found, &walk, &assembly);
+    set_scan_columns(&mut found);
     Ok(found)
 }
 
