@@ -4,9 +4,8 @@
 //! `AiNode` included, with Quail's rules among them. [`default_rule_names`]
 //! gives the default order: DataFusion's default rules, with Quail's thirteen
 //! before `replace_distinct_aggregate`, which turns a `DISTINCT` into a
-//! GROUP BY. Then
-//! [`crate::ClaimModelRegions`] runs last: it runs the listed rules
-//! until the plan stops changing, then claims the model regions.
+//! GROUP BY. [`crate::claim_model_regions`] claims the model regions of
+//! the plan the optimizer leaves, before physical planning.
 //!
 //! Each `AiNode` tells DataFusion's rules what they may do around it:
 //! which filters may move below it and which columns it reads (see
@@ -136,20 +135,16 @@ pub fn logical_rule(name: &str) -> Result<Arc<dyn OptimizerRule + Send + Sync>> 
     }
 }
 
-/// The rules named `names`, in order, then [`crate::ClaimModelRegions`].
+/// The rules named `names`, in order.
 ///
 /// # Errors
 ///
-/// A name is unknown, or names the claim, which always runs last.
+/// A name is unknown.
 pub fn logical_rules(names: &[String]) -> Result<Vec<Arc<dyn OptimizerRule + Send + Sync>>> {
     let mut rules = Vec::new();
     for name in names {
-        if name == crate::region::claim::CLAIM_RULE {
-            return plan_err!("{name} always runs last; leave it out of the list");
-        }
         rules.push(logical_rule(name)?);
     }
-    rules.push(Arc::new(crate::ClaimModelRegions::new(rules.clone())));
     Ok(rules)
 }
 
@@ -165,9 +160,9 @@ pub(crate) fn with_quail_rules(
             .iter()
             .map(|name| quail_rule(name).expect("a rule of Quail's"))
     };
-    let kept = existing.iter().filter(|rule| {
-        !QUAIL_RULES.contains(&rule.name()) && rule.name() != crate::region::claim::CLAIM_RULE
-    });
+    let kept = existing
+        .iter()
+        .filter(|rule| !QUAIL_RULES.contains(&rule.name()));
     let mut rules: Vec<Arc<dyn OptimizerRule + Send + Sync>> = Vec::new();
     let mut placed = false;
     for rule in kept {
@@ -180,19 +175,16 @@ pub(crate) fn with_quail_rules(
     if !placed {
         rules.splice(0..0, quail());
     }
-    rules.push(Arc::new(crate::ClaimModelRegions::new(rules.clone())));
     rules
 }
 
 /// The default rules without the claim, which a trial of a model region
 /// runs over its operators.
 pub(crate) fn default_rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
-    let mut rules = with_quail_rules(&Optimizer::new().rules);
-    rules.pop();
-    rules
+    with_quail_rules(&Optimizer::new().rules)
 }
 
-/// The default logical optimizer rule names, without the final region claim.
+/// The default logical optimizer rule names.
 pub fn default_rule_names() -> Vec<String> {
     default_rules()
         .iter()
@@ -208,10 +200,6 @@ mod tests {
     fn the_default_rules_are_datafusions_with_quails_before_replacing_distinct() {
         let names = default_rule_names();
         assert_eq!(names, EXPECTED_DEFAULT_RULES);
-        let rules = logical_rules(&names).unwrap();
-        assert_eq!(
-            rules.last().unwrap().name(),
-            crate::region::claim::CLAIM_RULE
-        );
+        assert_eq!(logical_rules(&names).unwrap().len(), names.len());
     }
 }

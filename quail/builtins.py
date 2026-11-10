@@ -10,8 +10,7 @@ from quail.extensions import ExtensionRegistry, LogicalRule, PhysicalRule
 from quail.specs import DEVICES, MODELS
 
 # the logical optimizer rules, in order: DataFusion's default rules with
-# Quail's before replace_distinct_aggregate; claim_model_regions always
-# runs after them
+# Quail's before replace_distinct_aggregate
 LOGICAL_RULES = tuple(_quail_native.LOGICAL_RULES)
 # the built-in physical rules, in the order they apply
 PHYSICAL_RULES = tuple(_quail_native.PHYSICAL_RULES)

@@ -73,9 +73,11 @@ model-region rows.
 
 - AI functions under their SQL and internal names.
 - The `lower_ai_calls` analyzer rule before the host's analyzer rules.
-- Quail's logical optimizer rules among DataFusion's, with
-  `claim_model_regions` last.
-- A query planner for `ModelRegionExec` and `SharedInputExec`.
+- Quail's logical optimizer rules among DataFusion's.
+- A query planner that claims model regions from the optimized plan
+  (`claim_model_regions`), then plans `ModelRegionExec` and
+  `SharedInputExec`. A host with its own query planner calls
+  `claim_model_regions` there.
 
 `with_logical_rules()` selects a rule list explicitly. If the host has
 its own `QueryPlanner`, call `register_rules()` to keep it and add

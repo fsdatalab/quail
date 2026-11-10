@@ -484,7 +484,9 @@ impl ExtensionPlanner for ModelRegionPlanner {
     }
 }
 
-/// DataFusion's default query planner, with `ModelRegionPlanner` added.
+/// DataFusion's default query planner, which claims the plan's model
+/// regions ([`crate::claim_model_regions`]) and plans each with
+/// `ModelRegionPlanner`.
 #[derive(Debug)]
 pub struct QuailQueryPlanner {
     runner: Arc<dyn RegionRunner>,
@@ -507,7 +509,8 @@ impl QueryPlanner for QuailQueryPlanner {
         let planner = DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(
             ModelRegionPlanner::new(Arc::clone(&self.runner)),
         )]);
-        planner.create_physical_plan(logical_plan, session).await
+        let claimed = crate::claim_model_regions(logical_plan.clone(), session)?;
+        planner.create_physical_plan(&claimed, session).await
     }
 }
 

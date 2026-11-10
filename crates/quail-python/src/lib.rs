@@ -380,17 +380,19 @@ impl Session {
         })
     }
 
-    /// Return DataFusion's optimized logical plan for a query.
+    /// Return DataFusion's optimized logical plan for a query, with its
+    /// model regions claimed.
     ///
     /// # Errors
     ///
     /// The query does not plan.
     pub fn optimized_plan(&self, query: &str, dialect: Option<&str>) -> Result<LogicalPlan> {
-        self.runtime().block_on(async {
+        let optimized = self.runtime().block_on(async {
             frame(&self.context, query, dialect)
                 .await?
                 .into_optimized_plan()
-        })
+        })?;
+        quail_datafusion::claim_model_regions(optimized, &self.context.state())
     }
 
     /// Return each model region of a query, in plan order.

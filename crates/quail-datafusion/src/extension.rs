@@ -10,7 +10,8 @@
 //! ```
 //!
 //! A host with its own `QueryPlanner` calls [`QuailExtension::register_rules`]
-//! instead and adds [`QuailExtension::extension_planner`] to its planner's
+//! instead. Its planner calls [`crate::claim_model_regions`] on the
+//! optimized plan and has [`QuailExtension::extension_planner`] among its
 //! extension planners.
 
 use std::sync::Arc;
@@ -51,7 +52,7 @@ impl QuailExtension {
     }
 
     /// Run `rules`, names [`crate::logical_rule`] knows, in order, as the
-    /// session's optimizer rules; `ClaimModelRegions` runs after them.
+    /// session's optimizer rules.
     ///
     /// # Errors
     ///
@@ -75,7 +76,8 @@ impl QuailExtension {
     }
 
     /// Add Quail's functions and rules to `state`, keeping its query
-    /// planner; the host adds [`Self::extension_planner`] to it.
+    /// planner; the host's planner calls [`crate::claim_model_regions`]
+    /// and has [`Self::extension_planner`].
     ///
     /// `LowerAiCalls` runs first, on the plan as DataFusion's SQL planner
     /// bound it, before the host's analyzer rules such as type coercion.

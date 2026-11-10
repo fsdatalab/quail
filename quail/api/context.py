@@ -1,9 +1,9 @@
 """Run SQL through DataFusion, with Quail planning each model region.
 
 DataFusion parses, binds, and optimizes the query, each AI call as an
-``AiNode``. Its last rule, ``ClaimModelRegions``, replaces each part of
-the plan that calls an AI function, together with the operators around
-it that Quail plans, with one model region.
+``AiNode``. Quail's query planner then replaces each part of the
+optimized plan that calls an AI function, together with the operators
+around it that Quail plans, with one model region.
 Rust derives each region's operators from DataFusion's plan of it, as
 ``Session.sql`` compiles SQL, and Quail plans and runs them; DataFusion
 runs every operator outside the regions. A region whose shape Quail's

@@ -99,9 +99,10 @@ it cannot pass. See [Runtime filters](/docs/architecture/physical-plans#runtime-
 
 ## Rule order
 
-DataFusion runs logical rules in registration order. `claim_model_regions`
-always runs last. Quail then builds candidate physical plans and applies
-physical rules to each candidate before comparing estimated GPU time.
+DataFusion runs logical rules in registration order. The query planner
+then claims model regions from the optimized plan. Quail builds
+candidate physical plans for each region and applies physical rules to
+each candidate before comparing estimated GPU time.
 
 See [Optimizer](/docs/architecture/optimizer) for the built-in order.
 

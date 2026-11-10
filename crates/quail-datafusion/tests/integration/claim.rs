@@ -62,7 +62,13 @@ fn context() -> Result<SessionContext> {
 }
 
 async fn optimized(context: &SessionContext, query: &str) -> Result<LogicalPlan> {
-    context.sql(query).await?.into_optimized_plan()
+    claimed(context, context.sql(query).await?.into_optimized_plan()?)
+}
+
+/// An optimized plan with its model regions claimed, as the query
+/// planner sees it.
+fn claimed(context: &SessionContext, plan: LogicalPlan) -> Result<LogicalPlan> {
+    quail_datafusion::claim_model_regions(plan, &context.state())
 }
 
 /// Each model region of a plan, each checked to derive its operators.
@@ -192,7 +198,7 @@ async fn datafusion_tests_score_values_with_other_expressions() -> Result<()> {
                 "SELECT r.id FROM reviews r WHERE {predicate} ORDER BY r.id"
             ))
             .await?;
-        let plan = frame.clone().into_optimized_plan()?;
+        let plan = claimed(&context, frame.clone().into_optimized_plan()?)?;
         assert_eq!(regions(&plan).len(), 1, "{}", plan.display_indent());
         frame.create_physical_plan().await?;
     }
@@ -257,7 +263,7 @@ async fn an_unnamed_classification_keeps_its_sql_output_name() -> Result<()> {
         );
         let frame = context.sql(&query).await?;
         let name = frame.schema().field(0).name().clone();
-        let plan = frame.into_optimized_plan()?;
+        let plan = claimed(&context, frame.into_optimized_plan()?)?;
         assert_eq!(plan.schema().field(0).name(), &name);
         let found = regions(&plan);
         assert_eq!(found.len(), 1);
@@ -284,7 +290,7 @@ async fn a_projected_ai_if_returns_a_boolean_without_filtering_rows() -> Result<
         let query = format!("SELECT r.id, {expression} FROM reviews r");
         let frame = context.sql(&query).await?;
         let name = frame.schema().field(1).name().clone();
-        let plan = frame.into_optimized_plan()?;
+        let plan = claimed(&context, frame.into_optimized_plan()?)?;
         assert_eq!(plan.schema().field(1).name(), &name);
         assert_eq!(plan.schema().field(1).data_type(), &DataType::Boolean);
         let found = regions(&plan);

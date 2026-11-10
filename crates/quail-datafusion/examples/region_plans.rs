@@ -64,7 +64,10 @@ async fn main() -> Result<()> {
                 println!("BIND ERROR: {error}");
                 continue;
             }
-            Ok(frame) => frame.into_optimized_plan()?,
+            Ok(frame) => quail_datafusion::claim_model_regions(
+                frame.into_optimized_plan()?,
+                &context.state(),
+            )?,
         };
         plan.apply(|node| {
             if let LogicalPlan::Extension(extension) = node

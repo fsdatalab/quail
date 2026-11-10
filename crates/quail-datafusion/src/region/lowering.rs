@@ -330,7 +330,7 @@ impl Extracted {
             .collect()
     }
 
-    /// Claim the model regions of `plan`, as [`super::claim::ClaimModelRegions`] explains.
+    /// Claim the model regions of `plan`, as [`super::claim::claim_model_regions`] explains.
     ///
     /// `needed` holds the columns the operator above reads from `plan`, or
     /// None when it reads every one.

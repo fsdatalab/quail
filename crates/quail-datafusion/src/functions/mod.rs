@@ -2,7 +2,7 @@
 //!
 //! The UDFs let DataFusion parse, bind, and type a query that calls
 //! the AI functions. They never run: `LowerAiCalls` turns every call
-//! into an `AiNode`, and `ClaimModelRegions` moves each into a model
+//! into an `AiNode`, and `claim_model_regions` moves each into a model
 //! region, which Quail plans and executes.
 
 pub(crate) mod field_access;
@@ -130,7 +130,7 @@ impl ScalarUDFImpl for QuailFunction {
 
     fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         exec_err!(
-            "{} runs only inside a model region; ClaimModelRegions did not claim it",
+            "{} runs only inside a model region; claim_model_regions did not claim it",
             self.name
         )
     }

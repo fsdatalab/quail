@@ -4,13 +4,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use datafusion::catalog::Session;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, Result, ScalarValue, plan_err};
+use datafusion::execution::SessionState;
 use datafusion::logical_expr::{Expr, LogicalPlan, Projection};
-use datafusion::optimizer::{
-    Analyzer, Optimizer, OptimizerConfig, OptimizerContext, OptimizerRule,
-};
+use datafusion::optimizer::{Analyzer, Optimizer, OptimizerContext};
 use quail_planner::error::CompileError;
 
 use super::ModelRegion;
@@ -24,57 +24,56 @@ use crate::functions::is_ai_call;
 
 pub(crate) use super::lowering::lower_regions;
 
-/// The name of [`ClaimModelRegions`], which runs after every other
-/// optimizer rule.
-pub const CLAIM_RULE: &str = "claim_model_regions";
-
-/// Replace each part of the optimized plan that holds `AiNode`s with one
-/// `ModelRegion`, and leave the relational operators above it to
-/// DataFusion, as the module explains.
+/// Replace each part of an optimized plan that holds `AiNode`s with one
+/// `ModelRegion`, leave the relational operators above it to DataFusion,
+/// and optimize what the claim built around the regions.
 ///
-/// DataFusion's optimizer runs each rule once per pass, and a region's
-/// operators are out of the later passes' reach, so the rule first runs
-/// the rules listed before it until the plan stops changing.
+/// `plan` is the plan as the session's optimizer left it: its rules have
+/// moved every filter, limit, and guard they can into the `AiNode`s. A
+/// region hides its operators from DataFusion, so the claim comes after
+/// those rules, not among them: [`crate::QuailQueryPlanner`] calls it
+/// before physical planning, and a host with its own query planner does
+/// the same.
 ///
 /// A region's inputs are the parts DataFusion computes for it: each
 /// table's plain filters, and each CTE or FROM subquery that groups or
-/// windows rows or that the region does not read through.
-#[derive(Debug)]
-pub struct ClaimModelRegions {
-    rules: Vec<Arc<dyn OptimizerRule + Send + Sync>>,
-}
-
-impl ClaimModelRegions {
-    /// The claim after `rules`, the optimizer rules listed before it.
-    pub fn new(rules: Vec<Arc<dyn OptimizerRule + Send + Sync>>) -> Self {
-        Self { rules }
-    }
-}
-
-impl OptimizerRule for ClaimModelRegions {
-    fn name(&self) -> &str {
-        CLAIM_RULE
-    }
-
-    fn rewrite(
-        &self,
-        plan: LogicalPlan,
-        config: &dyn OptimizerConfig,
-    ) -> Result<Transformed<LogicalPlan>> {
-        if !calls_ai(&plan)? {
-            // Fallback columns may already be sealed by the analyzer.
-            let cleaned = number_regions(drop_unread_probabilities(plan.clone())?)?;
-            return Ok(if cleaned == plan {
-                Transformed::no(plan)
-            } else {
-                Transformed::yes(cleaned)
-            });
+/// windows rows or that the region does not read through. The claim
+/// joins a region's answers back to the columns its tables hold, and
+/// the session's optimizer then runs once more, over the regions as
+/// single operators, to prune and place that work.
+///
+/// # Errors
+///
+/// A model call is where no region can run it, or `session` is not
+/// DataFusion's `SessionState`, whose optimizer the claim runs.
+pub fn claim_model_regions(plan: LogicalPlan, session: &dyn Session) -> Result<LogicalPlan> {
+    let Some(state) = session.as_any().downcast_ref::<SessionState>() else {
+        return plan_err!("claiming model regions needs DataFusion's SessionState");
+    };
+    // EXPLAIN holds the plan it explains, which the optimizer left optimized
+    match plan {
+        LogicalPlan::Explain(mut explain) => {
+            explain.plan = Arc::new(claim_model_regions(
+                Arc::unwrap_or_clone(explain.plan),
+                session,
+            )?);
+            return Ok(LogicalPlan::Explain(explain));
         }
-        let optimized =
-            Optimizer::with_rules(self.rules.clone()).optimize(plan, config, |_, _| {})?;
-        let claimed = claim_regions(optimized, None)?;
-        number_regions(drop_unread_probabilities(claimed)?).map(Transformed::yes)
+        LogicalPlan::Analyze(mut analyze) => {
+            analyze.input = Arc::new(claim_model_regions(
+                Arc::unwrap_or_clone(analyze.input),
+                session,
+            )?);
+            return Ok(LogicalPlan::Analyze(analyze));
+        }
+        _ => {}
     }
+    if !calls_ai(&plan)? {
+        // the analyzer has already made a fallback column's region
+        return number_regions(drop_unread_probabilities(plan)?);
+    }
+    let claimed = number_regions(drop_unread_probabilities(claim_regions(plan, None)?)?)?;
+    state.optimize(&claimed)
 }
 
 /// Number occurrences, not plan contents: identical sibling regions still run

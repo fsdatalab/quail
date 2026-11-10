@@ -1,7 +1,7 @@
 //! The operators of a model region's part that DataFusion runs above the
 //! region.
 //!
-//! [`lift_relational`] splits a part [`crate::ClaimModelRegions`] claims
+//! [`lift_relational`] splits a part [`crate::claim_model_regions`] claims
 //! into the region, which runs on the GPU, and the operators above it,
 //! which run in DataFusion on the rows the region returns:
 //!

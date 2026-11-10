@@ -81,7 +81,8 @@ async fn a_host_session_with_quail_runs_ai_functions_in_its_own_sql() -> Result<
     Ok(())
 }
 
-/// A host's own query planner, with Quail's extension planner added.
+/// A host's own query planner: it claims the model regions and has
+/// Quail's extension planner.
 struct HostPlanner {
     extensions: Vec<Arc<dyn ExtensionPlanner + Send + Sync>>,
 }
@@ -99,14 +100,15 @@ impl QueryPlanner for HostPlanner {
         plan: &LogicalPlan,
         state: &dyn Session,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let claimed = quail_datafusion::claim_model_regions(plan.clone(), state)?;
         DefaultPhysicalPlanner::with_extension_planners(self.extensions.clone())
-            .create_physical_plan(plan, state)
+            .create_physical_plan(&claimed, state)
             .await
     }
 }
 
 #[tokio::test]
-async fn a_host_with_its_own_query_planner_adds_quails_extension_planner() -> Result<()> {
+async fn a_host_with_its_own_query_planner_claims_regions_and_adds_quails_planner() -> Result<()> {
     let quail = QuailExtension::new(Arc::new(KeepsFirstReview));
     let state = SessionStateBuilder::new()
         .with_default_features()

@@ -21,8 +21,7 @@ class LogicalRule:
     The name is the rule's ``OptimizerRule::name()``: one of Quail's
     rules or DataFusion's default rules, listed in
     ``quail_datafusion::logical_rule``. A registry lists the rules a
-    session applies, by name, in the order they apply;
-    ``claim_model_regions`` always runs after them.
+    session applies, by name, in the order they apply.
     """
 
     name: str

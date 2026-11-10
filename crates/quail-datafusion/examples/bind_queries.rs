@@ -82,7 +82,10 @@ async fn main() -> Result<()> {
         let id = query["id"].as_str().unwrap();
         let outcome = match context.sql(query["sql"].as_str().unwrap()).await {
             Err(error) => format!("BIND ERROR: {error}"),
-            Ok(frame) => match frame.into_optimized_plan() {
+            Ok(frame) => match frame
+                .into_optimized_plan()
+                .and_then(|plan| quail_datafusion::claim_model_regions(plan, &context.state()))
+            {
                 Err(error) => format!("OPTIMIZE ERROR: {error}"),
                 Ok(plan) => format!(
                     "ok, {} region(s), root is region: {}",

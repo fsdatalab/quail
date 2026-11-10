@@ -11,7 +11,7 @@
 //! | [`functions`] | the AI functions as UDFs, and SQL dialect support |
 //! | [`ai`] | `AiNode`, one AI call as a plan node |
 //! | [`rules`] | `LowerAiCalls` and the optimizer rules around `AiNode`s |
-//! | [`region`] | `ModelRegion`, `ClaimModelRegions`, and `ModelRegionExec` |
+//! | [`region`] | `ModelRegion`, `claim_model_regions`, and `ModelRegionExec` |
 //! | [`derive`] | a region's operators, read from its DataFusion plan |
 //!
 //! ```ignore
@@ -45,7 +45,7 @@ pub use functions::field_access::StructFieldAccess;
 pub use functions::regexps::SnowflakeRegexpLike;
 pub use functions::{AI_FUNCTION_NAMES, SPAN_SUFFIX, is_ai_call, quail_functions};
 pub use region::ModelRegion;
-pub use region::claim::ClaimModelRegions;
+pub use region::claim::claim_model_regions;
 pub use region::exec::{
     InputBatches, InputRows, InputStream, ModelRegionExec, ModelRegionPlanner, RegionBatches,
     RegionRunner, collect_inputs,
@@ -79,8 +79,7 @@ pub fn session_state(runner: Arc<dyn RegionRunner>) -> Result<SessionState> {
 }
 
 /// Build a DataFusion session state with Quail registered, whose
-/// optimizer runs `rules`, names [`logical_rule`] knows, in order, then
-/// [`ClaimModelRegions`].
+/// optimizer runs `rules`, names [`logical_rule`] knows, in order.
 ///
 /// DataFusion's `DATAFUSION_*` environment variables set its options,
 /// such as `DATAFUSION_EXECUTION_TARGET_PARTITIONS`.

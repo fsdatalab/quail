@@ -1,6 +1,6 @@
 //! Model regions: the part of a plan that Quail runs as one unit.
 //!
-//! - `claim`: the `ClaimModelRegions` rule, which cuts each region out
+//! - `claim`: `claim_model_regions`, which cuts each region out
 //!   of the optimized plan.
 //! - `lift`, `join_back`, `shared`: the operators DataFusion keeps above
 //!   a region, and the inputs that a region and its parent both read.
