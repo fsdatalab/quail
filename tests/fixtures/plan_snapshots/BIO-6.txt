@@ -16,8 +16,8 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
                                                                                            est. rows   est. pass   est. time
-  Filter: m.__label_m_0 IN ('cardiac disorders', 'vascular disorders')
-    AiClassify: __label_m_0 over m                                                                                   4.77 ms
+  Filter: m.__quail_column_1 IN ('cardiac disorders', 'vascular disorders')
+    AiClassify: __quail_column_1 over m                                                                              4.77 ms
       rule=trie_decode, labels=26, label tokens=662
       Scan terms as m [1]                                                                          6
         tokens=60, mean_document_tokens=10

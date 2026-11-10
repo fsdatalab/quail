@@ -95,7 +95,7 @@ def test_the_physical_plan_shows_when_a_map_stops_its_answers():
                      quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
     physical = session.sql(f"SELECT r.id FROM reviews r WHERE {VERDICT}").explain()
     session.close()
-    assert ("stops an answer once left(r.__column_r_0, 3) = 'yes' is not TRUE on "
+    assert ("stops an answer once left(r.__quail_column_1, 3) = 'yes' is not TRUE on "
             "its tokens so far, or once every one is TRUE") in physical
 
 

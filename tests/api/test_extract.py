@@ -398,7 +398,7 @@ def test_not_and_or_of_answers_run_after_the_extractions_they_read(session):
     one = session.sql(head + f"NOT ({ends} IS NULL OR {start} < 0)")
     assert placed(one) == [
         ("extraction", "c.lease.ends IS NOT NULL"),
-        ("extraction", "NOT (c.lease.ends_span.start < 0)")]
+        ("extraction", "c.lease.ends_span.start >= 0")]
     one = session.sql(head + f"{ends} IS NULL OR {start} >= 0")
     assert placed(one) == [
         ("extraction", "c.lease.ends IS NULL OR c.lease.ends_span.start >= 0")]
@@ -407,7 +407,7 @@ def test_not_and_or_of_answers_run_after_the_extractions_they_read(session):
     # extraction read, each other column read by document ID
     mixed = session.sql(head + f"NOT ({ends} IS NULL AND c.id = 2)")
     assert placed(mixed) == [
-        ("extraction", "c.lease.ends IS NOT NULL OR NOT (c.id = 2)")]
+        ("extraction", "c.lease.ends IS NOT NULL OR c.id != 2")]
     assert kept(mixed) == [1]
     fields = session.sql(head + f"{ends} = 'x' OR {rent} IS NOT NULL")
     assert placed(fields) == [

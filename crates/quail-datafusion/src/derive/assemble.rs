@@ -37,9 +37,6 @@ pub(super) struct Assembly<'w, 'a> {
     pub(super) filters: ByAlias<FilterPredicate>,
     /// Each AI join and gate, by its node.
     pub(super) joins: BTreeMap<usize, JoinSpec>,
-    /// The call and name of each column operator that SELECT returns or a
-    /// test reads, the first name of a call holding.
-    pub(super) names: Vec<(ModelCall, String)>,
     pub(super) conditions: PlacedConditions,
     pub(super) found: Operators,
     /// Each table's stack, by alias, in scan order.
@@ -221,31 +218,8 @@ impl<'w, 'a> Assembly<'w, 'a> {
     /// extraction's call per field, each with its name.
     fn bound_columns(&mut self, node: &AiNode) -> Option<(&'static str, Vec<(ModelCall, String)>)> {
         let kind = column_call_kind(&node.call)?;
-        let call = self.walk.written(&node.call, &[]);
-        let calls = match kind {
-            "extract" => {
-                let (_, members) = self.binder.bind_ai_extract(&call, &node.answer).ok()?;
-                members
-                    .into_iter()
-                    .map(|member| match member {
-                        ValueExpression::Alias(alias) => match *alias.expression {
-                            ValueExpression::ModelCall(call) => Some(call),
-                            _ => None,
-                        },
-                        _ => None,
-                    })
-                    .collect::<Option<Vec<ModelCall>>>()?
-            }
-            _ => vec![self.binder.bind_column_call(&call, kind).ok()?],
-        };
-        let named = calls
-            .into_iter()
-            .map(|call| {
-                let (_, name) = self.names.iter().find(|(found, _)| *found == call)?;
-                Some((call, name.clone()))
-            })
-            .collect::<Option<Vec<_>>>()?;
-        Some((kind, named))
+        let found = self.binder.answer(&node.answer)?;
+        Some((kind, found.calls.clone()))
     }
 
     /// A column node's guard as a condition; the outer None when it does
@@ -254,8 +228,8 @@ impl<'w, 'a> Assembly<'w, 'a> {
         match &node.guard {
             None => Some(None),
             Some(guard) => {
-                let written = self.walk.written(guard, &[]);
-                self.binder.bind_condition(&written).ok().map(Some)
+                let read = self.walk.through(guard);
+                self.binder.bind_condition(&read).ok().map(Some)
             }
         }
     }

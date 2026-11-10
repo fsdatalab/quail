@@ -1,15 +1,12 @@
 //! Read the plan in input order and track each operator's source tables.
-//! Recover written expressions from answer columns and derived tables.
+//! Read each derived table's column as the expression that defines it.
 
-use super::binding::{Binder, unsupported};
-use crate::SPAN_SUFFIX;
-use crate::ai::{AiNode, Fetch, Semantics, WrittenTest};
+use super::binding::unsupported;
+use crate::ai::{AiNode, Fetch, Semantics};
 use crate::extension::as_node;
-use crate::rules::lower::quail_function;
-use datafusion::arrow::datatypes::{DataType, SchemaRef};
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::Column;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::logical_expr::utils::split_conjunction;
 use datafusion::logical_expr::{Expr, Join, JoinType, LogicalPlan};
 use quail_planner::error::CompileError;
 use std::collections::BTreeSet;
@@ -281,7 +278,7 @@ impl<'a> Walk<'a> {
     /// The tables an expression reads, through the derived tables merged
     /// into the query.
     pub(super) fn call_tables(&self, expr: &Expr) -> BTreeSet<String> {
-        self.written(expr, &[])
+        self.through(expr)
             .column_refs()
             .into_iter()
             .filter_map(|column| {
@@ -293,10 +290,10 @@ impl<'a> Walk<'a> {
             .collect()
     }
 
-    /// `expr` as the query wrote it: each merged derived table's column
-    /// as its definition, and each answer column in `answers` as the call
-    /// that computes it.
-    pub(super) fn written(&self, expr: &Expr, answers: &[Answer]) -> Expr {
+    /// `expr` with each merged derived table's column as the expression
+    /// that defines it, so it reads the tables' columns and the answer
+    /// columns the `AiNode`s add.
+    pub(super) fn through(&self, expr: &Expr) -> Expr {
         expr.clone()
             .transform_up(|node| {
                 let Expr::Column(column) = &node else {
@@ -311,12 +308,7 @@ impl<'a> Walk<'a> {
                     && let Some((_, definition)) =
                         columns.iter().find(|(name, _)| *name == column.name)
                 {
-                    return Ok(Transformed::yes(self.written(definition, answers)));
-                }
-                if column.relation.is_none()
-                    && let Some(answer) = answers.iter().find(|found| found.name == column.name)
-                {
-                    return Ok(Transformed::yes(answer.call.clone()));
+                    return Ok(Transformed::yes(self.through(definition)));
                 }
                 Ok(Transformed::no(node))
             })
@@ -324,175 +316,26 @@ impl<'a> Walk<'a> {
             .unwrap_or_else(|_| expr.clone())
     }
 
-    /// `expr` as the query wrote it, as [`Walk::written`], with each
-    /// answer of an AI filter that keeps every row read as a column of
-    /// the filter's table, which `binder` then knows.
-    pub(super) fn filter_answers(&self, expr: &Expr, binder: &mut Binder) -> Expr {
-        let mut answers: Vec<(String, String)> = Vec::new();
-        for id in self.ids() {
-            let Kind::Ai(node) = &self.get(id).kind else {
-                continue;
-            };
-            let tables = self.call_tables(&node.call);
-            if node.function() == "ai_filter"
-                && node.filter.is_none()
-                && node.semantics == Semantics::Rows
-                && let [alias] = tables.into_iter().collect::<Vec<_>>().as_slice()
-            {
-                answers.push((node.answer.clone(), alias.clone()));
-            }
-        }
-        self.written(expr, &[])
-            .transform_up(|found| match &found {
-                Expr::Column(column) if column.relation.is_none() => {
-                    match answers.iter().find(|(answer, _)| *answer == column.name) {
-                        Some((answer, alias)) => {
-                            binder.note_answer_type(alias, answer, DataType::Boolean);
-                            Ok(Transformed::yes(Expr::Column(Column::new(
-                                Some(alias.clone()),
-                                answer.clone(),
-                            ))))
-                        }
-                        None => Ok(Transformed::no(found)),
-                    }
-                }
-                _ => Ok(Transformed::no(found)),
-            })
-            .map(|found| found.data)
-            .unwrap_or_else(|_| self.written(expr, &[]))
-    }
-
-    /// The terms of the plan's filters, as the query wrote them, then its
-    /// tests of answer columns, in written order.
-    pub(super) fn where_terms(&self, answers: &[Answer]) -> Vec<Expr> {
-        let mut tests: Vec<&WrittenTest> = Vec::new();
-        for id in self.ids() {
-            let Kind::Ai(node) = &self.get(id).kind else {
-                continue;
-            };
-            for test in &node.tests {
-                if !tests
-                    .iter()
-                    .any(|found| (found.clause, found.position) == (test.clause, test.position))
-                {
-                    tests.push(test);
-                }
-            }
-        }
-        let mut terms = Vec::new();
-        for id in self.ids() {
-            let found: Vec<&Expr> = match &self.get(id).kind {
-                Kind::Ai(node) if !node.is_predicate() && node.semantics == Semantics::Rows => {
-                    node.filter.iter().flat_map(split_conjunction).collect()
-                }
-                _ => continue,
-            };
-            // each test of answers is in written order below
-            terms.extend(
-                found
-                    .into_iter()
-                    .filter(|term| {
-                        // DataFusion may write one test as several terms
-                        !tests
-                            .iter()
-                            .any(|test| split_conjunction(&test.test).contains(term))
-                    })
-                    .map(|term| self.written(term, answers)),
-            );
-        }
-        tests.sort_by_key(|test| (test.clause, test.position));
-        terms.extend(
-            tests
-                .into_iter()
-                .map(|test| self.written(&test.written, &[])),
-        );
-        terms
-    }
-
-    /// The answer columns the plan's AI columns add, with their calls.
-    pub(super) fn answers(&self) -> Vec<Answer> {
-        let mut found = Vec::new();
-        for id in self.ids() {
-            let Kind::Ai(node) = &self.get(id).kind else {
-                continue;
-            };
-            if node.is_predicate() {
-                continue;
-            }
-            found.push(Answer {
-                name: node.answer.clone(),
-                call: node.call.clone(),
-            });
-            if node.function() == "ai_extract"
-                && let Expr::ScalarFunction(call) = &node.call
-            {
-                let spans = datafusion::logical_expr::expr::ScalarFunction::new_udf(
-                    quail_function("ai_extract_span"),
-                    call.args.clone(),
-                );
-                found.push(Answer {
-                    name: format!("{}{SPAN_SUFFIX}", node.answer),
-                    call: Expr::ScalarFunction(spans),
-                });
-            }
-        }
-        found
-    }
-
-    /// A SELECT list item as the query wrote it: an answer column as its
-    /// call under the column's name.
-    pub(super) fn selected(&self, expr: &Expr, answers: &[Answer]) -> Expr {
+    /// A SELECT list item read through the derived tables, under the
+    /// name the region returns it by.
+    pub(super) fn selected(&self, expr: &Expr) -> Expr {
         let (inner, name) = match expr {
             Expr::Alias(alias) => (alias.expr.as_ref(), Some(alias.name.clone())),
             other => (other, None),
         };
-        let merged = self.written(inner, &[]);
-        if let Expr::Column(column) = &merged
-            && column.relation.is_none()
-            && let Some(answer) = answers.iter().find(|found| found.name == column.name)
-        {
-            let written = match inner {
-                Expr::Column(column) => column.name.clone(),
-                other => other.schema_name().to_string(),
-            };
-            return answer.call.clone().alias(name.unwrap_or(written));
-        }
-        // DataFusion merges a SELECT list over the region's into it; an
-        // expression over an answer reads the answer's call, as written
-        let merged = merged
-            .clone()
-            .transform_up(|found| match &found {
-                Expr::Column(column) if column.relation.is_none() => Ok(
-                    match answers.iter().find(|answer| answer.name == column.name) {
-                        Some(answer) => Transformed::yes(answer.call.clone()),
-                        None => Transformed::no(found),
-                    },
-                ),
-                _ => Ok(Transformed::no(found)),
-            })
-            .map(|found| found.data)
-            .unwrap_or(merged);
-        if merged == *inner {
+        let read = self.through(inner);
+        if read == *inner {
             return expr.clone();
         }
         let name = name.unwrap_or_else(|| match inner {
             Expr::Column(column) => column.name.clone(),
             other => other.schema_name().to_string(),
         });
-        match &merged {
-            Expr::Column(column) if column.name == name && !matches!(expr, Expr::Alias(_)) => {
-                merged
-            }
-            _ => merged.alias(name),
+        match &read {
+            Expr::Column(column) if column.name == name && !matches!(expr, Expr::Alias(_)) => read,
+            _ => read.alias(name),
         }
     }
-}
-
-/// An answer column an AI column adds, and the call that computes it.
-#[derive(Debug, Clone)]
-pub(super) struct Answer {
-    pub(super) name: String,
-    pub(super) call: Expr,
 }
 
 /// Each output column of a derived table and its expression: a SELECT

@@ -1,12 +1,15 @@
 //! Bind tables, join predicates, and WHERE terms in written order.
 //! Check which tables each AI join and gate reads.
 
-use super::binding::{Binder, label_test, unsupported};
-use super::walk::{Answer, Kind, Walk};
+use super::binding::{AnswerColumn, Binder, negated_inward, string_literal, unsupported};
+use super::walk::{Kind, Walk};
 use super::{ByAlias, push};
-use crate::ai::{AiNode, Semantics};
-use datafusion::logical_expr::Expr;
+use crate::ai::{AiNode, Semantics, WrittenTest};
+use crate::functions::column_call_kind;
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::utils::{conjunction, split_conjunction};
+use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use quail_planner::error::{CompileError, compile_error};
 use quail_planner::expressions::{
     asked_call, call_aliases, column_alias_of, equality_text, repr_list, repr_str,
@@ -23,9 +26,9 @@ pub(super) struct Relation {
     pub(super) filters: ByAlias<FilterPredicate>,
     /// Each AI join and gate, by its node.
     pub(super) joins: BTreeMap<usize, JoinSpec>,
-    /// alias -> its tests of a label: the classification, the labels it
-    /// accepts, and the test's selectivity.
-    pub(super) label_tests: ByAlias<(ModelCall, Value, Option<f64>)>,
+    /// alias -> its tests of a label: the label's column, the labels the
+    /// test accepts, and the test's selectivity.
+    pub(super) label_tests: ByAlias<(String, Value, Option<f64>)>,
     /// The conditions that ask no model, and their HINT's selectivity.
     pub(super) conditions: Vec<(ValueExpression, Option<f64>)>,
     /// alias -> the ON equalities of the JOIN of that table that no AI
@@ -35,8 +38,8 @@ pub(super) struct Relation {
     claimed: Vec<String>,
     /// The FROM table, then the JOINed tables.
     pub(super) tables: Vec<String>,
-    /// Whether a term the lowering left in place binds, which the
-    /// operators cannot read.
+    /// Whether a gate is not over a join, which the operators cannot
+    /// read.
     pub(super) unplaced: bool,
     /// The answer of each AI filter that keeps every row, and its
     /// selectivity hint, for the guards that read it.
@@ -70,16 +73,20 @@ fn is_column_equality(term: &Expr) -> bool {
 impl Relation {
     /// Bind the relation's tables and terms in the order the query wrote
     /// them: the tables, each JOIN's ON, the ON AI predicates, then WHERE.
+    ///
+    /// `names` maps an answer column to the name the SELECT list returns
+    /// it by.
     pub(super) fn bind(
         walk: &Walk<'_>,
         binder: &mut Binder,
-        answers: &[Answer],
+        names: &BTreeMap<String, String>,
     ) -> Result<Self, CompileError> {
         let mut relation = Self::default();
         for table in walk.tables.iter().filter(|table| !table.gate) {
             binder.add_table(&table.alias, &table.provider, table.schema.clone())?;
             relation.tables.push(table.alias.clone());
         }
+        bind_answers(walk, binder, names)?;
         for id in walk.ids() {
             let Kind::Join(join) = &walk.get(id).kind else {
                 continue;
@@ -97,13 +104,13 @@ impl Relation {
             terms.extend(join.filter.iter().flat_map(split_conjunction).cloned());
             let mut equalities = Vec::new();
             for term in terms {
-                let term = walk.written(&term, answers);
+                let term = walk.through(&term);
                 // DataFusion pushes a WHERE test of the two sides into the
                 // join; an equality of their columns is the join's key
                 if is_column_equality(&term) {
                     equalities.push(binder.bind_equality(&term, &joined)?);
                 } else {
-                    relation.bind_where_term(binder, &term)?;
+                    relation.bind_term(binder, &term, None)?;
                 }
             }
             if !equalities.is_empty() {
@@ -183,8 +190,45 @@ impl Relation {
         for (id, node) in rest {
             relation.bind_asked(walk, binder, id, node)?;
         }
-        for term in walk.where_terms(answers) {
-            relation.bind_where_term(binder, &term)?;
+        // each column node's tests: the terms no written test holds, in
+        // the plan's order, then the written tests in written order
+        let mut tests: Vec<&WrittenTest> = Vec::new();
+        let mut terms: Vec<&Expr> = Vec::new();
+        for id in walk.ids() {
+            let Kind::Ai(node) = &walk.get(id).kind else {
+                continue;
+            };
+            for test in &node.tests {
+                if !tests
+                    .iter()
+                    .any(|found| (found.clause, found.position) == (test.clause, test.position))
+                {
+                    tests.push(test);
+                }
+            }
+            if !node.is_predicate() && node.semantics == Semantics::Rows {
+                terms.extend(node.filter.iter().flat_map(split_conjunction));
+            }
+        }
+        // DataFusion may write one test as several terms
+        terms.retain(|term| {
+            !tests
+                .iter()
+                .any(|test| split_conjunction(&test.test).contains(term))
+        });
+        for term in terms {
+            relation.bind_term(binder, &walk.through(term), None)?;
+        }
+        tests.sort_by_key(|test| (test.clause, test.position));
+        for test in tests {
+            // the lowering keeps a call's selectivity option on the test
+            // as written, not on the node's call
+            let (written, hint) = binder.unwrap_hint(&test.written)?;
+            let hint = match hint {
+                Some(hint) => Some(hint),
+                None => binder.label_selectivity(&written)?,
+            };
+            relation.bind_term(binder, &walk.through(&test.test), hint)?;
         }
         Ok(relation)
     }
@@ -198,7 +242,7 @@ impl Relation {
         node: &AiNode,
     ) -> Result<(), CompileError> {
         let join = node.in_on().then_some(true);
-        let call = walk.written(&node.call, &[]);
+        let call = walk.through(&node.call);
         if node.semantics != Semantics::Rows {
             let input = walk.get(walk.get(id).inputs[0]);
             let Kind::Join(_) = &input.kind else {
@@ -253,7 +297,7 @@ impl Relation {
         } = term;
         let in_or = plain.is_some() || disjunction.is_some();
         let alternative = match &plain {
-            Some(plain) => Some(binder.bind_condition(&walk.written(plain, &[]))?),
+            Some(plain) => Some(binder.bind_condition(&walk.through(plain))?),
             None => None,
         };
         // a guard on another call's answer is the OR's short circuit
@@ -271,17 +315,27 @@ impl Relation {
             )
         });
         let guard = match &guard {
-            Some(guard) => Some(binder.bind_condition(&walk.written(guard, &[]))?),
+            Some(guard) => Some(binder.bind_condition(&walk.through(guard))?),
             None => None,
         };
         let answer = (node.function() == "ai_filter" && node.filter.is_none() && !in_or)
             .then(|| node.answer.clone());
         let (predicate, options) = if node.function() == "ai_score" {
-            let answer = Answer {
-                name: node.answer.clone(),
-                call,
-            };
-            let term = walk.written(node.filter.as_ref().expect("a test"), &[answer]);
+            // the test compares the score's call with a threshold
+            let term = walk
+                .through(node.filter.as_ref().expect("a test"))
+                .transform_up(|found| {
+                    Ok(match &found {
+                        Expr::Column(column)
+                            if column.relation.is_none() && column.name == node.answer =>
+                        {
+                            Transformed::yes(call.clone())
+                        }
+                        _ => Transformed::no(found),
+                    })
+                })
+                .map_err(|error| CompileError::new(error.to_string()))?
+                .data;
             let (test, options) = binder.bind_ai_score_test(&term, &["selectivity"], join)?;
             (Asked::Compare(test), options)
         } else {
@@ -324,7 +378,7 @@ impl Relation {
         if in_or || guard.is_some() || answer.is_some() || negated {
             return unsupported(&format!(
                 "DataFusion must evaluate {} over joined model results.",
-                walk.written(node.filter.as_ref().unwrap_or(&node.call), &[])
+                walk.through(node.filter.as_ref().unwrap_or(&node.call))
             ));
         }
         let spec = JoinSpec {
@@ -340,29 +394,168 @@ impl Relation {
         Ok(())
     }
 
-    /// Bind a WHERE term that is no AI filter: a plain condition, a test
-    /// of a label, or a test of another column operator's answer.
-    fn bind_where_term(&mut self, binder: &mut Binder, term: &Expr) -> Result<(), CompileError> {
-        if let Some(bound) = binder.bind_plain_where_term(term)? {
-            self.conditions.extend(bound);
-            return Ok(());
-        }
-        let (unhinted, hint) = binder.unwrap_hint(term)?;
-        if let Some((classify, items)) = label_test(&unhinted) {
-            let (call, labels, selectivity) = binder.bind_label_test(classify, &items, hint)?;
-            let read = call_aliases(&call);
-            if read.len() != 1 {
+    /// Bind a term that asks no model: a test of one label, or a plain
+    /// condition, one per part of an AND unless `hint`, a HINT's
+    /// selectivity, estimates the whole term.
+    fn bind_term(
+        &mut self,
+        binder: &mut Binder,
+        term: &Expr,
+        hint: Option<f64>,
+    ) -> Result<(), CompileError> {
+        let (term, written) = binder.unwrap_hint(term)?;
+        let (term, hint) = (&term, hint.or(written));
+        if let Some((answer, items)) = label_test(term)
+            && let Some(found) = binder.answer(answer).filter(|found| found.kind == "label")
+        {
+            let Some(alias) = found.alias.clone() else {
                 return unsupported("DataFusion must evaluate this label test over joined rows.");
+            };
+            let (name, selectivity) = (found.name.clone(), hint);
+            let mut accepted = Vec::new();
+            for item in items {
+                match string_literal(item) {
+                    Some(text) => accepted.push(Value::String(text)),
+                    None => {
+                        return unsupported(
+                            "DataFusion must compare this label with the other expression.",
+                        );
+                    }
+                }
             }
-            push(&mut self.label_tests, &read[0], (call, labels, selectivity));
+            let mut unique = accepted.clone();
+            unique.sort_by_key(|value| value.to_string());
+            unique.dedup();
+            if unique.len() != accepted.len() {
+                return unsupported("DataFusion must evaluate a label test with repeated values.");
+            }
+            push(
+                &mut self.label_tests,
+                &alias,
+                (name, Value::Array(accepted), selectivity),
+            );
             return Ok(());
         }
-        // the binder's refusal of the term, or a term it reads that the
-        // lowering left in place
-        binder.refuse_where_term(term)?;
-        self.unplaced = true;
+        let term = negated_inward(term.clone(), false);
+        let parts = match hint {
+            Some(_) => vec![&term],
+            None => split_conjunction(&term),
+        };
+        for part in parts {
+            self.conditions.push((binder.bind_condition(part)?, hint));
+        }
         Ok(())
     }
+}
+
+/// The answer column and tested values of an `=` or `IN` test of one
+/// unqualified column, or None.
+fn label_test(expr: &Expr) -> Option<(&str, Vec<&Expr>)> {
+    fn answer(expr: &Expr) -> Option<&str> {
+        match expr {
+            Expr::Column(column) if column.relation.is_none() => Some(column.name.as_str()),
+            _ => None,
+        }
+    }
+    match expr {
+        Expr::InList(InList {
+            expr,
+            list,
+            negated: false,
+        }) => Some((answer(expr)?, list.iter().collect())),
+        // DataFusion writes a short IN list as an OR of equalities
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::Or,
+            right,
+        }) => {
+            let (column, mut labels) = label_test(left)?;
+            let (other, more) = label_test(right)?;
+            if column != other {
+                return None;
+            }
+            labels.extend(more);
+            Some((column, labels))
+        }
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::Eq,
+            right,
+        }) => match (answer(left), answer(right)) {
+            (Some(column), None) => Some((column, vec![right.as_ref()])),
+            (None, Some(column)) => Some((column, vec![left.as_ref()])),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Bind the call of each `AiNode` that adds columns, in the plan's
+/// order, and record the columns with `binder`; an AI filter that keeps
+/// every row adds its Boolean answer.
+fn bind_answers(
+    walk: &Walk<'_>,
+    binder: &mut Binder,
+    names: &BTreeMap<String, String>,
+) -> Result<(), CompileError> {
+    for id in walk.ids() {
+        let Kind::Ai(node) = &walk.get(id).kind else {
+            continue;
+        };
+        if node.semantics != Semantics::Rows {
+            continue;
+        }
+        let name = names.get(&node.answer).unwrap_or(&node.answer).clone();
+        let mut found = AnswerColumn {
+            answer: node.answer.clone(),
+            name: name.clone(),
+            kind: "boolean",
+            alias: None,
+            calls: Vec::new(),
+            fields: Vec::new(),
+        };
+        if node.is_predicate() {
+            let tables: Vec<String> = walk.call_tables(&node.call).into_iter().collect();
+            if node.function() != "ai_filter" || node.filter.is_some() || tables.len() != 1 {
+                continue;
+            }
+            found.alias = tables.into_iter().next();
+            found.name = node.answer.clone();
+            binder.add_answer(found);
+            continue;
+        }
+        let call = walk.through(&node.call);
+        if node.function() == "ai_score" {
+            found.kind = "score";
+            found.calls = vec![(binder.bind_ai_value(&call)?, name)];
+            binder.add_answer(found);
+            continue;
+        }
+        let Some(kind) = column_call_kind(&node.call) else {
+            continue;
+        };
+        found.kind = kind;
+        match kind {
+            "extract" => {
+                let (fields, members) = binder.bind_ai_extract(&call, &name)?;
+                found.fields = fields.fields;
+                for member in members {
+                    if let ValueExpression::Alias(alias) = member
+                        && let ValueExpression::ModelCall(call) = *alias.expression
+                    {
+                        found.calls.push((call, alias.name));
+                    }
+                }
+            }
+            _ => found.calls = vec![(binder.bind_column_call(&call, kind)?, name)],
+        }
+        let read = call_aliases(&found.calls[0].0);
+        if let [alias] = read.as_slice() {
+            found.alias = Some(alias.clone());
+        }
+        binder.add_answer(found);
+    }
+    Ok(())
 }
 /// A list of names as Python writes a tuple of them.
 fn repr_tuple(items: &[String]) -> String {

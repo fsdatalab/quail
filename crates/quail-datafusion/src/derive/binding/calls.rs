@@ -4,6 +4,7 @@
 use super::{Binder, Options};
 use crate::functions::function_name;
 use datafusion::arrow::datatypes::DataType;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, ScalarValue};
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
@@ -335,36 +336,26 @@ impl Binder {
         Ok((ScoreTest { call, test }, options))
     }
 
-    /// Bind a test of an `AI.CLASSIFY` call's label, `= 'label'` or
-    /// `IN ('label', ...)`: the classification, the labels it accepts,
-    /// and its selectivity, the HINT's or the call's own.
-    pub(crate) fn bind_label_test(
-        &mut self,
-        classify: &Expr,
-        items: &[&Expr],
-        hint: Option<f64>,
-    ) -> Result<(ModelCall, Value, Option<f64>), CompileError> {
-        let (call, options) = self.bind_ai_classify(classify)?;
-        let mut accepted = Vec::new();
-        for item in items {
-            match string_literal(item) {
-                Some(text) => accepted.push(Value::String(text)),
-                None => {
-                    return super::unsupported(
-                        "DataFusion must compare this label with the other expression.",
-                    );
-                }
+    /// The selectivity option of the `AI.CLASSIFY` call a test of its
+    /// label makes, as the query wrote the test; None without one.
+    pub(crate) fn label_selectivity(&self, written: &Expr) -> Result<Option<f64>, CompileError> {
+        let mut options = None;
+        let _ = written.apply(|node| {
+            if is_call(node, "ai_classify") {
+                options = arguments(node).get(2).cloned();
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        for (key, value) in options.as_ref().and_then(object_fields).unwrap_or_default() {
+            if key.eq_ignore_ascii_case("selectivity") {
+                return match (string_literal(value), number_of(value)) {
+                    (None, Some(number)) => Ok(Some(number)),
+                    _ => compile_error("The selectivity option must be a number."),
+                };
             }
         }
-        let mut unique = accepted.clone();
-        unique.sort_by_key(|value| value.to_string());
-        unique.dedup();
-        if unique.len() != accepted.len() {
-            return super::unsupported(
-                "DataFusion must evaluate a label test with repeated values.",
-            );
-        }
-        Ok((call, Value::Array(accepted), hint.or(options.selectivity)))
+        Ok(None)
     }
 
     fn bind_ai_classify(&mut self, node: &Expr) -> Result<(ModelCall, Options), CompileError> {
@@ -577,7 +568,7 @@ impl Binder {
     }
 
     /// Bind a score or classification to its model call.
-    pub(super) fn bind_ai_value(&mut self, node: &Expr) -> Result<ModelCall, CompileError> {
+    pub(crate) fn bind_ai_value(&mut self, node: &Expr) -> Result<ModelCall, CompileError> {
         if is_call(node, "ai_classify") {
             return Ok(self.bind_ai_classify(node)?.0);
         }
@@ -706,7 +697,7 @@ mod tests {
     use quail_planner::error::ErrorKind;
 
     fn binder() -> Binder {
-        Binder::new(&(String::new(), String::new()), "default", &[])
+        Binder::new(&(String::new(), String::new()), "default")
     }
 
     fn call(name: &str, args: Vec<Expr>) -> Expr {

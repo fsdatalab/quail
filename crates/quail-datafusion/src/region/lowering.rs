@@ -492,7 +492,7 @@ fn read_calls(expr: &Expr, named: &[(Expr, String)]) -> Result<Expr> {
                 return Ok(Transformed::no(expr));
             }
             let mut binder =
-                crate::derive::binding::Binder::new(&(String::new(), String::new()), "ai-if", &[]);
+                crate::derive::binding::Binder::new(&(String::new(), String::new()), "ai-if");
             let (test, _) = binder
                 .unwrap_hint(&expr)
                 .map_err(|error| datafusion::common::DataFusionError::Plan(error.to_string()))?;

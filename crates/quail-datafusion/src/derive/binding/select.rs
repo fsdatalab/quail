@@ -1,42 +1,16 @@
 //! Bind SELECT items to output columns and extraction structs.
-//! Check output names and reject repeated AI expressions.
+//! Check output names and reject a model result returned twice.
 
-use super::calls::{arguments, is_call};
-use super::conditions::has_ai_call;
 use super::{Binder, contains, unsupported};
-use crate::functions::{ai_function_name, column_call_kind, function_name};
+use crate::SPAN_SUFFIX;
+use crate::functions::{ai_function_name, function_name};
 use datafusion::logical_expr::Expr;
 use quail_planner::error::CompileError;
 use quail_planner::expressions::{aliased_call, call_aliases, column_name, repr_list, repr_str};
 use quail_planner::physical::{Alias, ExtractStruct, ValueExpression};
 
-/// Each output column name of a SELECT list and its expression, but a
-/// column the list passes on under its own name.
-pub(super) fn select_outputs(expressions: &[Expr]) -> Vec<(String, Expr)> {
-    let mut outputs: Vec<(String, Expr)> = Vec::new();
-    for item in expressions {
-        let (inner, _) = unalias(item);
-        let name = output_name(item);
-        let self_reference = matches!(inner, Expr::Column(column) if column.name == name);
-        if !self_reference && !outputs.iter().any(|(found, _)| *found == name) {
-            outputs.push((name, inner.clone()));
-        }
-    }
-    outputs
-}
-
-/// Each column-operator call a SELECT list returns, by its output name.
-pub(super) fn selected_calls(expressions: &[Expr]) -> Vec<(String, Expr)> {
-    expressions
-        .iter()
-        .filter_map(|expr| {
-            let (inner, _) = unalias(expr);
-            column_call_kind(inner).map(|_| (output_name(expr), inner.clone()))
-        })
-        .collect()
-}
-
-fn output_name(expr: &Expr) -> String {
+/// The name a SELECT list item returns its column by.
+pub(crate) fn output_name(expr: &Expr) -> String {
     match expr {
         Expr::Alias(alias) => alias.name.clone(),
         Expr::Column(column) => column.name.clone(),
@@ -144,16 +118,6 @@ impl Binder {
         Ok(())
     }
 
-    fn output_of(&self, expr: &Expr) -> Option<Expr> {
-        let Expr::Column(column) = expr else {
-            return None;
-        };
-        self.outputs
-            .iter()
-            .find(|(name, _)| *name == column.name)
-            .map(|(_, found)| found.clone())
-    }
-
     /// Bind a SELECT list.
     ///
     /// # Errors
@@ -166,42 +130,45 @@ impl Binder {
             spans: Vec::new(),
             output: Vec::new(),
         };
-        let mut extracts: Vec<(String, Expr)> = Vec::new();
-        let mut spans: Vec<(String, Expr)> = Vec::new();
+        // (struct name, answer) of each extraction returned, then of
+        // each span
+        let mut extracts: Vec<(String, String)> = Vec::new();
+        let mut spans: Vec<(String, String)> = Vec::new();
         for item in projection {
             let (node, alias) = unalias(item);
-            let node = self.output_of(node).unwrap_or_else(|| node.clone());
-            let automatic = output_name(item);
-            let alias = alias.or_else(|| crate::is_ai_call(&node).then_some(automatic.as_str()));
-            if is_call(&node, "ai_extract_span") {
-                let Some(alias) = alias else {
-                    return unsupported("AI.EXTRACT_SPAN needs an AS name in SELECT.");
-                };
-                spans.push((alias.to_string(), node));
+            let name = alias.map_or_else(|| output_name(item), str::to_string);
+            if let Expr::Column(column) = node
+                && column.relation.is_none()
+                && let Some(answer) = column.name.strip_suffix(SPAN_SUFFIX)
+                && self
+                    .answer(answer)
+                    .is_some_and(|found| found.kind == "extract")
+            {
+                spans.push((name, answer.to_string()));
                 continue;
             }
-            if is_call(&node, "ai_extract")
-                && let Some(alias) = alias
-            {
-                extracts.push((alias.to_string(), node.clone()));
-            }
-            for column in self.bind_select_item(&node, alias, &mut selected.structs)? {
+            for column in self.bind_select_item(node, &name, alias.is_some(), &mut selected)? {
                 selected.output.push(column_name(&column, true));
                 if !selected.columns.contains(&column) {
                     selected.columns.push(column);
                 }
             }
+            if let Expr::Column(column) = node
+                && column.relation.is_none()
+                && self
+                    .answer(&column.name)
+                    .is_some_and(|found| found.kind == "extract")
+            {
+                extracts.push((name, column.name.clone()));
+            }
         }
         for (alias, span) in spans {
-            let paired = extracts
-                .iter()
-                .find(|(_, extract)| arguments(extract) == arguments(&span));
-            let Some((name, _)) = paired else {
+            let Some((name, _)) = extracts.iter().find(|(_, answer)| *answer == span) else {
                 return unsupported(&format!(
                     "The extraction for span output {alias} must run in a separate model region."
                 ));
             };
-            selected.spans.push((*name).to_string());
+            selected.spans.push(name.clone());
         }
         let mut unique = selected.output.clone();
         unique.sort();
@@ -215,60 +182,71 @@ impl Binder {
         Ok(selected)
     }
 
+    /// Bind one SELECT item, returned as `name`: an answer column as its
+    /// model call, an extraction as its fields' calls, and any other
+    /// value as itself.
     fn bind_select_item(
         &mut self,
         node: &Expr,
-        alias: Option<&str>,
-        structs: &mut Vec<ExtractStruct>,
+        name: &str,
+        aliased: bool,
+        selected: &mut Selected,
     ) -> Result<Vec<ValueExpression>, CompileError> {
-        let named = |expression: ValueExpression,
-                     function: &str|
-         -> Result<Vec<ValueExpression>, CompileError> {
-            let Some(alias) = alias else {
-                return unsupported(&format!("{function} needs an AS name in SELECT."));
-            };
-            Ok(vec![ValueExpression::Alias(Alias {
+        let named = |expression: ValueExpression| {
+            ValueExpression::Alias(Alias {
                 expression: Box::new(expression),
-                name: alias.to_string(),
-            })])
+                name: name.to_string(),
+            })
         };
-        if is_call(node, "ai_score") {
-            let call = self.bind_ai_value(node)?;
-            if !(1..=2).contains(&call_aliases(&call).len()) {
-                return unsupported("This score must run over a materialized input relation.");
+        let answer = match node {
+            Expr::Column(column) if column.relation.is_none() => self.answer(&column.name),
+            _ => None,
+        };
+        match answer {
+            Some(found) if found.kind == "extract" => {
+                selected.structs.push(ExtractStruct {
+                    name: name.to_string(),
+                    fields: found.fields.clone(),
+                });
+                return Ok(found
+                    .calls
+                    .iter()
+                    .zip(&found.fields)
+                    .map(|((call, _), field)| {
+                        ValueExpression::Alias(Alias {
+                            expression: Box::new(ValueExpression::ModelCall(call.clone())),
+                            name: format!("{name}.{field}"),
+                        })
+                    })
+                    .collect());
             }
-            return named(ValueExpression::ModelCall(call), "AI.SCORE");
+            Some(found) if found.kind != "boolean" => {
+                let call = found.calls[0].0.clone();
+                if found.kind == "score" && !(1..=2).contains(&call_aliases(&call).len()) {
+                    return unsupported("This score must run over a materialized input relation.");
+                }
+                return Ok(vec![named(ValueExpression::ModelCall(call))]);
+            }
+            _ => {}
         }
-        if is_call(node, "ai_classify") {
-            let call = self.bind_ai_value(node)?;
-            return named(ValueExpression::ModelCall(call), "AI.CLASSIFY");
-        }
-        if is_call(node, "ai_extract") {
-            let Some(alias) = alias else {
-                return unsupported("AI.EXTRACT needs an AS name in SELECT.");
-            };
-            let (found, members) = self.bind_ai_extract(node, alias)?;
-            structs.push(found);
-            return Ok(members);
-        }
-        if is_call(node, "ai_sae_features") {
-            let call = self.bind_ai_sae_features(node)?;
-            return named(ValueExpression::ModelCall(call), "AI.SAE_FEATURES");
-        }
-        if is_call(node, "ai_map") {
-            let call = self.bind_ai_map(node)?;
-            return named(ValueExpression::ModelCall(call), "AI.MAP");
-        }
-        if has_ai_call(node) || contains(node, |inner| column_call_kind(inner).is_some()) {
+        let nested = contains(node, |inner| match inner {
+            Expr::Column(column) if column.relation.is_none() => {
+                let answer = column
+                    .name
+                    .strip_suffix(SPAN_SUFFIX)
+                    .unwrap_or(&column.name);
+                self.answer(answer)
+                    .is_some_and(|found| found.kind != "boolean")
+            }
+            _ => false,
+        });
+        if nested {
             return unsupported("A model call cannot be nested in this SELECT expression.");
         }
-        let value = self.bind_value(node)?;
-        Ok(vec![match alias {
-            Some(alias) => ValueExpression::Alias(Alias {
-                expression: Box::new(value),
-                name: alias.to_string(),
-            }),
-            None => value,
-        }])
+        let read = self.answer_refs(node)?;
+        let value = self.bind_value(&read)?;
+        // an AI filter's answer leaves the region under its own name
+        let renamed = aliased || read != *node && column_name(&value, true) != name;
+        Ok(vec![if renamed { named(value) } else { value }])
     }
 }

@@ -8,9 +8,7 @@ use super::walk::Walk;
 use super::{ByAlias, lookup, note, push};
 use crate::SPAN_SUFFIX;
 use quail_planner::error::CompileError;
-use quail_planner::expressions::{
-    aliased_call, call_aliases, column_name, column_references, condition_columns,
-};
+use quail_planner::expressions::{aliased_call, column_name, column_references, condition_columns};
 use quail_planner::operators::{ColumnTest, Operators, SemanticColumn};
 use quail_planner::physical::{ModelCall, ValueExpression};
 use serde_json::Value;
@@ -120,52 +118,21 @@ impl<'w, 'a> Assembly<'w, 'a> {
         let specs: Vec<&JoinSpec> = joins.values().collect();
         check_joins(&equalities, &tables, &specs, &projected)?;
         check_calls(&filters, &specs, &projected)?;
-        let tested = &binder.tested;
-        // a tested label takes SELECT's name, a test's, or one of its own
-        let mut names: Vec<(ModelCall, String)> = Vec::new();
-        for (alias, found) in &label_tests {
-            let asks = lookup(&filters, alias).len();
-            for (index, (call, _, _)) in found.iter().enumerate() {
-                let name = projected
-                    .iter()
-                    .find(|(owner, _)| *owner == call)
-                    .map(|(_, name)| name)
-                    .or_else(|| {
-                        tested
-                            .iter()
-                            .rev()
-                            .find(|(owner, _)| owner == call)
-                            .map(|(_, name)| name)
-                    })
-                    .cloned()
-                    .unwrap_or_else(|| format!("__label_{alias}_{}", asks + index));
-                names.push((call.clone(), name));
-            }
-        }
-        names.extend(
-            projected
-                .iter()
-                .map(|(call, name)| ((*call).clone(), name.clone())),
-        );
-        names.extend(tested.iter().cloned());
-        let named = |call: &ModelCall| -> &String {
-            let (_, name) = names
-                .iter()
-                .find(|(found, _)| found == call)
-                .expect("a named call");
-            name
-        };
         // the columns each table's column operators add
+        let mut names: Vec<(ModelCall, String)> = Vec::new();
         let mut computed: BTreeMap<(String, String), &str> = BTreeMap::new();
-        for (call, _) in &names {
-            let read = call_aliases(call);
-            if read.len() == 1
-                && ["label", "extract", "features", "map"].contains(&call.kind.as_str())
-            {
-                let name = named(call);
-                computed.insert((read[0].clone(), name.clone()), &call.kind);
-                if call.kind == "extract" {
-                    computed.insert((read[0].clone(), format!("{name}{SPAN_SUFFIX}")), "extract");
+        for found in &binder.answers {
+            if !["label", "extract", "features", "map"].contains(&found.kind) {
+                continue;
+            }
+            for (call, name) in &found.calls {
+                names.push((call.clone(), name.clone()));
+                if let Some(alias) = &found.alias {
+                    computed.insert((alias.clone(), name.clone()), found.kind);
+                    if found.kind == "extract" {
+                        let span = format!("{name}{SPAN_SUFFIX}");
+                        computed.insert((alias.clone(), span), "extract");
+                    }
                 }
             }
         }
@@ -178,10 +145,14 @@ impl<'w, 'a> Assembly<'w, 'a> {
             })
             .collect();
         for (alias, found) in &label_tests {
-            for (call, labels, selectivity) in found {
-                check_labels(named(call), labels, call)?;
+            for (name, labels, selectivity) in found {
+                let (call, _) = names
+                    .iter()
+                    .find(|(_, found)| found == name)
+                    .expect("a named label");
+                check_labels(name, labels, call)?;
                 terms.push(Term {
-                    condition: binder.label_condition(alias, named(call), labels)?,
+                    condition: binder.label_condition(alias, name, labels)?,
                     selectivity: *selectivity,
                     labels: Some(labels.clone()),
                 });
@@ -193,7 +164,6 @@ impl<'w, 'a> Assembly<'w, 'a> {
             binder,
             filters,
             joins,
-            names,
             conditions,
             found: Operators::default(),
             stacks: Vec::new(),

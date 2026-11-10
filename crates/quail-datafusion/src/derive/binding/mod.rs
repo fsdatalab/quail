@@ -8,7 +8,7 @@ mod select;
 use crate::functions::function_name;
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::common::Column;
-use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::tree_node::TreeNode;
 use datafusion::logical_expr::Expr;
 use quail_planner::error::CompileError;
 use quail_planner::expressions::repr_str;
@@ -17,12 +17,8 @@ use quail_planner::physical::{ColumnRef, GetField, ModelCall, ValueExpression};
 use quail_planner::prompts::Turn;
 
 pub(crate) use calls::string_literal;
-pub(crate) use conditions::{check_labels, label_test};
-pub(crate) use select::Selected;
-use select::{select_outputs, selected_calls};
-
-/// A condition and the selectivity its HINT gives, if any.
-pub(crate) type Hinted = (ValueExpression, Option<f64>);
+pub(crate) use conditions::{check_labels, negated_inward};
+pub(crate) use select::{Selected, output_name};
 
 pub(crate) fn unsupported<T>(message: &str) -> Result<T, CompileError> {
     Err(CompileError::unsupported(message))
@@ -40,6 +36,25 @@ pub(crate) struct Options {
     pub(crate) anchor: Option<String>,
 }
 
+/// The columns one `AiNode` adds, as the region's operators name them.
+#[derive(Debug, Clone)]
+pub(crate) struct AnswerColumn {
+    /// The node's answer column, as the plan's expressions read it.
+    pub(crate) answer: String,
+    /// The operator's name: the SELECT list's name for the answer, or
+    /// the answer column's.
+    pub(crate) name: String,
+    /// `label`, `extract`, `map`, `features`, `score`, or `boolean`.
+    pub(crate) kind: &'static str,
+    /// The one table the call reads, or None for a call over pairs.
+    pub(crate) alias: Option<String>,
+    /// The model calls the node runs, an extraction's one per field,
+    /// each with its column's name; none for an AI filter's answer.
+    pub(crate) calls: Vec<(ModelCall, String)>,
+    /// An extraction's fields.
+    pub(crate) fields: Vec<String>,
+}
+
 pub(crate) struct Binder {
     turn: Turn,
     layout: String,
@@ -48,29 +63,22 @@ pub(crate) struct Binder {
     tables: Vec<(String, String, SchemaRef)>,
     /// alias -> the document expression its prompts read.
     document_columns: Vec<(String, ValueExpression)>,
-    /// A column operator a WHERE test reads other than as a label test
-    /// -> its name.
-    pub(crate) tested: Vec<(ModelCall, String)>,
-    /// AS name -> the column-operator call SELECT gives it.
-    selected: Vec<(String, Expr)>,
-    /// Output column name -> the group, aggregate, or window expression.
-    outputs: Vec<(String, Expr)>,
+    /// The columns each `AiNode` adds, in the plan's order.
+    pub(crate) answers: Vec<AnswerColumn>,
     /// (alias, column, type) of each answer column a test reads.
     answer_types: Vec<(String, String, DataType)>,
 }
 
 impl Binder {
     /// A binder with no table in scope yet, for prompts rendered with
-    /// `turn` and `layout`, and the SELECT list `select`.
-    pub(crate) fn new(turn: &Turn, layout: &str, select: &[Expr]) -> Self {
+    /// `turn` and `layout`.
+    pub(crate) fn new(turn: &Turn, layout: &str) -> Self {
         Self {
             turn: turn.clone(),
             layout: layout.to_string(),
             tables: Vec::new(),
             document_columns: Vec::new(),
-            tested: Vec::new(),
-            selected: selected_calls(select),
-            outputs: select_outputs(select),
+            answers: Vec::new(),
             answer_types: Vec::new(),
         }
     }
@@ -134,13 +142,6 @@ impl Binder {
     fn bind_value(&mut self, expr: &Expr) -> Result<ValueExpression, CompileError> {
         match expr {
             Expr::Column(column) => {
-                if column.relation.is_none()
-                    && let Some((_, output)) =
-                        self.outputs.iter().find(|(name, _)| *name == column.name)
-                {
-                    let output = output.clone();
-                    return self.bind_value(&output);
-                }
                 return self.resolve_column(column).map(ValueExpression::ColumnRef);
             }
             Expr::OuterReferenceColumn(_, column) => {
@@ -183,20 +184,7 @@ impl Binder {
     /// A value or condition DataFusion computes, as an `Expression`
     /// over the columns it reads.
     fn computed(&self, expr: &Expr) -> Result<ValueExpression, CompileError> {
-        let expr = expr
-            .clone()
-            .transform_up(|node| match &node {
-                Expr::Column(column) if column.relation.is_none() => Ok(
-                    match self.outputs.iter().find(|(name, _)| *name == column.name) {
-                        Some((_, output)) => Transformed::yes(output.clone()),
-                        None => Transformed::no(node),
-                    },
-                ),
-                _ => Ok(Transformed::no(node)),
-            })
-            .map_err(|error| CompileError::new(error.to_string()))?
-            .data;
-        if contains(&expr, |inner| {
+        if contains(expr, |inner| {
             matches!(
                 inner,
                 Expr::AggregateFunction(_)
@@ -211,7 +199,7 @@ impl Binder {
                 "DataFusion must evaluate this expression outside the model region.",
             );
         }
-        crate::derive::expressions::expression(&expr, |column| {
+        crate::derive::expressions::expression(expr, |column| {
             let reference = self.resolve_column(column)?;
             let data_type = self.column_type(&reference)?;
             Ok((reference, data_type))

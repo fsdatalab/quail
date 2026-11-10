@@ -5,12 +5,12 @@
 //! operators in: each table's scan, the `AiNode`s on it, then the joins
 //! and the AI joins above them. It then
 //!
-//! 1. binds each table, ON and WHERE term, AI call, and SELECT list item
-//!    with the [`Binder`], in the order the query wrote them, reading
-//!    each `AiNode`'s call and written place and the tests it keeps;
-//! 2. names each column operator, by its SELECT alias or a name of its
-//!    own, and places each condition: at a table's scan, after the
-//!    operator that computes the columns it reads, or on the result rows;
+//! 1. binds each table and each `AiNode`'s call with the [`Binder`],
+//!    naming the columns a node adds by the SELECT list's name for them
+//!    or the node's own, then each ON term, filter, and guard, which
+//!    read those columns, and the SELECT list;
+//! 2. places each condition: at a table's scan, after the operator that
+//!    computes the columns it reads, or on the result rows;
 //! 3. assembles [`Operators`] in the plan's order, each `AiNode` giving
 //!    one AI filter, AI join, gate, or column operator.
 //!
@@ -34,6 +34,8 @@ mod placement;
 mod relation;
 mod walk;
 
+use std::collections::BTreeMap;
+
 use datafusion::common::ScalarValue;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::logical_expr::{Expr, LogicalPlan};
@@ -44,7 +46,7 @@ use quail_planner::physical::Projected;
 use quail_planner::prompts::Turn;
 
 use self::assemble::{Assembly, push_down_columns};
-use self::binding::{Binder, Selected, unsupported};
+use self::binding::{Binder, Selected, output_name, unsupported};
 use self::relation::Relation;
 use self::walk::{Walk, read_fetch, read_top, with_select_list};
 use crate::ai::AiNode;
@@ -197,25 +199,28 @@ fn derive_operators(
     if let Some(error) = walk.refusal.take() {
         return Err(error);
     }
-    let answers = walk.answers();
     let select: Vec<Expr> = top
         .projection
         .iter()
-        .map(|expr| walk.selected(expr, &answers))
+        .map(|expr| walk.selected(expr))
         .collect();
-    let mut binder = Binder::new(turn, layout, &select);
-    let relation = Relation::bind(&walk, &mut binder, &answers)?;
-    let select: Vec<Expr> = select
-        .iter()
-        .map(|expr| {
-            let bound = walk.filter_answers(expr, &mut binder);
-            if bound == *expr {
-                bound
-            } else {
-                bound.alias(expr.schema_name().to_string())
-            }
-        })
-        .collect();
+    // an answer takes the name the SELECT list first returns it by
+    let mut names: BTreeMap<String, String> = BTreeMap::new();
+    for item in &select {
+        let mut inner = item;
+        while let Expr::Alias(alias) = inner {
+            inner = &alias.expr;
+        }
+        if let Expr::Column(column) = inner
+            && column.relation.is_none()
+        {
+            names
+                .entry(column.name.clone())
+                .or_insert_with(|| output_name(item));
+        }
+    }
+    let mut binder = Binder::new(turn, layout);
+    let relation = Relation::bind(&walk, &mut binder, &names)?;
     let Selected {
         columns,
         structs,
