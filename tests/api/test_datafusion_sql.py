@@ -86,31 +86,24 @@ def test_a_limit_above_a_datafusion_projection_stops_at_its_rows(session):
     assert finish(query, ORACLE).collect().num_rows == 2
 
 
-def test_a_document_column_beside_an_ai_answer_is_joined_back_on_the_id(session):
+def test_a_region_returns_a_document_column_beside_an_ai_answer(session):
     query = session.sql(
         "SELECT r.id, r.stars, AI.CLASSIFY(PROMPT('t: {0}', r.body), ['a', 'b']) "
         "AS kind FROM reviews r")
-    # the region returns the id and the label; DataFusion joins stars back
-    assert "Projection: r.id, kind" in query.logical
-    assert "HashJoinExec" in query.explain()
+    assert "Projection: r.id, r.stars, kind" in query.logical
+    assert "HashJoinExec" not in query.explain()
     rows = finish(query, ORACLE).collect()
     assert rows.sort_by("r.id").to_pylist() == [
         {"r.id": "r0", "r.stars": 5, "kind": "a"},
         {"r.id": "r1", "r.stars": 2, "kind": "a"},
         {"r.id": "r2", "r.stars": 4, "kind": "a"}]
-    # a label read beside a joined column is DataFusion's string, as it
-    # was when the region returned the column itself
+    # a label read beside a table's column is DataFusion's string
     assert rows.schema.field("kind").type == pa.string()
 
 
-# DataFusion builds the join back's hash table on the small tables, or,
-# without join reordering, on the region's rows; either way its dynamic
-# filters must keep every pair
-@pytest.mark.parametrize("reordering", ["true", "false"])
 def test_an_ai_join_returns_each_matching_pair_once_with_both_tables_columns(
-        session, monkeypatch, reordering):
+        session, monkeypatch):
     monkeypatch.setenv("DATAFUSION_OPTIMIZER_ENABLE_DYNAMIC_FILTER_PUSHDOWN", "true")
-    monkeypatch.setenv("DATAFUSION_OPTIMIZER_JOIN_REORDERING", reordering)
     query = session.sql(
         "SELECT r.id, r.stars, p.id, p.text FROM reviews r JOIN products p "
         "ON AI_FILTER(PROMPT('m {0} {1}', r.body, p.text)) ORDER BY r.id, p.id")

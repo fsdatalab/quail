@@ -190,9 +190,8 @@ def test_relational_plans_build_and_run(tmp_path):
         # an aggregate with no measures is a DISTINCT, which the filter
         # stops per trajectory
         query = build_query(sess, get_query("REL-AGENT-3"))
-        # the region returns the id; DataFusion joins trajectory_id back
         assert [column.column for column in operators_of(query).projection.columns
-                ] == ["id"]
+                ] == ["trajectory_id"]
         explained = query.explain()
         assert "gby=[trajectory_id@0 as trajectory_id], aggr=[]" in explained
         assert "stop per key: trajectory_id" in explained

@@ -14,7 +14,6 @@ use quail_planner::error::CompileError;
 
 use super::ModelRegion;
 use super::inputs::{numbered, split_inputs};
-use super::join_back::join_back;
 use super::lift::lift_relational;
 use super::shared::SharedInput;
 use crate::ai::AiNode;
@@ -36,10 +35,10 @@ pub(crate) use super::lowering::lower_regions;
 ///
 /// A region's inputs are the parts DataFusion computes for it: each
 /// table's plain filters, and each CTE or FROM subquery that groups or
-/// windows rows or that the region does not read through. The claim
-/// joins a region's answers back to the columns its tables hold, and
-/// the session's optimizer then runs once more, over the regions as
-/// single operators, to prune and place that work.
+/// windows rows or that the region does not read through. A region
+/// returns the columns of its tables that the query above reads, beside
+/// its answers. The session's optimizer then runs once more, over the
+/// regions as single operators, to prune and place the work above them.
 ///
 /// # Errors
 ///
@@ -711,11 +710,9 @@ fn claim_run(
         let (bound, inputs) = split_inputs(selected)?;
         let numbered_inputs = numbered(&bound);
         let (bound, above) = lift_relational(bound)?;
-        let names: Vec<String> = inputs.iter().map(|(name, _)| name.clone()).collect();
-        let (bound, back) = join_back(bound, &names)?;
-        Ok::<_, datafusion::common::DataFusionError>((bound, inputs, numbered_inputs, above, back))
+        Ok::<_, datafusion::common::DataFusionError>((bound, inputs, numbered_inputs, above))
     })();
-    let (bound, inputs, numbered_inputs, above, back) = match shaped {
+    let (bound, inputs, numbered_inputs, above) = match shaped {
         Ok(shaped) => shaped,
         Err(error) => return Ok(Err(error.strip_backtrace())),
     };
@@ -735,21 +732,15 @@ fn claim_run(
     // test or UNNEST keeps of them
     region.fetch =
         fetch.filter(|_| above.keeps_rows() && !crate::ai::any_filters_on_or(&region.plan));
-    let shared = back.inputs();
-    let mut read = Vec::new();
     for (name, input) in inputs {
         let mut input = claim_regions(input, None)?;
-        let numbered = numbered_inputs.contains(&name);
-        if numbered || shared.contains(&name) {
-            input = extension_node(SharedInput::try_new(input, numbered)?);
+        if numbered_inputs.contains(&name) {
+            input = extension_node(SharedInput::try_new(input, true)?);
         }
-        read.push((name.clone(), input.clone()));
         region.inputs.push(input);
         region.input_names.push(name);
     }
-    above
-        .build(back.build(extension_node(region), &read)?)
-        .map(Ok)
+    above.build(extension_node(region)).map(Ok)
 }
 
 /// A plan that returns the rows of the run of `AiNode`s at `plan`'s root

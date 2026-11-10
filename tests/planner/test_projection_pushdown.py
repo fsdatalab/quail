@@ -45,12 +45,11 @@ def test_projected_results_token_reuse_and_join_projection(tmp_path):
     result = _run(query, make_executor(truth))
 
     assert sorted(result.to_rows()) == [(3, "r2"), (5, "r0")]
-    # the region reads the id; DataFusion joins stars back on it
     (scan,) = query.facts()["scans"]
-    assert scan["columns"] == ["id"]
+    assert scan["columns"] == ["stars", "id"]
     store = query.token_inputs()["r"]
-    # the id, then the document, which locates answers
-    assert store.projected_columns == ("id", "review")
+    # the columns the query returns, then the document
+    assert store.projected_columns == ("stars", "id", "review")
     # a later query reads the same token store instead of tokenizing again
     tokenized = _token_buffer(store)
 

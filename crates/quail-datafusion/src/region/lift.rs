@@ -15,8 +15,6 @@
 //! p.stars` over an AI join leaves the SELECT list `r.id`, `p.name`,
 //! `r.stars`, and `p.stars` below the operators above; DataFusion keeps
 //! the rows with `r.stars < p.stars` and computes `name`.
-//! [`crate::region::join_back`] then splits that list into the region's ids
-//! and answers and the join that adds `p.name` and the stars back.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;

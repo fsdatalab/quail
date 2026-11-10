@@ -2,8 +2,8 @@
 //!
 //! - `claim`: `claim_model_regions`, which cuts each region out
 //!   of the optimized plan.
-//! - `lift`, `join_back`, `shared`: the operators DataFusion keeps above
-//!   a region, and the inputs that a region and its parent both read.
+//! - `lift`, `shared`: the operators DataFusion keeps above
+//!   a region, and the numbered rows DataFusion computes for one.
 //! - `region_hint`: the tests above a region that may drop its rows.
 //! - `exec`: `ModelRegionExec`, which hands a region to a `RegionRunner`.
 //! - this module: the `ModelRegion` logical node.
@@ -13,7 +13,6 @@ pub(crate) mod exec;
 pub(crate) mod identified;
 mod inputs;
 mod join;
-pub(crate) mod join_back;
 pub(crate) mod lift;
 mod lowering;
 pub mod region_hint;

@@ -8,20 +8,18 @@
 //! calls from `gather_filters_for_pushdown`). When the child has two
 //! columns of one name, the filter reads the first, whichever column
 //! the join reads. A model region over two tables returns two id
-//! columns of one name, such as `r.id` and `p.id`, so the join that adds
-//! the tables' other columns back gives each id a name of its own
-//! (`join_back.rs`).
+//! columns of one name, such as `r.id` and `p.id`, so it takes no
+//! dynamic filter that reads either (`ModelRegionExec`).
 //!
 //! The first test reproduces the bug with DataFusion's operators alone.
-//! It fails once DataFusion maps the columns by position; the renaming
-//! in `join_back.rs` can then go.
+//! It fails once DataFusion maps the columns by position; the region
+//! can then take those filters.
 
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::config::ConfigOptions;
-use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{Constraint, Constraints, JoinType, NullEquality, Result};
 use datafusion::datasource::MemTable;
 use datafusion::datasource::memory::MemorySourceConfig;
@@ -34,8 +32,7 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
 use datafusion::prelude::SessionContext;
 use quail_datafusion::{
-    IdentifiedTable, InputStream, ModelRegion, ModelRegionExec, RegionBatches, RegionRunner,
-    session_context,
+    IdentifiedTable, InputStream, ModelRegion, RegionBatches, RegionRunner, session_context,
 };
 
 fn text_schema(columns: &[&str]) -> Arc<Schema> {
@@ -105,10 +102,14 @@ async fn datafusion_filters_the_first_of_two_columns_of_one_name() -> Result<()>
     assert_eq!(
         rows,
         0,
-        "DataFusion now keeps the pairs; drop the renaming in join_back.rs:\n{}",
+        "DataFusion now keeps the pairs; let ModelRegionExec take the filter:\n{}",
         displayable(plan.as_ref()).indent(true)
     );
     Ok(())
+}
+
+fn int_array(values: &[i64]) -> Arc<dyn Array> {
+    Arc::new(Int64Array::from(values.to_vec()))
 }
 
 /// Stands in for Quail's executor: the model keeps the pairs of reviews
@@ -130,9 +131,13 @@ impl RegionRunner for KeepsTwoReviews {
             .any(|(qualifier, _)| qualifier.is_some_and(|found| found.table() == "p"));
         let columns = schema
             .iter()
-            .map(|(qualifier, _)| {
-                let values = match qualifier.map(|found| found.table()) {
-                    Some("p") => vec!["p0", "p1", "p0", "p1"],
+            .map(|(qualifier, field)| {
+                let product = qualifier.is_some_and(|found| found.table() == "p");
+                let values = match (product, field.name().as_str()) {
+                    (_, "stars") if pairs => return int_array(&[5, 5, 4, 4]),
+                    (_, "stars") => return int_array(&[5, 4]),
+                    (true, "text") => vec!["x", "y", "x", "y"],
+                    (true, _) => vec!["p0", "p1", "p0", "p1"],
                     _ if pairs => vec!["r0", "r0", "r2", "r2"],
                     _ => vec!["r0", "r2"],
                 };
@@ -197,35 +202,18 @@ async fn run(context: &SessionContext, query: &str) -> Result<(Arc<dyn Execution
     Ok((plan, rows))
 }
 
-/// Whether a hash join in `plan` builds its table from the region's rows.
-fn builds_on_the_region(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    let contains_region = |plan: &Arc<dyn ExecutionPlan>| {
-        let mut found = false;
-        plan.apply(|node| {
-            found |= node.is::<ModelRegionExec>();
-            Ok(TreeNodeRecursion::Continue)
-        })
-        .expect("a plan walk");
-        found
-    };
-    let mut found = false;
-    plan.apply(|node| {
-        if let Some(join) = node.downcast_ref::<HashJoinExec>() {
-            found |= contains_region(join.left()) && !contains_region(join.right());
-        }
-        Ok(TreeNodeRecursion::Continue)
-    })
-    .expect("a plan walk");
-    found
-}
-
 const DYNAMIC_FILTERS: &str = "SET datafusion.optimizer.enable_dynamic_filter_pushdown = true";
 
 #[tokio::test]
-async fn an_ai_join_returns_its_pairs_with_the_region_on_either_side_of_the_join_back() -> Result<()>
-{
-    let query = "SELECT r.id, r.stars, p.id, p.text FROM reviews r JOIN products p \
-        ON AI_FILTER(PROMPT('m {0} {1}', r.body, p.text)) ORDER BY r.id, p.id";
+async fn an_ai_join_returns_its_tables_other_columns_without_a_join_above() -> Result<()> {
+    let context = context(&[DYNAMIC_FILTERS]).await?;
+    let (plan, rows) = run(
+        &context,
+        "SELECT r.id, r.stars, p.id, p.text FROM reviews r JOIN products p \
+            ON AI_FILTER(PROMPT('m {0} {1}', r.body, p.text)) ORDER BY r.id, p.id",
+    )
+    .await?;
+    let text = displayable(plan.as_ref()).indent(true).to_string();
     let expected = [
         "+----+-------+----+------+",
         "| id | stars | id | text |",
@@ -237,22 +225,8 @@ async fn an_ai_join_returns_its_pairs_with_the_region_on_either_side_of_the_join
         "+----+-------+----+------+",
     ]
     .join("\n");
-    let mut sides = Vec::new();
-    // with its statistics, DataFusion builds on the small tables; without
-    // them, on the region's rows, the join back's left side
-    for reordering in [true, false] {
-        let setting = format!("SET datafusion.optimizer.join_reordering = {reordering}");
-        let context = context(&[DYNAMIC_FILTERS, &setting]).await?;
-        let (plan, rows) = run(&context, query).await?;
-        assert_eq!(
-            rows,
-            expected,
-            "{}",
-            displayable(plan.as_ref()).indent(true)
-        );
-        sides.push(builds_on_the_region(&plan));
-    }
-    assert_eq!(sides, [false, true]);
+    assert_eq!(rows, expected, "{text}");
+    assert!(!text.contains("HashJoinExec"), "{text}");
     Ok(())
 }
 
@@ -270,6 +244,9 @@ async fn a_join_with_a_plain_table_filters_the_regions_rows_by_the_tables_keys()
     // the sort below the join applies the tags' product ids to the
     // region's rows
     assert!(text.contains("FilterExec: DynamicFilter"), "{text}");
+    // the region has two columns named id, so it does not take the test
+    assert!(!text.contains("hint=["), "{text}");
+    eprintln!("{text}");
     let expected = [
         "+----+----+",
         "| id | id |",

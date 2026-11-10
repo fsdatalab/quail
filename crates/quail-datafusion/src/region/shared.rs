@@ -1,14 +1,11 @@
-//! `SharedInput`: a region input that the region and the join above it
-//! read once.
+//! `SharedInput`: a region input whose rows are computed once and
+//! numbered.
 //!
-//! A model region returns the id column of each table it reads and its
-//! answers; DataFusion joins each table back on its id above the region
-//! ([`crate::region::join_back`]). When DataFusion computes a table's rows for
-//! the region, such as a table's plain filters or a CTE that groups
-//! rows, the region and the join read the same `SharedInput`: its rows
-//! are computed once, by whichever reads first, and both read those
-//! rows. An input without an id column gets one, [`ROW_COLUMN`], each
-//! row's position among those rows.
+//! A model region names each row it returns by its table's id column.
+//! An input DataFusion computes for the region without one, such as a
+//! join or a CTE that groups rows, gets [`ROW_COLUMN`], each row's
+//! position among those rows. Every reader of one `SharedInput` reads
+//! the same rows, computed by whichever reads first.
 
 use std::collections::HashMap;
 use std::fmt;

@@ -482,16 +482,6 @@ def test_user_row_column_is_not_a_generated_identity(constant_model):
     assert table.column(0).to_pylist() == ([1, 2, 3, 4] if truth else [])
 
 
-def test_join_back_identity_does_not_shadow_a_selected_answer(constant_model):
-    context, _ = constant_model
-    table = context.sql(
-        f"SELECT r.id, r.stars, {CLASSIFY} AS __quail_key_r FROM r ORDER BY r.id"
-    )
-    assert list(zip(*(column.to_pylist() for column in table.columns))) == [
-        (f"r{i}", i + 1, "a") for i in range(4)
-    ]
-
-
 def test_generated_names_do_not_shadow_user_columns(constant_model):
     context, truth = constant_model
     table = context.sql(

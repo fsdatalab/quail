@@ -4,7 +4,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{Field, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::Session;
 use datafusion::common::config::ConfigOptions;
@@ -16,6 +16,7 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
 use datafusion::physical_expr::expressions::DynamicFilterPhysicalExpr;
+use datafusion::physical_expr::utils::collect_columns;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execute_stream;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -220,6 +221,7 @@ impl ExecutionPlan for ModelRegionExec {
         // the operators above still apply every filter: the region only
         // may drop the rows a filter rejects
         let filters = vec![PushedDown::No; child_pushdown_result.parent_filters.len()];
+        let schema = self.schema();
         let dynamic: Vec<Arc<dyn PhysicalExpr>> = child_pushdown_result
             .parent_filters
             .into_iter()
@@ -227,6 +229,16 @@ impl ExecutionPlan for ModelRegionExec {
             .filter(|test| {
                 test.exists(|expr| Ok(expr.downcast_ref::<DynamicFilterPhysicalExpr>().is_some()))
                     .unwrap_or(false)
+            })
+            // DataFusion 55.2 maps a filter's columns into a child by
+            // name, so a test of one of two columns of one name, such as
+            // `r.id` and `p.id`, may read the other
+            // (tests/integration/dynamic_filter.rs)
+            .filter(|test| {
+                collect_columns(test).iter().all(|column| {
+                    let named = |field: &&Arc<Field>| field.name() == column.name();
+                    schema.fields().iter().filter(named).count() == 1
+                })
             })
             .collect();
         let propagation = FilterPushdownPropagation::with_parent_pushdown_result(filters);

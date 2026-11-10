@@ -18,20 +18,16 @@ SortPreservingMergeExec: [n@1 DESC NULLS LAST, test_result@0 ASC NULLS LAST]
             AggregateExec: mode=Partial, gby=[test_result@1 as AI.CLASSIFY(prompt(Utf8("Judge strictly from the agent trace above what the most recent test or reproduction run showed.
 
 {0}"), t.trace),make_array(struct(Utf8("bug fixed, tests pass"), Utf8("the reported bug no longer occurs and other tests pass")), struct(Utf8("bug still occurs"), Utf8("the reported bug still happens")), struct(Utf8("bug fixed, other tests fail"), Utf8("the reported bug no longer occurs but other tests fail")), struct(Utf8("run errored"), Utf8("the run crashed or errored before testing anything"))))], aggr=[count(Int64(1)), count(DISTINCT t.trajectory_id)]
-              HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(id@0, __quail_key_t@1)], projection=[trajectory_id@1, test_result@2]
-                CoalescePartitionsExec
-                  DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
-                RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
-                  ProjectionExec: expr=[test_result@0 as test_result, id@1 as __quail_key_t]
-                    ModelRegionExec: hint=[DynamicFilter [ empty ]]
+              RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+                ModelRegionExec
 
 model region:
 logical:
-  Projection: test_result, t.id
+  Projection: t.trajectory_id, test_result
     AiNode: test_result = ai_classify(prompt(Utf8("Judge strictly from the agent trace above what the most recent test or reproduction run showed.\n\n{0}"), t.trace), make_array(struct(Utf8("bug fixed, tests pass"), Utf8("the reported bug no longer occurs and other tests pass")), struct(Utf8("bug still occurs"), Utf8("the reported bug still happens")), struct(Utf8("bug fixed, other tests fail"), Utf8("the reported bug no longer occurs but other tests fail")), struct(Utf8("run errored"), Utf8("the run crashed or errored before testing anything"))))
       AiNode: __quail_column_1 = ai_classify(prompt(Utf8("Judge strictly from the agent trace above how far the agent has gotten so far.\n\n{0}"), t.trace), make_array(struct(Utf8("has not located the relevant code"), Utf8("has not yet found the code that causes the issue")), struct(Utf8("located the relevant code"), Utf8("found the code that causes the issue but has not changed it")), struct(Utf8("changed the code, not checked"), Utf8("edited the code but has not run a test or reproduction since")), struct(Utf8("changed the code, check passes"), Utf8("edited the code and the latest test or reproduction run succeeds")), struct(Utf8("changed the code, check fails"), Utf8("edited the code and the latest test or reproduction run still fails")))), filter: hint(__quail_column_1 = Utf8("changed the code, not checked") OR __quail_column_1 = Utf8("changed the code, check passes") OR __quail_column_1 = Utf8("changed the code, check fails"), named_struct(Utf8("selectivity"), Float64(0.3606094808126411)))
         SubqueryAlias: t
-          TableScan: agent_traces projection=[trace, trajectory_id, id]
+          TableScan: agent_traces projection=[trace, trajectory_id]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens

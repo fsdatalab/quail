@@ -559,31 +559,20 @@ async fn a_plain_expression_in_select_runs_in_datafusion_above_the_region() -> R
 }
 
 #[tokio::test]
-async fn a_table_without_a_key_is_numbered_and_joined_back_on_its_rows() -> Result<()> {
+async fn a_table_without_a_key_is_numbered_and_its_columns_come_from_the_region() -> Result<()> {
     let context = context()?;
     let query = "SELECT r.id, a.aspect FROM reviews r \
         JOIN aspects a ON AI.IF(PROMPT('Does {0} discuss {1}?', r.body, a.aspect))";
     let plan = optimized(&context, query).await?;
     let [region] = <[ModelRegion; 1]>::try_from(regions(&plan)).unwrap();
-    // the region returns the review's key and the aspect's row number
+    let text = plan.display_indent().to_string();
     assert_eq!(
         lines(&region.plan)[0],
-        "Projection: r.id, a.__quail_row",
-        "{}",
-        plan.display_indent()
-    );
-    // the join above reads the aspects through the region's shared input
-    let text = plan.display_indent().to_string();
-    assert!(
-        text.contains("Inner Join: __quail_key_a = a.__quail_row"),
+        "Projection: r.id, a.aspect",
         "{text}"
     );
-    let shared: Vec<&str> = lines(&plan)
-        .iter()
-        .filter(|line| line.starts_with("SharedInput: "))
-        .map(|line| text.matches(line.as_str()).next().unwrap_or_default())
-        .collect();
-    assert_eq!(shared.len(), 2, "{text}");
-    assert_eq!(shared[0], shared[1], "{text}");
+    // DataFusion numbers the aspects' rows once and adds no join
+    assert_eq!(text.matches("SharedInput: ").count(), 1, "{text}");
+    assert!(!text.contains("Join: "), "{text}");
     Ok(())
 }

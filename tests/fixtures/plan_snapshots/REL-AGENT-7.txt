@@ -22,19 +22,15 @@ Instruction: answer TRUE if the agent has implemented a plausible fix that direc
 {0}
 
 Instruction: answer TRUE if the agent has implemented a plausible fix that directly addresses the reported issue. Answer FALSE otherwise."), t.trace))), count(Int64(1))]
-              HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(id@0, __quail_key_t@1)], projection=[trajectory_id@1, __quail_call_1@2]
-                CoalescePartitionsExec
-                  DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
-                RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
-                  ProjectionExec: expr=[__quail_call_1@0 as __quail_call_1, id@1 as __quail_key_t]
-                    ModelRegionExec: hint=[DynamicFilter [ empty ]]
+              RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+                ModelRegionExec
 
 model region:
 logical:
-  Projection: __quail_call_1, t.id
+  Projection: t.trajectory_id, __quail_call_1
     AiNode: __quail_call_1 = ai_score(prompt(Utf8("Judge strictly from the agent trace above whether, by the end of the trace, the agent has implemented a plausible fix that directly addresses the reported issue. A fix must include a code or configuration change whose purpose is to correct the issue. Inspection, reproduction, tests without a fix, and unrelated edits do not count.\n\n{0}\n\nInstruction: answer TRUE if the agent has implemented a plausible fix that directly addresses the reported issue. Answer FALSE otherwise."), t.trace))
       SubqueryAlias: t
-        TableScan: agent_traces projection=[trace, trajectory_id, id]
+        TableScan: agent_traces projection=[trace, trajectory_id]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
