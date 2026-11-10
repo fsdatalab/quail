@@ -44,7 +44,7 @@ def test_stage_cut_rejects_invalid_graph_in_subprocess(kind, message):
             "value_type": "rows", "source": source, "schema": [],
         }]
     # Keep a regression to stack overflow isolated from the pytest process.
-    code = """
+    script_text = """
 import resource
 import sys
 import _quail_native
@@ -57,7 +57,7 @@ else:
     raise AssertionError('invalid graph was accepted')
 """
     result = subprocess.run(
-        [sys.executable, "-c", code, json.dumps(graph), message],
+        [sys.executable, "-c", script_text, json.dumps(graph), message],
         capture_output=True, text=True, timeout=20,
     )
     assert result.returncode == 0, result.stderr

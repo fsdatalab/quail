@@ -45,7 +45,7 @@ NATIVE_SOURCE = "/opt/quail-native"
 MATURIN = "maturin>=1.9,<2"
 # the native module alone, as a project: the image mounts the quail
 # package from source
-NATIVE_PROJECT = """\
+NATIVE_PROJECT_TEXT = """\
 [build-system]
 requires = ["maturin>=1.9,<2"]
 build-backend = "maturin"
@@ -96,7 +96,8 @@ def _with_native_planner(image: modal.Image) -> modal.Image:
             .add_local_dir(REPOSITORY / "crates", f"{NATIVE_SOURCE}/crates", copy=True)
             .uv_pip_install(MATURIN, uv_version=UV_VERSION)
             .run_commands(
-                f"cat > {NATIVE_SOURCE}/pyproject.toml <<'EOF'\n{NATIVE_PROJECT}EOF",
+                f"cat > {NATIVE_SOURCE}/pyproject.toml <<'EOF'\n"
+                f"{NATIVE_PROJECT_TEXT}EOF",
                 # an image builds once: Cargo's default release settings,
                 # not the workspace's fast-rebuild ones
                 f"cd {NATIVE_SOURCE} && PATH=$HOME/.cargo/bin:$PATH "
