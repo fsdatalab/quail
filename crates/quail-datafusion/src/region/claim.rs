@@ -799,9 +799,11 @@ fn isolate_chain(plan: &LogicalPlan) -> Result<Option<(LogicalPlan, Vec<Expr>)>>
                 .map_or_else(String::new, |relation| relation.table().to_string())
         })
         .collect();
+    // a computed column has no relation of its own
+    qualifiers.retain(|qualifier| !qualifier.is_empty());
     qualifiers.dedup();
     let name = match qualifiers.as_slice() {
-        [one] if !one.is_empty() => one.clone(),
+        [one] => one.clone(),
         _ => format!("__quail_rows_{number}"),
     };
     let input = datafusion::logical_expr::LogicalPlanBuilder::from(bottom.clone())
@@ -888,12 +890,10 @@ fn claim_run(
             plan.display()
         )));
     }
-    match derive_error(&bound) {
-        // a shape the binder does not read may run in smaller parts
-        Some(error) if error.is_unsupported() => return Ok(Err(error.to_string())),
-        // any other error is the query's own
-        Some(error) => return plan_err!("{}", error.message()),
-        None => {}
+    // a shape the binder does not read may run in smaller parts; any
+    // other error is the query's own, reported when the region is planned
+    if let Some(error) = derive_error(&bound).filter(CompileError::is_unsupported) {
+        return Ok(Err(error.to_string()));
     }
     let mut region = ModelRegion::new(bound);
     // a fetch counts the rows the region returns, not the rows a lifted
@@ -945,11 +945,15 @@ fn simpler_run(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
             nodes.push(found);
             bottom = found.input.as_ref();
         }
-        if nodes.iter().any(|found| found.hint_test.is_some()) {
+        if nodes
+            .iter()
+            .any(|found| found.hint_test.is_some() || !found.tests.is_empty())
+        {
             let mut run = bottom.clone();
             for found in nodes.iter().rev() {
                 let mut found = (*found).clone();
                 found.hint_test = None;
+                found.tests = Vec::new();
                 run = extension_node(found.with_input(run)?);
             }
             return Ok(Some(run));
