@@ -84,8 +84,12 @@ def test_a_classification_in_a_derived_table_and_outside_it_labels_each_row_once
     # without the rule, the derived table is a model region of its own
     assert len(sessions[1].sql(sql).regions()) == 2
     on, off = (_rows_and_questions(session, sql) for session in sessions)
-    assert on[0] == off[0] == [(f"r{index}", label, label) for index, label in
-                               enumerate("ababab")]
+    assert on[0] == [(f"r{index}", label, label) for index, label in
+                     enumerate("ababab")]
+    # the oracle labels a row by its position in the region's input, and
+    # the outer region reads the derived table's rows in the order they
+    # arrive, so only the inner label is fixed
+    assert [row[:2] for row in off[0]] == [row[:2] for row in on[0]]
     # without the rule, the outer call labels every row again
     assert (on[1], off[1]) == (6, 12)
 

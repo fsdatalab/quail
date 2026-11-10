@@ -68,17 +68,11 @@ pub fn claim_model_regions(plan: LogicalPlan, session: &dyn Session) -> Result<L
         }
         _ => {}
     }
-    if std::env::var("QUAIL_DEBUG").is_ok() {
-        eprintln!("CLAIM:\n{}", plan.display_indent());
-    }
     if !calls_ai(&plan)? {
         // the analyzer has already made a fallback column's region
         return number_regions(drop_unread_probabilities(plan)?);
     }
     let claimed = number_regions(drop_unread_probabilities(claim_regions(plan, None)?)?)?;
-    if std::env::var("QUAIL_DEBUG").is_ok() {
-        eprintln!("CLAIMED:\n{}", claimed.display_indent());
-    }
     // DataFusion 55.2's `push_down_leaf_projections` fails on the join the
     // claim builds above a region: it moves a struct field read below the
     // join and then names the region's `r.id` beside the table's. The
@@ -93,22 +87,10 @@ pub fn claim_model_regions(plan: LogicalPlan, session: &dyn Session) -> Result<L
         })
         .cloned()
         .collect();
-    let optimized = state
+    state
         .analyzer()
         .execute_and_check(claimed, state.config_options(), |_, _| {})
-        .and_then(|plan| {
-            Optimizer::with_rules(rules).optimize(plan, state, |plan, rule| {
-                if std::env::var("QUAIL_DEBUG").is_ok() {
-                    eprintln!("AFTER {}:\n{}", rule.name(), plan.display_indent());
-                }
-            })
-        });
-    if std::env::var("QUAIL_DEBUG").is_ok()
-        && let Err(error) = &optimized
-    {
-        eprintln!("OPTIMIZE ERROR: {error:?}");
-    }
-    optimized
+        .and_then(|plan| Optimizer::with_rules(rules).optimize(plan, state, |_, _| {}))
 }
 
 /// Number occurrences, not plan contents: identical sibling regions still run
@@ -295,9 +277,7 @@ fn claim_needed(
     if !calls_ai(&plan)? {
         return Ok(plan);
     }
-    if ai_only()
-        && let Some((chain, restore)) = isolate_chain(&plan)?
-    {
+    if let Some((chain, restore)) = isolate_chain(&plan)? {
         // the run's own names for the needed columns, by position
         let renamed = needed.as_ref().map(|needed| {
             plan.schema()
@@ -326,24 +306,13 @@ fn claim_needed(
         )?));
     }
     let mut refused = None;
-    let kept = if ai_only() {
-        as_node::<AiNode>(&plan).is_none()
-    } else {
-        kept_by_datafusion(&plan)?
-    };
-    if !kept {
-        let selected = select_list(plan.clone(), needed.clone().filter(|_| ai_only()))?;
+    if as_node::<AiNode>(&plan).is_some() {
+        let selected = select_list(plan.clone(), needed.clone())?;
         let (bound, inputs, _) = split_inputs(selected)?;
         let numbered_inputs = numbered(&bound);
         let (bound, above) = lift_relational(bound)?;
         let names: Vec<String> = inputs.iter().map(|(name, _)| name.clone()).collect();
-        if std::env::var("QUAIL_DEBUG").is_ok() {
-            eprintln!("LIFTED:\n{}", bound.display_indent());
-        }
         let (bound, back) = join_back(bound, &names)?;
-        if std::env::var("QUAIL_DEBUG").is_ok() {
-            eprintln!("REGION:\n{}", bound.display_indent());
-        }
         if calls_ai(&bound)? && quail_plans(&bound)? {
             refused = refusal_of(&bound);
             if refused.is_none() {
@@ -786,17 +755,14 @@ pub(super) fn is_subquery(expr: &Expr) -> bool {
     }
 }
 
-/// SPIKE: whether regions hold AI operators only.
-pub(crate) fn ai_only() -> bool {
-    std::env::var("QUAIL_AI_ONLY").is_ok()
-}
-
 static NEXT_ROWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// SPIKE: the run of `AiNode`s at `plan`'s root over its input as an
-/// opaque relation DataFusion computes, and the columns that restore the
-/// run's own names. None for an AI join or a run already over such a
-/// relation.
+/// The run of `AiNode`s at `plan`'s root over its input as rows
+/// DataFusion computes, and the columns that restore the run's own
+/// names above it.
+///
+/// None when the run reads its input as it stands: an AI join's two
+/// sides, one table ([`is_table`]), or rows already cut off.
 fn isolate_chain(plan: &LogicalPlan) -> Result<Option<(LogicalPlan, Vec<Expr>)>> {
     let mut nodes = Vec::new();
     let mut bottom = plan;
@@ -811,9 +777,6 @@ fn isolate_chain(plan: &LogicalPlan) -> Result<Option<(LogicalPlan, Vec<Expr>)>>
         && as_node::<SharedInput>(alias.input.as_ref()).is_some()
     {
         return Ok(None);
-    }
-    if std::env::var("QUAIL_DEBUG").is_ok() {
-        eprintln!("WRAP bottom:\n{}", bottom.display_indent());
     }
     let columns = bottom.schema().columns();
     let renamed: Vec<Expr> = columns
@@ -871,8 +834,8 @@ fn isolate_chain(plan: &LogicalPlan) -> Result<Option<(LogicalPlan, Vec<Expr>)>>
     Ok(Some((input, restore)))
 }
 
-/// SPIKE: whether `plan` reads one table and calls no model, which a
-/// region reads as an input by itself, with the table's id column.
+/// Whether `plan` reads one table and calls no model: a region reads it
+/// as an input with the table's own id column.
 fn is_table(plan: &LogicalPlan) -> bool {
     let mut num_scans = 0;
     let _ = plan.apply(|node| {

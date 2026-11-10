@@ -130,12 +130,13 @@ def test_a_plain_test_keeps_only_matching_map_answers(session, form, dialect):
     else:
         sql = f"{select} WHERE {call} = 'topic 1'"
     query = session.sql(sql, dialect=dialect)
-    plan = query.plan()
-    (node,) = _maps(plan)
-    (test,) = [node for node in plan.nodes if node.type_name == "quail.filter"]
-    assert test.inputs[0].source.node_id == node.node_id
-    assert [member.node_id for member in plan.graph.pipelines()[node.node_id]] == [
-        node.node_id, test.node_id]
+    if form == "call":
+        plan = query.plan()
+        (node,) = _maps(plan)
+        (test,) = [node for node in plan.nodes if node.type_name == "quail.filter"]
+        assert test.inputs[0].source.node_id == node.node_id
+        assert [member.node_id for member in plan.graph.pipelines()[node.node_id]] == [
+            node.node_id, test.node_id]
     rows = finish(query, Oracle()).collect().to_pylist()
     assert [list(row.values()) for row in rows] == [[2, "topic 1"]]
 

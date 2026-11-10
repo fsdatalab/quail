@@ -5,13 +5,10 @@ SortExec: TopK(fetch=20), expr=[recovered_score@1 DESC NULLS LAST, id@0 ASC NULL
 
 model region:
 logical:
-  Projection: t.id, ai_score(prompt(Utf8("Judge strictly from the agent trace above whether the agent recovered after pursuing an approach that did not work. Recovery means the agent recognized or moved past the unsuccessful approach and then made useful progress with a different or corrected approach.
-  
-  {0}
-  
-  Instruction: answer TRUE if the trace shows the agent recovering after an unsuccessful approach, FALSE otherwise."), t.trace)) AS recovered_score
-    SubqueryAlias: t
-      TableScan: agent_traces projection=[id, trace]
+  Projection: t.id, recovered_score
+    AiNode: recovered_score = ai_score(prompt(Utf8("Judge strictly from the agent trace above whether the agent recovered after pursuing an approach that did not work. Recovery means the agent recognized or moved past the unsuccessful approach and then made useful progress with a different or corrected approach.\n\n{0}\n\nInstruction: answer TRUE if the trace shows the agent recovering after an unsuccessful approach, FALSE otherwise."), t.trace))
+      SubqueryAlias: t
+        TableScan: agent_traces projection=[id, trace]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
