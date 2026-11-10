@@ -110,9 +110,14 @@ already passes, and this query does not need the remaining text.
 
 Quail recognizes literal prefix tests and comparisons with answer text.
 It also handles null tests and integer comparisons with answer length.
-It combines these through SQL boolean operators. Unsupported expressions
-wait for the complete answer. An extraction's possible completions must
-continue a span of its document.
+It combines these through SQL boolean operators. An extraction's
+possible completions must continue a span of its document.
+
+When those forms leave a test undecided and few complete answers are
+still possible, DataFusion evaluates the test on each one. This decides
+any expression of the answer, such as `answer LIKE '%2027%'`, for an
+extraction with few places left to copy from. Any other expression waits
+for the complete answer.
 
 See [partial.rs](https://github.com/fsdatalab/quail/blob/main/crates/quail-datafusion/src/partial.rs)
 for supported expression forms.
