@@ -837,8 +837,14 @@ fn lower_projection(
                         .strip_suffix(SPAN_SUFFIX)
                         .unwrap_or(&alias.name)
                         .to_string()
-                } else {
+                } else if columns.selected.iter().any(|(found, _)| *found == call)
+                    || input.schema().has_column_with_unqualified_name(&alias.name)
+                {
                     columns.name_for(&call)
+                } else {
+                    // the SELECT list's own name for the call
+                    columns.reserved.insert(alias.name.clone());
+                    alias.name.clone()
                 };
                 if input.schema().has_column_with_unqualified_name(&name) {
                     exprs.push(expr.clone());
