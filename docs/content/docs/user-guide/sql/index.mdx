@@ -29,8 +29,9 @@ Use `dialect="snowflake"` for Snowflake syntax, the default.
 
 ## SQL around the model's work
 
-A *model region* contains AI calls and the operators Quail runs with
-them. DataFusion runs the rest of the query.
+A *model region* contains AI calls that read the same rows, and AI
+joins. DataFusion runs every other operator: plain filters, joins,
+grouping, sorting, and limits.
 
 E.g., classify reviews with more than three stars and count each label:
 

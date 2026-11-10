@@ -60,8 +60,8 @@ WHERE AI.IF(PROMPT('Does this review mention a positive aspect? {0}', r.body))
 ```
 
 Use `AND` when every filter must pass. Calls that read the same document
-can share model-region work. Other expression shapes use the
-[SQL fallback](/docs/user-guide/sql/sql-functions#unsupported-sql).
+can share model-region work. In any other expression, each call
+[runs by itself](/docs/user-guide/sql/sql-functions#ai-calls-in-any-sql).
 
 `NOT AI.IF(...)` keeps the rows the model answers no for. It is the same
 filter: Quail orders it by cost with the other filters, and a `LIMIT`
@@ -75,7 +75,8 @@ FROM reviews r
 WHERE NOT AI.IF(PROMPT('Does this review discuss the ending? {0}', r.body));
 ```
 
-`NOT AI.IF(...)` over joined rows uses the SQL fallback.
+`NOT AI.IF(...)` over joined rows asks the model about each pair, and
+DataFusion keeps the pairs it answers no for.
 
 E.g., if `reviews` also has a boolean `flagged` column, keep flagged
 reviews or reviews that mention a refund:
@@ -94,8 +95,8 @@ for `AND`, and each call is asked only about the rows no earlier term
 passed.
 
 Other disjunctions, including score comparisons and predicates over joined
-inputs, use the [SQL fallback](/docs/user-guide/sql/sql-functions#unsupported-sql)
-when they cannot form an optimized model region. DataFusion evaluates the
+inputs, [run each call by itself](/docs/user-guide/sql/sql-functions#ai-calls-in-any-sql)
+when the calls cannot share a model region. DataFusion evaluates the
 condition over named AI answers; this path need not skip model calls just
 because another term is already true.
 
@@ -184,7 +185,7 @@ JOIN documents d ON AI.SCORE(
 ```
 
 The optimized pair-scoring path uses `{0}` exactly once. Other prompt
-shapes use the SQL fallback over materialized pairs.
+shapes score the pairs DataFusion computes.
 Use `CROSS JOIN` with `AI.SCORE` in `SELECT` to return unfiltered pair scores.
 A query can combine `AI.SCORE`, `AI.IF`, and `AI.CLASSIFY`; incompatible
 operators run in separate model regions. The configured model must support

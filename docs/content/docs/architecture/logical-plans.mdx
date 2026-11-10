@@ -55,15 +55,17 @@ tables below the node.
 
 1. **Parse and bind.** DataFusion resolves the SQL against the session's
    tables and functions.
-2. **Lower AI calls.** Quail's `lower_ai_calls` analyzer rule creates
-   `AiNode`s. Tests of answer columns initially remain DataFusion filters.
+2. **Lower AI calls.** Quail's `lower_ai_calls` analyzer rule makes one
+   pass: each AI call becomes an `AiNode` below the operator that held
+   it. Tests of answer columns initially remain DataFusion filters.
 3. **Rewrite the plan.** DataFusion moves ordinary filters toward scans
    and removes unused columns. Quail places AI calls at the tables they
    read, absorbs tests of answers, and merges repeated AI calls.
 4. **Claim model regions.** After the optimizer, the query planner
-   calls `claim_model_regions`. It replaces connected AI work with
-   `ModelRegion` nodes, then runs the optimizer once more over the
-   operators around them. `EXPLAIN` shows `AiNode`s in the logical plan
+   calls `claim_model_regions`. It replaces each run of `AiNode`s with
+   a `ModelRegion` node, then runs the optimizer once more over the
+   operators around them. A run over one table reads the table, with
+   its key. A run over anything else reads rows DataFusion computes. `EXPLAIN` shows `AiNode`s in the logical plan
    and `ModelRegionExec` in the physical plan.
 5. **Read region operators.** `derive` converts each model region into
    `Operators`, which Quail's planner uses to choose a physical plan.
