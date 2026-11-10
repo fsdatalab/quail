@@ -247,7 +247,12 @@ fn claim_regions(plan: LogicalPlan, fetch: Option<usize>) -> Result<LogicalPlan>
         )?));
     }
     let mut refused = None;
-    if !kept_by_datafusion(&plan)? {
+    let kept = if ai_only() {
+        as_node::<AiNode>(&plan).is_none()
+    } else {
+        kept_by_datafusion(&plan)?
+    };
+    if !kept {
         let selected = select_list(plan.clone(), None)?;
         let (bound, inputs, _) = split_inputs(selected)?;
         let numbered_inputs = numbered(&bound);
@@ -397,9 +402,6 @@ fn passed_fetch(plan: &LogicalPlan, fetch: Option<usize>) -> Option<usize> {
 pub(super) fn kept_by_datafusion(plan: &LogicalPlan) -> Result<bool> {
     if as_node::<AiNode>(plan).is_some() {
         return Ok(false);
-    }
-    if ai_only() {
-        return Ok(true);
     }
     // these run in DataFusion with their AI calls moved below them
     if matches!(
