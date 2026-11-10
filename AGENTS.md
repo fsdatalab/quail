@@ -49,9 +49,10 @@ CI runs these on every pull request. Run them before pushing:
   docstrings (`[tool.ruff]` in `pyproject.toml`).
 - `lint-imports` checks that each package imports only packages
   below it, in the order `[tool.importlinter]` in `pyproject.toml`
-  lists: `api` on top of `execution`, `planner`, `physical`,
-  `logical`, and so on down to `specs`. Put shared code in the lower
-  package rather than importing upward.
+  lists: `server` on top of `api`, `backends`, `execution`,
+  `physical`, and so on down to `specs`. Put shared code in the lower
+  package rather than importing upward. The planner is Rust
+  (`crates/quail-planner`), so this check does not cover it.
 - `tools/check_long_strings.py` flags string literals over 200
   characters. Long content is allowed when its name identifies content
   (a name containing PROMPT, TEMPLATE, SQL, QUERY, HTML, or TEXT), kept in a
@@ -185,10 +186,13 @@ Built on:
 - **DeepGEMM**: the FP8 matrix multiplies.
 - **Triton**: Quail's fused kernels (RMSNorm plus quantize, QK-norm
   plus RoPE, SiLU plus quantize, the attention merge).
-- **Apache Arrow and Acero**: tables, streams, and the relational
-  operators in query plans.
+- **Apache DataFusion** (with sqlparser): SQL parsing and binding,
+  logical optimization, and every relational operator: scans, plain
+  filters, plain joins, aggregates, sorts, and limits. Quail adds the
+  AI operators and runs only those.
+- **Apache Arrow**: tables, and the streams that carry rows between
+  DataFusion and Quail.
 - **Substrait**: the plan format quail-b queries are written in.
-- **DataFusion and sqlparser**: SQL parsing and binding.
 - **Hugging Face** (`transformers`, `huggingface_hub`, `datasets`):
   tokenizers, checkpoints, and benchmark data.
 - **Modal**: every GPU run and the result volumes.
@@ -205,9 +209,11 @@ how they release and explain changes.
     (Quail Server and the remote `Session`).
   - `EXPLAIN` and the Spark UI, for showing a plan and what it cost
     (`explain()`, `explain(analyze=True)`).
-- **Apache DataFusion**: an Arrow-native query engine built to be
-  extended, with clear extension points (Quail's extension registry,
-  custom operators, and rules) and docs for each.
+- **Apache DataFusion**: also the model for how to extend an engine:
+  clear extension points (Quail's extension registry, custom
+  operators, and rules) and docs for each. Projects built on it, such
+  as Comet, InfluxDB 3, and Lance, show how an extension marks the
+  part of a plan it runs and leaves the rest to the host.
 - **DuckDB**: an engine that is easy to embed and whose docs answer a
   question in one short page with a runnable example.
 - **Apache Arrow**: columnar data and Arrow Flight for moving results
