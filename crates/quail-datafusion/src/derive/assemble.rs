@@ -4,7 +4,7 @@
 use super::binding::Binder;
 use super::placement::PlacedConditions;
 use super::relation::JoinSpec;
-use super::walk::{Kind, Walk, contains_ai_call};
+use super::walk::{Kind, Walk};
 use super::{ByAlias, lookup, note, push};
 use crate::ai::{AiNode, Fetch, Semantics};
 use crate::functions::column_call_kind;
@@ -84,15 +84,13 @@ impl<'w, 'a> Assembly<'w, 'a> {
         }
     }
 
-    /// The `index`th input of `id`, passing through projections, and
-    /// through plain filters when `filters` says so.
-    fn input(&self, id: usize, index: usize, filters: bool) -> Option<usize> {
+    /// The `index`th input of `id`, passing through projections.
+    fn input(&self, id: usize, index: usize) -> Option<usize> {
         let mut below = *self.walk.get(id).inputs.get(index)?;
         loop {
             let visit = self.walk.get(below);
             match &visit.kind {
                 Kind::PassThrough if !visit.inputs.is_empty() => below = visit.inputs[0],
-                Kind::Filter(_) if filters && !visit.inputs.is_empty() => below = visit.inputs[0],
                 _ => return Some(below),
             }
         }
@@ -121,7 +119,6 @@ impl<'w, 'a> Assembly<'w, 'a> {
                     });
                     self.stacks.push((alias.clone(), Vec::new()));
                 }
-                Kind::Filter(predicate) if contains_ai_call(predicate) => return None,
                 Kind::Ai(node) if node.is_predicate() || node.semantics != Semantics::Rows => {
                     if !self.is_table_filter(id) {
                         self.place_join(id)?;
@@ -198,7 +195,7 @@ impl<'w, 'a> Assembly<'w, 'a> {
         if read != self.call_tables(id) {
             return None;
         }
-        let input = self.input(id, 0, true)?;
+        let input = self.input(id, 0)?;
         let on = match &self.walk.get(input).kind {
             Kind::Join(_) => spec.on.clone(),
             _ => Vec::new(),
@@ -206,7 +203,7 @@ impl<'w, 'a> Assembly<'w, 'a> {
         self.join_on.insert(input, on.clone());
         let mut outer = input;
         while let Kind::Join(_) = &self.walk.get(outer).kind {
-            outer = self.input(outer, 0, false)?;
+            outer = self.input(outer, 0)?;
         }
         let mut outer_aliases: Vec<String> = Vec::new();
         for alias in &self.walk.get(outer).tables {

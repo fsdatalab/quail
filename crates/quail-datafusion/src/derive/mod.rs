@@ -46,9 +46,7 @@ use quail_planner::prompts::Turn;
 use self::assemble::{Assembly, push_down_columns};
 use self::binding::{Binder, Selected, unsupported};
 use self::relation::Relation;
-use self::walk::{
-    Walk, has_subqueries, read_fetch, read_top, refuse_grouped_input, with_select_list,
-};
+use self::walk::{Walk, has_subqueries, read_fetch, read_top, with_select_list};
 use crate::ai::AiNode;
 use crate::region::ModelRegion;
 
@@ -193,7 +191,6 @@ fn derive_operators(
 ) -> Result<Operators, CompileError> {
     let listed = with_select_list(plan);
     let top = read_top(&listed)?;
-    refuse_grouped_input(top.relation)?;
     let fetch = read_fetch(&top).ok_or_else(|| unplaced(plan))?;
     let mut walk = Walk::default();
     walk.visit(top.relation);

@@ -81,31 +81,6 @@ pub(super) fn read_fetch(top: &Top<'_>) -> Option<Option<i64>> {
     (!elsewhere).then_some(fetch)
 }
 
-/// Refuse a SELECT whose input is a GROUP BY or a window.
-///
-/// DataFusion runs a GROUP BY or window above the region, or as an input
-/// it computes for the region.
-///
-/// # Errors
-///
-/// The input groups or windows rows.
-pub(super) fn refuse_grouped_input(relation: &LogicalPlan) -> Result<(), CompileError> {
-    let groups =
-        |plan: &LogicalPlan| matches!(plan, LogicalPlan::Aggregate(_) | LogicalPlan::Window(_));
-    if groups(relation) || matches!(relation, LogicalPlan::Filter(filter) if groups(&filter.input))
-    {
-        return unsupported(
-            "DataFusion must compute grouped or windowed rows before the model reads them.",
-        );
-    }
-    Ok(())
-}
-/// Whether an expression calls an AI function anywhere.
-pub(super) fn contains_ai_call(expr: &Expr) -> bool {
-    expr.exists(|node| Ok(crate::is_ai_call(node)))
-        .unwrap_or(false)
-}
-
 /// Whether a plan reads a CTE or a FROM subquery.
 pub(super) fn has_subqueries(plan: &LogicalPlan) -> bool {
     plan.exists(|node| {
@@ -129,7 +104,6 @@ pub(super) struct Table {
 pub(super) enum Kind<'a> {
     Scan(usize),
     Join(&'a Join),
-    Filter(Expr),
     Ai(&'a AiNode),
     /// A projection, or a SubqueryAlias of a derived table.
     PassThrough,
@@ -182,9 +156,10 @@ impl<'a> Walk<'a> {
             LogicalPlan::Projection(projection) => {
                 (Kind::PassThrough, vec![self.visit(&projection.input)])
             }
-            LogicalPlan::Filter(filter) => {
-                let predicate = filter.predicate.clone();
-                (Kind::Filter(predicate), vec![self.visit(&filter.input)])
+            LogicalPlan::Filter(_) => {
+                self.unplaced = true;
+                self.unknown = true;
+                (Kind::PassThrough, Vec::new())
             }
             LogicalPlan::Join(join) => {
                 if join.join_type != JoinType::Inner {
@@ -283,26 +258,16 @@ impl<'a> Walk<'a> {
         }
     }
 
-    /// Record the table a scan reads, with the filters DataFusion pushed
-    /// between its alias and its scan; None for a derived table.
+    /// Record the table a scan reads; None for a derived table.
     fn table(&mut self, plan: &'a LogicalPlan) -> Option<usize> {
-        let (alias, mut below) = match plan {
+        let (alias, below) = match plan {
             LogicalPlan::SubqueryAlias(alias) => {
                 (alias.alias.table().to_string(), alias.input.as_ref())
             }
             other => (String::new(), other),
         };
-        let mut filters: Vec<&'a Expr> = Vec::new();
-        let scan = loop {
-            match below {
-                LogicalPlan::Filter(filter) => {
-                    filters.push(&filter.predicate);
-                    below = &filter.input;
-                }
-                LogicalPlan::Projection(projection) => below = &projection.input,
-                LogicalPlan::TableScan(scan) => break scan,
-                _ => return None,
-            }
+        let LogicalPlan::TableScan(scan) = below else {
+            return None;
         };
         let provider = scan.table_name.table().to_string();
         let alias = if alias.is_empty() {
@@ -317,41 +282,6 @@ impl<'a> Walk<'a> {
             schema: scan.source.schema(),
             gate: false,
         });
-        // a filter below the alias names the table by its provider
-        let rename = |expr: &Expr| -> Expr {
-            expr.clone()
-                .transform_up(|node| match node {
-                    Expr::Column(column)
-                        if column
-                            .relation
-                            .as_ref()
-                            .is_some_and(|found| found.table() == provider) =>
-                    {
-                        Ok(Transformed::yes(Expr::Column(Column::new(
-                            Some(alias.clone()),
-                            column.name,
-                        ))))
-                    }
-                    other => Ok(Transformed::no(other)),
-                })
-                .map(|found| found.data)
-                .unwrap_or_else(|_| expr.clone())
-        };
-        for predicate in filters.iter().rev().copied().chain(&scan.filters) {
-            if contains_ai_call(predicate) {
-                self.unplaced = true;
-            }
-            let id = self.visits.len();
-            self.visits.push(Some(Visit {
-                kind: Kind::Filter(rename(predicate)),
-                inputs: Vec::new(),
-                parent: None,
-                ancestors: self.stack.clone(),
-                tables: Vec::new(),
-                ai_join: false,
-            }));
-            self.order.push(id);
-        }
         Some(index)
     }
 
@@ -475,7 +405,6 @@ impl<'a> Walk<'a> {
         let mut terms = Vec::new();
         for id in self.ids() {
             let found: Vec<&Expr> = match &self.get(id).kind {
-                Kind::Filter(predicate) => split_conjunction(predicate),
                 Kind::Ai(node) if !node.is_predicate() && node.semantics == Semantics::Rows => {
                     node.filter.iter().flat_map(split_conjunction).collect()
                 }
