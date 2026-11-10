@@ -873,8 +873,12 @@ fn claim_run(
             plan.display()
         )));
     }
-    if let Some(error) = derive_error(&bound) {
-        return Ok(Err(error.to_string()));
+    match derive_error(&bound) {
+        // a shape the binder does not read may run in smaller parts
+        Some(error) if error.is_unsupported() => return Ok(Err(error.to_string())),
+        // any other error is the query's own
+        Some(error) => return plan_err!("{}", error.message()),
+        None => {}
     }
     let mut region = ModelRegion::new(bound);
     // a fetch counts the rows the region returns, not the rows a lifted

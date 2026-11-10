@@ -322,6 +322,11 @@ impl Columns {
         if let Some((_, name)) = self.selected.iter().find(|(found, _)| found == call) {
             return name.clone();
         }
+        self.unnamed()
+    }
+
+    /// A new name that is no column of the plan.
+    fn unnamed(&mut self) -> String {
         loop {
             self.num_unnamed += 1;
             let name = format!("__quail_column_{}", self.num_unnamed);
@@ -846,10 +851,12 @@ fn lower_projection(
                     columns.reserved.insert(alias.name.clone());
                     alias.name.clone()
                 };
-                if input.schema().has_column_with_unqualified_name(&name) {
-                    exprs.push(expr.clone());
-                    continue;
-                }
+                // a name the input already has goes to the SELECT list alone
+                let name = if input.schema().has_column_with_unqualified_name(&name) {
+                    columns.unnamed()
+                } else {
+                    name
+                };
                 input = add_column(input, call.clone(), &name)?;
                 name
             }
