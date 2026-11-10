@@ -68,12 +68,37 @@ pub fn claim_model_regions(plan: LogicalPlan, session: &dyn Session) -> Result<L
         }
         _ => {}
     }
+    if std::env::var("QUAIL_DEBUG").is_ok() {
+        eprintln!("CLAIM:\n{}", plan.display_indent());
+    }
     if !calls_ai(&plan)? {
         // the analyzer has already made a fallback column's region
         return number_regions(drop_unread_probabilities(plan)?);
     }
     let claimed = number_regions(drop_unread_probabilities(claim_regions(plan, None)?)?)?;
-    state.optimize(&claimed)
+    if std::env::var("QUAIL_DEBUG").is_ok() {
+        eprintln!("CLAIMED:\n{}", claimed.display_indent());
+    }
+    // DataFusion 55.2's `push_down_leaf_projections` fails on the join the
+    // claim builds above a region: it moves a struct field read below the
+    // join and then names the region's `r.id` beside the table's. The
+    // session's optimizer has already run the rule over the whole plan.
+    let rules = state
+        .optimizers()
+        .iter()
+        .filter(|rule| rule.name() != "push_down_leaf_projections")
+        .cloned()
+        .collect();
+    let optimized = state
+        .analyzer()
+        .execute_and_check(claimed, state.config_options(), |_, _| {})
+        .and_then(|plan| Optimizer::with_rules(rules).optimize(plan, state, |_, _| {}));
+    if std::env::var("QUAIL_DEBUG").is_ok()
+        && let Err(error) = &optimized
+    {
+        eprintln!("OPTIMIZE ERROR: {error:?}");
+    }
+    optimized
 }
 
 /// Number occurrences, not plan contents: identical sibling regions still run
@@ -302,7 +327,13 @@ fn claim_needed(
         let numbered_inputs = numbered(&bound);
         let (bound, above) = lift_relational(bound)?;
         let names: Vec<String> = inputs.iter().map(|(name, _)| name.clone()).collect();
+        if std::env::var("QUAIL_DEBUG").is_ok() {
+            eprintln!("LIFTED:\n{}", bound.display_indent());
+        }
         let (bound, back) = join_back(bound, &names)?;
+        if std::env::var("QUAIL_DEBUG").is_ok() {
+            eprintln!("REGION:\n{}", bound.display_indent());
+        }
         if calls_ai(&bound)? && quail_plans(&bound)? {
             refused = refusal_of(&bound);
             if refused.is_none() {
