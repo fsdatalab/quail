@@ -12,9 +12,10 @@
 //! ```
 //!
 //! For example, `SELECT r.id, CASE WHEN r.long THEN AI.MAP(...) END AS
-//! summary` writes summaries of the long reviews only. The rule rewrites
-//! a projection directly above a classification, extraction, map, or SAE
-//! features node when:
+//! summary` writes summaries of the long reviews only. The step rewrites
+//! a projection above a classification, extraction, map, or SAE features
+//! node, through the SELECT lists and derived-table aliases between them
+//! that pass the node's columns on as they are, when:
 //!
 //! - every item that reads a column the node adds reads it as `CASE WHEN
 //!   c THEN <column> END`, with the same `c`, and no other item reads
@@ -33,6 +34,7 @@
 //!     ⇒ π_{B, (CASE WHEN c THEN e END) → z}(AI_{extract → e}(R; g = g ∧ c))
 //! ```
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use datafusion::common::tree_node::{Transformed, TreeNode};
@@ -43,6 +45,7 @@ use datafusion::logical_expr::{Expr, LogicalPlan, Projection};
 
 use crate::ai::{AiNode, Semantics};
 use crate::extension::{as_node, extension_node};
+use crate::rules::repeated::{through_alias, through_projection};
 
 /// Make each `CASE` test above a column node the node's guard, as the
 /// module explains.
@@ -54,82 +57,61 @@ fn push_down_case(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     let LogicalPlan::Projection(projection) = &plan else {
         return Ok(Transformed::no(plan));
     };
-    let Some(node) = as_node::<AiNode>(&projection.input) else {
-        return Ok(Transformed::no(plan));
-    };
-    let plain = node.semantics == Semantics::Rows
-        && !node.is_predicate()
-        && node.filter.is_none()
-        && node.tests.is_empty()
-        && node.hint.is_none()
-        && node.fetch.is_none();
-    if !plain {
-        return Ok(Transformed::no(plan));
+    // each test `c` with the columns the SELECT list reads only under it
+    let mut tests: Vec<&Expr> = Vec::new();
+    for expr in &projection.expr {
+        if let Some((when, _)) = guarded_column(expr)
+            && !tests.contains(&when)
+        {
+            tests.push(when);
+        }
     }
-    let extracts = node.function() == "ai_extract";
-    let mut test: Option<Expr> = None;
-    let mut exprs = Vec::new();
-    for (index, expr) in projection.expr.iter().enumerate() {
-        let inner = match expr {
-            Expr::Alias(alias) => alias.expr.as_ref(),
-            other => other,
+    for test in tests {
+        let mut answers: Vec<Column> = Vec::new();
+        let mut others: BTreeSet<Column> = BTreeSet::new();
+        for expr in &projection.expr {
+            match guarded_column(expr) {
+                Some((when, column)) if when == test => answers.push(column),
+                _ => others.extend(expr.column_refs().into_iter().cloned()),
+            }
+        }
+        let Some((input, extracts)) = guard_below(&projection.input, test, &answers, &others)?
+        else {
+            continue;
         };
-        let reads_answer = inner
-            .column_refs()
+        let exprs = projection
+            .expr
             .iter()
-            .any(|column| column.relation.is_none() && node.is_field(&column.name));
-        if !reads_answer {
-            exprs.push(expr.clone());
-            continue;
-        }
-        let Some((when, answer)) = guarded_answer(inner, node) else {
-            return Ok(Transformed::no(plan));
-        };
-        match &test {
-            Some(found) if found != when => return Ok(Transformed::no(plan)),
-            _ => test = Some(when.clone()),
-        }
-        if extracts {
-            // an unasked row's struct of NULL answers reads as NULL
-            exprs.push(expr.clone());
-            continue;
-        }
-        let (qualifier, field) = projection.schema.qualified_field(index);
-        exprs.push(Expr::Column(answer).alias_qualified(qualifier.cloned(), field.name()));
+            .enumerate()
+            .map(|(index, expr)| match guarded_column(expr) {
+                // an extraction's unasked row is a struct of NULL answers,
+                // which its CASE makes NULL as a whole
+                Some((when, column)) if when == test && !extracts => {
+                    let (qualifier, field) = projection.schema.qualified_field(index);
+                    Expr::Column(column).alias_qualified(qualifier.cloned(), field.name())
+                }
+                _ => expr.clone(),
+            })
+            .collect();
+        return Ok(Transformed::yes(LogicalPlan::Projection(
+            Projection::try_new(exprs, Arc::new(input))?,
+        )));
     }
-    let Some(test) = test else {
-        return Ok(Transformed::no(plan));
-    };
-    if !reads_call_table(&test, node) {
-        return Ok(Transformed::no(plan));
-    }
-    // an extraction's CASE stays above it, once its test is the guard
-    let guarded_already = node
-        .guard
-        .as_ref()
-        .is_some_and(|guard| split_conjunction(guard).contains(&&test));
-    if extracts && guarded_already {
-        return Ok(Transformed::no(plan));
-    }
-    let mut guarded = node.clone();
-    guarded.guard = Some(match guarded.guard.take() {
-        Some(guard) => guard.and(test),
-        None => test,
-    });
-    let input = extension_node(guarded.checked()?);
-    Ok(Transformed::yes(LogicalPlan::Projection(
-        Projection::try_new(exprs, Arc::new(input))?,
-    )))
+    Ok(Transformed::no(plan))
 }
 
-/// `(c, a)` when `expr` is `CASE WHEN c THEN a END` and `a` is a column
-/// the node adds.
-fn guarded_answer<'a>(expr: &'a Expr, node: &AiNode) -> Option<(&'a Expr, Column)> {
+/// `(c, a)` when a SELECT list's item is `CASE WHEN c THEN a END` and `a`
+/// is a column.
+fn guarded_column(expr: &Expr) -> Option<(&Expr, Column)> {
+    let inner = match expr {
+        Expr::Alias(alias) => alias.expr.as_ref(),
+        other => other,
+    };
     let Expr::Case(Case {
         expr: None,
         when_then_expr,
         else_expr: None,
-    }) = expr
+    }) = inner
     else {
         return None;
     };
@@ -137,10 +119,109 @@ fn guarded_answer<'a>(expr: &'a Expr, node: &AiNode) -> Option<(&'a Expr, Column
         return None;
     };
     match then.as_ref() {
-        Expr::Column(column) if column.relation.is_none() && node.is_field(&column.name) => {
-            Some((when.as_ref(), column.clone()))
-        }
+        Expr::Column(column) => Some((when.as_ref(), column.clone())),
         _ => None,
+    }
+}
+
+/// `plan` with `test` as the guard of the `AiNode` that adds `answers`,
+/// and whether the node is an extraction; None when the module's
+/// conditions do not hold.
+///
+/// `answers` are columns of `plan` read only where `test` is TRUE, and
+/// `others` the columns of `plan` read whatever the test is. The node is
+/// reached through the SELECT lists and derived-table aliases that pass
+/// the answers on as they are.
+fn guard_below(
+    plan: &LogicalPlan,
+    test: &Expr,
+    answers: &[Column],
+    others: &BTreeSet<Column>,
+) -> Result<Option<(LogicalPlan, bool)>> {
+    let rebuilt = |found: Option<(LogicalPlan, bool)>| -> Result<Option<(LogicalPlan, bool)>> {
+        match found {
+            Some((input, extracts)) => Ok(Some((
+                plan.with_new_exprs(plan.expressions(), vec![input])?,
+                extracts,
+            ))),
+            None => Ok(None),
+        }
+    };
+    match plan {
+        LogicalPlan::Projection(projection) => {
+            let defined = |column: &Column| -> Option<&Expr> {
+                let index = projection.schema.index_of_column(column).ok()?;
+                Some(&projection.expr[index])
+            };
+            let passed: Option<Vec<Column>> = answers
+                .iter()
+                .map(|answer| match defined(answer)?.clone().unalias() {
+                    Expr::Column(column) => Some(column),
+                    _ => None,
+                })
+                .collect();
+            let (Some(answers), Some(test)) = (passed, through_projection(test, projection)) else {
+                return Ok(None);
+            };
+            let mut read = BTreeSet::new();
+            for other in others {
+                let Some(expr) = defined(other) else {
+                    return Ok(None);
+                };
+                read.extend(expr.column_refs().into_iter().cloned());
+            }
+            rebuilt(guard_below(&projection.input, &test, &answers, &read)?)
+        }
+        LogicalPlan::SubqueryAlias(alias) => {
+            let below = |column: &Column| -> Option<Column> {
+                let index = alias.schema.index_of_column(column).ok()?;
+                Some(Column::from(alias.input.schema().qualified_field(index)))
+            };
+            let passed: Option<Vec<Column>> = answers.iter().map(below).collect();
+            let read: Option<BTreeSet<Column>> = others.iter().map(below).collect();
+            let (Some(answers), Some(read), Some(test)) =
+                (passed, read, through_alias(test, alias))
+            else {
+                return Ok(None);
+            };
+            rebuilt(guard_below(&alias.input, &test, &answers, &read)?)
+        }
+        LogicalPlan::Extension(_) => {
+            let Some(node) = as_node::<AiNode>(plan) else {
+                return Ok(None);
+            };
+            let adds = |column: &Column| column.relation.is_none() && node.is_field(&column.name);
+            let plain = node.semantics == Semantics::Rows
+                && !node.is_predicate()
+                && node.filter.is_none()
+                && node.tests.is_empty()
+                && node.hint.is_none()
+                && node.fetch.is_none();
+            if !plain
+                || answers.is_empty()
+                || !answers.iter().all(adds)
+                || others.iter().any(adds)
+                || !reads_call_table(test, node)
+            {
+                return Ok(None);
+            }
+            // an extraction's CASE stays above it, once its test is the guard
+            let extracts = node.function() == "ai_extract";
+            let guarded_already = node
+                .guard
+                .as_ref()
+                .is_some_and(|guard| split_conjunction(guard).contains(&test));
+            if extracts && guarded_already {
+                return Ok(None);
+            }
+            let mut guarded = node.clone();
+            guarded.guard = Some(match guarded.guard.take() {
+                Some(guard) => guard.and(test.clone()),
+                None => test.clone(),
+            });
+            Ok(Some((extension_node(guarded.checked()?), extracts)))
+        }
+        _ => Ok(None),
     }
 }
 

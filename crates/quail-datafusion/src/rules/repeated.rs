@@ -220,7 +220,7 @@ fn expose(
 
 /// `expr` with each column of `projection`'s output read as the
 /// expression that computes it; None when one is not an output column.
-pub(super) fn through_projection(expr: &Expr, projection: &Projection) -> Option<Expr> {
+pub(crate) fn through_projection(expr: &Expr, projection: &Projection) -> Option<Expr> {
     let mut missing = false;
     let found = expr
         .clone()
@@ -251,7 +251,7 @@ pub(super) fn through_projection(expr: &Expr, projection: &Projection) -> Option
 
 /// `expr` with each column of the derived table `alias` read as its
 /// input's column of the same name.
-pub(super) fn through_alias(expr: &Expr, alias: &SubqueryAlias) -> Option<Expr> {
+pub(crate) fn through_alias(expr: &Expr, alias: &SubqueryAlias) -> Option<Expr> {
     let mut missing = false;
     let found = expr
         .clone()

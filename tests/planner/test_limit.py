@@ -67,6 +67,14 @@ def test_a_limit_over_an_ai_filter_returns_that_many_passing_rows(sessions):
         _assert_some_of(rows, PASSING, 2)
 
 
+def test_a_limit_above_a_cte_is_the_fetch_of_the_ai_filter_inside_it(sessions):
+    sql = (f"WITH kind AS (SELECT r.id FROM reviews r WHERE {AI_IF}) "
+           "SELECT kind.id FROM kind LIMIT 2")
+    assert "fetch: 2" in sessions[0].sql(sql).logical
+    for rows in _rows_on_and_off(sessions, sql):
+        _assert_some_of(rows, PASSING, 2)
+
+
 def test_a_fetch_keeps_a_later_test_of_the_answer_above_the_ai_node(sessions):
     # testing the label before the fetch would return three reviews
     # labeled 'a'; the test runs on the three reviews the fetch keeps

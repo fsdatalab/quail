@@ -72,6 +72,16 @@ def test_a_case_over_a_classification_labels_only_the_rows_it_reads(sessions):
     assert (on[1], off[1]) == (3, 6)
 
 
+def test_a_case_above_a_cte_guards_the_classification_inside_it(sessions):
+    sql = (f"WITH t AS (SELECT r.id, r.long, {TONE} AS tone FROM reviews r) "
+           "SELECT t.id, CASE WHEN t.long THEN t.tone END AS tone FROM t")
+    assert "guard: r.long" in sessions[0].sql(sql).logical
+    on, off = (_rows_and_questions(session, sql) for session in sessions)
+    assert on[0] == off[0] == [("r0", "a"), ("r1", None), ("r2", None),
+                               ("r3", "b"), ("r4", None), ("r5", "b")]
+    assert (on[1], off[1]) == (3, 6)
+
+
 def test_a_case_over_a_map_writes_only_the_answers_it_reads(sessions):
     sql = ("SELECT r.id, CASE WHEN r.id <> 'r0' AND r.long "
            "THEN AI_MAP(r.body, 'Summarize.') END AS s FROM reviews r")
