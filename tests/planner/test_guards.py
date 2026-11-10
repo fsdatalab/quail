@@ -205,6 +205,26 @@ def test_the_planner_runs_the_term_of_an_or_that_passes_more_rows_first():
     assert (kind, long) == ([0, 1, 5], [0, 1, 2, 3, 4, 5])
 
 
+@pytest.mark.parametrize("third_passes,printed", [
+    # the third filter drops half the rows, more than the OR's 32%: it
+    # runs first, then the OR's term that passes more rows
+    (0.5, ["kind:", "long:", "third:"]),
+    # it drops a tenth of the rows, so the OR runs first, its terms together
+    (0.9, ["third:", "kind:", "long:"]),
+])
+def test_an_or_ranks_as_one_filter_among_the_filters_beside_it(
+        sessions, third_passes, printed):
+    kind = "AI_FILTER(PROMPT('kind: {0}', r.body), {'selectivity': 0.2})"
+    long = "AI_FILTER(PROMPT('long: {0}', r.body), {'selectivity': 0.6})"
+    third = (f"AI_FILTER(PROMPT('third: {{0}}', r.body), "
+             f"{{'selectivity': {third_passes}}})")
+    query = sessions[0].sql(
+        f"SELECT r.id FROM reviews r WHERE ({kind} OR {long}) AND {third}")
+    # explain() prints the last filter to run first
+    physical = query.explain().split("physical:")[1]
+    assert sorted(printed, key=physical.index) == printed
+
+
 def test_an_or_of_a_column_and_two_ai_filters_asks_each_where_no_earlier_term_is_true():
     sql = f"SELECT r.id FROM reviews r WHERE r.long OR {KIND} OR {LONG}"
     off = [name for name in LOGICAL_RULES if name != OR_RULE]

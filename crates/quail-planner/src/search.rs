@@ -302,8 +302,68 @@ pub fn label_calls(found: &Operators) -> Vec<(crate::physical::ModelCall, String
     calls
 }
 
+/// `seconds` over the fraction of rows `spared`: the rank the search
+/// places next the lowest of.
+fn step_rank(seconds: f64, spared: f64) -> f64 {
+    if spared > 0.0 {
+        seconds / spared
+    } else if seconds == 0.0 {
+        0.0
+    } else {
+        f64::INFINITY
+    }
+}
+
+/// The steps the search places together, in written order: each step
+/// alone, and the terms of one OR as one unit.
+fn units(steps: &[TableStep]) -> Vec<Vec<usize>> {
+    let mut found: Vec<Vec<usize>> = Vec::new();
+    for (index, step) in steps.iter().enumerate() {
+        let same_or = |unit: &&mut Vec<usize>| {
+            step.or_term.is_some() && steps[unit[0]].or_term == step.or_term
+        };
+        match found.iter_mut().find(same_or) {
+            Some(unit) => unit.push(index),
+            None => found.push(vec![index]),
+        }
+    }
+    found
+}
+
+/// The fraction of the rows a unit reads that the steps after it need
+/// not: the rows a filter drops, or the rows no term of an OR passes.
+fn unit_spared(steps: &[TableStep], unit: &[usize]) -> f64 {
+    match unit {
+        [alone] if steps[*alone].or_term.is_none() => steps[*alone].spared(),
+        terms => terms
+            .iter()
+            .map(|index| 1.0 - steps[*index].selectivity)
+            .product(),
+    }
+}
+
+/// Where a sequence of steps stands: the rows that reach the next step,
+/// the last step, and the prompts already scored.
+#[derive(Clone)]
+struct Reached {
+    flow: RowFlow,
+    previous: Option<usize>,
+    scored: Vec<Prompt>,
+    /// The steps so far, in run order, and their seconds.
+    ordered: Vec<usize>,
+    seconds: f64,
+}
+
 /// Choose an order using costs at each expected survivor count, as
 /// `order_filters_indexed` with the steps' own residency rule.
+///
+/// The search places units: a step, or the terms of one OR together. It
+/// tries each unit first and then takes the unit of the lowest rank,
+/// its seconds over the fraction of rows it spares the steps after it
+/// (Hellerstein and Stonebraker, 1993). The terms of an OR run in the
+/// order of their own rank, seconds over the fraction of rows a term
+/// passes, and the OR ranks as one filter that passes the rows any
+/// term passes. Each step is priced at the rows that reach it.
 ///
 /// # Errors
 ///
@@ -329,77 +389,112 @@ pub fn order_steps(
         cache.insert(key, seconds);
         Ok(seconds)
     };
-    let starters: Vec<usize> = indices
+    // `reached` after one more step, and the seconds the step ranks by
+    let mut after_step = |reached: &Reached,
+                          index: usize,
+                          later: &[usize]|
+     -> Result<(Reached, f64), CompileError> {
+        let step = &steps[index];
+        let asked = reached.flow.asked(step.or_term.as_ref());
+        let seconds = match reached.previous {
+            None => cost(index, asked, true)?,
+            Some(_)
+                if step
+                    .reuse_key
+                    .as_ref()
+                    .is_some_and(|key| reached.scored.contains(key)) =>
+            {
+                0.0
+            }
+            Some(previous) => {
+                let fresh = !resident_after(&steps[previous], step);
+                cost(index, if asked > 0.0 { asked } else { 1.0 }, fresh)?
+            }
+        };
+        let mut next = reached.clone();
+        // a step no row reaches costs nothing, whatever it ranks by
+        next.seconds += if asked > 0.0 || reached.previous.is_none() {
+            seconds
+        } else {
+            0.0
+        };
+        next.ordered.push(index);
+        next.previous = Some(index);
+        next.scored.extend(step.reuse_key.iter().cloned());
+        step.pass(&mut next.flow, later.iter().map(|index| &steps[*index]));
+        Ok((next, seconds))
+    };
+    // `reached` after a unit, its terms in rank order, and the unit's rank
+    let mut after_unit =
+        |reached: &Reached, unit: &[usize]| -> Result<(Reached, f64), CompileError> {
+            let mut next = reached.clone();
+            let mut remaining = unit.to_vec();
+            let mut seconds = 0.0;
+            while !remaining.is_empty() {
+                let mut choice: Option<(f64, usize, Reached, f64)> = None;
+                for &index in &remaining {
+                    let later: Vec<usize> = remaining
+                        .iter()
+                        .copied()
+                        .filter(|other| *other != index)
+                        .collect();
+                    let (stepped, priced) = after_step(&next, index, &later)?;
+                    let candidate = step_rank(priced, steps[index].spared());
+                    if choice
+                        .as_ref()
+                        .is_none_or(|found| (candidate, index) < (found.0, found.1))
+                    {
+                        choice = Some((candidate, index, stepped, priced));
+                    }
+                }
+                let (_, selected, stepped, priced) = choice.expect("a remaining term");
+                seconds += priced;
+                next = stepped;
+                remaining.retain(|index| *index != selected);
+            }
+            Ok((next, step_rank(seconds, unit_spared(steps, unit))))
+        };
+    let units = units(steps);
+    let starters: Vec<&Vec<usize>> = units
         .iter()
-        .copied()
-        .filter(|index| steps[*index].selectivity < 1.0)
+        .filter(|unit| unit_spared(steps, unit) > 0.0)
         .collect();
     if starters.is_empty() {
         return Ok(indices);
     }
-    let mut best: Option<(f64, usize, Vec<usize>)> = None;
+    let start = Reached {
+        flow: RowFlow::new(count),
+        previous: None,
+        scored: Vec::new(),
+        ordered: Vec::new(),
+        seconds: 0.0,
+    };
+    let mut best: Option<Reached> = None;
     for first in starters {
-        let mut ordered = vec![first];
-        let mut total = cost(first, count, true)?;
-        let mut flow = RowFlow::new(count);
-        let others = || indices.iter().filter(|index| **index != first);
-        steps[first].pass(&mut flow, others().map(|index| &steps[*index]));
-        let mut scored: Vec<Prompt> = steps[first].reuse_key.iter().cloned().collect();
-        let mut remaining: Vec<usize> = indices
-            .iter()
-            .copied()
-            .filter(|index| *index != first)
-            .collect();
-        let mut previous = first;
+        let (mut reached, _) = after_unit(&start, first)?;
+        let mut remaining: Vec<&Vec<usize>> = units.iter().filter(|unit| *unit != first).collect();
         while !remaining.is_empty() {
-            let mut choice: Option<(f64, usize, f64)> = None;
-            for &index in &remaining {
-                let step = &steps[index];
-                let reused = step
-                    .reuse_key
-                    .as_ref()
-                    .is_some_and(|key| scored.contains(key));
-                let fresh = !resident_after(&steps[previous], step);
-                let asked = flow.asked(step.or_term.as_ref());
-                let seconds = if reused {
-                    0.0
-                } else {
-                    cost(index, if asked > 0.0 { asked } else { 1.0 }, fresh)?
-                };
-                let spared = step.spared();
-                let rank = if spared > 0.0 {
-                    seconds / spared
-                } else if seconds == 0.0 {
-                    0.0
-                } else {
-                    f64::INFINITY
-                };
-                let candidate = (rank, index, if asked > 0.0 { seconds } else { 0.0 });
+            let mut choice: Option<(f64, usize, Reached)> = None;
+            for unit in &remaining {
+                let (next, candidate) = after_unit(&reached, unit)?;
                 if choice
                     .as_ref()
-                    .is_none_or(|found| (candidate.0, candidate.1) < (found.0, found.1))
+                    .is_none_or(|found| (candidate, unit[0]) < (found.0, found.1))
                 {
-                    choice = Some(candidate);
+                    choice = Some((candidate, unit[0], next));
                 }
             }
-            let (_, selected, seconds) = choice.expect("a remaining step");
-            total += seconds;
-            ordered.push(selected);
-            previous = selected;
-            if let Some(key) = &steps[selected].reuse_key {
-                scored.push(key.clone());
-            }
-            remaining.retain(|index| *index != selected);
-            steps[selected].pass(&mut flow, remaining.iter().map(|index| &steps[*index]));
+            let (_, selected, next) = choice.expect("a remaining unit");
+            reached = next;
+            remaining.retain(|unit| unit[0] != selected);
         }
-        if best
-            .as_ref()
-            .is_none_or(|found| (total, first) < (found.0, found.1))
-        {
-            best = Some((total, first, ordered));
+        if best.as_ref().is_none_or(|found| {
+            (reached.seconds, reached.ordered[0]) < (found.seconds, found.ordered[0])
+        }) {
+            best = Some(reached);
         }
     }
-    Ok(best.expect("a starter").2)
+    Ok(best.expect("a starter").ordered)
 }
 
 // ---------------------------------------------------------------- joins
