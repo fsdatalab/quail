@@ -781,12 +781,27 @@ fn isolate_chain(plan: &LogicalPlan) -> Result<Option<(LogicalPlan, Vec<Expr>)>>
         .map(|(index, column)| Expr::Column(column.clone()).alias(format!("column_{index}")))
         .collect();
     let number = NEXT_ROWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // rows of one relation keep its name
+    let mut qualifiers: Vec<String> = columns
+        .iter()
+        .map(|column| {
+            column
+                .relation
+                .as_ref()
+                .map_or_else(String::new, |relation| relation.table().to_string())
+        })
+        .collect();
+    qualifiers.dedup();
+    let name = match qualifiers.as_slice() {
+        [one] if !one.is_empty() => one.clone(),
+        _ => format!("__quail_rows_{number}"),
+    };
     let input = datafusion::logical_expr::LogicalPlanBuilder::from(bottom.clone())
         .project(renamed)?
         .build()?;
     let input = extension_node(SharedInput::try_new(input, false)?);
     let mut input = datafusion::logical_expr::LogicalPlanBuilder::from(input)
-        .alias(format!("__quail_rows_{number}"))?
+        .alias(name)?
         .build()?;
     let replacements = input.schema().columns();
     let remap = |expr: Expr| -> Result<Expr> {
