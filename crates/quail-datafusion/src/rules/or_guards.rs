@@ -14,7 +14,7 @@
 //! its filter is the OR, with the answer in the call's place, and it
 //! returns none of the columns it adds. The rewrite is the logical form
 //! of `π_Q(σ_{a ∨ b}(AI_{f → b}(R))) ⇒ π_Q(σ_{a ∨ b}(AI_{f → b}(R; g =
-//! g ∧ (a IS NOT TRUE))))`, with `g` TRUE, once `absorb_into_ai_nodes` has made the OR the
+//! g ∧ (a IS NOT TRUE))))`, with `g` TRUE, once `derive` has made the OR the
 //! node's filter. The rule guards an `AiNode` when:
 //!
 //! - the node is an `AI.IF` of rows with no guard, `HINT`, or fetch,

@@ -33,7 +33,7 @@
 //! DataFusion's optimizer rules move filters and column lists around the
 //! node as its `UserDefinedLogicalNodeCore` methods allow; each method
 //! says which rewrites keep the node's meaning. A LIMIT or DISTINCT above
-//! the node becomes its fetch (`PushDownLimitIntoAiNodes`,
+//! the node becomes its fetch (`Derive`,
 //! `PushDownDistinct`).
 
 use std::cmp::Ordering;
@@ -510,7 +510,7 @@ impl UserDefinedLogicalNodeCore for AiNode {
     }
 
     /// False: a limit above the node becomes its fetch
-    /// ([`crate::PushDownLimitIntoAiNodes`]) rather than a copy below it,
+    /// ([`crate::Derive`]) rather than a copy below it,
     /// so the executor counts the rows that pass the node.
     fn supports_limit_pushdown(&self) -> bool {
         false

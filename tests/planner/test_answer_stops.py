@@ -3,8 +3,7 @@
 should_stop_answers_early gives a map or extraction the region's exact
 tests of its answer alone; the executor stops an answer once one is
 decided not TRUE on the text so far, or, when nothing else reads the
-answer, once every one is decided TRUE. A hint test from
-push_down_hint_tests (R3) stops an answer the same way. The oracle
+answer, once every one is decided TRUE. The oracle
 writes each answer one character a token. Each test runs a query with
 the rule on and off, checks that both return the same rows, and counts
 the characters written.
@@ -88,21 +87,6 @@ def test_an_extraction_stops_once_no_span_of_its_document_can_pass():
         len("March 3, 2020 was") + 1 + 1 + 1 + len("March 30") + 1,
         len("March 3, 2020 was") + len("May 2021") + len("March 9")
         + len("Jan 1") + len("March 30") + len("Apr 2"))
-
-
-def test_a_hint_test_stops_answers_when_the_exact_filter_stays_outside():
-    sql = f"SELECT r.id FROM reviews r WHERE {VERDICT}"
-    logical = tuple(name for name in LOGICAL_RULES if name != "absorb_into_ai_nodes")
-    session = quail.Session(CONFIG, tokenizer=TOKENIZER,
-                            registry=built_in_registry(logical_rules=logical))
-    session.register("reviews",
-                     quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
-    assert "hint test: left(" in session.sql(sql).logical
-    session.close()
-    hinted_rows, hinted = _run(sql, logical=logical, physical=OFF, maps=_verdict)
-    assert hinted_rows == [("r0",), ("r2",), ("r4",)]
-    # a hint stops only the answers it rejects
-    assert hinted.answer_tokens == 3 * 1 + 3 * 15
 
 
 def test_the_physical_plan_shows_when_a_map_stops_its_answers():

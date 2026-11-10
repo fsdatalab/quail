@@ -53,11 +53,10 @@ pub use region::exec::{
 pub use region::identified::IdentifiedTable;
 pub use region::region_hint::{RegionColumn, RegionColumns, RegionHint};
 pub use region::shared::{ROW_COLUMN, SharedInput, SharedInputExec};
-pub use rules::absorb::AbsorbIntoAiNodes;
+pub use rules::derive::Derive;
 pub use rules::distinct::{EliminateDistinct, PushDownDistinct};
 pub use rules::guards::PushDownCaseGuards;
 pub use rules::keyed::{PushDownCountThreshold, PushDownSemiJoinFetch};
-pub use rules::limit::PushDownLimitIntoAiNodes;
 pub use rules::lower::{LowerAiCalls, lower_ai_calls};
 pub use rules::or_guards::PushDownOrGuards;
 pub use rules::placement::PlaceAiNodes;

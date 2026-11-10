@@ -10,7 +10,7 @@
 //!   the term is a `Filter` above them that reads each answer in its
 //!   call's place: `b` for `AI.IF(...)`, `NOT b` for `NOT AI.IF(...)`,
 //!   `r.flagged OR b1 OR b2` for an OR of two calls.
-//!   [`crate::rules::absorb`] then makes the `Filter` the last node's
+//!   [`crate::rules::derive`] then makes the `Filter` the last node's
 //!   own, as DataFusion has simplified it. A call that reads two tables
 //!   is an AI join.
 //! - A comparison of an `AI.SCORE` call is an `AiNode` whose filter is

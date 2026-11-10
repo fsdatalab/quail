@@ -57,7 +57,7 @@ pub(super) fn read_top(plan: &LogicalPlan) -> Result<Top<'_>, CompileError> {
 }
 
 /// The global fetch of the region's last `AiNode`, which a LIMIT became
-/// (`PushDownLimitIntoAiNodes`); None, in the outer Option, when another
+/// (`Derive`); None, in the outer Option, when another
 /// node has one, as the region's operators cannot place a LIMIT there.
 pub(super) fn read_fetch(top: &Top<'_>) -> Option<Option<i64>> {
     let mut last = top.relation;

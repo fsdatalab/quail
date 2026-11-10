@@ -2,7 +2,7 @@
 //!
 //! DataFusion's optimizer runs its own rules over the whole plan, each
 //! `AiNode` included, with Quail's rules among them. [`default_rule_names`]
-//! gives the default order: DataFusion's default rules, with Quail's thirteen
+//! gives the default order: DataFusion's default rules, with Quail's eleven
 //! before `replace_distinct_aggregate`, which turns a `DISTINCT` into a
 //! GROUP BY. [`crate::claim_model_regions`] claims the model regions of
 //! the plan the optimizer leaves, before physical planning.
@@ -10,14 +10,12 @@
 //! Each `AiNode` tells DataFusion's rules what they may do around it:
 //! which filters may move below it and which columns it reads (see
 //! [`crate::ai::AiNode`]). A limit does not move below a node: it
-//! becomes the node's fetch ([`crate::PushDownLimitIntoAiNodes`]).
+//! becomes the node's fetch ([`crate::Derive`]).
 
-pub(crate) mod absorb;
+pub(crate) mod derive;
 pub(crate) mod distinct;
 pub(crate) mod guards;
-pub(crate) mod hints;
 pub(crate) mod keyed;
-pub(crate) mod limit;
 pub(crate) mod lower;
 pub(crate) mod or_guards;
 pub(crate) mod placement;
@@ -31,17 +29,15 @@ use datafusion::common::{Result, plan_err};
 use datafusion::optimizer::{Optimizer, OptimizerRule};
 
 /// Quail's own rules, in the order they run.
-pub const QUAIL_RULES: [&str; 13] = [
+pub const QUAIL_RULES: [&str; 11] = [
     "eliminate_distinct",
-    "absorb_into_ai_nodes",
+    "derive",
     "place_ai_nodes",
     "merge_repeated_ai_calls",
     "push_down_distinct",
-    "push_down_limit_into_ai_nodes",
     "push_down_projection_into_ai_nodes",
     "push_down_case_guards",
     "push_down_or_guards",
-    "push_down_hint_tests",
     "push_down_substring_prechecks",
     "push_down_semi_join_fetch",
     "push_down_count_threshold",
@@ -51,21 +47,19 @@ pub const QUAIL_RULES: [&str; 13] = [
 const QUAIL_RULES_BEFORE: &str = "replace_distinct_aggregate";
 
 #[cfg(test)]
-const EXPECTED_DEFAULT_RULES: [&str; 38] = [
+const EXPECTED_DEFAULT_RULES: [&str; 36] = [
     "rewrite_set_comparison",
     "optimize_unions",
     "unions_to_filter",
     "simplify_expressions",
     "eliminate_distinct",
-    "absorb_into_ai_nodes",
+    "derive",
     "place_ai_nodes",
     "merge_repeated_ai_calls",
     "push_down_distinct",
-    "push_down_limit_into_ai_nodes",
     "push_down_projection_into_ai_nodes",
     "push_down_case_guards",
     "push_down_or_guards",
-    "push_down_hint_tests",
     "push_down_substring_prechecks",
     "push_down_semi_join_fetch",
     "push_down_count_threshold",
@@ -96,10 +90,9 @@ fn quail_rule(name: &str) -> Option<Arc<dyn OptimizerRule + Send + Sync>> {
     Some(match name {
         "eliminate_distinct" => Arc::new(crate::rules::distinct::EliminateDistinct),
         "place_ai_nodes" => Arc::new(crate::rules::placement::PlaceAiNodes),
-        "absorb_into_ai_nodes" => Arc::new(crate::rules::absorb::AbsorbIntoAiNodes),
+        "derive" => Arc::new(crate::rules::derive::Derive),
         "merge_repeated_ai_calls" => Arc::new(crate::rules::repeated::MergeRepeatedAiCalls),
         "push_down_distinct" => Arc::new(crate::rules::distinct::PushDownDistinct),
-        "push_down_limit_into_ai_nodes" => Arc::new(crate::rules::limit::PushDownLimitIntoAiNodes),
         "push_down_projection_into_ai_nodes" => {
             Arc::new(crate::rules::projection::PushDownProjectionIntoAiNodes)
         }
@@ -110,7 +103,6 @@ fn quail_rule(name: &str) -> Option<Arc<dyn OptimizerRule + Send + Sync>> {
         "push_down_semi_join_fetch" => Arc::new(crate::rules::keyed::PushDownSemiJoinFetch),
         "push_down_count_threshold" => Arc::new(crate::rules::keyed::PushDownCountThreshold),
         "push_down_or_guards" => Arc::new(crate::rules::or_guards::PushDownOrGuards),
-        "push_down_hint_tests" => Arc::new(crate::rules::hints::PushDownHintTests),
         _ => return None,
     })
 }

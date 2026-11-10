@@ -14,7 +14,7 @@ from helpers.sessions import CONFIG, TOKENIZER
 import quail
 from quail.builtins import LOGICAL_RULES, built_in_registry
 
-RULE = "push_down_limit_into_ai_nodes"
+RULE = "derive"
 REVIEWS = pa.table({
     "id": ["r0", "r1", "r2", "r3", "r4", "r5"],
     "stars": [5, 2, 4, 1, 5, 3],
