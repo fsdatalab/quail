@@ -97,22 +97,16 @@ def _same_rows(table: pa.Table, expected: pa.Table, ordered: bool) -> bool:
     return sorted(_rows(table), key=repr) == sorted(_rows(expected), key=repr)
 
 
-@pytest.mark.parametrize("name", QUERIES)
-def test_a_region_answers_as_the_written_query(context, name):
-    text = QUERIES[name]
-    session = context.session
-    expected = finish(session.sql(text), ORACLE).collect()
-    table = context.sql(text)
-    assert table.column_names == expected.column_names
-    assert _same_rows(table, expected, ordered="ORDER BY" in text)
-
-
-@pytest.mark.parametrize("name", QUERIES)
-def test_rust_derives_each_region_as_session_sql_compiles_it(context, name):
-    text = QUERIES[name]
-    (region,) = context.region_plans(text)
-    query = context.session.sql(text)
-    assert (region["operators"], region["logical"]) == (query.operators, query.logical)
+def test_a_region_plans_and_answers_as_the_written_query(context):
+    for name, text in QUERIES.items():
+        query = context.session.sql(text)
+        (region,) = context.region_plans(text)
+        assert (region["operators"], region["logical"]) == (
+            query.operators, query.logical), name
+        expected = finish(query, ORACLE).collect()
+        table = context.sql(text)
+        assert table.column_names == expected.column_names, name
+        assert _same_rows(table, expected, ordered="ORDER BY" in text), name
 
 
 def test_operators_outside_a_region_run_in_datafusion(context):
@@ -172,35 +166,6 @@ def test_every_check_query_derives_one_region_as_session_sql_compiles_it():
         session.close()
 
 
-def test_a_region_hands_on_rows_before_it_finishes():
-    session = quail.Session(CONFIG, tokenizer=TOKENIZER)
-    oracle = Oracle(scores=lambda spec, ids: ids[0] / 10)
-    events = []
-    executor = oracle_executor(oracle)
-
-    def run(request):
-        response = executor(request)
-        events.append("finished")
-        return response
-
-    context = quail.SessionContext(session, physical_executor=run)
-    context.register("reviews", quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
-    text = "SELECT r.id, AI.SCORE(PROMPT('q7: {0}', r.body)) AS score FROM reviews r"
-    ((_, planned),) = context._native.plans(text)
-    batches = []
-
-    def on_rows(table):
-        events.append("rows")
-        batches.append(table)
-
-    assert Engine(session, run).execute(planned, {}, on_rows) is None
-    # one batch per scored row, each before the region finished
-    assert events == ["rows"] * 4 + ["finished"]
-    streamed = pa.concat_tables(batches)
-    assert _same_rows(streamed, context.sql(text), ordered=False)
-    session.close()
-
-
 # per operator family: a query of that operator alone, and the oracle
 # truth it is answered from; `answered` records each answer
 FAMILIES = {
@@ -230,9 +195,13 @@ FAMILIES = {
 }
 
 
-@pytest.mark.parametrize("family", FAMILIES)
-def test_each_operator_hands_on_its_first_rows_before_the_region_finishes(family):
-    text, truth = FAMILIES[family]
+def test_each_operator_hands_on_its_first_rows_before_the_region_finishes():
+    for family, (text, truth) in FAMILIES.items():
+        _check_first_rows_precede_the_last_answer(family, text, truth)
+
+
+def _check_first_rows_precede_the_last_answer(family, text, truth):
+    """Run `text` on a new session and check rows arrive before it finishes."""
     events = []
 
     def answered(value):
@@ -260,13 +229,14 @@ def test_each_operator_hands_on_its_first_rows_before_the_region_finishes(family
         events.append("rows")
         batches.append(table)
 
-    assert Engine(session, run).execute(planned, {}, on_rows) is None
+    assert Engine(session, run).execute(planned, {}, on_rows) is None, family
     # the first rows went on before the model gave its last answer
     last_answer = len(events) - 1 - events[::-1].index("answered")
-    assert events.index("rows") < last_answer
-    assert events[-1] == "finished"
+    assert events.index("rows") < last_answer, family
+    assert events[-1] == "finished", family
     events.clear()
-    assert _same_rows(pa.concat_tables(batches), context.sql(text), ordered=False)
+    streamed = pa.concat_tables(batches)
+    assert _same_rows(streamed, context.sql(text), ordered=False), family
     session.close()
 
 
@@ -350,28 +320,33 @@ TOP_K_SCORES = {"scores": lambda spec, ids: 1.0 if ids[0] % 2 == 0 else 0.3}
 TOP_K_ROWS = [("r00", 1.0), ("r02", 1.0), ("r04", 1.0)]
 
 
-@pytest.mark.parametrize("where", ["", "WHERE r.stars > -1"])
-def test_a_top_k_over_a_score_asks_fewer_rows_once_it_holds_k(monkeypatch, where):
-    # with a WHERE the region reads DataFusion's rows; without one it
-    # reads the table; either way one run skips rows as the hint tightens
+def test_a_top_k_over_a_score_asks_fewer_rows_once_it_holds_k(monkeypatch):
     # one partition: DataFusion hands the region the rows in table order
     monkeypatch.setenv("DATAFUSION_EXECUTION_TARGET_PARTITIONS", "1")
+    for where in ("", "WHERE r.stars > -1"):
+        _check_a_top_k_over_a_score_skips_rows(where)
+
+
+def _check_a_top_k_over_a_score_skips_rows(where):
+    """Run a top 3 by score, with and without its LIMIT, and count scored rows."""
+    # with a WHERE the region reads DataFusion's rows; without one it
+    # reads the table; either way one run skips rows as the hint tightens
     text = (f"SELECT r.id, AI.SCORE(PROMPT('q7: {{0}}', r.body)) AS score "
             f"FROM reviews r {where} ORDER BY score DESC, r.id LIMIT 3")
     # the sort holds three rows after r02, and r00, r02, and r04 at 1.0
     # after r04
     hinted = Oracle(**TOP_K_SCORES, tightens_after={2, 4})
     context = _reviews_context(hinted, 12)
-    assert _rows(context.sql(text)) == TOP_K_ROWS
+    assert _rows(context.sql(text)) == TOP_K_ROWS, where
     # without the LIMIT the sort holds every row and hands no threshold
     every = Oracle(**TOP_K_SCORES)
     whole = _reviews_context(every, 12)
-    assert _rows(whole.sql(text.replace(" LIMIT 3", "")))[:3] == TOP_K_ROWS
-    assert _scored_rows(every) == 12
+    assert _rows(whole.sql(text.replace(" LIMIT 3", "")))[:3] == TOP_K_ROWS, where
+    assert _scored_rows(every) == 12, where
     # r03 may still score above r01's 0.3; once r00, r02, and r04 hold
     # 1.0, a later review can only tie at 1.0 with a larger id, which the
     # top 3 does not take
-    assert _scored_rows(hinted) == 5
+    assert _scored_rows(hinted) == 5, where
     context.session.close()
     whole.session.close()
 
