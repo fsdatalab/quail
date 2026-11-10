@@ -249,6 +249,24 @@ def test_a_negated_ai_filter_runs_in_one_model_region(shape):
         session.close()
 
 
+@pytest.mark.parametrize("negated", [False, True])
+def test_an_ai_filter_that_is_also_selected_asks_the_model_once(negated):
+    session = quail.Session(CONFIG, tokenizer=TOKENIZER)
+    oracle = Oracle(filters={"r": {"q1:": [1, 0, 1, 0]}})
+    oracle.catalog = session.catalog
+    context = quail.SessionContext(session, physical_executor=oracle_executor(oracle))
+    context.register("r", quail.DocumentProvider.from_table(R, id_col="id"))
+    test = f"NOT {PREDICATE}" if negated else PREDICATE
+    try:
+        table = context.sql(f"SELECT r.id, {PREDICATE} AS k FROM r WHERE {test}")
+        ids = ["r1", "r3"] if negated else ["r0", "r2"]
+        assert sorted(table.to_pylist(), key=repr) == [
+            {"r.id": found, "k": not negated} for found in ids]
+        assert sorted(oracle.asked) == [("r", row) for row in range(4)]
+    finally:
+        session.close()
+
+
 REGION_BOUNDARY_QUERIES = {
     "score compared with a numeric expression": (
         f"SELECT r.id FROM r WHERE {SCORE} > r.stars / 4.0"

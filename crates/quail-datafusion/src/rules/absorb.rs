@@ -21,8 +21,9 @@ use std::sync::Arc;
 
 use datafusion::common::Result;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+use datafusion::logical_expr::expr_rewriter::NamePreserver;
 use datafusion::logical_expr::utils::{conjunction, split_conjunction};
-use datafusion::logical_expr::{Expr, Extension, Filter, LogicalPlan};
+use datafusion::logical_expr::{Expr, Extension, Filter, LogicalPlan, lit};
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
 use crate::ai::{AiNode, Semantics};
@@ -57,9 +58,79 @@ impl OptimizerRule for AbsorbIntoAiNodes {
 /// operator above it reads its answer; a subquery returns its own columns.
 fn drop_unread_answers(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     let plan = plan.transform_up(|below| below.map_subqueries(drop_unread_answers))?;
-    let mut dropped = drop_in(plan.data)?;
-    dropped.transformed |= plan.transformed;
+    let (read, _) = read_kept_answers(plan.data.clone())?;
+    let mut dropped = drop_in(read.data)?;
+    dropped.transformed |= plan.transformed || read.transformed;
     Ok(dropped)
+}
+
+/// An `AI.IF` answer and the value every row its node passes has.
+type Kept = Vec<(String, bool)>;
+
+/// `plan` with each read of an answer above the `AI.IF` node that filters
+/// on it as the value the filter keeps: TRUE above `σ_b`, FALSE above
+/// `σ_{NOT b}`. For example, `SELECT AI.IF(q) AS k ... WHERE AI.IF(q)`
+/// returns `k` as TRUE without asking again. Also the answers that hold
+/// such a value in the rows `plan` returns.
+///
+/// Only operators that return rows of their input unchanged carry a
+/// value up: an outer join's unmatched rows hold NULL instead.
+fn read_kept_answers(plan: LogicalPlan) -> Result<(Transformed<LogicalPlan>, Kept)> {
+    let mut kept = Kept::new();
+    let mut changed = false;
+    let mut inputs = Vec::new();
+    for input in plan.inputs() {
+        let (read, below) = read_kept_answers(input.clone())?;
+        changed |= read.transformed;
+        kept.extend(below);
+        inputs.push(read.data);
+    }
+    let own = as_node::<AiNode>(&plan).and_then(|node| {
+        let filters = node.function() == "ai_filter"
+            && node.semantics == Semantics::Rows
+            && !node.returned_fields().is_empty();
+        let negated = node.answer_term(node.filter.as_ref().filter(|_| filters)?)?;
+        Some((node.answer.clone(), !negated))
+    });
+    let carries = match &plan {
+        LogicalPlan::Join(join) => join.join_type == datafusion::logical_expr::JoinType::Inner,
+        LogicalPlan::Filter(_)
+        | LogicalPlan::Projection(_)
+        | LogicalPlan::SubqueryAlias(_)
+        | LogicalPlan::Sort(_)
+        | LogicalPlan::Limit(_) => true,
+        other => as_node::<AiNode>(other).is_some(),
+    };
+    let preserver = NamePreserver::new(&plan);
+    let mut exprs = Vec::new();
+    for expr in plan.expressions() {
+        let saved = preserver.save(&expr);
+        let read = expr.transform_up(|found| {
+            let value = match &found {
+                Expr::Column(column) if column.relation.is_none() => kept
+                    .iter()
+                    .find(|(name, _)| *name == column.name)
+                    .map(|(_, value)| *value),
+                _ => None,
+            };
+            Ok(match value {
+                Some(value) => Transformed::yes(lit(value)),
+                None => Transformed::no(found),
+            })
+        })?;
+        changed |= read.transformed;
+        exprs.push(saved.restore(read.data));
+    }
+    let plan = if changed {
+        plan.with_new_exprs(exprs, inputs)?
+    } else {
+        plan
+    };
+    if !carries {
+        kept.clear();
+    }
+    kept.extend(own);
+    Ok((Transformed::new_transformed(plan, changed), kept))
 }
 
 fn drop_in(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
