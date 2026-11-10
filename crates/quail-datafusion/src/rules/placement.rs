@@ -79,6 +79,10 @@ fn plan_tables(plan: &LogicalPlan) -> BTreeSet<String> {
             found.insert(alias.alias.table().to_string());
             return Ok(TreeNodeRecursion::Jump);
         }
+        // a table read without an alias names its columns itself
+        if let LogicalPlan::TableScan(scan) = node {
+            found.insert(scan.table_name.table().to_string());
+        }
         Ok(TreeNodeRecursion::Continue)
     });
     found

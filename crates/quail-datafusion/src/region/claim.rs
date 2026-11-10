@@ -68,10 +68,14 @@ pub fn claim_model_regions(plan: LogicalPlan, session: &dyn Session) -> Result<L
         }
         _ => {}
     }
+    if std::env::var("QUAIL_DEBUG").is_ok() {
+        eprintln!("CLAIM:\n{}", plan.display_indent());
+    }
     if !calls_ai(&plan)? {
         // the analyzer has already made a fallback column's region
         return number_regions(drop_unread_probabilities(plan)?);
     }
+    NEXT_ROWS.with(|next| next.set(0));
     let claimed = number_regions(drop_unread_probabilities(claim_regions(plan, None)?)?)?;
     // DataFusion 55.2's `push_down_leaf_projections` fails on the join the
     // claim builds above a region: it moves a struct field read below the
@@ -733,7 +737,11 @@ pub(super) fn is_subquery(expr: &Expr) -> bool {
     }
 }
 
-static NEXT_ROWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    /// How many inputs the claim on this thread has named: a query's
+    /// inputs are numbered from zero each time it is claimed.
+    static NEXT_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// The run of `AiNode`s at `plan`'s root over its input as rows
 /// DataFusion computes, and the columns that restore the run's own
@@ -765,7 +773,7 @@ fn isolate_chain(plan: &LogicalPlan) -> Result<Option<(LogicalPlan, Vec<Expr>)>>
         .enumerate()
         .map(|(index, column)| Expr::Column(column.clone()).alias(format!("column_{index}")))
         .collect();
-    let number = NEXT_ROWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let number = NEXT_ROWS.with(|next| next.replace(next.get() + 1));
     // rows of one relation keep its name
     let mut qualifiers: Vec<String> = columns
         .iter()
