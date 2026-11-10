@@ -25,16 +25,31 @@
 //!   with an integer;
 //! - AND, OR, NOT, and `IS [NOT] TRUE` or `FALSE` of these.
 //!
-//! Any other part may give any value, so a condition made of it stays
-//! undecided until the answer is complete. Parts are combined one at a
-//! time, ignoring that two parts read the same answer, so a decision is
-//! sound but may come later than it could.
+//! Any other part may give any value, and parts are combined one at a
+//! time, ignoring that two parts read the same answer. So a condition
+//! these shapes leave undecided is then evaluated by DataFusion on each
+//! complete answer, when `C(w)` is a short list: a finished answer, or
+//! an extraction with few places left to copy from. That decides any
+//! expression of the answer alone, such as `a LIKE '%x%'` or
+//! `UPPER(a) = 'YES'`.
 
-use datafusion::common::ScalarValue;
+use std::sync::{Arc, OnceLock};
+
+use datafusion::arrow::array::{ArrayRef, AsArray, RecordBatch, StringArray};
+use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::{Column, DFSchema, ScalarValue};
 use datafusion::logical_expr::expr::{InList, Like, ScalarFunction};
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
+use datafusion::prelude::SessionContext;
 use quail_planner::error::CompileError;
 use quail_planner::physical::Expression;
+
+/// The most complete answers DataFusion evaluates a condition on.
+const MAX_LISTED: usize = 1024;
+
+/// The column that holds each listed answer.
+const LISTED: &str = "answer";
 
 /// What a condition is at a partial answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +118,32 @@ impl Completions {
             None => true,
             Some(tails) => tails.iter().any(|tail| !tail.is_empty()),
         }
+    }
+
+    /// Every complete answer still possible, when they are few: the text
+    /// so far, and the text with each cut of each tail. None when the
+    /// answer may go on with any text, or there are more than
+    /// [`MAX_LISTED`]. An extraction strips the whitespace around its
+    /// span, so the list can hold answers the model cannot give, which
+    /// only delays a decision.
+    fn listed(&self) -> Option<Vec<String>> {
+        if self.complete {
+            return Some(vec![self.prefix.clone()]);
+        }
+        let mut found = std::collections::BTreeSet::from([self.prefix.clone()]);
+        for tail in self.tails.as_ref()? {
+            for (added, (index, character)) in tail.char_indices().enumerate() {
+                if self.max_chars.is_some_and(|max| added >= max) {
+                    break;
+                }
+                let cut = &tail[..index + character.len_utf8()];
+                found.insert(format!("{}{cut}", self.prefix));
+                if found.len() > MAX_LISTED {
+                    return None;
+                }
+            }
+        }
+        Some(found.into_iter().collect())
     }
 
     /// The fewest and the most characters an answer has; None for no
@@ -378,6 +419,64 @@ impl<F: Fn(&Expr) -> bool> Reader<'_, F> {
         }
     }
 
+    /// Which values `expr` gives the complete answers still possible,
+    /// each one evaluated by DataFusion; None when the answers are too
+    /// many to list ([`Completions::listed`]), `expr` reads a column that
+    /// is not the answer, or DataFusion does not evaluate it.
+    fn evaluated(&self, expr: &Expr) -> Option<Possible> {
+        let mut answers: Vec<Option<String>> =
+            self.answers.listed()?.into_iter().map(Some).collect();
+        if self.answers.may_be_null {
+            answers.push(None);
+        }
+        let mut other = false;
+        let read = expr
+            .clone()
+            .transform_up(|found| match &found {
+                Expr::Column(_) if self.answer(&found) => {
+                    Ok(Transformed::yes(Expr::Column(Column::from_name(LISTED))))
+                }
+                Expr::Column(_) => {
+                    other = true;
+                    Ok(Transformed::no(found))
+                }
+                _ => Ok(Transformed::no(found)),
+            })
+            .ok()?
+            .data;
+        if other {
+            return None;
+        }
+        let field = Field::new(LISTED, DataType::Utf8, true);
+        let schema = Arc::new(Schema::new(vec![field]));
+        let column: ArrayRef = Arc::new(StringArray::from(answers));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![column]).ok()?;
+        static CONTEXT: OnceLock<SessionContext> = OnceLock::new();
+        let physical = CONTEXT
+            .get_or_init(SessionContext::new)
+            .create_physical_expr(read, &DFSchema::try_from(schema).ok()?)
+            .ok()?;
+        let values = physical
+            .evaluate(&batch)
+            .ok()?
+            .into_array(batch.num_rows())
+            .ok()?;
+        let values = values.as_boolean_opt()?;
+        let mut found = Possible {
+            t: false,
+            f: false,
+            n: false,
+        };
+        for value in values {
+            match value {
+                Some(true) => found.t = true,
+                Some(false) => found.f = true,
+                None => found.n = true,
+            }
+        }
+        Some(found)
+    }
+
     /// `left op right` with the answer, or a function of it, on the left
     /// and a literal on the right; None for another shape.
     fn compared(&self, left: &Expr, op: Operator, right: &Expr) -> Option<Possible> {
@@ -449,7 +548,16 @@ pub fn decide_expr(
     is_answer: impl Fn(&Expr) -> bool,
     answers: &Completions,
 ) -> Decision {
-    let found = Reader { is_answer, answers }.possible(expr);
+    let reader = Reader { is_answer, answers };
+    let mut found = reader.possible(expr);
+    // the shapes above ignore that two parts read one answer, and read
+    // any other shape as any value: a short list of answers settles both
+    if found.t
+        && (found.f || found.n)
+        && let Some(listed) = reader.evaluated(expr)
+    {
+        found = listed;
+    }
     if !found.t {
         Decision::NotTrue
     } else if !found.f && !found.n {
@@ -590,6 +698,37 @@ mod tests {
         assert_eq!(at(&date, &span), Decision::NotTrue);
         let year = col("a").eq(lit("Mary 2021"));
         assert_eq!(at(&year, &span), Decision::Undecided);
+    }
+
+    #[test]
+    fn datafusion_decides_any_test_of_a_short_list_of_answers() {
+        use datafusion::prelude::upper;
+        // a finished answer is one answer
+        let done = Completions {
+            complete: true,
+            ..text("yes, kind")
+        };
+        let loud = upper(col("a")).eq(lit("YES, KIND"));
+        assert_eq!(at(&loud, &done), Decision::True);
+        assert_eq!(at(&loud, &text("yes")), Decision::Undecided);
+        // a span that can only go on as "2027." never holds "2026"
+        let copied = Completions {
+            tails: Some(vec!["27.".into()]),
+            ..text("20")
+        };
+        let holds = |year: &str| col("a").like(lit(format!("%{year}%")));
+        assert_eq!(at(&holds("2026"), &copied), Decision::NotTrue);
+        assert_eq!(at(&holds("2027"), &copied), Decision::Undecided);
+        assert_eq!(at(&holds("20"), &copied), Decision::True);
+        // an answer that may be NULL is not certainly TRUE
+        let nullable = Completions {
+            may_be_null: true,
+            ..copied.clone()
+        };
+        assert_eq!(at(&holds("20"), &nullable), Decision::Undecided);
+        // two parts that read the one answer are decided together
+        let either = col("a").like(lit("%7%")).or(col("a").not_like(lit("%7%")));
+        assert_eq!(at(&either, &copied), Decision::True);
     }
 
     #[test]
