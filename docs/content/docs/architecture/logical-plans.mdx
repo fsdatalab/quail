@@ -42,7 +42,7 @@ stores one AI call and the operations that apply to its answer:
 | `call` | The AI call. |
 | `guard` | Ask the model only for rows where this condition is TRUE. |
 | `filter` | Keep rows where this exact condition on input columns and answers is TRUE. |
-| `hint`, `hint_test` | Planning options and a test the executor may use to reject rows early. The original filter remains above a hint test. |
+| `hint` | Planning options, such as a selectivity. |
 | `projection` | The added columns the node returns. |
 | `fetch` | Keep the first rows globally, or the first rows for each key. |
 | `semantics` | Return passing rows, or the outer rows that have a match (`Semi`) or no match (`Anti`). |

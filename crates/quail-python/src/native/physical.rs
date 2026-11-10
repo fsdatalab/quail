@@ -166,14 +166,14 @@ static KINDS: &[Kind] = &[
         tag: "quail.ai_extract",
         node: true,
         fields: fields!(NODE, MODEL_NODE; "attention" = S, "guard" = NONE,
-            "stop_tests" = EMPTY, "stop_when_true" = NO, "hint_tests" = EMPTY),
+            "stop_tests" = EMPTY, "stop_when_true" = NO),
     },
     Kind {
         class: "AiMap",
         tag: "quail.ai_map",
         node: true,
         fields: fields!(NODE, MODEL_NODE; "attention" = S, "guard" = NONE,
-            "stop_tests" = EMPTY, "stop_when_true" = NO, "hint_tests" = EMPTY),
+            "stop_tests" = EMPTY, "stop_when_true" = NO),
     },
     Kind {
         class: "AiSaeFeatures",

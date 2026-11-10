@@ -246,11 +246,10 @@ physical_nodes! {
     }
     /// One `AI.EXTRACT` question.
     ///
-    /// The executor stops an answer once a stop test or a hint test is
-    /// decided not TRUE on the tokens decoded so far, or, with
-    /// `stop_when_true`, once every stop test is decided TRUE. Stop tests
-    /// are the region's exact tests that read the answer alone; hint
-    /// tests are tests the node may drop rows by.
+    /// The executor stops an answer once a stop test is decided not TRUE
+    /// on the tokens decoded so far, or, with `stop_when_true`, once
+    /// every stop test is decided TRUE. Stop tests are the region's exact
+    /// tests that read the answer alone.
     AiExtract(AiExtractAttributes) = "quail.ai_extract" {
         backend_name: String,
         model: String,
@@ -265,16 +264,13 @@ physical_nodes! {
         stop_tests: Vec<ValueExpression>,
         #[serde(default)]
         stop_when_true: bool,
-        #[serde(default)]
-        hint_tests: Vec<ValueExpression>,
     }
     /// An `AI.MAP` call.
     ///
-    /// The executor stops an answer once a stop test or a hint test is
-    /// decided not TRUE on the tokens decoded so far, or, with
-    /// `stop_when_true`, once every stop test is decided TRUE. Stop tests
-    /// are the region's exact tests that read the answer alone; hint
-    /// tests are tests the node may drop rows by.
+    /// The executor stops an answer once a stop test is decided not TRUE
+    /// on the tokens decoded so far, or, with `stop_when_true`, once
+    /// every stop test is decided TRUE. Stop tests are the region's exact
+    /// tests that read the answer alone.
     AiMap(AiMapAttributes) = "quail.ai_map" {
         backend_name: String,
         model: String,
@@ -289,8 +285,6 @@ physical_nodes! {
         stop_tests: Vec<ValueExpression>,
         #[serde(default)]
         stop_when_true: bool,
-        #[serde(default)]
-        hint_tests: Vec<ValueExpression>,
     }
     /// An `AI.SAE_FEATURES` call.
     AiSaeFeatures(AiSaeFeaturesAttributes) = "quail.ai_sae_features" {

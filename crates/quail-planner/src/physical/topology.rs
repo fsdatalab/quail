@@ -561,22 +561,17 @@ impl PhysicalNode {
         }
     }
 
-    /// A map's or extraction's stop tests, hint tests, and whether it
-    /// stops once every stop test is decided TRUE; empty for every other
-    /// node.
-    pub fn answer_stops(&self) -> (&[ValueExpression], &[ValueExpression], bool) {
+    /// A map's or extraction's stop tests, and whether it stops once
+    /// every stop test is decided TRUE; empty for every other node.
+    pub fn answer_stops(&self) -> (&[ValueExpression], bool) {
         match self {
-            PhysicalNode::AiMap(node) => (
-                &node.attributes.stop_tests,
-                &node.attributes.hint_tests,
-                node.attributes.stop_when_true,
-            ),
-            PhysicalNode::AiExtract(node) => (
-                &node.attributes.stop_tests,
-                &node.attributes.hint_tests,
-                node.attributes.stop_when_true,
-            ),
-            _ => (&[], &[], false),
+            PhysicalNode::AiMap(node) => {
+                (&node.attributes.stop_tests, node.attributes.stop_when_true)
+            }
+            PhysicalNode::AiExtract(node) => {
+                (&node.attributes.stop_tests, node.attributes.stop_when_true)
+            }
+            _ => (&[], false),
         }
     }
 

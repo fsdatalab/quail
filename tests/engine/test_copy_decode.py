@@ -543,7 +543,7 @@ def test_an_extraction_goes_on_while_any_live_position_can_pass_its_test():
     decoder = MapDecoder(events_torch(0), torch.eye(num_tokens), len(texts), [8],
                          vocabulary.tokenizer.stop_ids, 16,
                          workspace_bytes=64 * 2**20)
-    decoder.answer_stops[0] = AnswerStop("ends", (test,), (), False)
+    decoder.answer_stops[0] = AnswerStop("ends", (test,), False)
     slots = np.arange(len(texts))[None]
     decoder.configure_copy(0, slots, documents, [spec])
     for slot in slots[0]:

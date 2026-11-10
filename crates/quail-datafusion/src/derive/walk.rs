@@ -81,14 +81,6 @@ pub(super) fn read_fetch(top: &Top<'_>) -> Option<Option<i64>> {
     (!elsewhere).then_some(fetch)
 }
 
-/// Whether a plan reads a CTE or a FROM subquery.
-pub(super) fn has_subqueries(plan: &LogicalPlan) -> bool {
-    plan.exists(|node| {
-        Ok(matches!(node, LogicalPlan::SubqueryAlias(alias)
-            if !matches!(alias.input.as_ref(), LogicalPlan::TableScan(_))))
-    })
-    .unwrap_or(false)
-}
 /// A table the region scans.
 #[derive(Debug, Clone)]
 pub(super) struct Table {
@@ -140,11 +132,6 @@ pub(super) struct Walk<'a> {
     merged: Vec<(String, Vec<(String, Expr)>)>,
     /// The binder's refusal of the FROM and JOIN shape, if any.
     pub(super) refusal: Option<CompileError>,
-    /// Whether the plan has an operator Quail's operators do not read.
-    pub(super) unplaced: bool,
-    /// Whether that operator is one no operator of Quail's is, such as a
-    /// LIMIT below a filter.
-    pub(super) unknown: bool,
 }
 
 impl<'a> Walk<'a> {
@@ -156,11 +143,6 @@ impl<'a> Walk<'a> {
             LogicalPlan::Projection(projection) => {
                 (Kind::PassThrough, vec![self.visit(&projection.input)])
             }
-            LogicalPlan::Filter(_) => {
-                self.unplaced = true;
-                self.unknown = true;
-                (Kind::PassThrough, Vec::new())
-            }
             LogicalPlan::Join(join) => {
                 if join.join_type != JoinType::Inner {
                     self.refuse(unsupported(&format!(
@@ -171,16 +153,6 @@ impl<'a> Walk<'a> {
                 let left = self.visit(&join.left);
                 let right = self.visit(&join.right);
                 (Kind::Join(join), vec![left, right])
-            }
-            LogicalPlan::Extension(extension) => {
-                match extension.node.as_any().downcast_ref::<AiNode>() {
-                    Some(node) => (Kind::Ai(node), vec![self.visit(&node.input)]),
-                    None => {
-                        self.unplaced = true;
-                        self.unknown = true;
-                        (Kind::PassThrough, Vec::new())
-                    }
-                }
             }
             LogicalPlan::SubqueryAlias(alias) => match self.table(plan) {
                 Some(table) => (Kind::Scan(table), Vec::new()),
@@ -196,11 +168,16 @@ impl<'a> Walk<'a> {
                 Some(table) => (Kind::Scan(table), Vec::new()),
                 None => unreachable!("a table scan reads a table"),
             },
-            _ => {
-                self.unplaced = true;
-                self.unknown = true;
-                (Kind::PassThrough, Vec::new())
-            }
+            other => match as_node::<AiNode>(other) {
+                Some(node) => (Kind::Ai(node), vec![self.visit(&node.input)]),
+                // the claim puts no other operator in a region
+                None => {
+                    self.refuse(unsupported(
+                        "These operators must run outside the model region.",
+                    ));
+                    (Kind::PassThrough, Vec::new())
+                }
+            },
         };
         self.stack.pop();
         for input in &inputs {
@@ -522,10 +499,7 @@ pub(super) struct Answer {
 /// list's, or, where DataFusion removed one that passes its input on,
 /// the input's columns.
 fn derived_columns(plan: &LogicalPlan) -> Vec<(String, Expr)> {
-    let mut node = plan;
-    while let LogicalPlan::Filter(filter) = node {
-        node = &filter.input;
-    }
+    let node = plan;
     if !matches!(node, LogicalPlan::Projection(_)) {
         return plan
             .schema()

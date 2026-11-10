@@ -131,6 +131,10 @@ impl TableStep {
 }
 
 /// Whether a step reads the KV the step before it left.
+///
+/// `plan_kv_retention` keeps a pipeline's KV exactly when the next
+/// pipeline over the same table has the same document head, so
+/// `resident_inputs` finds the same steps resident in the built graph.
 pub fn resident_after(previous: &TableStep, step: &TableStep) -> bool {
     previous.document_head == step.document_head
 }

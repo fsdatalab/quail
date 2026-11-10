@@ -46,7 +46,7 @@ use quail_planner::prompts::Turn;
 use self::assemble::{Assembly, push_down_columns};
 use self::binding::{Binder, Selected, unsupported};
 use self::relation::Relation;
-use self::walk::{Walk, has_subqueries, read_fetch, read_top, with_select_list};
+use self::walk::{Walk, read_fetch, read_top, with_select_list};
 use crate::ai::AiNode;
 use crate::region::ModelRegion;
 
@@ -197,10 +197,6 @@ fn derive_operators(
     if let Some(error) = walk.refusal.take() {
         return Err(error);
     }
-    if walk.unknown {
-        return Err(unplaced(plan));
-    }
-    let allow_relational = has_subqueries(plan);
     let answers = walk.answers();
     let select: Vec<Expr> = top
         .projection
@@ -228,7 +224,7 @@ fn derive_operators(
     } = binder.bind_select(&select)?;
     binder.validate_query(&columns, &structs)?;
     let unplaced_term = relation.unplaced;
-    let mut assembly = Assembly::new(&walk, &mut binder, relation, &columns, allow_relational)?;
+    let mut assembly = Assembly::new(&walk, &mut binder, relation, &columns)?;
     if assembly.place().is_none() {
         return Err(unplaced(plan));
     }
@@ -264,9 +260,6 @@ fn derive_operators(
     found.fetch = fetch;
     if found.fetch.is_some_and(|limit| limit <= 0) {
         return unsupported("DataFusion must apply a non-positive LIMIT outside the model region.");
-    }
-    if allow_relational && quail_planner::plan_statistics::plan_prompts(&found).is_empty() {
-        return unsupported("DataFusion must run this region because it has no model call.");
     }
     push_down_columns(&mut found, &walk, &assembly);
     Ok(found)

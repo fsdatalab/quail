@@ -123,7 +123,6 @@ mod tests {
                 guard: None,
                 stop_tests: Vec::new(),
                 stop_when_true: false,
-                hint_tests: Vec::new(),
             },
         });
         let added = [
@@ -137,7 +136,6 @@ mod tests {
             "closes_disjunction",
             "stop_tests",
             "stop_when_true",
-            "hint_tests",
         ];
         for node in [filter, map] {
             let mut saved = serde_json::to_value(&node).unwrap();

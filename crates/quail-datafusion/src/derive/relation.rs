@@ -557,15 +557,11 @@ pub(super) fn check_joins(
     Ok(())
 }
 
-/// Refuse AI.SCORE beside generative predicates, and a query that asks
-/// no model.
+/// Refuse AI.SCORE beside generative predicates.
 pub(super) fn check_calls(
     filters: &ByAlias<FilterPredicate>,
     joins: &[&JoinSpec],
-    label_tests: &ByAlias<(ModelCall, Value, Option<f64>)>,
     projected: &[(&ModelCall, String)],
-    tested: &[(ModelCall, String)],
-    allow_relational: bool,
 ) -> Result<(), CompileError> {
     let scores: Vec<bool> = filters
         .iter()
@@ -581,14 +577,6 @@ pub(super) fn check_calls(
         .collect();
     if scores.contains(&true) && scores.contains(&false) {
         return unsupported("Scores and generative model calls must run in separate regions.");
-    }
-    let asks = !(joins.is_empty()
-        && filters.is_empty()
-        && label_tests.is_empty()
-        && projected.is_empty()
-        && tested.is_empty());
-    if !(allow_relational || asks) {
-        return unsupported("DataFusion must run this region because it has no model call.");
     }
     Ok(())
 }

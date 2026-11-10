@@ -132,10 +132,6 @@ pub struct AiNode {
     /// The options of the `HINT` the query wraps the call's term in,
     /// such as `{'selectivity': 0.4}`.
     pub hint: Option<Expr>,
-    /// A test of the input's columns and the added columns: the node may
-    /// drop rows where it is not TRUE, as an executor that stops an
-    /// answer once the test is decided.
-    pub hint_test: Option<Expr>,
     /// The positions in `fields` of the added columns the node returns;
     /// None returns every one.
     pub projection: Option<Vec<usize>>,
@@ -169,7 +165,6 @@ impl AiNode {
             guard: None,
             filter: None,
             hint: None,
-            hint_test: None,
             projection: None,
             fetch: None,
             semantics: Semantics::Rows,
@@ -346,7 +341,6 @@ impl AiNode {
         node.call = rewrite(node.call)?;
         node.guard = node.guard.map(&rewrite).transpose()?;
         node.filter = node.filter.map(&rewrite).transpose()?;
-        node.hint_test = node.hint_test.map(&rewrite).transpose()?;
         for test in &mut node.tests {
             test.test = rewrite(test.test.clone())?;
             test.written = rewrite(test.written.clone())?;
@@ -375,9 +369,6 @@ impl AiNode {
         }
         if let Some(hint) = &self.hint {
             write!(f, ", hint: {hint}")?;
-        }
-        if let Some(test) = &self.hint_test {
-            write!(f, ", hint test: {test}")?;
         }
         match &self.fetch {
             Some(Fetch::Global(n)) => write!(f, ", fetch: {n}")?,
@@ -477,7 +468,6 @@ impl UserDefinedLogicalNodeCore for AiNode {
             .expressions()
             .into_iter()
             .chain(self.filter.clone())
-            .chain(self.hint_test.clone())
             .chain(self.tests.iter().map(|test| test.test.clone()));
         for expr in read {
             for column in expr.column_refs() {

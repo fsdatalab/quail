@@ -823,7 +823,7 @@ def test_a_map_answer_stops_once_its_test_is_decided(monkeypatch):
     torch_ = events_torch(2)
     ids = list(range(len(documents)))
     node = map_node("a", tail, limit)
-    node.stop_tests, node.hint_tests, node.stop_when_true = (test,), (), True
+    node.stop_tests, node.stop_when_true = (test,), True
     maps = MapOperator(None, [node], ids, 0)
     stages = gated_stages([maps])
     prefixes, keys, tree, dependencies = maps.branch_inputs(

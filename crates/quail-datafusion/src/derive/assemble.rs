@@ -99,9 +99,6 @@ impl<'w, 'a> Assembly<'w, 'a> {
     /// Place the region's operators in the plan's order; None when the
     /// plan holds an operator Quail's operators do not read here.
     pub(super) fn place(&mut self) -> Option<()> {
-        if self.walk.unplaced {
-            return None;
-        }
         for id in self.walk.ids() {
             // a column node's and an AI.IF filter's executors read a guard
             if let Kind::Ai(node) = &self.walk.get(id).kind
@@ -263,15 +260,6 @@ impl<'w, 'a> Assembly<'w, 'a> {
         }
     }
 
-    /// A column node's hint test as a condition over its answer columns;
-    /// None when it has none or it does not bind, as a hint may be left
-    /// out.
-    fn bound_hint(&mut self, node: &AiNode) -> Option<ValueExpression> {
-        let test = node.hint_test.as_ref()?;
-        let written = self.walk.written(test, &self.walk.answers());
-        self.binder.bind_condition(&written).ok()
-    }
-
     fn place_column(&mut self, id: usize, node: &AiNode) -> Option<()> {
         let read: Vec<String> = self.call_tables(id).into_iter().collect();
         let is_column = |kind: &Kind| matches!(kind, Kind::Ai(found) if !found.is_predicate() && found.semantics == Semantics::Rows);
@@ -310,7 +298,6 @@ impl<'w, 'a> Assembly<'w, 'a> {
                             .guard
                             .as_ref()
                             .map(|found| crate::rules::guards::guard_selectivity(found, &[])),
-                        hint_tests: Vec::new(),
                     });
                     let position = self.found.classifies.len() - 1;
                     self.columns_at
@@ -325,18 +312,7 @@ impl<'w, 'a> Assembly<'w, 'a> {
         let above_joins = self.walk.get(self.walk.get(id).inputs[0]).ai_join;
         let guard = self.bound_guard(node)?;
         let (kind, columns) = self.bound_columns(node)?;
-        let hint = self.bound_hint(node);
         for (call, name) in columns {
-            // a hint test that reads this column alone
-            let hint_tests = hint
-                .iter()
-                .filter(|test| {
-                    column_references(test)
-                        .iter()
-                        .all(|found| found.alias == alias && found.column == name)
-                })
-                .cloned()
-                .collect();
             let list = self.list(kind);
             list.push(SemanticColumn {
                 call,
@@ -347,7 +323,6 @@ impl<'w, 'a> Assembly<'w, 'a> {
                     .guard
                     .as_ref()
                     .map(|found| crate::rules::guards::guard_selectivity(found, &[])),
-                hint_tests,
             });
             let position = list.len() - 1;
             self.columns_at

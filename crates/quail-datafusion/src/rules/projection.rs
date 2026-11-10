@@ -268,7 +268,6 @@ impl Reads<'_> {
                         .expressions()
                         .into_iter()
                         .chain(ai.filter.clone())
-                        .chain(ai.hint_test.clone())
                         .chain(ai.tests.iter().map(|test| test.test.clone()));
                     for expr in exprs {
                         self.expr(&expr);

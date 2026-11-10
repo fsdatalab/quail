@@ -4,7 +4,7 @@ While the model writes an answer, the tokens decoded so far limit the
 complete answers still possible. A test is decided TRUE when every one
 of them passes it, and decided not TRUE when none does; otherwise it is
 undecided (see ``Expression.decide``). The executor stops an answer,
-and frees its KV, once a stop test or a hint test is decided not TRUE:
+and frees its KV, once a stop test is decided not TRUE:
 the region drops the row. When nothing else reads the answer, it also
 stops once every stop test is decided TRUE: the region keeps the row
 whatever the rest of the answer says.
@@ -40,14 +40,12 @@ class AnswerStop:
     Attributes:
         answer: The name of the column that holds the answer.
         stop_tests: The region's exact tests of the answer alone.
-        hint_tests: Tests of the answer the node may drop rows by.
         when_true: Whether the answer stops once every stop test is
             decided TRUE.
     """
 
     answer: str
     stop_tests: tuple
-    hint_tests: tuple
     when_true: bool
 
     def decide(self, prefix: str, *, may_be_null: bool = False,
@@ -80,15 +78,14 @@ class AnswerStop:
         if not completions:
             return Stop.CONTINUE
         decided = []
-        for test in (*self.stop_tests, *self.hint_tests):
+        for test in self.stop_tests:
             found = {test.decide(self.answer, **completion)
                      if hasattr(test, "decide") else "undecided"
                      for completion in completions}
             decided.append(found.pop() if len(found) == 1 else "undecided")
         if "not true" in decided:
             return Stop.REJECTED
-        exact = decided[:len(self.stop_tests)]
-        if self.when_true and exact and all(found == "true" for found in exact):
+        if self.when_true and decided and all(found == "true" for found in decided):
             return Stop.ACCEPTED
         return Stop.CONTINUE
 
@@ -96,10 +93,9 @@ class AnswerStop:
 def answer_stop(node) -> AnswerStop | None:
     """Return a map's or extraction's answer stop, or None without tests."""
     stop_tests = tuple(getattr(node, "stop_tests", ()))
-    hint_tests = tuple(getattr(node, "hint_tests", ()))
-    if not stop_tests and not hint_tests:
+    if not stop_tests:
         return None
-    return AnswerStop(node.spec.name, stop_tests, hint_tests,
+    return AnswerStop(node.spec.name, stop_tests,
                       bool(getattr(node, "stop_when_true", False)))
 
 

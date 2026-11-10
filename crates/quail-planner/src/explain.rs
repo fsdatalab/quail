@@ -1167,8 +1167,8 @@ impl TreeRows<'_> {
                 condition_text(guard)
             ));
         }
-        let (stops, hints, when_true) = known.answer_stops();
-        let tests: Vec<String> = stops.iter().chain(hints).map(condition_text).collect();
+        let (stops, when_true) = known.answer_stops();
+        let tests: Vec<String> = stops.iter().map(condition_text).collect();
         if !tests.is_empty() {
             let also = if when_true {
                 ", or once every one is TRUE"

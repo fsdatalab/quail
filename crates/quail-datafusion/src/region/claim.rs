@@ -771,14 +771,10 @@ fn simpler_run(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
             nodes.push(found);
             bottom = found.input.as_ref();
         }
-        if nodes
-            .iter()
-            .any(|found| found.hint_test.is_some() || !found.tests.is_empty())
-        {
+        if nodes.iter().any(|found| !found.tests.is_empty()) {
             let mut run = bottom.clone();
             for found in nodes.iter().rev() {
                 let mut found = (*found).clone();
-                found.hint_test = None;
                 found.tests = Vec::new();
                 run = extension_node(found.with_input(run)?);
             }
@@ -793,7 +789,6 @@ fn simpler_run(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
     let plain = node.filter.is_none()
         && node.guard.is_none()
         && node.hint.is_none()
-        && node.hint_test.is_none()
         && node.fetch.is_none()
         && node.projection.is_none()
         && node.tests.is_empty();
@@ -804,7 +799,6 @@ fn simpler_run(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
     stripped.filter = None;
     stripped.guard = None;
     stripped.hint = None;
-    stripped.hint_test = None;
     stripped.fetch = None;
     stripped.projection = None;
     stripped.tests = Vec::new();

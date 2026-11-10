@@ -92,8 +92,7 @@ fn place_conditions(
 impl<'w, 'a> Assembly<'w, 'a> {
     /// Name each column operator and place the relation's conditions.
     ///
-    /// `columns` is the SELECT list; `allow_relational` says whether the
-    /// region reads a CTE or FROM subquery.
+    /// `columns` is the SELECT list.
     ///
     /// # Errors
     ///
@@ -104,7 +103,6 @@ impl<'w, 'a> Assembly<'w, 'a> {
         binder: &'w mut Binder,
         relation: Relation,
         columns: &[ValueExpression],
-        allow_relational: bool,
     ) -> Result<Self, CompileError> {
         let Relation {
             filters,
@@ -121,15 +119,8 @@ impl<'w, 'a> Assembly<'w, 'a> {
             .collect();
         let specs: Vec<&JoinSpec> = joins.values().collect();
         check_joins(&equalities, &tables, &specs, &projected)?;
+        check_calls(&filters, &specs, &projected)?;
         let tested = &binder.tested;
-        check_calls(
-            &filters,
-            &specs,
-            &label_tests,
-            &projected,
-            tested,
-            allow_relational,
-        )?;
         // a tested label takes SELECT's name, a test's, or one of its own
         let mut names: Vec<(ModelCall, String)> = Vec::new();
         for (alias, found) in &label_tests {
