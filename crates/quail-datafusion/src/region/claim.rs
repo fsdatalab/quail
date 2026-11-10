@@ -305,51 +305,29 @@ fn claim_needed(
             Arc::new(claimed),
         )?));
     }
-    let mut refused = None;
     if as_node::<AiNode>(&plan).is_some() {
-        let selected = select_list(plan.clone(), needed.clone())?;
-        let (bound, inputs, _) = split_inputs(selected)?;
-        let numbered_inputs = numbered(&bound);
-        let (bound, above) = lift_relational(bound)?;
-        let names: Vec<String> = inputs.iter().map(|(name, _)| name.clone()).collect();
-        let (bound, back) = join_back(bound, &names)?;
-        if calls_ai(&bound)? && quail_plans(&bound)? {
-            refused = refusal_of(&bound);
-            if refused.is_none() {
-                let mut region = ModelRegion::new(bound);
-                // a fetch counts the rows the region returns, not the
-                // rows a lifted test or UNNEST keeps of them
-                region.fetch = fetch
-                    .filter(|_| above.keeps_rows() && !crate::ai::any_filters_on_or(&region.plan));
-                let shared = back.inputs();
-                let mut read = Vec::new();
-                for (name, input) in inputs {
-                    let mut input = claim_regions(input, None)?;
-                    let numbered = numbered_inputs.contains(&name);
-                    if numbered || shared.contains(&name) {
-                        input = extension_node(SharedInput::try_new(input, numbered)?);
-                    }
-                    read.push((name.clone(), input.clone()));
-                    region.inputs.push(input);
-                    region.input_names.push(name);
-                }
-                return above.build(back.build(extension_node(region), &read)?);
+        let refused = match claim_run(&plan, fetch, needed.clone())? {
+            Ok(claimed) => return Ok(claimed),
+            Err(refused) => refused,
+        };
+        // a run no region takes is tried in smaller parts
+        return match simpler_run(&plan)? {
+            Some(simpler) => {
+                let fetch = fetch.filter(|_| as_node::<AiNode>(&simpler).is_some());
+                claim_needed(simpler, fetch, needed)
             }
-        }
+            None => plan_err!("{refused}"),
+        };
     }
     // DataFusion runs this operator; its inputs are claimed below it
-    if as_node::<AiNode>(&plan).is_some()
-        || plan
-            .expressions()
-            .iter()
-            .any(|expr| expr.exists(|inner| Ok(is_ai_call(inner))).unwrap_or(false))
+    if plan
+        .expressions()
+        .iter()
+        .any(|expr| expr.exists(|inner| Ok(is_ai_call(inner))).unwrap_or(false))
     {
         return plan_err!(
-            "{}",
-            refused.unwrap_or_else(|| format!(
-                "This operator cannot contain a model call:\n{}",
-                plan.display()
-            ))
+            "This operator cannot contain a model call:\n{}",
+            plan.display()
         );
     }
     let passed = passed_fetch(&plan, fetch);
@@ -821,7 +799,7 @@ fn isolate_chain(plan: &LogicalPlan) -> Result<Option<(LogicalPlan, Vec<Expr>)>>
             .data)
     };
     for node in nodes.iter().rev() {
-        input = extension_node(node.map_expressions(&remap)?.with_input(input)?);
+        input = extension_node(node.map_expressions(remap)?.with_input(input)?);
     }
     let restore = plan
         .schema()
@@ -845,4 +823,142 @@ fn is_table(plan: &LogicalPlan) -> bool {
         Ok(TreeNodeRecursion::Continue)
     });
     num_scans == 1 && !calls_ai(plan).unwrap_or(true)
+}
+
+/// One model region for the run of `AiNode`s at `plan`'s root, or the
+/// binder's refusal of the run.
+fn claim_run(
+    plan: &LogicalPlan,
+    fetch: Option<usize>,
+    needed: Option<Vec<Column>>,
+) -> Result<std::result::Result<LogicalPlan, String>> {
+    let selected = select_list(plan.clone(), needed)?;
+    let (bound, inputs, _) = split_inputs(selected)?;
+    let numbered_inputs = numbered(&bound);
+    let (bound, above) = lift_relational(bound)?;
+    let names: Vec<String> = inputs.iter().map(|(name, _)| name.clone()).collect();
+    let (bound, back) = join_back(bound, &names)?;
+    if !quail_plans(&bound)? {
+        return Ok(Err(format!(
+            "This operator cannot contain a model call:\n{}",
+            plan.display()
+        )));
+    }
+    if let Some(error) = derive_error(&bound) {
+        return Ok(Err(error.to_string()));
+    }
+    let mut region = ModelRegion::new(bound);
+    // a fetch counts the rows the region returns, not the rows a lifted
+    // test or UNNEST keeps of them
+    region.fetch =
+        fetch.filter(|_| above.keeps_rows() && !crate::ai::any_filters_on_or(&region.plan));
+    let shared = back.inputs();
+    let mut read = Vec::new();
+    for (name, input) in inputs {
+        let mut input = claim_regions(input, None)?;
+        let numbered = numbered_inputs.contains(&name);
+        if numbered || shared.contains(&name) {
+            input = extension_node(SharedInput::try_new(input, numbered)?);
+        }
+        read.push((name.clone(), input.clone()));
+        region.inputs.push(input);
+        region.input_names.push(name);
+    }
+    above
+        .build(back.build(extension_node(region), &read)?)
+        .map(Ok)
+}
+
+/// A plan that returns the rows of the run of `AiNode`s at `plan`'s root
+/// and asks less of one region, or None when there is nothing simpler.
+///
+/// A run of several nodes gives up its top node, which becomes a run of
+/// its own over the others' rows. A single node gives up its options: its
+/// filter and fetch become a `Filter` and `Limit` above it, and its
+/// guard, hint, and hint test, which only save work, are dropped. A node
+/// with no options has its arguments computed below it.
+fn simpler_run(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
+    let Some(node) = as_node::<AiNode>(plan) else {
+        return Ok(None);
+    };
+    let pass_on = |input: &LogicalPlan| -> Result<LogicalPlan> {
+        let columns = input.schema().columns().into_iter().map(Expr::Column);
+        Ok(LogicalPlan::Projection(Projection::try_new(
+            columns.collect(),
+            Arc::new(input.clone()),
+        )?))
+    };
+    if as_node::<AiNode>(node.input.as_ref()).is_some() {
+        let below = pass_on(node.input.as_ref())?;
+        return Ok(Some(extension_node(node.with_input(below)?)));
+    }
+    if node.semantics != crate::ai::Semantics::Rows {
+        return Ok(None);
+    }
+    let plain = node.filter.is_none()
+        && node.guard.is_none()
+        && node.hint.is_none()
+        && node.hint_test.is_none()
+        && node.fetch.is_none()
+        && node.projection.is_none();
+    if plain {
+        return computed_arguments(node);
+    }
+    let mut stripped = node.clone();
+    stripped.filter = None;
+    stripped.guard = None;
+    stripped.hint = None;
+    stripped.hint_test = None;
+    stripped.fetch = None;
+    stripped.projection = None;
+    let mut above = extension_node(stripped.checked()?);
+    if let Some(filter) = &node.filter {
+        above = LogicalPlan::Filter(datafusion::logical_expr::Filter::try_new(
+            filter.clone(),
+            Arc::new(above),
+        )?);
+    }
+    if let Some(crate::ai::Fetch::Global(rows)) = &node.fetch {
+        above = datafusion::logical_expr::LogicalPlanBuilder::from(above)
+            .limit(0, Some(*rows))?
+            .build()?;
+    }
+    let columns = plan.schema().columns().into_iter().map(Expr::Column);
+    Ok(Some(LogicalPlan::Projection(Projection::try_new(
+        columns.collect(),
+        Arc::new(above),
+    )?)))
+}
+
+/// `node`, which has no options, over a SELECT list that computes each
+/// argument of its call that is not a column; None when every argument
+/// is one already.
+fn computed_arguments(node: &AiNode) -> Result<Option<LogicalPlan>> {
+    let mut exprs: Vec<Expr> = node
+        .input
+        .schema()
+        .columns()
+        .into_iter()
+        .map(Expr::Column)
+        .collect();
+    exprs.push(node.call.clone().alias(&node.answer));
+    let written = Projection::try_new(exprs, Arc::clone(&node.input))?;
+    let computed = crate::rules::lower::precompute_prompt_arguments(written.clone())?;
+    if computed == written {
+        return Ok(None);
+    }
+    let lowered = crate::lower_ai_calls(LogicalPlan::Projection(computed))?;
+    // the node's own columns, without the computed arguments
+    let columns = datafusion::logical_expr::UserDefinedLogicalNodeCore::schema(node).columns();
+    if !columns
+        .iter()
+        .all(|column| lowered.schema().has_column(column))
+    {
+        return Ok(None);
+    }
+    let columns: Vec<Expr> = columns.into_iter().map(Expr::Column).collect();
+    Ok(Some(LogicalPlan::Projection(Projection::try_new(
+        columns,
+        Arc::new(lowered),
+    )?)))
 }

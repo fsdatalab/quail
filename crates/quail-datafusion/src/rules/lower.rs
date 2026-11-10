@@ -283,7 +283,7 @@ fn stack_asked(
 /// The column each call a filter tests or a SELECT list returns is
 /// added under: a SELECT alias, or a name of its own.
 #[derive(Debug, Default)]
-struct Columns {
+pub(crate) struct Columns {
     /// (call, name) of each column call a SELECT list returns.
     selected: Vec<(Expr, String)>,
     reserved: std::collections::BTreeSet<String>,
@@ -865,36 +865,52 @@ fn lower_projection(
     )))
 }
 
-/// Rewrite the AI calls of one part of a query that Quail plans into
-/// Quail's plan nodes, as the module explains.
+impl Columns {
+    /// The names for the calls of `plan`: its SELECT lists' aliases, and
+    /// new ones that are no column of it.
+    pub(crate) fn of(plan: &LogicalPlan) -> Result<Self> {
+        let mut reserved = std::collections::BTreeSet::new();
+        plan.apply_with_subqueries(|node| {
+            reserved.extend(
+                node.schema()
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().clone()),
+            );
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        Ok(Self {
+            selected: selected_calls(plan),
+            reserved,
+            ..Self::default()
+        })
+    }
+}
+
+/// `node` with the AI calls of its own expressions as `AiNode`s below
+/// it, as the module explains. Any operator but a `Filter`, an inner
+/// `Join`, or a `Projection` is unchanged.
+pub(crate) fn lower_node(
+    node: LogicalPlan,
+    columns: &mut Columns,
+) -> Result<Transformed<LogicalPlan>> {
+    match &node {
+        LogicalPlan::Filter(filter) => lower_filter(filter, columns),
+        LogicalPlan::Join(join) => lower_join(join, columns),
+        LogicalPlan::Projection(projection) => lower_projection(projection, columns),
+        _ => Ok(Transformed::no(node)),
+    }
+}
+
+/// Rewrite the AI calls of a plan into Quail's plan nodes, as the module
+/// explains.
 ///
 /// # Errors
 ///
 /// A rewritten operator's schema does not fit DataFusion's rules.
 pub fn lower_ai_calls(plan: LogicalPlan) -> Result<LogicalPlan> {
-    let mut reserved = std::collections::BTreeSet::new();
-    plan.apply(|node| {
-        reserved.extend(
-            node.schema()
-                .fields()
-                .iter()
-                .map(|field| field.name().clone()),
-        );
-        Ok(TreeNodeRecursion::Continue)
-    })?;
-    let mut columns = Columns {
-        selected: selected_calls(&plan),
-        reserved,
-        num_unnamed: 0,
-        num_answers: 0,
-        num_clauses: 0,
-    };
+    let mut columns = Columns::of(&plan)?;
     Ok(plan
-        .transform_up(|node| match &node {
-            LogicalPlan::Filter(filter) => lower_filter(filter, &mut columns),
-            LogicalPlan::Join(join) => lower_join(join, &mut columns),
-            LogicalPlan::Projection(projection) => lower_projection(projection, &mut columns),
-            _ => Ok(Transformed::no(node)),
-        })?
+        .transform_up(|node| lower_node(node, &mut columns))?
         .data)
 }

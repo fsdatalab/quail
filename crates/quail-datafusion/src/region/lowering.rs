@@ -72,7 +72,8 @@ pub(crate) fn lower_regions(plan: LogicalPlan, config: &ConfigOptions) -> Result
         }
         Ok(TreeNodeRecursion::Continue)
     })?;
-    extracted.claim(plan, None)
+    let mut columns = crate::rules::lower::Columns::of(&plan)?;
+    extracted.lower(plan, &mut columns)
 }
 
 /// Remove the name DataFusion gives an AI call written by a dotted
@@ -132,6 +133,104 @@ struct Extracted {
 }
 
 impl Extracted {
+    /// `plan` with every AI call as an `AiNode` below the operator that
+    /// held it.
+    fn lower(
+        &mut self,
+        plan: LogicalPlan,
+        columns: &mut crate::rules::lower::Columns,
+    ) -> Result<LogicalPlan> {
+        if !calls_ai_function(&plan)? {
+            return Ok(plan);
+        }
+        // an expression's subquery is a plan of its own
+        let mut failed = None;
+        let plan = plan
+            .map_expressions(|expr| {
+                expr.transform_down(|inner| {
+                    let lowered = |body: &LogicalPlan, this: &mut Self, columns: &mut _| {
+                        this.lower(body.clone(), columns).map(Arc::new)
+                    };
+                    let done = match inner {
+                        Expr::ScalarSubquery(mut found) if found.outer_ref_columns.is_empty() => {
+                            lowered(&found.subquery, self, columns).map(|body| {
+                                found.subquery = body;
+                                Expr::ScalarSubquery(found)
+                            })
+                        }
+                        Expr::Exists(mut found)
+                            if found.subquery.outer_ref_columns.is_empty() =>
+                        {
+                            lowered(&found.subquery.subquery, self, columns).map(|body| {
+                                found.subquery.subquery = body;
+                                Expr::Exists(found)
+                            })
+                        }
+                        Expr::InSubquery(mut found)
+                            if found.subquery.outer_ref_columns.is_empty() =>
+                        {
+                            lowered(&found.subquery.subquery, self, columns).map(|body| {
+                                found.subquery.subquery = body;
+                                Expr::InSubquery(found)
+                            })
+                        }
+                        other => return Ok(Transformed::no(other)),
+                    };
+                    match done {
+                        Ok(expr) => Ok(Transformed::yes(expr)),
+                        Err(error) => {
+                            failed = Some(error);
+                            Ok(Transformed::no(Expr::Literal(
+                                datafusion::common::ScalarValue::Null,
+                                None,
+                            )))
+                        }
+                    }
+                })
+            })?
+            .data;
+        if let Some(error) = failed {
+            return Err(error);
+        }
+        self.num_inputs += 1;
+        if let Some(join) = super::join::lower_outer_join(&plan, self.num_inputs, |input| {
+            self.lower(input, columns)
+        })? {
+            return Ok(join);
+        }
+        let inputs = plan
+            .inputs()
+            .into_iter()
+            .cloned()
+            .map(|input| self.lower(input, columns))
+            .collect::<Result<Vec<_>>>()?;
+        let plan = plan.with_new_exprs(plan.expressions(), inputs)?;
+        // an operator that is no filter, inner join, or SELECT list reads
+        // its calls from a SELECT list below it
+        let plan = match plan {
+            LogicalPlan::Aggregate(_) | LogicalPlan::Window(_) | LogicalPlan::Sort(_) => self
+                .extract(plan, false)?
+                .data
+                .map_children(|child| crate::rules::lower::lower_node(child, columns))?
+                .data,
+            plan => crate::rules::lower::lower_node(plan, columns)?.data,
+        };
+        // a call inside a larger expression is read from a SELECT list below
+        let nested = !matches!(plan, LogicalPlan::Extension(_))
+            && plan
+                .expressions()
+                .iter()
+                .any(|expr| expr.exists(|inner| Ok(is_ai_call(inner))).unwrap_or(false));
+        if nested && matches!(plan, LogicalPlan::Filter(_) | LogicalPlan::Projection(_)) {
+            return Ok(self
+                .extract(plan, false)?
+                .data
+                .map_children(|child| crate::rules::lower::lower_node(child, columns))?
+                .data);
+        }
+        Ok(plan)
+    }
+
     fn fresh_call(&mut self) -> String {
         loop {
             self.num_calls += 1;
