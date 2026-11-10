@@ -86,13 +86,23 @@ pub fn claim_model_regions(plan: LogicalPlan, session: &dyn Session) -> Result<L
     let rules = state
         .optimizers()
         .iter()
-        .filter(|rule| rule.name() != "push_down_leaf_projections")
+        // Quail's rules act on `AiNode`s, which the claim has replaced
+        .filter(|rule| {
+            rule.name() != "push_down_leaf_projections"
+                && !crate::rules::QUAIL_RULES.contains(&rule.name())
+        })
         .cloned()
         .collect();
     let optimized = state
         .analyzer()
         .execute_and_check(claimed, state.config_options(), |_, _| {})
-        .and_then(|plan| Optimizer::with_rules(rules).optimize(plan, state, |_, _| {}));
+        .and_then(|plan| {
+            Optimizer::with_rules(rules).optimize(plan, state, |plan, rule| {
+                if std::env::var("QUAIL_DEBUG").is_ok() {
+                    eprintln!("AFTER {}:\n{}", rule.name(), plan.display_indent());
+                }
+            })
+        });
     if std::env::var("QUAIL_DEBUG").is_ok()
         && let Err(error) = &optimized
     {
