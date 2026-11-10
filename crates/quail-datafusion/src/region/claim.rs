@@ -310,6 +310,21 @@ fn claim_needed(
         )?));
     }
     if as_node::<AiNode>(&plan).is_some() {
+        // a region returns an extraction's spans beside its answer
+        let needed = needed.map(|mut needed| {
+            let answers: Vec<Column> = needed
+                .iter()
+                .filter_map(|column| column.name.strip_suffix(crate::SPAN_SUFFIX))
+                .map(Column::from_name)
+                .filter(|answer| plan.schema().has_column(answer))
+                .collect();
+            for answer in answers {
+                if !needed.contains(&answer) {
+                    needed.push(answer);
+                }
+            }
+            needed
+        });
         let refused = match claim_run(&plan, fetch, needed.clone())? {
             Ok(claimed) => return Ok(claimed),
             Err(refused) => refused,
