@@ -699,7 +699,7 @@ pub(super) fn is_subquery(expr: &Expr) -> bool {
 }
 
 /// SPIKE: whether regions hold AI operators only.
-fn ai_only() -> bool {
+pub(crate) fn ai_only() -> bool {
     std::env::var("QUAIL_AI_ONLY").is_ok()
 }
 
@@ -716,7 +716,7 @@ fn isolate_chain(plan: &LogicalPlan) -> Result<Option<(LogicalPlan, Vec<Expr>)>>
         nodes.push(node);
         bottom = node.input.as_ref();
     }
-    if nodes.is_empty() || matches!(bottom, LogicalPlan::Join(_)) {
+    if nodes.is_empty() || matches!(bottom, LogicalPlan::Join(_)) || is_table(bottom) {
         return Ok(None);
     }
     if let LogicalPlan::SubqueryAlias(alias) = bottom
@@ -763,4 +763,27 @@ fn isolate_chain(plan: &LogicalPlan) -> Result<Option<(LogicalPlan, Vec<Expr>)>>
         })
         .collect();
     Ok(Some((input, restore)))
+}
+
+/// SPIKE: whether `plan` is one table under plain filters and aliases,
+/// which a region reads as an input by itself.
+fn is_table(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::TableScan(_) => true,
+        LogicalPlan::SubqueryAlias(alias) => is_table(&alias.input),
+        LogicalPlan::Filter(filter) => {
+            !filter
+                .predicate
+                .exists(|inner| {
+                    Ok(is_ai_call(inner)
+                        || matches!(
+                            inner,
+                            Expr::Exists(_) | Expr::InSubquery(_) | Expr::ScalarSubquery(_)
+                        ))
+                })
+                .unwrap_or(true)
+                && is_table(&filter.input)
+        }
+        _ => false,
+    }
 }

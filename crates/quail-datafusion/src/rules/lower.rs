@@ -336,7 +336,9 @@ fn selected_calls(plan: &LogicalPlan) -> Vec<(Expr, String)> {
             for expr in &projection.expr {
                 if let Expr::Alias(alias) = expr
                     && (column_call_kind(&alias.expr).is_some()
-                        || matches!(function_name(&alias.expr), Some("ai_filter")))
+                        || matches!(function_name(&alias.expr), Some("ai_filter"))
+                        || (crate::region::claim::ai_only()
+                            && function_name(&alias.expr) == Some("ai_score")))
                 {
                     found.push((alias.expr.as_ref().clone(), alias.name.clone()));
                 }
@@ -413,8 +415,7 @@ fn added_column(plan: &LogicalPlan, call: &Expr) -> Option<String> {
     let mut name = None;
     let _ = plan.apply(|node| {
         if let Some(column) = as_node::<AiNode>(node)
-            && (!column.is_predicate()
-                || (column.function() == "ai_filter" && column.filter.is_none()))
+            && (!column.is_predicate() || column.filter.is_none())
             && column.call == *call
         {
             name = Some(column.answer.clone());
@@ -817,7 +818,9 @@ fn lower_projection(
         };
         if !(column_call_kind(&alias.expr).is_some()
             || is_span_call(&alias.expr)
-            || matches!(function_name(&alias.expr), Some("ai_filter")))
+            || matches!(function_name(&alias.expr), Some("ai_filter"))
+            || (crate::region::claim::ai_only()
+                && function_name(&alias.expr) == Some("ai_score")))
             || alias.relation.is_some()
             || alias.metadata.is_some()
         {
