@@ -157,9 +157,8 @@ def test_an_or_over_two_tables_runs_on_the_result_rows(session):
         WHERE r.stars > 4 OR p.price > 15
         ORDER BY r.id, p.asin
     """)
-    # DataFusion computes each table's side, and tests the OR of them on
-    # the region's rows
-    assert row_tests(query) == ["__quail_expr_0 OR __quail_expr_1"]
+    # DataFusion tests the OR on the region's rows
+    assert row_tests(query) == ["stars > 4 OR price > 15"]
     result = _run(query, oracle_executor(Oracle(joins=lambda *_: True)))
     # every pair with p1, and r0 and r5 (5 stars) with p0; r3's null
     # stars with p1 is NULL OR TRUE, which is true
@@ -220,7 +219,7 @@ def test_where_takes_the_same_expressions_as_select(session):
         "WHERE AI_FILTER(PROMPT('q1: {0}', r.review)) ORDER BY r.id")
     assert _run(query, make_executor(TRUTH)).to_rows() == [
         ("r0", True), ("r1", False), ("r3", None), ("r4", True)]
-    with pytest.raises(CompileError, match="upper.r.lang. is not supported"):
+    with pytest.raises(CompileError, match="a test is true or false, got Utf8"):
         _run(session.sql(f"{first} AND UPPER(r.lang)"), make_executor(TRUTH))
 
 

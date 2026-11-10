@@ -1,5 +1,6 @@
 """Edited-plan scope and per-region ANALYZE results, without a GPU."""
 
+import re
 import pyarrow as pa
 import pytest
 from helpers.oracle import Oracle, oracle_executor
@@ -123,8 +124,13 @@ def test_analyze_matches_reverse_execution_order_and_uses_downstream_actual_plan
 def test_identical_sibling_regions_have_distinct_stable_ids(session, monkeypatch):
     query = session.sql(f"{SINGLE} UNION ALL {SINGLE}")
     first, second = query.regions()
-    assert first.logical == second.logical
-    assert first.operators == second.operators
+    # an answer column is numbered across the query, not within a region
+
+    def unnumbered(text):
+        return re.sub(r"__quail_answer_\d+", "__quail_answer", text)
+
+    assert unnumbered(first.logical) == unnumbered(second.logical)
+    assert unnumbered(first.operators) == unnumbered(second.operators)
     assert first.region_id != second.region_id
     result, requests = _run(query)
     assert len(requests) == 2

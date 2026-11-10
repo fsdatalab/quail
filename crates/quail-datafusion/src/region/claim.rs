@@ -77,16 +77,16 @@ pub fn claim_model_regions(plan: LogicalPlan, session: &dyn Session) -> Result<L
     }
     NEXT_ROWS.with(|next| next.set(0));
     let claimed = number_regions(drop_unread_probabilities(claim_regions(plan, None)?)?)?;
-    // DataFusion 55.2's `push_down_leaf_projections` fails on the join the
-    // claim builds above a region: it moves a struct field read below the
-    // join and then names the region's `r.id` beside the table's. The
-    // session's optimizer has already run the rule over the whole plan.
+    // DataFusion 55.2's two leaf-expression rules fail on the join the
+    // claim builds above a region: they move a struct field read below the
+    // join and then name the region's `r.id` beside the table's. The
+    // session's optimizer has already run them over the whole plan.
     let rules = state
         .optimizers()
         .iter()
         // Quail's rules act on `AiNode`s, which the claim has replaced
         .filter(|rule| {
-            rule.name() != "push_down_leaf_projections"
+            !["extract_leaf_expressions", "push_down_leaf_projections"].contains(&rule.name())
                 && !crate::rules::QUAIL_RULES.contains(&rule.name())
         })
         .cloned()

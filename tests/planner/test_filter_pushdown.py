@@ -68,22 +68,25 @@ def _region_reads_the_filtered_table(query) -> None:
 def test_a_filter_above_an_ai_filter_runs_before_the_model(sessions):
     sql = (f"SELECT d.id FROM (SELECT r.id, r.stars FROM reviews r WHERE {AI_IF}) d "
            "WHERE d.stars > 3")
-    for session in sessions:
-        _region_reads_the_filtered_table(session.sql(sql))
-        rows, read = _rows_and_read(session, sql)
-        assert rows == [("r2",), ("r4",)]
-        assert read == STARRED
+    on, off = sessions
+    _region_reads_the_filtered_table(on.sql(sql))
+    rows, read = _rows_and_read(on, sql)
+    assert rows == [("r2",), ("r4",)]
+    assert read == STARRED
+    # without the rule DataFusion tests the stars after the model answers
+    assert _rows_and_read(off, sql)[0] == rows
 
 
 def test_a_filter_above_a_classification_runs_before_the_model(sessions):
     sql = ("SELECT d.id, d.t FROM (SELECT r.id, r.stars, "
            "AI_CLASSIFY(PROMPT('tone: {0}', r.body), ['a', 'b']) AS t "
            "FROM reviews r) d WHERE d.stars > 3")
-    for session in sessions:
-        _region_reads_the_filtered_table(session.sql(sql))
-        rows, read = _rows_and_read(session, sql)
-        assert rows == [("r0", "a"), ("r2", "a"), ("r4", "a")]
-        assert read == STARRED
+    on, off = sessions
+    _region_reads_the_filtered_table(on.sql(sql))
+    rows, read = _rows_and_read(on, sql)
+    assert rows == [("r0", "a"), ("r2", "a"), ("r4", "a")]
+    assert read == STARRED
+    assert _rows_and_read(off, sql)[0] == rows
 
 
 # R4: an extraction whose answer must contain a literal reads only the

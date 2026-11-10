@@ -406,9 +406,8 @@ def test_not_and_or_of_answers_run_after_the_extractions_they_read(session):
     # an answer and a source column, or two extractions: after the last
     # extraction read, each other column read by document ID
     mixed = session.sql(head + f"NOT ({ends} IS NULL AND c.id = 2)")
-    # DataFusion computes the source column's test, c.id = 2
     assert placed(mixed) == [
-        ("extraction", "c.lease.ends IS NOT NULL OR NOT (c.__quail_expr_0)")]
+        ("extraction", "c.lease.ends IS NOT NULL OR NOT (c.id = 2)")]
     assert kept(mixed) == [1]
     fields = session.sql(head + f"{ends} = 'x' OR {rent} IS NOT NULL")
     assert placed(fields) == [
