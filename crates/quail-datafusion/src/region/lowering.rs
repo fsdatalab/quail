@@ -774,7 +774,7 @@ fn read_calls(expr: &Expr, named: &[(Expr, String)]) -> Result<Expr> {
 
 /// The columns of `input` that `plan` reads, when the operator above
 /// `plan` reads `needed` of its columns.
-fn read_from(
+pub(super) fn read_from(
     plan: &LogicalPlan,
     input: &LogicalPlan,
     needed: Option<&[Column]>,

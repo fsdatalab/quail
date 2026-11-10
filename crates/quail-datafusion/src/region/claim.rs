@@ -203,6 +203,16 @@ fn without_probabilities(call: &Expr) -> Option<(Expr, Expr)> {
 /// a `Limit` above passes them on through projections only; a region
 /// there may stop the model once it has that many.
 fn claim_regions(plan: LogicalPlan, fetch: Option<usize>) -> Result<LogicalPlan> {
+    claim_needed(plan, fetch, None)
+}
+
+/// [`claim_regions`], where the operator above reads only the `needed`
+/// columns of `plan`, or every one when None.
+fn claim_needed(
+    plan: LogicalPlan,
+    fetch: Option<usize>,
+    needed: Option<Vec<Column>>,
+) -> Result<LogicalPlan> {
     if !calls_ai(&plan)? {
         return Ok(plan);
     }
@@ -240,7 +250,28 @@ fn claim_regions(plan: LogicalPlan, fetch: Option<usize>) -> Result<LogicalPlan>
     if ai_only()
         && let Some((chain, restore)) = isolate_chain(&plan)?
     {
-        let claimed = claim_regions(chain, fetch)?;
+        // the run's own names for the needed columns, by position
+        let renamed = needed.as_ref().map(|needed| {
+            plan.schema()
+                .columns()
+                .iter()
+                .zip(chain.schema().columns())
+                .filter(|(original, _)| needed.contains(original))
+                .map(|(_, column)| column)
+                .collect::<Vec<_>>()
+        });
+        let restore = match &needed {
+            Some(needed) => plan
+                .schema()
+                .columns()
+                .into_iter()
+                .zip(restore)
+                .filter(|(original, _)| needed.contains(original))
+                .map(|(_, expr)| expr)
+                .collect(),
+            None => restore,
+        };
+        let claimed = claim_needed(chain, fetch, renamed)?;
         return Ok(LogicalPlan::Projection(Projection::try_new(
             restore,
             Arc::new(claimed),
@@ -253,7 +284,7 @@ fn claim_regions(plan: LogicalPlan, fetch: Option<usize>) -> Result<LogicalPlan>
         kept_by_datafusion(&plan)?
     };
     if !kept {
-        let selected = select_list(plan.clone(), None)?;
+        let selected = select_list(plan.clone(), needed.clone().filter(|_| ai_only()))?;
         let (bound, inputs, _) = split_inputs(selected)?;
         let numbered_inputs = numbered(&bound);
         let (bound, above) = lift_relational(bound)?;
@@ -303,7 +334,10 @@ fn claim_regions(plan: LogicalPlan, fetch: Option<usize>) -> Result<LogicalPlan>
         .inputs()
         .into_iter()
         .cloned()
-        .map(|input| claim_regions(input, passed))
+        .map(|input| {
+            let read = super::lowering::read_from(&plan, &input, needed.as_deref());
+            claim_needed(input, passed, read)
+        })
         .collect::<Result<Vec<_>>>()?;
     plan.with_new_exprs(plan.expressions(), inputs)
 }
