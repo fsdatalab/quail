@@ -325,10 +325,14 @@ fn claim_needed(
             }
             needed
         });
-        let refused = match claim_run(&plan, fetch, needed.clone())? {
+        let refused = match claim_run(&plan, fetch, needed.clone(), false)? {
             Ok(claimed) => return Ok(claimed),
             Err(refused) => refused,
         };
+        // DataFusion can compute an expression the region does not read
+        if let Ok(claimed) = claim_run(&plan, fetch, needed.clone(), true)? {
+            return Ok(claimed);
+        }
         // a run no region takes is tried in smaller parts
         return match simpler_run(&plan)? {
             Some(simpler) => {
@@ -863,19 +867,25 @@ fn is_table(plan: &LogicalPlan) -> bool {
 }
 
 /// One model region for the run of `AiNode`s at `plan`'s root, or the
-/// binder's refusal of the run.
+/// binder's refusal of the run. With `precompute`, DataFusion computes
+/// the run's expressions of one table's columns before the region.
 fn claim_run(
     plan: &LogicalPlan,
     fetch: Option<usize>,
     needed: Option<Vec<Column>>,
+    precompute: bool,
 ) -> Result<std::result::Result<LogicalPlan, String>> {
     // a run the claim cannot shape into a region is refused like one the
     // binder cannot read
     let shaped = (|| {
         let selected = select_list(plan.clone(), needed)?;
-        // DataFusion computes each expression of one table's columns as a
-        // column of that table's input
-        let selected = super::inputs::precompute_plain_expressions(selected)?;
+        // each expression of one table's columns as a column of that
+        // table's input
+        let selected = if precompute {
+            super::inputs::precompute_plain_expressions(selected)?
+        } else {
+            selected
+        };
         let (bound, inputs, _) = split_inputs(selected)?;
         let numbered_inputs = numbered(&bound);
         let (bound, above) = lift_relational(bound)?;
