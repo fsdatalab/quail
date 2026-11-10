@@ -206,6 +206,14 @@ fn mover(node: &LogicalPlan) -> Option<Mover> {
             // a plain filter is DataFusion's to push
             return None;
         }
+        // a column no table and no `AiNode` below names, such as a model
+        // region's answer, is read where the filter stands
+        let unknown = filter.predicate.column_refs().iter().any(|column| {
+            column.relation.is_none() && !answers.iter().any(|(name, _)| *name == column.name)
+        });
+        if unknown {
+            return None;
+        }
         let tables = expr_tables(&filter.predicate, &answers);
         return (tables.len() == 1).then_some(Mover {
             tables,

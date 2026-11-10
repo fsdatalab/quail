@@ -84,6 +84,7 @@ pub fn claim_model_regions(plan: LogicalPlan, session: &dyn Session) -> Result<L
         .filter(|rule| {
             !["extract_leaf_expressions", "push_down_leaf_projections"].contains(&rule.name())
                 && !crate::rules::QUAIL_RULES.contains(&rule.name())
+                && !rule.name().starts_with("derive")
         })
         .cloned()
         .collect();
