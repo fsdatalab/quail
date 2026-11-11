@@ -156,6 +156,28 @@ impl UserDefinedLogicalNodeCore for SharedInput {
         let Ok([input]) = <[LogicalPlan; 1]>::try_from(inputs) else {
             return internal_err!("SharedInput reads one input");
         };
+        // A rule may prune the input's columns, but not add one: every
+        // reader of these rows reads the columns the node was built with.
+        let own = self.input.schema();
+        let added = input
+            .schema()
+            .columns()
+            .iter()
+            .any(|column| !own.has_column(column));
+        let input = if added {
+            let kept: Vec<Expr> = input
+                .schema()
+                .columns()
+                .into_iter()
+                .filter(|column| own.has_column(column))
+                .map(Expr::Column)
+                .collect();
+            datafusion::logical_expr::LogicalPlanBuilder::from(input)
+                .project(kept)?
+                .build()?
+        } else {
+            input
+        };
         Self::with_key(self.key, input, self.numbered, self.scope.clone())
     }
 }

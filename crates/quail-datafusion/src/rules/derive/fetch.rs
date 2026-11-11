@@ -21,7 +21,7 @@
 //! The need reaches its node through the SELECT lists and derived-table
 //! aliases between them, which return one row for each row, with the key
 //! columns followed by name. A per-key need also passes a `Filter` that
-//! reads no answer of the node: the filter moves below the node, as a
+//! reads only columns of the node's input: the filter moves below the node, as a
 //! fetch counts the rows left after it. Any other operator can change
 //! how many rows there are, and stops the need.
 //!
@@ -266,12 +266,16 @@ fn enough(
             if !node.accepts_fetch() {
                 return Ok(None);
             }
-            let reads_answer = |expr: &Expr| {
+            // a filter moves below the node only when the node's input has
+            // every column it reads: not the node's answer, and not a
+            // column a SELECT list between them computes
+            let input = node.input.schema();
+            let reads_other = |expr: &Expr| {
                 expr.column_refs()
                     .iter()
-                    .any(|column| column.relation.is_none() && node.is_field(&column.name))
+                    .any(|column| !input.has_column(column))
             };
-            if filters.iter().any(reads_answer) {
+            if filters.iter().any(reads_other) {
                 return Ok(None);
             }
             let fetch = match need {
