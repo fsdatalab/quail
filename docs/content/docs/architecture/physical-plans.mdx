@@ -86,11 +86,9 @@ For example, imagine a table `vendors` with a `name` column and a table
 of invoices, joined on the vendor name a map writes for each invoice:
 
 ```sql
-SELECT x.id, v.id
+SELECT i.id, v.id
 FROM vendors v
-JOIN (SELECT i.id, AI.MAP(i.text, 'Name the vendor.', 16) AS vendor
-      FROM invoices i) x
-  ON v.name = x.vendor
+JOIN invoices i ON v.name = AI.MAP(i.text, 'Name the vendor.', 16)
 ```
 
 The hash join reads `vendors` first and sends its names to the region.

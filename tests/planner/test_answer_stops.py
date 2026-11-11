@@ -179,9 +179,8 @@ def test_a_join_on_a_maps_answer_stops_each_answer_that_can_match_no_key(
     # the join builds on the vendors, so their names are the region's
     # hint before the model writes an answer
     table = context.sql(
-        "SELECT x.id, v.id FROM vendors v JOIN (SELECT r.id, "
-        "AI.MAP(r.body, 'Name the vendor.', 16) AS vendor FROM reviews r) x "
-        "ON v.name = x.vendor")
+        "SELECT r.id, v.id FROM vendors v JOIN reviews r "
+        "ON v.name = AI.MAP(r.body, 'Name the vendor.', 16)")
     rows = sorted(zip(*(column.to_pylist() for column in table.columns)))
     session.close()
     assert rows == [("r0", "v0"), ("r2", "v1"), ("r4", "v0")]
