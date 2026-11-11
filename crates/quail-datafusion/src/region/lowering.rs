@@ -305,13 +305,15 @@ impl Extracted {
         }
     }
 
-    /// A join with each key that makes an AI call read from a SELECT
-    /// list below the side it reads, so the join compares columns: for
-    /// example `JOIN v ON AI.MAP(i.text, ...) = v.name` reads the map's
-    /// answer from a SELECT list over `i`.
+    /// A join with each AI call of one input read from a SELECT list
+    /// below that input, so the join reads columns: for example `JOIN v
+    /// ON AI.MAP(i.text, ...) = v.name` reads the map's answer from a
+    /// SELECT list over `i`, and so does a test of one input in ON, such
+    /// as `ON r.id = v.rid AND AI.IF(PROMPT('{0}', r.body))`.
     ///
-    /// A key is one side of an equality whose two sides read one input
-    /// each, in the join's keys or among the terms of its ON.
+    /// A call that reads both inputs is the join's own AI predicate and
+    /// stays. The join keeps the added columns in its output, as the
+    /// operators above may read the same answers.
     fn join_keys_below(&mut self, plan: LogicalPlan) -> Result<LogicalPlan> {
         let LogicalPlan::Join(join) = &plan else {
             return Ok(plan);
@@ -332,72 +334,79 @@ impl Extracted {
                 _ => None,
             }
         };
-        let mut pairs: Vec<(Expr, Expr)> = Vec::new();
-        let mut any = false;
+        let mut sides = [(*join.left).clone(), (*join.right).clone()];
+        let mut moved = false;
+        // `expr` with each of its AI calls read as a column of the SELECT
+        // list below the input it reads, named as the lowering names a
+        // call anywhere else
+        let mut below = |this: &mut Self, expr: &Expr, index: usize| -> Result<Expr> {
+            let named = this.name(ai_calls(expr)?, sides[index].schema());
+            let mut selected: Vec<Expr> = sides[index]
+                .schema()
+                .iter()
+                .map(|(qualifier, field)| {
+                    Expr::Column(Column::new(qualifier.cloned(), field.name()))
+                })
+                .collect();
+            selected.extend(named.iter().map(|(call, name)| call.clone().alias(name)));
+            sides[index] = LogicalPlanBuilder::from(sides[index].clone())
+                .project(selected)?
+                .build()?;
+            moved = true;
+            read_calls(expr, &named)
+        };
+        let mut keys: (Vec<Expr>, Vec<Expr>) = (Vec::new(), Vec::new());
         for (left, right) in &join.on {
-            any |= calls(left)? || calls(right)?;
-            pairs.push((left.clone(), right.clone()));
+            keys.0.push(if calls(left)? {
+                below(self, left, 0)?
+            } else {
+                left.clone()
+            });
+            keys.1.push(if calls(right)? {
+                below(self, right, 1)?
+            } else {
+                right.clone()
+            });
         }
         let mut rest: Vec<Expr> = Vec::new();
         for term in join.filter.iter().flat_map(split_conjunction) {
+            if !calls(term)? {
+                rest.push(term.clone());
+                continue;
+            }
+            if let Some(index) = side(term) {
+                rest.push(below(self, term, index)?);
+                continue;
+            }
             if let Expr::BinaryExpr(binary) = term
                 && binary.op == datafusion::logical_expr::Operator::Eq
-                && (calls(&binary.left)? || calls(&binary.right)?)
+                && let (Some(first), Some(second)) = (side(&binary.left), side(&binary.right))
+                && first != second
             {
-                match (side(&binary.left), side(&binary.right)) {
-                    (Some(0), Some(1)) => {
-                        pairs.push(((*binary.left).clone(), (*binary.right).clone()));
-                        any = true;
-                        continue;
+                let mut key = |this: &mut Self, expr: &Expr, index: usize| {
+                    if calls(expr)? {
+                        below(this, expr, index)
+                    } else {
+                        Ok(expr.clone())
                     }
-                    (Some(1), Some(0)) => {
-                        pairs.push(((*binary.right).clone(), (*binary.left).clone()));
-                        any = true;
-                        continue;
-                    }
-                    _ => {}
-                }
+                };
+                let (left, right) = if first == 0 {
+                    (&binary.left, &binary.right)
+                } else {
+                    (&binary.right, &binary.left)
+                };
+                keys.0.push(key(self, left, 0)?);
+                keys.1.push(key(self, right, 1)?);
+                continue;
             }
             rest.push(term.clone());
         }
-        if !any {
+        if !moved {
             return Ok(plan);
-        }
-        let returned: Vec<Expr> = plan
-            .schema()
-            .iter()
-            .map(|(qualifier, field)| Expr::Column(Column::new(qualifier.cloned(), field.name())))
-            .collect();
-        let mut sides = [(*join.left).clone(), (*join.right).clone()];
-        let mut keys: (Vec<Expr>, Vec<Expr>) = (Vec::new(), Vec::new());
-        for (left, right) in pairs {
-            let mut moved = Vec::new();
-            for (index, key) in [left, right].into_iter().enumerate() {
-                if !calls(&key)? {
-                    moved.push(key);
-                    continue;
-                }
-                let name = self.fresh_call();
-                let mut selected: Vec<Expr> = sides[index]
-                    .schema()
-                    .iter()
-                    .map(|(qualifier, field)| {
-                        Expr::Column(Column::new(qualifier.cloned(), field.name()))
-                    })
-                    .collect();
-                selected.push(key.alias(&name));
-                sides[index] = LogicalPlanBuilder::from(sides[index].clone())
-                    .project(selected)?
-                    .build()?;
-                moved.push(Expr::Column(Column::from_name(name)));
-            }
-            keys.1.push(moved.pop().expect("a right key"));
-            keys.0.push(moved.pop().expect("a left key"));
         }
         let [left, right] = sides;
         LogicalPlanBuilder::from(left)
             .join_with_expr_keys(right, join.join_type, keys, conjunction(rest))?
-            .project(returned)?
             .build()
     }
 

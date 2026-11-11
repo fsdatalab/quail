@@ -473,3 +473,39 @@ def test_a_join_filter_keeps_a_document_while_it_keeps_one_of_its_copies(
         "WHERE r.stars >= 2 AND AI.IF(PROMPT('ok? {0}', d.name))"))
     session.close()
     assert rows == [("r1", "d1"), ("r2", "d2"), ("r3", "d3")]
+
+
+def test_an_ai_call_of_one_table_in_a_joins_on_runs_below_the_join():
+    session, context = _yes_context({
+        "r": pa.table({"id": ["r0", "r1"], "body": ["a", "b"]}),
+        "v": pa.table({"id": ["v0", "v1"], "rid": ["r0", "r1"]}),
+    })
+    cases = {
+        "a test of one table":
+            "SELECT r.id, v.id FROM r JOIN v ON r.id = v.rid "
+            "AND AI.IF(PROMPT('q: {0}', r.body))",
+        "the same test of an outer join":
+            "SELECT r.id, v.id FROM r LEFT JOIN v ON r.id = v.rid "
+            "AND AI.IF(PROMPT('q: {0}', r.body))",
+    }
+    for name, sql in cases.items():
+        assert _sorted_rows(context.sql(sql)) == [("r0", "v0"), ("r1", "v1")], name
+    session.close()
+
+
+def test_a_join_keys_answer_is_also_returned():
+    session = quail.Session(CONFIG, tokenizer=TOKENIZER)
+    names = ["Acme", "Globex"]
+    oracle = Oracle(maps=lambda spec, document: names[document])
+    oracle.catalog = session.catalog
+    context = quail.SessionContext(
+        session, physical_executor=oracle_executor(oracle))
+    context.register("r", quail.DocumentProvider.from_table(
+        pa.table({"id": ["r0", "r1"], "body": ["a", "b"]}), id_col="id"))
+    context.register("v", quail.DocumentProvider.from_table(
+        pa.table({"id": ["v0"], "name": ["Acme"]}), id_col="id"))
+    call = "AI.MAP(r.body, 'Name the vendor.', 16)"
+    rows = _sorted_rows(context.sql(
+        f"SELECT r.id, v.id, {call} AS m FROM r JOIN v ON v.name = {call}"))
+    session.close()
+    assert rows == [("r0", "v0", "Acme")]
