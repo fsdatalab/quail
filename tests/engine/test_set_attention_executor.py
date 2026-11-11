@@ -41,7 +41,7 @@ class _Pieces:
         return ids
 
 
-def test_one_mixed_pass_decodes_a_yes_no_a_choice_and_a_read():
+def test_a_mixed_pass_decodes_codes_and_a_pointer_read_takes_the_likeliest_span():
     from quail.backends.quail.executor.pass_groups import (
         SetQuestion,
         _decode,
@@ -65,8 +65,7 @@ def test_one_mixed_pass_decodes_a_yes_no_a_choice_and_a_read():
     assert probabilities.argmax(-1).tolist() == [0, 1]
     assert spans.tolist() == [[4, 6, 0.9], [0, 0, 0.1]]
 
-
-def test_a_pointer_read_takes_the_likeliest_span_or_nothing():
+    # a pointer read takes the likeliest span or nothing
     torch = pytest.importorskip("torch")
     from quail.backends.quail.executor.readout import pointer_spans
 
@@ -165,7 +164,7 @@ class _OneGroup:
         return self.answers
 
 
-def test_a_label_packed_with_a_filter_answers_only_the_rows_the_filter_keeps():
+def test_a_label_or_score_packed_with_another_step_answers_the_rows_that_step_keeps():
     from quail.backends.quail.executor import pipeline
     from quail.backends.quail.executor.pass_groups import GroupAnswers
     from quail.physical import AiClassify, AiFilter, ClassifySpec
@@ -193,8 +192,7 @@ def test_a_label_packed_with_a_filter_answers_only_the_rows_the_filter_keeps():
     assert (results["f"].metrics.fresh_tokens, results["c"].metrics.fresh_tokens) \
         == (100, 0)
 
-
-def test_a_score_packed_with_a_label_reads_its_answers_for_every_row():
+    # a score packed with a label reads its answers for every row
     from quail.backends.quail.executor import pipeline
     from quail.backends.quail.executor.pass_groups import GroupAnswers
     from quail.physical import AiClassify, AiScore, ClassifySpec, ScoreSpec

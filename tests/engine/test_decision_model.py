@@ -44,7 +44,8 @@ def _tokens(text):
     return re.findall(r"\S+\n*|\n+|[ \t]+", text)
 
 
-def test_filter_prompt_is_the_decision2_noul_format_tokenized_by_segment():
+def test_filter_prompt_is_the_decision2_noul_format_and_worker_offsets_match_it(
+        tmp_path):
     prompt = bind_prompt("Does the customer have a receipt? {0}", (REF,),
                          layout=LAYOUT)
     lowered = lower_prompt(prompt, _tokens)
@@ -68,8 +69,7 @@ def test_filter_prompt_is_the_decision2_noul_format_tokenized_by_segment():
     assert ids[last - answer_row_offsets(NO_TURN, _tokens)[0] - 1] == (
         '{"description":"No","key":"false"}\n')
 
-
-def test_worker_answer_offsets_match_session_tokens(tmp_path):
+    # the worker's answer offsets match the session's tokens
     from quail.backends.quail.worker import decision_offsets
     from quail.common.tokens import Tokenizer
 

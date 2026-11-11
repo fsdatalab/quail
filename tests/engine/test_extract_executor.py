@@ -22,6 +22,7 @@ from helpers.extract_fakes import (
 from helpers.extract_reference import AnswerState, Decoder
 from helpers.fakes import fake_pipeline, fake_readout, thread_servers
 from helpers.kv_checker import Setup, make_arena
+from test_kv_reads import named
 from test_map_decode import cpu_staging, events_torch
 
 from quail.backends.quail import QuailModelExecution
@@ -78,11 +79,7 @@ def packed_scripted_inputs(monkeypatch):
     monkeypatch.setattr(chunk_mod, "pack_chunk", capture)
 
 
-@pytest.mark.parametrize(("scores", "stop", "chosen", "done"), [
-    ([-1, -1, -9, -10], -8, 1, False),
-    ([-2, -1, -9, -0.5], -8, None, True),
-])
-def test_continuation_arrays_handle_duplicates_ties_and_stops(
+def check_continuation_arrays_handle_duplicates_ties_and_stops(
         scores, stop, chosen, done):
     tokens = [33, 1, 1]
     vocabulary = SimpleNamespace(vocab=range(64), is_stop=np.zeros(64, dtype=bool))
@@ -103,34 +100,44 @@ def test_continuation_arrays_handle_duplicates_ties_and_stops(
             index for index, token in enumerate(tokens) if token == chosen]
 
 
-def test_writing_that_begins_outside_the_document_answers_none(monkeypatch):
+def test_continuation_arrays_handle_duplicates_ties_and_stops():
+    for scores, stop, chosen, done in [
+        ([-1, -1, -9, -10], -8, 1, False),
+        ([-2, -1, -9, -0.5], -8, None, True),
+    ]:
+        named(
+            f"scores={scores} stop={stop} chosen={chosen} done={done}",
+            check_continuation_arrays_handle_duplicates_ties_and_stops,
+            scores=scores, stop=stop, chosen=chosen, done=done)
+
+
+def test_an_answer_outside_the_document_is_none_and_a_rejected_draft_is_replaced(
+        monkeypatch):
     # at the cue the model prefers a word that begins no position: its
     # answer is not in the document, and neither extraction answers
-    state, model, run, _ = _setup(monkeypatch)
-    tables = model.tables
-    stray = tables.tokenizer(" five")[0]
-    cue_row = model._cue_row
+    with monkeypatch.context() as patch:
+        state, model, run, _ = _setup(patch)
+        tables = model.tables
+        stray = tables.tokenizer(" five")[0]
+        cue_row = model._cue_row
 
-    def straying(key):
-        if key[1] != 0:
-            return cue_row(key)
-        march = tables.tokenizer("March")[0]
-        return model._cue({stray: -0.05, march: -0.5}, -6.0)
+        def straying(key):
+            if key[1] != 0:
+                return cue_row(key)
+            march = tables.tokenizer("March")[0]
+            return model._cue({stray: -0.05, march: -0.5}, -6.0)
 
-    model._cue_row = straying
-    result, stages = run()
+        model._cue_row = straying
+        result, stages = run()
     assert result.outputs["rows:c"].column("ends").to_pylist() == [
         None, "five years", None]
     assert stages.documents[0].answers[0].none_wins
 
-
-@pytest.mark.parametrize("recurrent", [False])
-def test_a_rejected_draft_is_replaced_by_the_next_round(monkeypatch, recurrent):
     # "five" starts two positions; the draft follows the first, "five
     # days", and the model chooses " years" instead: the round ends
     # there, and the next round feeds " years" in the draft's place
     text = "five days or five years"
-    asked, model = _extract_spec(monkeypatch, text, "five years", recurrent=recurrent)
+    asked, model = _extract_spec(monkeypatch, text, "five years")
     assert asked.answer == "five years" and asked.span == (13, 23)
     assert asked.written == model.tables.tokenizer(" five years")
     assert asked.steps >= 2
@@ -383,7 +390,8 @@ def _setup(monkeypatch, documents=None, token_documents=None,
     return state, model, run, run_pipeline
 
 
-def test_extraction_borrows_prefix_pages_and_keeps_decode_kv(monkeypatch):
+def test_extraction_borrows_prefix_pages_and_grows_answers_without_headroom_admission(
+        monkeypatch):
     documents = [LEASE, LEASE, NOTHING]
     _, _, plain, _ = _setup(monkeypatch, documents=documents)
     unshared, _ = plain()
@@ -401,13 +409,7 @@ def test_extraction_borrows_prefix_pages_and_keeps_decode_kv(monkeypatch):
         assert model.reads[document.key] <= 1
         assert all(entry[2] > 0 for entry in rounds)
 
-
-def test_extraction_answers_grow_on_demand_without_headroom_admission(monkeypatch):
     from quail.backends.quail.executor import answer_admission
-
-    documents = [LEASE, LEASE, NOTHING]
-    _, _, reference, _ = _setup(monkeypatch, documents=documents)
-    expected, _ = reference()
 
     def refuse(*args, **kwargs):
         raise AssertionError("extraction answers need no headroom admission")
@@ -415,7 +417,7 @@ def test_extraction_answers_grow_on_demand_without_headroom_admission(monkeypatc
     monkeypatch.setattr(answer_admission, "HeadroomAdmission", refuse)
     _, _, run, _ = _setup(monkeypatch, documents=documents)
     result, _ = run()
-    assert result.outputs["rows:c"].table().equals(expected.outputs["rows:c"].table())
+    assert result.outputs["rows:c"].table().equals(unshared.outputs["rows:c"].table())
 
 
 @pytest.mark.parametrize("gpu_timing,recurrent", [(True, True)])

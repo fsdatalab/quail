@@ -12,11 +12,11 @@ from types import SimpleNamespace
 
 import numpy as np
 import pyarrow as pa
-import pytest
 import torch
 from helpers.conditions import condition as sql_condition
 from helpers.fakes import cpu_staging, fake_pipeline
 from helpers.kv_checker import HashModel, Setup, chain, cpu_torch, make_arena
+from test_kv_reads import named
 
 from quail.backends.quail.executor.admission import pages_for
 from quail.backends.quail.executor.answer_admission import (
@@ -172,11 +172,7 @@ def classification_and_condition(ids):
     return classification, condition
 
 
-@pytest.mark.parametrize("budget,question,lag,path", [
-    (40, None, 0, "unified"),
-    (400, [700, 701], 3, "tree"),
-])
-def test_map_answers_equal_greedy_decoding(monkeypatch, budget, question, lag,
+def check_map_answers_equal_greedy_decoding(monkeypatch, budget, question, lag,
                                            path):
     cpu_staging(monkeypatch)
     rng = np.random.default_rng(0)
@@ -234,8 +230,19 @@ def test_map_answers_equal_greedy_decoding(monkeypatch, budget, question, lag,
     assert not arena.accounting.owned
 
 
-@pytest.mark.parametrize("pages,limit,lag", [(6, 2, 3), (300, None, 0)])
-def test_conditions_gate_all_branches_and_limits_wait_for_every_answer(
+def test_map_answers_equal_greedy_decoding(monkeypatch):
+    for budget, question, lag, path in [
+        (40, None, 0, "unified"),
+        (400, [700, 701], 3, "tree"),
+    ]:
+        named(
+            f"budget={budget} question={question} lag={lag} path={path}",
+            check_map_answers_equal_greedy_decoding,
+            monkeypatch=monkeypatch, budget=budget, question=question, lag=lag,
+            path=path)
+
+
+def check_conditions_gate_all_branches_and_limits_wait_for_every_answer(
         monkeypatch, pages, limit, lag):
     cpu_staging(monkeypatch)
     rng = np.random.default_rng(7)
@@ -294,9 +301,15 @@ def test_conditions_gate_all_branches_and_limits_wait_for_every_answer(
     assert not arena.accounting.owned
 
 
-@pytest.mark.parametrize("num_maps,limit,pages", [
-    (1, None, 300), (2, None, 6), (3, 2, 6)])
-def test_fused_document_operators_equal_running_each_operator_alone(
+def test_conditions_gate_all_branches_and_limits_wait_for_every_answer(monkeypatch):
+    for pages, limit, lag in [(6, 2, 3), (300, None, 0)]:
+        named(
+            f"pages={pages} limit={limit} lag={lag}",
+            check_conditions_gate_all_branches_and_limits_wait_for_every_answer,
+            monkeypatch=monkeypatch, pages=pages, limit=limit, lag=lag)
+
+
+def check_fused_document_operators_equal_running_each_operator_alone(
         monkeypatch, num_maps, limit, pages):
     cpu_staging(monkeypatch)
     rng = np.random.default_rng(11)
@@ -361,6 +374,15 @@ def test_fused_document_operators_equal_running_each_operator_alone(
     assert fused == separate[:limit]
 
 
+def test_fused_document_operators_equal_running_each_operator_alone(monkeypatch):
+    for num_maps, limit, pages in [
+    (1, None, 300), (2, None, 6), (3, 2, 6)]:
+        named(
+            f"num_maps={num_maps} limit={limit} pages={pages}",
+            check_fused_document_operators_equal_running_each_operator_alone,
+            monkeypatch=monkeypatch, num_maps=num_maps, limit=limit, pages=pages)
+
+
 def batch_decode(tokens, skip_special_tokens=True):
     return [" ".join(str(int(token)) for token in answer) for answer in tokens]
 
@@ -377,12 +399,7 @@ def map_state(setup, arena, forward_chunk):
 
 
 # every setting appears in some case
-@pytest.mark.parametrize("num_maps,limit,lag,budget,stop_modulus,path", [
-    (3, None, 3, 20, 0, "tree"),
-    (1, 2, 0, 200, 19, "tree"),
-    (2, 2, 0, 20, 0, "unified"),
-])
-def test_evicted_answers_recompute_exactly_with_gates_and_limits(
+def check_evicted_answers_recompute_exactly_with_gates_and_limits(
         monkeypatch, num_maps, limit, lag, budget, stop_modulus, path,
         state_slots=0, window=None):
     cpu_staging(monkeypatch)
@@ -440,15 +457,26 @@ def test_evicted_answers_recompute_exactly_with_gates_and_limits(
     assert not arena.accounting.owned
 
 
-@pytest.mark.parametrize("budget,lag,window", [(20, 0, 5), (200, 3, None)])
-def test_hybrid_answers_recompute_exactly_and_reuse_checkpoint_slots(
-        monkeypatch, budget, lag, window):
-    test_evicted_answers_recompute_exactly_with_gates_and_limits(
-        monkeypatch, num_maps=3, limit=None, lag=lag, budget=budget,
-        stop_modulus=0, path="unified", state_slots=24, window=window)
+def test_evicted_answers_recompute_exactly_with_gates_and_limits(monkeypatch):
+    for num_maps, limit, lag, budget, stop_modulus, path, state_slots, window in [
+        (3, None, 3, 20, 0, "tree", 0, None),
+        (1, 2, 0, 200, 19, "tree", 0, None),
+        (2, 2, 0, 20, 0, "unified", 0, None),
+        # hybrid models recompute from checkpoint slots and reuse them
+        (3, None, 0, 20, 0, "unified", 24, 5),
+        (3, None, 3, 200, 0, "unified", 24, None),
+    ]:
+        named(
+            f"num_maps={num_maps} limit={limit} lag={lag} budget={budget} "
+            f"stop_modulus={stop_modulus} path={path} "
+            f"state_slots={state_slots} window={window}",
+            check_evicted_answers_recompute_exactly_with_gates_and_limits,
+            monkeypatch=monkeypatch, num_maps=num_maps, limit=limit, lag=lag,
+            budget=budget, stop_modulus=stop_modulus, path=path,
+            state_slots=state_slots, window=window)
 
 
-def test_eviction_prefers_long_remaining_answers_over_near_limit_answers():
+def test_eviction_takes_the_answers_with_the_most_tokens_left_to_write():
     decoder = MapDecoder(events_torch(0), torch.eye(VOCABULARY), 4,
                          [24, 6], [STOP], 4, expected_tokens=[12, 3])
     for a, q in enumerate([0, 0, 1, 1]):
@@ -466,6 +494,24 @@ def test_eviction_prefers_long_remaining_answers_over_near_limit_answers():
               for q in range(len(decoder.limits))}
     np.testing.assert_array_equal(decoder.eviction_order(curves),
                                   decoder.eviction_order())
+
+    # short prompts end after 3 tokens, long ones run to the limit; two
+    # answers that wrote 2 tokens each differ only in their prompt length
+    num_documents = 20
+    decoder = MapDecoder(events_torch(0), torch.eye(VOCABULARY), num_documents,
+                         [24], [STOP], 4, expected_tokens=[12])
+    decoder.answer_slots = {0: np.arange(num_documents)}
+    prefixes = [8] * 10 + [2000] * 10
+    for a in [*range(2, 10), *range(12, 20)]:
+        decoder.lengths[0][a] = decoder.written[0][a] = 3 if a < 10 else 24
+    admission = HeadroomAdmission(decoder, prefixes, 6, {}, [0] * num_documents,
+                                  lambda tokens: pages_for(tokens, 4),
+                                  choose_headroom=False, bucket_answers=1)
+    decoder.start(0, 0, 14, [0, 1, 2, 3])
+    decoder.start(10, 0, 2006, [4, 5, 6, 7])
+    decoder.written[0][[0, 10]] = 2
+    assert decoder.eviction_order()[0] == 0
+    assert admission.eviction_order()[0] == 10
 
 
 def test_recomputed_documents_keep_shared_reads_correct_at_later_map_stages(
@@ -562,11 +608,7 @@ def run_maps_under_eviction(monkeypatch, mode, num_maps, budget, lag, path):
     return stats, model, answers
 
 
-@pytest.mark.parametrize("mode,num_maps,budget,lag,path", [
-    ("headroom", 3, 20, 0, "tree"),
-    ("headroom=0", 1, 200, 3, "unified"),
-])
-def test_headroom_admission_answers_equal_greedy_decoding_under_eviction(
+def check_headroom_admission_answers_equal_greedy_decoding_under_eviction(
         monkeypatch, mode, num_maps, budget, lag, path):
     stats, model, _ = run_maps_under_eviction(monkeypatch, mode, num_maps, budget,
                                               lag, path)
@@ -577,21 +619,20 @@ def test_headroom_admission_answers_equal_greedy_decoding_under_eviction(
     assert work["sol_s"] > 0
 
 
-def test_a_documents_answers_admitted_one_at_a_time_equal_greedy_decoding(
-        monkeypatch):
-    # twelve documents, three maps each: map 0 is the document's own slot
-    _, model, _ = run_maps_under_eviction(monkeypatch, "headroom", 3, 20, 2, "tree")
-    slots = np.vstack((np.arange(12), np.arange(12, 36).reshape(12, 2).T))
-    first_pass = {}
-    for index, decoding in enumerate(model.decode_slots):
-        for slot in decoding:
-            first_pass.setdefault(slot, index)
-    starts = [{first_pass[int(slot)] for slot in slots[:, document]}
-              for document in range(12)]
-    assert any(len(passes) > 1 for passes in starts)
+def test_headroom_admission_answers_equal_greedy_decoding_under_eviction(
+        monkeypatch, tmp_path):
+    for mode, num_maps, budget, lag, path in [
+        ("headroom", 3, 20, 0, "tree"),
+        ("headroom=0", 1, 200, 3, "unified"),
+    ]:
+        named(
+            f"mode={mode} num_maps={num_maps} budget={budget} lag={lag} "
+            f"path={path}",
+            check_headroom_admission_answers_equal_greedy_decoding_under_eviction,
+            monkeypatch=monkeypatch, mode=mode, num_maps=num_maps, budget=budget,
+            lag=lag, path=path)
 
-
-def test_a_headroom_trace_is_written_only_once_the_run_returns(monkeypatch, tmp_path):
+    # the trace is written only once the run returns
     monkeypatch.setenv("QUAIL_HEADROOM_TRACE", str(tmp_path))
     arenas = []
     built = make_arena
@@ -601,7 +642,7 @@ def test_a_headroom_trace_is_written_only_once_the_run_returns(monkeypatch, tmp_
         return arenas[-1]
 
     monkeypatch.setattr(__name__ + ".make_arena", kept_arena)
-    run_maps_under_eviction(monkeypatch, "headroom", 3, 20, 2, "tree")
+    _, model, _ = run_maps_under_eviction(monkeypatch, "headroom", 3, 20, 2, "tree")
     assert not list(tmp_path.iterdir())
     (arena,) = arenas
     arena.write_trace_files()
@@ -609,6 +650,16 @@ def test_a_headroom_trace_is_written_only_once_the_run_returns(monkeypatch, tmp_
     trace = json.loads(path.read_text())
     assert trace["rebuilds"] and trace["page_tokens"] == 4
     assert not arena.trace_files
+
+    # twelve documents, three maps each: map 0 is the document's own slot
+    slots = np.vstack((np.arange(12), np.arange(12, 36).reshape(12, 2).T))
+    first_pass = {}
+    for index, decoding in enumerate(model.decode_slots):
+        for slot in decoding:
+            first_pass.setdefault(slot, index)
+    starts = [{first_pass[int(slot)] for slot in slots[:, document]}
+              for document in range(12)]
+    assert any(len(passes) > 1 for passes in starts)
 
 
 def headroom_admission(written=0, ended=(), expected_tokens=16, limit=32,
@@ -626,7 +677,8 @@ def headroom_admission(written=0, ended=(), expected_tokens=16, limit=32,
     return decoder, admission
 
 
-def test_zero_headroom_admits_when_the_prompt_fits_but_waits_for_replays():
+def test_headroom_admission_admits_a_document_whose_prompt_and_headroom_fit():
+    # without chosen headroom, a prompt that fits is admitted unless replays wait
     decoder = MapDecoder(events_torch(0), torch.eye(VOCABULARY), 2,
                          [32], [STOP], 4, expected_tokens=[16])
     decoder.answer_slots = {0: np.arange(2)}
@@ -643,8 +695,7 @@ def test_zero_headroom_admits_when_the_prompt_fits_but_waits_for_replays():
     assert admission.allows(1, 8, 4)
     assert admission.waits()
 
-
-def test_a_new_document_leaves_running_headroom_alone_when_pages_are_ample():
+    # a new document leaves running headroom alone when pages are ample
     decoder, admission = headroom_admission(ended=[(2, 30)], prefix_tokens=8000)
     decoder.start(0, 0, 8006, list(range(2003)))
     admission.refresh(np.array([0, -1, -2]), free_pages=1000)
@@ -658,8 +709,7 @@ def test_a_new_document_leaves_running_headroom_alone_when_pages_are_ample():
     assert admission._remaining(np.array([0]))[0] == held
     assert admission.headroom_pages + 4 <= 1000
 
-
-def test_a_second_document_in_a_round_shrinks_the_first_ones_headroom_to_fit():
+    # a second document in a round shrinks the first one's headroom to fit
     decoder, admission = headroom_admission(prefix_tokens=8, limit=128,
                                             expected_tokens=64)
     admission.refresh(np.array([-1, -1, -1]), free_pages=30)
@@ -672,65 +722,7 @@ def test_a_second_document_in_a_round_shrinks_the_first_ones_headroom_to_fit():
     assert admission.headroom_pages < first
     assert admission.headroom_pages <= 30 - 8
 
-
-def test_headroom_that_pays_off_only_after_two_pages_is_taken_whole_or_not_at_all():
-    risk = np.array([[10.0, 10.0, 0.0], [5.0, 4.0, 4.0]])
-    assert allocate_headroom(risk, 2).tolist() == [2, 0]
-    assert allocate_headroom(risk, 1).tolist() == [0, 1]
-    assert allocate_headroom(risk, 0).tolist() == [0, 0]
-
-
-def test_headroom_searched_from_a_nearby_price_matches_a_search_from_scratch():
-    rng = np.random.default_rng(3)
-    for _ in range(50):
-        # rows of falling risk, inf past each row's limit
-        risk = np.cumsum(-rng.exponential(1.0, size=(40, 17)), axis=1)
-        risk = risk - risk.min(axis=1, keepdims=True)
-        limits = rng.integers(4, 17, size=40)
-        risk[np.arange(17) > limits[:, None]] = np.inf
-        budget = int(rng.integers(0, 200))
-        chosen, price = _allocate(risk, budget)
-        assert price is not None and chosen.sum() <= budget
-        assert np.array_equal(allocate_headroom(risk, budget), chosen)
-        for hint in (price / 3, price, price * 3):
-            assert np.array_equal(_allocate(risk, budget, hint)[0], chosen)
-
-
-def test_the_quick_bound_never_exceeds_the_rebuild_seconds_admission_adds():
-    _, admission = headroom_admission(num_documents=60)
-    rng = np.random.default_rng(4)
-
-    def grids(rows):
-        risk = np.cumsum(-rng.exponential(1.0, size=(rows, 17)), axis=1)
-        risk = risk - risk.min(axis=1, keepdims=True)
-        risk[np.arange(17) > rng.integers(4, 17, size=rows)[:, None]] = np.inf
-        return risk
-
-    for _ in range(50):
-        admission.held_slots = np.arange(40)
-        admission.held_base = np.zeros(40, dtype=np.int64)
-        admission.held_risk = grids(40)
-        budget = int(rng.integers(20, 200))
-        admission._hold(admission._allocate_held(budget), budget)
-        candidate = grids(int(rng.integers(1, 5)))
-        left = budget - int(rng.integers(0, 20))
-        extra, _ = admission_cost(admission.held_risk, admission.held_pages,
-                                  candidate, left)
-        bound = admission._least_extra(admission._held_bound(), candidate, left)
-        assert bound <= extra + 1e-9
-
-
-def test_admitting_a_document_costs_the_rebuild_risk_it_pushes_onto_held_answers():
-    held = np.array([[100.0, 80.0, 0.0]])
-    candidate = np.array([[3.0, 3.0, 3.0]])
-    extra, chosen = admission_cost(held, np.array([2]), candidate, 1)
-    assert extra == 80.0
-    assert chosen.tolist() == [1, 0]
-    extra, _ = admission_cost(held, np.array([2]), candidate, 2)
-    assert extra == 0.0
-
-
-def test_survival_curves_match_a_full_recount_after_answers_end_unseen():
+    # survival curves match a full recount after answers end unseen
     decoder, admission = headroom_admission(num_documents=60, limit=32,
                                             expected_tokens=8)
     admission.bucket_answers = 1
@@ -757,24 +749,59 @@ def test_survival_curves_match_a_full_recount_after_answers_end_unseen():
     assert np.allclose(admission.curves, recount.curves)
 
 
-def test_eviction_takes_remaining_tokens_from_each_answers_length_bucket():
-    # short prompts end after 3 tokens, long ones run to the limit; two
-    # answers that wrote 2 tokens each differ only in their prompt length
-    num_documents = 20
-    decoder = MapDecoder(events_torch(0), torch.eye(VOCABULARY), num_documents,
-                         [24], [STOP], 4, expected_tokens=[12])
-    decoder.answer_slots = {0: np.arange(num_documents)}
-    prefixes = [8] * 10 + [2000] * 10
-    for a in [*range(2, 10), *range(12, 20)]:
-        decoder.lengths[0][a] = decoder.written[0][a] = 3 if a < 10 else 24
-    admission = HeadroomAdmission(decoder, prefixes, 6, {}, [0] * num_documents,
-                                  lambda tokens: pages_for(tokens, 4),
-                                  choose_headroom=False, bucket_answers=1)
-    decoder.start(0, 0, 14, [0, 1, 2, 3])
-    decoder.start(10, 0, 2006, [4, 5, 6, 7])
-    decoder.written[0][[0, 10]] = 2
-    assert decoder.eviction_order()[0] == 0
-    assert admission.eviction_order()[0] == 10
+def test_headroom_goes_to_the_answers_whose_rebuild_risk_it_lowers_most():
+    # headroom that pays off only after two pages is taken whole or not at all
+    risk = np.array([[10.0, 10.0, 0.0], [5.0, 4.0, 4.0]])
+    assert allocate_headroom(risk, 2).tolist() == [2, 0]
+    assert allocate_headroom(risk, 1).tolist() == [0, 1]
+    assert allocate_headroom(risk, 0).tolist() == [0, 0]
+
+    # a search from a nearby price matches a search from scratch
+    rng = np.random.default_rng(3)
+    for _ in range(50):
+        # rows of falling risk, inf past each row's limit
+        risk = np.cumsum(-rng.exponential(1.0, size=(40, 17)), axis=1)
+        risk = risk - risk.min(axis=1, keepdims=True)
+        limits = rng.integers(4, 17, size=40)
+        risk[np.arange(17) > limits[:, None]] = np.inf
+        budget = int(rng.integers(0, 200))
+        chosen, price = _allocate(risk, budget)
+        assert price is not None and chosen.sum() <= budget
+        assert np.array_equal(allocate_headroom(risk, budget), chosen)
+        for hint in (price / 3, price, price * 3):
+            assert np.array_equal(_allocate(risk, budget, hint)[0], chosen)
+
+    # admitting a document costs the rebuild risk it pushes onto held answers
+    held = np.array([[100.0, 80.0, 0.0]])
+    candidate = np.array([[3.0, 3.0, 3.0]])
+    extra, chosen = admission_cost(held, np.array([2]), candidate, 1)
+    assert extra == 80.0
+    assert chosen.tolist() == [1, 0]
+    extra, _ = admission_cost(held, np.array([2]), candidate, 2)
+    assert extra == 0.0
+
+    # the quick bound never exceeds the rebuild seconds admission adds
+    _, admission = headroom_admission(num_documents=60)
+    rng = np.random.default_rng(4)
+
+    def grids(rows):
+        risk = np.cumsum(-rng.exponential(1.0, size=(rows, 17)), axis=1)
+        risk = risk - risk.min(axis=1, keepdims=True)
+        risk[np.arange(17) > rng.integers(4, 17, size=rows)[:, None]] = np.inf
+        return risk
+
+    for _ in range(50):
+        admission.held_slots = np.arange(40)
+        admission.held_base = np.zeros(40, dtype=np.int64)
+        admission.held_risk = grids(40)
+        budget = int(rng.integers(20, 200))
+        admission._hold(admission._allocate_held(budget), budget)
+        candidate = grids(int(rng.integers(1, 5)))
+        left = budget - int(rng.integers(0, 20))
+        extra, _ = admission_cost(admission.held_risk, admission.held_pages,
+                                  candidate, left)
+        bound = admission._least_extra(admission._held_bound(), candidate, left)
+        assert bound <= extra + 1e-9
 
 
 def test_a_borrowed_prefix_is_not_counted_twice_in_attention_pairs():
@@ -842,4 +869,3 @@ def test_a_map_answer_stops_once_its_test_is_decided(monkeypatch):
     assert decoder.rows_fed[0] < sum(map(len, wanted))
     assert not decoder.active
     assert not arena.accounting.owned
-

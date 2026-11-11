@@ -19,12 +19,9 @@ from helpers.kv_checker import (
 pytest.importorskip("torch")
 
 
-@pytest.fixture(params=[("tree", False, False), ("unified", True, True)],
-                ids=["tree", "sliding-canvas"])
-def arena_kind(request, monkeypatch):
-    """(attention path, sliding layers, canvas row), with CPU staging."""
-    cpu_staging(monkeypatch)
-    return request.param
+# (attention path, sliding layers, canvas row) by name
+ARENA_KINDS = {"tree": ("tree", False, False),
+               "sliding-canvas": ("unified", True, True)}
 
 
 def corpus(rng, n, header_tokens, piece_tokens):
@@ -80,14 +77,7 @@ def named(case, check, *args, **options):
         raise AssertionError(f"{case}: {error}") from error
 
 
-def test_small_filters_joins_and_filters_feeding_joins(arena_kind):
-    """Short documents on arenas a few of them fill.
-
-    A join whose child shares its first page with a retained anchor of
-    an earlier join runs last: the anchor trimmed its window, so on a
-    sliding arena the child cannot borrow the rows the anchor dropped
-    and packs whole; elsewhere it borrows the page.
-    """
+def check_small_filters_joins_and_filters_feeding_joins(arena_kind):
     for seed in range(6):
         rng = random.Random(seed)
         documents, setup = small(rng, arena_kind, 40, (40, 80, 400), (24, 60))
@@ -111,23 +101,28 @@ def test_small_filters_joins_and_filters_feeding_joins(arena_kind):
                   sliding_pages=12, budget=200, page_tokens=16)
     check_join_after_join([parent, child], *join_parts(), setup)
 
-
-def test_a_negated_filter_chain_keeps_the_documents_answered_no(arena_kind):
+    # a negated filter chain keeps the documents answered no
     rng = random.Random(7)
     documents, setup = small(rng, arena_kind, 40, (40, 80, 400), (24, 60))
-    check_filter(documents, questions(rng), setup, negated=True)
+    named("negated filter", check_filter, documents, questions(rng), setup,
+          negated=True)
 
 
-@pytest.mark.parametrize("path,window,canvas,state_slots", [
-    ("tree", None, (), 0),
-    ("tree", 32, (), 0),
-    ("unified", None, (), 0),
-    ("unified", 32, (99,), 0),
-    ("unified", None, (), 24),
-    ("unified", 32, (), 24),
-], ids=["tree", "tree-sliding", "unified", "sliding-canvas", "hybrid",
-        "hybrid-sliding"])
-def test_a_document_longer_than_a_pass_prefills_over_passes_and_answers_alike(
+def test_small_filters_joins_and_filters_feeding_joins(monkeypatch):
+    """Short documents on arenas a few of them fill.
+
+    A join whose child shares its first page with a retained anchor of
+    an earlier join runs last: the anchor trimmed its window, so on a
+    sliding arena the child cannot borrow the rows the anchor dropped
+    and packs whole; elsewhere it borrows the page.
+    """
+    cpu_staging(monkeypatch)
+    for name, arena_kind in ARENA_KINDS.items():
+        named(name, check_small_filters_joins_and_filters_feeding_joins,
+              arena_kind)
+
+
+def check_a_document_longer_than_a_pass_prefills_over_passes_and_answers_alike(
         monkeypatch, path, window, canvas, state_slots):
     """Documents of up to 160 tokens on a 40-token pass, then a roomy one.
 
@@ -162,6 +157,23 @@ def test_a_document_longer_than_a_pass_prefills_over_passes_and_answers_alike(
               setup, retain=True)
         named(f"feed budget {budget}", check_feed, documents, [90, 91, 92],
               *join_parts(), setup)
+
+
+def test_a_document_longer_than_a_pass_prefills_over_passes_and_answers_alike(
+        monkeypatch):
+    for name, (path, window, canvas, state_slots) in {
+        "tree": ("tree", None, (), 0),
+        "tree-sliding": ("tree", 32, (), 0),
+        "unified": ("unified", None, (), 0),
+        "sliding-canvas": ("unified", 32, (99,), 0),
+        "hybrid": ("unified", None, (), 24),
+        "hybrid-sliding": ("unified", 32, (), 24),
+    }.items():
+        with monkeypatch.context() as patch:
+            named(
+                name,
+                check_a_document_longer_than_a_pass_prefills_over_passes_and_answers_alike,
+                patch, path, window, canvas, state_slots)
 
 
 def test_an_unpaged_filter_writes_a_long_document_in_pages_over_passes(

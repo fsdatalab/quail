@@ -4,9 +4,9 @@ from collections import Counter
 from types import SimpleNamespace
 
 import numpy as np
-import pytest
 import torch
 from helpers.extract_fakes import make_spec
+from test_kv_reads import named
 from test_map_decode import events_torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
@@ -163,11 +163,7 @@ def verifier_inputs(decoder, vocabulary, mixed=False):
     return group, projected[group.key], documents, indices
 
 
-@pytest.mark.parametrize("trace,num_fields,workspace_bytes", [
-    (False, 1, 64 * 2**20),
-    (True, 41, 128000),
-])
-def test_long_draft_choices_and_state_match_sequential_verification(
+def check_long_draft_choices_and_state_match_sequential_verification(
     monkeypatch, tmp_path, trace, num_fields, workspace_bytes
 ):
     if trace:
@@ -204,3 +200,17 @@ def test_long_draft_choices_and_state_match_sequential_verification(
     assert (group.widths >= group.alive.sum(dim=1).numpy()).all()
     assert (actual[:, 0] == -2).any()
     assert (actual[:, 0] >= 0).any()
+
+
+def test_long_draft_choices_and_state_match_sequential_verification(
+        monkeypatch, tmp_path):
+    for trace, num_fields, workspace_bytes in [
+        (False, 1, 64 * 2**20),
+        (True, 41, 128000),
+    ]:
+        named(
+            f"trace={trace} num_fields={num_fields} "
+            f"workspace_bytes={workspace_bytes}",
+            check_long_draft_choices_and_state_match_sequential_verification,
+            monkeypatch=monkeypatch, tmp_path=tmp_path, trace=trace,
+            num_fields=num_fields, workspace_bytes=workspace_bytes)

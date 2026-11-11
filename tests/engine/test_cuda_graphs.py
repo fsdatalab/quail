@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 
 import pytest
+from test_kv_reads import named
 
 from quail.backends.quail.executor.cuda_graphs import (
     CapturedPieces,
@@ -44,27 +45,25 @@ def pipeline():
     return model
 
 
-@pytest.mark.parametrize("model", [QWEN3_4B_FP8, QWEN3_5_4B_BF16])
-def test_dense_models_capture_the_stock_vllm_sizes_with_padding_under_256(model):
-    buckets = graph_token_buckets(model, H100_SXM)
-    assert len(buckets) == 81
-    assert buckets[0] == 1
-    assert buckets[-1] == 8_192
-    for n in range(1, buckets[-1] + 1):
-        assert next(b for b in buckets if b >= n) - n < 256
-    assert graph_memory_bytes(model, H100_SXM) == (
-        2 * buckets[-1] * model.act_per_token)
+def test_dense_models_capture_the_stock_vllm_sizes_and_other_models_stay_eager():
+    for model in [QWEN3_4B_FP8, QWEN3_5_4B_BF16]:
+        buckets = graph_token_buckets(model, H100_SXM)
+        assert len(buckets) == 81, model.name
+        assert buckets[0] == 1, model.name
+        assert buckets[-1] == 8_192, model.name
+        # padding stays under 256 tokens
+        for n in range(1, buckets[-1] + 1):
+            assert next(b for b in buckets if b >= n) - n < 256, model.name
+        assert graph_memory_bytes(model, H100_SXM) == (
+            2 * buckets[-1] * model.act_per_token), model.name
+
+    # experts, SAE readouts, and LFM2 keep the eager path
+    for model in [QWEN3_6_35B_A3B_FP8, QWEN3_5_2B_SAE_BF16, LFM2_2_6B_BF16]:
+        assert PiecewiseGraphs.for_specs(None, model, H100_SXM) is None, model.name
+        assert graph_memory_bytes(model, H100_SXM) == 0, model.name
 
 
-@pytest.mark.parametrize(
-    "model", [QWEN3_6_35B_A3B_FP8, QWEN3_5_2B_SAE_BF16, LFM2_2_6B_BF16])
-def test_experts_sae_readouts_and_lfm2_keep_the_eager_path(model):
-    assert PiecewiseGraphs.for_specs(None, model, H100_SXM) is None
-    assert graph_memory_bytes(model, H100_SXM) == 0
-
-
-@pytest.mark.parametrize("mode", ["tree", "unified"])
-def test_padding_never_reaches_attention(mode):
+def check_padding_never_reaches_attention(mode):
     model = pipeline()
     buffers = PiecewiseBuffers(model, 8, device="cpu")
     source = chunk()
@@ -91,7 +90,11 @@ def test_padding_never_reaches_attention(mode):
     buffers.mixer(model, 0, source)
 
 
-def test_smaller_buckets_share_the_largest_buckets_rows_but_not_its_scales():
+def test_padding_never_reaches_attention_and_buckets_share_the_largest_buckets_rows():
+    for mode in ["tree", "unified"]:
+        named(f"mode={mode}", check_padding_never_reaches_attention, mode=mode)
+
+    # smaller buckets share the largest bucket's rows but not its scales
     model = pipeline()
     largest = PiecewiseBuffers(model, 8, device="cpu")
     small = PiecewiseBuffers(model, 3, device="cpu", storage=largest)
@@ -152,8 +155,7 @@ def test_captured_kv_mappings_mask_padding_and_keep_partial_page_order():
     assert not keys[1].count_nonzero()
 
 
-@pytest.mark.parametrize("unsupported", ["large", "disabled", "canvas", "writes"])
-def test_unsupported_batches_fall_back(unsupported):
+def check_unsupported_batches_fall_back(unsupported):
     model = pipeline()
     graphs = PiecewiseGraphs(model, token_buckets=(8,), memory_bytes=1024)
     graphs.storage = model.engine.arena.k
@@ -181,7 +183,12 @@ def test_unsupported_batches_fall_back(unsupported):
     assert graphs.replays == 0
 
 
-def test_shared_reads_and_prefill_chunks_are_supported():
+def test_graphs_replay_supported_batches_and_fall_back_on_the_rest():
+    for unsupported in ["large", "disabled", "canvas", "writes"]:
+        named(f"unsupported={unsupported}", check_unsupported_batches_fall_back,
+              unsupported=unsupported)
+
+    # shared reads and prefill chunks are supported
     model = pipeline()
     graphs = PiecewiseGraphs(model, token_buckets=(8,), memory_bytes=1024)
     graphs.storage = model.engine.arena.k
@@ -192,8 +199,7 @@ def test_shared_reads_and_prefill_chunks_are_supported():
     source.attention_mode = "unified"
     assert graphs.supports(source)
 
-
-def test_replay_returns_independent_output_storage():
+    # a replay returns output storage of its own
     model = pipeline()
     buffers = PiecewiseBuffers(model, 8, device="cpu")
     buffers.output.copy_(torch.arange(32).reshape(8, 4))

@@ -4,12 +4,12 @@ from types import SimpleNamespace
 
 import numpy as np
 import pyarrow as pa
-import pytest
 import torch
 from helpers.conditions import condition as sql_condition
 from helpers.extract_fakes import make_spec
 from helpers.extract_reference import Decoder, add_answers
 from helpers.extract_reference import ReferenceInputs as ExtractionInputs
+from test_kv_reads import named
 from test_map_decode import events_torch
 
 from quail.backends.quail.executor.map_decoder import MapDecoder
@@ -18,17 +18,7 @@ from quail.execution.answer_stops import AnswerStop
 
 # a draft policy matters only with draft tokens, and drafts only past one token
 # a row budget below every draft trims drafts, never answers
-@pytest.mark.parametrize(
-    "draft_tokens,draft_policy,spellings,answer_limit,row_budget",
-    [
-        (0, "fixed", False, 1, None),
-        (4, "fixed", True, 8, None),
-        (4, "adaptive", False, 8, None),
-        (4, "fixed", True, 8, 40),
-        (4, "adaptive", False, 8, 40),
-    ],
-)
-def test_copy_answers_and_spans_match_the_recurrent_token_rule(
+def check_copy_answers_and_spans_match_the_recurrent_token_rule(
     draft_tokens, draft_policy, spellings, answer_limit, row_budget
 ):
     rng = np.random.default_rng(817)
@@ -136,12 +126,25 @@ def test_copy_answers_and_spans_match_the_recurrent_token_rule(
         ]
 
 
+def test_copy_answers_and_spans_match_the_recurrent_token_rule():
+    for draft_tokens, draft_policy, spellings, answer_limit, row_budget in [
+        (0, "fixed", False, 1, None),
+        (4, "fixed", True, 8, None),
+        (4, "adaptive", False, 8, None),
+        (4, "fixed", True, 8, 40),
+        (4, "adaptive", False, 8, 40),
+    ]:
+        named(
+            f"draft_tokens={draft_tokens} draft_policy={draft_policy} "
+            f"spellings={spellings} answer_limit={answer_limit} "
+            f"row_budget={row_budget}",
+            check_copy_answers_and_spans_match_the_recurrent_token_rule,
+            draft_tokens=draft_tokens, draft_policy=draft_policy, spellings=spellings,
+            answer_limit=answer_limit, row_budget=row_budget)
+
+
 # every setting appears in some case
-@pytest.mark.parametrize("draft_tokens,limit,filtered,lag,pages", [
-    (3, 2, False, 0, 24),
-    (0, None, True, 3, 300),
-])
-def test_copy_branches_match_reference_after_filters_and_limits(
+def check_copy_branches_match_reference_after_filters_and_limits(
     monkeypatch, draft_tokens, limit, filtered, lag, pages, state_slots=0
 ):
     from helpers.fakes import cpu_staging, fake_pipeline
@@ -331,24 +334,23 @@ def test_copy_branches_match_reference_after_filters_and_limits(
                            "the workload must continue after rejecting a draft")
 
 
-@pytest.mark.parametrize("draft_tokens,pages,lag,filtered", [(3, 300, 3, True)])
-def test_hybrid_copy_answers_match_reference_after_rejected_drafts(
-        monkeypatch, draft_tokens, pages, lag, filtered):
-    test_copy_branches_match_reference_after_filters_and_limits(
-        monkeypatch, draft_tokens=draft_tokens, limit=None, filtered=filtered,
-        lag=lag, pages=pages, state_slots=120)
+def test_copy_branches_match_reference_after_filters_and_limits(monkeypatch):
+    for draft_tokens, limit, filtered, lag, pages, state_slots in [
+        (3, 2, False, 0, 24, 0),
+        (0, None, True, 3, 300, 0),
+        # a hybrid model, whose rejected drafts restore saved state
+        (3, None, True, 3, 300, 120),
+    ]:
+        named(
+            f"draft_tokens={draft_tokens} limit={limit} filtered={filtered} "
+            f"lag={lag} pages={pages} state_slots={state_slots}",
+            check_copy_branches_match_reference_after_filters_and_limits,
+            monkeypatch=monkeypatch, draft_tokens=draft_tokens, limit=limit,
+            filtered=filtered, lag=lag, pages=pages, state_slots=state_slots)
 
 
 # every setting appears in some case
-@pytest.mark.parametrize(
-    "map_first,tested,extract_attention,map_attention,pages",
-    [
-        (False, "extract", "tree", "tree", 300),
-        (True, "map", "unified", "unified", 24),
-        (False, None, "tree", "unified", 24),
-    ],
-)
-def test_maps_and_extracts_share_branches_without_changing_results(
+def check_maps_and_extracts_share_branches_without_changing_results(
     monkeypatch, map_first, tested, extract_attention, map_attention, pages
 ):
     from helpers.fakes import cpu_staging
@@ -488,6 +490,22 @@ def test_maps_and_extracts_share_branches_without_changing_results(
         model.shared_reads > 0
     )
     assert not arena.accounting.owned
+
+
+def test_maps_and_extracts_share_branches_without_changing_results(monkeypatch):
+    for map_first, tested, extract_attention, map_attention, pages in [
+        (False, "extract", "tree", "tree", 300),
+        (True, "map", "unified", "unified", 24),
+        (False, None, "tree", "unified", 24),
+    ]:
+        named(
+            f"map_first={map_first} tested={tested} "
+            f"extract_attention={extract_attention} "
+            f"map_attention={map_attention} pages={pages}",
+            check_maps_and_extracts_share_branches_without_changing_results,
+            monkeypatch=monkeypatch, map_first=map_first, tested=tested,
+            extract_attention=extract_attention, map_attention=map_attention,
+            pages=pages)
 
 
 def test_copy_tables_match_each_documents_candidate_index():

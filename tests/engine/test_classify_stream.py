@@ -19,6 +19,7 @@ from helpers.fakes import (
     fake_readout,
     fake_torch,
 )
+from test_kv_reads import named
 
 from quail.backends.quail import QuailModelExecution
 from quail.backends.quail.executor import chunk as chunk_mod
@@ -720,11 +721,18 @@ def _recorded(result, model) -> tuple:
     return len(compositions), digest, fresh, rows
 
 
-@pytest.mark.parametrize("region", sorted(RECORDED_CHUNKS))
-def test_each_region_packs_the_chunks_it_packed_before_streaming(
+def check_each_region_packs_the_chunks_it_packed_before_streaming(
         monkeypatch, region):
     assert _recorded(*_run_recorded_region(monkeypatch, region)) \
         == RECORDED_CHUNKS[region]
+
+
+def test_each_region_packs_the_chunks_it_packed_before_streaming(monkeypatch):
+    for region in sorted(RECORDED_CHUNKS):
+        named(
+            f"region={region}",
+            check_each_region_packs_the_chunks_it_packed_before_streaming,
+            monkeypatch=monkeypatch, region=region)
 
 
 def test_a_score_hands_on_each_row_once_its_request_is_answered(monkeypatch):
@@ -773,7 +781,7 @@ class EvenDocuments:
         return [d % 2 == 0 for d in range(14)]
 
 
-def test_a_classification_alone_skips_the_documents_the_hint_drops(monkeypatch):
+def test_classifications_alone_skip_the_documents_the_hint_drops(monkeypatch):
     with reporting(None, EvenDocuments(), {"r": "reviews"}):
         result, model = _run_recorded_region(monkeypatch, "classify")
     labeled = result["_outputs"][PortRef("classify:r", "rows:r")]
@@ -782,9 +790,7 @@ def test_a_classification_alone_skips_the_documents_the_hint_drops(monkeypatch):
                  if entry["prefix"] is not None]
     assert sorted(prefilled) == list(range(0, 14, 2))
 
-
-def test_a_chain_of_classifications_alone_skips_the_documents_the_hint_drops(
-        monkeypatch):
+    # a chain of classifications skips them too
     with reporting(None, EvenDocuments(), {"r": "reviews"}):
         result, _ = _run_recorded_region(monkeypatch, "classifies")
     labeled = result["_outputs"][PortRef("classify:kind", "rows:r")].to_pydict()

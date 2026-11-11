@@ -4,6 +4,7 @@ import random
 
 import pytest
 from helpers.fakes import fake_readout
+from test_kv_reads import named
 
 from quail.backends.quail.executor.admission import (
     DROP,
@@ -174,7 +175,7 @@ def test_admission_invariants_over_random_shapes():
                                stages, frames, budget, resident, lists)
 
 
-def test_ready_requests_fill_remaining_tokens_without_starving_skipped_requests():
+def test_ready_requests_fill_a_chunk_and_a_limit_ends_the_run_and_drains_the_queue():
     sched = JoinAdmission(
         [1] * 4, [[1], [10, 17, 6, 4, 6]], 20, 100, 1,
         anchor_partners={a: [[0], [2, 4] if a == 2 else [a]]
@@ -187,6 +188,27 @@ def test_ready_requests_fill_remaining_tokens_without_starving_skipped_requests(
     assert sum(sched.stages[1][a] for a, *_ in chunk) == 20
     assert sched.next_chunk(96) == [(1, 1, 0, 1, False)]
     assert sched.next_chunk(96) == [(2, 1, 1, 2, False)]
+
+    # three anchors of one suffix each, a limit of one survivor: the
+    # first finishes, and the others already launched drain
+    sched = JoinAdmission([50, 50, 50], [[10]], 250, arena_pages=100,
+                          page_tokens=16, limit=1)
+    groups = sched.next_chunk(100)
+    assert [a for a, *_ in groups] == [0, 1, 2]
+    sched.report(0, 0, 0, 1, [1])
+    assert sched.limit_reached() and sched.next_chunk(100) == []
+    assert not sched.done()
+    sched.report(1, 0, 0, 1, [1])
+    sched.report(2, 0, 0, 1, [0])
+    assert sched.done() and sched.survivors == 2
+    sched = JoinAdmission([50, 50, 50], [[10], [200]], 250, arena_pages=100,
+                          page_tokens=16, limit=1)
+    for a, *_ in sched.next_chunk(100):
+        sched.report(a, 0, 0, 1, [1])
+    assert sched.next_chunk(100) == [(0, 1, 0, 1, False)]
+    sched.report(0, 1, 0, 1, [1])
+    assert sched.done()
+    assert sched.drain() == [1, 2]
 
 
 def _tree_filter(monkeypatch, *, truth, budget, retain=(), limit=None,
@@ -236,28 +258,23 @@ def _tree_filter(monkeypatch, *, truth, budget, retain=(), limit=None,
     return got, tokens, stats["borrowed_tokens"], arena
 
 
-@pytest.mark.parametrize("num_key_survivors", [1, 2])
-def test_a_stop_key_group_skips_its_rest_once_enough_documents_survive(
-        monkeypatch, num_key_survivors):
+def test_a_stop_key_group_skips_its_rest_once_enough_documents_survive(monkeypatch):
     from helpers.fakes import DOC
 
     # a chunk holds one document, every document passes, and the group
-    # keeps num_key_survivors documents in flight
-    documents = [[DOC + index] * 64 for index in range(5)]
-    tree = PrefixTree(order=list(range(5)), parent=[None] * 5, shared=[0] * 5)
-    got, _, _, _ = _tree_filter(
-        monkeypatch, truth={index: [1] for index in range(5)}, budget=80,
-        documents=documents, tree=tree, stop_groups=[7] * 5,
-        num_key_survivors=num_key_survivors)
-    # with two in flight, a third starts while the second's answer is
-    # pending; the last two never run
-    assert sorted(got) == {1: [0], 2: [0, 1, 2]}[num_key_survivors]
+    # keeps num_key_survivors documents in flight; with two in flight, a
+    # third starts while the second's answer is pending and the last two
+    # never run
+    for num_key_survivors, ran in [(1, [0]), (2, [0, 1, 2])]:
+        documents = [[DOC + index] * 64 for index in range(5)]
+        tree = PrefixTree(order=list(range(5)), parent=[None] * 5, shared=[0] * 5)
+        got, _, _, _ = _tree_filter(
+            monkeypatch, truth={index: [1] for index in range(5)}, budget=80,
+            documents=documents, tree=tree, stop_groups=[7] * 5,
+            num_key_survivors=num_key_survivors)
+        assert sorted(got) == ran, f"num_key_survivors={num_key_survivors}"
 
-
-def test_a_document_standing_for_copies_counts_once_per_copy_in_each_group(
-        monkeypatch):
-    from helpers.fakes import DOC
-
+    # a document standing for copies counts once per copy in each group:
     # a chunk holds one document and every document passes; document 0
     # stands for two copies in group 7, so it alone completes group 7
     documents = [[DOC + index] * 64 for index in range(4)]
@@ -269,10 +286,8 @@ def test_a_document_standing_for_copies_counts_once_per_copy_in_each_group(
     # document 2 never runs; group 8 needs document 3 as well as 1
     assert sorted(got) == [0, 1, 3]
 
-
-def test_a_hint_skips_a_document_of_a_stop_key_group():
-    # document 0, in groups a and b, is skipped by the hint; the others
-    # run, one per group in flight
+    # a hint skips a document of a stop-key group: document 0, in groups
+    # a and b, is skipped; the others run, one per group in flight
     admission = JoinAdmission([10, 10, 10], [[5]], 1000, 1 << 20, 16,
                               stop_groups=[("a", "b"), ("a",), ("b",)],
                               skip=lambda document: document == 0)
@@ -377,42 +392,18 @@ def test_filter_borrows_from_parents_and_stacks_siblings(monkeypatch):
     assert arena.free_pages == 64
 
 
-def test_join_admission_limit_ends_the_run_and_drains_the_queue():
-    # three anchors of one suffix each, a limit of one survivor: the
-    # first finishes, and the others already launched drain
-    sched = JoinAdmission([50, 50, 50], [[10]], 250, arena_pages=100,
-                          page_tokens=16, limit=1)
-    groups = sched.next_chunk(100)
-    assert [a for a, *_ in groups] == [0, 1, 2]
-    sched.report(0, 0, 0, 1, [1])
-    assert sched.limit_reached() and sched.next_chunk(100) == []
-    assert not sched.done()
-    sched.report(1, 0, 0, 1, [1])
-    sched.report(2, 0, 0, 1, [0])
-    assert sched.done() and sched.survivors == 2
-    sched = JoinAdmission([50, 50, 50], [[10], [200]], 250, arena_pages=100,
-                          page_tokens=16, limit=1)
-    for a, *_ in sched.next_chunk(100):
-        sched.report(a, 0, 0, 1, [1])
-    assert sched.next_chunk(100) == [(0, 1, 0, 1, False)]
-    sched.report(0, 1, 0, 1, [1])
-    assert sched.done()
-    assert sched.drain() == [1, 2]
+def test_a_document_too_long_fails_by_name_and_one_that_fits_waits_for_free_pages():
+    for prefixes, exceeds in [
+        # 245 tokens and a 10-token question exceed the 250-token chunk
+        ([50, 245, 60], "250-token forward pass"),
+        # 400 tokens need 26 pages of 16 tokens, more than the 20-page arena
+        ([50, 400, 60], "20 pages of the whole arena"),
+    ]:
+        with pytest.raises(OversizedDocumentError, match=exceeds) as raised:
+            JoinAdmission(prefixes, [[10], [10]], 250, arena_pages=20,
+                          page_tokens=16)
+        assert raised.value.anchor == 1, exceeds
 
-
-@pytest.mark.parametrize(("prefixes", "exceeds"), [
-    # 245 tokens and a 10-token question exceed the 250-token chunk
-    ([50, 245, 60], "250-token forward pass"),
-    # 400 tokens need 26 pages of 16 tokens, more than the 20-page arena
-    ([50, 400, 60], "20 pages of the whole arena"),
-])
-def test_a_document_too_long_for_a_chunk_or_the_arena_fails_by_name(prefixes, exceeds):
-    with pytest.raises(OversizedDocumentError, match=exceeds) as raised:
-        JoinAdmission(prefixes, [[10], [10]], 250, arena_pages=20, page_tokens=16)
-    assert raised.value.anchor == 1
-
-
-def test_a_long_document_that_fits_the_arena_waits_for_free_pages():
     # anchor 1 needs 13 of the 20 pages; with 19 free, anchor 0 takes 7,
     # and anchor 1 is admitted once anchor 0's pages are free again
     sched = JoinAdmission([100, 200], [[10]], 250, arena_pages=20, page_tokens=16)
@@ -448,8 +439,9 @@ def test_documents_entering_a_gated_stage_wait_in_place_and_are_asked_together()
     assert asked == [(0, 1), (1, 1), (1, 2), (2, 1)]
     assert settled == [Settlement("dropped", 2, False)]
     assert sched.next_chunk(100) == [(0, 1, 0, 1, False), (1, 2, 0, 1, False)]
-@pytest.mark.parametrize("kept", [False, True])
-def test_dependents_wait_for_their_parent_and_price_only_the_unshared_tokens(kept):
+
+
+def check_dependents_wait_for_their_parent_and_price_only_the_unshared_tokens(kept):
     requested = []
 
     def requests(stage):
@@ -480,7 +472,14 @@ def test_dependents_wait_for_their_parent_and_price_only_the_unshared_tokens(kep
     assert sched.survivors == 1 and sched.done()
 
 
-def test_a_released_dependent_runs_after_its_parent_finishes():
+def test_dependents_wait_for_their_parent_and_price_only_the_unshared_tokens():
+    for kept in [False, True]:
+        named(
+            f"kept={kept}",
+            check_dependents_wait_for_their_parent_and_price_only_the_unshared_tokens,
+            kept)
+
+    # a released dependent runs after its parent finishes
     sched = JoinAdmission(
         [2, 2], [[2]], 4, arena_pages=4, page_tokens=16,
         dependencies={1: (0, 0)}, limit=1)

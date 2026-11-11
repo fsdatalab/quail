@@ -63,31 +63,7 @@ PAYLOAD = {"physical_plan": ENVELOPE, "model": "qwen3-4b-fp8", "gpus": 1,
            "documents": {}, **ENVELOPE["settings"]}
 
 
-def test_arena_resize_releases_pieces_that_write_kv(booted, monkeypatch):
-    calls = []
-    gpu = LoadedGpu.__new__(LoadedGpu)
-    gpu.torch = sys.modules["torch"]
-    monkeypatch.setattr(gpu.torch.cuda, "synchronize",
-                        lambda: calls.append("synchronize"))
-    gpu.pipeline = SimpleNamespace(piecewise_graphs=SimpleNamespace(
-        invalidate=lambda: calls.append("invalidate")))
-    gpu.arena = SimpleNamespace(
-        num_pages=8, num_sliding_pages=0, k=[], v=[], gdn_state=None,
-        conv_state=None, resize=lambda *a, **kw: calls.append("resize"))
-    gpu.model = gpu.F = None
-    gpu.decision_head = None
-    # a dense model keeps no checkpoint slots, so resize gets no state pool
-    gpu.spec = MODELS["qwen3-4b-fp8"]
-    gpu.device = H100_SXM
-    gpu.execution = SimpleNamespace(bind_query=lambda **kw: None)
-    gpu.bind_query([1], [2], 32, arena_pages=(8, 0))
-    assert calls == ["resize"]
-    calls.clear()
-    gpu.bind_query([1], [2], 32, arena_pages=(16, 0))
-    assert calls == ["synchronize", "invalidate", "resize"]
-
-
-def test_prepared_boot_is_handed_to_the_query_and_used_once(
+def test_prepared_boot_is_used_once_and_an_arena_resize_releases_pieces_that_write_kv(
         booted, monkeypatch):
     registry = built_in_registry()
     backend = registry.backend("quail")
@@ -168,8 +144,31 @@ def test_prepared_boot_is_handed_to_the_query_and_used_once(
     execution.close()
     assert replacement() is None
 
+    # an arena resize releases the pieces that write KV
+    calls = []
+    gpu = LoadedGpu.__new__(LoadedGpu)
+    gpu.torch = sys.modules["torch"]
+    monkeypatch.setattr(gpu.torch.cuda, "synchronize",
+                        lambda: calls.append("synchronize"))
+    gpu.pipeline = SimpleNamespace(piecewise_graphs=SimpleNamespace(
+        invalidate=lambda: calls.append("invalidate")))
+    gpu.arena = SimpleNamespace(
+        num_pages=8, num_sliding_pages=0, k=[], v=[], gdn_state=None,
+        conv_state=None, resize=lambda *a, **kw: calls.append("resize"))
+    gpu.model = gpu.F = None
+    gpu.decision_head = None
+    # a dense model keeps no checkpoint slots, so resize gets no state pool
+    gpu.spec = MODELS["qwen3-4b-fp8"]
+    gpu.device = H100_SXM
+    gpu.execution = SimpleNamespace(bind_query=lambda **kw: None)
+    gpu.bind_query([1], [2], 32, arena_pages=(8, 0))
+    assert calls == ["resize"]
+    calls.clear()
+    gpu.bind_query([1], [2], 32, arena_pages=(16, 0))
+    assert calls == ["synchronize", "invalidate", "resize"]
 
-def test_a_failed_boot_releases_the_gpu_and_the_next_boot_loads_again(
+
+def test_a_failed_boot_releases_the_gpu_and_a_cold_boot_stays_out_of_collections(
         booted, monkeypatch):
     calls = []
     monkeypatch.setattr(worker, "release_models",
@@ -195,12 +194,7 @@ def test_a_failed_boot_releases_the_gpu_and_the_next_boot_loads_again(
     assert again is gpu and boot["kind"] == "warm"
     assert calls == [("release", ["gpu"])]
 
-
-def test_a_cold_boot_leaves_the_loaded_objects_out_of_later_collections(
-        booted, monkeypatch):
-    monkeypatch.setattr(worker.LoadedGpu, "warm", lambda self: (0.0, None))
-    registry = built_in_registry()
-    context = worker._single_gpu_context(registry, ENVELOPE)
+    # a cold boot leaves the loaded objects out of later collections
     gc.unfreeze()
     try:
         gpu, _ = worker._boot_for_query({}, registry.backend("quail"), context,

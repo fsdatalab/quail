@@ -45,7 +45,8 @@ def lengths(phases):
     return [phase.lengths for phase in phases]
 
 
-def test_borrower_after_the_parent_chunk_reads_the_saved_state(torch_stub):
+def test_borrowers_read_the_saved_state_and_answer_steps_update_their_slot_in_place(
+        torch_stub):
     arena = arena_with_slots()
     resident(arena, "p", "c")
     plan_phases(arena, [group("p", 48, 0, 48, points=(32,))], stage)
@@ -59,6 +60,27 @@ def test_borrower_after_the_parent_chunk_reads_the_saved_state(torch_stub):
     assert phases[0].read_slots.tolist() == [arena.accounting.slots["p"]]
     with pytest.raises(ValueError, match="checkpoints cover"):
         plan_phases(arena, [resident_group("p", 32, 0, 2)], stage)
+
+    # one-token answer steps update their slot in place
+    arena = arena_with_slots()
+    resident(arena, "a", "b")
+    plan_phases(arena, [group("a", 48, 0, 48), group("b", 40, 50, 90)], stage)
+    document = arena.accounting.slots["a"]
+    phases = plan_phases(
+        arena, [answer_step("a", 48, 0), answer_step("b", 40, 1, tokens=2)],
+        stage)
+    assert lengths(phases) == [(2,), (1,)]
+    chunked, step = phases
+    assert chunked.state_rows is None
+    answer = arena.extension("a")[0]
+    assert answer != document
+    assert step.state_rows.tolist() == [answer + 1]
+    assert step.copy_reads.tolist() == [document]
+    assert step.copy_writes.tolist() == [answer]
+    (step,) = plan_phases(arena, [answer_step("a", 49, 0)], stage)
+    assert step.read_slots.tolist() == step.write_slots.tolist() == [answer]
+    assert step.state_rows.tolist() == [answer + 1]
+    assert step.copy_reads is None
 
 
 # ---- edge cases -------------------------------------------------------
@@ -131,25 +153,3 @@ def answer_step(key, f, row, tokens=1):
                 row1=row + tokens,
                 suffix_spans=(np.array([row]), np.array([row + tokens])),
                 kept=tokens)
-
-
-def test_one_token_answer_steps_update_their_slot_in_place(torch_stub):
-    arena = arena_with_slots()
-    resident(arena, "a", "b")
-    plan_phases(arena, [group("a", 48, 0, 48), group("b", 40, 50, 90)], stage)
-    document = arena.accounting.slots["a"]
-    phases = plan_phases(
-        arena, [answer_step("a", 48, 0), answer_step("b", 40, 1, tokens=2)],
-        stage)
-    assert lengths(phases) == [(2,), (1,)]
-    chunked, step = phases
-    assert chunked.state_rows is None
-    answer = arena.extension("a")[0]
-    assert answer != document
-    assert step.state_rows.tolist() == [answer + 1]
-    assert step.copy_reads.tolist() == [document]
-    assert step.copy_writes.tolist() == [answer]
-    (step,) = plan_phases(arena, [answer_step("a", 49, 0)], stage)
-    assert step.read_slots.tolist() == step.write_slots.tolist() == [answer]
-    assert step.state_rows.tolist() == [answer + 1]
-    assert step.copy_reads is None

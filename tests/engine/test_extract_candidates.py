@@ -1,8 +1,8 @@
 """The extraction's candidates: word keys, first tokens, and streams."""
 
 import numpy as np
-import pytest
 from helpers.extract_fakes import RANKED, make_vocabulary, squeezed
+from test_kv_reads import named
 
 from quail.backends.quail.executor.extract.candidates import (
     DocumentTokens,
@@ -47,9 +47,8 @@ def test_first_tokens_follow_the_models_spelling():
     assert text[march_stream.char:march_stream.ends[3]] == " March 3."
 
 
-@pytest.mark.parametrize("first_window,window", [(9, 19)])
-def test_stream_batches_preserve_tokens_and_offsets_across_windows(
-        monkeypatch, first_window, window):
+def test_windows_preserve_tokens_offsets_unicode_and_whitespace_runs(monkeypatch):
+    first_window, window = 9, 19
     texts = [" ".join(["word"] * 300), "word   \n word  ", "word"]
     tables = make_vocabulary(*texts)
     streams = []
@@ -87,14 +86,19 @@ def test_stream_batches_preserve_tokens_and_offsets_across_windows(
     ensure_tokens(streams, 10_000, tables)
     assert batches == before
 
+    for size in [1, 2, 8, 16]:
+        named(
+            f"packed windows of size {size}",
+            check_packed_windows_preserve_unicode_and_partial_whitespace_runs,
+            size=size)
+
 
 def _scores(vocabulary, pairs):
     values = np.full(len(vocabulary.vocab), -np.inf, dtype=np.float32)
     for token, score in pairs.items():
         values[token] = score
     return values
-@pytest.mark.parametrize("size", [1, 2, 8, 16])
-def test_packed_windows_preserve_unicode_and_partial_whitespace_runs(size):
+def check_packed_windows_preserve_unicode_and_partial_whitespace_runs(size):
     texts = ["", "  café\n\n\n東京 🙂 word\t end  ", "a b", "\n\t "]
     packed = TextWindows(texts)
     documents = np.repeat(np.arange(len(texts)), [len(text) + 1 for text in texts])
@@ -107,5 +111,3 @@ def test_packed_windows_preserve_unicode_and_partial_whitespace_runs(size):
         actual = np.minimum(packed.ends[left[row]:left[row] + len(text)]
                             - packed.offsets[document], cuts[row])
         np.testing.assert_array_equal(actual, ends)
-
-

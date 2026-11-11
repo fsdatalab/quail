@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import _quail_native
 import pytest
+from test_kv_reads import named
 
 from quail.backends.quail import graph as staged
 from quail.backends.quail.worker import GpuWorkers, RegionServers
@@ -37,8 +38,15 @@ def forbidden_serve(*_args):
     pytest.fail("invalid coordinator inputs must not start listeners")
 
 
-def test_grouping_failure_precedes_listeners(setup, monkeypatch):
+def test_invalid_inputs_fail_before_any_listener_starts(setup, monkeypatch):
     payload, plan = setup
+    for stages in [None, "not stages", {}, [{"key": "r"}]]:
+        with pytest.raises(ValueError):
+            staged.execute_staged_graph(dict(payload, stages=stages), plan, 2,
+                                        forbidden_serve, None)
+            pytest.fail(f"stages {stages!r} were accepted")
+
+    # a failure while grouping is raised as it is
     sentinel = RuntimeError("grouping preparation sentinel")
 
     def fail(*_args):
@@ -49,17 +57,6 @@ def test_grouping_failure_precedes_listeners(setup, monkeypatch):
         staged.execute_staged_graph(payload, plan, 2, forbidden_serve, None)
     assert caught.value is sentinel
 
-
-@pytest.mark.parametrize("stages", [None, "not stages", {}, [{"key": "r"}]])
-def test_invalid_stages_precede_listeners(setup, stages):
-    payload, plan = setup
-    payload["stages"] = stages
-    with pytest.raises(ValueError):
-        staged.execute_staged_graph(payload, plan, 2, forbidden_serve, None)
-
-
-def test_invalid_group_ids_precede_listeners(setup, monkeypatch):
-    payload, plan = setup
     monkeypatch.setattr(staged, "stage_groupings", lambda *_: {"r": [["not an id"]]})
     with pytest.raises(TypeError):
         staged.execute_staged_graph(payload, plan, 2, forbidden_serve, None)
@@ -75,9 +72,8 @@ def _wait_in_accept(path, connection, ignore_terminate):
         listener.accept()  # No coordinator connects in this regression.
 
 
-@pytest.mark.parametrize("ignore_terminate", [False, True])
-def test_coordinator_failure_aborts_unconnected_children(setup, monkeypatch,
-                                                        ignore_terminate):
+def check_coordinator_failure_aborts_unconnected_children(setup, monkeypatch,
+                                                         ignore_terminate):
     payload, plan = setup
     context = mp.get_context("spawn")
     workers = GpuWorkers.__new__(GpuWorkers)
@@ -121,7 +117,17 @@ def test_coordinator_failure_aborts_unconnected_children(setup, monkeypatch,
         workers.close(terminate=True)
 
 
-def test_abort_failure_does_not_replace_coordinator_error(setup, monkeypatch):
+def test_coordinator_failure_aborts_unconnected_children(setup, monkeypatch):
+    for ignore_terminate in [False, True]:
+        named(
+            f"ignore_terminate={ignore_terminate}",
+            check_coordinator_failure_aborts_unconnected_children,
+            setup=setup, monkeypatch=monkeypatch, ignore_terminate=ignore_terminate)
+
+
+def test_a_coordinator_or_result_failure_aborts_the_servers_and_keeps_its_error(
+        setup, monkeypatch):
+    # a failing abort does not replace the coordinator's error
     payload, plan = setup
     sentinel = RuntimeError("original coordinator error")
 
@@ -138,9 +144,7 @@ def test_abort_failure_does_not_replace_coordinator_error(setup, monkeypatch):
             lambda *_: SimpleNamespace(abort=abort, finish=forbidden_serve), None)
     assert caught.value is sentinel
 
-
-def test_result_failure_also_aborts_owned_servers(setup, monkeypatch):
-    payload, plan = setup
+    # a failing result also aborts the servers
     sentinel = RuntimeError("server result sentinel")
     aborted = []
 

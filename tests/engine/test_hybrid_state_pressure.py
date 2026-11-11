@@ -8,7 +8,6 @@ import sys
 from types import ModuleType, SimpleNamespace
 
 import numpy as np
-import pytest
 from helpers.fakes import bare_arena, fake_pipeline, fake_torch
 
 from quail.backends.quail.executor import chunk as chunk_mod
@@ -118,15 +117,6 @@ def _retained_run(slots, retained, documents, stages, monkeypatch):
     return arena
 
 
-@pytest.mark.parametrize("retained,stage_count", [(39, 2)],
-                         ids=["nearly-full-multistage"])
-def test_retained_documents_do_not_exhaust_the_checkpoint_slots(
-        retained, stage_count, monkeypatch):
-    arena = _retained_run(40, retained, 160, _stages(stage_count),
-                          monkeypatch)
-    assert arena.accounting.free_slots
-
-
 def _tree_run(slots, parents, children, monkeypatch, stages=1, frame=(),
               budget=1_000, spread=16):
     """Parents whose children share prefixes of increasing length."""
@@ -158,11 +148,12 @@ def _tree_run(slots, parents, children, monkeypatch, stages=1, frame=(),
     return arena
 
 
-@pytest.mark.parametrize("slots,children,stages,frame", [
-    (10, 6, 2, (7, 7)),
-], ids=["multistage-frame"])
-def test_parents_with_many_share_lengths_run_in_a_small_pool(
-        slots, children, stages, frame, monkeypatch):
+def test_retained_documents_and_many_share_lengths_run_in_a_small_slot_pool(
+        monkeypatch):
+    # 39 retained documents nearly fill 40 checkpoint slots
+    arena = _retained_run(40, 39, 160, _stages(2), monkeypatch)
+    assert arena.accounting.free_slots
+
     # a pool too small for every share point keeps the ones that save
     # the most, and the other borrowers compute their whole prefix
-    _tree_run(slots, 6, children, monkeypatch, stages=stages, frame=frame)
+    _tree_run(10, 6, 6, monkeypatch, stages=2, frame=(7, 7))

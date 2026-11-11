@@ -3,9 +3,9 @@
 from types import SimpleNamespace
 
 import numpy as np
-import pytest
 from helpers.conditions import condition as sql_condition
 from helpers.kv_checker import cpu_torch
+from test_kv_reads import named
 
 from quail.backends.quail.executor.operators.filter import ConditionGate
 from quail.backends.quail.executor.operators.sae_features import SaeFeaturesOperator
@@ -15,8 +15,7 @@ from quail.common.expressions import FEATURE_LIST
 from quail.physical import AiSaeFeatures, Filter, SaeFeaturesSpec
 
 
-@pytest.mark.parametrize("pooling", ["last", "max"])
-def test_feature_lists_are_tested_after_settling_and_cached_as_values(pooling):
+def check_feature_lists_are_tested_after_settling_and_cached_as_values(pooling):
     packed = np.asarray([[3, 7, 0.5, 0], [3, 7, 0, 0], [3, 7, 0.5, 0]])
     node = AiSaeFeatures(node_id="features", spec=SaeFeaturesSpec(
         aliases=("r",), name="features", pooling=pooling,
@@ -55,3 +54,11 @@ def test_feature_lists_are_tested_after_settling_and_cached_as_values(pooling):
                 [{"feature": 3, "strength": 0.5}]]
     values = dict(zip(rows.ids["r"].to_pylist(), rows.column("features").to_pylist()))
     assert values == dict(enumerate(expected))
+
+
+def test_feature_lists_are_tested_after_settling_and_cached_as_values():
+    for pooling in ["last", "max"]:
+        named(
+            f"pooling={pooling}",
+            check_feature_lists_are_tested_after_settling_and_cached_as_values,
+            pooling=pooling)

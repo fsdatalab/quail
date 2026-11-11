@@ -5,6 +5,7 @@ import pytest
 from helpers.oracle import Oracle, oracle_executor
 from helpers.quailb_data import standin_sets
 from helpers.sessions import TOKENIZER
+from test_kv_reads import named
 
 import quail
 from bench.quailb import queries, register_tables
@@ -68,11 +69,8 @@ def _run(tmp_path, gpus, build):
                 calls, pairs)
 
 
-@pytest.mark.parametrize("query_id", [
-    "FEV-9", "IMDB-2", "IMDB-4", "IMDB-15", "CUAD-10", "REL-AGENT-3"])
-def test_a_query_on_two_gpus_asks_each_question_once_and_returns_the_rows_of_one(
+def check_two_gpus_ask_each_question_once_and_return_the_rows_of_one(
         tmp_path, query_id):
-    standin_sets(tmp_path)
     one, two = (_run(tmp_path, gpus, lambda session: queries(session)[query_id][1]())
                 for gpus in (1, 2))
     rows, asked, calls, pairs = two
@@ -82,8 +80,16 @@ def test_a_query_on_two_gpus_asks_each_question_once_and_returns_the_rows_of_one
     assert len(set(pairs)) == len(pairs) and sorted(pairs) == sorted(one[3])
 
 
-def test_an_anti_join_on_two_gpus_keeps_the_anchors_of_one(tmp_path):
+def test_a_query_on_two_gpus_asks_each_question_once_and_returns_the_rows_of_one(
+        tmp_path):
     standin_sets(tmp_path)
+    for query_id in ["FEV-9", "IMDB-2", "IMDB-4", "IMDB-15", "CUAD-10",
+                     "REL-AGENT-3"]:
+        named(query_id,
+              check_two_gpus_ask_each_question_once_and_return_the_rows_of_one,
+              tmp_path, query_id)
+
+    # an anti-join keeps the anchors and pairs of one GPU
     one, two = (_run(tmp_path, gpus, lambda session: session.sql(ANTI_JOIN))
                 for gpus in (1, 2))
     assert two[0] == one[0] and sorted(two[3]) == sorted(one[3])
@@ -110,7 +116,8 @@ def _planned(tmp_path, query_id):
         return query.plan(), query.explain()
 
 
-def test_a_join_hashes_its_anchors_and_broadcasts_its_partners(tmp_path):
+def test_a_plan_on_two_gpus_hashes_anchors_broadcasts_partners_and_explains_its_stages(
+        tmp_path):
     # IMDB-4: the reviews' filters run with their join; aspects go whole
     stages = _planned(tmp_path, "IMDB-4")[0].settings["stages"]
     assert [(stage["key"], stage["nodes"],
@@ -119,8 +126,6 @@ def test_a_join_hashes_its_anchors_and_broadcasts_its_partners(tmp_path):
         ("r", ["ai_filter:r", "ai_filter:r:0", "ai_join:r"],
          [("scan:a", False), ("scan:r", True)])]
 
-
-def test_explain_on_two_gpus_shows_the_stages_the_run_reads(tmp_path):
     # FEV-9: each partner's filter is a stage; the barrier's stage hashes
     # c2 again and reads the join answers whole
     text = _planned(tmp_path, "FEV-9")[1]
@@ -139,7 +144,8 @@ def contracts():
         yield session
 
 
-def test_copies_of_a_text_on_several_gpus_are_asked_once(contracts):
+def test_several_gpus_ask_copies_of_a_text_once_and_extract_from_the_survivors(
+        contracts):
     query = contracts.sql(
         "SELECT c.id FROM contracts c "
         "WHERE AI_FILTER(PROMPT('Is {0} relevant?', c.text))")
@@ -150,8 +156,7 @@ def test_copies_of_a_text_on_several_gpus_are_asked_once(contracts):
     assert result.to_rows() == [(0,), (1,), (2,), (3,)]
     assert len(result.report["memory_workers"]) == 4
 
-
-def test_an_extraction_after_a_test_on_several_gpus_reads_the_survivors(contracts):
+    # an extraction after a test on its answer reads the survivors
     query = contracts.sql(
         "SELECT c.id, AI.EXTRACT(c.text, {'ends': 'When does it end?'}) AS lease "
         "FROM contracts c "

@@ -55,16 +55,6 @@ def test_filter_execution_and_retention_inputs(monkeypatch):
     assert result.outputs["rows:d"].ids["d"].to_pylist() == [10]
 
 
-def _key_columns(r_keys, p_keys):
-    return {alias: pa.table({alias: pa.array(range(len(keys)), pa.int32()),
-                             "key": pa.array(keys)})
-            for alias, keys in (("r", r_keys), ("p", p_keys))}
-
-
-def _pairs(table):
-    return sorted(zip(table.column("r").to_pylist(), table.column("p").to_pylist()))
-
-
 def test_pair_join_and_gpu_timing_run_through_the_quail_graph(monkeypatch):
     # document d has key d % 4; partners 0 and 3 share key 0, so a
     # document with key 0 pairs with both and one with key 3 with none
@@ -129,3 +119,13 @@ def test_pair_join_and_gpu_timing_run_through_the_quail_graph(monkeypatch):
     assert on["chunks"] >= len(model.launched)
     assert all(0 < metrics["gpu_s"] <= metrics["chunks"] * 0.002 + 1e-9
                for metrics in per_node.values())
+
+
+def _key_columns(r_keys, p_keys):
+    return {alias: pa.table({alias: pa.array(range(len(keys)), pa.int32()),
+                             "key": pa.array(keys)})
+            for alias, keys in (("r", r_keys), ("p", p_keys))}
+
+
+def _pairs(table):
+    return sorted(zip(table.column("r").to_pylist(), table.column("p").to_pylist()))

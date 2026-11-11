@@ -9,6 +9,7 @@ import torch
 from helpers.extract_fakes import make_spec
 from helpers.extract_reference import Decoder
 from helpers.extract_reference import ReferenceInputs as ExtractionInputs
+from test_kv_reads import named
 from test_map_decode import events_torch
 
 from quail.backends.quail.executor.map_decoder import MapDecoder
@@ -21,11 +22,7 @@ def inputs(spec, vocabulary, texts):
 
 
 # every setting appears in some case
-@pytest.mark.parametrize("dtype,draft_tokens,num_questions", [
-    (torch.float32, 0, 1),
-    (torch.bfloat16, 4, 41),
-])
-def test_copy_traces_match_the_host_rule_on_the_same_logits(
+def check_copy_traces_match_the_host_rule_on_the_same_logits(
     monkeypatch, tmp_path, dtype, draft_tokens, num_questions
 ):
     text = "five days or five years. five years."
@@ -111,6 +108,22 @@ def test_copy_traces_match_the_host_rule_on_the_same_logits(
             assert got == pytest.approx(want, abs=1e-6)
         assert expected[0]["margin"] == 0
         assert expected[-1]["chosen"] == -1
+
+
+def test_copy_traces_match_the_host_rule_on_the_same_logits(monkeypatch, tmp_path):
+    for dtype, draft_tokens, num_questions in [
+        (torch.float32, 0, 1),
+        (torch.bfloat16, 4, 41),
+    ]:
+        # trace files append, so each case writes its own directory
+        directory = tmp_path / f"questions-{num_questions}"
+        directory.mkdir()
+        named(
+            f"dtype={dtype} draft_tokens={draft_tokens} "
+            f"num_questions={num_questions}",
+            check_copy_traces_match_the_host_rule_on_the_same_logits,
+            monkeypatch=monkeypatch, tmp_path=directory, dtype=dtype,
+            draft_tokens=draft_tokens, num_questions=num_questions)
 
 
 def test_a_replayed_copy_prepares_the_continuation_after_a_rejected_draft():
