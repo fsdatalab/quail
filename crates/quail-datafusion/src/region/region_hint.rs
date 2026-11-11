@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, RecordBatch};
 use datafusion::arrow::compute::cast;
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::datatypes::{DataType, Schema};
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column as LogicalColumn, Result};
 use datafusion::logical_expr::{Expr, LogicalPlan, Operator};
@@ -32,6 +32,7 @@ use datafusion::physical_expr_common::physical_expr::{
 };
 
 use crate::ai::AiNode;
+use crate::derive::partial::{Completions, LISTED, can_be_true};
 use crate::region::ModelRegion;
 
 /// The tests above a region that it may drop rows by, over the region's
@@ -92,6 +93,107 @@ impl RegionHint {
         }
         Ok(keep)
     }
+
+    /// Whether a test reads the answer in column `index` of `schema`,
+    /// or its field `field` when the column is an extraction's struct,
+    /// and no other column.
+    pub fn reads_answer(&self, index: usize, field: Option<&str>) -> bool {
+        self.tests
+            .iter()
+            .any(|test| answer_test(test, index, field).is_some())
+    }
+
+    /// Whether some test, as the tests are now, is TRUE for no complete
+    /// answer still possible in column `index` of `schema`, or in its
+    /// field `field`: the row leaves the query above whatever the rest
+    /// of the answer says.
+    ///
+    /// A test that also reads another column, or that DataFusion does
+    /// not decide on a partial answer, rejects nothing.
+    ///
+    /// # Errors
+    ///
+    /// A test does not give its current form.
+    pub fn rejects_answer(
+        &self,
+        schema: &Schema,
+        index: usize,
+        field: Option<&str>,
+        answers: &Completions,
+    ) -> Result<bool> {
+        let data_type = match (schema.field(index).data_type(), field) {
+            (DataType::Struct(fields), Some(field)) => {
+                match fields.iter().find(|found| found.name() == field) {
+                    Some(found) => found.data_type().clone(),
+                    None => return Ok(false),
+                }
+            }
+            (found, None) => found.clone(),
+            _ => return Ok(false),
+        };
+        for test in &self.tests {
+            let test = snapshot_physical_expr(Arc::clone(test))?;
+            if let Some(test) = answer_test(&test, index, field)
+                && can_be_true(&test, &data_type, answers) == Some(false)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+/// `test` reading the answer as column 0, named [`LISTED`], when the
+/// only column it reads is the answer: column `index`, or `get_field`
+/// of it and `field`. None when it reads no answer or another column.
+fn answer_test(
+    test: &Arc<dyn PhysicalExpr>,
+    index: usize,
+    field: Option<&str>,
+) -> Option<Arc<dyn PhysicalExpr>> {
+    use datafusion::common::tree_node::TreeNodeRecursion;
+    use datafusion::physical_expr::ScalarFunctionExpr;
+    use datafusion::physical_expr::expressions::Literal;
+    let answer: Arc<dyn PhysicalExpr> = Arc::new(Column::new(LISTED, 0));
+    let is_column = |expr: &Arc<dyn PhysicalExpr>| {
+        expr.downcast_ref::<Column>()
+            .is_some_and(|column| column.index() == index)
+    };
+    let mut found = false;
+    let mut other = false;
+    let read = Arc::clone(test)
+        .transform_down(|node| {
+            if let Some(call) = node.downcast_ref::<ScalarFunctionExpr>()
+                && call.name() == "get_field"
+                && let [input, name] = call.args()
+                && is_column(input)
+            {
+                let named = name
+                    .downcast_ref::<Literal>()
+                    .and_then(|literal| literal.value().try_as_str().flatten());
+                if field.is_some() && named == field {
+                    found = true;
+                    return Ok(Transformed::new(
+                        Arc::clone(&answer),
+                        true,
+                        TreeNodeRecursion::Jump,
+                    ));
+                }
+                other = true;
+                return Ok(Transformed::new(node, false, TreeNodeRecursion::Jump));
+            }
+            if node.downcast_ref::<Column>().is_some() {
+                if field.is_none() && is_column(&node) {
+                    found = true;
+                    return Ok(Transformed::yes(Arc::clone(&answer)));
+                }
+                other = true;
+            }
+            Ok(Transformed::no(node))
+        })
+        .ok()?
+        .data;
+    (found && !other).then_some(read)
 }
 
 /// What a region knows about each of its columns before the model runs.
@@ -449,6 +551,76 @@ mod tests {
         assert_eq!(compare(bounds, Operator::Gt, 0.9), Truth::Undecided);
         assert_eq!(compare(bounds, Operator::Eq, 1.0), Truth::Undecided);
         assert_eq!(compare(bounds, Operator::GtEq, -0.5), Truth::True);
+    }
+
+    /// `expr`, over the columns of `schema`, as the one test of a hint.
+    fn hint_of(schema: &Schema, expr: Expr) -> RegionHint {
+        use datafusion::common::DFSchema;
+        let fields = DFSchema::try_from(schema.clone()).unwrap();
+        let test = datafusion::prelude::SessionContext::new()
+            .create_physical_expr(expr, &fields)
+            .unwrap();
+        RegionHint { tests: vec![test] }
+    }
+
+    #[test]
+    fn a_top_k_threshold_rejects_a_map_answer_that_cannot_sort_before_it() {
+        use datafusion::arrow::datatypes::Field;
+        use datafusion::logical_expr::{col, lit};
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("vendor", DataType::Utf8, true),
+        ]);
+        // the sort keeps the vendors that sort before Globex
+        let hint = hint_of(&schema, col("vendor").lt(lit("Globex")));
+        assert!(hint.reads_answer(1, None));
+        assert!(!hint.reads_answer(0, None));
+        let rejects = |prefix: &str| {
+            hint.rejects_answer(&schema, 1, None, &Completions::text(prefix))
+                .unwrap()
+        };
+        assert!(rejects("Initech"));
+        assert!(rejects("H"));
+        assert!(!rejects("Acme"));
+        // an answer that starts as the threshold does may still sort first
+        assert!(!rejects("G"));
+        // a test that also reads the id is not the answer's alone
+        let both = hint_of(&schema, col("vendor").lt(col("id")));
+        assert!(!both.reads_answer(1, None));
+    }
+
+    #[test]
+    fn a_join_key_set_rejects_an_extracted_field_that_can_match_no_key() {
+        use datafusion::arrow::datatypes::{Field, Fields};
+        use datafusion::functions::core::expr_fn::get_field;
+        use datafusion::logical_expr::{col, lit};
+        let answer = DataType::Struct(Fields::from(vec![
+            Field::new("law", DataType::Utf8, true),
+            Field::new("party", DataType::Utf8, true),
+        ]));
+        let schema = Schema::new(vec![Field::new("contract", answer, true)]);
+        let keys = vec![lit("Delaware"), lit("New York")];
+        let hint = hint_of(
+            &schema,
+            get_field(col("contract"), "law").in_list(keys, false),
+        );
+        assert!(hint.reads_answer(0, Some("law")));
+        assert!(!hint.reads_answer(0, Some("party")));
+        // the span copies the document, which goes on as one of two texts
+        let copied = |prefix: &str, tails: &[&str]| Completions {
+            prefix: prefix.to_string(),
+            complete: false,
+            may_be_null: false,
+            tails: Some(tails.iter().map(|tail| (*tail).to_string()).collect()),
+            max_chars: None,
+        };
+        let rejects = |answers: &Completions| {
+            hint.rejects_answer(&schema, 0, Some("law"), answers)
+                .unwrap()
+        };
+        assert!(rejects(&copied("Texas", &[" law", " courts"])));
+        assert!(!rejects(&copied("New", &[" York law", " Jersey"])));
+        assert!(rejects(&copied("New", &[" Jersey", " Mexico"])));
     }
 
     #[test]

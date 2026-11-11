@@ -9,6 +9,13 @@ the region drops the row. When nothing else reads the answer, it also
 stops once every stop test is decided TRUE: the region keeps the row
 whatever the rest of the answer says.
 
+The region's hint adds tests that tighten while the query runs: a top-k
+sort above the region keeps only answers that sort before its current
+last row, and a hash join keeps only answers among its other side's
+keys. Once no complete answer still possible passes such a test, the
+operator above drops the row whatever the rest of the answer says, so
+the answer stops.
+
 The answer then holds its text so far, which is itself one of the
 complete answers still possible, so the region's tests give it the
 value they were decided to have.
@@ -42,11 +49,14 @@ class AnswerStop:
         stop_tests: The region's exact tests of the answer alone.
         when_true: Whether the answer stops once every stop test is
             decided TRUE.
+        hint: The region's ``InputHint`` when one of its tests reads the
+            answer alone, or None.
     """
 
     answer: str
     stop_tests: tuple
     when_true: bool
+    hint: object = None
 
     def decide(self, prefix: str, *, may_be_null: bool = False,
                tails: list[str] | None = None,
@@ -85,18 +95,29 @@ class AnswerStop:
             decided.append(found.pop() if len(found) == 1 else "undecided")
         if "not true" in decided:
             return Stop.REJECTED
+        if self.hint is not None and all(
+                self.hint.rejects_answer(self.answer, **completion)
+                for completion in completions):
+            return Stop.REJECTED
         if self.when_true and decided and all(found == "true" for found in decided):
             return Stop.ACCEPTED
         return Stop.CONTINUE
 
 
-def answer_stop(node) -> AnswerStop | None:
-    """Return a map's or extraction's answer stop, or None without tests."""
+def answer_stop(node, hint=None) -> AnswerStop | None:
+    """Return a map's or extraction's answer stop, or None without tests.
+
+    Args:
+        node: The map or extraction node.
+        hint: The running region's ``InputHint``, or None.
+    """
     stop_tests = tuple(getattr(node, "stop_tests", ()))
-    if not stop_tests:
+    if hint is not None and not hint.reads_answer(node.spec.name):
+        hint = None
+    if not stop_tests and hint is None:
         return None
     return AnswerStop(node.spec.name, stop_tests,
-                      bool(getattr(node, "stop_when_true", False)))
+                      bool(getattr(node, "stop_when_true", False)), hint)
 
 
 def copied_completions(text: str, spans) -> list[dict]:

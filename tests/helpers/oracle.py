@@ -309,7 +309,7 @@ class Oracle:
         The executor stops once the node's tests are decided on the
         answer so far; source is an extraction's document text.
         """
-        stop = answer_stop(node)
+        stop = answer_stop(node, region_hint())
         if text is None or stop is None:
             self.answer_tokens += 0 if text is None else len(text)
             return text

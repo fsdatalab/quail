@@ -274,6 +274,29 @@ pub(crate) struct InputHint {
     /// Each table's rows, by table name, in the order the executor reads
     /// them.
     rows: HashMap<String, RecordBatch>,
+    /// The region's columns, which the tests read by position.
+    schema: SchemaRef,
+}
+
+impl InputHint {
+    /// The region column an operator's answer is in, and the field of
+    /// it for an extraction's `struct.field`; None when no one column
+    /// has the name.
+    fn answer_column(&self, answer: &str) -> Option<(usize, Option<String>)> {
+        let named = |name: &str| {
+            let mut found =
+                (self.schema.fields().iter().enumerate()).filter(|(_, field)| field.name() == name);
+            match (found.next(), found.next()) {
+                (Some((index, _)), None) => Some(index),
+                _ => None,
+            }
+        };
+        if let Some(index) = named(answer) {
+            return Some((index, None));
+        }
+        let (name, field) = answer.rsplit_once('.')?;
+        Some((named(name)?, Some(field.to_string())))
+    }
 }
 
 #[pymethods]
@@ -296,6 +319,41 @@ impl InputHint {
         };
         self.hint
             .keep(&self.columns, table, rows)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+    }
+
+    /// Whether a test reads the answer column `answer`, an operator's
+    /// name such as `vendor` or `contract.law`, and no other column.
+    fn reads_answer(&self, answer: &str) -> bool {
+        self.answer_column(answer)
+            .is_some_and(|(index, field)| self.hint.reads_answer(index, field.as_deref()))
+    }
+
+    /// Whether some test, as the tests are now, is TRUE for no complete
+    /// answer that starts with `prefix`; the arguments are those of
+    /// `Expression.decide`.
+    #[pyo3(signature = (answer, prefix, complete=false, may_be_null=false, tails=None, max_chars=None))]
+    fn rejects_answer(
+        &self,
+        answer: &str,
+        prefix: &str,
+        complete: bool,
+        may_be_null: bool,
+        tails: Option<Vec<String>>,
+        max_chars: Option<usize>,
+    ) -> PyResult<bool> {
+        let Some((index, field)) = self.answer_column(answer) else {
+            return Ok(false);
+        };
+        let answers = quail_datafusion::derive::partial::Completions {
+            prefix: prefix.to_string(),
+            complete,
+            may_be_null,
+            tails,
+            max_chars,
+        };
+        self.hint
+            .rejects_answer(&self.schema, index, field.as_deref(), &answers)
             .map_err(|error| PyRuntimeError::new_err(error.to_string()))
     }
 }
@@ -632,10 +690,21 @@ fn input_hint(
             rows.insert(table, found);
         }
     }
-    Ok((!rows.is_empty()).then(|| InputHint {
+    // a test of an answer alone holds no table's rows; the decoder
+    // reads it while the answer is written
+    let answers = columns.0.iter().enumerate().any(|(index, column)| {
+        matches!(column, quail_datafusion::RegionColumn::Answer)
+            && hint.tests.iter().any(|test| {
+                datafusion::physical_expr::utils::collect_columns(test)
+                    .iter()
+                    .any(|read| read.index() == index)
+            })
+    });
+    Ok((!rows.is_empty() || answers).then(|| InputHint {
         hint: hint.clone(),
         columns,
         rows,
+        schema: Arc::new(region.plan.schema().as_arrow().clone()),
     }))
 }
 

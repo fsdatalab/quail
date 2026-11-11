@@ -15,7 +15,12 @@ from helpers.sessions import CONFIG, TOKENIZER
 
 import quail
 from quail.builtins import LOGICAL_RULES, PHYSICAL_RULES, built_in_registry
-from quail.execution.answer_stops import Stop, answer_stop, copied_completions
+from quail.execution.answer_stops import (
+    AnswerStop,
+    Stop,
+    answer_stop,
+    copied_completions,
+)
 
 STOP_RULE = "should_stop_answers_early"
 REVIEWS = pa.table({
@@ -151,3 +156,46 @@ def test_a_map_answer_is_decided_on_its_text_with_its_leading_space():
     for prefix, decided in ((" ", Stop.CONTINUE), (" Ye", Stop.CONTINUE),
                             ("Ye", Stop.REJECTED), (" No", Stop.REJECTED)):
         assert stop.decide(prefix) is decided, prefix
+
+
+VENDORS = ["Acme", "Initech Systems", "Globex", "Zeta Corporation",
+           "Acme", "Hooli"]
+
+
+def test_a_join_on_a_maps_answer_stops_each_answer_that_can_match_no_key(
+        monkeypatch):
+    monkeypatch.setenv("DATAFUSION_OPTIMIZER_ENABLE_DYNAMIC_FILTER_PUSHDOWN", "true")
+    from helpers.oracle import oracle_executor
+
+    session = quail.Session(CONFIG, tokenizer=TOKENIZER)
+    oracle = Oracle(maps=lambda spec, document: VENDORS[document])
+    oracle.catalog = session.catalog
+    context = quail.SessionContext(
+        session, physical_executor=oracle_executor(oracle))
+    context.register("reviews",
+                     quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
+    context.register("vendors", quail.DocumentProvider.from_table(
+        pa.table({"id": ["v0", "v1"], "name": ["Acme", "Globex"]}), id_col="id"))
+    # the join builds on the vendors, so their names are the region's
+    # hint before the model writes an answer
+    table = context.sql(
+        "SELECT x.id, v.id FROM vendors v JOIN (SELECT r.id, "
+        "AI.MAP(r.body, 'Name the vendor.', 16) AS vendor FROM reviews r) x "
+        "ON v.name = x.vendor")
+    rows = sorted(zip(*(column.to_pylist() for column in table.columns)))
+    session.close()
+    assert rows == [("r0", "v0"), ("r2", "v1"), ("r4", "v0")]
+    # an answer that starts with neither name stops at its first character
+    assert oracle.stopped_early == 3
+    assert oracle.answer_tokens == len("Acme") * 2 + len("Globex") + 3
+
+
+def test_an_answer_stops_only_when_the_hint_rejects_every_completion():
+    class Hint:
+        def rejects_answer(self, answer, prefix, **completion):
+            return answer == "vendor" and not prefix.startswith("A")
+
+    stop = AnswerStop("vendor", (), False, Hint())
+    assert stop.decide_any([dict(prefix="Z")]) is Stop.REJECTED
+    assert stop.decide_any([dict(prefix="Z"), dict(prefix="Ac")]) is Stop.CONTINUE
+    assert stop.decide_any([dict(prefix="Ac")]) is Stop.CONTINUE

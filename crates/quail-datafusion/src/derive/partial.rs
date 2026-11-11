@@ -44,6 +44,7 @@ use datafusion::logical_expr::expr::{InList, Like, ScalarFunction};
 use datafusion::logical_expr::simplify::SimplifyContext;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use datafusion::optimizer::simplify_expressions::ExprSimplifier;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_optimizer::pruning::PruningPredicateBuilder;
 use datafusion::prelude::SessionContext;
 use quail_planner::error::CompileError;
@@ -53,7 +54,7 @@ use quail_planner::physical::Expression;
 const MAX_LISTED: usize = 1024;
 
 /// The column that holds each listed answer.
-const LISTED: &str = "answer";
+pub(crate) const LISTED: &str = "answer";
 
 /// The schema of a batch of answers: the one column [`LISTED`].
 fn answer_schema() -> Arc<Schema> {
@@ -117,6 +118,60 @@ impl PruningStatistics for Range {
     ) -> Option<datafusion::arrow::array::BooleanArray> {
         None
     }
+}
+
+/// Whether `test`, which reads the answer as its one column, column 0
+/// named [`LISTED`] of type `data_type`, can be TRUE for a complete
+/// answer still possible; None when DataFusion does not decide it.
+///
+/// A short list of answers is evaluated one by one. An answer that may
+/// go on with any text is the range of strings that start with the text
+/// so far, which `PruningPredicate` reads.
+pub fn can_be_true(
+    test: &Arc<dyn PhysicalExpr>,
+    data_type: &DataType,
+    answers: &Completions,
+) -> Option<bool> {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        LISTED,
+        data_type.clone(),
+        true,
+    )]));
+    if let Some(listed) = answers.listed() {
+        let mut found: Vec<Option<String>> = listed.into_iter().map(Some).collect();
+        if answers.may_be_null {
+            found.push(None);
+        }
+        let column: ArrayRef = Arc::new(StringArray::from(found));
+        let column = datafusion::arrow::compute::cast(&column, data_type).ok()?;
+        let batch = RecordBatch::try_new(schema, vec![column]).ok()?;
+        let values = test
+            .evaluate(&batch)
+            .ok()?
+            .into_array(batch.num_rows())
+            .ok()?;
+        return Some(
+            values
+                .as_boolean_opt()?
+                .iter()
+                .any(|value| value == Some(true)),
+        );
+    }
+    if !matches!(
+        data_type,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    ) {
+        return None;
+    }
+    let range = Range {
+        least: answers.prefix.clone(),
+        greatest: after(&answers.prefix),
+    };
+    let predicate = PruningPredicateBuilder::new()
+        .with_file_schema(schema)
+        .try_build(Arc::clone(test))
+        .ok()?;
+    predicate.prune(&range).ok()?.first().copied()
 }
 
 /// What a condition is at a partial answer.

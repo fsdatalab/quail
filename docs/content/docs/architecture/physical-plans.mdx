@@ -76,8 +76,25 @@ stop. For other regions:
 - A filter on an input column can reject a row before model execution.
 - A filter on an unknown AI answer rejects a row only if every possible
   answer fails. For `AI.SCORE`, Quail uses bounds of 0 and 1.
+- A filter on the text of an `AI.MAP` or `AI.EXTRACT` answer is also
+  read while the answer is written. The answer stops once no complete
+  answer still possible can pass.
 - The executor reads updated hints before admitting documents. A hint
   saves no work if the region finishes before DataFusion can tighten it.
+
+For example, imagine a table `vendors` with a `name` column and a table
+of invoices, joined on the vendor name a map writes for each invoice:
+
+```sql
+SELECT x.id, v.id
+FROM vendors v
+JOIN (SELECT i.id, AI.MAP(i.text, 'Name the vendor.', 16) AS vendor
+      FROM invoices i) x
+  ON v.name = x.vendor
+```
+
+The hash join reads `vendors` first and sends its names to the region.
+An answer that starts with a text no name starts with stops at once.
 
 E.g., a top-k sort by descending score cannot reject an unscored row
 merely because the current threshold is 0.9. That row could score 1.

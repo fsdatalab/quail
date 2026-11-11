@@ -40,6 +40,7 @@ from quail.execution.finished import (
     hinted,
     hinted_out,
     hinting,
+    region_hint,
     report,
 )
 from quail.execution.ids import id_positions
@@ -336,7 +337,7 @@ class RegionExecution:
             if operator.answer_limits:
                 operator.decoder = decoder
                 for q, node in enumerate(operator.nodes):
-                    stop = answer_stop(node)
+                    stop = answer_stop(node, region_hint())
                     if stop is not None:
                         decoder.answer_stops[operator.first + q] = stop
         return decoder
