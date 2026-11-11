@@ -190,31 +190,37 @@ def answer_oracle(ground_truth, tables):
     return answer
 
 
-def label_name(info: PlanInfo, operator, aliases: dict) -> str:
-    """Return the name Quail gave a classification's column.
+def answer_name(output: str, relations, outputs, aliases: dict) -> str:
+    """Return the name Quail gave an operator's answer column.
 
-    A classification the query returns keeps its output name. One the
-    query only tests has no name in its SQL, so Quail names its column
-    itself, and it is the one unnamed label over the operator's
-    relations.
+    An answer the query returns under its output name keeps that name.
+    One the query only tests, sorts by, or aggregates has no name in its
+    SQL, so Quail names its column itself, and it is the one unnamed
+    answer over the operator's relations.
 
     Args:
-        info: The query's plan reading.
-        operator: The classification.
-        aliases: Each label column Quail computed -> the aliases it reads.
+        output: The operator's output name in the benchmark's plan.
+        relations: The aliases the operator reads.
+        outputs: The output names of the plan's operators of this kind.
+        aliases: Each answer column Quail computed -> the aliases it reads.
 
     Raises:
-        KeyError: No one label column is the operator's.
+        KeyError: No one answer column is the operator's.
     """
-    if operator.output in aliases:
-        return operator.output
-    outputs = {found.output for found in info.classifies}
+    if output in aliases:
+        return output
     unnamed = [name for name, read in aliases.items()
-               if name not in outputs and set(operator.relations) <= set(read)]
+               if name not in outputs and set(relations) <= set(read)]
     if len(unnamed) != 1:
-        raise KeyError(
-            f"no one label column for classification {operator.output}: {unnamed}")
+        raise KeyError(f"no one answer column for {output}: {unnamed}")
     return unnamed[0]
+
+
+def label_name(info: PlanInfo, operator, aliases: dict) -> str:
+    """Return the name Quail gave a classification's column."""
+    return answer_name(
+        operator.output, operator.relations,
+        {found.output for found in info.classifies}, aliases)
 
 
 def run_output(result, info: PlanInfo, tables) -> RunOutput:
@@ -259,8 +265,13 @@ def run_output(result, info: PlanInfo, tables) -> RunOutput:
         """Return operator ID -> its answer table, the ids and one column."""
         tables = {}
         for operator in operators:
+            found = result.answer_tables[kind]
             name = operator.output if name_of is None else name_of(operator)
-            table = result.answer_tables[kind][name]
+            name = answer_name(
+                name, (operator.relation,),
+                {other.output for other in operators},
+                {key: table.column_names for key, table in found.items()})
+            table = found[name]
             values = table.column(name)
             tables[operator.id] = pa.table({
                 operator.relation: id_column(
@@ -364,11 +375,13 @@ def prompt_pieces(query, info: PlanInfo, anchors) -> dict | None:
         pieces["classifies"].append({"id": operator.id, **piece})
     # the planner lays a score out as the AI.IF prompt of its document,
     # so its head is the preamble and its tail follows the document
+    scored = {node.spec.name: node for node in query.plan().nodes
+              if isinstance(node, AiScore) and not isinstance(node, AiClassify)}
     for operator in info.scores:
-        node = next(node for node in query.plan().nodes
-                    if isinstance(node, AiScore)
-                    and not isinstance(node, AiClassify)
-                    and node.spec.name == operator.output)
+        node = scored[answer_name(
+            operator.output, (operator.relation,),
+            {found.output for found in info.scores},
+            {name: (operator.relation,) for name in scored})]
         head, tail = node.spec.prompt_token_parts
         if not pieces["preamble"]:
             pieces["preamble"] = list(head)
