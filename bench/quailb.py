@@ -209,12 +209,25 @@ def run_output(result, info: PlanInfo, tables) -> RunOutput:
             "answer": answer_values(table),
         })
     classify_answers = {}
+    labels = result.answer_tables["classifies"]
+    outputs = {operator.output for operator in info.classifies}
     for operator in info.classifies:
-        table = result.answer_tables["classifies"][operator.output]
+        name = operator.output
+        if name not in labels:
+            # a classification the query only tests has no output name in
+            # its SQL, so Quail names its column itself
+            unnamed = [found for found, table in labels.items()
+                       if found not in outputs
+                       and set(operator.relations) <= set(table.column_names)]
+            if len(unnamed) != 1:
+                raise KeyError(
+                    f"no one answer table for classification {name}: {unnamed}")
+            (name,) = unnamed
+        table = labels[name]
         classify_answers[operator.id] = pa.table({
             **{alias: id_column(alias, table.column(alias))
                for alias in operator.relations},
-            "label": table.column(operator.output),
+            "label": table.column(name),
         })
     join_answers = {}
     for position, table in result.answer_tables["joins"].items():
