@@ -24,7 +24,7 @@ impl DecodeCost {
     /// Coefficients from the model's shapes and the device's peak rates.
     pub fn from_specs(model: &ModelSpec, device: &DeviceSpec) -> Self {
         let weight_bytes = python_sum(
-            dense_decoder_components(&Work::default(), model, 1.0, 0.0, 0)
+            dense_decoder_components(&Work::default(), model, 1.0)
                 .iter()
                 .map(|component| component.bytes_moved.total()),
         );

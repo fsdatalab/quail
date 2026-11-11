@@ -11,13 +11,8 @@ fn latencies(
     model: &ModelSpec,
     device: &DeviceSpec,
     passes: f64,
-    rows: f64,
-    head_rows: i64,
 ) -> Vec<ComponentLatency> {
-    component_latencies(
-        dense_decoder_components(work, model, passes, rows, head_rows),
-        device,
-    )
+    component_latencies(dense_decoder_components(work, model, passes), device)
 }
 
 fn scalar_tokens(work: &Work) -> f64 {
@@ -30,7 +25,7 @@ fn scalar_tokens(work: &Work) -> f64 {
 pub fn compute_seconds(work: &Work, model: &ModelSpec, device: &DeviceSpec, peak: bool) -> f64 {
     if peak {
         return python_sum(
-            dense_decoder_components(work, model, 0.0, 0.0, 0)
+            dense_decoder_components(work, model, 0.0)
                 .iter()
                 .map(|component| {
                     component.flops.scalar().expect("summed work")
@@ -39,7 +34,7 @@ pub fn compute_seconds(work: &Work, model: &ModelSpec, device: &DeviceSpec, peak
         );
     }
     python_sum(
-        latencies(work, model, device, 0.0, 0.0, 0)
+        latencies(work, model, device, 0.0)
             .iter()
             .map(|latency| latency.compute_seconds.scalar().expect("summed work")),
     )
@@ -55,13 +50,11 @@ pub fn unrounded_seconds(
     model: &ModelSpec,
     device: &DeviceSpec,
     chunk_tokens: i64,
-    rows: f64,
-    head_rows: i64,
 ) -> f64 {
     assert!(chunk_tokens >= 1, "chunk_tokens must be at least 1");
     let passes = scalar_tokens(work) / chunk_tokens as f64;
     python_sum(
-        latencies(work, model, device, passes, rows, head_rows)
+        latencies(work, model, device, passes)
             .iter()
             .map(ComponentLatency::seconds),
     )
@@ -109,7 +102,7 @@ impl SpeedOfLight {
     }
 }
 
-/// Price aggregate query work and its answer rows with ideal packing.
+/// Price aggregate query work with ideal packing.
 ///
 /// # Panics
 ///
@@ -119,7 +112,6 @@ pub fn speed_of_light(
     model: &ModelSpec,
     device: &DeviceSpec,
     chunk_tokens: i64,
-    rows: f64,
     min_passes: i64,
 ) -> SpeedOfLight {
     assert!(chunk_tokens >= 1, "chunk_tokens must be at least 1");
@@ -133,6 +125,6 @@ pub fn speed_of_light(
     SpeedOfLight {
         work: work.clone(),
         passes,
-        components: latencies(work, model, device, passes as f64, rows, 0),
+        components: latencies(work, model, device, passes as f64),
     }
 }

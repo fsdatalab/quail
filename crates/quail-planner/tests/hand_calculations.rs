@@ -93,7 +93,7 @@ fn qwen3_4b_reads_each_dense_weight_once_per_pass() {
     let models = models();
     let model = &models["qwen3-4b-fp8"];
     let work = &ask(&q(400.0), &q(50.0), 0) * 1000.0;
-    let result = speed_of_light(&work, model, &h100(), 110_376, 0.0, 0);
+    let result = speed_of_light(&work, model, &h100(), 110_376, 0);
     let names: Vec<&str> = result
         .components
         .iter()
@@ -116,7 +116,7 @@ fn qwen3_4b_reads_each_dense_weight_once_per_pass() {
     assert_eq!(dense_bytes, (dense_params(model) * result.passes) as f64);
     let mut larger_copy = model.clone();
     larger_copy.w_mem_bytes = 150e9;
-    let larger = speed_of_light(&work, &larger_copy, &h100(), 110_376, 0.0, 0);
+    let larger = speed_of_light(&work, &larger_copy, &h100(), 110_376, 0);
     assert!((larger.seconds() - result.seconds()).abs() <= 1e-12 * result.seconds());
 }
 
@@ -125,7 +125,7 @@ fn diffusion_gemma_attention_reads_full_and_sliding_kv() {
     let models = models();
     let model = &models["diffusion-gemma-26b-a4b-fp8"];
     let work = ask(&q(4096.0), &q(16.0), model.sliding_window);
-    let attention = &dense_decoder_components(&work, model, 1.0, 0.0, 0)[2];
+    let attention = &dense_decoder_components(&work, model, 1.0)[2];
     assert_eq!(
         value(&attention.flops),
         4.0 * 16.0 * (5.0 * 512.0 * value(&work.pairs) + 25.0 * 256.0 * value(&work.sliding_pairs))
@@ -157,7 +157,7 @@ fn one_review_through_a_filter_and_a_join_matches_the_hand_calculation() {
         (value(&work.state_written), value(&work.state_read)),
         (2.0, 3.0)
     );
-    let sol = speed_of_light(&work, model, &h100(), 116_508, 0.0, 0);
+    let sol = speed_of_light(&work, model, &h100(), 116_508, 0);
     assert_eq!(sol.passes, 1);
     let names: Vec<&str> = sol
         .components

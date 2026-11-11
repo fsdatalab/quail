@@ -63,6 +63,7 @@ fn work_from(fields: &Bound<'_, PyDict>) -> PyResult<Work> {
         state_written: get("state_written")?,
         state_read: get("state_read")?,
         sae_encoded: get("sae_encoded")?,
+        ..Work::default()
     })
 }
 
@@ -146,13 +147,12 @@ impl CostModel {
         rows: f64,
         head_rows: i64,
     ) -> PyResult<f64> {
+        let model = self.model(model)?;
         Ok(sol::unrounded_seconds(
-            &work_from(work)?,
-            self.model(model)?,
+            &work_from(work)?.with_readout(rows, head_rows, model.vocab),
+            model,
             self.device(device)?,
             chunk_tokens,
-            rows,
-            head_rows,
         ))
     }
 

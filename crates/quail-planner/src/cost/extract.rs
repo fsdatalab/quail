@@ -359,6 +359,7 @@ pub fn table_work(
         state_written: scalar(column(&records, |w| &w.state_written)),
         state_read: scalar(column(&records, |w| &w.state_read)),
         sae_encoded: scalar(column(&records, |w| &w.sae_encoded)),
+        ..Work::default()
     };
     let mut fed = numpy_sum(&records.iter().map(|r| r.1).collect::<Vec<_>>());
     let mut rows = numpy_sum(&records.iter().map(|r| r.2).collect::<Vec<_>>());
@@ -416,16 +417,9 @@ pub fn estimate(
     };
     let (work, fed, rows) = table_work(lengths, shared, &inputs)?;
     let scale = expected_rows / n as f64;
-    let total = &work * scale;
+    let total = (&work * scale).with_readout(rows * scale, 0, model.vocab);
     let copies = parallel_copies(gpus, expected_rows.min(n as f64));
-    let seconds = unrounded_seconds(
-        &(&total * (1.0 / copies)),
-        model,
-        device,
-        chunk,
-        rows * scale / copies,
-        0,
-    );
+    let seconds = unrounded_seconds(&(&total * (1.0 / copies)), model, device, chunk);
     let passes = value(&total.tokens) / chunk as f64;
     Ok(ExtractCost {
         seconds,

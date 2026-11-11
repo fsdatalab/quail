@@ -812,15 +812,8 @@ type Rank = (f64, f64, f64, f64, f64);
 type FixedBest = (Rank, Work, Vec<JoinStep>, Vec<(PricedJoin, String)>);
 
 fn rank(base: &Work, work: &Work, context: &PlanningContext, chunk: i64) -> Rank {
-    let seconds = speed_of_light(
-        &(base + work),
-        &context.model,
-        &context.device,
-        chunk,
-        0.0,
-        0,
-    )
-    .seconds();
+    let seconds =
+        speed_of_light(&(base + work), &context.model, &context.device, chunk, 0).seconds();
     (
         seconds,
         work.tokens.total(),
@@ -1386,7 +1379,7 @@ mod tests {
             .into_iter()
             .map(|(alias, rows)| (alias.to_string(), rows))
             .collect();
-        let seconds = |work: &Work| speed_of_light(work, &model, &device, 8192, 0.0, 0).seconds();
+        let seconds = |work: &Work| speed_of_light(work, &model, &device, 8192, 0).seconds();
         let found = search_joins(
             &specs,
             &expected,

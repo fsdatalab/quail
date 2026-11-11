@@ -78,7 +78,7 @@ pub fn choose_pass_groups(
                     .map(|tokens| (tokens + header) as f64),
             );
             let work = &packed(&state, &questions, model.sliding_window) * reach[a - 1];
-            let cost = best[a - 1] + unrounded_seconds(&work, model, device, chunk_tokens, 0.0, 0);
+            let cost = best[a - 1] + unrounded_seconds(&work, model, device, chunk_tokens);
             if !cost.is_finite() {
                 return Err("pass-group cost must be finite".into());
             }

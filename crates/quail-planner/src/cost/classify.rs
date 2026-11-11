@@ -236,15 +236,17 @@ pub fn estimate_suffixes(
         rows = answer_rows;
     }
     let expected_rows = inputs.expected_rows;
-    let total = &work * (expected_rows / n as f64);
+    let total = (&work * (expected_rows / n as f64)).with_readout(
+        rows * expected_rows,
+        head_rows,
+        inputs.model.vocab,
+    );
     let copies = parallel_copies(inputs.gpus, python_min(expected_rows, n as f64));
     let seconds = unrounded_seconds(
         &(&total * (1.0 / copies)),
         inputs.model,
         inputs.device,
         inputs.chunk,
-        rows * expected_rows / copies,
-        head_rows,
     );
     let passes = total.tokens.total() / inputs.chunk as f64;
     ClassifyCost {

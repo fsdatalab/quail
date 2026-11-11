@@ -25,5 +25,5 @@ pub fn filter_cost(
     } else {
         ask(&mean, &question, model.sliding_window)
     };
-    unrounded_seconds(&work, model, device, chunk_tokens, 0.0, 0)
+    unrounded_seconds(&work, model, device, chunk_tokens)
 }

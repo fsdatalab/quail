@@ -17,6 +17,11 @@ pub struct Work {
     pub state_read: Quantity,
     /// Tokens the model's SAE encodes, for `AI.SAE_FEATURES`.
     pub sae_encoded: Quantity,
+    /// Answer rows the model's head reads out.
+    pub readout_rows: Quantity,
+    /// Head rows read, summed over the answer rows: an answer row that
+    /// reads the whole vocabulary counts the vocabulary's size.
+    pub readout_head_rows: Quantity,
 }
 
 impl Add for &Work {
@@ -32,6 +37,8 @@ impl Add for &Work {
             state_written: &self.state_written + &other.state_written,
             state_read: &self.state_read + &other.state_read,
             sae_encoded: &self.sae_encoded + &other.sae_encoded,
+            readout_rows: &self.readout_rows + &other.readout_rows,
+            readout_head_rows: &self.readout_head_rows + &other.readout_head_rows,
         }
     }
 }
@@ -49,11 +56,23 @@ impl Mul<f64> for &Work {
             state_written: &self.state_written * count,
             state_read: &self.state_read * count,
             sae_encoded: &self.sae_encoded * count,
+            readout_rows: &self.readout_rows * count,
+            readout_head_rows: &self.readout_head_rows * count,
         }
     }
 }
 
 impl Work {
+    /// This work with `rows` answer rows read out, each reading
+    /// `head_rows` rows of the model's head, or the whole vocabulary
+    /// when `head_rows` is 0.
+    pub fn with_readout(mut self, rows: f64, head_rows: i64, vocab: i64) -> Work {
+        let head = if head_rows != 0 { head_rows } else { vocab };
+        self.readout_rows = Quantity::Scalar(rows);
+        self.readout_head_rows = Quantity::Scalar(rows * head as f64);
+        self
+    }
+
     /// Sum work over document arrays, leaving scalar counts unchanged.
     pub fn total(&self) -> Work {
         let sum = |value: &Quantity| Quantity::Scalar(value.total());
@@ -67,6 +86,8 @@ impl Work {
             state_written: sum(&self.state_written),
             state_read: sum(&self.state_read),
             sae_encoded: sum(&self.sae_encoded),
+            readout_rows: sum(&self.readout_rows),
+            readout_head_rows: sum(&self.readout_head_rows),
         }
     }
 
@@ -87,6 +108,8 @@ impl Work {
                 work.state_written.clone(),
                 work.state_read.clone(),
                 work.sae_encoded.clone(),
+                work.readout_rows.clone(),
+                work.readout_head_rows.clone(),
             ]
         };
         fields(self)
@@ -234,6 +257,8 @@ pub fn decode(prefix: &Quantity, rounds: &[f64], window: i64) -> Work {
             state_written: work.state_written,
             state_read: work.state_read,
             sae_encoded: Quantity::Scalar(0.0),
+            readout_rows: work.readout_rows,
+            readout_head_rows: work.readout_head_rows,
         };
     }
     work

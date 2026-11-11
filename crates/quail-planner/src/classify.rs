@@ -607,8 +607,7 @@ impl ClassifyTable {
             expected_rows,
             call,
         );
-        spec.estimated_seconds =
-            unrounded_seconds(&work, &self.model, &self.device, self.chunk, 0.0, 0);
+        spec.estimated_seconds = unrounded_seconds(&work, &self.model, &self.device, self.chunk);
         spec.prompt_token_parts = vec![head, tail];
         spec.label_token_ids = option_spellings(&lowered.prompt.letters, tokenizer)?;
         spec.scoring = SET_CHOICE_SCORING.to_string();
@@ -663,8 +662,7 @@ impl ClassifyTable {
             expected_rows,
             call,
         );
-        spec.estimated_seconds =
-            unrounded_seconds(&work, &self.model, &self.device, self.chunk, 0.0, 0);
+        spec.estimated_seconds = unrounded_seconds(&work, &self.model, &self.device, self.chunk);
         spec.prompt_token_parts = vec![head, tail];
         spec.label_token_ids = option_spellings(&prompt.prompt.letters, tokenizer)?;
         spec.scoring = SET_CHOICE_SCORING.to_string();

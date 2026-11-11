@@ -212,7 +212,7 @@ pub fn set_pass_tokens(context: &PlanningContext) -> Result<(i64, i64), CompileE
 impl PlanPricer {
     /// The seconds of packed work.
     pub fn seconds_of(&self, context: &PlanningContext, work: &Work) -> f64 {
-        speed_of_light(work, &context.model, &context.device, self.chunk, 0.0, 0).seconds()
+        speed_of_light(work, &context.model, &context.device, self.chunk, 0).seconds()
     }
 
     /// Price a graph: its seconds, and node id -> its explain entry.

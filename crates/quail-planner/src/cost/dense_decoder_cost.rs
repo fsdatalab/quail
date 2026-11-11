@@ -88,18 +88,12 @@ pub fn attention_pair_flops(model: &ModelSpec) -> (i64, i64) {
     (full, sliding_flops)
 }
 
-/// The modeled decoder components, with a readout when `rows` is set.
+/// The modeled decoder components, with a readout when the work has answer rows.
 ///
 /// # Panics
 ///
 /// `passes` is negative, or `work.sae_encoded` is an array.
-pub fn dense_decoder_components(
-    work: &Work,
-    model: &ModelSpec,
-    passes: f64,
-    rows: f64,
-    head_rows: i64,
-) -> Vec<CostComponent> {
+pub fn dense_decoder_components(work: &Work, model: &ModelSpec, passes: f64) -> Vec<CostComponent> {
     assert!(passes >= 0.0, "passes must be nonnegative");
     let separate_gdn = if model.gdn_weight_precision.is_some() {
         gdn_projection_params(model)
@@ -199,14 +193,16 @@ pub fn dense_decoder_components(
             gemm: true,
         });
     }
+    let rows = work.readout_rows.scalar().expect("summed work");
     if rows != 0.0 {
+        let head_rows = work.readout_head_rows.scalar().expect("summed work") / rows;
         components.push(readout(model, rows, passes, head_rows));
     }
     components
 }
 
 /// The answer readout: the decision head, or the output head's rows.
-fn readout(model: &ModelSpec, rows: f64, passes: f64, head_rows: i64) -> CostComponent {
+fn readout(model: &ModelSpec, rows: f64, passes: f64, head_rows: f64) -> CostComponent {
     if model.role == "decision" {
         let (width, hidden) = (model.decision_head_dim, model.hidden);
         return CostComponent {
@@ -219,12 +215,7 @@ fn readout(model: &ModelSpec, rows: f64, passes: f64, head_rows: i64) -> CostCom
             gemm: false,
         };
     }
-    let head_rows = if head_rows != 0 {
-        head_rows
-    } else {
-        model.vocab
-    };
-    let head = 2.0 * model.hidden as f64 * head_rows as f64;
+    let head = 2.0 * model.hidden as f64 * head_rows;
     CostComponent {
         name: "readout",
         flops: Quantity::Scalar(head * rows),

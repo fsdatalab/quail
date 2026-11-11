@@ -140,8 +140,7 @@ fn extract_spec(
             &[(tail - state_tail) as f64],
             model.sliding_window,
         );
-        spec.estimated_seconds =
-            unrounded_seconds(&(&work * expected_rows), model, device, chunk, 0.0, 0);
+        spec.estimated_seconds = unrounded_seconds(&(&work * expected_rows), model, device, chunk);
         spec.max_answer_tokens = model.read_span_tokens;
         spec.state_tail_tokens = state_tail;
         spec.question_header_token_ids = question_header;

@@ -148,7 +148,6 @@ impl ScoreCost {
             &self.model,
             &self.device,
             self.chunk_tokens,
-            0.0,
             0,
         )
         .seconds();

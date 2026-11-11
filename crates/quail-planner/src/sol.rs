@@ -1428,12 +1428,15 @@ impl<'a, 'c> Estimate<'a, 'c> {
     }
 
     fn latency(&self, candidate: &Candidate) -> crate::cost::sol::SpeedOfLight {
+        let rows = self.latency_rows(candidate);
         speed_of_light(
-            &candidate.work,
+            &candidate
+                .work
+                .clone()
+                .with_readout(rows, 0, self.context.model.vocab),
             &self.context.model,
             &self.context.device,
             self.chunk,
-            self.latency_rows(candidate),
             self.decode_passes,
         )
     }

@@ -1335,6 +1335,7 @@ fn read_pricer(value: &serde_json::Value) -> PyResult<quail_planner::pricing::Pl
                 state_written: field("state_written"),
                 state_read: field("state_read"),
                 sae_encoded: field("sae_encoded"),
+                ..Default::default()
             },
         );
     }
