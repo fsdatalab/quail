@@ -32,14 +32,14 @@ QUERIES = (
 )
 
 
-@pytest.mark.parametrize("model", ["decision-2.0-kai-0.6b-bf16", "d1-2b-fp8"])
-@pytest.mark.parametrize("text", QUERIES)
-def test_each_layout_plans_with_the_rust_lowering(model, text):
-    config = EngineConfig(model=model, device="h100-sxm")
-    with quail.Session(config, tokenizer=TOKENIZER) as session:
-        session.register("reviews",
-                         quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
-        session.register("aspects",
-                         quail.DocumentProvider.from_table(ASPECTS, id_col="id"))
-        plan = session.sql(text).plan()
-    assert not isinstance(plan, Refusal), plan
+def test_each_layout_plans_with_the_rust_lowering():
+    for model in ("decision-2.0-kai-0.6b-bf16", "d1-2b-fp8"):
+        config = EngineConfig(model=model, device="h100-sxm")
+        with quail.Session(config, tokenizer=TOKENIZER) as session:
+            session.register("reviews",
+                             quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
+            session.register("aspects",
+                             quail.DocumentProvider.from_table(ASPECTS, id_col="id"))
+            for text in QUERIES:
+                plan = session.sql(text).plan()
+                assert not isinstance(plan, Refusal), (model, text, plan)

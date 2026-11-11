@@ -65,17 +65,16 @@ def _bind(model, kind, template, args, *, labels=(), descriptions=(),
 LAYOUT_MODELS = ("qwen3.8-27b-fp8", "decision-2.0-kai-0.6b-bf16", "d1-2b-fp8")
 
 
-@pytest.mark.parametrize("model", LAYOUT_MODELS)
-@pytest.mark.parametrize("name", CALLS)
-def test_each_prompt_binds_in_each_layout(model, name):
-    kind, template, args, options = CALLS[name]
-    prompt = _bind(MODELS[model], kind, template, args, **options)
-    assert prompt.args == args
+def test_each_prompt_binds_in_each_layout():
+    for model in LAYOUT_MODELS:
+        for name, (kind, template, args, options) in CALLS.items():
+            prompt = _bind(MODELS[model], kind, template, args, **options)
+            assert prompt.args == args, (model, name)
 
 
-@pytest.mark.parametrize("model", LAYOUT_MODELS)
-@pytest.mark.parametrize("name", REFUSED)
-def test_a_malformed_prompt_is_refused_in_each_layout(model, name):
-    kind, template, args, options = REFUSED[name]
-    with pytest.raises(CompileError):
-        _bind(MODELS[model], kind, template, args, **options)
+def test_a_malformed_prompt_is_refused_in_each_layout():
+    for model in LAYOUT_MODELS:
+        for name, (kind, template, args, options) in REFUSED.items():
+            with pytest.raises(CompileError):
+                _bind(MODELS[model], kind, template, args, **options)
+                pytest.fail(f"{name} was bound on {model}")

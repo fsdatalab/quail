@@ -66,8 +66,16 @@ def test_a_limit_over_an_ai_filter_returns_that_many_passing_rows(sessions):
     for rows in _rows_on_and_off(sessions, sql):
         _assert_some_of(rows, PASSING, 2)
 
+    with_an_offset = f"SELECT r.id FROM reviews r WHERE {AI_IF} LIMIT 2 OFFSET 1"
+    assert "fetch: 3" in sessions[0].sql(with_an_offset).logical
+    for rows in _rows_on_and_off(sessions, with_an_offset):
+        _assert_some_of(rows, PASSING, 2)
 
-def test_a_limit_above_a_cte_is_the_fetch_of_the_ai_filter_inside_it(sessions):
+    past_the_passing_rows = f"SELECT r.id FROM reviews r WHERE {AI_IF} LIMIT 10"
+    for rows in _rows_on_and_off(sessions, past_the_passing_rows):
+        assert sorted(rows) == PASSING
+
+    # a LIMIT above a CTE is the fetch of the AI filter inside it
     sql = (f"WITH kind AS (SELECT r.id FROM reviews r WHERE {AI_IF}) "
            "SELECT kind.id FROM kind LIMIT 2")
     assert "fetch: 2" in sessions[0].sql(sql).logical
@@ -75,7 +83,7 @@ def test_a_limit_above_a_cte_is_the_fetch_of_the_ai_filter_inside_it(sessions):
         _assert_some_of(rows, PASSING, 2)
 
 
-def test_a_fetch_keeps_a_later_test_of_the_answer_above_the_ai_node(sessions):
+def test_a_fetch_keeps_a_later_test_of_the_answer_or_the_input_above_it(sessions):
     # testing the label before the fetch would return three reviews
     # labeled 'a'; the test runs on the three reviews the fetch keeps
     sql = ("SELECT d.id FROM (SELECT r.id, AI_CLASSIFY(PROMPT('tone: {0}', r.body), "
@@ -85,8 +93,6 @@ def test_a_fetch_keeps_a_later_test_of_the_answer_above_the_ai_node(sessions):
     for rows in _rows_on_and_off(sessions, sql):
         assert len(rows) <= 3 and set(rows) <= {("r0",), ("r2",), ("r4",)}, rows
 
-
-def test_a_fetch_keeps_a_later_filter_of_the_input_above_the_ai_node(sessions):
     sql = (f"SELECT d.id FROM (SELECT r.id, r.stars FROM reviews r WHERE {AI_IF} "
            "LIMIT 3) d WHERE d.stars > 3")
     logical = sessions[0].sql(sql).logical
@@ -94,19 +100,6 @@ def test_a_fetch_keeps_a_later_filter_of_the_input_above_the_ai_node(sessions):
     for rows in _rows_on_and_off(sessions, sql):
         # three of the four passing reviews hold at least one of r2 and r4
         assert 1 <= len(rows) <= 2 and set(rows) <= {("r2",), ("r4",)}, rows
-
-
-def test_a_limit_with_an_offset_skips_rows_after_the_ai_filter(sessions):
-    sql = f"SELECT r.id FROM reviews r WHERE {AI_IF} LIMIT 2 OFFSET 1"
-    assert "fetch: 3" in sessions[0].sql(sql).logical
-    for rows in _rows_on_and_off(sessions, sql):
-        _assert_some_of(rows, PASSING, 2)
-
-
-def test_fewer_passing_rows_than_the_limit_returns_every_passing_row(sessions):
-    sql = f"SELECT r.id FROM reviews r WHERE {AI_IF} LIMIT 10"
-    for rows in _rows_on_and_off(sessions, sql):
-        assert sorted(rows) == PASSING
 
 
 def test_a_limit_over_a_projection_of_an_answer_becomes_the_fetch(sessions):

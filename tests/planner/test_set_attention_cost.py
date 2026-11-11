@@ -13,10 +13,8 @@ def _groups(selectivities, questions=50, state=300.0, longest=300,
         D1_2B_BF16.name, H100_SXM.name, chunk, 16, header)
 
 
-def test_a_filter_that_keeps_few_rows_gets_its_own_pass_group():
+def test_a_pass_group_holds_filters_that_keep_many_rows_and_fit_one_chunk():
+    # a filter that keeps few rows gets its own pass group
     assert _groups([0.02, 0.5, 0.5]) == [0, 1, 1]
-
-
-def test_a_pass_group_fits_one_chunk_with_the_longest_document_and_headers():
     # 300 + 50 + 3 * (50 + 5) = 515 tokens fit 520; a fifth question does not
     assert _groups([1.0] * 5, chunk=520, header=5) == [0, 0, 0, 0, 1]

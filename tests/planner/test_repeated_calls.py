@@ -123,14 +123,12 @@ def test_an_extraction_in_select_and_its_field_in_where_asks_each_row_once(sessi
         assert sorted(asked) == list(range(6))
 
 
-def test_calls_that_differ_only_in_spelling_are_refused(sessions):
+def test_calls_a_spelling_apart_are_refused_and_calls_a_typo_apart_warn(sessions):
     sql = ("SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('kind: {0}', r.body)) "
            "AND AI_FILTER(PROMPT('Kind {0}', r.body))")
     with pytest.raises(CompileError, match="differ only in case, whitespace"):
         sessions[0].sql(sql).explain()
 
-
-def test_calls_a_typo_apart_warn_and_both_run(sessions):
     sql = ("SELECT r.id FROM reviews r "
            "WHERE AI_FILTER(PROMPT('Is the review kind? {0}', r.body)) "
            "AND AI_FILTER(PROMPT('Is the reveiw kind? {0}', r.body))")

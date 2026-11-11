@@ -44,21 +44,20 @@ def test_model_weights_and_kv_memory_budgets():
             > budgets.arena_tokens(model, H100_SXM)
 
 
-@pytest.mark.parametrize("model,chunk", [
-    (QWEN3_4B_FP8, 1), (DIFFUSION_GEMMA_26B_FP8, 1_000_000)])
-def test_copy_verification_shares_readout_workspace_without_reducing_kv(model, chunk):
-    workspace = budgets.copy_verification_workspace_bytes(model, chunk)
-    readout = 2 * budgets.READOUT_BLOCK_ROWS * model.vocab * 4
-    assert isinstance(workspace, int)
-    assert workspace == int(min(chunk * model.act_per_token, readout))
-    activations = budgets.ACT_RESERVE_CHUNKS * chunk * model.act_per_token
-    assert activations - workspace >= workspace
-    assert budgets.arena_bytes(model, H100_SXM, chunk) == (
-        H100_SXM.mem_bytes * budgets.POOL_FRACTION - model.W_resident - activations
-        - budgets.graph_memory_bytes(model, H100_SXM))
-    assert budgets.chunk_memory_bytes(model, chunk) == (
-        model.W_resident + activations
-        + budgets.checkpoint_memory_bytes(model, chunk))
+def test_copy_verification_shares_readout_workspace_without_reducing_kv():
+    for model, chunk in ((QWEN3_4B_FP8, 1), (DIFFUSION_GEMMA_26B_FP8, 1_000_000)):
+        workspace = budgets.copy_verification_workspace_bytes(model, chunk)
+        readout = 2 * budgets.READOUT_BLOCK_ROWS * model.vocab * 4
+        assert isinstance(workspace, int)
+        assert workspace == int(min(chunk * model.act_per_token, readout)), model.name
+        activations = budgets.ACT_RESERVE_CHUNKS * chunk * model.act_per_token
+        assert activations - workspace >= workspace, model.name
+        assert budgets.arena_bytes(model, H100_SXM, chunk) == (
+            H100_SXM.mem_bytes * budgets.POOL_FRACTION - model.W_resident
+            - activations - budgets.graph_memory_bytes(model, H100_SXM)), model.name
+        assert budgets.chunk_memory_bytes(model, chunk) == (
+            model.W_resident + activations
+            + budgets.checkpoint_memory_bytes(model, chunk)), model.name
 
 
 def test_device_memory_budgets():

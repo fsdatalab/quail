@@ -26,23 +26,14 @@ def session():
     value.close()
 
 
-@pytest.mark.parametrize("text", [
-    "SELECT DISTINCT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.body))",
-    "SELECT DISTINCT r.stars AS k, COUNT(*) AS n FROM reviews r "
-    "WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) GROUP BY r.stars",
-])
-def test_a_distinct_that_removes_no_row_is_eliminated(session, text):
-    # DataFusion's plan of the region, as explain() shows it
-    assert "Distinct" not in session.sql(text).logical
-
-
-def test_a_distinct_on_one_tables_columns_stops_its_filter_at_the_first_match(session):
-    query = session.sql("SELECT DISTINCT r.stars FROM reviews r "
-                        "WHERE AI_FILTER(PROMPT('q1: {0}', r.body))")
-    # DataFusion runs the DISTINCT above the region
-    assert "AggregateExec" in query.explain()
-    assert "fetch: 1 per [stars]" in query.logical
-    assert query.facts()["stop_keys"] == {"r": ["stars"]}
+def test_a_distinct_that_removes_no_row_is_eliminated(session):
+    for text in (
+            "SELECT DISTINCT r.id FROM reviews r "
+            "WHERE AI_FILTER(PROMPT('q1: {0}', r.body))",
+            "SELECT DISTINCT r.stars AS k, COUNT(*) AS n FROM reviews r "
+            "WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) GROUP BY r.stars"):
+        # DataFusion's plan of the region, as explain() shows it
+        assert "Distinct" not in session.sql(text).logical, text
 
 
 KEYED = pa.table({
@@ -86,7 +77,11 @@ def _rows_on_and_off(sessions, sql) -> list:
 def test_a_distinct_over_an_ai_filters_input_columns_returns_each_passing_key_once(
         sessions):
     sql = f"SELECT DISTINCT r.stars FROM reviews r WHERE {AI_IF}"
-    assert "fetch: 1 per [stars]" in sessions[0].sql(sql).logical
+    query = sessions[0].sql(sql)
+    # DataFusion runs the DISTINCT above the region
+    assert "AggregateExec" in query.explain()
+    assert "fetch: 1 per [stars]" in query.logical
+    assert query.facts()["stop_keys"] == {"r": ["stars"]}
     assert "fetch: 1 per [stars]" not in sessions[1].sql(sql).logical
     assert _rows_on_and_off(sessions, sql) == [(3,), (4,), (5,)]
 

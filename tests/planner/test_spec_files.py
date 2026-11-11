@@ -37,13 +37,13 @@ def test_every_built_in_model_loads_with_its_file_name():
     assert "qwen3-4b-fp8" in MODELS
 
 
-def test_a_misspelled_field_is_refused(tmp_path):
-    _write(tmp_path, "typo", 'name = "typo"\nlayerz = 3\n')
+def test_a_misspelled_field_or_a_file_named_for_another_spec_is_refused(tmp_path):
+    (tmp_path / "typo").mkdir()
+    _write(tmp_path / "typo", "typo", 'name = "typo"\nlayerz = 3\n')
     with pytest.raises(ValueError, match="layerz"):
-        read_models(tmp_path)
+        read_models(tmp_path / "typo")
 
-
-def test_a_file_named_for_another_spec_is_refused(tmp_path):
-    _write(tmp_path, "one", 'name = "two"\n')
+    (tmp_path / "renamed").mkdir()
+    _write(tmp_path / "renamed", "one", 'name = "two"\n')
     with pytest.raises(ValueError, match="names another spec"):
-        read_models(tmp_path)
+        read_models(tmp_path / "renamed")

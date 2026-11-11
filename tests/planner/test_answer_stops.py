@@ -10,7 +10,6 @@ the characters written.
 """
 
 import pyarrow as pa
-import pytest
 from helpers.oracle import Oracle, finish
 from helpers.sessions import CONFIG, TOKENIZER
 
@@ -56,6 +55,13 @@ def test_a_map_stops_each_answer_once_its_prefix_test_is_decided():
     # a rejected answer stops at "n", an accepted one at "yes"
     assert (on.answer_tokens, off.answer_tokens) == (3 * 1 + 3 * 3, 3 * 18 + 3 * 15)
     assert on.stopped_early == 6
+    session = quail.Session(CONFIG, tokenizer=TOKENIZER)
+    session.register("reviews",
+                     quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
+    physical = session.sql(sql).explain()
+    session.close()
+    assert ("stops an answer once left(r.__quail_column_1, 3) = 'yes' is not TRUE on "
+            "its tokens so far, or once every one is TRUE") in physical
 
 
 def test_a_map_the_select_list_reads_writes_each_answer_it_keeps_whole():
@@ -89,19 +95,7 @@ def test_an_extraction_stops_once_no_span_of_its_document_can_pass():
         + len("Jan 1") + len("March 30") + len("Apr 2"))
 
 
-def test_the_physical_plan_shows_when_a_map_stops_its_answers():
-    session = quail.Session(CONFIG, tokenizer=TOKENIZER)
-    session.register("reviews",
-                     quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
-    physical = session.sql(f"SELECT r.id FROM reviews r WHERE {VERDICT}").explain()
-    session.close()
-    assert ("stops an answer once left(r.__quail_column_1, 3) = 'yes' is not TRUE on "
-            "its tokens so far, or once every one is TRUE") in physical
-
-
-@pytest.mark.parametrize(("prefix", "decided"), [
-    ("Jan", "not true"), ("Mar", "true"), ("", "undecided"), ("Ma", "undecided")])
-def test_an_expression_decides_a_prefix_test_on_a_partial_answer(prefix, decided):
+def test_an_expression_decides_a_prefix_test_on_a_partial_answer():
     session = quail.Session(CONFIG, tokenizer=TOKENIZER)
     session.register("reviews",
                      quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
@@ -110,7 +104,9 @@ def test_an_expression_decides_a_prefix_test_on_a_partial_answer(prefix, decided
     session.close()
     (node,) = [node for node in plan.graph.nodes if node.type_name == "quail.ai_map"]
     (test,) = node.stop_tests
-    assert test.decide(node.spec.name, prefix) == decided
+    for prefix, decided in (("Jan", "not true"), ("Mar", "true"), ("", "undecided"),
+                            ("Ma", "undecided")):
+        assert test.decide(node.spec.name, prefix) == decided, prefix
 
 
 LAWS = ("Disputes go to the state courts. This Agreement is governed by the laws "
@@ -134,19 +130,14 @@ LAW_SQL = ("SELECT r.id, AI_EXTRACT(r.body, {'law': 'Which law?'}) AS e "
            "= 'State of California'")
 
 
-@pytest.mark.parametrize("prefix", [" State", "State", "State of", "State of ",
-                                    "State of Cal", " "])
-def test_an_extraction_goes_on_while_a_copied_span_can_still_pass(prefix):
+def test_an_extraction_goes_on_until_no_copied_span_can_pass():
     stop = _plan_test(LAW_SQL)
-    # the copy may still be at any place the document holds the prefix,
-    # in any case, and its answer is that span stripped
-    spans = [(start, start + len(prefix)) for start in range(len(LAWS))
-             if LAWS[start:start + len(prefix)].lower() == prefix.lower()]
-    assert stop.decide_any(copied_completions(LAWS, spans)) is Stop.CONTINUE
-
-
-def test_an_extraction_stops_once_no_copied_span_can_pass():
-    stop = _plan_test(LAW_SQL)
+    for prefix in (" State", "State", "State of", "State of ", "State of Cal", " "):
+        # the copy may still be at any place the document holds the prefix,
+        # in any case, and its answer is that span stripped
+        spans = [(start, start + len(prefix)) for start in range(len(LAWS))
+                 if LAWS[start:start + len(prefix)].lower() == prefix.lower()]
+        assert stop.decide_any(copied_completions(LAWS, spans)) is Stop.CONTINUE, prefix
     start = LAWS.index("State of")
     spans = [(LAWS.index("state courts"), LAWS.index(" courts")),
              (start, start + len("State"))]
@@ -154,10 +145,9 @@ def test_an_extraction_stops_once_no_copied_span_can_pass():
         "California", "New York"), spans)) is Stop.REJECTED
 
 
-@pytest.mark.parametrize(("prefix", "decided"), [
-    (" ", Stop.CONTINUE), (" Ye", Stop.CONTINUE), ("Ye", Stop.REJECTED),
-    (" No", Stop.REJECTED)])
-def test_a_map_answer_is_decided_on_its_text_with_its_leading_space(prefix, decided):
+def test_a_map_answer_is_decided_on_its_text_with_its_leading_space():
     stop = _plan_test("SELECT r.id FROM reviews r "
                       "WHERE AI_MAP(r.body, 'Is it kind?') = ' Yes'")
-    assert stop.decide(prefix) is decided
+    for prefix, decided in ((" ", Stop.CONTINUE), (" Ye", Stop.CONTINUE),
+                            ("Ye", Stop.REJECTED), (" No", Stop.REJECTED)):
+        assert stop.decide(prefix) is decided, prefix

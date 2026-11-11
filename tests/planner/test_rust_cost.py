@@ -2,6 +2,7 @@
 
 
 import numpy as np
+import pyarrow as pa
 import pytest
 
 from quail.specs import DEVICES, MODELS
@@ -28,18 +29,6 @@ def plain(value):
     return value
 
 
-def test_every_spec_file_is_read(rust):
-    assert sorted(rust.model_names()) == sorted(MODELS)
-    assert sorted(rust.device_names()) == sorted(DEVICES)
-
-
-def test_the_array_sum_rounds_as_numpy_does():
-    generator = np.random.default_rng(0)
-    for length in (0, 1, 7, 8, 9, 127, 128, 129, 1000, 4097):
-        values = generator.random(length) * 10 ** generator.integers(0, 12, length)
-        assert native.CostModel.numpy_sum(values.tolist()) == float(np.sum(values))
-
-
 LABEL_SETS = (
     [[11], [12], [13]],
     [[5, 6, 7], [5, 6, 8], [5, 9], [4]],
@@ -47,8 +36,19 @@ LABEL_SETS = (
 )
 
 
-def test_the_label_trie_reads_the_same_nodes():
+def test_every_spec_file_is_read(rust):
+    assert sorted(rust.model_names()) == sorted(MODELS)
+    assert sorted(rust.device_names()) == sorted(DEVICES)
+
+
+def test_the_rust_sums_label_nodes_and_length_summaries_match_pythons():
     from quail import labels as python_labels
+    from quail.common.tokens import TokenLengths
+
+    generator = np.random.default_rng(0)
+    for length in (0, 1, 7, 8, 9, 127, 128, 129, 1000, 4097):
+        values = generator.random(length) * 10 ** generator.integers(0, 12, length)
+        assert native.CostModel.numpy_sum(values.tolist()) == float(np.sum(values))
 
     for label_ids in LABEL_SETS:
         for starts in ((), tuple((True,) + (False,) * (len(ids) - 1)
@@ -58,12 +58,6 @@ def test_the_label_trie_reads_the_same_nodes():
                 label_ids, [list(flags) for flags in starts])
             assert plain(found[:2]) == plain((
                 sorted(read), sorted(python_labels.fed_nodes(read))))
-
-
-def test_a_length_column_summarizes_to_its_sums_and_short_counts():
-    import pyarrow as pa
-
-    from quail.common.tokens import TokenLengths
 
     rng = np.random.default_rng(3)
     columns = (

@@ -9,7 +9,6 @@ counts the documents the model read.
 """
 
 import pyarrow as pa
-import pytest
 from helpers.oracle import Oracle, finish
 from helpers.sessions import CONFIG, TOKENIZER
 
@@ -56,16 +55,18 @@ def _rows_and_read(rule, sql, reviews=REVIEWS, passing=(0, 1, 2, 3)) -> list:
     return found
 
 
-def test_an_in_subquery_of_an_ai_filter_stops_each_key_at_its_first_match():
-    sql = (f"SELECT p.sku FROM products p WHERE p.number IN "
-           f"(SELECT r.product FROM reviews r WHERE {AI_IF})")
-    on, off = _rows_and_read(SEMI_JOIN_RULE, sql)
-    assert on[0] == off[0] == [("p1",), ("p2",)]
-    # r1 and r3 share a product with a review that already passed
-    assert (on[1], off[1]) == ([0, 2, 4, 5], [0, 1, 2, 3, 4, 5])
+def test_an_in_subquery_or_exists_of_an_ai_filter_stops_each_key_at_its_first_match():
+    in_sql = (f"SELECT p.sku FROM products p WHERE p.number IN "
+              f"(SELECT r.product FROM reviews r WHERE {AI_IF})")
+    exists_sql = (f"SELECT p.sku FROM products p WHERE EXISTS (SELECT 1 FROM "
+                  f"reviews r WHERE r.product = p.number AND {AI_IF})")
+    for sql in (in_sql, exists_sql):
+        on, off = _rows_and_read(SEMI_JOIN_RULE, sql)
+        assert on[0] == off[0] == [("p1",), ("p2",)], sql
+        # r1 and r3 share a product with a review that already passed
+        assert (on[1], off[1]) == ([0, 2, 4, 5], [0, 1, 2, 3, 4, 5]), sql
 
-
-def test_an_in_subquery_keeps_its_other_filters_before_the_model():
+    # the subquery's other filters still run before the model
     sql = (f"SELECT p.sku FROM products p WHERE p.number IN "
            f"(SELECT r.product FROM reviews r WHERE r.product > 1 AND {AI_IF})")
     on, off = _rows_and_read(SEMI_JOIN_RULE, sql)
@@ -73,22 +74,10 @@ def test_an_in_subquery_keeps_its_other_filters_before_the_model():
     assert (len(on[1]), len(off[1])) == (3, 4)
 
 
-def test_a_correlated_exists_of_an_ai_filter_stops_each_key_at_its_first_match():
-    sql = (f"SELECT p.sku FROM products p WHERE EXISTS (SELECT 1 FROM reviews r "
-           f"WHERE r.product = p.number AND {AI_IF})")
-    on, off = _rows_and_read(SEMI_JOIN_RULE, sql)
-    # the same rows as asking every review, as the IN subquery returns
-    assert on[0] == off[0] == [("p1",), ("p2",)]
-    # r1 and r3 share a product with a review that already passed
-    assert (on[1], off[1]) == ([0, 2, 4, 5], [0, 1, 2, 3, 4, 5])
-
-
-@pytest.mark.parametrize("subquery", [
+def test_an_in_subquery_of_a_classification_has_no_per_key_fetch():
     # a classification is not an AI.IF: the executor has no stop for it
-    "SELECT r.product FROM reviews r WHERE "
-    "AI_CLASSIFY(PROMPT('tone: {0}', r.body), ['a', 'b']) = 'a'",
-])
-def test_an_in_subquery_of_another_ai_operator_has_no_per_key_fetch(subquery):
+    subquery = ("SELECT r.product FROM reviews r WHERE "
+                "AI_CLASSIFY(PROMPT('tone: {0}', r.body), ['a', 'b']) = 'a'")
     session = _session(LOGICAL_RULES)
     query = session.sql(f"SELECT p.sku FROM products p WHERE p.number IN ({subquery})")
     assert "per [" not in query.explain()
@@ -103,14 +92,14 @@ THREE_EACH = pa.table({
 })
 
 
-@pytest.mark.parametrize("having", ["COUNT(*) >= 2", "COUNT(*) > 1", "2 <= COUNT(*)"])
-def test_a_count_threshold_stops_each_key_once_it_has_enough_matches(having):
-    sql = (f"SELECT r.product FROM reviews r WHERE {AI_IF} "
-           f"GROUP BY r.product HAVING {having}")
-    on, off = _rows_and_read(COUNT_RULE, sql, THREE_EACH, passing=(0, 1, 3, 6))
-    assert on[0] == off[0] == [(1,)]
-    # product 1 has two matches after r0 and r1, so r2 is not read
-    assert (on[1], off[1]) == ([0, 1, 3, 4, 5, 6, 7, 8], list(range(9)))
+def test_a_count_threshold_stops_each_key_once_it_has_enough_matches():
+    for having in ("COUNT(*) >= 2", "COUNT(*) > 1", "2 <= COUNT(*)"):
+        sql = (f"SELECT r.product FROM reviews r WHERE {AI_IF} "
+               f"GROUP BY r.product HAVING {having}")
+        on, off = _rows_and_read(COUNT_RULE, sql, THREE_EACH, passing=(0, 1, 3, 6))
+        assert on[0] == off[0] == [(1,)], having
+        # product 1 has two matches after r0 and r1, so r2 is not read
+        assert (on[1], off[1]) == ([0, 1, 3, 4, 5, 6, 7, 8], list(range(9))), having
 
 
 def test_a_count_threshold_the_select_list_reads_reads_every_document():

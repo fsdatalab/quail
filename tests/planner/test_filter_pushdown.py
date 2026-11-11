@@ -65,7 +65,8 @@ def _region_reads_the_filtered_table(query) -> None:
     assert lines[region + 1].startswith("FilterExec: stars@"), lines
 
 
-def test_a_filter_above_an_ai_filter_runs_before_the_model(sessions):
+def test_a_filter_above_an_ai_filter_or_classification_runs_before_the_model(
+        sessions):
     sql = (f"SELECT d.id FROM (SELECT r.id, r.stars FROM reviews r WHERE {AI_IF}) d "
            "WHERE d.stars > 3")
     on, off = sessions
@@ -76,12 +77,9 @@ def test_a_filter_above_an_ai_filter_runs_before_the_model(sessions):
     # without the rule DataFusion tests the stars after the model answers
     assert _rows_and_read(off, sql)[0] == rows
 
-
-def test_a_filter_above_a_classification_runs_before_the_model(sessions):
     sql = ("SELECT d.id, d.t FROM (SELECT r.id, r.stars, "
            "AI_CLASSIFY(PROMPT('tone: {0}', r.body), ['a', 'b']) AS t "
            "FROM reviews r) d WHERE d.stars > 3")
-    on, off = sessions
     _region_reads_the_filtered_table(on.sql(sql))
     rows, read = _rows_and_read(on, sql)
     assert rows == [("r0", "a"), ("r2", "a"), ("r4", "a")]
@@ -119,18 +117,17 @@ def _end_dates(session, sql) -> tuple[list, int]:
     return sorted(row["l.id"] for row in result.to_pylist()), len(asked)
 
 
-@pytest.mark.parametrize("test", ["{} LIKE '%2027%'", "{} ILIKE '20_7'"])
-def test_an_extraction_tested_with_like_reads_only_documents_with_its_literal(test):
+def test_an_extraction_tested_with_like_reads_only_documents_with_its_literal():
     call = "AI_EXTRACT(l.text, {'year': 'When does it end?'})"
     year = call + "['year']"
-    sql = f"SELECT l.id, {call} AS e FROM leases l WHERE {test.format(year)}"
-    on = _leases_session(LOGICAL_RULES)
-    off = _leases_session(logical_rules_without(SUBSTRING_RULE))
-    found = [_end_dates(session, sql) for session in (on, off)]
-    on.close()
-    off.close()
-    assert found[0][0] == found[1][0] == ["c0", "c2", "c4"]
     # LIKE '%2027%' needs "2027", and ILIKE '20_7' needs "20": the model
     # reads the documents that contain it
-    num_read = {"{} LIKE '%2027%'": 3, "{} ILIKE '20_7'": 4}[test]
-    assert (found[0][1], found[1][1]) == (num_read, 5)
+    for test, num_read in (("{} LIKE '%2027%'", 3), ("{} ILIKE '20_7'", 4)):
+        sql = f"SELECT l.id, {call} AS e FROM leases l WHERE {test.format(year)}"
+        on = _leases_session(LOGICAL_RULES)
+        off = _leases_session(logical_rules_without(SUBSTRING_RULE))
+        found = [_end_dates(session, sql) for session in (on, off)]
+        on.close()
+        off.close()
+        assert found[0][0] == found[1][0] == ["c0", "c2", "c4"], test
+        assert (found[0][1], found[1][1]) == (num_read, 5), test

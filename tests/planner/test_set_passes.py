@@ -36,14 +36,13 @@ def test_two_ai_filters_on_d1_2b_share_one_pass(tmp_path):
     session.close()
 
 
-def test_a_d1_plan_prices_and_explains_the_passes_its_operators_share(tmp_path):
+def _forty_reviews_session(tmp_path):
     import pyarrow as pa
     import pyarrow.parquet as pq
 
     import quail
     from quail.api.config import EngineConfig
     from quail.catalog import DocumentProvider
-    from quail.physical import AiClassify
 
     body = " ".join(["word"] * 300)
     pq.write_table(pa.table({"id": list(range(40)), "body": [body] * 40}),
@@ -52,6 +51,13 @@ def test_a_d1_plan_prices_and_explains_the_passes_its_operators_share(tmp_path):
                             tokenizer=TOKENIZER)
     session.register("reviews", DocumentProvider.from_parquet(
         str(tmp_path / "reviews.parquet"), id_col="id"))
+    return session
+
+
+def test_two_d1_classifications_share_a_pass_the_plan_prices_and_explains(tmp_path):
+    from quail.physical import AiClassify
+
+    session = _forty_reviews_session(tmp_path)
     query = session.sql(
         "SELECT r.id, AI.CLASSIFY(PROMPT('Which mood? {0}', r.body), "
         "ARRAY['happy', 'sad']) AS mood, AI.CLASSIFY(PROMPT('Which size? {0}', "
@@ -67,26 +73,6 @@ def test_a_d1_plan_prices_and_explains_the_passes_its_operators_share(tmp_path):
     assert "seconds" not in plan.estimates[second]
     assert f"Passes on r: [{first}, {second}]" in text
     assert "paged KV" not in text and "admission budget" not in text
-    session.close()
-
-
-def test_two_d1_classifications_share_a_pass_across_a_condition_between_them(
-        tmp_path):
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
-    import quail
-    from quail.api.config import EngineConfig
-    from quail.catalog import DocumentProvider
-    from quail.physical import AiClassify
-
-    body = " ".join(["word"] * 300)
-    pq.write_table(pa.table({"id": list(range(40)), "body": [body] * 40}),
-                   tmp_path / "reviews.parquet")
-    session = quail.Session(EngineConfig(model="d1-2b-bf16", device="h100-sxm"),
-                            tokenizer=TOKENIZER)
-    session.register("reviews", DocumentProvider.from_parquet(
-        str(tmp_path / "reviews.parquet"), id_col="id"))
 
     plan = session.sql(
         "SELECT r.id, AI.CLASSIFY(PROMPT('Which size? {0}', r.body), "
@@ -105,22 +91,11 @@ def test_two_d1_classifications_share_a_pass_across_a_condition_between_them(
     session.close()
 
 
-def test_a_d1_filter_and_classification_on_one_table_share_a_pass(tmp_path):
-    import pyarrow as pa
-    import pyarrow.parquet as pq
+def test_a_d1_classification_shares_a_pass_with_a_filter_or_score_of_its_table(
+        tmp_path):
+    from quail.physical import AiClassify, AiFilter, AiScore
 
-    import quail
-    from quail.api.config import EngineConfig
-    from quail.catalog import DocumentProvider
-    from quail.physical import AiClassify, AiFilter
-
-    body = " ".join(["word"] * 300)
-    pq.write_table(pa.table({"id": list(range(40)), "body": [body] * 40}),
-                   tmp_path / "reviews.parquet")
-    session = quail.Session(EngineConfig(model="d1-2b-bf16", device="h100-sxm"),
-                            tokenizer=TOKENIZER)
-    session.register("reviews", DocumentProvider.from_parquet(
-        str(tmp_path / "reviews.parquet"), id_col="id"))
+    session = _forty_reviews_session(tmp_path)
     query = session.sql(
         "SELECT r.id, AI.CLASSIFY(PROMPT('Which mood? {0}', r.body), "
         "ARRAY['happy', 'sad']) AS mood FROM reviews r "
@@ -137,25 +112,7 @@ def test_a_d1_filter_and_classification_on_one_table_share_a_pass(tmp_path):
     assert plan.estimates[kind.node_id]["pass_members"] == (kind.node_id,
                                                            label.node_id)
     assert f"Passes on r: [{kind.node_id}, {label.node_id}]" in query.explain()
-    session.close()
 
-
-def test_a_d1_score_and_a_classification_of_one_table_share_a_pass(tmp_path):
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
-    import quail
-    from quail.api.config import EngineConfig
-    from quail.catalog import DocumentProvider
-    from quail.physical import AiClassify, AiScore
-
-    body = " ".join(["word"] * 300)
-    pq.write_table(pa.table({"id": list(range(40)), "body": [body] * 40}),
-                   tmp_path / "reviews.parquet")
-    session = quail.Session(EngineConfig(model="d1-2b-bf16", device="h100-sxm"),
-                            tokenizer=TOKENIZER)
-    session.register("reviews", DocumentProvider.from_parquet(
-        str(tmp_path / "reviews.parquet"), id_col="id"))
     query = session.sql(
         "SELECT r.id, AI.SCORE(PROMPT('Is it funny? {0}', r.body)) AS fun, "
         "AI.CLASSIFY(PROMPT('Which mood? {0}', r.body), ARRAY['happy', 'sad']) "

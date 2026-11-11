@@ -27,6 +27,7 @@ REVIEWS = pa.table({
     "long": [True, False, None, True, False, True],
 })
 TONE = "AI_CLASSIFY(PROMPT('tone: {0}', r.body), ['a', 'b'])"
+KIND = "AI_FILTER(PROMPT('kind: {0}', r.body))"
 
 
 def _session(rules) -> quail.Session:
@@ -70,16 +71,13 @@ def test_a_case_over_a_classification_labels_only_the_rows_it_reads(sessions):
                                ("r3", "b"), ("r4", None), ("r5", "b")]
     # three rows are long; a NULL test asks nothing, as CASE reads it
     assert (on[1], off[1]) == (3, 6)
+    assert "asks only where r.long" in sessions[0].sql(sql).explain()
 
-
-def test_a_case_above_a_cte_guards_the_classification_inside_it(sessions):
-    sql = (f"WITH t AS (SELECT r.id, r.long, {TONE} AS tone FROM reviews r) "
-           "SELECT t.id, CASE WHEN t.long THEN t.tone END AS tone FROM t")
-    assert "guard: r.long" in sessions[0].sql(sql).logical
-    on, off = (_rows_and_questions(session, sql) for session in sessions)
-    assert on[0] == off[0] == [("r0", "a"), ("r1", None), ("r2", None),
-                               ("r3", "b"), ("r4", None), ("r5", "b")]
-    assert (on[1], off[1]) == (3, 6)
+    above_a_cte = (f"WITH t AS (SELECT r.id, r.long, {TONE} AS tone FROM reviews r) "
+                   "SELECT t.id, CASE WHEN t.long THEN t.tone END AS tone FROM t")
+    assert "guard: r.long" in sessions[0].sql(above_a_cte).logical
+    assert [_rows_and_questions(session, above_a_cte)
+            for session in sessions] == [on, off]
 
 
 def test_a_case_over_a_map_writes_only_the_answers_it_reads(sessions):
@@ -100,28 +98,27 @@ def test_a_case_and_its_answer_read_together_ask_every_row(sessions):
     assert on[1] == 6
 
 
-def test_the_physical_plan_shows_a_classifications_guard(sessions):
-    sql = f"SELECT r.id, CASE WHEN r.long THEN {TONE} END AS t FROM reviews r"
-    physical = sessions[0].sql(sql).explain()
-    assert "asks only where r.long" in physical
-
-
-def test_stock_vllm_refuses_a_guarded_classification():
+def test_stock_vllm_refuses_a_guarded_classification_and_a_guarded_ai_filter():
     session = quail.Session(
         EngineConfig(gpus=1, model="qwen3-4b-fp8", backend="stock_vllm",
                      device="h100-sxm"),
         tokenizer=TOKENIZER)
     session.register("reviews",
                      quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
-    plan = session.sql(
-        f"SELECT r.id, CASE WHEN r.long THEN {TONE} END AS t FROM reviews r").plan()
+    plans = {
+        "guard_needs_quail_backend": session.sql(
+            f"SELECT r.id, CASE WHEN r.long THEN {TONE} END AS t "
+            "FROM reviews r").plan(),
+        "or_filter_needs_quail_backend": session.sql(
+            f"SELECT r.id FROM reviews r WHERE r.long OR {KIND}").plan(),
+    }
     session.close()
-    assert isinstance(plan, Refusal)
-    assert plan.constraint == "guard_needs_quail_backend"
+    for constraint, plan in plans.items():
+        assert isinstance(plan, Refusal), constraint
+        assert plan.constraint == constraint
 
 
 OR_RULE = "derive.guard"
-KIND = "AI_FILTER(PROMPT('kind: {0}', r.body))"
 
 
 def _or_rows_and_questions(rules, sql) -> tuple[list, list]:
@@ -140,7 +137,8 @@ def _or_rows_and_questions(rules, sql) -> tuple[list, list]:
     return sorted(row["r.id"] for row in result.to_pylist()), sorted(asked)
 
 
-def test_an_or_of_a_column_and_an_ai_filter_asks_only_where_the_column_is_not_true():
+def test_an_or_of_a_column_and_an_ai_filter_asks_only_where_the_column_is_not_true(
+        sessions):
     sql = f"SELECT r.id FROM reviews r WHERE r.long OR {KIND}"
     off = logical_rules_without(OR_RULE)
     on_rows, on_asked = _or_rows_and_questions(LOGICAL_RULES, sql)
@@ -148,6 +146,11 @@ def test_an_or_of_a_column_and_an_ai_filter_asks_only_where_the_column_is_not_tr
     # r0, r3, r5 are long; of the rest, r2 and r4 are kind
     assert on_rows == off_rows == ["r0", "r2", "r3", "r4", "r5"]
     assert (on_asked, off_asked) == ([1, 2, 4], [0, 1, 2, 3, 4, 5])
+    query = sessions[0].sql(sql)
+    assert "guard: r.long IS NOT TRUE" in query.logical
+    physical = query.explain()
+    assert "asks only where" in physical
+    assert "passes each row where r.long" in physical
 
 
 def test_an_or_with_a_null_column_asks_the_model_about_the_null_row():
@@ -157,15 +160,6 @@ def test_an_or_with_a_null_column_asks_the_model_about_the_null_row():
         logical_rules_without(OR_RULE), sql)
     assert on_rows == off_rows == ["r0", "r2", "r3", "r4", "r5"]
     assert on_asked == [0, 1, 2, 4]
-
-
-def test_the_plans_show_an_or_filters_guard_and_alternative(sessions):
-    sql = f"SELECT r.id FROM reviews r WHERE r.long OR {KIND}"
-    query = sessions[0].sql(sql)
-    assert "guard: r.long IS NOT TRUE" in query.logical
-    physical = query.explain()
-    assert "asks only where" in physical
-    assert "passes each row where r.long" in physical
 
 
 LONG = "AI_FILTER(PROMPT('long: {0}', r.body))"
@@ -215,27 +209,27 @@ def test_the_planner_runs_the_term_of_an_or_that_passes_more_rows_first():
     assert (kind, long) == ([0, 1, 5], [0, 1, 2, 3, 4, 5])
 
 
-@pytest.mark.parametrize("third_passes,printed", [
-    # the third filter drops half the rows, more than the OR's 32%: it
-    # runs first, then the OR's term that passes more rows
-    (0.5, ["kind:", "long:", "third:"]),
-    # it drops a tenth of the rows, so the OR runs first, its terms together
-    (0.9, ["third:", "kind:", "long:"]),
-])
-def test_an_or_ranks_as_one_filter_among_the_filters_beside_it(
-        sessions, third_passes, printed):
+def test_an_or_ranks_as_one_filter_among_the_filters_beside_it(sessions):
     kind = "AI_FILTER(PROMPT('kind: {0}', r.body), {'selectivity': 0.2})"
     long = "AI_FILTER(PROMPT('long: {0}', r.body), {'selectivity': 0.6})"
-    third = (f"AI_FILTER(PROMPT('third: {{0}}', r.body), "
-             f"{{'selectivity': {third_passes}}})")
-    query = sessions[0].sql(
-        f"SELECT r.id FROM reviews r WHERE ({kind} OR {long}) AND {third}")
-    # explain() prints the last filter to run first
-    physical = query.explain().split("physical:")[1]
-    assert sorted(printed, key=physical.index) == printed
+    for third_passes, printed in (
+            # the third filter drops half the rows, more than the OR's 32%: it
+            # runs first, then the OR's term that passes more rows
+            (0.5, ["kind:", "long:", "third:"]),
+            # it drops a tenth of the rows, so the OR runs first, its terms
+            # together
+            (0.9, ["third:", "kind:", "long:"])):
+        third = (f"AI_FILTER(PROMPT('third: {{0}}', r.body), "
+                 f"{{'selectivity': {third_passes}}})")
+        query = sessions[0].sql(
+            f"SELECT r.id FROM reviews r WHERE ({kind} OR {long}) AND {third}")
+        # explain() prints the last filter to run first
+        physical = query.explain().split("physical:")[1]
+        assert sorted(printed, key=physical.index) == printed, third_passes
 
 
-def test_an_or_of_a_column_and_two_ai_filters_asks_each_where_no_earlier_term_is_true():
+def test_an_or_of_a_column_and_two_ai_filters_asks_each_where_no_earlier_term_is_true(
+        sessions):
     sql = f"SELECT r.id FROM reviews r WHERE r.long OR {KIND} OR {LONG}"
     off = logical_rules_without(OR_RULE)
     on = _ors_rows_and_questions(LOGICAL_RULES, sql, {4}, {1})
@@ -247,11 +241,7 @@ def test_an_or_of_a_column_and_two_ai_filters_asks_each_where_no_earlier_term_is
     # where the first said no
     assert on[1:] in (([1, 2, 4], [1, 2]), ([2, 4], [1, 2, 4]))
     assert everything[1:] == ([0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5])
-
-
-def test_the_plans_show_the_guards_of_an_or_of_two_ai_filters(sessions):
-    query = sessions[0].sql(
-        f"SELECT r.id FROM reviews r WHERE r.long OR {KIND} OR {LONG}")
+    query = sessions[0].sql(sql)
     assert "guard: r.long IS NOT TRUE AND __quail_answer_1 IS NOT TRUE" in query.logical
     physical = query.explain()
     assert "keeps every row for the later terms of its OR" in physical
@@ -260,20 +250,7 @@ def test_the_plans_show_the_guards_of_an_or_of_two_ai_filters(sessions):
     assert "passes each row where r.long" in physical
 
 
-def test_stock_vllm_refuses_an_or_of_a_column_and_an_ai_filter():
-    session = quail.Session(
-        EngineConfig(gpus=1, model="qwen3-4b-fp8", backend="stock_vllm",
-                     device="h100-sxm"),
-        tokenizer=TOKENIZER)
-    session.register("reviews",
-                     quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
-    plan = session.sql(f"SELECT r.id FROM reviews r WHERE r.long OR {KIND}").plan()
-    session.close()
-    assert isinstance(plan, Refusal)
-    assert plan.constraint == "or_filter_needs_quail_backend"
-
-
-def test_a_guarded_classification_is_priced_on_the_rows_its_guard_passes(sessions):
+def test_a_guarded_ai_call_is_priced_on_the_rows_its_guard_passes(sessions):
     def classified_rows(sql):
         plan = sessions[0].sql(sql).plan()
         (node,) = [node for node in plan.nodes if isinstance(node, AiClassify)]
@@ -286,9 +263,6 @@ def test_a_guarded_classification_is_priced_on_the_rows_its_guard_passes(session
     assert guarded[0] == pytest.approx(0.2 * everything[0])
     assert guarded[1] < everything[1]
 
-
-def test_an_ai_filter_in_an_or_is_priced_on_the_rows_where_the_rest_is_not_true(
-        sessions):
     sql = f"SELECT r.id FROM reviews r WHERE r.long OR {KIND}"
     (guarded,) = [node for node in sessions[0].sql(sql).plan().nodes
                   if isinstance(node, AiFilter)]

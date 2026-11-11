@@ -65,21 +65,16 @@ NODE_CASES = {
 }
 
 
-@pytest.mark.parametrize("node_type", NODE_CASES)
-def test_a_plan_with_each_node_type_reads_into_the_rust_types_unchanged(node_type):
-    model, gpus, text = NODE_CASES[node_type]
-    config = EngineConfig(model=model, device="h100-sxm", gpus=gpus)
-    with quail.Session(config, tokenizer=TOKENIZER) as session:
-        for name, table in TABLES.items():
-            session.register(
-                name, quail.DocumentProvider.from_table(table, id_col="id"))
-        query = session.sql(text)
-        plans = [query.plan()]
-        trips = [_round_trip(plan, session) for plan in plans]
-    assert node_type in {node["type"] for written, _ in trips
-                         for node in written["graph"]["nodes"]}
-    for written, read_back in trips:
-        assert read_back == written
+def test_a_plan_with_each_node_type_reads_into_the_rust_types_unchanged():
+    for node_type, (model, gpus, text) in NODE_CASES.items():
+        config = EngineConfig(model=model, device="h100-sxm", gpus=gpus)
+        with quail.Session(config, tokenizer=TOKENIZER) as session:
+            for name, table in TABLES.items():
+                session.register(
+                    name, quail.DocumentProvider.from_table(table, id_col="id"))
+            written, read_back = _round_trip(session.sql(text).plan(), session)
+        assert node_type in {node["type"] for node in written["graph"]["nodes"]}
+        assert read_back == written, node_type
 
 
 def test_a_plan_with_an_unknown_field_is_refused():

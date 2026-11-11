@@ -44,10 +44,10 @@ def _rounds(answer_tokens, max_answer_tokens, draft_tokens):
         answer_tokens, max_answer_tokens, draft_tokens)
 
 
-def _assert_same_work(work, expected):
+def _assert_same_work(work, expected, case=""):
     for field in fields(Work):
         assert work[field.name] == pytest.approx(
-            getattr(expected, field.name), rel=1e-12), field.name
+            getattr(expected, field.name), rel=1e-12), (field.name, case)
 
 
 def _rounds_work(context, round_tokens, limit, answer_tokens):
@@ -87,21 +87,21 @@ def _priced_round_by_round(length, shared, *, window, recurrent, cap, rho,
     return work
 
 
-@pytest.mark.parametrize("window", [0, 512])
-@pytest.mark.parametrize("recurrent", [False, True])
-def test_a_table_costs_the_sum_of_its_documents_priced_round_by_round(
-        window, recurrent):
+def test_a_table_costs_the_sum_of_its_documents_priced_round_by_round():
     lengths = np.array([3, 40, 300, 480, 505, 900, 2500])
     shared = np.array([0, 20, 0, 400, 0, 600, 1000])
-    options = dict(window=window, recurrent=recurrent, cap=16, rho=0.02,
-                   limit=1024, answer_tokens=64)
-    expected = Work()
-    for length, borrowed in zip(lengths, shared):
-        expected += _priced_round_by_round(int(length), int(borrowed), **options)
-    work, _, _ = native.CostModel.extract_table_work(
-        lengths.tolist(), shared.tolist(), HEAD, TAIL, window, False, 1024, 16,
-        "adaptive", 0.02, 64, recurrent)
-    _assert_same_work(work, expected)
+    for recurrent in (False, True):
+        for window in (0, 512):
+            options = dict(window=window, recurrent=recurrent, cap=16, rho=0.02,
+                           limit=1024, answer_tokens=64)
+            expected = Work()
+            for length, borrowed in zip(lengths, shared):
+                expected += _priced_round_by_round(
+                    int(length), int(borrowed), **options)
+            work, _, _ = native.CostModel.extract_table_work(
+                lengths.tolist(), shared.tolist(), HEAD, TAIL, window, False, 1024,
+                16, "adaptive", 0.02, 64, recurrent)
+            _assert_same_work(work, expected, f"window {window}, {recurrent=}")
 
 
 def test_expected_rounds_follow_the_answer_length_curve():

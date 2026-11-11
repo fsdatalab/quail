@@ -152,7 +152,7 @@ def _extract_session(rules) -> quail.Session:
     return session
 
 
-def test_an_extraction_under_a_select_list_returns_only_the_columns_it_reads():
+def test_an_extraction_returns_its_spans_only_when_the_query_reads_them():
     sql = ("SELECT x.id, x.e FROM (SELECT r.id, AI_EXTRACT(r.body, {'w': 'which?'}) "
            "AS e FROM reviews r) x")
     found = []
@@ -170,8 +170,7 @@ def test_an_extraction_under_a_select_list_returns_only_the_columns_it_reads():
     assert found[0] == (True, [("r0", "ab"), ("r1", None), ("r2", "ab")])
     assert found[1] == (False, found[0][1])
 
-
-def test_an_extraction_the_query_returns_keeps_its_spans():
+    # an extraction whose spans the query returns keeps them
     session = _extract_session(LOGICAL_RULES)
     query = session.sql(
         "SELECT r.id, AI_EXTRACT(r.body, {'w': 'which?'}) AS e, "

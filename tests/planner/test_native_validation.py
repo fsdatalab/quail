@@ -27,22 +27,14 @@ def _graph():
     }
 
 
-@pytest.mark.parametrize("kind, message", [
+INVALID_GRAPHS = (
     ("cycle", "cycle"), ("dangling", "missing output"),
     ("duplicate", "duplicate physical node id"),
-])
-def test_stage_cut_rejects_invalid_graph_in_subprocess(kind, message):
-    graph = _graph()
-    if kind == "duplicate":
-        graph["nodes"].append(copy.deepcopy(graph["nodes"][0]))
-    else:
-        source = dict(graph["root"])
-        if kind == "dangling":
-            source["node_id"] = "missing"
-        graph["nodes"][0]["inputs"] = [{
-            "type": "quail.physical.base.InputPort", "name": "rows:r",
-            "value_type": "rows", "source": source, "schema": [],
-        }]
+)
+
+
+def test_stage_cut_rejects_each_invalid_graph_and_accepts_a_valid_one():
+    assert json.loads(native.region_stages(json.dumps(_graph()))) == []
     # Keep a regression to stack overflow isolated from the pytest process.
     script_text = """
 import resource
@@ -56,18 +48,26 @@ except ValueError as error:
 else:
     raise AssertionError('invalid graph was accepted')
 """
-    result = subprocess.run(
-        [sys.executable, "-c", script_text, json.dumps(graph), message],
-        capture_output=True, text=True, timeout=20,
-    )
-    assert result.returncode == 0, result.stderr
+    for kind, message in INVALID_GRAPHS:
+        graph = _graph()
+        if kind == "duplicate":
+            graph["nodes"].append(copy.deepcopy(graph["nodes"][0]))
+        else:
+            source = dict(graph["root"])
+            if kind == "dangling":
+                source["node_id"] = "missing"
+            graph["nodes"][0]["inputs"] = [{
+                "type": "quail.physical.base.InputPort", "name": "rows:r",
+                "value_type": "rows", "source": source, "schema": [],
+            }]
+        result = subprocess.run(
+            [sys.executable, "-c", script_text, json.dumps(graph), message],
+            capture_output=True, text=True, timeout=20,
+        )
+        assert result.returncode == 0, (kind, result.stderr)
 
 
-def test_stage_cut_accepts_valid_graph():
-    assert json.loads(native.region_stages(json.dumps(_graph()))) == []
-
-
-@pytest.mark.parametrize("overrides, message", [
+INVALID_PASS_GROUP_INPUTS = [
     ({"selectivities": []}, "one selectivity"),
     ({"selectivities": [1.0, 1.0, 1.0]}, "one selectivity"),
     *[({field: value}, "finite and nonnegative")
@@ -84,23 +84,26 @@ def test_stage_cut_accepts_valid_graph():
     ({"rows": 1e308, "state_tokens": 1e308}, "cost must be finite"),
     ({"question_tokens": [2**63 - 1, 10]}, "does not fit"),
     ({"longest_state": 2**63 - 1}, "does not fit"),
-])
-def test_pass_groups_reject_invalid_inputs(overrides, message):
-    arguments = dict(
-        question_tokens=[10, 10], selectivities=[1.0, 1.0], rows=100.0,
-        state_tokens=20.0, longest_state=20, model=D1_2B_BF16.name,
-        device=H100_SXM.name, chunk_tokens=100, set_size=1, header=0,
-    )
-    arguments.update(overrides)
-    with pytest.raises(ValueError, match=message):
-        cost_model().choose_pass_groups(**arguments)
+]
 
 
-@pytest.mark.parametrize("question_tokens, selectivities, expected", [
-    ([], [], []), ([10, 10], [0.0, 1.0], [0, 1]),
-])
-def test_pass_groups_accept_valid_edge_cases(question_tokens, selectivities, expected):
-    assert cost_model().choose_pass_groups(
-        question_tokens, selectivities, 0.0, 0.0, 0,
-        D1_2B_BF16.name, H100_SXM.name, 100, 1, 0,
-    ) == expected
+def test_pass_groups_reject_each_invalid_input():
+    for overrides, message in INVALID_PASS_GROUP_INPUTS:
+        arguments = dict(
+            question_tokens=[10, 10], selectivities=[1.0, 1.0], rows=100.0,
+            state_tokens=20.0, longest_state=20, model=D1_2B_BF16.name,
+            device=H100_SXM.name, chunk_tokens=100, set_size=1, header=0,
+        )
+        arguments.update(overrides)
+        with pytest.raises(ValueError, match=message):
+            cost_model().choose_pass_groups(**arguments)
+            pytest.fail(f"{overrides} was accepted")
+
+
+def test_pass_groups_accept_no_questions_and_a_filter_that_keeps_no_row():
+    for question_tokens, selectivities, expected in (
+            ([], [], []), ([10, 10], [0.0, 1.0], [0, 1])):
+        assert cost_model().choose_pass_groups(
+            question_tokens, selectivities, 0.0, 0.0, 0,
+            D1_2B_BF16.name, H100_SXM.name, 100, 1, 0,
+        ) == expected, question_tokens
