@@ -10,6 +10,7 @@
 
 pub(crate) mod claim;
 pub(crate) mod exec;
+pub(crate) mod filter_guard;
 pub(crate) mod identified;
 mod inputs;
 mod join;
@@ -48,12 +49,6 @@ pub struct ModelRegion {
     /// The most rows the operators above read, when a LIMIT above passes
     /// them on unchanged; the region may stop the model once it has them.
     pub fetch: Option<usize>,
-    /// Whether the region takes the dynamic filters of the operators
-    /// above it. False when the SELECT list above the region gives two
-    /// of its columns one name, such as `r.id` and `t.id`: DataFusion
-    /// 55.2 maps a filter through a SELECT list by column name, so a
-    /// filter of one would reach the region reading the other.
-    pub takes_filters: bool,
 }
 
 impl ModelRegion {
@@ -65,7 +60,6 @@ impl ModelRegion {
             inputs: Vec::new(),
             input_names: Vec::new(),
             fetch: None,
-            takes_filters: true,
         }
     }
 }

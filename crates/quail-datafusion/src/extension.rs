@@ -22,6 +22,7 @@ use datafusion::execution::context::SessionState;
 use datafusion::execution::registry::FunctionRegistry;
 use datafusion::logical_expr::{Extension, LogicalPlan, UserDefinedLogicalNode};
 use datafusion::optimizer::AnalyzerRule;
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_planner::ExtensionPlanner;
 
 use crate::functions::quail_functions;
@@ -101,9 +102,25 @@ impl QuailExtension {
             Some(names) => logical_rules(names)?,
             None => with_quail_rules(state.optimizers()),
         };
+        // the guard names the columns a region's dynamic filters may read,
+        // before DataFusion pushes those filters down
+        let guard: Arc<dyn PhysicalOptimizerRule + Send + Sync> =
+            Arc::new(crate::region::filter_guard::GuardRegionFilters);
+        let mut physical: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> = state
+            .physical_optimizers()
+            .iter()
+            .filter(|rule| rule.name() != guard.name())
+            .cloned()
+            .collect();
+        let position = physical
+            .iter()
+            .position(|rule| rule.name() == crate::region::filter_guard::BEFORE_RULE)
+            .unwrap_or(physical.len());
+        physical.insert(position, guard);
         let mut state = SessionStateBuilder::new_from_existing(state)
             .with_analyzer_rules(analyzer)
             .with_optimizer_rules(optimizer)
+            .with_physical_optimizer_rules(physical)
             .build();
         for function in quail_functions() {
             state.register_udf(function)?;

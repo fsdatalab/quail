@@ -1,10 +1,11 @@
 //! `ModelRegionExec` and the planners that build it and `SharedInputExec`.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::{Field, SchemaRef};
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::Session;
 use datafusion::common::config::ConfigOptions;
@@ -97,6 +98,9 @@ pub struct ModelRegionExec {
     fetch: Option<usize>,
     /// The dynamic filters the operators above handed the region.
     hint: RegionHint,
+    /// The columns a dynamic filter may read, once
+    /// [`super::filter_guard::GuardRegionFilters`] has named them.
+    filter_columns: Option<BTreeSet<String>>,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
 }
@@ -122,6 +126,7 @@ impl ModelRegionExec {
             inputs,
             fetch: None,
             hint: RegionHint::default(),
+            filter_columns: None,
             schema,
             properties: Arc::new(properties),
         }
@@ -133,6 +138,19 @@ impl ModelRegionExec {
         let mut exec = Self::new(self.region.clone(), Arc::clone(&self.runner), inputs);
         exec.fetch = self.fetch;
         exec.hint = self.hint.clone();
+        exec.filter_columns = self.filter_columns.clone();
+        exec
+    }
+
+    /// The operator over `inputs`, taking dynamic filters that read
+    /// `columns` only.
+    pub(crate) fn with_filter_columns(
+        &self,
+        columns: BTreeSet<String>,
+        inputs: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Self {
+        let mut exec = self.with_inputs(inputs);
+        exec.filter_columns = Some(columns);
         exec
     }
 
@@ -221,7 +239,6 @@ impl ExecutionPlan for ModelRegionExec {
         // the operators above still apply every filter: the region only
         // may drop the rows a filter rejects
         let filters = vec![PushedDown::No; child_pushdown_result.parent_filters.len()];
-        let schema = self.schema();
         let dynamic: Vec<Arc<dyn PhysicalExpr>> = child_pushdown_result
             .parent_filters
             .into_iter()
@@ -230,19 +247,17 @@ impl ExecutionPlan for ModelRegionExec {
                 test.exists(|expr| Ok(expr.downcast_ref::<DynamicFilterPhysicalExpr>().is_some()))
                     .unwrap_or(false)
             })
-            // DataFusion 55.2 maps a filter's columns into a child by
-            // name, so a test of one of two columns of one name, such as
-            // `r.id` and `p.id`, may read the other
-            // (tests/integration/dynamic_filter.rs)
+            // only a filter whose columns arrived mapped correctly
             .filter(|test| {
-                collect_columns(test).iter().all(|column| {
-                    let named = |field: &&Arc<Field>| field.name() == column.name();
-                    schema.fields().iter().filter(named).count() == 1
+                self.filter_columns.as_ref().is_some_and(|safe| {
+                    collect_columns(test)
+                        .iter()
+                        .all(|column| safe.contains(column.name()))
                 })
             })
             .collect();
         let propagation = FilterPushdownPropagation::with_parent_pushdown_result(filters);
-        if phase != FilterPushdownPhase::Post || dynamic.is_empty() || !self.region.takes_filters {
+        if phase != FilterPushdownPhase::Post || dynamic.is_empty() {
             return Ok(propagation);
         }
         let mut exec = self.with_inputs(self.inputs.clone());

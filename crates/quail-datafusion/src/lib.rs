@@ -50,6 +50,7 @@ pub use region::exec::{
     InputBatches, InputRows, InputStream, ModelRegionExec, ModelRegionPlanner, RegionBatches,
     RegionRunner, collect_inputs,
 };
+pub use region::filter_guard::GuardRegionFilters;
 pub use region::identified::IdentifiedTable;
 pub use region::region_hint::{RegionColumn, RegionColumns, RegionHint};
 pub use region::shared::{ROW_COLUMN, SharedInput, SharedInputExec};

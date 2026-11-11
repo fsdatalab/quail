@@ -74,6 +74,9 @@ model-region rows.
 - AI functions under their SQL and internal names.
 - The `lower_ai_calls` analyzer rule before the host's analyzer rules.
 - Quail's logical optimizer rules among DataFusion's.
+- The `guard_region_filters` physical rule before DataFusion pushes
+  dynamic filters down. A host that builds its session another way
+  adds it there; without it a region takes no dynamic filter.
 - A query planner that claims model regions from the optimized plan
   (`claim_model_regions`), then plans `ModelRegionExec` and
   `SharedInputExec`. A host with its own query planner calls

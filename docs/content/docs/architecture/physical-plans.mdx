@@ -71,7 +71,13 @@ Quail can skip model work for rows that cannot pass them. The operator
 above the region still applies the filter.
 
 Quail disables these hints when the model region has a fetch or per-key
-stop. For other regions:
+stop. A region also takes a filter only when every column it reads
+reached the region mapped to the right column. DataFusion 55.2 maps a
+filter into each operator by column name, so below a join of two tables
+that each have an `id`, a filter on one `id` can read the other. The
+`guard_region_filters` physical rule follows each filter from the join
+or sort that starts it down to the region, and the region refuses a
+filter that passed such a point. For other regions:
 
 - A filter on an input column can reject a row before model execution.
 - A filter on an unknown AI answer rejects a row only if every possible
