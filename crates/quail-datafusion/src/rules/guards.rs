@@ -248,10 +248,11 @@ pub(crate) fn reads_call_table(test: &Expr, node: &AiNode) -> bool {
     let input = node.input.schema();
     call.len() == 1
         && read == call
+        // an unqualified column is another node's answer, not the table's
         && test
             .column_refs()
             .iter()
-            .all(|column| input.has_column(column))
+            .all(|column| column.relation.is_some() && input.has_column(column))
         && !test
             .exists(|inner| Ok(crate::is_ai_call(inner)))
             .unwrap_or(true)

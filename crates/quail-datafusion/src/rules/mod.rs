@@ -31,8 +31,10 @@ pub(crate) mod substring;
 
 use std::sync::Arc;
 
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Result, plan_err};
-use datafusion::optimizer::{Optimizer, OptimizerRule};
+use datafusion::logical_expr::LogicalPlan;
+use datafusion::optimizer::{ApplyOrder, Optimizer, OptimizerConfig, OptimizerRule};
 
 /// Quail's own rules, in the order they run.
 pub const QUAIL_RULES: [&str; 4] = [
@@ -85,7 +87,47 @@ const EXPECTED_DEFAULT_RULES: [&str; 30] = [
     "optimize_projections",
 ];
 
+/// A rule of Quail's, followed by a recomputation of every operator's
+/// schema from its inputs.
+///
+/// A rule that moves or reorders `AiNode`s changes the columns, or their
+/// order, of the operators it rebuilds. An operator above them keeps
+/// the schema it was built with, and DataFusion's rules read columns of
+/// that schema by position.
+#[derive(Debug)]
+struct Recomputed(Arc<dyn OptimizerRule + Send + Sync>);
+
+impl OptimizerRule for Recomputed {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
+    fn apply_order(&self) -> Option<ApplyOrder> {
+        self.0.apply_order()
+    }
+
+    fn rewrite(
+        &self,
+        plan: LogicalPlan,
+        config: &dyn OptimizerConfig,
+    ) -> Result<Transformed<LogicalPlan>> {
+        let rewritten = self.0.rewrite(plan, config)?;
+        if !rewritten.transformed {
+            return Ok(rewritten);
+        }
+        let plan = rewritten
+            .data
+            .transform_up(|node| node.recompute_schema().map(Transformed::yes))?
+            .data;
+        Ok(Transformed::yes(plan))
+    }
+}
+
 fn quail_rule(name: &str) -> Option<Arc<dyn OptimizerRule + Send + Sync>> {
+    unchecked_rule(name).map(|rule| Arc::new(Recomputed(rule)) as _)
+}
+
+fn unchecked_rule(name: &str) -> Option<Arc<dyn OptimizerRule + Send + Sync>> {
     Some(match name {
         "eliminate_distinct" => Arc::new(crate::rules::distinct::EliminateDistinct),
         "place_ai_nodes" => Arc::new(crate::rules::placement::PlaceAiNodes),

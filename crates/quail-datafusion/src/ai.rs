@@ -180,8 +180,16 @@ impl AiNode {
     /// # Errors
     ///
     /// A field's name is already a column of the input, a projection
-    /// position is not a field's, or a gate's input is not a join.
+    /// position is not a field's, a gate's input is not a join, or the
+    /// node reads a column its input does not have.
     pub fn checked(mut self) -> Result<Self> {
+        if let Some(missing) = self
+            .reads()
+            .into_iter()
+            .find(|column| !self.input.schema().has_column(column))
+        {
+            return plan_err!("{} reads {missing}, which its input lacks", self.answer);
+        }
         let added =
             DFSchema::from_unqualified_fields(self.fields.clone().into(), Default::default())?;
         let mut all = self.input.schema().as_ref().clone();
@@ -210,6 +218,25 @@ impl AiNode {
             },
         };
         Ok(self)
+    }
+
+    /// Every column the node reads from its input: the columns of its
+    /// call, guard, and filter that it does not add itself. A rule may
+    /// put the node only over an input that has them all.
+    pub fn reads(&self) -> Vec<datafusion::common::Column> {
+        let mut reads = Vec::new();
+        for expr in [Some(&self.call), self.guard.as_ref(), self.filter.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            for column in expr.column_refs() {
+                let own = column.relation.is_none() && self.is_field(&column.name);
+                if !own && !reads.contains(column) {
+                    reads.push(column.clone());
+                }
+            }
+        }
+        reads
     }
 
     /// Whether the node can take `term`, a test that reads its answer,

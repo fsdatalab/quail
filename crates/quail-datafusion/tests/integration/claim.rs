@@ -603,3 +603,17 @@ async fn an_ai_filter_joins_the_region_of_an_extraction_a_join_key_reads() -> Re
     assert_eq!(operators, ["ai_extract", "ai_filter"], "{text}");
     Ok(())
 }
+
+#[tokio::test]
+async fn a_join_above_reordered_ai_nodes_reads_their_columns_by_their_new_order() -> Result<()> {
+    let context = context()?;
+    // the map's test and the classification both move below the join,
+    // where the classification goes first
+    let query = "SELECT r.id, a.aspect, \
+        AI.CLASSIFY(PROMPT('q: {0}', r.body), ['x', 'y']) AS c0 \
+        FROM reviews r LEFT JOIN aspects a ON r.id = a.aspect \
+        WHERE AI.MAP(r.body, 'Name it.', 8) NOT ILIKE '%o%'";
+    let plan = optimized(&context, query).await?;
+    assert_eq!(regions(&plan).len(), 1, "{}", plan.display_indent());
+    Ok(())
+}

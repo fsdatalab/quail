@@ -556,7 +556,7 @@ impl Extracted {
                     .find(|(found, name)| {
                         *found == key
                             && !self.used.contains(name)
-                            && !input.has_column_with_unqualified_name(name)
+                            && !crate::rules::lower::names_input(input, name)
                     })
                     .map(|(_, name)| name.clone());
                 let name = named.unwrap_or_else(|| {

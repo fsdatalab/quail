@@ -24,13 +24,12 @@
 //! other classifications; then each extraction, SAE feature, and map
 //! column, each followed by the tests its answers allow.
 
-use datafusion::logical_expr::UserDefinedLogicalNodeCore;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, Result};
-use datafusion::logical_expr::utils::{conjunction, split_conjunction};
+use datafusion::logical_expr::utils::split_conjunction;
 use datafusion::logical_expr::{Expr, Filter, JoinType, LogicalPlan, Projection};
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
@@ -178,7 +177,12 @@ fn mover(node: &LogicalPlan) -> Option<Mover> {
         if ai.fetch.is_some() {
             return None;
         }
-        let tables = expr_tables(&ai.call, &[]);
+        // every table the node reads, by its call, guard, or filter
+        let answers = plan_answers(&ai.input);
+        let mut tables = expr_tables(&ai.call, &[]);
+        for expr in ai.guard.iter().chain(&ai.filter) {
+            tables.extend(expr_tables(expr, &answers));
+        }
         // an AI filter whose answer the query reads adds it as a column
         let added = ai
             .returned_fields()
@@ -332,21 +336,11 @@ fn push_down(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
                     .iter()
                     .all(|expr| matches!(expr, Expr::Column(_)))
                     || as_node::<AiNode>(&node).is_some_and(|ai| {
-                        ai.expressions()
-                            .iter()
-                            .chain(&ai.filter)
-                            .chain(&ai.guard)
-                            .flat_map(|expr| expr.column_refs())
-                            // its filter reads its own answer
-                            .filter(|read| {
-                                read.relation.is_some()
-                                    || !ai.fields.iter().any(|field| *field.name() == read.name)
-                            })
-                            .all(|read| {
-                                projection.expr.iter().any(
-                                    |passed| matches!(passed, Expr::Column(found) if found == read),
-                                )
-                            })
+                        ai.reads().iter().all(|read| {
+                            projection.expr.iter().any(
+                                |passed| matches!(passed, Expr::Column(found) if found == read),
+                            )
+                        })
                     }) =>
             {
                 let below = with_input(&node, projection.input.as_ref().clone())?;
@@ -434,18 +428,12 @@ fn order_stack(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
             .map(|field| field.name().clone())
             .collect()
     };
-    let mut plan = below;
-    for filter in &filters {
-        plan = extension_node(filter.with_input(plan)?);
-    }
-    let mut placed: Vec<AiNode> = Vec::new();
-    let add_column =
-        |plan: LogicalPlan, column: &AiNode, placed: &mut Vec<AiNode>| -> Result<LogicalPlan> {
-            placed.push(column.clone());
-            Ok(extension_node(column.with_input(plan)?))
-        };
+    // the order Quail prefers: the AI filters, each label test after
+    // the classification it reads, then the other columns by kind, each
+    // followed by the tests it completes
+    let mut sequence: Vec<Item> = filters.iter().cloned().map(Item::Filter).collect();
+    let mut placed: Vec<&AiNode> = Vec::new();
     let mut done_tests = vec![false; tests.len()];
-    // each test of a label after the classification it reads
     for (index, test) in tests.iter().enumerate() {
         let read = expr_answers(test);
         let reads: Vec<&AiNode> = columns
@@ -457,10 +445,11 @@ fn order_stack(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
         }
         for column in reads {
             if !placed.iter().any(|found| found.answer == column.answer) {
-                plan = add_column(plan, column, &mut placed)?;
+                placed.push(column);
+                sequence.push(Item::Column(column.clone()));
             }
         }
-        plan = LogicalPlan::Filter(Filter::try_new(test.clone(), Arc::new(plan))?);
+        sequence.push(Item::Test(test.clone()));
         done_tests[index] = true;
     }
     let mut ordered: Vec<&AiNode> = columns.iter().collect();
@@ -469,23 +458,56 @@ fn order_stack(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
         if placed.iter().any(|found| found.answer == column.answer) {
             continue;
         }
-        plan = add_column(plan, column, &mut placed)?;
-        let available: BTreeSet<String> = placed.iter().flat_map(&names).collect();
+        placed.push(column);
+        sequence.push(Item::Column(column.clone()));
+        let available: BTreeSet<String> = placed.iter().flat_map(|found| names(found)).collect();
         for (index, test) in tests.iter().enumerate() {
             if !done_tests[index] && expr_answers(test).is_subset(&available) {
-                plan = LogicalPlan::Filter(Filter::try_new(test.clone(), Arc::new(plan))?);
+                sequence.push(Item::Test(test.clone()));
                 done_tests[index] = true;
             }
         }
     }
-    let rest: Vec<Expr> = tests
+    for (test, _) in tests.iter().zip(&done_tests).filter(|(_, done)| !**done) {
+        sequence.push(Item::Test(test.clone()));
+    }
+    // each operator goes over the first input that has every answer it
+    // reads: an AI filter that took a test of another node's answer
+    // follows that node
+    let stack: BTreeSet<String> = filters
         .iter()
-        .zip(&done_tests)
-        .filter(|(_, done)| !**done)
-        .map(|(test, _)| test.clone())
+        .chain(&columns)
+        .flat_map(|found| found.fields.iter().map(|field| field.name().clone()))
         .collect();
-    if let Some(predicate) = conjunction(rest) {
-        plan = LogicalPlan::Filter(Filter::try_new(predicate, Arc::new(plan))?);
+    let needs = |item: &Item| -> BTreeSet<String> {
+        let read: BTreeSet<String> = match item {
+            Item::Filter(found) | Item::Column(found) => found
+                .reads()
+                .into_iter()
+                .filter(|column| column.relation.is_none())
+                .map(|column| column.name)
+                .collect(),
+            Item::Test(test) => expr_answers(test),
+        };
+        read.intersection(&stack).cloned().collect()
+    };
+    let mut plan = below;
+    let mut available: BTreeSet<String> = BTreeSet::new();
+    while !sequence.is_empty() {
+        let Some(next) = sequence
+            .iter()
+            .position(|item| needs(item).is_subset(&available))
+        else {
+            // operators that read each other's answers stay as written
+            return Ok(Transformed::no(node));
+        };
+        plan = match sequence.remove(next) {
+            Item::Filter(found) | Item::Column(found) => {
+                available.extend(found.fields.iter().map(|field| field.name().clone()));
+                extension_node(found.with_input(plan)?)
+            }
+            Item::Test(test) => LogicalPlan::Filter(Filter::try_new(test, Arc::new(plan))?),
+        };
     }
     let changed = plan != node;
     Ok(Transformed::new(plan, changed, TreeNodeRecursion::Jump))

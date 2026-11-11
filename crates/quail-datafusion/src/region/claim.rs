@@ -71,6 +71,7 @@ pub fn claim_model_regions(plan: LogicalPlan, session: &dyn Session) -> Result<L
         return number_regions(drop_unread_probabilities(plan)?);
     }
     NEXT_ROWS.with(|next| next.set(0));
+    let plan = super::unread::drop_unread_nodes(plan)?;
     let claimed = number_regions(drop_unread_probabilities(claim_regions(plan, None)?)?)?;
     // DataFusion 55.2's two leaf-expression rules fail on the join the
     // claim builds above a region: they move a struct field read below the

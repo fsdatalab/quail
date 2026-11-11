@@ -341,11 +341,14 @@ impl Columns {
         self.num_clauses
     }
 
-    fn name_for(&mut self, call: &Expr) -> String {
-        if let Some((_, name)) = self.selected.iter().find(|(found, _)| found == call) {
-            return name.clone();
+    /// The name of `call`'s answer column over `input`: the SELECT
+    /// list's name for the call, or a new one when `input` has a column
+    /// or a table of that name, which then goes to the SELECT list alone.
+    fn name_for(&mut self, call: &Expr, input: &datafusion::common::DFSchema) -> String {
+        match self.selected.iter().find(|(found, _)| found == call) {
+            Some((_, name)) if !names_input(input, name) => name.clone(),
+            _ => self.unnamed(),
         }
-        self.unnamed()
     }
 
     /// A new name that is no column of the plan.
@@ -358,6 +361,15 @@ impl Columns {
             }
         }
     }
+}
+
+/// Whether `name` is a column or a table of `input`, so that no answer
+/// column over it may take the name.
+pub(crate) fn names_input(input: &datafusion::common::DFSchema, name: &str) -> bool {
+    input.has_column_with_unqualified_name(name)
+        || input
+            .iter()
+            .any(|(qualifier, _)| qualifier.is_some_and(|found| found.table() == name))
 }
 
 /// The calls a SELECT list returns as columns, as `call AS name`.
@@ -619,7 +631,7 @@ fn lower_filter(filter: &Filter, columns: &mut Columns) -> Result<Transformed<Lo
         let name = match added_column(&input, &call) {
             Some(name) => name,
             None => {
-                let name = columns.name_for(&call);
+                let name = columns.name_for(&call, input.schema());
                 input = add_column(input, call.clone(), &name)?;
                 name
             }
@@ -889,20 +901,13 @@ fn lower_projection(
                 } else if columns.selected.iter().any(|(found, _)| *found == call)
                     || input.schema().has_column_with_unqualified_name(&alias.name)
                 {
-                    columns.name_for(&call)
+                    columns.name_for(&call, input.schema())
                 } else {
                     // the SELECT list's own name for the call
                     columns.reserved.insert(alias.name.clone());
                     alias.name.clone()
                 };
-                // a name the input already has, as a column or a table, goes
-                // to the SELECT list alone
-                let names_table = input
-                    .schema()
-                    .iter()
-                    .any(|(qualifier, _)| qualifier.is_some_and(|found| found.table() == name));
-                let name = if names_table || input.schema().has_column_with_unqualified_name(&name)
-                {
+                let name = if names_input(input.schema(), &name) {
                     columns.unnamed()
                 } else {
                     name
