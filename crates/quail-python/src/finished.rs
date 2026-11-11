@@ -19,8 +19,7 @@ use arrow::array::{
     RecordBatchOptions, StringArray, StructArray, new_null_array,
 };
 use arrow::compute::{
-    SortColumn, TakeOptions, cast, concat_batches, interleave, is_not_null, lexsort_to_indices,
-    take,
+    SortColumn, TakeOptions, cast, concat_batches, interleave, lexsort_to_indices, take,
 };
 use arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
 use quail_planner::expressions::{
@@ -41,9 +40,6 @@ enum Keep {
     All,
     /// The rows whose last column, a join's answer, is true.
     True,
-    /// The rows whose named column, a classification's label, is not
-    /// null: a document whose answer names no label has no row.
-    Valid(String),
 }
 
 /// The rows one port reports, kept by their document ids.
@@ -258,9 +254,6 @@ impl FinishedRows {
                 .cloned()
                 .collect();
             let index = step_of(&mut steps, (port.node.clone(), port.port.clone()), aliases);
-            if answer.kind == "classifies" {
-                steps[index].keep = Keep::Valid(answer.name.clone());
-            }
             steps[index].columns.push(name.clone());
             let labels = match entry {
                 Some((_, _, kind, labels, true))
@@ -505,10 +498,6 @@ impl FinishedRows {
                     .ok_or("a join's rows have no answer column")?
                     .clone(),
             ),
-            Keep::Valid(name) => (schema.index_of(name).ok())
-                .map(|index| is_not_null(batch.column(index)))
-                .transpose()
-                .map_err(arrow_error)?,
         };
         let ids = (self.relations[relation].aliases.iter())
             .map(|alias| {

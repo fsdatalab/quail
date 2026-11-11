@@ -21,6 +21,26 @@ Square brackets mark optional arguments.
 | [`AI.SAE_FEATURES(prompt, options)`](#aisae_features) | List of features and strengths. |
 | [`HINT(condition, options)`](#planning-hints) | The condition's value, with a selectivity estimate for planning. |
 
+### NULL documents
+
+An AI function of a NULL document returns NULL, and Quail does not ask
+the model about that row. A `PROMPT` over several columns is NULL when
+any of them is.
+
+- `WHERE AI.IF(...)` and `WHERE NOT AI.IF(...)` both drop the row, as a
+  NULL test is not TRUE.
+- `AI.CLASSIFY`, `AI.EXTRACT`, `AI.MAP`, and `AI.SCORE` return NULL for
+  the row. Test it with `IS NULL`.
+- A pair with a NULL document matches nothing in an AI join.
+
+For example, imagine a table `reviews` joined to a table `replies` with
+`LEFT JOIN`. A review with no reply has a NULL `replies.text`, so
+`AI.CLASSIFY(replies.text, ['polite', 'rude'])` is NULL for that review.
+
+One case differs: in `NOT EXISTS (... AI.IF(PROMPT(..., outer.text,
+inner.text)))`, the model is still asked about an outer row whose
+document is NULL, with empty text.
+
 ## PROMPT
 
 `PROMPT` inserts document columns into literal text. `{0}` refers to the

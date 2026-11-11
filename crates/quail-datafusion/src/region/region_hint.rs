@@ -91,6 +91,17 @@ impl RegionHint {
                 *kept &= !matches!(truth, Truth::False | Truth::Null);
             }
         }
+        // a row whose document is NULL stays: its answers are NULL, which
+        // the tests here take to be values, and the model is not asked
+        for (table, position) in &columns.1 {
+            if table != input || *position >= rows.num_columns() {
+                continue;
+            }
+            let document = rows.column(*position);
+            for (row, kept) in keep.iter_mut().enumerate() {
+                *kept |= document.is_null(row);
+            }
+        }
         Ok(keep)
     }
 
@@ -218,9 +229,10 @@ pub enum RegionColumn {
     Answer,
 }
 
-/// What a region knows about each of its columns, by position.
+/// What a region knows about each of its columns, by position, and the
+/// table and column position of each document its AI calls read.
 #[derive(Debug, Clone, PartialEq)]
-pub struct RegionColumns(pub Vec<RegionColumn>);
+pub struct RegionColumns(pub Vec<RegionColumn>, pub Vec<(String, usize)>);
 
 impl RegionColumns {
     /// Read a region's columns from its plan: each column passed on
@@ -242,6 +254,21 @@ impl RegionColumns {
                 .count()
                 > 1
         };
+        let mut documents = Vec::new();
+        let _ = region.plan.apply(|node| {
+            if let LogicalPlan::Extension(extension) = node
+                && let Some(ai) = extension.node.as_any().downcast_ref::<AiNode>()
+            {
+                for column in ai.call.column_refs() {
+                    if let Some(found) = passed_on(region, &ai.input, column)
+                        && !documents.contains(&found)
+                    {
+                        documents.push(found);
+                    }
+                }
+            }
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        });
         RegionColumns(
             schema
                 .iter()
@@ -259,6 +286,7 @@ impl RegionColumns {
                     RegionColumn::Answer
                 })
                 .collect(),
+            documents,
         )
     }
 

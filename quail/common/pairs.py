@@ -19,6 +19,9 @@ COLUMNS_PREFIX = "columns:"
 # the value column a deduplicated table carries: each row's first row
 # with the same tokens and the same deduplicate setting columns
 FIRST_DOCUMENT = "__first_document"
+# the value column that is TRUE for each document of a scan that is
+# NULL, present only when one is; Rust's planner writes it
+NULL_DOCUMENT = "__null_document"
 # the value column of a deduplicated rows input to an AI filter with a
 # stop key: the documents each key document stands for
 COPIES = "__copies"

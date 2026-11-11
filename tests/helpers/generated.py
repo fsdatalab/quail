@@ -4,7 +4,8 @@ A query writes each AI call as a macro, such as ``IF2(r.body)``.
 ``ai_sql`` expands the macros to AI calls. ``plain_sql`` expands them to
 SQL that computes the same answer from the document's text, so plain
 DataFusion returns the rows the AI query must return. ``truth`` answers
-the test oracle from the same text.
+the test oracle from the same text. An AI call of a NULL document is
+NULL, in both.
 """
 
 import random
@@ -133,9 +134,17 @@ def ai_sql(sql: str) -> str:
     return _expand(sql, AI)
 
 
+def _strict(call):
+    """Return the macro's SQL, NULL when a document is NULL."""
+    def expanded(key, *documents):
+        absent = " OR ".join(f"{document} IS NULL" for document in documents)
+        return f"(CASE WHEN {absent} THEN NULL ELSE {call(key, *documents)} END)"
+    return expanded
+
+
 def plain_sql(sql: str) -> str:
     """Return the query with each macro as SQL over the document's text."""
-    return _expand(sql, PLAIN)
+    return _expand(sql, {name: _strict(call) for name, call in PLAIN.items()})
 
 
 def tables(seed: int) -> dict[str, pa.Table]:
@@ -144,10 +153,12 @@ def tables(seed: int) -> dict[str, pa.Table]:
     words = ["Acme", "acme", "Globex", "Hooli", "Initech", "Zed", "Bolt"]
 
     def documents(prefix, num_documents):
+        # the last document is NULL
         return pa.table({
             "id": [f"{prefix}{index}" for index in range(num_documents)],
             "body": [f"{rng.choice(words)} {rng.choice(words)} {prefix}{index}"
-                     f"{'x' * rng.randrange(3)}" for index in range(num_documents)],
+                     f"{'x' * rng.randrange(3)}"
+                     for index in range(num_documents - 1)] + [None],
             "stars": [rng.randrange(1, 5) for _ in range(num_documents)]})
 
     names = ["Acme", "acme", "Globex", "Globex", None, "Hooli", "Zed", None, "r3"]

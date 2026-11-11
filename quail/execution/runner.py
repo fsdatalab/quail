@@ -9,7 +9,7 @@ from typing import Any, Callable, Mapping, Protocol
 
 from quail.execution.deduplicate import deduplicate
 from quail.execution.finished import held, report_outputs
-from quail.execution.guard import guarded
+from quail.execution.guard import guarded, present_join_inputs, reads_null_documents
 from quail.execution.metrics import NodeMetrics, NodeResult, RunResult
 from quail.physical import (
     ExecutionLocation,
@@ -105,6 +105,13 @@ class GenericRunner:
 
         completed = tuple(dict.fromkeys(ref.node_id for ref in (initial_outputs or ())))
         pipelines = graph.pipelines(completed) if context.run_pipeline else {}
+        # a guarded node runs in a pipeline of its own, and a NULL
+        # document guards every node that asks about its table
+        for pipeline in list(pipelines.values()):
+            if len(pipeline) > 1 and any(
+                    reads_null_documents(member, context) for member in pipeline):
+                for member in pipeline:
+                    pipelines[member.node_id] = (member,)
         ordered = graph.topological_nodes()
         for node in ordered:
             pipeline = pipelines.get(node.node_id)
@@ -119,6 +126,9 @@ class GenericRunner:
                         for port in member.inputs
                         if port.source.node_id not in inside}
                     for member in pipeline}
+                for member in pipeline:
+                    inputs[member.node_id] = present_join_inputs(
+                        member, inputs[member.node_id], context)
                 # a guarded node runs in a pipeline of its own
                 guard = guarded(node, inputs[node.node_id], context)
                 if guard is not None:
@@ -162,6 +172,7 @@ class GenericRunner:
                     ]
                     for input_port in node.inputs
                 }
+                inputs = present_join_inputs(node, inputs, context)
                 guard = guarded(node, inputs, context)
                 if guard is not None:
                     inputs = guard.inputs(inputs)

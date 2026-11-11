@@ -13,7 +13,7 @@ import pyarrow as pa
 from quail.api.execute import execute_query
 from quail.api.region_inputs import input_scans
 from quail.common.expressions import CompileError, SimilarCallWarning
-from quail.common.pairs import FIRST_DOCUMENT, columns_key
+from quail.common.pairs import FIRST_DOCUMENT, NULL_DOCUMENT, columns_key
 from quail.common.tokens import ScanInput, TokenStore
 from quail.execution.finished import finished_table
 from quail.execution.metrics import NodeMetrics, NodeResult, scalar_node_metrics
@@ -519,6 +519,13 @@ class RegionQuery:
                 values[FIRST_DOCUMENT] = store.tokens.first_documents_with(
                     [store.column(column) for column in deduplicated[alias]])
             tables[columns_key(alias)] = pa.table(values)
+        # which documents are NULL, for every scan that has one
+        for alias, store in self._token_inputs.items():
+            if NULL_DOCUMENT in store.projected_columns:
+                key = columns_key(alias)
+                absent = store.column(NULL_DOCUMENT)
+                tables[key] = (pa.table({NULL_DOCUMENT: absent}) if key not in tables
+                               else tables[key].append_column(NULL_DOCUMENT, absent))
         return tables
 
     def finished_rows(self, on_rows=None):

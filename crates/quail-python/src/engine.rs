@@ -662,6 +662,13 @@ fn input_hint(
                         .index_of(provider.schema().field(*index).name())?;
                 }
             }
+            for (table, index) in &mut columns.1 {
+                if *table == name {
+                    *index = rows
+                        .schema
+                        .index_of(provider.schema().field(*index).name())?;
+                }
+            }
         }
     }
     let mut rows = HashMap::new();

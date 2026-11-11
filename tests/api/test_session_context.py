@@ -543,19 +543,27 @@ def test_an_ai_call_in_a_correlated_subquery_is_answered():
     session.close()
 
 
-def test_a_row_an_outer_join_fills_with_null_gets_the_models_answer():
+def test_an_ai_call_of_a_null_document_is_null_and_asks_no_model():
     session = quail.Session(CONFIG, tokenizer=TOKENIZER)
-    oracle = Oracle(labels=lambda spec, ids: "a")
+    oracle = Oracle(labels=lambda spec, ids: "a", filters=lambda *_: True)
     oracle.catalog = session.catalog
     context = quail.SessionContext(
         session, physical_executor=oracle_executor(oracle))
     context.register("r", quail.DocumentProvider.from_table(
-        pa.table({"id": ["r0"], "body": ["x"]}), id_col="id"))
+        pa.table({"id": ["r0", "r1"], "body": ["x", None]}), id_col="id"))
     context.register("v", quail.DocumentProvider.from_table(
         pa.table({"id": ["v0", "v1"], "name": ["a", "b"]}), id_col="id"))
     call = "AI.CLASSIFY(PROMPT('q: {0}', r.body), ['a', 'b'])"
-    # v1 has no partner; the call above the join still answers for its row
-    rows = _sorted_rows(context.sql(
-        f"SELECT v.id, {call} AS c FROM r RIGHT JOIN v ON {call} = v.name"))
+    cases = {
+        f"SELECT r.id, {call} AS c FROM r": [("r0", "a"), ("r1", None)],
+        "SELECT r.id FROM r WHERE AI.IF(PROMPT('q: {0}', r.body))": [("r0",)],
+        "SELECT r.id FROM r WHERE NOT AI.IF(PROMPT('q: {0}', r.body))": [],
+        f"SELECT r.id FROM r WHERE {call} IS NULL": [("r1",)],
+        # v1 has no partner; its row has no document, so no answer
+        f"SELECT v.id, {call} AS c FROM r RIGHT JOIN v ON {call} = v.name":
+            [("v0", "a"), ("v1", None)],
+    }
+    for sql, expected in cases.items():
+        assert sorted(_sorted_rows(context.sql(sql)), key=repr) == expected, sql
     session.close()
-    assert rows == [("v0", "a"), ("v1", "a")]
+    assert ("r", 1) not in oracle.asked

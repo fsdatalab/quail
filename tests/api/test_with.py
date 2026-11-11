@@ -78,11 +78,12 @@ def test_extraction_then_score_sends_the_extracted_text_to_the_scorer(session):
     assert rows.column("x.id").to_pylist() == [1, 2, 3]
     assert rows.column("x.clause").to_pylist() == [
         {"terms": clause} for clause in CLAUSES.values()]
-    # the oracle scores the scorer's first document 0.9; which row that
-    # is follows the order the first region returned its rows in
-    assert sorted(rows.column("score").to_pylist()) == [0.1, 0.1, 0.9]
-    # the scorer read the extracted clauses, not the contracts; a null
-    # answer reaches it as empty text
+    # a NULL clause has a NULL score: the model is not asked about it
+    scores = rows.column("score").to_pylist()
+    assert [score is None for score in scores] == [
+        clause is None for clause in CLAUSES.values()]
+    assert {score for score in scores if score is not None} <= {0.1, 0.9}
+    # the scorer's input is the extracted clauses, not the contracts
     (scored,) = recorder.documents["x"]
     assert sorted([int(token) for token in tokens] for tokens in scored) == sorted(
         [encoder()(CLAUSES[0]), [], encoder()(CLAUSES[2])])
@@ -114,8 +115,11 @@ def test_a_cte_runs_once_however_many_times_it_is_read(session):
     # the CTE nothing reads never runs
     assert len(recorder.requests) == 2
     rows = result.collect().sort_by("a.id")
-    assert rows.column("a.id").to_pylist() == [1, 2, 3]
-    assert rows.column("other").to_pylist() == [1, 2, 3]
+    # the contract with no clause matches nothing: its document is NULL
+    matched = [contract + 1 for contract, clause in CLAUSES.items()
+               if clause is not None]
+    assert rows.column("a.id").to_pylist() == matched
+    assert rows.column("other").to_pylist() == matched
     # both aliases read the one result table
     assert recorder.documents["a"] == recorder.documents["b"]
 

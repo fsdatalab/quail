@@ -39,7 +39,7 @@ def _rows(table):
     return sorted(rows, key=repr)
 
 
-@pytest.mark.parametrize("seed", [0, 1, 4, 7])
+@pytest.mark.parametrize("seed", [0, 1, 4, 7, 40])
 @pytest.mark.parametrize("optimized", [False, True], ids=["plain", "optimized"])
 def test_generated_queries_return_the_rows_plain_sql_computes(
         seed, optimized, monkeypatch):

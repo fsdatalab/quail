@@ -93,9 +93,11 @@ pub(crate) fn or_terms(node: &AiNode) -> Option<(Expr, bool)> {
         if found.is_some() || others.iter().any(|term| reads_answer(term)) {
             return None;
         }
-        let negated = answers
-            .iter()
-            .any(|term| node.answer_term(term) == Some(true));
+        // the OR reads the answer one way: `b OR NOT b` is no test of it
+        let [answer] = answers.as_slice() else {
+            return None;
+        };
+        let negated = node.answer_term(answer) == Some(true);
         found = disjunction(others.into_iter().cloned()).map(|rest| (rest, negated));
     }
     found
@@ -126,6 +128,9 @@ pub(crate) fn or_parts(node: &AiNode) -> Option<OrParts> {
         };
         match read.try_as_col() {
             Some(column) if column.relation.is_none() && answers.contains(&column.name) => {
+                if others.iter().any(|(name, _)| *name == column.name) {
+                    return None;
+                }
                 others.push((column.name.clone(), reversed));
             }
             _ => plain.push(term.clone()),

@@ -140,8 +140,9 @@ def expected_rows(truth):
         "window over AI score": [(row[0], 1) for row in IDS],
         "inner join + AI filter": [("r1", "x"), ("r2", "y")] if truth else [],
         "left join + AI filter on left": LEFT_JOIN if truth else [],
-        "left join + AI on right in WHERE": LEFT_JOIN if truth else [],
-        "full join + AI filter": LEFT_JOIN + [(None, "z")] if truth else [],
+        # a row the join fills with NULL has a NULL answer, which is not TRUE
+        "left join + AI on right in WHERE": [("r1", "x"), ("r2", "y")] if truth else [],
+        "full join + AI filter": LEFT_JOIN if truth else [],
         "left join ON AI": PAIRS if truth else LEFT_UNMATCHED,
         "full join ON AI": PAIRS if truth else LEFT_UNMATCHED + RIGHT_UNMATCHED,
         "cross join + AI pair filter": PAIRS if truth else [],

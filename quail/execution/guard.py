@@ -9,6 +9,11 @@ filter returns the rows a term passed. A short-circuit filter asks only
 the rows no earlier one passed.
 An AI filter that returns its answer keeps every row it reads and adds
 the answer column: TRUE or FALSE where it asked, NULL elsewhere.
+
+A row whose document is NULL is guarded the same way, whatever the
+plan: the model is not asked about it, a column node answers NULL for
+it, and an AI filter does not pass it. An AI join reads no such row:
+a pair with a NULL document does not match.
 """
 
 from __future__ import annotations
@@ -19,10 +24,20 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from quail.common.expressions import accepts
-from quail.common.pairs import columns_key
+from quail.common.pairs import NULL_DOCUMENT, columns_key
 from quail.execution.metrics import NodeResult
 from quail.execution.rows import Rows, rows_of
-from quail.physical import AiFilter
+from quail.physical import (
+    AiClassify,
+    AiExtract,
+    AiFilter,
+    AiJoin,
+    AiMap,
+    AiSaeFeatures,
+    AiScore,
+)
+
+DOCUMENT_NODES = (AiFilter, AiClassify, AiExtract, AiMap, AiSaeFeatures, AiScore)
 
 
 @dataclass
@@ -127,6 +142,55 @@ class Guarded:
         return NodeResult({**result.outputs, port: rows}, metrics)
 
 
+def _document_alias(node) -> str | None:
+    """Return the alias whose one document the node asks about, if it has one."""
+    if isinstance(node, AiFilter):
+        return node.alias
+    if isinstance(node, DOCUMENT_NODES) and len(node.spec.aliases) == 1:
+        return node.spec.aliases[0]
+    return None
+
+
+def reads_null_documents(node, context) -> bool:
+    """Return whether the node asks about a table that has a NULL document."""
+    alias = _document_alias(node)
+    columns = None if alias is None else context.sources.get(columns_key(alias))
+    return columns is not None and NULL_DOCUMENT in columns.column_names
+
+
+def present_join_inputs(node, inputs: dict, context) -> dict:
+    """Return an AI join's inputs without the rows whose document is NULL.
+
+    An anti join keeps its anchors: one with a NULL document matches no
+    partner, so the join returns it.
+
+    Args:
+        node: The node to run.
+        inputs: Its input port values.
+        context: The execution context.
+    """
+    if not isinstance(node, AiJoin):
+        return inputs
+    anti = not bool(node.keeps(True))
+    found = dict(inputs)
+    for port in node.inputs:
+        value = inputs.get(port.name)
+        named = port.source.port.partition(":")
+        if value is None or named[0] not in ("rows", "pairs"):
+            continue
+        aliases = value.aliases if isinstance(value, Rows) else (named[2],)
+        for alias in aliases:
+            columns = context.sources.get(columns_key(alias))
+            if (columns is None or NULL_DOCUMENT not in columns.column_names
+                    or (anti and alias == node.anchor)):
+                continue
+            rows = rows_of(found[port.name], alias)
+            present = pc.invert(pc.take(columns.column(NULL_DOCUMENT), rows.ids[alias]))
+            kept = rows.filter(present)
+            found[port.name] = kept if isinstance(value, Rows) else kept.ids[alias]
+    return found
+
+
 def guarded(node, inputs: dict, context) -> Guarded | None:
     """Evaluate a column node's guard over the rows it reads.
 
@@ -144,7 +208,9 @@ def guarded(node, inputs: dict, context) -> Guarded | None:
     alternative = getattr(node, "alternative", None)
     answer = getattr(node, "answer", None)
     disjunction = getattr(node, "disjunction", None)
-    if guard is None and alternative is None and answer is None and disjunction is None:
+    absent = reads_null_documents(node, context)
+    if (guard is None and alternative is None and answer is None
+            and disjunction is None and not absent):
         return None
     (port,) = [port.name for port in node.inputs]
     alias = node.alias if isinstance(node, AiFilter) else node.spec.aliases[0]
@@ -160,6 +226,10 @@ def guarded(node, inputs: dict, context) -> Guarded | None:
         passes = pc.or_(passes, earlier)
         if node.short_circuit:
             asked = pc.and_(pc.fill_null(asked, False), pc.invert(earlier))
+    if absent:
+        null_documents = context.sources[columns_key(alias)].column(NULL_DOCUMENT)
+        present = pc.invert(pc.take(null_documents, rows.ids[alias]))
+        asked = pc.and_(pc.fill_null(asked, False), present)
     return Guarded(node, port, rows, asked, passes)
 
 

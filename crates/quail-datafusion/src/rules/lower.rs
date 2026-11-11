@@ -454,10 +454,10 @@ fn column_calls(term: &Expr) -> Vec<Expr> {
 /// The name of the column an `AiNode` below `plan` adds for `call`, if
 /// `plan` returns that column with the node's answer in every row.
 ///
-/// An outer join fills the rows of one input with NULL, where the call
-/// above the join has the model's answer, so the search stops at that
-/// input. It also stops at an operator that returns other rows than it
-/// reads, such as an aggregate.
+/// An outer join fills the rows of one input with NULL, and the call
+/// above the join is NULL there too, as its document is. The search
+/// stops at an operator that returns other rows than it reads, such as
+/// an aggregate.
 fn added_column(plan: &LogicalPlan, call: &Expr) -> Option<String> {
     fn search(node: &LogicalPlan, call: &Expr) -> Option<String> {
         if let Some(column) = as_node::<AiNode>(node)
@@ -467,18 +467,8 @@ fn added_column(plan: &LogicalPlan, call: &Expr) -> Option<String> {
             return Some(column.answer.clone());
         }
         let inputs: Vec<&LogicalPlan> = match node {
-            LogicalPlan::Join(join) => match join.join_type {
-                JoinType::Inner => vec![&join.left, &join.right],
-                JoinType::Left | JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark => {
-                    vec![&join.left]
-                }
-                JoinType::Right
-                | JoinType::RightSemi
-                | JoinType::RightAnti
-                | JoinType::RightMark => vec![&join.right],
-                JoinType::Full => Vec::new(),
-            },
-            LogicalPlan::Filter(_)
+            LogicalPlan::Join(_)
+            | LogicalPlan::Filter(_)
             | LogicalPlan::Projection(_)
             | LogicalPlan::Sort(_)
             | LogicalPlan::Window(_)
@@ -764,10 +754,21 @@ fn combine_prompt_documents(
         documents.push(lit(format!("\n\nDOCUMENT {index}:\n")));
         documents.push(document.clone());
     }
-    prompt.args = vec![
-        lit(format!("{{0}}\n\n{question}")),
-        datafusion::functions::string::expr_fn::concat(documents),
-    ];
+    // the one document is NULL when any of its parts is, as `concat`
+    // alone reads a NULL part as empty text
+    let absent = prompt
+        .args
+        .iter()
+        .skip(1)
+        .cloned()
+        .map(Expr::is_null)
+        .reduce(Expr::or)
+        .expect("two documents or more");
+    let combined = datafusion::functions::string::expr_fn::concat(documents);
+    let document =
+        datafusion::logical_expr::when(absent, lit(datafusion::common::ScalarValue::Utf8(None)))
+            .otherwise(combined)?;
+    prompt.args = vec![lit(format!("{{0}}\n\n{question}")), document];
     Ok(())
 }
 

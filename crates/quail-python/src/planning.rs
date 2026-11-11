@@ -209,10 +209,11 @@ impl Planner {
             {
                 names.push(source);
             }
+            let columns = value_columns(&names, rows)?;
             files.push(ScanInputs {
                 alias: scan.alias.clone(),
                 tokens: Arc::clone(&store),
-                columns: value_columns(&names, rows)?,
+                columns: with_null_documents(columns, &scan.column, rows)?,
             });
             let documents = store.documents();
             document_tokens.insert(scan.alias.clone(), store.lengths().to_vec());
@@ -436,6 +437,60 @@ fn value_columns(names: &[String], rows: &TableRows) -> Result<crate::stages::Ta
                 arrow::array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
             RecordBatch::try_new_with_options(Arc::clone(&schema), columns, &options)
                 .map_err(arrow_error)
+        })
+        .collect::<Result<_, _>>()?;
+    Ok((schema, batches))
+}
+
+/// The value column that says which of a scan's documents are NULL, as
+/// `quail.common.pairs.NULL_DOCUMENT` names it.
+const NULL_DOCUMENT: &str = "__null_document";
+
+/// `columns` with the [`NULL_DOCUMENT`] column, when a document of the
+/// scan is NULL: the executor asks the model about no such row.
+fn with_null_documents(
+    columns: crate::stages::Table,
+    column: &ScanColumn,
+    rows: &TableRows,
+) -> Result<crate::stages::Table, CompileError> {
+    let built = match column {
+        ScanColumn::Expression(expression) => Some(PhysicalValue::new(expression)?),
+        ScanColumn::Unnamed(_) => None,
+    };
+    let mut masks: Vec<ArrayRef> = Vec::new();
+    let mut found = false;
+    for batch in &rows.batches {
+        let values = match (column, &built) {
+            (_, Some(built)) => built.evaluate(batch, false)?,
+            (ScanColumn::Unnamed(name), None) => batch
+                .column_by_name(name)
+                .cloned()
+                .ok_or_else(|| CompileError::new(format!("no column {name}")))?,
+            (ScanColumn::Expression(_), None) => unreachable!("an expression is built"),
+        };
+        found |= values.null_count() > 0;
+        masks.push(Arc::new(
+            arrow::compute::is_null(&values).map_err(arrow_error)?,
+        ));
+    }
+    if !found {
+        return Ok(columns);
+    }
+    let (schema, batches) = columns;
+    let mut fields: Vec<arrow::datatypes::FieldRef> = schema.fields().iter().cloned().collect();
+    fields.push(Arc::new(arrow::datatypes::Field::new(
+        NULL_DOCUMENT,
+        DataType::Boolean,
+        false,
+    )));
+    let schema = Arc::new(arrow::datatypes::Schema::new(fields));
+    let batches = batches
+        .into_iter()
+        .zip(masks)
+        .map(|(batch, mask)| {
+            let mut values = batch.columns().to_vec();
+            values.push(mask);
+            RecordBatch::try_new(Arc::clone(&schema), values).map_err(arrow_error)
         })
         .collect::<Result<_, _>>()?;
     Ok((schema, batches))
