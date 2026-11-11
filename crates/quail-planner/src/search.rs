@@ -231,12 +231,12 @@ pub fn table_steps(
         let (first, later) = if estimate {
             let tail = context.lowered(&call.prompt)?.tail_token_ids.len() as i64;
             let cost = |fresh: bool| {
-                StepCost::PerDocument(crate::cost::filters::filter_work(
+                StepCost::PerDocument(Box::new(crate::cost::filters::filter_work(
                     tail,
                     mean_tokens,
                     &context.model,
                     fresh,
-                ))
+                )))
             };
             (cost(true), cost(false))
         } else {

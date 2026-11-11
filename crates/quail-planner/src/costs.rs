@@ -22,7 +22,7 @@ use crate::scores::{prompt_aliases, score_statistics};
 #[derive(Debug, Clone, PartialEq)]
 pub enum StepCost {
     /// Work per document.
-    PerDocument(Work),
+    PerDocument(Box<Work>),
     /// A score's own estimate at each count.
     Score(Box<ScoreCost>),
     /// A column operator's planner prices it.
@@ -41,7 +41,7 @@ impl StepCost {
     /// The tokenizer fails, or the model cannot run a column operator.
     pub fn work(&self, context: &PlanningContext, rows: f64) -> Result<Option<Work>, CompileError> {
         let work = match self {
-            StepCost::PerDocument(work) => return Ok(Some(work * rows)),
+            StepCost::PerDocument(work) => return Ok(Some(&**work * rows)),
             StepCost::Score(cost) => cost.estimate(rows, None).0,
             StepCost::Column { column, resident } => {
                 match crate::search::column_work(context, column, *resident, rows)? {
@@ -103,7 +103,9 @@ pub fn prepare_filter_costs(
             // a guarded filter asks the model about its guard's rows alone
             let asked = crate::statistics::predicate_asked_fraction(predicate);
             let cost = |fresh: bool| {
-                StepCost::PerDocument(&filter_work(question, mean_tokens, model, fresh) * asked)
+                StepCost::PerDocument(Box::new(
+                    &filter_work(question, mean_tokens, model, fresh) * asked,
+                ))
             };
             (cost(true), cost(false), None)
         };
