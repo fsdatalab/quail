@@ -696,6 +696,11 @@ class MapDecoder:
                     completions, length = self._partial_answer(q, slot)
                 else:
                     text, length = texts[index]
+                    # the answer is the text without the whitespace
+                    # around it, and it goes on from there
+                    text = text.strip()
+                    if not text:
+                        continue
                     completions = [dict(prefix=text)]
                 if stop.decide_any(completions) is Stop.CONTINUE:
                     continue

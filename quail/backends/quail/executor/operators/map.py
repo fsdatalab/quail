@@ -206,7 +206,10 @@ class MapOperator(ColumnOperator, ModelOperator):
     def column_values(self, index, positions) -> tuple:
         tokens = self.decoder.answers(self.first + index, self._slots(index, positions))
         tokenizer = self.state.loaded_model.tokenizer
-        return (pa.array(tokenizer.decode_batch(tokens), pa.string()),)
+        # an answer is the model's text without the whitespace around it:
+        # the first token of a turn starts with a space
+        texts = [text.strip() for text in tokenizer.decode_batch(tokens)]
+        return (pa.array(texts, pa.string()),)
 
     def close(self, fresh, spans, stats, offset) -> dict:
         """Build each map's answer table and attribute its GPU work."""

@@ -831,7 +831,21 @@ class LetterTokenizer:
                 for tokens in batch]
 
 
-def test_a_map_answer_stops_once_its_test_is_decided(monkeypatch):
+class SpacedTokenizer(LetterTokenizer):
+    """Start each answer with a space, as a model's first token does."""
+
+    @staticmethod
+    def decode_batch(batch):
+        return [" " + text if text else text
+                for text in LetterTokenizer.decode_batch(batch)]
+
+
+def _tested_map(monkeypatch, when_true):
+    """Run a map whose answer is tested to start with its commonest letter.
+
+    Returns the answers greedy decoding writes, as tokens and as text,
+    that letter, the answers the map wrote, and its decoder.
+    """
     cpu_staging(monkeypatch)
     rng = np.random.default_rng(3)
     documents = [rng.integers(20, 900, size=int(n)).tolist()
@@ -850,25 +864,38 @@ def test_a_map_answer_stops_once_its_test_is_decided(monkeypatch):
     torch_ = events_torch(2)
     ids = list(range(len(documents)))
     node = map_node("a", tail, limit)
-    node.stop_tests, node.stop_when_true = (test,), True
+    node.stop_tests, node.stop_when_true = (test,), when_true
     maps = MapOperator(None, [node], ids, 0)
     stages = gated_stages([maps])
     prefixes, keys, tree, dependencies = maps.branch_inputs(
         documents, [("d", i) for i in ids], None, setup.page_tokens, 0)
     decoder = MapDecoder(torch_, torch.eye(VOCABULARY), len(prefixes), [limit],
                          [STOP], setup.page_tokens)
-    decoder.tokenizer = LetterTokenizer()
+    decoder.tokenizer = SpacedTokenizer()
     decoder.answer_stops[0] = answer_stop(node)
     maps.decoder = decoder
     StageExecutor(torch_, arena, pipeline, stages, prefixes, 400, anchor_keys=keys,
                prefix_tree=tree, decoder=decoder, dependencies=dependencies).run()
     got = [answer.tolist() for answer in decoder.answers(0, maps._slots(0, ids))]
+    assert not decoder.active
+    assert not arena.accounting.owned
+    return wanted, text, first, got, decoder
+
+
+def test_a_map_answer_stops_once_its_test_is_decided(monkeypatch):
+    wanted, _, _, got, decoder = _tested_map(monkeypatch, when_true=True)
     # an answer the test settles stops after its first token, either way
     assert got == [want[:1] for want in wanted]
     assert decoder.stopped_early[0] == sum(1 for want in wanted if want)
     assert decoder.rows_fed[0] < sum(map(len, wanted))
-    assert not decoder.active
-    assert not arena.accounting.owned
+
+
+def test_a_test_reads_a_map_answer_without_the_space_it_starts_with(monkeypatch):
+    wanted, text, first, got, _ = _tested_map(monkeypatch, when_true=False)
+    # an answer that passes is written in full: the query returns it
+    assert got == [want if found.startswith(first) else want[:1]
+                   for want, found in zip(wanted, text)]
+    assert any(found.startswith(first) and len(found) > 1 for found in text)
 
 
 def test_an_answers_text_so_far_is_its_tokens_decoded_from_the_first():
