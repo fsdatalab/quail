@@ -2,9 +2,9 @@
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-from helpers.oracle import Oracle, oracle_executor, question_text
+from helpers.oracle import Oracle, finish, oracle_executor, question_text
 from helpers.planning import operators_of
-from helpers.sessions import TOKENIZER, encoder
+from helpers.sessions import CONFIG, TOKENIZER, encoder
 
 import quail
 from bench.quailb import (
@@ -384,3 +384,21 @@ def test_sec_queries_read_their_own_directory_as_engines_see_the_filings(tmp_pat
         query = sess.sql("SELECT f.id FROM sec_filings f WHERE f.text_chars = 14 "
                          "AND AI_FILTER(PROMPT('Is {0} a contract?', f.text))")
         assert not isinstance(query.plan(), Refusal)
+
+
+def test_a_map_answers_prefix_test_keeps_its_rows_and_reports_no_filter():
+    calls = pa.table({
+        "id": ["s0", "s1", "s2"], "transcript": ["a b", "c d", "e f"]})
+    written = ["price: too high", "none", "timing: next quarter"]
+    spec = get_query("SALES-6")
+    with quail.Session(CONFIG, tokenizer=TOKENIZER) as session:
+        session.register("sales_calls", DocumentProvider.from_table(
+            calls, id_col="id"))
+        query = build_query(session, spec)
+        result = finish(query, Oracle(maps=lambda spec, document: written[document]))
+        output = run_output(result, spec.info, {"sales_calls": calls})
+        pieces = prompt_pieces(query, spec.info, {})
+    assert output.rows.to_pylist() == [{"c": "s0", "objection": "price: too high"}]
+    # the test is no AI filter, so it has no answers or prompt of its own
+    assert not output.filter_answers and not pieces["filters"]
+    assert [item["id"] for item in pieces["maps"]] == ["map-1"]

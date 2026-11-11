@@ -54,7 +54,7 @@ from quail_b.queries import (
 )
 from quail_b.queries import queries as query_specs
 from quail_b.scoring import RunOutput, reference_answer
-from quail_b.substrait import Filter, InList, PlanInfo
+from quail_b.substrait import Filter, InList, PlanInfo, StartsWith
 
 # the fixed planner inputs, by prompt, and by prompt and accepted
 # labels for an IN-list filter; a predicate without an estimate here gets
@@ -234,8 +234,9 @@ def run_output(result, info: PlanInfo, tables) -> RunOutput:
     filter_answers = {}
     for (alias, position), table in result.answer_tables["filters"].items():
         operator = _alias_filters(info, alias)[position]
-        if isinstance(operator, InList):
-            # QUAIL-B scores an IN-list filter from the classification's labels
+        if isinstance(operator, (InList, StartsWith)):
+            # QUAIL-B scores an IN-list filter from the classification's
+            # labels, and a map answer has no reference
             continue
         filter_answers[operator.id] = pa.table({
             alias: id_column(alias, table.column(alias)),
@@ -303,9 +304,9 @@ def run_output(result, info: PlanInfo, tables) -> RunOutput:
 
 
 def _alias_filters(info: PlanInfo, alias: str) -> list:
-    """Return an alias's AI filters and IN-list filters, in written order."""
+    """Return an alias's AI filters and answer tests, in written order."""
     return [operator for operator in info.operators
-            if isinstance(operator, (Filter, InList))
+            if isinstance(operator, (Filter, InList, StartsWith))
             and operator.relation == alias]
 
 
@@ -353,7 +354,7 @@ def prompt_pieces(query, info: PlanInfo, anchors) -> dict | None:
     for alias, written_prompts in filters.items():
         written = _alias_filters(info, alias)
         for position, prompt in enumerate(written_prompts):
-            if isinstance(written[position], InList):
+            if isinstance(written[position], (InList, StartsWith)):
                 continue
             pieces["filters"].append({
                 "id": written[position].id,
