@@ -121,6 +121,7 @@ pub fn score_spec(
             .collect(),
         expected_rows,
         estimated_seconds: seconds,
+        estimated_work: work.values(),
         prompt_token_parts: parts,
         share_prefixes: false,
         pair_fraction,

@@ -190,6 +190,7 @@ fn base_spec(
             .collect(),
         expected_rows,
         estimated_seconds: 0.0,
+        estimated_work: Vec::new(),
         prompt_token_parts: Vec::new(),
         share_prefixes: false,
         pair_fraction: 1.0,
@@ -416,6 +417,7 @@ impl ClassifyTable {
         }
         let mut chosen = spec.clone();
         chosen.estimated_seconds = estimated.seconds;
+        chosen.estimated_work = estimated.work.values();
         chosen.prompt_token_parts = vec![head, tail];
         chosen.label_token_ids = labels;
         chosen.label_word_starts = starts;
@@ -567,6 +569,7 @@ impl ClassifyTable {
             call,
         );
         spec.estimated_seconds = estimated.seconds;
+        spec.estimated_work = estimated.work.values();
         spec.prompt_token_parts = vec![head, tail];
         spec.label_token_ids = labels;
         spec.scoring = LETTERS_SCORING.to_string();
@@ -608,6 +611,7 @@ impl ClassifyTable {
             call,
         );
         spec.estimated_seconds = unrounded_seconds(&work, &self.model, &self.device, self.chunk);
+        spec.estimated_work = work.values();
         spec.prompt_token_parts = vec![head, tail];
         spec.label_token_ids = option_spellings(&lowered.prompt.letters, tokenizer)?;
         spec.scoring = SET_CHOICE_SCORING.to_string();
@@ -663,6 +667,7 @@ impl ClassifyTable {
             call,
         );
         spec.estimated_seconds = unrounded_seconds(&work, &self.model, &self.device, self.chunk);
+        spec.estimated_work = work.values();
         spec.prompt_token_parts = vec![head, tail];
         spec.label_token_ids = option_spellings(&prompt.prompt.letters, tokenizer)?;
         spec.scoring = SET_CHOICE_SCORING.to_string();
@@ -695,6 +700,7 @@ impl ClassifyTable {
         );
         let mut spec = base_spec(&call.prompt, name, aliases, expected_rows, call);
         spec.estimated_seconds = estimated.seconds;
+        spec.estimated_work = estimated.work.values();
         spec.prompt_token_parts = vec![head, tail];
         spec.label_token_ids = blocks;
         spec.scoring = DECISION_SCORING.to_string();
@@ -747,6 +753,7 @@ impl ClassifyTable {
             call,
         );
         spec.estimated_seconds = estimated.seconds;
+        spec.estimated_work = estimated.work.values();
         spec.prompt_token_parts = vec![head, tail];
         spec.label_token_ids = blocks;
         spec.scoring = DECISION_SCORING.to_string();

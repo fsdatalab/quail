@@ -54,7 +54,7 @@ const MODEL_NODE: [Field; 6] = [
     ("pass_group", Some("-1")),
     ("document_ends", Some("[]")),
 ];
-const SPEC: [Field; 8] = [
+const SPEC: [Field; 9] = [
     ("name", None),
     ("aliases", None),
     ("query_template", None),
@@ -63,6 +63,7 @@ const SPEC: [Field; 8] = [
     ("estimated_seconds", None),
     ("prompt_token_parts", Some("[]")),
     ("share_prefixes", Some("false")),
+    ("estimated_work", Some("[]")),
 ];
 const ANSWER: [Field; 7] = [
     ("alias", None),

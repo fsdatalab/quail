@@ -1,8 +1,8 @@
 //! Price a physical plan: each node on its own, and the plan as a whole.
 //!
-//! The plan's seconds pack every node's work into forward passes
-//! together and add the seconds-priced nodes, so node prices do not add
-//! up to the plan's.
+//! Every node's price is its work. The plan's seconds are the seconds
+//! of all that work together, packed into forward passes, so node
+//! seconds do not add up to the plan's.
 
 use std::collections::BTreeMap;
 
@@ -10,14 +10,14 @@ use crate::cost::budgets::{floor_divide, pages_of, parallel_copies};
 use crate::cost::extract::{self, ExtractInputs};
 use crate::cost::quantity::{Quantity, numpy_sum};
 use crate::cost::score::score_fixed_tokens;
-use crate::cost::sol::speed_of_light;
+use crate::cost::sol::{speed_of_light, unrounded_seconds};
 use crate::cost::statistics::{AliasStats, round_half_even};
 use crate::cost::work::{Work, ask, packed, scan};
 use crate::physical::{AiFilterAttributes, PhysicalNode, build_pipelines, resident_inputs};
 use serde_json::{Map, Value};
 
 use crate::classify::classify_statistics;
-use crate::columns::map_seconds;
+use crate::columns::map_cost;
 use crate::context::PlanningContext;
 use crate::error::CompileError;
 use crate::plan_statistics::CorpusStats;
@@ -99,6 +99,19 @@ fn spec_seconds(node: &PhysicalNode) -> Option<f64> {
         }
         _ => None,
     }
+}
+
+/// The work an inference node's spec was priced with, when it has it.
+fn spec_work(node: &PhysicalNode) -> Option<Work> {
+    let values = match node {
+        PhysicalNode::AiScore(node) => &node.attributes.spec.as_ref()?.estimated_work,
+        PhysicalNode::AiClassify(node) => &node.attributes.spec.as_ref()?.estimated_work,
+        PhysicalNode::AiExtract(node) => &node.attributes.spec.as_ref()?.estimated_work,
+        PhysicalNode::AiMap(node) => &node.attributes.spec.as_ref()?.estimated_work,
+        PhysicalNode::AiSaeFeatures(node) => &node.attributes.spec.as_ref()?.estimated_work,
+        _ => return None,
+    };
+    (!values.is_empty()).then(|| Work::from_values(values))
 }
 
 fn spec_state_tail(node: &PhysicalNode) -> i64 {
@@ -408,11 +421,33 @@ impl PlanPricer {
                     }
                 }
                 _ if spec_seconds(node).is_some() => {
-                    let seconds = self.inference_seconds(context, node, resident)?;
-                    entry.insert("seconds".into(), Value::from(seconds));
-                    NodePrice {
-                        work: None,
-                        seconds,
+                    let share = self.computed_share(context, node, resident)?;
+                    match spec_work(node) {
+                        // its work joins the plan's, packed with the rest
+                        Some(work) => {
+                            let copies = parallel_copies(context.gpus, spec_expected_rows(node));
+                            let work = &work * (share / copies);
+                            let seconds = unrounded_seconds(
+                                &work,
+                                &context.model,
+                                &context.device,
+                                self.chunk,
+                            );
+                            entry.insert("seconds".into(), Value::from(seconds));
+                            NodePrice {
+                                work: Some(work),
+                                seconds: 0.0,
+                            }
+                        }
+                        // a spec built without its work has its seconds alone
+                        None => {
+                            let seconds = spec_seconds(node).unwrap_or(0.0) * share;
+                            entry.insert("seconds".into(), Value::from(seconds));
+                            NodePrice {
+                                work: None,
+                                seconds,
+                            }
+                        }
                     }
                 }
                 _ => NodePrice::default(),
@@ -533,8 +568,10 @@ impl PlanPricer {
         );
     }
 
-    /// An inference node's seconds: its spec's, scaled by the share it computes.
-    fn inference_seconds(
+    /// The share of its spec's estimate an inference node computes: what
+    /// its documents do not borrow from another's KV, over its key
+    /// documents.
+    fn computed_share(
         &self,
         context: &PlanningContext,
         node: &PhysicalNode,
@@ -545,21 +582,22 @@ impl PlanPricer {
         let shared = alias
             .as_deref()
             .and_then(|alias| self.shared(context, node, alias));
-        let mut seconds = spec_seconds(node).unwrap_or(0.0);
+        let priced = spec_seconds(node).unwrap_or(0.0) != 0.0;
+        let mut share = 1.0;
         if let (Some(shared), Some(alias)) = (shared, &alias)
-            && seconds != 0.0
+            && priced
         {
-            seconds *= self.fresh_fraction(context, node, alias, shared, resident)?;
+            share *= self.fresh_fraction(context, node, alias, shared, resident)?;
         }
         let keys = alias
             .as_deref()
             .and_then(|alias| context.key_documents(alias));
         if let (Some(keys), Some(alias)) = (keys, &alias)
-            && seconds != 0.0
+            && priced
         {
-            seconds *= self.asked_fraction(context, node, alias, keys, shared)?;
+            share *= self.asked_fraction(context, node, alias, keys, shared)?;
         }
-        Ok(seconds)
+        Ok(share)
     }
 
     /// The share of a node's fresh tokens that its key documents compute.
@@ -639,8 +677,9 @@ impl PlanPricer {
             }
             PhysicalNode::AiMap(map) => {
                 let spec = map.attributes.spec.as_ref().expect("a spec");
-                let whole = map_seconds(context, spec, spec.expected_rows, resident, &[])?;
-                let part = map_seconds(context, spec, spec.expected_rows, resident, &shared_f64)?;
+                let whole = map_cost(context, spec, spec.expected_rows, resident, &[])?.seconds;
+                let part =
+                    map_cost(context, spec, spec.expected_rows, resident, &shared_f64)?.seconds;
                 Ok(ratio(part, whole))
             }
             PhysicalNode::AiClassify(classify) => {

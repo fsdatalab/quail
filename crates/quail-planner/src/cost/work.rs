@@ -73,6 +73,45 @@ impl Work {
         self
     }
 
+    /// The work's counts, each summed over documents, in field order.
+    pub fn values(&self) -> Vec<f64> {
+        [
+            &self.tokens,
+            &self.pairs,
+            &self.kv_written,
+            &self.kv_read,
+            &self.sliding_pairs,
+            &self.sliding_kv_read,
+            &self.state_written,
+            &self.state_read,
+            &self.sae_encoded,
+            &self.readout_rows,
+            &self.readout_head_rows,
+        ]
+        .iter()
+        .map(|value| value.total())
+        .collect()
+    }
+
+    /// The work of counts in the order [`Work::values`] gives them; no
+    /// work for an empty list.
+    pub fn from_values(values: &[f64]) -> Work {
+        let at = |index: usize| Quantity::Scalar(values.get(index).copied().unwrap_or(0.0));
+        Work {
+            tokens: at(0),
+            pairs: at(1),
+            kv_written: at(2),
+            kv_read: at(3),
+            sliding_pairs: at(4),
+            sliding_kv_read: at(5),
+            state_written: at(6),
+            state_read: at(7),
+            sae_encoded: at(8),
+            readout_rows: at(9),
+            readout_head_rows: at(10),
+        }
+    }
+
     /// Sum work over document arrays, leaving scalar counts unchanged.
     pub fn total(&self) -> Work {
         let sum = |value: &Quantity| Quantity::Scalar(value.total());

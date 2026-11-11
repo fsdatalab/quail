@@ -108,6 +108,7 @@ fn extract_spec(
         arguments: bound.arguments,
         expected_rows,
         estimated_seconds: 0.0,
+        estimated_work: Vec::new(),
         prompt_token_parts: vec![
             prompt.preamble_token_ids.clone(),
             prompt.tail_token_ids.clone(),
@@ -140,7 +141,9 @@ fn extract_spec(
             &[(tail - state_tail) as f64],
             model.sliding_window,
         );
-        spec.estimated_seconds = unrounded_seconds(&(&work * expected_rows), model, device, chunk);
+        let work = &work * expected_rows;
+        spec.estimated_seconds = unrounded_seconds(&work, model, device, chunk);
+        spec.estimated_work = work.values();
         spec.max_answer_tokens = model.read_span_tokens;
         spec.state_tail_tokens = state_tail;
         spec.question_header_token_ids = question_header;
@@ -183,21 +186,22 @@ fn extract_spec(
     )
     .map_err(CompileError::new)?;
     spec.estimated_seconds = cost.seconds;
+    spec.estimated_work = cost.work.values();
     Ok(spec)
 }
 
-/// A map's estimated seconds over its documents, as `map_seconds`.
+/// A map's estimated cost over its documents.
 ///
 /// # Errors
 ///
 /// The planner has no token counts for the map's table.
-pub fn map_seconds(
+pub fn map_cost(
     context: &PlanningContext,
     spec: &MapSpec,
     expected_rows: f64,
     resident: bool,
     shared: &[f64],
-) -> Result<f64, CompileError> {
+) -> Result<extract::ExtractCost, CompileError> {
     let lengths: Vec<f64> = context
         .lengths(&spec.aliases[0])?
         .iter()
@@ -216,7 +220,7 @@ pub fn map_seconds(
         recurrent: false,
     };
     let model = &context.model;
-    Ok(extract::estimate(
+    extract::estimate(
         expected_rows,
         &lengths,
         shared,
@@ -226,8 +230,7 @@ pub fn map_seconds(
         &context.device,
         context.gpus,
     )
-    .map_err(CompileError::new)?
-    .seconds)
+    .map_err(CompileError::new)
 }
 
 fn map_spec(
@@ -246,12 +249,15 @@ fn map_spec(
         arguments: bound.arguments,
         expected_rows,
         estimated_seconds: 0.0,
+        estimated_work: Vec::new(),
         prompt_token_parts: vec![prompt.preamble_token_ids, prompt.tail_token_ids],
         share_prefixes: false,
         max_answer_tokens: call.max_answer_tokens,
         expected_answer_tokens: MAP_ANSWER_TOKENS.min(call.max_answer_tokens),
     };
-    spec.estimated_seconds = map_seconds(context, &spec, expected_rows, resident, &[])?;
+    let cost = map_cost(context, &spec, expected_rows, resident, &[])?;
+    spec.estimated_seconds = cost.seconds;
+    spec.estimated_work = cost.work.values();
     Ok(spec)
 }
 
@@ -297,7 +303,7 @@ fn sae_features_spec(
         gpus: context.gpus,
         max_pooling,
     };
-    let (_, seconds) = cost.estimate(expected_rows, resident);
+    let (work, seconds) = cost.estimate(expected_rows, resident);
     let bound = bind(&call.prompt);
     Ok(SaeFeaturesSpec {
         name: column.name.clone(),
@@ -306,6 +312,7 @@ fn sae_features_spec(
         arguments: bound.arguments,
         expected_rows,
         estimated_seconds: seconds,
+        estimated_work: work.values(),
         prompt_token_parts: vec![prompt.preamble_token_ids, prompt.tail_token_ids],
         share_prefixes: false,
         pooling: call.pooling.clone(),

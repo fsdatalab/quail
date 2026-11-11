@@ -17,6 +17,8 @@ tagged_struct! {
         arguments: Vec<(String, String)>,
         expected_rows: f64,
         estimated_seconds: f64,
+        /// The work the seconds price, as `Work::values` lists it.
+        estimated_work: Vec<f64> = default,
         prompt_token_parts: Vec<TokenIds>,
         share_prefixes: bool,
         pair_fraction: f64,
@@ -35,6 +37,8 @@ tagged_struct! {
         arguments: Vec<(String, String)>,
         expected_rows: f64,
         estimated_seconds: f64,
+        /// The work the seconds price, as `Work::values` lists it.
+        estimated_work: Vec<f64> = default,
         prompt_token_parts: Vec<TokenIds>,
         share_prefixes: bool,
         pair_fraction: f64,
@@ -62,6 +66,8 @@ tagged_struct! {
         arguments: Vec<(String, String)>,
         expected_rows: f64,
         estimated_seconds: f64,
+        /// The work the seconds price, as `Work::values` lists it.
+        estimated_work: Vec<f64> = default,
         prompt_token_parts: Vec<TokenIds>,
         share_prefixes: bool,
         question: String,
@@ -88,6 +94,8 @@ tagged_struct! {
         arguments: Vec<(String, String)>,
         expected_rows: f64,
         estimated_seconds: f64,
+        /// The work the seconds price, as `Work::values` lists it.
+        estimated_work: Vec<f64> = default,
         prompt_token_parts: Vec<TokenIds>,
         share_prefixes: bool,
         max_answer_tokens: i64,
@@ -104,6 +112,8 @@ tagged_struct! {
         arguments: Vec<(String, String)>,
         expected_rows: f64,
         estimated_seconds: f64,
+        /// The work the seconds price, as `Work::values` lists it.
+        estimated_work: Vec<f64> = default,
         prompt_token_parts: Vec<TokenIds>,
         share_prefixes: bool,
         pooling: String,
