@@ -4,8 +4,14 @@
 //! `AiNode` included, with Quail's rules among them. [`default_rule_names`]
 //! gives the default order: DataFusion's default rules, with Quail's four
 //! before `replace_distinct_aggregate`, which turns a `DISTINCT` into a
-//! GROUP BY. [`crate::claim_model_regions`] claims the model regions of
-//! the plan the optimizer leaves, before physical planning.
+//! GROUP BY, and `lower_ai_calls` after `decorrelate_lateral_join`.
+//! [`crate::claim_model_regions`] claims the model regions of the plan
+//! the optimizer leaves, before physical planning.
+//!
+//! [`crate::LowerAiCalls`] runs twice: as an analyzer rule on the plan
+//! the query wrote, and as the optimizer rule `lower_ai_calls` on the
+//! joins DataFusion makes of correlated subqueries, which hold the
+//! subquery's AI calls in their ON.
 //!
 //! Each `AiNode` tells DataFusion's rules what they may do around it:
 //! which filters may move below it and which columns it reads (see
@@ -39,8 +45,14 @@ pub const QUAIL_RULES: [&str; 4] = [
 /// The rule Quail's rules run before.
 const QUAIL_RULES_BEFORE: &str = "replace_distinct_aggregate";
 
+/// The rule that lowers the AI calls DataFusion's rules leave in a join.
+const LOWERING_RULE: &str = "lower_ai_calls";
+
+/// The last of DataFusion's rules that make a join of a subquery.
+const LOWERING_RULE_AFTER: &str = "decorrelate_lateral_join";
+
 #[cfg(test)]
-const EXPECTED_DEFAULT_RULES: [&str; 29] = [
+const EXPECTED_DEFAULT_RULES: [&str; 30] = [
     "rewrite_set_comparison",
     "optimize_unions",
     "unions_to_filter",
@@ -54,6 +66,7 @@ const EXPECTED_DEFAULT_RULES: [&str; 29] = [
     "decorrelate_predicate_subquery",
     "scalar_subquery_to_join",
     "decorrelate_lateral_join",
+    "lower_ai_calls",
     "extract_equijoin_predicate",
     "eliminate_duplicated_expr",
     "eliminate_filter",
@@ -78,6 +91,7 @@ fn quail_rule(name: &str) -> Option<Arc<dyn OptimizerRule + Send + Sync>> {
         "place_ai_nodes" => Arc::new(crate::rules::placement::PlaceAiNodes),
         name if name.starts_with("derive") => Arc::new(crate::rules::derive::Derive::named(name)?),
         "merge_repeated_ai_calls" => Arc::new(crate::rules::repeated::MergeRepeatedAiCalls),
+        LOWERING_RULE => Arc::new(crate::rules::lower::LowerAiCalls),
         _ => return None,
     })
 }
@@ -117,8 +131,8 @@ pub fn logical_rules(names: &[String]) -> Result<Vec<Arc<dyn OptimizerRule + Sen
 
 /// `existing`, a session's rules, with Quail's rules before
 /// `replace_distinct_aggregate`, or first when it has none, and
-/// [`crate::ClaimModelRegions`] last. A rule of Quail's already in the
-/// list is moved there.
+/// `lower_ai_calls` after `decorrelate_lateral_join`, or last when it
+/// has none. A rule of Quail's already in the list is moved there.
 pub(crate) fn with_quail_rules(
     existing: &[Arc<dyn OptimizerRule + Send + Sync>],
 ) -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
@@ -127,20 +141,29 @@ pub(crate) fn with_quail_rules(
             .iter()
             .map(|name| quail_rule(name).expect("a rule of Quail's"))
     };
+    let lowering = || quail_rule(LOWERING_RULE).expect("a rule of Quail's");
     let kept = existing
         .iter()
-        .filter(|rule| !QUAIL_RULES.contains(&rule.name()));
+        .filter(|rule| !QUAIL_RULES.contains(&rule.name()) && rule.name() != LOWERING_RULE);
     let mut rules: Vec<Arc<dyn OptimizerRule + Send + Sync>> = Vec::new();
     let mut placed = false;
+    let mut lowered = false;
     for rule in kept {
         if rule.name() == QUAIL_RULES_BEFORE && !placed {
             rules.extend(quail());
             placed = true;
         }
         rules.push(Arc::clone(rule));
+        if rule.name() == LOWERING_RULE_AFTER && !lowered {
+            rules.push(lowering());
+            lowered = true;
+        }
     }
     if !placed {
         rules.splice(0..0, quail());
+    }
+    if !lowered {
+        rules.push(lowering());
     }
     rules
 }

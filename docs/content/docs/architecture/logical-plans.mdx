@@ -58,6 +58,9 @@ tables below the node.
 2. **Lower AI calls.** Quail's `lower_ai_calls` analyzer rule makes one
    pass: each AI call becomes an `AiNode` below the operator that held
    it. Tests of answer columns initially remain DataFusion filters.
+   The same rule runs again in the optimizer, after DataFusion turns
+   correlated subqueries into joins, and lowers the AI calls those
+   joins hold.
 3. **Rewrite the plan.** DataFusion moves ordinary filters toward scans
    and removes unused columns. Quail places AI calls at the tables they
    read, absorbs tests of answers, and merges repeated AI calls.

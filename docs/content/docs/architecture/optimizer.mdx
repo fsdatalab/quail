@@ -73,7 +73,8 @@ for supported operations and arguments.
 ## Built-in rules
 
 DataFusion's logical rules run over the whole plan, including `AiNode`s.
-Quail inserts its rules before `replace_distinct_aggregate`. The query
+Quail inserts its rules before `replace_distinct_aggregate`, and
+`lower_ai_calls` after `decorrelate_lateral_join`. The query
 planner claims model regions from the plan they leave. The table lists
 Quail's logical rules in order;
 [Rewrites by number](/docs/extending/rules#rewrites-by-number) gives their

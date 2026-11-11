@@ -7,7 +7,7 @@ use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, Result};
 use datafusion::logical_expr::utils::{conjunction, split_conjunction};
 use datafusion::logical_expr::{
-    Aggregate, Expr, Filter, LogicalPlan, LogicalPlanBuilder, Projection, Window,
+    Aggregate, Expr, Filter, JoinType, LogicalPlan, LogicalPlanBuilder, Projection, Window,
 };
 
 use super::claim::calls_ai_function;
@@ -105,6 +105,36 @@ fn drop_written_names(plan: LogicalPlan) -> Result<LogicalPlan> {
         })
     })
     .map(|done| done.data)
+}
+
+/// An inner join with each ON term that calls the model, and is not the
+/// join's own AI predicate, as a WHERE term above it: an inner join
+/// keeps a pair exactly when every ON term is TRUE.
+fn terms_above(plan: LogicalPlan) -> Result<LogicalPlan> {
+    let LogicalPlan::Join(join) = &plan else {
+        return Ok(plan);
+    };
+    if join.join_type != JoinType::Inner {
+        return Ok(plan);
+    }
+    let mut kept = Vec::new();
+    let mut above = Vec::new();
+    for term in join.filter.iter().flat_map(split_conjunction) {
+        let calls = !ai_calls(term)?.is_empty();
+        if calls && !crate::rules::lower::is_join_predicate(term) {
+            above.push(term.clone());
+        } else {
+            kept.push(term.clone());
+        }
+    }
+    let Some(above) = conjunction(above) else {
+        return Ok(plan);
+    };
+    let mut below = join.clone();
+    below.filter = conjunction(kept);
+    LogicalPlanBuilder::from(LogicalPlan::Join(below))
+        .filter(above)?
+        .build()
 }
 
 /// The AI calls moved out of DataFusion's operators so far.
@@ -205,12 +235,13 @@ impl Extracted {
             return union.build();
         }
         self.num_inputs += 1;
+        let plan = self.join_keys_below(plan)?;
+        let plan = terms_above(plan)?;
         if let Some(join) = super::join::lower_outer_join(&plan, self.num_inputs, |input| {
             self.lower(input, columns)
         })? {
             return Ok(join);
         }
-        let plan = self.join_keys_below(plan)?;
         let inputs = plan
             .inputs()
             .into_iter()

@@ -522,3 +522,40 @@ def test_an_ai_filters_answer_is_returned_beside_a_join_on_another_answer():
         "JOIN v ON AI.MAP(r.body, 'Name it.', 8) <> v.name ORDER BY r.id")
     session.close()
     assert table.column("k").to_pylist() == [True, True]
+
+
+def test_an_ai_call_in_a_correlated_subquery_is_answered():
+    session, context = _yes_context({
+        "r": pa.table({"id": ["r0", "r1"], "body": ["a", "b"]}),
+        "v": pa.table({"id": ["v0", "v1", "v2"], "rid": ["r0", "r1", "r9"]}),
+    })
+    test = "r.id = v.rid AND AI.IF(PROMPT('q: {0}', r.body))"
+    cases = {
+        f"SELECT v.id FROM v WHERE EXISTS (SELECT 1 FROM r WHERE {test})":
+            [("v0",), ("v1",)],
+        f"SELECT v.id FROM v WHERE NOT EXISTS (SELECT 1 FROM r WHERE {test})":
+            [("v2",)],
+        f"SELECT v.id, (SELECT COUNT(*) FROM r WHERE {test}) AS n FROM v":
+            [("v0", 1), ("v1", 1), ("v2", 0)],
+    }
+    for sql, expected in cases.items():
+        assert _sorted_rows(context.sql(sql)) == expected, sql
+    session.close()
+
+
+def test_a_row_an_outer_join_fills_with_null_gets_the_models_answer():
+    session = quail.Session(CONFIG, tokenizer=TOKENIZER)
+    oracle = Oracle(labels=lambda spec, ids: "a")
+    oracle.catalog = session.catalog
+    context = quail.SessionContext(
+        session, physical_executor=oracle_executor(oracle))
+    context.register("r", quail.DocumentProvider.from_table(
+        pa.table({"id": ["r0"], "body": ["x"]}), id_col="id"))
+    context.register("v", quail.DocumentProvider.from_table(
+        pa.table({"id": ["v0", "v1"], "name": ["a", "b"]}), id_col="id"))
+    call = "AI.CLASSIFY(PROMPT('q: {0}', r.body), ['a', 'b'])"
+    # v1 has no partner; the call above the join still answers for its row
+    rows = _sorted_rows(context.sql(
+        f"SELECT v.id, {call} AS c FROM r RIGHT JOIN v ON {call} = v.name"))
+    session.close()
+    assert rows == [("v0", "a"), ("v1", "a")]

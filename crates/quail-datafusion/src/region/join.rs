@@ -25,10 +25,7 @@ pub(super) fn lower_outer_join(
     let LogicalPlan::Join(join) = plan else {
         return Ok(None);
     };
-    if !matches!(
-        join.join_type,
-        JoinType::Left | JoinType::Right | JoinType::Full
-    ) {
+    if join.join_type == JoinType::Inner {
         return Ok(None);
     }
     let mut has_ai = false;
@@ -107,27 +104,56 @@ pub(super) fn lower_outer_join(
     // is duplicated or NULL. The first join restores left-only rows; their
     // NULL pair-right id cannot match a right row in the second join. RIGHT
     // needs no left-only rows, whereas FULL preserves both unmatched sides.
-    let first = if join.join_type == JoinType::Right {
-        JoinType::Inner
-    } else {
-        JoinType::Left
+    let restored = match join.join_type {
+        // a semi, anti, or mark join returns one side's rows, each kept,
+        // dropped, or marked by whether it has a matching pair
+        JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark => {
+            LogicalPlanBuilder::from(left.rows.clone())
+                .join(
+                    matches,
+                    join.join_type,
+                    (vec![left.id()], vec![matched_left]),
+                    None,
+                )?
+                .build()?
+        }
+        JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark => {
+            LogicalPlanBuilder::from(matches)
+                .join(
+                    right.rows.clone(),
+                    join.join_type,
+                    (vec![matched_right], vec![right.id()]),
+                    None,
+                )?
+                .build()?
+        }
+        _ => {
+            let first = if join.join_type == JoinType::Right {
+                JoinType::Inner
+            } else {
+                JoinType::Left
+            };
+            LogicalPlanBuilder::from(left.rows.clone())
+                .join(matches, first, (vec![left.id()], vec![matched_left]), None)?
+                .join(
+                    right.rows.clone(),
+                    join.join_type,
+                    (vec![matched_right], vec![right.id()]),
+                    None,
+                )?
+                .build()?
+        }
     };
-    let restored = LogicalPlanBuilder::from(left.rows.clone())
-        .join(matches, first, (vec![left.id()], vec![matched_left]), None)?
-        .join(
-            right.rows.clone(),
-            join.join_type,
-            (vec![matched_right], vec![right.id()]),
-            None,
-        )?
-        .build()?;
     let exprs = join
         .schema
         .columns()
         .into_iter()
         .map(|column| {
-            let Some(read) = left.column(&column).or_else(|| right.column(&column)) else {
-                return internal_err!("outer AI join cannot restore column {column}");
+            let read = match left.column(&column).or_else(|| right.column(&column)) {
+                Some(read) => read,
+                // a mark join's mark is the restoring join's own
+                None if restored.schema().has_column(&column) => column.clone(),
+                None => return internal_err!("outer AI join cannot restore column {column}"),
             };
             Ok(Expr::Column(read).alias_qualified(column.relation, column.name))
         })

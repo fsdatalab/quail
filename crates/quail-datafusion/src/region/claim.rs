@@ -532,7 +532,7 @@ pub(super) fn calls_ai(plan: &LogicalPlan) -> Result<bool> {
 
 /// Whether any operator in the subtree, or an EXISTS or IN subquery in
 /// it, calls an AI function that is not yet lowered into an `AiNode`.
-pub(super) fn calls_ai_function(plan: &LogicalPlan) -> Result<bool> {
+pub(crate) fn calls_ai_function(plan: &LogicalPlan) -> Result<bool> {
     plan.exists(|node| {
         // an `AiNode`'s expressions hold its lowered call
         if as_node::<AiNode>(node).is_some() {

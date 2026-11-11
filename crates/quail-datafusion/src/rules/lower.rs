@@ -47,9 +47,9 @@ use datafusion::logical_expr::utils::{conjunction, split_conjunction};
 use datafusion::logical_expr::{
     Expr, ExprSchemable, Filter, Join, JoinType, LogicalPlan, Operator, Projection,
 };
-use datafusion::optimizer::AnalyzerRule;
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 use datafusion::optimizer::simplify_expressions::ExprSimplifier;
+use datafusion::optimizer::{AnalyzerRule, OptimizerConfig, OptimizerRule};
 
 use crate::SPAN_SUFFIX;
 use crate::ai::{AiNode, Semantics, Written, WrittenTest};
@@ -73,6 +73,23 @@ impl AnalyzerRule for LowerAiCalls {
 
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
         crate::region::claim::lower_regions(plan)
+    }
+}
+
+impl OptimizerRule for LowerAiCalls {
+    fn name(&self) -> &str {
+        "lower_ai_calls"
+    }
+
+    fn rewrite(
+        &self,
+        plan: LogicalPlan,
+        _config: &dyn OptimizerConfig,
+    ) -> Result<Transformed<LogicalPlan>> {
+        if !crate::region::claim::calls_ai_function(&plan)? {
+            return Ok(Transformed::no(plan));
+        }
+        Ok(Transformed::yes(crate::region::claim::lower_regions(plan)?))
     }
 }
 
@@ -148,6 +165,12 @@ fn is_asked(term: &Expr) -> bool {
     function_name(term) == Some("ai_filter") || is_score_test(term)
 }
 
+/// Whether a term of a join's ON is the join's own AI predicate, which
+/// [`lower_join`] makes an AI join of.
+pub(crate) fn is_join_predicate(term: &Expr) -> bool {
+    is_score_test(hinted(term)) || filter_calls(hinted(term)).is_some()
+}
+
 /// Terms of one WHERE or ON, each with its position among them.
 type Terms = Vec<(usize, Expr)>;
 
@@ -158,7 +181,7 @@ fn split_asked(predicate: &Expr) -> (Terms, Terms, usize) {
     let num_terms = terms.len();
     let (mut asked, mut rest) = (Vec::new(), Vec::new());
     for (position, term) in terms.into_iter().enumerate() {
-        if is_score_test(hinted(term)) || filter_calls(hinted(term)).is_some() {
+        if is_join_predicate(term) {
             asked.push((position, term.clone()));
         } else {
             rest.push((position, term.clone()));
@@ -417,24 +440,45 @@ fn column_calls(term: &Expr) -> Vec<Expr> {
 }
 
 /// The name of the column an `AiNode` below `plan` adds for `call`, if
-/// one does.
+/// `plan` returns that column with the node's answer in every row.
+///
+/// An outer join fills the rows of one input with NULL, where the call
+/// above the join has the model's answer, so the search stops at that
+/// input. It also stops at an operator that returns other rows than it
+/// reads, such as an aggregate.
 fn added_column(plan: &LogicalPlan, call: &Expr) -> Option<String> {
-    let mut name = None;
-    let _ = plan.apply(|node| {
+    fn search(node: &LogicalPlan, call: &Expr) -> Option<String> {
         if let Some(column) = as_node::<AiNode>(node)
             && (!column.is_predicate() || column.filter.is_none())
             && column.call == *call
         {
-            name = Some(column.answer.clone());
-            return Ok(TreeNodeRecursion::Stop);
+            return Some(column.answer.clone());
         }
-        // a derived table's columns are named by its alias
-        if matches!(node, LogicalPlan::SubqueryAlias(_)) {
-            return Ok(TreeNodeRecursion::Jump);
-        }
-        Ok(TreeNodeRecursion::Continue)
-    });
-    name
+        let inputs: Vec<&LogicalPlan> = match node {
+            LogicalPlan::Join(join) => match join.join_type {
+                JoinType::Inner => vec![&join.left, &join.right],
+                JoinType::Left | JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark => {
+                    vec![&join.left]
+                }
+                JoinType::Right
+                | JoinType::RightSemi
+                | JoinType::RightAnti
+                | JoinType::RightMark => vec![&join.right],
+                JoinType::Full => Vec::new(),
+            },
+            LogicalPlan::Filter(_)
+            | LogicalPlan::Projection(_)
+            | LogicalPlan::Sort(_)
+            | LogicalPlan::Window(_)
+            | LogicalPlan::Limit(_)
+            | LogicalPlan::Repartition(_)
+            | LogicalPlan::Extension(_) => node.inputs(),
+            // a derived table's columns are named by its alias
+            _ => Vec::new(),
+        };
+        inputs.into_iter().find_map(|input| search(input, call))
+    }
+    search(plan, call).filter(|name| plan.schema().has_column_with_unqualified_name(name))
 }
 
 /// `input` with an `AiNode` adding `call`'s answer as `name`,
