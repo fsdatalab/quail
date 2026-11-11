@@ -103,6 +103,11 @@ class Oracle:
         features: A callable (spec, document) -> a feature list of
             {"feature", "strength"} mappings; None plants one feature
             per document, its id modulo 7 at strength id + 1.
+        truth: A callable (kind, question, texts) -> the answer of any
+            operator, from the question's text and the text of each
+            document it reads; kind is "filter", "join", "label",
+            "score", "map", or "extract". It replaces the arguments
+            above, and reads each input by position.
         probabilities: Whether a classification reports label
             probabilities when its spec asks for them.
         retain: How many of a keep_kv filter's survivors the oracle
@@ -122,7 +127,7 @@ class Oracle:
     query = None
 
     def __init__(self, filters=None, joins=None, labels=None, scores=None,
-                 answers=None, features=None, maps=None, *,
+                 answers=None, features=None, maps=None, *, truth=None,
                  probabilities=False, retain=0, join_metrics=None,
                  pipelines=False, tightens_after=()):
         self.filters = filters or {}
@@ -132,6 +137,16 @@ class Oracle:
         self.answers = answers
         self.features = features
         self.maps = maps or (lambda spec, document: f"{spec.name} {document}")
+        self.truth = truth
+        if truth is not None:
+            self.scores = lambda spec, ids: truth(
+                "score", spec.query_template, self._texts(spec.aliases, ids))
+            self.maps = lambda spec, document: truth(
+                "map", spec.query_template,
+                self._texts(spec.aliases[:1], [document]))
+            self.answers = lambda spec, document: truth(
+                "extract", question_text(spec.prompt_token_parts[1]),
+                self._texts(spec.aliases[:1], [document]))
         self.probabilities = probabilities
         self.retain = retain
         self.join_metrics = join_metrics
@@ -157,8 +172,17 @@ class Oracle:
 
     def _source(self, alias, document) -> int:
         """The registered table's row of an input's document position."""
-        rows = self.source_rows.get(alias)
+        rows = None if self.truth is not None else self.source_rows.get(alias)
         return int(document) if rows is None else rows[int(document)]
+
+    def _texts(self, aliases, ids) -> tuple:
+        """The text of each input's document, an empty string for NULL."""
+        found = []
+        for alias, document in zip(aliases, ids):
+            text = self.texts[alias][int(document)]
+            text = text.as_py() if hasattr(text, "as_py") else text
+            found.append("" if text is None else str(text))
+        return tuple(found)
 
     def _sources(self, aliases, ids) -> tuple:
         return tuple(self._source(alias, document)
@@ -208,6 +232,10 @@ class Oracle:
 
     def _filter_answer(self, node, document) -> bool:
         document = self._source(node.alias, document)
+        if self.truth is not None:
+            return bool(self.truth(
+                "filter", question_text(node.question_token_ids),
+                self._texts([node.alias], [document])))
         if callable(self.filters):
             return bool(self.filters(node.alias, document, node.written_position))
         truth = self.filters[node.alias]
@@ -220,6 +248,11 @@ class Oracle:
     def _join_answer(self, node, anchor_id, partner_ids) -> bool:
         anchor_id, *partner_ids = self._sources(
             (node.anchor, *node.partners), (anchor_id, *partner_ids))
+        if self.truth is not None:
+            return bool(self.truth(
+                "join", question_text(node.frame_token_ids),
+                self._texts((node.anchor, *node.partners),
+                            (anchor_id, *partner_ids))))
         if callable(self.joins):
             assignment = dict(zip((node.anchor, *node.partners),
                                   (anchor_id, *partner_ids)))
@@ -228,6 +261,9 @@ class Oracle:
         return bool(rule(anchor_id, *partner_ids))
 
     def _label(self, spec, ids):
+        if self.truth is not None:
+            return self.truth("label", spec.query_template,
+                              self._texts(spec.aliases, ids))
         if callable(self.labels):
             return self.labels(spec, ids)
         return None if self.labels is None else self.labels[ids[0]]
@@ -427,7 +463,7 @@ class OracleFilter(FilterOperator):
             self.region.send_finished(self)
         if node.keep_kv and oracle.arena is not None:
             kept = [document for local, document in enumerate(self.ids)
-                    if self.answers[local][0]]
+                    if self.answers.get(local, [False])[0]]
             for document in kept[:oracle.retain]:
                 oracle.arena.retain((node.alias, document), 16)
 

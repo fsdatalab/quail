@@ -617,3 +617,17 @@ async fn a_join_above_reordered_ai_nodes_reads_their_columns_by_their_new_order(
     assert_eq!(regions(&plan).len(), 1, "{}", plan.display_indent());
     Ok(())
 }
+
+#[tokio::test]
+async fn a_test_of_two_answers_below_a_join_stays_below_it() -> Result<()> {
+    let context = context()?;
+    // no region runs a test of two calls' answers, and the SELECT list
+    // below the join hides them from the rows the AI join returns
+    let query = "SELECT r.id, a.aspect FROM reviews r JOIN aspects a \
+        ON AI.IF(PROMPT('q {0} {1}', r.body, a.aspect)) AND r.id = a.aspect \
+        WHERE (length(AI.MAP(r.body, 'q3', 16)) > 4 \
+        OR lower(AI.MAP(r.body, 'q1', 16)) <> 'acme')";
+    let plan = optimized(&context, query).await?;
+    assert_eq!(regions(&plan).len(), 2, "{}", plan.display_indent());
+    Ok(())
+}

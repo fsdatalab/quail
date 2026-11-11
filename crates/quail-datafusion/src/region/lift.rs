@@ -81,6 +81,17 @@ pub(crate) fn lift_relational(plan: LogicalPlan) -> Result<(LogicalPlan, Above)>
     let mut lifted: Vec<Expr> = Vec::new();
     let relation = take_row_tests(root.input.as_ref().clone(), &answers, false, &mut lifted)?;
     let tests = lifted;
+    // a test moves above the region only when the region's rows have
+    // every column it reads; a SELECT list below a join can hide one,
+    // and the part is then claimed in smaller parts
+    let hidden = tests.iter().any(|test| {
+        test.column_refs()
+            .iter()
+            .any(|column| !relation.schema().has_column(column))
+    });
+    if hidden {
+        return Ok((with_a_column(plan)?, Above::default()));
+    }
     // each SELECT list item the region returns as it is, by position
     let mut kept: Vec<Expr> = Vec::new();
     let mut selected: Vec<Expr> = Vec::new();

@@ -340,12 +340,15 @@ fn input_key(node: &AiNode, keys: &[Column]) -> Option<Vec<String>> {
 }
 
 /// The key of a `DISTINCT` over `keys`: the node's returned answer
-/// alone, or columns of its input ([`input_key`]).
+/// alone, or columns of its input ([`input_key`]). An `AI.IF` is keyed
+/// by its input only: the executor stops a filter per group of input
+/// rows, not per answer.
 fn distinct_key(node: &AiNode, keys: &[Column]) -> Option<Vec<String>> {
-    let returns_answer = node
-        .returned_fields()
-        .iter()
-        .any(|field| field.name() == &node.answer);
+    let returns_answer = node.function() != "ai_filter"
+        && node
+            .returned_fields()
+            .iter()
+            .any(|field| field.name() == &node.answer);
     if let [column] = keys
         && column.relation.is_none()
         && column.name == node.answer
