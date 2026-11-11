@@ -55,7 +55,7 @@ dev = [
 ]
 
 [tool.uv.sources]
-quail-b = { git = "https://github.com/fsdatalab/quail-bench.git", rev = "2799ea6" }
+quail-b = { git = "https://github.com/fsdatalab/quail-bench.git", rev = "0a187b5" }
 
 # One wheel holds the quail package and _quail_native, the planner's
 # Rust module, built from the crates/ workspace
