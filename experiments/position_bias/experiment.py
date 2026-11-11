@@ -137,6 +137,7 @@ def run_task(data: TaskData, scorer: Scorer, *, seeds: Sequence[int] = SEEDS,
                      "precision": precision(selection.top, data.labels),
                      "num_rounds": selection.num_rounds,
                      "num_comparisons": selection.num_comparisons,
+                     "truncated": selection.truncated,
                      "new_seconds": cache.seconds - before,
                      "rounds": selection.rounds}
             record["quickselect"].append(entry)

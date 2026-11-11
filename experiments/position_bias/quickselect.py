@@ -34,6 +34,7 @@ class Selection:
     num_rounds: int = 0
     num_comparisons: int = 0
     rounds: list[dict] = field(default_factory=list)
+    truncated: bool = False
 
 
 def candidate_wins(compare: Compare, pivot: str, candidates: Sequence[str],
@@ -69,8 +70,15 @@ def candidate_wins(compare: Compare, pivot: str, candidates: Sequence[str],
 
 
 def quickselect(ids: Sequence[str], k: int, compare: Compare, *, rule: str,
-                bias: float = 0.0, seed: int = 0) -> Selection:
+                bias: float = 0.0, seed: int = 0,
+                max_comparisons_per_record: int = 20) -> Selection:
     """Return k ids that the comparator ranks highest.
+
+    A comparator that lets every candidate beat every pivot shrinks the
+    candidates by one per round, which costs about n * n / 2
+    comparisons. Past `max_comparisons_per_record` * n comparisons the
+    run stops and fills the rest of the k ids at random from the
+    candidates left, and marks the selection truncated.
 
     Args:
         ids: The candidate ids.
@@ -79,14 +87,20 @@ def quickselect(ids: Sequence[str], k: int, compare: Compare, *, rule: str,
         rule: The decision rule; see `candidate_wins`.
         bias: The first-slot bias the "calibrated" rule cancels.
         seed: Seeds the pivot choices.
+        max_comparisons_per_record: The comparison budget, per id.
     """
     rng = random.Random(seed)
     selection = Selection(top=[])
     remaining = list(ids)
     needed = k
+    budget = max_comparisons_per_record * len(ids)
     while needed > 0:
         if len(remaining) <= needed:
             selection.top.extend(remaining)
+            break
+        if selection.num_comparisons >= budget:
+            selection.top.extend(rng.sample(remaining, needed))
+            selection.truncated = True
             break
         pivot = rng.choice(remaining)
         candidates = [key for key in remaining if key != pivot]

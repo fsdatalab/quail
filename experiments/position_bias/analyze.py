@@ -57,6 +57,20 @@ def summarize(record: dict) -> dict:
            "tied_same_slot": swap["tied"]["same_slot_rate"],
            "bias": swap["all"]["bias"], "bias_stderr": swap["all"]["bias_stderr"],
            "pair_seconds": record.get("pair_seconds")}
+    # P(RECORD 1 wins) with the relevant record first, and second, over
+    # the different-label pairs; their gap is 1 for a perfect comparator
+    # and 0 for one that ignores which record is where
+    first, second = [], []
+    for row_ in record["swap"]["rows"]:
+        if row_["label_a"] == row_["label_b"]:
+            continue
+        relevant_first = row_["p_forward"] if row_["label_a"] else row_["p_backward"]
+        relevant_second = row_["p_backward"] if row_["label_a"] else row_["p_forward"]
+        first.append(relevant_first)
+        second.append(relevant_second)
+    row["p_relevant_first"] = statistics.mean(first)
+    row["p_relevant_second"] = statistics.mean(second)
+    row["comparison_gap"] = row["p_relevant_first"] - row["p_relevant_second"]
     for rule in ("raw", "calibrated", "both_orders"):
         runs = [entry for entry in record["quickselect"] if entry["rule"] == rule]
         values = [entry["precision"] for entry in runs]
@@ -64,6 +78,8 @@ def summarize(record: dict) -> dict:
         row[rule + "_min"], row[rule + "_max"] = min(values), max(values)
         row[rule + "_comparisons"] = statistics.mean(
             entry["num_comparisons"] for entry in runs)
+        row[rule + "_truncated"] = sum(entry.get("truncated", False)
+                                       for entry in runs)
     return row
 
 
@@ -121,10 +137,12 @@ def plot_topk(summary, path):
     width = 0.2
     for axes, task in zip(panels, TASK_NAMES):
         _axes_style(axes)
-        present = [(label, summary[model][task]) for model, label, _ in MODELS
+        # every model keeps its column; a missing record leaves it empty
+        present = [(index, summary[model][task])
+                   for index, (model, _, _) in enumerate(MODELS)
                    if task in summary.get(model, {})]
         for offset, (rule, color) in enumerate(zip(rules, SERIES)):
-            xs = [index + (offset - 1.5) * width for index in range(len(present))]
+            xs = [index + (offset - 1.5) * width for index, _ in present]
             values = [row[rule] for _, row in present]
             axes.bar(xs, values, width=width, color=color, edgecolor=SURFACE,
                      linewidth=1.5, label=RULE_TITLES[rule])
@@ -136,7 +154,7 @@ def plot_topk(summary, path):
         axes.set_ylim(0, 1.05)
         axes.set_ylabel(f"{TASK_TITLES[task]}\ntop-k precision", fontsize=8,
                         color=TEXT_SECONDARY)
-        axes.set_xticks(range(len(present)), [label for label, _ in present])
+        axes.set_xticks(range(len(MODELS)), [label for _, label, _ in MODELS])
     panels[0].legend(loc="upper left", fontsize=8, frameon=False, ncols=4,
                      bbox_to_anchor=(0, 1.25))
     figure.tight_layout()
@@ -198,7 +216,8 @@ def main():
                 print(f"{label:16} {task:8} pointwise {row['pointwise']:.2f} "
                       f"raw {row['raw']:.2f} calibrated {row['calibrated']:.2f} "
                       f"both {row['both_orders']:.2f} same-slot "
-                      f"{row['mixed_same_slot']:.2f} bias {row['bias']:+.3f}")
+                      f"{row['mixed_same_slot']:.2f} bias {row['bias']:+.3f} "
+                      f"gap {row['comparison_gap']:+.2f}")
 
 
 if __name__ == "__main__":
