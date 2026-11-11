@@ -4,7 +4,7 @@
 
 use crate::error::{CompileError, compile_error};
 use crate::physical::{
-    Alias, Asked, ColumnRef, Equality, ExtractStruct, ModelCall, Projected, ValueExpression,
+    Asked, ColumnRef, Equality, ExtractStruct, ModelCall, Projected, ValueExpression,
 };
 use serde_json::Value;
 
@@ -265,9 +265,6 @@ pub fn call_aliases(call: &ModelCall) -> Vec<String> {
     found
 }
 
-/// The struct fields of one feature list, as `FEATURE_LIST` holds them.
-pub const FEATURE_FIELDS: [&str; 2] = ["feature", "strength"];
-
 /// The predicate of an AI filter or AI join as a model call.
 pub fn asked_call(asked: &Asked) -> &ModelCall {
     match asked {
@@ -437,17 +434,6 @@ fn repr_json_list(value: &Value) -> String {
 }
 
 // ---------------------------------------------------------------- checks
-
-/// Validate an Alias: its model call or value expression, and its name.
-pub fn validate_alias(alias: &Alias) -> Result<(), CompileError> {
-    if let ValueExpression::ModelCall(call) = alias.expression.as_ref() {
-        validate_call(call)?;
-    }
-    if alias.name.is_empty() {
-        return compile_error("a projected expression needs a name");
-    }
-    Ok(())
-}
 
 fn strings(value: &Value) -> Vec<Value> {
     match value {

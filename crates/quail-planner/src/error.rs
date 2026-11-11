@@ -68,12 +68,6 @@ impl CompileError {
     pub fn is_unsupported(&self) -> bool {
         self.kind == ErrorKind::Unsupported
     }
-
-    /// Append diagnostic context without changing the error's kind or refusal.
-    pub fn with_context(mut self, context: impl fmt::Display) -> Self {
-        self.message = format!("{}:\n{context}", self.message);
-        self
-    }
 }
 
 /// A plan the configuration cannot run within its limits.
@@ -133,15 +127,7 @@ mod tests {
     }
 
     #[test]
-    fn context_preserves_kind_and_message_format() {
-        let error = CompileError::unsupported("These operators must run outside the model region")
-            .with_context("plan");
-        assert_eq!(
-            error.to_string(),
-            "These operators must run outside the model region:\nplan"
-        );
-        assert!(error.is_unsupported());
-        assert_eq!(error.refusal(), None);
+    fn a_refusal_without_reasons_reports_its_constraint() {
         assert_eq!(
             CompileError::refused(Refusal::new("reason", "memory", 2.0, 1.0, "GB")).message(),
             "reason"
