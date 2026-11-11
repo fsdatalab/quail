@@ -318,7 +318,6 @@ impl Extracted {
         let LogicalPlan::Join(join) = &plan else {
             return Ok(plan);
         };
-        let calls = |expr: &Expr| ai_calls(expr).map(|found| !found.is_empty());
         // which input an expression reads: 0, 1, or neither alone
         let side = |expr: &Expr| {
             let columns = expr.column_refs();
@@ -337,69 +336,50 @@ impl Extracted {
         let mut sides = [(*join.left).clone(), (*join.right).clone()];
         let mut moved = false;
         // `expr` with each of its AI calls read as a column of the SELECT
-        // list below the input it reads, named as the lowering names a
-        // call anywhere else
-        let mut below = |this: &mut Self, expr: &Expr, index: usize| -> Result<Expr> {
-            let named = this.name(ai_calls(expr)?, sides[index].schema());
-            let mut selected: Vec<Expr> = sides[index]
-                .schema()
-                .iter()
-                .map(|(qualifier, field)| {
-                    Expr::Column(Column::new(qualifier.cloned(), field.name()))
-                })
-                .collect();
-            selected.extend(named.iter().map(|(call, name)| call.clone().alias(name)));
-            sides[index] = LogicalPlanBuilder::from(sides[index].clone())
-                .project(selected)?
-                .build()?;
+        // list below the input the call reads, named as the lowering
+        // names a call anywhere else; unchanged when a call reads both
+        let mut below = |this: &mut Self, expr: &Expr| -> Result<Expr> {
+            let calls = ai_calls(expr)?;
+            let read: Vec<Option<usize>> = calls.iter().map(&side).collect();
+            if calls.is_empty() || read.contains(&None) {
+                return Ok(expr.clone());
+            }
+            let mut named = Vec::new();
+            for index in [0usize, 1] {
+                let mine: Vec<Expr> = calls
+                    .iter()
+                    .zip(&read)
+                    .filter(|(_, found)| **found == Some(index))
+                    .map(|(call, _)| call.clone())
+                    .collect();
+                if mine.is_empty() {
+                    continue;
+                }
+                let added = this.name(mine, sides[index].schema());
+                let mut selected: Vec<Expr> = sides[index]
+                    .schema()
+                    .iter()
+                    .map(|(qualifier, field)| {
+                        Expr::Column(Column::new(qualifier.cloned(), field.name()))
+                    })
+                    .collect();
+                selected.extend(added.iter().map(|(call, name)| call.clone().alias(name)));
+                sides[index] = LogicalPlanBuilder::from(sides[index].clone())
+                    .project(selected)?
+                    .build()?;
+                named.extend(added);
+            }
             moved = true;
             read_calls(expr, &named)
         };
         let mut keys: (Vec<Expr>, Vec<Expr>) = (Vec::new(), Vec::new());
         for (left, right) in &join.on {
-            keys.0.push(if calls(left)? {
-                below(self, left, 0)?
-            } else {
-                left.clone()
-            });
-            keys.1.push(if calls(right)? {
-                below(self, right, 1)?
-            } else {
-                right.clone()
-            });
+            keys.0.push(below(self, left)?);
+            keys.1.push(below(self, right)?);
         }
         let mut rest: Vec<Expr> = Vec::new();
         for term in join.filter.iter().flat_map(split_conjunction) {
-            if !calls(term)? {
-                rest.push(term.clone());
-                continue;
-            }
-            if let Some(index) = side(term) {
-                rest.push(below(self, term, index)?);
-                continue;
-            }
-            if let Expr::BinaryExpr(binary) = term
-                && binary.op == datafusion::logical_expr::Operator::Eq
-                && let (Some(first), Some(second)) = (side(&binary.left), side(&binary.right))
-                && first != second
-            {
-                let mut key = |this: &mut Self, expr: &Expr, index: usize| {
-                    if calls(expr)? {
-                        below(this, expr, index)
-                    } else {
-                        Ok(expr.clone())
-                    }
-                };
-                let (left, right) = if first == 0 {
-                    (&binary.left, &binary.right)
-                } else {
-                    (&binary.right, &binary.left)
-                };
-                keys.0.push(key(self, left, 0)?);
-                keys.1.push(key(self, right, 1)?);
-                continue;
-            }
-            rest.push(term.clone());
+            rest.push(below(self, term)?);
         }
         if !moved {
             return Ok(plan);

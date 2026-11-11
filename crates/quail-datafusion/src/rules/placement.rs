@@ -179,20 +179,22 @@ fn mover(node: &LogicalPlan) -> Option<Mover> {
             return None;
         }
         let tables = expr_tables(&ai.call, &[]);
+        // an AI filter whose answer the query reads adds it as a column
+        let added = ai
+            .returned_fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect();
         return match role(ai) {
             Role::TableFilter => (tables.len() == 1).then_some(Mover {
                 tables,
-                added: BTreeSet::new(),
+                added,
                 pairs: false,
             }),
             Role::Column => Some(Mover {
                 pairs: tables.len() > 1,
                 tables,
-                added: ai
-                    .returned_fields()
-                    .iter()
-                    .map(|field| field.name().clone())
-                    .collect(),
+                added,
             }),
             Role::Join => Some(Mover {
                 tables,

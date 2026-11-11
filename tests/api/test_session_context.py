@@ -509,3 +509,16 @@ def test_a_join_keys_answer_is_also_returned():
         f"SELECT r.id, v.id, {call} AS m FROM r JOIN v ON v.name = {call}"))
     session.close()
     assert rows == [("r0", "v0", "Acme")]
+
+
+def test_an_ai_filters_answer_is_returned_beside_a_join_on_another_answer():
+    session, context = _yes_context({
+        "r": pa.table({"id": ["r0", "r1"], "body": ["a", "b"]}),
+        "v": pa.table({"id": ["v0"], "name": ["x"]}),
+    })
+    # the AI.IF's answer is a column of r, which the join must pass on
+    table = context.sql(
+        "SELECT r.id, AI.IF(PROMPT('q: {0}', r.body)) AS k FROM r "
+        "JOIN v ON AI.MAP(r.body, 'Name it.', 8) <> v.name ORDER BY r.id")
+    session.close()
+    assert table.column("k").to_pylist() == [True, True]
