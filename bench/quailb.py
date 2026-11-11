@@ -190,6 +190,33 @@ def answer_oracle(ground_truth, tables):
     return answer
 
 
+def label_name(info: PlanInfo, operator, aliases: dict) -> str:
+    """Return the name Quail gave a classification's column.
+
+    A classification the query returns keeps its output name. One the
+    query only tests has no name in its SQL, so Quail names its column
+    itself, and it is the one unnamed label over the operator's
+    relations.
+
+    Args:
+        info: The query's plan reading.
+        operator: The classification.
+        aliases: Each label column Quail computed -> the aliases it reads.
+
+    Raises:
+        KeyError: No one label column is the operator's.
+    """
+    if operator.output in aliases:
+        return operator.output
+    outputs = {found.output for found in info.classifies}
+    unnamed = [name for name, read in aliases.items()
+               if name not in outputs and set(operator.relations) <= set(read)]
+    if len(unnamed) != 1:
+        raise KeyError(
+            f"no one label column for classification {operator.output}: {unnamed}")
+    return unnamed[0]
+
+
 def run_output(result, info: PlanInfo, tables) -> RunOutput:
     """Translate a Quail result's row indices into benchmark ids by operator."""
     ids = {relation.alias: pa.array(_ids(tables[relation.table]), pa.string())
@@ -210,19 +237,9 @@ def run_output(result, info: PlanInfo, tables) -> RunOutput:
         })
     classify_answers = {}
     labels = result.answer_tables["classifies"]
-    outputs = {operator.output for operator in info.classifies}
     for operator in info.classifies:
-        name = operator.output
-        if name not in labels:
-            # a classification the query only tests has no output name in
-            # its SQL, so Quail names its column itself
-            unnamed = [found for found, table in labels.items()
-                       if found not in outputs
-                       and set(operator.relations) <= set(table.column_names)]
-            if len(unnamed) != 1:
-                raise KeyError(
-                    f"no one answer table for classification {name}: {unnamed}")
-            (name,) = unnamed
+        name = label_name(info, operator, {
+            found: table.column_names for found, table in labels.items()})
         table = labels[name]
         classify_answers[operator.id] = pa.table({
             **{alias: id_column(alias, table.column(alias))
@@ -336,7 +353,8 @@ def prompt_pieces(query, info: PlanInfo, anchors) -> dict | None:
             "id": info.joins[position].id, "anchor": anchor,
             **_pair_pieces(lower(prompt), anchor)})
     for operator in info.classifies:
-        prompt, aliases = classifies[operator.output]
+        prompt, aliases = classifies[label_name(info, operator, {
+            name: read for name, (_, read) in classifies.items()})]
         if operator.partner is None:
             piece = {"tail": list(lower(prompt).tail_token_ids)}
         else:
