@@ -576,3 +576,30 @@ async fn a_table_without_a_key_is_numbered_and_its_columns_come_from_the_region(
     assert!(!text.contains("Join: "), "{text}");
     Ok(())
 }
+
+#[tokio::test]
+async fn an_ai_filter_joins_the_region_of_an_extraction_a_join_key_reads() -> Result<()> {
+    let context = context()?;
+    let query = "SELECT r.id, a.aspect FROM aspects a JOIN reviews r \
+        ON a.aspect = AI.EXTRACT(r.body, {'t': 'Which topic?'})['t'] \
+        WHERE AI.IF(PROMPT('Is {0} long?', r.body))";
+    let plan = optimized(&context, query).await?;
+    let text = plan.display_indent().to_string();
+    // the join key is a field of the extraction's answer, which a SELECT
+    // list above the region reads; the filter runs in the same region
+    let [region] = <[ModelRegion; 1]>::try_from(regions(&plan)).unwrap();
+    let found = lines(&region.plan);
+    let operators: Vec<&str> = found
+        .iter()
+        .filter(|line| line.contains("AiNode"))
+        .map(|line| {
+            if line.contains("ai_extract(") {
+                "ai_extract"
+            } else {
+                "ai_filter"
+            }
+        })
+        .collect();
+    assert_eq!(operators, ["ai_extract", "ai_filter"], "{text}");
+    Ok(())
+}

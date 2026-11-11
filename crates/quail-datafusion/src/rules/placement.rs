@@ -24,6 +24,7 @@
 //! other classifications; then each extraction, SAE feature, and map
 //! column, each followed by the tests its answers allow.
 
+use datafusion::logical_expr::UserDefinedLogicalNodeCore;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -320,11 +321,31 @@ fn push_down(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
                     Some(with_input(&input, below)?)
                 }
             }
+            // a SELECT list that passes on every column the node reads,
+            // whatever else it computes, such as a field of another
+            // node's answer
             LogicalPlan::Projection(projection)
                 if projection
                     .expr
                     .iter()
-                    .all(|expr| matches!(expr, Expr::Column(_))) =>
+                    .all(|expr| matches!(expr, Expr::Column(_)))
+                    || as_node::<AiNode>(&node).is_some_and(|ai| {
+                        ai.expressions()
+                            .iter()
+                            .chain(&ai.filter)
+                            .chain(&ai.guard)
+                            .flat_map(|expr| expr.column_refs())
+                            // its filter reads its own answer
+                            .filter(|read| {
+                                read.relation.is_some()
+                                    || !ai.fields.iter().any(|field| *field.name() == read.name)
+                            })
+                            .all(|read| {
+                                projection.expr.iter().any(
+                                    |passed| matches!(passed, Expr::Column(found) if found == read),
+                                )
+                            })
+                    }) =>
             {
                 let below = with_input(&node, projection.input.as_ref().clone())?;
                 let mut exprs = projection.expr.clone();
