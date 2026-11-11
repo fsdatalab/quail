@@ -162,38 +162,45 @@ class _Rows:
     """
 
     def __init__(self):
+        # each an array, or a run as (first, count)
         self.parts = []
-        self.firsts = []
-        self.counts = []
 
     def __bool__(self):
-        return bool(self.parts or self.firsts)
+        return bool(self.parts)
 
     def run(self, first, count):
         """Add the count rows that start at first."""
-        self.firsts.append(first)
-        self.counts.append(count)
+        self.parts.append((first, count))
 
     def append(self, rows):
         """Add an array of rows."""
-        self._flush()
         self.parts.append(rows)
-
-    def _flush(self):
-        if not self.firsts:
-            return
-        counts = np.asarray(self.counts, dtype=np.int64)
-        ends = np.cumsum(counts)
-        firsts = np.asarray(self.firsts, dtype=np.int64)
-        self.parts.append(
-            np.repeat(firsts - (ends - counts), counts)
-            + np.arange(int(ends[-1]) if len(ends) else 0, dtype=np.int64))
-        self.firsts, self.counts = [], []
 
     def joined(self):
         """Return every row added so far, in order, as one int64 array."""
-        self._flush()
-        return _concatenate(self.parts)
+        arrays, firsts, counts = [], [], []
+
+        def expand():
+            if not firsts:
+                return
+            lengths = np.asarray(counts, dtype=np.int64)
+            ends = np.cumsum(lengths)
+            arrays.append(
+                np.repeat(np.asarray(firsts, dtype=np.int64) - (ends - lengths),
+                          lengths)
+                + np.arange(int(ends[-1]), dtype=np.int64))
+            firsts.clear()
+            counts.clear()
+
+        for part in self.parts:
+            if isinstance(part, tuple):
+                firsts.append(part[0])
+                counts.append(part[1])
+            else:
+                expand()
+                arrays.append(part)
+        expand()
+        return _concatenate(arrays)
 
 
 def _staged(torch, data, dtype, pinned=True):
