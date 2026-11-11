@@ -312,6 +312,16 @@ impl Completions {
         self.text_test(can_true, true)
     }
 
+    /// Whether an answer holds `literal` somewhere: decided TRUE once the
+    /// text so far holds it, whatever follows.
+    fn contains(&self, literal: &str) -> Possible {
+        if self.prefix.contains(literal) {
+            return self.text_test(true, false);
+        }
+        // the text so far is an answer that does not hold it
+        self.text_test(self.can_grow(), true)
+    }
+
     fn equals(&self, literal: &str) -> Possible {
         let can_true = literal
             .strip_prefix(self.prefix.as_str())
@@ -509,12 +519,17 @@ impl<F: Fn(&Expr) -> bool> Reader<'_, F> {
                 let Some(pattern) = text_literal(pattern) else {
                     return ANY;
                 };
-                let found = match pattern.find(['%', '_']) {
-                    None => answers.equals(&pattern),
-                    Some(at) if at == pattern.len() - 1 && pattern.ends_with('%') => {
+                let inner = pattern
+                    .strip_prefix('%')
+                    .and_then(|rest| rest.strip_suffix('%'))
+                    .filter(|inner| !inner.is_empty() && !inner.contains(['%', '_']));
+                let found = match (inner, pattern.find(['%', '_'])) {
+                    (Some(inner), _) => answers.contains(inner),
+                    (None, None) => answers.equals(&pattern),
+                    (None, Some(at)) if at == pattern.len() - 1 && pattern.ends_with('%') => {
                         answers.starts_with(&pattern[..at])
                     }
-                    Some(_) => return ANY,
+                    _ => return ANY,
                 };
                 if *negated { found.not() } else { found }
             }
@@ -710,6 +725,93 @@ impl<F: Fn(&Expr) -> bool> Reader<'_, F> {
     }
 }
 
+/// The texts of `answers` in one letter case, `upper` or lower; None when
+/// a text is not ASCII, where a letter's case can depend on the letters
+/// after it.
+pub(crate) fn in_case(answers: &Completions, upper: bool) -> Option<Completions> {
+    let ascii =
+        answers.prefix.is_ascii() && answers.tails.iter().flatten().all(|tail| tail.is_ascii());
+    let fold = |text: &String| {
+        if upper {
+            text.to_ascii_uppercase()
+        } else {
+            text.to_ascii_lowercase()
+        }
+    };
+    ascii.then(|| Completions {
+        prefix: fold(&answers.prefix),
+        tails: answers
+            .tails
+            .as_ref()
+            .map(|tails| tails.iter().map(fold).collect()),
+        ..answers.clone()
+    })
+}
+
+/// A test that reads the answer only in one letter case, as the same
+/// test of the answer's texts in that case: `lower(a) LIKE 'neg%'` at
+/// the answers that start with `Ne` is `a LIKE 'neg%'` at those that
+/// start with `ne`. An ASCII `ILIKE` reads the answer in lower case.
+/// None when the test reads the answer as written, or in both cases.
+fn case_folded(
+    expr: &Expr,
+    is_answer: &impl Fn(&Expr) -> bool,
+    answers: &Completions,
+) -> Option<(Expr, Completions)> {
+    use datafusion::functions::string::expr_fn::lower;
+    let insensitive = expr
+        .clone()
+        .transform_up(|found| match found {
+            Expr::Like(like) if like.case_insensitive => {
+                let pattern = match like.pattern.as_ref() {
+                    Expr::Literal(value, _) => value.try_as_str().flatten(),
+                    _ => None,
+                };
+                match pattern.filter(|pattern| pattern.is_ascii()) {
+                    Some(pattern) => Ok(Transformed::yes(Expr::Like(Like::new(
+                        like.negated,
+                        Box::new(lower(*like.expr)),
+                        Box::new(datafusion::logical_expr::lit(pattern.to_ascii_lowercase())),
+                        like.escape_char,
+                        false,
+                    )))),
+                    None => Ok(Transformed::no(Expr::Like(like))),
+                }
+            }
+            other => Ok(Transformed::no(other)),
+        })
+        .ok()?
+        .data;
+    let (mut lowered, mut raised, mut as_written) = (false, false, false);
+    let read = insensitive
+        .transform_down(|found| {
+            if let Expr::ScalarFunction(call) = &found
+                && let [argument] = call.args.as_slice()
+                && is_answer(argument)
+                && matches!(call.name(), "lower" | "upper")
+            {
+                if call.name() == "lower" {
+                    lowered = true;
+                } else {
+                    raised = true;
+                }
+                return Ok(Transformed::new(
+                    argument.clone(),
+                    true,
+                    datafusion::common::tree_node::TreeNodeRecursion::Jump,
+                ));
+            }
+            as_written |= is_answer(&found);
+            Ok(Transformed::no(found))
+        })
+        .ok()?
+        .data;
+    if as_written || lowered == raised {
+        return None;
+    }
+    Some((read, in_case(answers, raised)?))
+}
+
 /// `expr` at the answers in `answers`, with `is_answer` telling which
 /// expression reads the answer.
 pub fn decide_expr(
@@ -717,6 +819,11 @@ pub fn decide_expr(
     is_answer: impl Fn(&Expr) -> bool,
     answers: &Completions,
 ) -> Decision {
+    let folded = case_folded(expr, &is_answer, answers);
+    let (expr, answers) = match &folded {
+        Some((expr, answers)) => (expr, answers),
+        None => (expr, answers),
+    };
     let reader = Reader { is_answer, answers };
     let mut found = reader.possible(expr);
     // the shapes above ignore that two parts read one answer, and read
@@ -783,6 +890,23 @@ mod tests {
 
     fn text(prefix: &str) -> Completions {
         Completions::text(prefix)
+    }
+
+    #[test]
+    fn a_test_of_an_answer_in_one_letter_case_is_decided_on_its_text_so_far() {
+        use datafusion::functions::string::expr_fn::lower;
+        let starts = col("a").ilike(lit("neg%"));
+        assert_eq!(at(&starts, &text("Po")), Decision::NotTrue);
+        assert_eq!(at(&starts, &text("NEG")), Decision::True);
+        assert_eq!(at(&starts, &text("N")), Decision::Undecided);
+        let holds = col("a").ilike(lit("%refund%"));
+        assert_eq!(at(&holds, &text("A REFUND was")), Decision::True);
+        assert_eq!(at(&holds, &text("The cust")), Decision::Undecided);
+        let equals = lower(col("a")).eq(lit("acme"));
+        assert_eq!(at(&equals, &text("B")), Decision::NotTrue);
+        assert_eq!(at(&equals, &text("AC")), Decision::Undecided);
+        // a letter outside ASCII may change case with what follows it
+        assert_eq!(at(&starts, &text("Σ")), Decision::Undecided);
     }
 
     #[test]

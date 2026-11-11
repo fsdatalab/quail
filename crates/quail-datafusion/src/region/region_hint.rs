@@ -32,7 +32,7 @@ use datafusion::physical_expr_common::physical_expr::{
 };
 
 use crate::ai::AiNode;
-use crate::derive::partial::{Completions, LISTED, can_be_true};
+use crate::derive::partial::{Completions, LISTED, can_be_true, in_case};
 use crate::region::ModelRegion;
 
 /// The tests above a region that it may drop rows by, over the region's
@@ -133,8 +133,17 @@ impl RegionHint {
         };
         for test in &self.tests {
             let test = snapshot_physical_expr(Arc::clone(test))?;
-            if let Some(test) = answer_test(&test, index, field)
-                && can_be_true(&test, &data_type, answers) == Some(false)
+            let Some((test, case)) = answer_test(&test, index, field) else {
+                continue;
+            };
+            // a test of the answer in one letter case reads its texts in
+            // that case
+            let folded = match case {
+                Some(upper) => in_case(answers, upper),
+                None => Some(answers.clone()),
+            };
+            if let Some(folded) = folded
+                && can_be_true(&test, &data_type, &folded) == Some(false)
             {
                 return Ok(true);
             }
@@ -145,12 +154,15 @@ impl RegionHint {
 
 /// `test` reading the answer as column 0, named [`LISTED`], when the
 /// only column it reads is the answer: column `index`, or `get_field`
-/// of it and `field`. None when it reads no answer or another column.
+/// of it and `field`. With it, the letter case the test reads the
+/// answer in: Some(true) when every read is `upper(answer)`,
+/// Some(false) for `lower(answer)`, and None as written. None when it
+/// reads no answer, another column, or the answer in two cases.
 fn answer_test(
     test: &Arc<dyn PhysicalExpr>,
     index: usize,
     field: Option<&str>,
-) -> Option<Arc<dyn PhysicalExpr>> {
+) -> Option<(Arc<dyn PhysicalExpr>, Option<bool>)> {
     use datafusion::common::tree_node::TreeNodeRecursion;
     use datafusion::physical_expr::ScalarFunctionExpr;
     use datafusion::physical_expr::expressions::Literal;
@@ -159,10 +171,39 @@ fn answer_test(
         expr.downcast_ref::<Column>()
             .is_some_and(|column| column.index() == index)
     };
+    let is_answer = |expr: &Arc<dyn PhysicalExpr>| match field {
+        None => is_column(expr),
+        Some(field) => expr
+            .downcast_ref::<ScalarFunctionExpr>()
+            .is_some_and(|call| {
+                call.name() == "get_field"
+                    && matches!(call.args(), [input, name] if is_column(input)
+                        && name.downcast_ref::<Literal>().and_then(|literal| {
+                            literal.value().try_as_str().flatten()
+                        }) == Some(field))
+            }),
+    };
     let mut found = false;
     let mut other = false;
+    let mut cases: Vec<Option<bool>> = Vec::new();
     let read = Arc::clone(test)
         .transform_down(|node| {
+            if let Some(call) = node.downcast_ref::<ScalarFunctionExpr>()
+                && matches!(call.name(), "lower" | "upper")
+                && let [argument] = call.args()
+                && is_answer(argument)
+            {
+                found = true;
+                cases.push(Some(call.name() == "upper"));
+                return Ok(Transformed::new(
+                    Arc::clone(&answer),
+                    true,
+                    TreeNodeRecursion::Jump,
+                ));
+            }
+            if is_answer(&node) {
+                cases.push(None);
+            }
             if let Some(call) = node.downcast_ref::<ScalarFunctionExpr>()
                 && call.name() == "get_field"
                 && let [input, name] = call.args()
@@ -193,7 +234,8 @@ fn answer_test(
         })
         .ok()?
         .data;
-    (found && !other).then_some(read)
+    let case = cases.first().copied().flatten();
+    (found && !other && cases.iter().all(|read| *read == case)).then_some((read, case))
 }
 
 /// What a region knows about each of its columns before the model runs.
@@ -584,6 +626,19 @@ mod tests {
         assert!(!rejects("Acme"));
         // an answer that starts as the threshold does may still sort first
         assert!(!rejects("G"));
+        // a join on the vendor's name in lower case reads the answer so
+        let keys = vec![lit("acme"), lit("globex")];
+        let folded = hint_of(
+            &schema,
+            datafusion::functions::string::expr_fn::lower(col("vendor")).in_list(keys, false),
+        );
+        let rejects = |prefix: &str| {
+            folded
+                .rejects_answer(&schema, 1, None, &Completions::text(prefix))
+                .unwrap()
+        };
+        assert!(folded.reads_answer(1, None));
+        assert!(!rejects("ACME"));
         // a test that also reads the id is not the answer's alone
         let both = hint_of(&schema, col("vendor").lt(col("id")));
         assert!(!both.reads_answer(1, None));

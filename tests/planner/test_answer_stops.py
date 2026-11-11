@@ -104,14 +104,22 @@ def test_an_expression_decides_a_prefix_test_on_a_partial_answer():
     session = quail.Session(CONFIG, tokenizer=TOKENIZER)
     session.register("reviews",
                      quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
-    plan = session.sql("SELECT r.id FROM reviews r "
-                       "WHERE AI_MAP(r.body, 'When?') LIKE 'Mar%'").plan()
+    cases = {
+        "LIKE 'Mar%'": (("Jan", "not true"), ("Mar", "true"), ("", "undecided"),
+                        ("Ma", "undecided")),
+        # a test in one letter case reads the text so far in that case
+        "ILIKE 'mar%'": (("JAN", "not true"), ("MAR", "true"), ("mA", "undecided")),
+        "ILIKE '%kind%'": (("It was KIND", "true"), ("It was", "undecided")),
+    }
+    for written, decisions in cases.items():
+        plan = session.sql("SELECT r.id FROM reviews r "
+                           f"WHERE AI_MAP(r.body, 'When?') {written}").plan()
+        (node,) = [node for node in plan.graph.nodes
+                   if node.type_name == "quail.ai_map"]
+        (test,) = node.stop_tests
+        for prefix, decided in decisions:
+            assert test.decide(node.spec.name, prefix) == decided, (written, prefix)
     session.close()
-    (node,) = [node for node in plan.graph.nodes if node.type_name == "quail.ai_map"]
-    (test,) = node.stop_tests
-    for prefix, decided in (("Jan", "not true"), ("Mar", "true"), ("", "undecided"),
-                            ("Ma", "undecided")):
-        assert test.decide(node.spec.name, prefix) == decided, prefix
 
 
 LAWS = ("Disputes go to the state courts. This Agreement is governed by the laws "
