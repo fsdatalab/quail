@@ -19,6 +19,7 @@ from quail_b.substrait import (
     InList,
     PlanInfo,
     Sort,
+    StartsWith,
 )
 
 AGGREGATE_SQL = {"count": "COUNT", "sum": "SUM", "avg": "AVG", "min": "MIN",
@@ -168,6 +169,9 @@ def query_sql(info: PlanInfo, selectivity=None) -> str:
                 (prompts[(item.relation, item.output)], frozenset(item.accepted)))
             where.append(test if fraction is None
                          else f"HINT({test}{_options(fraction)})")
+        elif isinstance(item, StartsWith):
+            where.append(f"{tested(item.output)} ILIKE "
+                         f"{sql_string(item.prefix + '%')}")
     joins, joined = [], {info.base_alias}
     for join in info.joins:
         left, right = join.relations
