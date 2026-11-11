@@ -3,9 +3,11 @@
 
 use std::collections::BTreeMap;
 
-use crate::cost::filters::filter_cost;
+use crate::cost::budgets::parallel_copies;
+use crate::cost::filters::filter_work;
 use crate::cost::joins::PricedJoin;
 use crate::cost::score::ScoreCost;
+use crate::cost::work::Work;
 use crate::physical::{Equality, FilterPredicate, Prompt};
 
 use crate::context::PlanningContext;
@@ -13,25 +15,42 @@ use crate::error::{CompileError, compile_error};
 use crate::expressions::asked_call;
 use crate::expressions::{argument_alias, column_name};
 use crate::lowering::LoweredPrompt;
-use crate::operators::SemanticJoin;
+use crate::operators::{SemanticColumn, SemanticJoin};
 use crate::scores::{prompt_aliases, score_statistics};
 
-/// A predicate's seconds as a function of the documents it reads.
+/// A step's work as a function of the documents it reads.
 #[derive(Debug, Clone, PartialEq)]
-pub enum CostCurve {
-    /// Seconds per document.
-    Linear(f64),
+pub enum StepCost {
+    /// Work per document.
+    PerDocument(Work),
     /// A score's own estimate at each count.
     Score(Box<ScoreCost>),
+    /// A column operator's planner prices it.
+    Column {
+        column: Box<SemanticColumn>,
+        resident: bool,
+    },
 }
 
-impl CostCurve {
-    /// The seconds over `rows` documents.
-    pub fn seconds(&self, rows: f64) -> f64 {
-        match self {
-            CostCurve::Linear(per_document) => rows * per_document,
-            CostCurve::Score(cost) => cost.estimate(rows, None).1,
-        }
+impl StepCost {
+    /// One model copy's work over `rows` documents, or None when the
+    /// model cannot run the step.
+    ///
+    /// # Errors
+    ///
+    /// The tokenizer fails, or the model cannot run a column operator.
+    pub fn work(&self, context: &PlanningContext, rows: f64) -> Result<Option<Work>, CompileError> {
+        let work = match self {
+            StepCost::PerDocument(work) => return Ok(Some(work * rows)),
+            StepCost::Score(cost) => cost.estimate(rows, None).0,
+            StepCost::Column { column, resident } => {
+                match crate::search::column_work(context, column, *resident, rows)? {
+                    Some(work) => work,
+                    None => return Ok(None),
+                }
+            }
+        };
+        Ok(Some(&work * (1.0 / parallel_copies(context.gpus, rows))))
     }
 }
 
@@ -39,10 +58,10 @@ impl CostCurve {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PredicateCost {
     pub selectivity: f64,
-    /// Seconds when the predicate reads its documents first.
-    pub first: CostCurve,
-    /// Seconds when an earlier predicate already read them.
-    pub later: CostCurve,
+    /// Its work when the predicate reads its documents first.
+    pub first: StepCost,
+    /// Its work when an earlier predicate already read them.
+    pub later: StepCost,
     /// The score prompt whose result the predicate reuses, or None.
     pub reuse_key: Option<Prompt>,
 }
@@ -70,23 +89,21 @@ pub fn prepare_filter_costs(
     chunk_tokens: i64,
     context: &PlanningContext,
 ) -> Result<Vec<PredicateCost>, CompileError> {
-    let (model, device) = (&context.model, &context.device);
+    let model = &context.model;
     let mut prepared = Vec::new();
     for predicate in predicates {
         let call = asked_call(&predicate.expression);
         let (first, later, reuse_key) = if call.kind == "score" {
             let (_, cost) =
                 score_statistics(&call.prompt, context, chunk_tokens, Some(mean_tokens))?;
-            let curve = CostCurve::Score(Box::new(cost));
+            let curve = StepCost::Score(Box::new(cost));
             (curve.clone(), curve, Some((*call.prompt).clone()))
         } else {
             let question = question_tokens(&context.lowered(&call.prompt)?, model.canvas_tokens)?;
             // a guarded filter asks the model about its guard's rows alone
             let asked = crate::statistics::predicate_asked_fraction(predicate);
             let cost = |fresh: bool| {
-                CostCurve::Linear(
-                    asked * filter_cost(question, mean_tokens, model, device, chunk_tokens, fresh),
-                )
+                StepCost::PerDocument(&filter_work(question, mean_tokens, model, fresh) * asked)
             };
             (cost(true), cost(false), None)
         };

@@ -7,15 +7,16 @@ use crate::cost::joins::{
     PricedJoin, longest_join_input, packed_join_work, stage_work as join_work,
 };
 use crate::cost::quantity::Quantity;
-use crate::cost::sol::speed_of_light;
+use crate::cost::sol::{speed_of_light, unrounded_seconds};
 use crate::cost::statistics::AliasStats;
 use crate::cost::work::{Work, ask, scan};
 use crate::physical::Prompt;
 
-use crate::classify::classify_seconds;
+use crate::classify::classify_work;
 use crate::columns::{ColumnSpec, column_spec};
 use crate::context::PlanningContext;
-use crate::costs::{CostCurve, prepare_filter_costs, question_tokens};
+pub use crate::costs::StepCost;
+use crate::costs::{prepare_filter_costs, question_tokens};
 use crate::error::CompileError;
 use crate::expressions::asked_call;
 use crate::expressions::{call_aliases, repr_str};
@@ -38,43 +39,22 @@ pub enum StepKey {
     Name(String),
 }
 
-/// How a step's seconds are found at a live count.
-#[derive(Debug, Clone)]
-pub enum StepCost {
-    Curve(CostCurve),
-    /// A column operator's planner prices it.
-    Column {
-        column: Box<SemanticColumn>,
-        resident: bool,
-    },
-}
-
-impl StepCost {
-    fn seconds(&self, context: &PlanningContext, rows: f64) -> Result<f64, CompileError> {
-        match self {
-            StepCost::Curve(curve) => Ok(curve.seconds(rows)),
-            StepCost::Column { column, resident } => {
-                column_seconds(context, column, *resident, rows)
-            }
-        }
-    }
-}
-
-/// A column operator's seconds, as its planner's `seconds`.
+/// A column operator's work over `rows` documents, or None when the
+/// model cannot run it.
 ///
 /// # Errors
 ///
 /// The tokenizer fails, or the model cannot run the operator.
-pub fn column_seconds(
+pub fn column_work(
     context: &PlanningContext,
     column: &SemanticColumn,
     resident: bool,
     rows: f64,
-) -> Result<f64, CompileError> {
+) -> Result<Option<Work>, CompileError> {
     // a guarded operator asks the model about its guard's rows alone
     let rows = rows * column.asked_fraction();
     if column.call.kind == "label" {
-        return classify_seconds(
+        return classify_work(
             context,
             &column.call,
             &column.name,
@@ -83,11 +63,12 @@ pub fn column_seconds(
             rows,
         );
     }
-    Ok(match column_spec(context, column, rows, resident)? {
-        ColumnSpec::Extract(spec) => spec.estimated_seconds,
-        ColumnSpec::Map(spec) => spec.estimated_seconds,
-        ColumnSpec::SaeFeatures(spec) => spec.estimated_seconds,
-    })
+    let values = match column_spec(context, column, rows, resident)? {
+        ColumnSpec::Extract(spec) => spec.estimated_work,
+        ColumnSpec::Map(spec) => spec.estimated_work,
+        ColumnSpec::SaeFeatures(spec) => spec.estimated_work,
+    };
+    Ok(Some(Work::from_values(&values)))
 }
 
 /// One step of a table's sequence and its costs, as `TableStep`.
@@ -202,8 +183,8 @@ pub fn table_steps(
             key: StepKey::Position(*position),
             selectivity: cost.selectivity,
             or_term: OrTerm::of(&predicates[*position]),
-            first: StepCost::Curve(cost.first),
-            later: StepCost::Curve(cost.later),
+            first: cost.first,
+            later: cost.later,
             reuse_key: cost.reuse_key,
             document_head: head(prompt)?,
         });
@@ -250,14 +231,12 @@ pub fn table_steps(
         let (first, later) = if estimate {
             let tail = context.lowered(&call.prompt)?.tail_token_ids.len() as i64;
             let cost = |fresh: bool| {
-                StepCost::Curve(CostCurve::Linear(crate::cost::filters::filter_cost(
+                StepCost::PerDocument(crate::cost::filters::filter_work(
                     tail,
                     mean_tokens,
                     &context.model,
-                    &context.device,
-                    chunk,
                     fresh,
-                )))
+                ))
             };
             (cost(true), cost(false))
         } else {
@@ -384,6 +363,7 @@ pub fn order_steps(
     steps: &[TableStep],
     rule: &str,
     count: f64,
+    chunk: i64,
     context: &PlanningContext,
 ) -> Result<Vec<usize>, CompileError> {
     let indices: Vec<usize> = (0..steps.len()).collect();
@@ -397,7 +377,11 @@ pub fn order_steps(
             return Ok(*found);
         }
         let step = &steps[index];
-        let seconds = if first { &step.first } else { &step.later }.seconds(context, rows)?;
+        // the one place a step's work becomes the seconds it ranks by
+        let seconds = match if first { &step.first } else { &step.later }.work(context, rows)? {
+            Some(work) => unrounded_seconds(&work, &context.model, &context.device, chunk),
+            None => f64::INFINITY,
+        };
         cache.insert(key, seconds);
         Ok(seconds)
     };
@@ -1203,6 +1187,7 @@ pub fn choose_operator_order(
             &steps,
             &rule,
             statistics.stats[&table.alias].num_documents as f64,
+            statistics.chunk,
             context,
         )?;
         step_orders.push((

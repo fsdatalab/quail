@@ -781,31 +781,29 @@ pub fn classify_spec(
         .0)
 }
 
-/// A one-table classification's seconds with its cheapest scoring rule,
-/// as `ClassifyPlanner.seconds`; infinite when no rule can run.
+/// A one-table classification's work with its cheapest scoring rule,
+/// or None when no rule can run.
 ///
 /// # Errors
 ///
 /// As `ClassifyTable::prepare`.
-pub fn classify_seconds(
+pub fn classify_work(
     context: &PlanningContext,
     call: &ModelCall,
     name: &str,
     alias: &str,
     resident: bool,
     expected_rows: f64,
-) -> Result<f64, CompileError> {
+) -> Result<Option<Work>, CompileError> {
     let spec = classify_spec(context, call, name, alias, expected_rows)?;
     if spec.estimated_seconds != 0.0 {
-        return Ok(spec.estimated_seconds);
+        return Ok(Some(Work::from_values(&spec.estimated_work)));
     }
     let table = classify_statistics(context, alias, &[])?;
     let mut spec = spec;
     spec.expected_rows = expected_rows;
-    Ok(
-        match table.choose_scoring(&spec, call, resident, context.tokenizer) {
-            Ok(chosen) => chosen.estimated_seconds,
-            Err(_) => f64::INFINITY,
-        },
-    )
+    Ok(table
+        .choose_scoring(&spec, call, resident, context.tokenizer)
+        .ok()
+        .map(|chosen| Work::from_values(&chosen.estimated_work)))
 }

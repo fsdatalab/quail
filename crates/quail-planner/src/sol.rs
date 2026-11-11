@@ -857,7 +857,8 @@ impl<'a, 'c> Estimate<'a, 'c> {
                 .expect("rows")
                 .1
                 .clone();
-            let ordered: Vec<usize> = order_steps(&steps, &rule, live.len() as f64, self.context)?;
+            let ordered: Vec<usize> =
+                order_steps(&steps, &rule, live.len() as f64, self.chunk, self.context)?;
             let mut rows = live;
             let mut reached: Option<Vec<Vec<i64>>> = None;
             if self.inputs.stop_groups.contains_key(&alias)

@@ -18,7 +18,7 @@ use crate::expressions::repr_str;
 use crate::graph::hash_join_nodes;
 use crate::operators::Operators;
 use crate::plan_statistics::CorpusStats;
-use crate::search::{StepCost, StepKey, TableStep, default_order_rule, order_steps, search_joins};
+use crate::search::{StepKey, TableStep, default_order_rule, order_steps, search_joins};
 use crate::statistics::effective_selectivity;
 
 /// One table's documents and tokens, before and after its scan's tests.
@@ -131,13 +131,16 @@ pub fn request_order(
                 key: StepKey::Position(position),
                 selectivity: cost.selectivity,
                 or_term: None,
-                first: StepCost::Curve(cost.first),
-                later: StepCost::Curve(cost.later),
+                first: cost.first,
+                later: cost.later,
                 reuse_key: cost.reuse_key,
                 document_head: Vec::new(),
             })
             .collect();
-        filter_orders.insert(alias.clone(), order_steps(&steps, &rule, 1.0, context)?);
+        filter_orders.insert(
+            alias.clone(),
+            order_steps(&steps, &rule, 1.0, chunk, context)?,
+        );
     }
     let mut expected: BTreeMap<String, f64> = stats
         .iter()
