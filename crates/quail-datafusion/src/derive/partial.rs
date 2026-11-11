@@ -13,39 +13,36 @@
 //! a span of its document, so it goes on with the text after one of the
 //! places where the document holds the text so far.
 //!
-//! [`decide`] reads a condition as a DataFusion expression and finds,
-//! for each part, which of TRUE, FALSE, and NULL some answer in `C(w)`
-//! gives. It reads these shapes of the answer `a`, with literals:
+//! [`decide`] evaluates a condition over `C(w)` instead of over one
+//! value. Each part of the expression has a [`Partial`]: what is known
+//! of its value for every answer in `C(w)`. A literal is one known
+//! value, the answer is a text that starts with the text so far, and a
+//! function gives the `Partial` of its value from the `Partial`s of its
+//! arguments through [`PartialEval`]:
 //!
-//! - `a LIKE 'x%'` and `a LIKE 'x'`, `STARTS_WITH(a, 'x')`, `LEFT(a, k)
-//!   = 'x'`, and `SUBSTR(a, 1, k) = 'x'`;
-//! - `a = 'x'`, `a <> 'x'`, and `a IN ('x', ...)`;
-//! - `a IS NULL` and `a IS NOT NULL`;
-//! - `LENGTH(a)`, `CHARACTER_LENGTH(a)`, or `CHAR_LENGTH(a)` compared
-//!   with an integer;
-//! - AND, OR, NOT, and `IS [NOT] TRUE` or `FALSE` of these.
+//! - `LOWER` and `UPPER` of a text are a text in that letter case;
+//! - `LEFT(a, k)` and `SUBSTR(a, 1, k)` are a text of at most `k`
+//!   characters;
+//! - `LENGTH`, `CHARACTER_LENGTH`, and `CHAR_LENGTH` are a count
+//!   between two bounds;
+//! - `STARTS_WITH`, the comparisons, `LIKE`, `ILIKE`, `IN`, `IS NULL`,
+//!   AND, OR, and NOT give which of TRUE, FALSE, and NULL are possible.
 //!
-//! Any other part may give any value, and parts are combined one at a
-//! time, ignoring that two parts read the same answer. So a condition
-//! these shapes leave undecided is then evaluated by DataFusion on each
-//! complete answer, when `C(w)` is a short list: a finished answer, or
-//! an extraction with few places left to copy from. That decides any
-//! expression of the answer alone, such as `a LIKE '%x%'` or
-//! `UPPER(a) = 'YES'`.
+//! A function without a [`PartialEval`] may give any value, and parts
+//! are combined one at a time, ignoring that two parts read the same
+//! answer. So a condition this leaves undecided is then evaluated by
+//! DataFusion on each complete answer, when `C(w)` is a short list: a
+//! finished answer, or an extraction with few places left to copy from.
+//! That decides any expression of the answer alone.
 
 use std::sync::{Arc, OnceLock};
 
 use datafusion::arrow::array::{ArrayRef, AsArray, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
-use datafusion::common::pruning::PruningStatistics;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column, DFSchema, ScalarValue};
 use datafusion::logical_expr::expr::{InList, Like, ScalarFunction};
-use datafusion::logical_expr::simplify::SimplifyContext;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
-use datafusion::optimizer::simplify_expressions::ExprSimplifier;
-use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_optimizer::pruning::PruningPredicateBuilder;
 use datafusion::prelude::SessionContext;
 use quail_planner::error::CompileError;
 use quail_planner::physical::Expression;
@@ -80,98 +77,6 @@ fn after(text: &str) -> Option<String> {
         }
     }
     None
-}
-
-/// The answers that start with a text, as the range of strings
-/// `PruningPredicate` reads: one container of rows.
-struct Range {
-    least: String,
-    /// None when no string bounds the answers from above.
-    greatest: Option<String>,
-}
-
-impl PruningStatistics for Range {
-    fn min_values(&self, _column: &Column) -> Option<ArrayRef> {
-        Some(Arc::new(StringArray::from(vec![Some(self.least.clone())])))
-    }
-
-    fn max_values(&self, _column: &Column) -> Option<ArrayRef> {
-        Some(Arc::new(StringArray::from(vec![self.greatest.clone()])))
-    }
-
-    fn num_containers(&self) -> usize {
-        1
-    }
-
-    fn null_counts(&self, _column: &Column) -> Option<ArrayRef> {
-        None
-    }
-
-    fn row_counts(&self) -> Option<ArrayRef> {
-        None
-    }
-
-    fn contained(
-        &self,
-        _column: &Column,
-        _values: &std::collections::HashSet<ScalarValue>,
-    ) -> Option<datafusion::arrow::array::BooleanArray> {
-        None
-    }
-}
-
-/// Whether `test`, which reads the answer as its one column, column 0
-/// named [`LISTED`] of type `data_type`, can be TRUE for a complete
-/// answer still possible; None when DataFusion does not decide it.
-///
-/// A short list of answers is evaluated one by one. An answer that may
-/// go on with any text is the range of strings that start with the text
-/// so far, which `PruningPredicate` reads.
-pub fn can_be_true(
-    test: &Arc<dyn PhysicalExpr>,
-    data_type: &DataType,
-    answers: &Completions,
-) -> Option<bool> {
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        LISTED,
-        data_type.clone(),
-        true,
-    )]));
-    if let Some(listed) = answers.listed() {
-        let mut found: Vec<Option<String>> = listed.into_iter().map(Some).collect();
-        if answers.may_be_null {
-            found.push(None);
-        }
-        let column: ArrayRef = Arc::new(StringArray::from(found));
-        let column = datafusion::arrow::compute::cast(&column, data_type).ok()?;
-        let batch = RecordBatch::try_new(schema, vec![column]).ok()?;
-        let values = test
-            .evaluate(&batch)
-            .ok()?
-            .into_array(batch.num_rows())
-            .ok()?;
-        return Some(
-            values
-                .as_boolean_opt()?
-                .iter()
-                .any(|value| value == Some(true)),
-        );
-    }
-    if !matches!(
-        data_type,
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
-    ) {
-        return None;
-    }
-    let range = Range {
-        least: answers.prefix.clone(),
-        greatest: after(&answers.prefix),
-    };
-    let predicate = PruningPredicateBuilder::new()
-        .with_file_schema(schema)
-        .try_build(Arc::clone(test))
-        .ok()?;
-    predicate.prune(&range).ok()?.first().copied()
 }
 
 /// What a condition is at a partial answer.
@@ -250,7 +155,7 @@ impl Completions {
     /// span, so the list can hold answers the model cannot give, which
     /// only delays a decision.
     fn listed(&self) -> Option<Vec<String>> {
-        if self.complete {
+        if !self.can_grow() {
             return Some(vec![self.prefix.clone()]);
         }
         let mut found = std::collections::BTreeSet::from([self.prefix.clone()]);
@@ -322,6 +227,85 @@ impl Completions {
         self.text_test(self.can_grow(), true)
     }
 
+    /// Whether an answer compares with `literal` as `op` says. Every
+    /// answer sorts from the text so far up to, and not at, the text
+    /// with its last character raised by one.
+    fn ordered(&self, op: Operator, literal: &str) -> Possible {
+        let least = self.prefix.as_str();
+        // whether some answer is above, or at or above, the literal
+        let reaches = |strictly: bool| {
+            if !self.can_grow() {
+                return if strictly {
+                    least > literal
+                } else {
+                    least >= literal
+                };
+            }
+            after(least).is_none_or(|greatest| greatest.as_str() > literal)
+        };
+        let (can_true, can_false) = match op {
+            Operator::Lt => (least < literal, reaches(false)),
+            Operator::LtEq => (least <= literal, reaches(true)),
+            Operator::Gt => (reaches(true), least <= literal),
+            _ => (reaches(false), least < literal),
+        };
+        self.text_test(can_true, can_false)
+    }
+
+    /// The texts in one letter case, `upper` or lower; None when a text
+    /// is not ASCII, where a letter's case can depend on the letters
+    /// after it.
+    fn in_case(&self, upper: bool) -> Option<Self> {
+        let ascii =
+            self.prefix.is_ascii() && self.tails.iter().flatten().all(|tail| tail.is_ascii());
+        let fold = |text: &String| {
+            if upper {
+                text.to_ascii_uppercase()
+            } else {
+                text.to_ascii_lowercase()
+            }
+        };
+        ascii.then(|| Self {
+            prefix: fold(&self.prefix),
+            tails: self
+                .tails
+                .as_ref()
+                .map(|tails| tails.iter().map(fold).collect()),
+            // a letter the answer has yet to add may become two in the
+            // other case, as the German sharp s does
+            max_chars: self
+                .max_chars
+                .filter(|_| self.tails.is_some() || !self.can_grow()),
+            ..self.clone()
+        })
+    }
+
+    /// The first `count` characters of each answer.
+    fn cut(&self, count: i64) -> Self {
+        let count = usize::try_from(count).unwrap_or(0);
+        let held = Self::chars(&self.prefix);
+        let first = |text: &str, count: usize| text.chars().take(count).collect::<String>();
+        if count <= held {
+            // every answer starts with the text so far
+            return Self {
+                prefix: first(&self.prefix, count),
+                complete: true,
+                may_be_null: self.may_be_null,
+                tails: None,
+                max_chars: None,
+            };
+        }
+        let room = count - held;
+        Self {
+            tails: self
+                .tails
+                .as_ref()
+                .map(|tails| tails.iter().map(|tail| first(tail, room)).collect()),
+            max_chars: Some(self.max_chars.map_or(room, |max| max.min(room))),
+            ..self.clone()
+        }
+    }
+
     fn equals(&self, literal: &str) -> Possible {
         let can_true = literal
             .strip_prefix(self.prefix.as_str())
@@ -329,43 +313,11 @@ impl Completions {
         let can_false = self.prefix != literal || self.can_grow();
         self.text_test(can_true, can_false)
     }
-
-    fn length(&self, op: Operator, bound: i64) -> Possible {
-        let (low, high) = self.lengths();
-        let holds = |length: i64| match op {
-            Operator::Eq => length == bound,
-            Operator::NotEq => length != bound,
-            Operator::Lt => length < bound,
-            Operator::LtEq => length <= bound,
-            Operator::Gt => length > bound,
-            _ => length >= bound,
-        };
-        let low = low as i64;
-        // the lengths are every integer from low to high
-        let (can_true, can_false) = match high {
-            Some(high) => {
-                let high = high as i64;
-                let any = |want: bool| (low..=high).any(|length| holds(length) == want);
-                if high - low <= 4096 {
-                    (any(true), any(false))
-                } else {
-                    (true, true)
-                }
-            }
-            None => match op {
-                Operator::Eq => (bound >= low, true),
-                Operator::NotEq => (true, bound >= low),
-                Operator::Lt | Operator::LtEq => (holds(low), true),
-                _ => (true, !holds(low)),
-            },
-        };
-        self.text_test(can_true, can_false)
-    }
 }
 
 /// Which of TRUE, FALSE, and NULL some complete answer gives a condition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Possible {
+pub struct Possible {
     t: bool,
     f: bool,
     n: bool,
@@ -407,45 +359,6 @@ impl Possible {
     }
 }
 
-/// `expr` without casts.
-fn uncast(expr: &Expr) -> &Expr {
-    match expr {
-        Expr::Cast(cast) => uncast(&cast.expr),
-        Expr::TryCast(cast) => uncast(&cast.expr),
-        Expr::Alias(alias) => uncast(&alias.expr),
-        other => other,
-    }
-}
-
-fn text_literal(expr: &Expr) -> Option<String> {
-    match uncast(expr) {
-        Expr::Literal(value, _) => value.try_as_str().flatten().map(str::to_string),
-        _ => None,
-    }
-}
-
-fn integer_literal(expr: &Expr) -> Option<i64> {
-    match uncast(expr) {
-        Expr::Literal(value, _) => {
-            match value.cast_to(&datafusion::arrow::datatypes::DataType::Int64) {
-                Ok(ScalarValue::Int64(Some(found))) => Some(found),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
-/// The arguments of a call of one of `names`.
-fn call_args<'e>(expr: &'e Expr, names: &[&str]) -> Option<&'e [Expr]> {
-    match uncast(expr) {
-        Expr::ScalarFunction(ScalarFunction { func, args }) if names.contains(&func.name()) => {
-            Some(args)
-        }
-        _ => None,
-    }
-}
-
 /// The operator with its sides swapped: `1 < a` is `a > 1`.
 fn swapped(op: Operator) -> Operator {
     match op {
@@ -457,103 +370,391 @@ fn swapped(op: Operator) -> Operator {
     }
 }
 
-/// Reads a condition over the answers in `C(w)`, as the module explains.
+/// What is known of an expression's value over the complete answers
+/// still possible.
+#[derive(Debug, Clone)]
+pub enum Partial {
+    /// The same value for every answer.
+    Known(ScalarValue),
+    /// A text that goes on from a text so far.
+    Text(Completions),
+    /// An integer from `low` to `high`, or with no most when None.
+    Count {
+        low: i64,
+        high: Option<i64>,
+        may_be_null: bool,
+    },
+    /// A test: which of TRUE, FALSE, and NULL some answer gives.
+    Truth(Possible),
+    /// Any value.
+    Any,
+}
+
+impl Partial {
+    fn text(&self) -> Option<String> {
+        match self {
+            Partial::Known(value) => value.try_as_str().flatten().map(str::to_string),
+            _ => None,
+        }
+    }
+
+    /// The value when it is a whole number; a decimal bound is not one.
+    fn integer(&self) -> Option<i64> {
+        match self {
+            Partial::Known(value) if value.data_type().is_integer() => {
+                match value.cast_to(&DataType::Int64) {
+                    Ok(ScalarValue::Int64(found)) => found,
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The value as the type a CAST gives it: a text stays a text only
+    /// as another string type, and a count only as an integer.
+    fn cast(self, data_type: &DataType) -> Partial {
+        let string = matches!(
+            data_type,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        );
+        match self {
+            Partial::Known(value) => value
+                .cast_to(data_type)
+                .map_or(Partial::Any, Partial::Known),
+            Partial::Text(_) if string => self,
+            Partial::Count { .. } if data_type.is_integer() => self,
+            _ => Partial::Any,
+        }
+    }
+
+    fn truth(&self) -> Possible {
+        match self {
+            Partial::Truth(found) => *found,
+            Partial::Known(ScalarValue::Boolean(value)) => Possible::constant(*value),
+            _ => ANY,
+        }
+    }
+
+    /// Which values `IS NULL` gives; None when nothing is known.
+    fn is_null(&self) -> Option<Possible> {
+        let may_be_null = match self {
+            Partial::Known(value) => return Some(Possible::constant(Some(value.is_null()))),
+            Partial::Text(found) => found.may_be_null,
+            Partial::Count { may_be_null, .. } => *may_be_null,
+            Partial::Truth(found) => {
+                return Some(Possible {
+                    t: found.n,
+                    f: found.t || found.f,
+                    n: false,
+                });
+            }
+            Partial::Any => return None,
+        };
+        Some(Possible {
+            t: may_be_null,
+            f: true,
+            n: false,
+        })
+    }
+}
+
+/// How a function maps what is known of its arguments to what is known
+/// of its value. A function that implements it is evaluated on a
+/// partial answer; any other gives [`Partial::Any`].
+pub trait PartialEval: Sync {
+    /// The value's `Partial` from the arguments', in order.
+    fn partial_eval(&self, args: &[Partial]) -> Partial;
+}
+
+/// `LOWER` or `UPPER`.
+struct LetterCase {
+    upper: bool,
+}
+
+impl PartialEval for LetterCase {
+    fn partial_eval(&self, args: &[Partial]) -> Partial {
+        match args {
+            [Partial::Text(found)] => found
+                .in_case(self.upper)
+                .map_or(Partial::Any, Partial::Text),
+            _ => Partial::Any,
+        }
+    }
+}
+
+/// The first `count` characters of a text; a negative count cuts from
+/// the end, which is not known.
+fn first_characters(found: &Completions, count: &Partial) -> Partial {
+    match count.integer() {
+        Some(count) if count >= 0 => Partial::Text(found.cut(count)),
+        _ => Partial::Any,
+    }
+}
+
+/// `LEFT(text, count)`.
+struct Left;
+
+impl PartialEval for Left {
+    fn partial_eval(&self, args: &[Partial]) -> Partial {
+        match args {
+            [Partial::Text(found), count] => first_characters(found, count),
+            _ => Partial::Any,
+        }
+    }
+}
+
+/// `SUBSTR(text, 1, count)`; a later start drops characters the text so
+/// far may not hold yet.
+struct Substr;
+
+impl PartialEval for Substr {
+    fn partial_eval(&self, args: &[Partial]) -> Partial {
+        match args {
+            [Partial::Text(found), start, count] if start.integer() == Some(1) => {
+                first_characters(found, count)
+            }
+            _ => Partial::Any,
+        }
+    }
+}
+
+/// `LENGTH`, `CHARACTER_LENGTH`, and `CHAR_LENGTH`.
+struct Length;
+
+impl PartialEval for Length {
+    fn partial_eval(&self, args: &[Partial]) -> Partial {
+        match args {
+            [Partial::Text(found)] => {
+                let (low, high) = found.lengths();
+                Partial::Count {
+                    low: low as i64,
+                    high: high.map(|high| high as i64),
+                    may_be_null: found.may_be_null,
+                }
+            }
+            _ => Partial::Any,
+        }
+    }
+}
+
+/// `STARTS_WITH(text, literal)`.
+struct StartsWith;
+
+impl PartialEval for StartsWith {
+    fn partial_eval(&self, args: &[Partial]) -> Partial {
+        match args {
+            [Partial::Text(found), literal] => match literal.text() {
+                Some(literal) => Partial::Truth(found.starts_with(&literal)),
+                None => Partial::Any,
+            },
+            _ => Partial::Any,
+        }
+    }
+}
+
+/// The [`PartialEval`] of a DataFusion function, by its name.
+fn partial_function(name: &str) -> Option<&'static dyn PartialEval> {
+    Some(match name {
+        "lower" => &LetterCase { upper: false },
+        "upper" => &LetterCase { upper: true },
+        "left" => &Left,
+        "substr" | "substring" => &Substr,
+        "length" | "character_length" | "char_length" => &Length,
+        "starts_with" => &StartsWith,
+        _ => return None,
+    })
+}
+
+/// Which values `low..=high op bound` gives.
+fn count_test(low: i64, high: Option<i64>, op: Operator, bound: i64) -> Option<(bool, bool)> {
+    let holds = |length: i64| match op {
+        Operator::Eq => length == bound,
+        Operator::NotEq => length != bound,
+        Operator::Lt => length < bound,
+        Operator::LtEq => length <= bound,
+        Operator::Gt => length > bound,
+        _ => length >= bound,
+    };
+    if !matches!(
+        op,
+        Operator::Eq
+            | Operator::NotEq
+            | Operator::Lt
+            | Operator::LtEq
+            | Operator::Gt
+            | Operator::GtEq
+    ) {
+        return None;
+    }
+    Some(match high {
+        Some(high) if high - low <= 4096 => {
+            let any = |want: bool| (low..=high).any(|length| holds(length) == want);
+            (any(true), any(false))
+        }
+        Some(_) => (true, true),
+        None => match op {
+            Operator::Eq => (bound >= low, true),
+            Operator::NotEq => (true, bound >= low),
+            Operator::Lt | Operator::LtEq => (holds(low), true),
+            _ => (true, !holds(low)),
+        },
+    })
+}
+
+/// Which values `left op right` gives.
+fn compare(left: &Partial, op: Operator, right: &Partial) -> Possible {
+    match (left, right) {
+        (Partial::Text(found), literal) => match (literal.text(), op) {
+            (Some(literal), Operator::Eq) => found.equals(&literal),
+            (Some(literal), Operator::NotEq) => found.equals(&literal).not(),
+            (Some(literal), Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq) => {
+                found.ordered(op, &literal)
+            }
+            _ => ANY,
+        },
+        (
+            Partial::Count {
+                low,
+                high,
+                may_be_null,
+            },
+            bound,
+        ) => match bound
+            .integer()
+            .and_then(|bound| count_test(*low, *high, op, bound))
+        {
+            Some((t, f)) => Possible {
+                t,
+                f,
+                n: *may_be_null,
+            },
+            None => ANY,
+        },
+        (Partial::Known(_), Partial::Text(_) | Partial::Count { .. }) => {
+            compare(right, swapped(op), left)
+        }
+        _ => ANY,
+    }
+}
+
+/// Which values `subject LIKE pattern` gives: a pattern with no
+/// wildcard, one that ends with its one `%`, or one between two `%`.
+fn like(subject: &Partial, pattern: &Partial, case_insensitive: bool) -> Possible {
+    let (Partial::Text(found), Some(pattern)) = (subject, pattern.text()) else {
+        return ANY;
+    };
+    // a backslash escapes the character after it
+    if pattern.contains('\\') {
+        return ANY;
+    }
+    let (found, pattern) = if case_insensitive {
+        match (found.in_case(false), pattern.is_ascii()) {
+            (Some(found), true) => (found, pattern.to_ascii_lowercase()),
+            _ => return ANY,
+        }
+    } else {
+        (found.clone(), pattern)
+    };
+    let inner = pattern
+        .strip_prefix('%')
+        .and_then(|rest| rest.strip_suffix('%'))
+        .filter(|inner| !inner.is_empty() && !inner.contains(['%', '_']));
+    match (inner, pattern.find(['%', '_'])) {
+        (Some(inner), _) => found.contains(inner),
+        (None, None) => found.equals(&pattern),
+        (None, Some(at)) if at == pattern.len() - 1 && pattern.ends_with('%') => {
+            found.starts_with(&pattern[..at])
+        }
+        // any other pattern passes only an answer that starts with the
+        // text before its first wildcard
+        (None, Some(at)) => Possible {
+            f: true,
+            ..found.starts_with(&pattern[..at])
+        },
+    }
+}
+
+/// Evaluates an expression over the answers in `C(w)`, as the module
+/// explains.
 struct Reader<'a, F: Fn(&Expr) -> bool> {
     is_answer: F,
     answers: &'a Completions,
 }
 
 impl<F: Fn(&Expr) -> bool> Reader<'_, F> {
-    fn answer(&self, expr: &Expr) -> bool {
-        (self.is_answer)(uncast(expr))
-    }
-
-    fn possible(&self, expr: &Expr) -> Possible {
-        let answers = self.answers;
+    /// What is known of `expr`'s value.
+    fn value(&self, expr: &Expr) -> Partial {
+        let truth = |expr: &Expr| self.value(expr).truth();
         match expr {
-            Expr::Alias(alias) => self.possible(&alias.expr),
-            Expr::Literal(ScalarValue::Boolean(value), _) => Possible::constant(*value),
-            Expr::Not(inner) => self.possible(inner).not(),
+            Expr::Alias(alias) => self.value(&alias.expr),
+            Expr::Cast(cast) => self.value(&cast.expr).cast(cast.field.data_type()),
+            Expr::TryCast(cast) => self.value(&cast.expr).cast(cast.field.data_type()),
+            Expr::Literal(value, _) => Partial::Known(value.clone()),
+            Expr::Column(_) if (self.is_answer)(expr) => Partial::Text(self.answers.clone()),
+            Expr::ScalarFunction(ScalarFunction { func, args }) => {
+                match partial_function(func.name()) {
+                    Some(function) => {
+                        let args: Vec<Partial> = args.iter().map(|arg| self.value(arg)).collect();
+                        function.partial_eval(&args)
+                    }
+                    None => Partial::Any,
+                }
+            }
+            Expr::Not(inner) => Partial::Truth(truth(inner).not()),
             Expr::IsTrue(inner)
             | Expr::IsNotFalse(inner)
             | Expr::IsFalse(inner)
             | Expr::IsNotTrue(inner) => {
-                let found = self.possible(inner);
+                let found = truth(inner);
                 let (yes, no) = match expr {
                     Expr::IsTrue(_) => (found.t, found.f || found.n),
                     Expr::IsNotTrue(_) => (found.f || found.n, found.t),
                     Expr::IsFalse(_) => (found.f, found.t || found.n),
                     _ => (found.t || found.n, found.f),
                 };
-                Possible {
+                Partial::Truth(Possible {
                     t: yes,
                     f: no,
                     n: false,
-                }
+                })
             }
-            Expr::IsNull(inner) if self.answer(inner) => Possible {
-                t: answers.may_be_null,
-                f: true,
-                n: false,
-            },
-            Expr::IsNotNull(inner) if self.answer(inner) => Possible {
-                t: true,
-                f: answers.may_be_null,
-                n: false,
-            },
-            Expr::BinaryExpr(BinaryExpr { left, op, right }) => match op {
-                Operator::And => self.possible(left).and(self.possible(right)),
-                Operator::Or => self.possible(left).or(self.possible(right)),
-                _ => self
-                    .compared(left, *op, right)
-                    .or_else(|| self.compared(right, swapped(*op), left))
-                    .unwrap_or(ANY),
-            },
+            Expr::IsNull(inner) => Partial::Truth(self.value(inner).is_null().unwrap_or(ANY)),
+            Expr::IsNotNull(inner) => {
+                Partial::Truth(self.value(inner).is_null().map_or(ANY, Possible::not))
+            }
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) => Partial::Truth(match op {
+                Operator::And => truth(left).and(truth(right)),
+                Operator::Or => truth(left).or(truth(right)),
+                _ => compare(&self.value(left), *op, &self.value(right)),
+            }),
             Expr::Like(Like {
                 negated,
                 expr: subject,
                 pattern,
                 escape_char: None,
-                case_insensitive: false,
-            }) if self.answer(subject) => {
-                let Some(pattern) = text_literal(pattern) else {
-                    return ANY;
-                };
-                let inner = pattern
-                    .strip_prefix('%')
-                    .and_then(|rest| rest.strip_suffix('%'))
-                    .filter(|inner| !inner.is_empty() && !inner.contains(['%', '_']));
-                let found = match (inner, pattern.find(['%', '_'])) {
-                    (Some(inner), _) => answers.contains(inner),
-                    (None, None) => answers.equals(&pattern),
-                    (None, Some(at)) if at == pattern.len() - 1 && pattern.ends_with('%') => {
-                        answers.starts_with(&pattern[..at])
-                    }
-                    _ => return ANY,
-                };
-                if *negated { found.not() } else { found }
+                case_insensitive,
+            }) => {
+                let found = like(
+                    &self.value(subject),
+                    &self.value(pattern),
+                    *case_insensitive,
+                );
+                Partial::Truth(if *negated { found.not() } else { found })
             }
             Expr::InList(InList {
                 expr: subject,
                 list,
                 negated,
-            }) if self.answer(subject) => {
+            }) => {
+                let subject = self.value(subject);
                 let mut found = Possible::constant(Some(false));
                 for item in list {
-                    let Some(literal) = text_literal(item) else {
-                        return ANY;
-                    };
-                    found = found.or(answers.equals(&literal));
+                    found = found.or(compare(&subject, Operator::Eq, &self.value(item)));
                 }
-                if *negated { found.not() } else { found }
+                Partial::Truth(if *negated { found.not() } else { found })
             }
-            _ => match call_args(expr, &["starts_with"]) {
-                Some([subject, literal]) if self.answer(subject) => match text_literal(literal) {
-                    Some(literal) => answers.starts_with(&literal),
-                    None => ANY,
-                },
-                _ => ANY,
-            },
+            _ => Partial::Any,
         }
     }
 
@@ -564,7 +765,7 @@ impl<F: Fn(&Expr) -> bool> Reader<'_, F> {
         let read = expr
             .clone()
             .transform_up(|found| match &found {
-                Expr::Column(_) if self.answer(&found) => {
+                Expr::Column(_) if (self.is_answer)(&found) => {
                     Ok(Transformed::yes(Expr::Column(Column::from_name(LISTED))))
                 }
                 Expr::Column(_) => {
@@ -576,51 +777,6 @@ impl<F: Fn(&Expr) -> bool> Reader<'_, F> {
             .ok()?
             .data;
         (!other).then_some(read)
-    }
-
-    /// Which values `expr` can give an answer that starts with the text
-    /// so far, as DataFusion's `PruningPredicate` decides from the
-    /// least and greatest such texts: whether `expr` can be TRUE, and
-    /// whether its negation can. None when the answer is complete,
-    /// `expr` reads a column that is not the answer, or DataFusion does
-    /// not plan it.
-    ///
-    /// Every answer that continues the text sorts from the text itself
-    /// up to the text with its last character raised by one, so a test a
-    /// range of strings cannot pass, such as `a = 'x'` or `a < 'x'`, is
-    /// decided for a map's open-ended answer. A shape the predicate does
-    /// not read counts as possible.
-    fn ranged(&self, expr: &Expr) -> Option<Possible> {
-        if self.answers.complete {
-            return None;
-        }
-        let read = self.over_answer(expr)?;
-        let schema = answer_schema();
-        let fields = DFSchema::try_from(Arc::clone(&schema)).ok()?;
-        let range = Range {
-            least: self.answers.prefix.clone(),
-            greatest: after(&self.answers.prefix),
-        };
-        let possible = |expr: Expr| -> Option<bool> {
-            let physical = context().create_physical_expr(expr, &fields).ok()?;
-            let predicate = PruningPredicateBuilder::new()
-                .with_file_schema(Arc::clone(&schema))
-                .try_build(physical)
-                .ok()?;
-            predicate.prune(&range).ok()?.first().copied()
-        };
-        let simplify = SimplifyContext::builder()
-            .with_schema(Arc::new(fields.clone()))
-            .build();
-        // the simplifier moves a NOT into the comparison it negates
-        let negated = ExprSimplifier::new(simplify)
-            .simplify(Expr::Not(Box::new(read.clone())))
-            .ok()?;
-        Some(Possible {
-            t: possible(read)?,
-            f: possible(negated)?,
-            n: self.answers.may_be_null,
-        })
     }
 
     /// Which values `expr` gives the complete answers still possible,
@@ -660,186 +816,22 @@ impl<F: Fn(&Expr) -> bool> Reader<'_, F> {
         }
         Some(found)
     }
-
-    /// `left op right` with the answer, or a function of it, on the left
-    /// and a literal on the right; None for another shape.
-    fn compared(&self, left: &Expr, op: Operator, right: &Expr) -> Option<Possible> {
-        let answers = self.answers;
-        let equality = matches!(op, Operator::Eq | Operator::NotEq);
-        let negate = |found: Possible| {
-            if op == Operator::NotEq {
-                found.not()
-            } else {
-                found
-            }
-        };
-        if equality && self.answer(left) {
-            return Some(negate(answers.equals(&text_literal(right)?)));
-        }
-        if let Some([subject]) = call_args(left, &["length", "character_length", "char_length"])
-            && self.answer(subject)
-        {
-            let bound = integer_literal(right)?;
-            return matches!(
-                op,
-                Operator::Eq
-                    | Operator::NotEq
-                    | Operator::Lt
-                    | Operator::LtEq
-                    | Operator::Gt
-                    | Operator::GtEq
-            )
-            .then(|| answers.length(op, bound));
-        }
-        let cut = match (
-            call_args(left, &["left"]),
-            call_args(left, &["substr", "substring"]),
-        ) {
-            (Some([subject, count]), _) => Some((subject, count)),
-            (_, Some([subject, start, count])) if integer_literal(start) == Some(1) => {
-                Some((subject, count))
-            }
-            _ => None,
-        };
-        if equality
-            && let Some((subject, count)) = cut
-            && self.answer(subject)
-        {
-            let count = integer_literal(count)?;
-            let literal = text_literal(right)?;
-            let length = literal.chars().count() as i64;
-            let found = if count <= 0 {
-                answers
-                    .equals("")
-                    .and(Possible::constant(Some(literal.is_empty())))
-            } else if length == count {
-                answers.starts_with(&literal)
-            } else if length < count {
-                answers.equals(&literal)
-            } else {
-                answers.text_test(false, true)
-            };
-            return Some(negate(found));
-        }
-        None
-    }
-}
-
-/// The texts of `answers` in one letter case, `upper` or lower; None when
-/// a text is not ASCII, where a letter's case can depend on the letters
-/// after it.
-pub(crate) fn in_case(answers: &Completions, upper: bool) -> Option<Completions> {
-    let ascii =
-        answers.prefix.is_ascii() && answers.tails.iter().flatten().all(|tail| tail.is_ascii());
-    let fold = |text: &String| {
-        if upper {
-            text.to_ascii_uppercase()
-        } else {
-            text.to_ascii_lowercase()
-        }
-    };
-    ascii.then(|| Completions {
-        prefix: fold(&answers.prefix),
-        tails: answers
-            .tails
-            .as_ref()
-            .map(|tails| tails.iter().map(fold).collect()),
-        ..answers.clone()
-    })
-}
-
-/// A test that reads the answer only in one letter case, as the same
-/// test of the answer's texts in that case: `lower(a) LIKE 'neg%'` at
-/// the answers that start with `Ne` is `a LIKE 'neg%'` at those that
-/// start with `ne`. An ASCII `ILIKE` reads the answer in lower case.
-/// None when the test reads the answer as written, or in both cases.
-fn case_folded(
-    expr: &Expr,
-    is_answer: &impl Fn(&Expr) -> bool,
-    answers: &Completions,
-) -> Option<(Expr, Completions)> {
-    use datafusion::functions::string::expr_fn::lower;
-    let insensitive = expr
-        .clone()
-        .transform_up(|found| match found {
-            Expr::Like(like) if like.case_insensitive => {
-                let pattern = match like.pattern.as_ref() {
-                    Expr::Literal(value, _) => value.try_as_str().flatten(),
-                    _ => None,
-                };
-                match pattern.filter(|pattern| pattern.is_ascii()) {
-                    Some(pattern) => Ok(Transformed::yes(Expr::Like(Like::new(
-                        like.negated,
-                        Box::new(lower(*like.expr)),
-                        Box::new(datafusion::logical_expr::lit(pattern.to_ascii_lowercase())),
-                        like.escape_char,
-                        false,
-                    )))),
-                    None => Ok(Transformed::no(Expr::Like(like))),
-                }
-            }
-            other => Ok(Transformed::no(other)),
-        })
-        .ok()?
-        .data;
-    let (mut lowered, mut raised, mut as_written) = (false, false, false);
-    let read = insensitive
-        .transform_down(|found| {
-            if let Expr::ScalarFunction(call) = &found
-                && let [argument] = call.args.as_slice()
-                && is_answer(argument)
-                && matches!(call.name(), "lower" | "upper")
-            {
-                if call.name() == "lower" {
-                    lowered = true;
-                } else {
-                    raised = true;
-                }
-                return Ok(Transformed::new(
-                    argument.clone(),
-                    true,
-                    datafusion::common::tree_node::TreeNodeRecursion::Jump,
-                ));
-            }
-            as_written |= is_answer(&found);
-            Ok(Transformed::no(found))
-        })
-        .ok()?
-        .data;
-    if as_written || lowered == raised {
-        return None;
-    }
-    Some((read, in_case(answers, raised)?))
 }
 
 /// `expr` at the answers in `answers`, with `is_answer` telling which
-/// expression reads the answer.
+/// column holds the answer.
 pub fn decide_expr(
     expr: &Expr,
     is_answer: impl Fn(&Expr) -> bool,
     answers: &Completions,
 ) -> Decision {
-    let folded = case_folded(expr, &is_answer, answers);
-    let (expr, answers) = match &folded {
-        Some((expr, answers)) => (expr, answers),
-        None => (expr, answers),
-    };
     let reader = Reader { is_answer, answers };
-    let mut found = reader.possible(expr);
-    // the shapes above ignore that two parts read one answer, and read
-    // any other shape as any value: a short list of answers settles both
-    if found.t && (found.f || found.n) {
-        if let Some(listed) = reader.evaluated(expr) {
-            found = listed;
-        } else if let Some(ranged) = reader.ranged(expr) {
-            // both readings hold, so a value either rules out is out
-            found = Possible {
-                t: found.t && ranged.t,
-                f: found.f && ranged.f,
-                n: found.n && ranged.n,
-            };
-        }
-    }
+    // a short list of answers is exact: DataFusion evaluates each one.
+    // Otherwise the parts are combined ignoring that two read one
+    // answer, and a part without a `PartialEval` is any value
+    let found = reader
+        .evaluated(expr)
+        .unwrap_or_else(|| reader.value(expr).truth());
     if !found.t {
         Decision::NotTrue
     } else if !found.f && !found.n {
@@ -1065,5 +1057,38 @@ mod tests {
         let other = col("a").like(lit("M_r%"));
         assert_eq!(at(&other, &text("Jan")), Decision::NotTrue);
         assert_eq!(at(&other, &text("Mar")), Decision::Undecided);
+    }
+
+    #[test]
+    fn a_part_the_evaluator_cannot_read_exactly_is_left_undecided() {
+        use datafusion::arrow::datatypes::DataType;
+        use datafusion::functions::string::expr_fn::upper;
+        use datafusion::functions::unicode::expr_fn::{left, substr};
+        use datafusion::logical_expr::cast;
+        // a backslash escapes the wildcard after it
+        let escaped = col("a").like(lit("a\\%"));
+        assert_eq!(at(&escaped, &text("a%")), Decision::Undecided);
+        // a cast answer is no longer the text
+        let number = cast(col("a"), DataType::Int32).eq(lit(5));
+        assert_eq!(at(&number, &text("0")), Decision::Undecided);
+        // no characters are the empty text, whatever the answer
+        let none = left(col("a"), lit(0)).eq(lit(""));
+        assert_eq!(at(&none, &text("x")), Decision::True);
+        // a negative count cuts from the end, and a later start skips
+        // characters the answer may not hold yet
+        let end = left(col("a"), lit(-1)).eq(lit("x"));
+        assert_eq!(at(&end, &text("x")), Decision::Undecided);
+        let rest = substr(col("a"), lit(2)).eq(lit(""));
+        assert_eq!(at(&rest, &text("I")), Decision::Undecided);
+        // a decimal bound is no count of characters
+        let half = character_length(col("a")).lt(lit(2.5));
+        assert_eq!(at(&half, &text("ab")), Decision::Undecided);
+        // one letter yet to come may be two in the other case
+        let sharp = upper(col("a")).eq(lit("SS"));
+        let one = Completions {
+            max_chars: Some(1),
+            ..text("")
+        };
+        assert_eq!(at(&sharp, &one), Decision::Undecided);
     }
 }

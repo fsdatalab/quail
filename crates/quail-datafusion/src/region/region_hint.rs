@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, RecordBatch};
 use datafusion::arrow::compute::cast;
-use datafusion::arrow::datatypes::{DataType, Schema};
+use datafusion::arrow::datatypes::DataType;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column as LogicalColumn, Result};
 use datafusion::logical_expr::{Expr, LogicalPlan, Operator};
@@ -32,7 +32,7 @@ use datafusion::physical_expr_common::physical_expr::{
 };
 
 use crate::ai::AiNode;
-use crate::derive::partial::{Completions, LISTED, can_be_true, in_case};
+use crate::derive::partial::{Completions, Decision, LISTED, decide_expr};
 use crate::region::ModelRegion;
 
 /// The tests above a region that it may drop rows by, over the region's
@@ -94,57 +94,38 @@ impl RegionHint {
         Ok(keep)
     }
 
-    /// Whether a test reads the answer in column `index` of `schema`,
-    /// or its field `field` when the column is an extraction's struct,
-    /// and no other column.
-    pub fn reads_answer(&self, index: usize, field: Option<&str>) -> bool {
-        self.tests
-            .iter()
-            .any(|test| answer_test(test, index, field).is_some())
+    /// Whether a test reads the answer in column `index` and no other
+    /// column.
+    pub fn reads_answer(&self, index: usize) -> bool {
+        self.tests.iter().any(|test| {
+            let columns = collect_columns(test);
+            !columns.is_empty() && columns.iter().all(|column| column.index() == index)
+        })
     }
 
     /// Whether some test, as the tests are now, is TRUE for no complete
-    /// answer still possible in column `index` of `schema`, or in its
-    /// field `field`: the row leaves the query above whatever the rest
-    /// of the answer says.
+    /// answer still possible in column `index`, or in its field `field`
+    /// when the column is an extraction's struct: the row leaves the
+    /// query above whatever the rest of the answer says.
     ///
-    /// A test that also reads another column, or that DataFusion does
-    /// not decide on a partial answer, rejects nothing.
+    /// Each test is decided as a WHERE test of the answer is, by
+    /// [`decide_expr`]. A part of a test that reads another column, or
+    /// that has no logical form here, may be any value.
     ///
     /// # Errors
     ///
     /// A test does not give its current form.
     pub fn rejects_answer(
         &self,
-        schema: &Schema,
         index: usize,
         field: Option<&str>,
         answers: &Completions,
     ) -> Result<bool> {
-        let data_type = match (schema.field(index).data_type(), field) {
-            (DataType::Struct(fields), Some(field)) => {
-                match fields.iter().find(|found| found.name() == field) {
-                    Some(found) => found.data_type().clone(),
-                    None => return Ok(false),
-                }
-            }
-            (found, None) => found.clone(),
-            _ => return Ok(false),
-        };
+        let answer = Expr::Column(LogicalColumn::from_name(LISTED));
         for test in &self.tests {
             let test = snapshot_physical_expr(Arc::clone(test))?;
-            let Some((test, case)) = answer_test(&test, index, field) else {
-                continue;
-            };
-            // a test of the answer in one letter case reads its texts in
-            // that case
-            let folded = match case {
-                Some(upper) => in_case(answers, upper),
-                None => Some(answers.clone()),
-            };
-            if let Some(folded) = folded
-                && can_be_true(&test, &data_type, &folded) == Some(false)
-            {
+            let test = logical(&test, index, field);
+            if decide_expr(&test, |expr| *expr == answer, answers) == Decision::NotTrue {
                 return Ok(true);
             }
         }
@@ -152,90 +133,76 @@ impl RegionHint {
     }
 }
 
-/// `test` reading the answer as column 0, named [`LISTED`], when the
-/// only column it reads is the answer: column `index`, or `get_field`
-/// of it and `field`. With it, the letter case the test reads the
-/// answer in: Some(true) when every read is `upper(answer)`,
-/// Some(false) for `lower(answer)`, and None as written. None when it
-/// reads no answer, another column, or the answer in two cases.
-fn answer_test(
-    test: &Arc<dyn PhysicalExpr>,
-    index: usize,
-    field: Option<&str>,
-) -> Option<(Arc<dyn PhysicalExpr>, Option<bool>)> {
-    use datafusion::common::tree_node::TreeNodeRecursion;
+/// A test above a region as a logical expression of the answer, the
+/// column [`LISTED`]: column `index`, or `get_field` of it and `field`.
+/// Any part with no logical form here, and any other column, is a column
+/// of another name, which the evaluator reads as any value.
+fn logical(test: &Arc<dyn PhysicalExpr>, index: usize, field: Option<&str>) -> Expr {
+    use datafusion::logical_expr::expr::{InList, ScalarFunction};
     use datafusion::physical_expr::ScalarFunctionExpr;
-    use datafusion::physical_expr::expressions::Literal;
-    let answer: Arc<dyn PhysicalExpr> = Arc::new(Column::new(LISTED, 0));
+    use datafusion::physical_expr::expressions::{CastExpr, InListExpr, Literal, TryCastExpr};
+    let other = || Expr::Column(LogicalColumn::from_name("other"));
+    let answer = || Expr::Column(LogicalColumn::from_name(LISTED));
+    let read = |expr: &Arc<dyn PhysicalExpr>| logical(expr, index, field);
     let is_column = |expr: &Arc<dyn PhysicalExpr>| {
         expr.downcast_ref::<Column>()
             .is_some_and(|column| column.index() == index)
     };
-    let is_answer = |expr: &Arc<dyn PhysicalExpr>| match field {
-        None => is_column(expr),
-        Some(field) => expr
-            .downcast_ref::<ScalarFunctionExpr>()
-            .is_some_and(|call| {
-                call.name() == "get_field"
-                    && matches!(call.args(), [input, name] if is_column(input)
-                        && name.downcast_ref::<Literal>().and_then(|literal| {
-                            literal.value().try_as_str().flatten()
-                        }) == Some(field))
-            }),
-    };
-    let mut found = false;
-    let mut other = false;
-    let mut cases: Vec<Option<bool>> = Vec::new();
-    let read = Arc::clone(test)
-        .transform_down(|node| {
-            if let Some(call) = node.downcast_ref::<ScalarFunctionExpr>()
-                && matches!(call.name(), "lower" | "upper")
-                && let [argument] = call.args()
-                && is_answer(argument)
-            {
-                found = true;
-                cases.push(Some(call.name() == "upper"));
-                return Ok(Transformed::new(
-                    Arc::clone(&answer),
-                    true,
-                    TreeNodeRecursion::Jump,
-                ));
-            }
-            if is_answer(&node) {
-                cases.push(None);
-            }
-            if let Some(call) = node.downcast_ref::<ScalarFunctionExpr>()
-                && call.name() == "get_field"
-                && let [input, name] = call.args()
-                && is_column(input)
-            {
-                let named = name
-                    .downcast_ref::<Literal>()
-                    .and_then(|literal| literal.value().try_as_str().flatten());
-                if field.is_some() && named == field {
-                    found = true;
-                    return Ok(Transformed::new(
-                        Arc::clone(&answer),
-                        true,
-                        TreeNodeRecursion::Jump,
-                    ));
-                }
-                other = true;
-                return Ok(Transformed::new(node, false, TreeNodeRecursion::Jump));
-            }
-            if node.downcast_ref::<Column>().is_some() {
-                if field.is_none() && is_column(&node) {
-                    found = true;
-                    return Ok(Transformed::yes(Arc::clone(&answer)));
-                }
-                other = true;
-            }
-            Ok(Transformed::no(node))
-        })
-        .ok()?
-        .data;
-    let case = cases.first().copied().flatten();
-    (found && !other && cases.iter().all(|read| *read == case)).then_some((read, case))
+    if let Some(literal) = test.downcast_ref::<Literal>() {
+        return Expr::Literal(literal.value().clone(), None);
+    }
+    if is_column(test) {
+        return if field.is_none() { answer() } else { other() };
+    }
+    if let Some(call) = test.downcast_ref::<ScalarFunctionExpr>() {
+        if call.name() == "get_field"
+            && let [input, name] = call.args()
+            && is_column(input)
+        {
+            let named = name
+                .downcast_ref::<Literal>()
+                .and_then(|literal| literal.value().try_as_str().flatten());
+            return if field.is_some() && named == field {
+                answer()
+            } else {
+                other()
+            };
+        }
+        return Expr::ScalarFunction(ScalarFunction::new_udf(
+            Arc::new(call.fun().clone()),
+            call.args().iter().map(read).collect(),
+        ));
+    }
+    if let Some(binary) = test.downcast_ref::<BinaryExpr>() {
+        return datafusion::logical_expr::binary_expr(
+            read(binary.left()),
+            *binary.op(),
+            read(binary.right()),
+        );
+    }
+    if let Some(not) = test.downcast_ref::<NotExpr>() {
+        return Expr::Not(Box::new(read(not.arg())));
+    }
+    if let Some(null) = test.downcast_ref::<IsNullExpr>() {
+        return Expr::IsNull(Box::new(read(null.arg())));
+    }
+    if let Some(null) = test.downcast_ref::<IsNotNullExpr>() {
+        return Expr::IsNotNull(Box::new(read(null.arg())));
+    }
+    if let Some(cast) = test.downcast_ref::<CastExpr>() {
+        return read(cast.expr());
+    }
+    if let Some(cast) = test.downcast_ref::<TryCastExpr>() {
+        return read(cast.expr());
+    }
+    if let Some(list) = test.downcast_ref::<InListExpr>() {
+        return Expr::InList(InList::new(
+            Box::new(read(list.expr())),
+            list.list().iter().map(read).collect(),
+            list.negated(),
+        ));
+    }
+    other()
 }
 
 /// What a region knows about each of its columns before the model runs.
@@ -584,6 +551,8 @@ fn input_values(
 
 #[cfg(test)]
 mod tests {
+    use datafusion::arrow::datatypes::Schema;
+
     use super::*;
 
     #[test]
@@ -615,10 +584,10 @@ mod tests {
         ]);
         // the sort keeps the vendors that sort before Globex
         let hint = hint_of(&schema, col("vendor").lt(lit("Globex")));
-        assert!(hint.reads_answer(1, None));
-        assert!(!hint.reads_answer(0, None));
+        assert!(hint.reads_answer(1));
+        assert!(!hint.reads_answer(0));
         let rejects = |prefix: &str| {
-            hint.rejects_answer(&schema, 1, None, &Completions::text(prefix))
+            hint.rejects_answer(1, None, &Completions::text(prefix))
                 .unwrap()
         };
         assert!(rejects("Initech"));
@@ -634,14 +603,14 @@ mod tests {
         );
         let rejects = |prefix: &str| {
             folded
-                .rejects_answer(&schema, 1, None, &Completions::text(prefix))
+                .rejects_answer(1, None, &Completions::text(prefix))
                 .unwrap()
         };
-        assert!(folded.reads_answer(1, None));
+        assert!(folded.reads_answer(1));
         assert!(!rejects("ACME"));
         // a test that also reads the id is not the answer's alone
         let both = hint_of(&schema, col("vendor").lt(col("id")));
-        assert!(!both.reads_answer(1, None));
+        assert!(!both.reads_answer(1));
     }
 
     #[test]
@@ -659,8 +628,10 @@ mod tests {
             &schema,
             get_field(col("contract"), "law").in_list(keys, false),
         );
-        assert!(hint.reads_answer(0, Some("law")));
-        assert!(!hint.reads_answer(0, Some("party")));
+        assert!(hint.reads_answer(0));
+        // a test of the law is none of the party
+        let party = Completions::text("Texas");
+        assert!(!hint.rejects_answer(0, Some("party"), &party).unwrap());
         // the span copies the document, which goes on as one of two texts
         let copied = |prefix: &str, tails: &[&str]| Completions {
             prefix: prefix.to_string(),
@@ -669,10 +640,7 @@ mod tests {
             tails: Some(tails.iter().map(|tail| (*tail).to_string()).collect()),
             max_chars: None,
         };
-        let rejects = |answers: &Completions| {
-            hint.rejects_answer(&schema, 0, Some("law"), answers)
-                .unwrap()
-        };
+        let rejects = |answers: &Completions| hint.rejects_answer(0, Some("law"), answers).unwrap();
         assert!(rejects(&copied("Texas", &[" law", " courts"])));
         assert!(!rejects(&copied("New", &[" York law", " Jersey"])));
         assert!(rejects(&copied("New", &[" Jersey", " Mexico"])));

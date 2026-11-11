@@ -326,7 +326,7 @@ impl InputHint {
     /// name such as `vendor` or `contract.law`, and no other column.
     fn reads_answer(&self, answer: &str) -> bool {
         self.answer_column(answer)
-            .is_some_and(|(index, field)| self.hint.reads_answer(index, field.as_deref()))
+            .is_some_and(|(index, _)| self.hint.reads_answer(index))
     }
 
     /// Whether some test, as the tests are now, is TRUE for no complete
@@ -353,7 +353,7 @@ impl InputHint {
             max_chars,
         };
         self.hint
-            .rejects_answer(&self.schema, index, field.as_deref(), &answers)
+            .rejects_answer(index, field.as_deref(), &answers)
             .map_err(|error| PyRuntimeError::new_err(error.to_string()))
     }
 }
