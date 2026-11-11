@@ -71,6 +71,11 @@ fn is_column_equality(term: &Expr) -> bool {
 }
 
 impl Relation {
+    /// Whether `answer` is the answer of an AI.IF that an OR tests.
+    pub(super) fn in_or(&self, answer: &str) -> bool {
+        self.or_terms.contains_key(answer)
+    }
+
     /// Bind the relation's tables and terms in the order the query wrote
     /// them: the tables, each JOIN's ON, the ON AI predicates, then WHERE.
     ///

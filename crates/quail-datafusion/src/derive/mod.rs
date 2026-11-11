@@ -221,6 +221,18 @@ fn derive_operators(
     }
     let mut binder = Binder::new(turn, layout);
     let relation = Relation::bind(&walk, &mut binder, &names)?;
+    // the executor answers an OR's AI.IF only where the OR needs it, so
+    // it has no answer for every row to return
+    let returns_or_term = select.iter().any(|item| {
+        item.column_refs()
+            .iter()
+            .any(|column| column.relation.is_none() && relation.in_or(&column.name))
+    });
+    if returns_or_term {
+        return Err(CompileError::unsupported(
+            "DataFusion must return this AI.IF answer, which an OR also tests.",
+        ));
+    }
     let Selected {
         columns,
         structs,
