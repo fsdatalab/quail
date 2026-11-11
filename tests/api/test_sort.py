@@ -33,7 +33,7 @@ def _scores():
 SCORE = "AI.SCORE(PROMPT('Asks for a refund: {0}', r.body))"
 
 
-def test_an_order_by_limit_over_an_ai_score_returns_the_top_k(session):
+def test_order_by_limit_and_offset_over_an_ai_score_return_the_sorted_rows(session):
     query = session.sql(f"SELECT r.id, {SCORE} AS score FROM reviews r "
                         "ORDER BY score DESC NULLS LAST LIMIT 2")
     rows = finish(query, _scores()).collect().to_pylist()
@@ -42,9 +42,7 @@ def test_an_order_by_limit_over_an_ai_score_returns_the_top_k(session):
     assert not any(isinstance(node, Limit) for node in query.plan().nodes)
     assert "filter_limit" not in query.plan().settings
     assert "SortExec: TopK(fetch=2)" in query.explain()
-
-
-def test_an_offset_skips_the_sorted_rows_with_nulls_highest(session):
+    # an offset skips the sorted rows, with nulls highest
     query = session.sql(f"SELECT r.id FROM reviews r ORDER BY {SCORE} DESC "
                         "LIMIT 2 OFFSET 3")
     rows = finish(query, _scores()).collect().to_pylist()
@@ -53,16 +51,14 @@ def test_an_offset_skips_the_sorted_rows_with_nulls_highest(session):
     assert finish(last, _scores()).collect().to_pylist() == [{"r.id": 13}]
 
 
-def test_a_limit_without_order_stops_the_region_at_its_rows(session):
+def test_a_limit_stops_an_ai_filter_and_a_distinct_returns_each_value_once(session):
     query = session.sql("SELECT r.id FROM reviews r "
                         "WHERE AI.IF(PROMPT('Asks for a refund: {0}', r.body)) LIMIT 2")
     assert query.plan().settings["filter_limit"] == 2
     rows = finish(query, Oracle(filters=lambda alias, document, position:
                                 "refund" in BODIES[document])).collect()
     assert rows.column("r.id").to_pylist() == [10, 12]
-
-
-def test_a_distinct_over_an_ai_filters_columns_returns_each_value_once(session):
+    # DISTINCT returns each value of the kept rows once
     query = session.sql("SELECT DISTINCT r.stars FROM reviews r "
                         "WHERE AI.IF(PROMPT('Asks for a refund: {0}', r.body)) "
                         "ORDER BY r.stars")

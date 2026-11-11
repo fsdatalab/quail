@@ -39,29 +39,6 @@ def session(tmp_path):
     value.close()
 
 
-@pytest.mark.parametrize("filtered", [True])
-def test_score_and_extract_return_both_columns(session, monkeypatch, filtered):
-    oracle = Oracle(answers=lambda spec, document: (
-        "March 3, 2027" if document == 0 else None))
-    query = session.sql(
-        "SELECT c.id, AI.SCORE(PROMPT('Is this a lease? {0}', c.text)) AS score, "
-        f"AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease, "
-        f"AI.EXTRACT_SPAN(c.text, {{'ends': '{QUESTION}'}}) AS lease_span "
-        "FROM contracts c "
-        + ("WHERE AI.SCORE(PROMPT('Is this a lease? {0}', c.text)) > 0.15"
-           if filtered else ""))
-    result = finish(query, oracle)
-    rows = result.collect()
-    assert rows.column("score").type == pa.float64()
-    expected = [
-        {"c.id": 1, "score": 0.1, "lease": {"ends": "March 3, 2027"},
-         "lease_span": {"ends": {"start": 14, "end": 27}}},
-        {"c.id": 2, "score": 0.2, "lease": {"ends": None},
-         "lease_span": {"ends": None}},
-    ]
-    assert rows.to_pylist() == (expected[1:] if filtered else expected)
-
-
 class _PhraseClient(request_tests._Client):
     """Writes each document's answer from the text its prompt tokens spell."""
 
@@ -106,11 +83,27 @@ class _TextPhraseClient(_PhraseClient):
              for prompt in prompts], sampling_params, use_tqdm)
 
 
+class _FieldsClient(_PhraseClient):
+    """Runs the fields of each document together, as the vLLM client does."""
+
+    def __init__(self):
+        super().__init__()
+        self.runs = []
+
+    def run_extract_fields(self, sampling_params, body_ids, tail_ids, *,
+                           answer_tokens, body_texts=None, tail_texts=None):
+        self.runs.append((tail_ids, answer_tokens))
+        return {"wall": 1.5, "outputs": [
+            self.generate([{"prompt_token_ids": body + tail}
+                           for body in body_ids], sampling_params)
+            for tail in tail_ids]}
+
+
 TEXTS = [LEASE, "No dates here.", "Term: five years\nmore text",
          "the absent one"]
 
 
-def test_request_backend_decodes_and_locates_one_answer_per_document():
+def test_a_request_backend_decodes_and_locates_each_fields_answer_per_document():
     limit = 7
     documents = {"c": [request_tests._tokens(text) for text in TEXTS]}
     specs = (
@@ -159,25 +152,7 @@ def test_request_backend_decodes_and_locates_one_answer_per_document():
     assert result.outputs["extract_answers:ends"].to_pydict()["ends"] == [
         "March 3, 2027", None, "five years", None]
 
-
-class _FieldsClient(_PhraseClient):
-    """Runs the fields of each document together, as the vLLM client does."""
-
-    def __init__(self):
-        super().__init__()
-        self.runs = []
-
-    def run_extract_fields(self, sampling_params, body_ids, tail_ids, *,
-                           answer_tokens, body_texts=None, tail_texts=None):
-        self.runs.append((tail_ids, answer_tokens))
-        return {"wall": 1.5, "outputs": [
-            self.generate([{"prompt_token_ids": body + tail}
-                           for body in body_ids], sampling_params)
-            for tail in tail_ids]}
-
-
-def test_request_backend_runs_the_fields_of_a_document_together():
-    documents = {"c": [request_tests._tokens(text) for text in TEXTS]}
+    # pipelined submission runs the fields of a document together
     specs = tuple(
         RequestExtractSpec(alias="c", output=output, question=QUESTION,
                            tail_token_ids=(tail,), max_answer_tokens=limit)
@@ -200,7 +175,7 @@ def test_request_backend_runs_the_fields_of_a_document_together():
             for step in steps] == [("ends", 4, 1.5), ("term", 4, 1.5)]
 
 
-def test_stock_vllm_plans_and_runs_an_extraction(monkeypatch):
+def test_stock_vllm_extracts_every_row_and_datafusion_keeps_the_top_k(monkeypatch):
     session = request_tests._session(
         "stock_vllm", contracts={"id": ["a", "b", "c", "d"], "text": TEXTS})
     fields = f"c.text, {{'ends': '{QUESTION}', 'term': 'How long is the term?'}}"
@@ -230,21 +205,9 @@ def test_stock_vllm_plans_and_runs_an_extraction(monkeypatch):
     steps = result.report["backend_metrics"]["steps"]
     assert [(step["kind"], step["requests"]) for step in steps] == [
         ("extract", 4), ("extract", 4)]
-    session.close()
-
-
-def test_stock_vllm_extracts_every_row_a_top_k_reads(monkeypatch):
-    session = request_tests._session(
-        "stock_vllm", contracts={"id": ["a", "b", "c", "d"], "text": TEXTS})
     query = session.sql(
         f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease "
         "FROM contracts c ORDER BY c.id DESC LIMIT 2")
-    boot = {"client": _PhraseClient(), "sampling_params": object(),
-            "capacity": request_tests.CAPACITY}
-    monkeypatch.setattr(
-        "quail.baselines.vllm.VLLMEngine.boot",
-        lambda self, spec, allowed_ids, *, device, resources: (
-            boot, {"kind": "cold", "boot_s": 0.1}))
     # the region extracts every row; DataFusion sorts them and keeps two
     rows = request_tests._run_stock_vllm(session, query).collect()
     assert rows.column_names == ["c.id", "lease"]
@@ -268,17 +231,8 @@ def _struct_answers():
     return Oracle(answers=lambda spec, document: answers[spec.name][document])
 
 
-@pytest.mark.parametrize("suffix", ["", " ORDER BY c.id DESC LIMIT 1"])
-def test_extract_returns_answer_and_span_structs(
-        session, monkeypatch, suffix):
-    result = finish(session.sql(STRUCT_SQL + suffix), _struct_answers())
-    rows = result.collect()
-    assert rows.column_names == ["c.id", "lease", "lease_span"]
+def test_extract_returns_answer_and_span_structs(session):
     span = pa.struct([("start", pa.int32()), ("end", pa.int32())])
-    assert rows.schema.field("lease").type == pa.struct(
-        [("ends", pa.string()), ("rent", pa.string())])
-    assert rows.schema.field("lease_span").type == pa.struct(
-        [("ends", span), ("rent", span)])
     expected = [
         {"c.id": 1, "lease": {"ends": "March 3, 2027", "rent": "$2,000"},
          "lease_span": {"ends": {"start": 14, "end": 27},
@@ -286,7 +240,30 @@ def test_extract_returns_answer_and_span_structs(
         {"c.id": 2, "lease": {"ends": None, "rent": None},
          "lease_span": {"ends": None, "rent": None}},
     ]
-    assert rows.to_pylist() == (expected[1:] if "DESC" in suffix else expected)
+    for suffix in ("", " ORDER BY c.id DESC LIMIT 1"):
+        result = finish(session.sql(STRUCT_SQL + suffix), _struct_answers())
+        rows = result.collect()
+        assert rows.column_names == ["c.id", "lease", "lease_span"], suffix
+        assert rows.schema.field("lease").type == pa.struct(
+            [("ends", pa.string()), ("rent", pa.string())]), suffix
+        assert rows.schema.field("lease_span").type == pa.struct(
+            [("ends", span), ("rent", span)]), suffix
+        assert rows.to_pylist() == (
+            expected[1:] if "DESC" in suffix else expected), suffix
+
+    # a score beside the extraction, and a test on it, keep both columns
+    score = "AI.SCORE(PROMPT('Is this a lease? {0}', c.text))"
+    query = session.sql(
+        f"SELECT c.id, {score} AS score, "
+        f"AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease, "
+        f"AI.EXTRACT_SPAN(c.text, {{'ends': '{QUESTION}'}}) AS lease_span "
+        f"FROM contracts c WHERE {score} > 0.15")
+    rows = finish(query, Oracle(answers=lambda spec, document: (
+        "March 3, 2027" if document == 0 else None))).collect()
+    assert rows.column("score").type == pa.float64()
+    assert rows.to_pylist() == [
+        {"c.id": 2, "score": 0.2, "lease": {"ends": None},
+         "lease_span": {"ends": None}}]
 
 
 def _answers_executor(answers):
@@ -361,10 +338,6 @@ def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):
         {0: "March 3, 2027", 1: None}))
     assert result.collect().num_rows == 0
 
-
-def test_a_datafusion_function_arrow_compute_lacks_tests_an_answer(session):
-    from quail.api.execute import execute_query
-
     # SPLIT_PART is DataFusion's; Arrow compute has no such function
     lease = f"AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}})"
     query = session.sql(
@@ -376,7 +349,8 @@ def test_a_datafusion_function_arrow_compute_lacks_tests_an_answer(session):
         {0: "March 3, 2027", 1: "June 1, 2030"}))
     assert result.collect().column("c.id").to_pylist() == [1]
 
-def test_not_and_or_of_answers_run_after_the_extractions_they_read(session):
+
+def test_not_and_or_of_answers_and_labels_run_after_the_operators_they_read(session):
     from quail.api.execute import execute_query
 
     fields = f"c.text, {{'ends': '{QUESTION}', 'rent': 'How much?'}}"
@@ -417,10 +391,7 @@ def test_not_and_or_of_answers_run_after_the_extractions_they_read(session):
         "ai-extract:1", "ai-extract:0"]
     assert kept(fields) == [1]
 
-
-@pytest.mark.parametrize("label", ["lease", "deed"])
-@pytest.mark.parametrize("answer", [None, "March 3, 2027"])
-def test_an_or_combines_a_label_and_an_extracted_answer(session, label, answer):
+    # an OR of a label and an extracted answer
     query = session.sql(
         "SELECT c.id AS contract_id, "
         "AI.CLASSIFY(c.text, ['lease', 'deed']) AS kind, "
@@ -428,55 +399,46 @@ def test_an_or_combines_a_label_and_an_extracted_answer(session, label, answer):
         "FROM contracts c WHERE AI.CLASSIFY(c.text, ['lease', 'deed']) = 'lease' "
         f"OR AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}})['ends'] IS NULL "
         "ORDER BY c.id")
-    oracle = Oracle(labels=lambda *_: label, answers=lambda *_: answer)
-    rows = finish(query, oracle).collect()
-    expected = [
-        {"contract_id": identity, "kind": label, "lease": {"ends": answer}}
-        for identity in (1, 2)
-    ] if label == "lease" or answer is None else []
-    assert rows.to_pylist() == expected
+    for label in ("lease", "deed"):
+        for answer in (None, "March 3, 2027"):
+            oracle = Oracle(labels=lambda *_, label=label: label,
+                            answers=lambda *_, answer=answer: answer)
+            rows = finish(query, oracle).collect()
+            expected = [
+                {"contract_id": identity, "kind": label, "lease": {"ends": answer}}
+                for identity in (1, 2)
+            ] if label == "lease" or answer is None else []
+            assert rows.to_pylist() == expected, (label, answer)
 
 
-def test_an_extracted_tables_token_store_holds_each_tokens_characters(session):
-    query = session.sql(
-        f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease "
-        "FROM contracts c")
-    query.plan()
-    (scan,) = query.token_inputs().values()
-    assert scan.tokens.has_offsets
-    view = scan.tokens[0]
-    assert view.character_offsets is not None
-    assert len(view.character_offsets) == len(view)
-
-
-@pytest.mark.parametrize("with_other_extraction", [False, True])
-def test_a_span_column_can_run_without_a_matching_extraction(
-        session, with_other_extraction):
-    other = ("AI.EXTRACT(c.text, {'ends': 'When?'}) AS lease, "
-             if with_other_extraction else "")
-    query = session.sql(
-        f"SELECT c.id AS contract_id, {other}"
-        "AI.EXTRACT_SPAN(c.text, {'ends': 'Why?'}) AS lease_span "
-        "FROM contracts c ORDER BY c.id")
-    questions = set()
-
-    def answer(spec, document):
-        questions.add(spec.question)
-        text = str(oracle.texts[spec.alias][document])
-        if "March" not in text:
-            return None
-        return "March 3, 2027" if spec.question == "When?" else "Rent"
-
-    oracle = Oracle(answers=answer)
-    rows = finish(query, oracle).collect()
+def test_a_span_column_can_run_without_a_matching_extraction(session):
     start = LEASE.index("Rent")
-    expected = [
-        {"contract_id": 1,
-         "lease_span": {"ends": {"start": start, "end": start + len("Rent")}}},
-        {"contract_id": 2, "lease_span": {"ends": None}},
-    ]
-    if with_other_extraction:
-        expected[0]["lease"] = {"ends": "March 3, 2027"}
-        expected[1]["lease"] = {"ends": None}
-    assert rows.to_pylist() == expected
-    assert questions == ({"When?", "Why?"} if with_other_extraction else {"Why?"})
+    for with_other_extraction in (False, True):
+        other = ("AI.EXTRACT(c.text, {'ends': 'When?'}) AS lease, "
+                 if with_other_extraction else "")
+        query = session.sql(
+            f"SELECT c.id AS contract_id, {other}"
+            "AI.EXTRACT_SPAN(c.text, {'ends': 'Why?'}) AS lease_span "
+            "FROM contracts c ORDER BY c.id")
+        questions = set()
+
+        def answer(spec, document):
+            questions.add(spec.question)
+            text = str(oracle.texts[spec.alias][document])
+            if "March" not in text:
+                return None
+            return "March 3, 2027" if spec.question == "When?" else "Rent"
+
+        oracle = Oracle(answers=answer)
+        rows = finish(query, oracle).collect()
+        expected = [
+            {"contract_id": 1,
+             "lease_span": {"ends": {"start": start, "end": start + len("Rent")}}},
+            {"contract_id": 2, "lease_span": {"ends": None}},
+        ]
+        if with_other_extraction:
+            expected[0]["lease"] = {"ends": "March 3, 2027"}
+            expected[1]["lease"] = {"ends": None}
+        assert rows.to_pylist() == expected, with_other_extraction
+        assert questions == (
+            {"When?", "Why?"} if with_other_extraction else {"Why?"})

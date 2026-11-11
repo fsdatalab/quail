@@ -12,7 +12,12 @@ from helpers.baselines import (
     _session,
 )
 
-from quail.baselines.vllm import stock_vllm_backend
+from quail.baselines.vllm import (
+    NgramVLLMEngine,
+    VLLMEngine,
+    ngram_vllm_backend,
+    stock_vllm_backend,
+)
 from quail.builtins import built_in_registry
 from quail.physical import RequestExecution
 from quail.physical.plan import graph_from_envelope
@@ -59,6 +64,15 @@ def test_request_backends_plan_validate_and_execute(monkeypatch):
     support = stock_vllm_backend().supports(QWEN3_4B_FP8, H100_SXM, 2)
     assert not support.supported
     assert "one model copy on one GPU" in support.reason
+
+    # ngram vLLM is stock vLLM that drafts from the prompt
+    backend = ngram_vllm_backend()
+    assert backend.answer_submission == "operator-at-a-time"
+    assert backend.engine_name != VLLMEngine.kind
+    kwargs = NgramVLLMEngine().llm_kwargs(QWEN3_4B_FP8, H100_SXM)
+    assert kwargs["speculative_config"] == {
+        "method": "ngram", "num_speculative_tokens": 5, "prompt_lookup_max": 4}
+    assert "speculative_config" not in VLLMEngine().llm_kwargs(QWEN3_4B_FP8, H100_SXM)
 
     boot = {"client": _Client(), "sampling_params": object(), "capacity": CAPACITY}
     monkeypatch.setattr(
@@ -158,6 +172,8 @@ def test_a_request_backend_owns_its_engine_from_boot_to_release(monkeypatch):
     assert backend.execute_request(context) == "warm"
     backend.release_request(context.runtime_state)
     assert adapter.live == [] and context.runtime_state == {}
+
+
 class _MapClient:
     """Answers each prompt with its last two tokens and limit, by call or step loop."""
 
@@ -197,10 +213,7 @@ class _MapClient:
                                   answer_tokens=answer_tokens)
 
 
-@pytest.mark.parametrize("with_maps", [False, True])
-@pytest.mark.parametrize("submission", ["operator-at-a-time", "shuffled"])
-def test_extracts_and_maps_of_a_document_go_in_one_generate_call(submission,
-                                                                 with_maps):
+def test_extracts_and_maps_go_in_one_generate_call_each_under_its_own_limit():
     from quail.physical import RequestExtractSpec, RequestMapSpec
 
     class Client(_MapClient):
@@ -212,61 +225,48 @@ def test_extracts_and_maps_of_a_document_go_in_one_generate_call(submission,
             self.calls.append(len(prompts))
             return super().generate(prompts, params, use_tqdm)
 
-    client = Client()
-    maps = (RequestMapSpec(alias="d", output="plot", tail_token_ids=(90,),
-                           max_answer_tokens=1024),) if with_maps else ()
-    node = RequestExecution(
-        node_id="request-model", backend_name="stock_vllm", aliases=("d",),
-        extracts=tuple(RequestExtractSpec(alias="d", output=output,
-                                          tail_token_ids=(tail,),
-                                          max_answer_tokens=16)
-                       for output, tail in (("kind", 80), ("size", 81))),
-        maps=maps)
-    result = _execution(
-        {"d": [[10], [11], [12]]}, client=client,
-        document_texts={"d": ["10:80/16 10:81/16", "it says 11:80", "three"]},
-        answer_submission=submission).execute(node, {"input:0": [0, 1, 2]})
-    assert client.calls == [9 if with_maps else 6]
-    if with_maps:
-        assert result.outputs["map_answers:plot"].to_pydict()["plot"] == [
-            "10:90/1024", "11:90/1024", "12:90/1024"]
-    # each answer is cut to the longest prefix its document holds
-    assert result.outputs["extract_answers:kind"].to_pydict()["kind"] == [
-        "10:80/16", "11:80", None]
-    assert result.outputs["extract_answers:size"].to_pydict()["size"] == [
-        "10:81/16", "11:", None]
+    for submission in ("operator-at-a-time", "shuffled"):
+        for with_maps in (False, True):
+            case = (submission, with_maps)
+            client = Client()
+            maps = (RequestMapSpec(alias="d", output="plot", tail_token_ids=(90,),
+                                   max_answer_tokens=1024),) if with_maps else ()
+            node = RequestExecution(
+                node_id="request-model", backend_name="stock_vllm", aliases=("d",),
+                extracts=tuple(RequestExtractSpec(alias="d", output=output,
+                                                  tail_token_ids=(tail,),
+                                                  max_answer_tokens=16)
+                               for output, tail in (("kind", 80), ("size", 81))),
+                maps=maps)
+            result = _execution(
+                {"d": [[10], [11], [12]]}, client=client,
+                document_texts={
+                    "d": ["10:80/16 10:81/16", "it says 11:80", "three"]},
+                answer_submission=submission).execute(node, {"input:0": [0, 1, 2]})
+            assert client.calls == [9 if with_maps else 6], case
+            if with_maps:
+                assert result.outputs["map_answers:plot"].to_pydict()["plot"] == [
+                    "10:90/1024", "11:90/1024", "12:90/1024"], case
+            # each answer is cut to the longest prefix its document holds
+            assert result.outputs["extract_answers:kind"].to_pydict()["kind"] == [
+                "10:80/16", "11:80", None], case
+            assert result.outputs["extract_answers:size"].to_pydict()["size"] == [
+                "10:81/16", "11:", None], case
 
-
-@pytest.mark.parametrize("submission", ["operator-at-a-time", "shuffled", "pipelined"])
-def test_maps_write_each_answer_under_its_own_limit(submission):
-    from quail.physical import RequestMapSpec
-
+    # each map writes its answer under its own limit
     specs = tuple(RequestMapSpec(alias="d", output=output, tail_token_ids=(tail,),
                                  max_answer_tokens=limit)
                   for output, tail, limit in (("plot", 90, 1024), ("topic", 91, 32)))
     node = RequestExecution(node_id="request-model", backend_name="stock_vllm",
                             aliases=("d",), maps=specs)
-    result = _execution(
-        {"d": [[10], [11], [12]]}, client=_MapClient(),
-        document_texts={"d": ["one", "two", "three"]},
-        answer_submission=submission).execute(node, {"input:0": [0, 1, 2]})
-    assert result.outputs["map_answers:plot"].to_pydict()["plot"] == [
-        "10:90/1024", "11:90/1024", "12:90/1024"]
-    assert result.outputs["map_answers:topic"].to_pydict()["topic"] == [
-        "10:91/32", "11:91/32", "12:91/32"]
-    steps = result.metrics.extension["steps"]
-    assert {step["submission"] for step in steps} == {submission}
-
-
-
-
-def test_ngram_vllm_drafts_from_the_prompt():
-    from quail.baselines.vllm import NgramVLLMEngine, VLLMEngine, ngram_vllm_backend
-
-    backend = ngram_vllm_backend()
-    assert backend.answer_submission == "operator-at-a-time"
-    assert backend.engine_name != VLLMEngine.kind
-    kwargs = NgramVLLMEngine().llm_kwargs(QWEN3_4B_FP8, H100_SXM)
-    assert kwargs["speculative_config"] == {
-        "method": "ngram", "num_speculative_tokens": 5, "prompt_lookup_max": 4}
-    assert "speculative_config" not in VLLMEngine().llm_kwargs(QWEN3_4B_FP8, H100_SXM)
+    for submission in ("operator-at-a-time", "shuffled", "pipelined"):
+        result = _execution(
+            {"d": [[10], [11], [12]]}, client=_MapClient(),
+            document_texts={"d": ["one", "two", "three"]},
+            answer_submission=submission).execute(node, {"input:0": [0, 1, 2]})
+        assert result.outputs["map_answers:plot"].to_pydict()["plot"] == [
+            "10:90/1024", "11:90/1024", "12:90/1024"], submission
+        assert result.outputs["map_answers:topic"].to_pydict()["topic"] == [
+            "10:91/32", "11:91/32", "12:91/32"], submission
+        steps = result.metrics.extension["steps"]
+        assert {step["submission"] for step in steps} == {submission}

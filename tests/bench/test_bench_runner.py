@@ -2,7 +2,6 @@
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pytest
 from helpers.oracle import Oracle, oracle_executor, question_text
 from helpers.planning import operators_of
 from helpers.sessions import TOKENIZER, encoder
@@ -218,46 +217,54 @@ CONTRACTS = pa.table({
 })
 
 
-@pytest.mark.parametrize("query_id", [
-    "IMDB-22", "IMDB-20", "IMDB-21", "IMDB-24", "IMDB-25", "CUAD-19", "CUAD-20"])
-def test_a_map_query_reports_every_answer_and_its_pieces(tmp_path, query_id):
-    spec = get_query(query_id)
+MAP_QUERIES = [
+    "IMDB-22", "IMDB-20", "IMDB-21", "IMDB-24", "IMDB-25", "CUAD-19", "CUAD-20"]
+
+
+def test_a_map_query_reports_every_answer_and_its_pieces(tmp_path):
     corpus = {"reviews": CORPUS["reviews"], "contracts": CONTRACTS}
     oracle = Oracle(filters=lambda alias, document, position: document != 1,
                     labels=lambda spec, ids: "negative")
+    index = {"r0": 0, "r1": 1, "ct0": 0, "ct1": 1, "ct2": 2}
     with _session(tmp_path) as sess:
         sess.register("contracts", DocumentProvider.from_table(
             CONTRACTS, id_col="id"))
-        query = build_query(sess, spec)
-        result = execute_query(query, physical_executor=oracle_executor(
-            oracle, **_REPORT, store=None))
-        output = run_output(result, spec.info, corpus)
-        pieces = prompt_pieces(query, spec.info, {})
         turn = sess.model.turn
-    (relation,) = spec.info.relations
-    alias = relation.alias
-    filtered = bool(spec.info.filters)
-    read = (["r0"] if relation.table == "reviews" else ["ct0", "ct2"]) \
-        if filtered else corpus[relation.table].column("id").to_pylist()
-    if query_id == "IMDB-25":
-        read = []   # every review is labeled negative; only mixed ones are mapped
-    assert sorted(output.map_answers) == [m.id for m in spec.info.maps]
-    for operator in spec.info.maps:
-        answers = output.map_answers[operator.id].to_pydict()
-        assert answers[alias] == read
-        index = {"r0": 0, "r1": 1, "ct0": 0, "ct1": 1, "ct2": 2}
-        assert answers["answer"] == [f"{operator.output} {index[i]}" for i in read]
-        assert output.rows.column(operator.output).to_pylist() == answers["answer"]
-    # every map shows the document under the shared preamble, so a
-    # filter or classification before it in the pipeline leaves its KV
-    assert pieces["preamble"] == _token_ids(turn[0] + quail.SHARED_PRE)
-    assert [piece["id"] for piece in pieces["maps"]] == [
-        m.id for m in spec.info.maps]
-    assert all(question_text(piece["tail"]).endswith("ANSWER:")
-               for piece in pieces["maps"])
+        for query_id in MAP_QUERIES:
+            spec = get_query(query_id)
+            query = build_query(sess, spec)
+            result = execute_query(query, physical_executor=oracle_executor(
+                oracle, **_REPORT, store=None))
+            output = run_output(result, spec.info, corpus)
+            pieces = prompt_pieces(query, spec.info, {})
+            (relation,) = spec.info.relations
+            alias = relation.alias
+            filtered = bool(spec.info.filters)
+            read = (["r0"] if relation.table == "reviews" else ["ct0", "ct2"]) \
+                if filtered else corpus[relation.table].column("id").to_pylist()
+            if query_id == "IMDB-25":
+                # every review is labeled negative; only mixed ones are mapped
+                read = []
+            assert sorted(output.map_answers) == [
+                m.id for m in spec.info.maps], query_id
+            for operator in spec.info.maps:
+                answers = output.map_answers[operator.id].to_pydict()
+                assert answers[alias] == read, query_id
+                assert answers["answer"] == [
+                    f"{operator.output} {index[i]}" for i in read], query_id
+                assert output.rows.column(operator.output).to_pylist() == (
+                    answers["answer"]), query_id
+            # every map shows the document under the shared preamble, so a
+            # filter or classification before it in the pipeline leaves its KV
+            assert pieces["preamble"] == _token_ids(
+                turn[0] + quail.SHARED_PRE), query_id
+            assert [piece["id"] for piece in pieces["maps"]] == [
+                m.id for m in spec.info.maps], query_id
+            assert all(question_text(piece["tail"]).endswith("ANSWER:")
+                       for piece in pieces["maps"]), query_id
 
 
-def test_stock_vllm_reports_an_extraction_and_its_pieces(tmp_path):
+def test_stock_vllm_reports_extractions_and_maps_with_their_pieces(tmp_path):
     spec = get_query("CUAD-1")
     span_type = pa.struct([("start", pa.int64()), ("end", pa.int64())])
 
@@ -292,11 +299,9 @@ def test_stock_vllm_reports_an_extraction_and_its_pieces(tmp_path):
     assert [item["id"] for item in pieces["extracts"]] == ["extract-1"]
     assert pieces["extracts"][0]["tail"][-1] == _token_ids(":")[-1]
 
-
-def test_stock_vllm_reports_maps_and_their_pieces(tmp_path):
     spec = get_query("CUAD-18")
 
-    def nodes(graph, request):
+    def map_nodes(graph, request):
         model = next(
             node for node in graph.nodes if isinstance(node, RequestExecution))
         return {model.node_id: NodeResult({
@@ -312,7 +317,7 @@ def test_stock_vllm_reports_maps_and_their_pieces(tmp_path):
         sess.register("contracts", DocumentProvider.from_table(
             CONTRACTS, id_col="id"))
         query = build_query(sess, spec)
-        result = _execute(query, nodes, cached_tokens=0)
+        result = _execute(query, map_nodes, cached_tokens=0)
         output = run_output(result, spec.info, {"contracts": CONTRACTS})
         pieces = prompt_pieces(query, spec.info, {})
     for operator in spec.info.maps:

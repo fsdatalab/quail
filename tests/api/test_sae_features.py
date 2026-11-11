@@ -58,7 +58,8 @@ def _unnest_oracle():
         {"feature": 100, "strength": 0.5}])
 
 
-def test_unnest_groups_rows_by_feature(session):
+def test_datafusion_unnests_groups_and_filters_the_feature_lists_a_region_returns(
+        session):
     query = session.sql(
         "SELECT x.f['feature'] AS feature, COUNT(*) AS n, "
         f"MAX(x.f['strength']) AS top FROM {ROWS} "
@@ -66,9 +67,6 @@ def test_unnest_groups_rows_by_feature(session):
     rows = finish(query, _unnest_oracle()).collect()
     assert rows.to_pylist()[0] == {"feature": 100, "n": 3, "top": 0.5}
     assert sorted(row["feature"] for row in rows.to_pylist()) == [0, 1, 2, 100]
-
-
-def test_not_and_or_of_unnested_fields_and_source_columns_filter_rows(session):
     # feature 100 has strength 0.5 in every document; document d has
     # feature d at strength d + 1
     fields = session.sql(
@@ -82,9 +80,6 @@ def test_not_and_or_of_unnested_fields_and_source_columns_filter_rows(session):
         "WHERE x.f['strength'] > 2 OR x.id = 7 ORDER BY feature")
     assert finish(mixed, _unnest_oracle()).collect().to_pylist() == [
         {"feature": 0}, {"feature": 2}, {"feature": 100}]
-
-
-def test_datafusion_unnests_the_feature_lists_the_region_returns(session):
     query = session.sql(f"SELECT r.id, UNNEST({FEATURES}) AS f FROM reviews r")
     assert "UnnestExec" in query.explain()
     rows = finish(query, _unnest_oracle()).collect()
@@ -93,24 +88,16 @@ def test_datafusion_unnests_the_feature_lists_the_region_returns(session):
         (7, 0), (7, 100), (9, 1), (9, 100), (11, 2), (11, 100)]
 
 
-@pytest.mark.parametrize("comparison, num_rows", [("IS NULL", 0), ("IS NOT NULL", 3)])
-def test_feature_list_null_tests_keep_empty_lists(session, comparison, num_rows):
+def test_a_feature_list_takes_null_tests_and_refuses_text_tests(session):
     features = "AI.SAE_FEATURES(PROMPT('Topic? {0}', r.body), {'pooling': 'last'})"
-    query = session.sql(
-        f"SELECT r.id, {features} AS features FROM reviews r "
-        f"WHERE {features} {comparison}")
-    assert finish(query, Oracle(features=lambda spec, document: []))\
-        .collect().num_rows == num_rows
-
-
-@pytest.mark.parametrize("test, reason", [
-    ("{} = 'x'", r"AI\.SAE_FEATURES returns a list, so use UNNEST"),
-    ("LENGTH({}) > 0", r"LENGTH needs text, so use array_length.*UNNEST"),
-])
-def test_feature_lists_reject_string_comparisons_and_string_length(
-        session, test, reason):
-    features = "AI.SAE_FEATURES(PROMPT('Topic? {0}', r.body), {'pooling': 'last'})"
-    with pytest.raises(CompileError, match=reason):
-        session.sql(
-            f"SELECT r.id, {features} AS features FROM reviews r "
-            f"WHERE {test.format(features)}")
+    head = f"SELECT r.id, {features} AS features FROM reviews r WHERE "
+    # an empty list is not NULL
+    for comparison, num_rows in (("IS NULL", 0), ("IS NOT NULL", 3)):
+        query = session.sql(f"{head}{features} {comparison}")
+        rows = finish(query, Oracle(features=lambda spec, document: [])).collect()
+        assert rows.num_rows == num_rows, comparison
+    for test, reason in (
+            ("{} = 'x'", r"AI\.SAE_FEATURES returns a list, so use UNNEST"),
+            ("LENGTH({}) > 0", r"LENGTH needs text, so use array_length.*UNNEST")):
+        with pytest.raises(CompileError, match=reason):
+            session.sql(head + test.format(features))

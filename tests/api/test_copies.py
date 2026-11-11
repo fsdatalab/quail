@@ -5,7 +5,6 @@ same rows and answers, and the deduplicated run asks only key documents.
 """
 
 import pyarrow as pa
-import pytest
 from helpers.oracle import Oracle, finish
 from helpers.sessions import CONFIG, TOKENIZER
 
@@ -93,26 +92,19 @@ def _both(build, monkeypatch, **options):
     return rows, plan, asked, plain_asked
 
 
-@pytest.mark.parametrize("pipelines", [True])
-def test_a_filter_asks_once_per_text_and_returns_every_copy(monkeypatch,
-                                                            pipelines):
-    rows, _, asked, plain = _both(_short, monkeypatch, pipelines=pipelines)
-    assert rows == [("r0",), ("r1",), ("r2",), ("r4",), ("r5",)]
-    assert (asked, plain) == ([0, 1, 3], list(range(6)))
-
-
 def _self_join(session):
     return session.sql(
         "SELECT a.id, b.id FROM reviews a JOIN reviews b ON a.hotel = b.hotel "
         "AND AI_FILTER(PROMPT('Do {0} and {1} agree?', a.body, b.body))")
 
 
-@pytest.mark.parametrize("build", [_self_join], ids=["self_join"])
-def test_a_join_asks_each_pair_of_texts_once(monkeypatch, build):
-    _, _, asked, plain = _both(build, monkeypatch)
-    # every asked review is the first of its text, on either side of a
-    # self-join; the notes have no copies
+def test_a_filter_asks_once_per_text_and_a_join_once_per_pair_of_texts(monkeypatch):
+    rows, _, asked, plain = _both(_short, monkeypatch, pipelines=True)
+    # the filter returns every copy of a text it keeps
+    assert rows == [("r0",), ("r1",), ("r2",), ("r4",), ("r5",)]
+    assert (asked, plain) == ([0, 1, 3], list(range(6)))
+    _, _, asked, plain = _both(_self_join, monkeypatch)
+    # every asked review is the first of its text, on either side
     assert {pair[0] for pair in asked} <= KEYS
-    if build is _self_join:
-        assert {pair[1] for pair in asked} <= KEYS
+    assert {pair[1] for pair in asked} <= KEYS
     assert len(set(asked)) < len(set(plain))

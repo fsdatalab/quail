@@ -28,23 +28,23 @@ def session():
         yield session
 
 
-@pytest.mark.parametrize("sql,count", [("SELECT * FROM reviews", 0), (CHAIN, 2)])
-def test_edited_plan_scope_is_rejected_before_execution_context(session, monkeypatch,
-                                                               sql, count):
+def test_edited_plan_scope_is_rejected_before_execution_context(session, monkeypatch):
     edited = session.sql(SINGLE).plan()
-    query = session.sql(sql)
-    assert query.num_regions == count
     calls = []
 
     def forbidden(*args, **kwargs):
         calls.append((args, kwargs))
         pytest.fail("invalid edited-plan scope reached execution")
 
+    queries = [(session.sql(sql), count)
+               for sql, count in (("SELECT * FROM reviews", 0), (CHAIN, 2))]
     # Binding is already complete. Even constructing the execution context is
     # too late to reject the scope, before any model callback or GPU work.
     monkeypatch.setattr("quail.api.context.SessionContext", forbidden)
-    with pytest.raises(ValueError, match=f"exactly one model region.*has {count}"):
-        query.run(plan=edited, physical_executor=forbidden)
+    for query, count in queries:
+        assert query.num_regions == count
+        with pytest.raises(ValueError, match=f"exactly one model region.*has {count}"):
+            query.run(plan=edited, physical_executor=forbidden)
     assert calls == []
 
 
@@ -145,7 +145,8 @@ def test_identical_sibling_regions_have_distinct_stable_ids(session, monkeypatch
     assert text.count("run:") == 2
 
 
-def test_analyze_labels_a_region_not_read_by_sql_as_unexecuted(session, monkeypatch):
+def test_analyze_labels_an_unexecuted_region_and_refuses_an_unknown_one(
+        session, monkeypatch):
     query = session.sql(CHAIN)
     result, _ = _run(query)
     missing = query.regions()[0].region_id
@@ -156,8 +157,8 @@ def test_analyze_labels_a_region_not_read_by_sql_as_unexecuted(session, monkeypa
     assert text.count("not executed (estimated plan):") == 1
     assert text.count("run:") == 1
 
-
-def test_analyze_rejects_unknown_executed_region_id(session, monkeypatch):
+    # a result naming a region the query does not have is refused
+    monkeypatch.undo()
     query = session.sql(SINGLE)
     result, _ = _run(query)
     result.region_results[999] = next(iter(result.region_results.values()))

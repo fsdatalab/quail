@@ -22,20 +22,17 @@ def context():
     session.close()
 
 
-def test_default_dialect_accepts_standard_aggregate_filter(context):
+def test_an_aggregate_filter_counts_the_rows_its_test_keeps(context):
     result = context.sql(
         "SELECT COUNT(*) FILTER (WHERE AI.IF(PROMPT('q1: {0}', r.body))) AS n "
         "FROM reviews r")
     assert result.to_pylist() == [{"n": 3}]
-
-
-def test_standard_aggregate_filter_without_ai(context):
     result = context.sql(
         "SELECT COUNT(*) FILTER (WHERE r.id <> 'r1') AS n FROM reviews r")
     assert result.to_pylist() == [{"n": 3}]
 
 
-def test_create_table_as_runs_model_input_and_registers_rows(context):
+def test_create_table_as_registers_its_rows_only_when_run(context):
     result = context.sql(
         "CREATE TABLE kept AS SELECT r.id FROM reviews r "
         "WHERE AI.IF(PROMPT('q1: {0}', r.body))")
@@ -47,9 +44,7 @@ def test_create_table_as_runs_model_input_and_registers_rows(context):
     context.sql("DROP TABLE kept")
     with pytest.raises(RuntimeError, match="kept.*not found"):
         context.sql("SELECT * FROM kept")
-
-
-def test_planning_create_table_does_not_execute_it(context):
+    # planning a CREATE TABLE does not run it
     context.region_plans(
         "CREATE TABLE planned AS SELECT r.id FROM reviews r "
         "WHERE AI.IF(PROMPT('q1: {0}', r.body))")

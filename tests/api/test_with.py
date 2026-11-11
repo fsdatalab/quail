@@ -120,23 +120,17 @@ def test_a_cte_runs_once_however_many_times_it_is_read(session):
     assert recorder.documents["a"] == recorder.documents["b"]
 
 
-@pytest.mark.parametrize("sql", [
-    """WITH first AS (
+def test_a_cte_that_filters_or_classifies_returns_the_rows_its_reader_selects(session):
+    sql = """WITH first AS (
            SELECT c.id FROM contracts c WHERE AI.IF(PROMPT('keep {0}', c.text))
            ORDER BY c.id LIMIT 2)
-       SELECT f.id AS result_id FROM first f WHERE f.id > 0""",
-])
-def test_relational_stages_before_and_after_ai_return_the_selected_rows(session, sql):
+       SELECT f.id AS result_id FROM first f WHERE f.id > 0"""
     result, recorder = run(session.sql(sql, dialect="bq"),
-                           Oracle(filters=lambda *args: True,
-                                  joins=lambda node, assignment:
-                                  len(set(assignment.values())) == 1))
+                           Oracle(filters=lambda *args: True))
     assert sorted(result.collect().column("result_id").to_pylist()) == [1, 2]
     assert "Project" in result.explain()
     assert len(recorder.requests) == 1
-
-
-def test_a_filtered_cte_on_the_right_of_a_join_keeps_its_filter(session):
+    # a filtered CTE on the right of a join keeps its filter
     query = session.sql("""
         WITH kept AS (
             SELECT c.id, c.text FROM contracts c
@@ -150,9 +144,6 @@ def test_a_filtered_cte_on_the_right_of_a_join_keeps_its_filter(session):
     assert result.collect().sort_by("a.id").to_pydict() == {
         "a.id": [1, 3], "other": [1, 3]}
     assert len(recorder.requests) == 1
-
-
-def test_a_cte_that_classifies_returns_the_columns_its_reader_names(session):
     query = session.sql("""
         WITH k AS (
             SELECT c.id, AI.CLASSIFY(c.text, ['lease', 'note']) AS kind
@@ -165,8 +156,7 @@ def test_a_cte_that_classifies_returns_the_columns_its_reader_names(session):
         "k.id": [1, 3], "k.kind": ["lease", "lease"]}
 
 
-@pytest.mark.parametrize("accepted", [True, False])
-def test_a_cte_join_can_reuse_an_alias_from_the_ctes_scope(session, accepted):
+def test_a_cte_join_can_reuse_an_alias_from_the_ctes_scope(session):
     query = session.sql("""
         WITH kept AS (
             SELECT c.id, c.text FROM contracts c
@@ -174,8 +164,9 @@ def test_a_cte_join_can_reuse_an_alias_from_the_ctes_scope(session, accepted):
         SELECT k.id AS contract_id, c.text AS contract_text
         FROM kept k JOIN contracts c ON k.id = c.id ORDER BY k.id
     """)
-    result, _ = run(query, Oracle(filters=lambda *_: accepted))
-    assert result.collect().to_pylist() == ([
-        {"contract_id": row["id"], "contract_text": row["text"]}
-        for row in CONTRACTS.to_pylist()
-    ] if accepted else [])
+    for accepted in (True, False):
+        result, _ = run(query, Oracle(filters=lambda *_, kept=accepted: kept))
+        assert result.collect().to_pylist() == ([
+            {"contract_id": row["id"], "contract_text": row["text"]}
+            for row in CONTRACTS.to_pylist()
+        ] if accepted else []), accepted

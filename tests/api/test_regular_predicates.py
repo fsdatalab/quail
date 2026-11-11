@@ -78,68 +78,16 @@ def test_regular_predicates_select_documents_before_the_model(session):
     query = session.sql(f"SELECT r.id FROM reviews r {first} AND LENGTH(r.lang) > 2")
     assert _run(query, make_executor(TRUTH)).to_rows() == []
 
-
-def test_not_and_or_keep_sqls_nulls():
-    stars = pa.table({"stars": [5, None, 2]})
-    written = condition(
-        "NOT (stars > 4 AND (stars < 3 OR NOT (stars IS NULL)))",
-        {"stars": pa.int64()}, "r", "reviews")
-    # the null row stays null through NOT, AND, and OR, so it is rejected
-    assert written.evaluate(stars).to_pylist() == [False, None, True]
-    assert selected_rows(stars, (written,)).to_pylist() == [2]
-
-
-def test_a_condition_refuses_a_column_of_another_type_than_its_plan_gives():
-    written = condition("stars > 4", {"stars": pa.int64()}, "r", "reviews")
-    assert written.types == ("Int64",)
-    with pytest.raises(CompileError, match="reads 'stars' as Int64"):
-        written.evaluate(pa.table({"stars": ["5", "1"]}))
-
-
-def test_a_condition_read_from_a_plan_evaluates_as_built():
-    written = condition("stars > 4", {"stars": pa.int64()}, "r", "reviews")
-    read = decode_plan_value(written.to_json())
-    rows = pa.table({"stars": [5, 1, None]})
-    assert read.evaluate(rows).to_pylist() == [True, False, None]
-
-
-@pytest.mark.parametrize(("test", "expected"), [
-    # Snowflake matches the whole value: 'e' is not 'en'
-    ("REGEXP_LIKE(r.lang, 'e')", []),
-    ("REGEXP_LIKE(r.lang, 'e.')", [("r0",), ("r3",)]),
-    ("RLIKE(r.lang, 'e')", []),
-    ("NOT RLIKE(r.lang, 'e')", [("r0",), ("r3",)]),
-    ("REGEXP_LIKE(r.lang, r.lang || '?')", [("r0",), ("r3",)]),
-])
-def test_a_snowflake_regexp_matches_the_whole_value(session, test, expected):
-    # the AI predicates keep r0 and r3, both in English
-    query = session.sql(FILTER_SQL + f" AND {test}")
-    assert _run(query, make_executor(TRUTH)).to_rows() == expected
-
-
-@pytest.mark.parametrize("test", [
-    "REGEXP_CONTAINS(r.lang, 'e')", "REGEXP_LIKE(r.lang, 'e')"])
-def test_a_bigquery_regexp_matches_anywhere_in_the_value(session, test):
-    query = session.sql(f"""
-        SELECT r.id FROM reviews r
-        WHERE AI.IF(PROMPT('q1: {{0}}', r.review))
-          AND AI.IF(PROMPT('q2: {{0}}', r.review)) AND {test}
-    """, dialect="bq")
-    assert _run(query, make_executor(TRUTH)).to_rows() == [("r0",), ("r3",)]
-
-
-def test_not_and_or_of_one_tables_columns_run_at_its_scan(session):
+    # NOT, AND, and OR of one table's columns run there too.
     # the AI predicates keep r0 (en, 5 stars) and r3 (en, no stars)
     query = session.sql(
         FILTER_SQL + " AND NOT (LOWER(r.lang) LIKE '%e%' AND r.stars < 3)")
-    # the test runs in DataFusion, before the region
     (scan,) = operators_of(query).scans
     assert scan.predicates == ()
     # r3's NULL < 3 makes the OR null, so DataFusion rejects r3
     assert _run(query, make_executor(TRUTH)).to_rows() == [("r0",)]
     query = session.sql(FILTER_SQL + " AND (r.stars IS NULL OR r.lang = 'de')")
     assert _run(query, make_executor(TRUTH)).to_rows() == [("r3",)]
-    # DataFusion runs NOT (a OR b) before the region
     query = session.sql(
         "SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.review)) "
         "AND NOT (r.lang = 'fr' OR r.stars IS NULL)")
@@ -147,7 +95,50 @@ def test_not_and_or_of_one_tables_columns_run_at_its_scan(session):
         ("r0",), ("r1",), ("r4",)]
 
 
-def test_an_or_over_two_tables_runs_on_the_result_rows(session):
+def test_a_condition_keeps_sqls_nulls_checks_its_types_and_reads_back_from_a_plan():
+    stars = pa.table({"stars": [5, None, 2]})
+    written = condition(
+        "NOT (stars > 4 AND (stars < 3 OR NOT (stars IS NULL)))",
+        {"stars": pa.int64()}, "r", "reviews")
+    # the null row stays null through NOT, AND, and OR, so it is rejected
+    assert written.evaluate(stars).to_pylist() == [False, None, True]
+    assert selected_rows(stars, (written,)).to_pylist() == [2]
+    written = condition("stars > 4", {"stars": pa.int64()}, "r", "reviews")
+    assert written.types == ("Int64",)
+    with pytest.raises(CompileError, match="reads 'stars' as Int64"):
+        written.evaluate(pa.table({"stars": ["5", "1"]}))
+    read = decode_plan_value(written.to_json())
+    rows = pa.table({"stars": [5, 1, None]})
+    assert read.evaluate(rows).to_pylist() == [True, False, None]
+
+
+SNOWFLAKE_REGEXPS = [
+    # Snowflake matches the whole value: 'e' is not 'en'
+    ("REGEXP_LIKE(r.lang, 'e')", []),
+    ("REGEXP_LIKE(r.lang, 'e.')", [("r0",), ("r3",)]),
+    ("RLIKE(r.lang, 'e')", []),
+    ("NOT RLIKE(r.lang, 'e')", [("r0",), ("r3",)]),
+    ("REGEXP_LIKE(r.lang, r.lang || '?')", [("r0",), ("r3",)]),
+]
+
+
+def test_a_regexp_matches_the_whole_value_in_snowflake_and_any_part_in_bigquery(
+        session):
+    # the AI predicates keep r0 and r3, both in English
+    for test, expected in SNOWFLAKE_REGEXPS:
+        query = session.sql(FILTER_SQL + f" AND {test}")
+        assert _run(query, make_executor(TRUTH)).to_rows() == expected, test
+    for test in ("REGEXP_CONTAINS(r.lang, 'e')", "REGEXP_LIKE(r.lang, 'e')"):
+        query = session.sql(f"""
+            SELECT r.id FROM reviews r
+            WHERE AI.IF(PROMPT('q1: {{0}}', r.review))
+              AND AI.IF(PROMPT('q2: {{0}}', r.review)) AND {test}
+        """, dialect="bq")
+        assert _run(query, make_executor(TRUTH)).to_rows() == [
+            ("r0",), ("r3",)], test
+
+
+def test_a_where_test_over_two_tables_runs_on_the_result_rows(session):
     session.register("products", quail.DocumentProvider.from_table(pa.table({
         "asin": ["p0", "p1"], "description": ["d0", "d1"],
         "price": [10, 20]}), id_col="asin"))
@@ -167,9 +158,22 @@ def test_an_or_over_two_tables_runs_on_the_result_rows(session):
         ("r4", "p1"), ("r5", "p0"), ("r5", "p1")]
     # the Project read the tested columns; the result does not return them
     assert result.collect().column_names == ["r.id", "p.asin"]
+    session.register("items", quail.DocumentProvider.from_table(pa.table({
+        "asin": ["p0", "p1"], "description": ["d0", "d1"],
+        "price": [3, 4]}), id_col="asin"))
+    query = session.sql("""
+        SELECT r.id, p.asin FROM reviews r
+        JOIN items p ON AI_FILTER(PROMPT('x {0} {1}', r.review, p.description))
+        WHERE r.stars > p.price
+        ORDER BY r.id, p.asin
+    """)
+    assert row_tests(query) == ["stars > price"]
+    result = _run(query, oracle_executor(Oracle(joins=lambda *_: True)))
+    assert result.to_rows() == [
+        ("r0", "p0"), ("r0", "p1"), ("r2", "p0"), ("r5", "p0"), ("r5", "p1")]
 
 
-def test_datafusion_functions_run_in_where_and_select(session):
+def test_where_and_select_take_the_same_datafusion_expressions(session):
     # q1 keeps r0, r1, r3, and r4; their stars are 5, 2, None, and 3
     query = session.sql("""
         SELECT r.id, REVERSE(UPPER(r.lang)) AS backwards,
@@ -185,9 +189,6 @@ def test_datafusion_functions_run_in_where_and_select(session):
     with pytest.raises(CompileError, match="unknown function 'nope'"):
         session.sql("SELECT r.id FROM reviews r WHERE NOPE(r.lang) = 'x' "
                     "AND AI_FILTER(PROMPT('q1: {0}', r.review))")
-
-
-def test_where_takes_the_same_expressions_as_select(session):
     session.register("pairs", quail.DocumentProvider.from_table(pa.table({
         "id": [f"r{i}" for i in range(6)],
         "review": [f"review {i} " + "pad " * 20 for i in range(6)],
@@ -221,22 +222,6 @@ def test_where_takes_the_same_expressions_as_select(session):
         ("r0", True), ("r1", False), ("r3", None), ("r4", True)]
     with pytest.raises(CompileError, match="a test is true or false, got Utf8"):
         _run(session.sql(f"{first} AND UPPER(r.lang)"), make_executor(TRUTH))
-
-
-def test_a_comparison_of_two_tables_in_where_runs_on_the_result_rows(session):
-    session.register("products", quail.DocumentProvider.from_table(pa.table({
-        "asin": ["p0", "p1"], "description": ["d0", "d1"],
-        "price": [3, 4]}), id_col="asin"))
-    query = session.sql("""
-        SELECT r.id, p.asin FROM reviews r
-        JOIN products p ON AI_FILTER(PROMPT('x {0} {1}', r.review, p.description))
-        WHERE r.stars > p.price
-        ORDER BY r.id, p.asin
-    """)
-    assert row_tests(query) == ["stars > price"]
-    result = _run(query, oracle_executor(Oracle(joins=lambda *_: True)))
-    assert result.to_rows() == [
-        ("r0", "p0"), ("r0", "p1"), ("r2", "p0"), ("r5", "p0"), ("r5", "p1")]
 
 
 def test_an_equality_of_two_tables_in_where_pairs_their_rows_before_the_ai_join(
@@ -286,18 +271,20 @@ SQL_CALLS = {
 }
 
 
-@pytest.mark.parametrize("dialect", ["bq", "snowflake"])
-def test_sql_functions_have_datafusions_meaning(session, dialect):
-    for expression, expected in SQL_CALLS.items():
-        query = session.sql(
-            f"SELECT r.id, {expression} AS v FROM reviews r "
-            f"WHERE AI_FILTER(PROMPT('q1: {{0}}', r.review)) ORDER BY r.id",
-            dialect=dialect)
-        values = _run(query, make_executor(TRUTH)).collect().column("v").to_pylist()
-        assert values == expected, expression
-    with pytest.raises(CompileError, match="write r.stars % 2"):
-        session.sql("SELECT r.id, MOD(r.stars, 2) AS v FROM reviews r "
-                    "WHERE AI_FILTER(PROMPT('q1: {0}', r.review))", dialect=dialect)
+def test_sql_functions_have_datafusions_meaning_in_every_dialect(session):
+    for dialect in ("bq", "snowflake"):
+        for expression, expected in SQL_CALLS.items():
+            query = session.sql(
+                f"SELECT r.id, {expression} AS v FROM reviews r "
+                f"WHERE AI_FILTER(PROMPT('q1: {{0}}', r.review)) ORDER BY r.id",
+                dialect=dialect)
+            values = _run(
+                query, make_executor(TRUTH)).collect().column("v").to_pylist()
+            assert values == expected, (dialect, expression)
+        with pytest.raises(CompileError, match="write r.stars % 2"):
+            session.sql("SELECT r.id, MOD(r.stars, 2) AS v FROM reviews r "
+                        "WHERE AI_FILTER(PROMPT('q1: {0}', r.review))",
+                        dialect=dialect)
 
 
 def test_order_by_group_by_on_and_prompt_take_expressions(session):

@@ -201,7 +201,8 @@ def test_join_predicates_semantics_and_equality_pruning(catalog):
     assert written_in_where == compile_sql(PAIR_JOIN_SQL, catalog)
 
 
-def test_each_part_of_a_where_clause_goes_to_the_operator_that_tests_it(catalog):
+def test_each_part_of_a_where_or_on_clause_goes_to_the_operator_that_tests_it(
+        catalog):
     sql = FILTER_JOIN_SQL + " AND r.id <> 'z'"
     # DataFusion runs the column test before the region, the one-table
     # AI.IF is an AI filter, and the two-table AI.IF an AI join
@@ -212,9 +213,7 @@ def test_each_part_of_a_where_clause_goes_to_the_operator_that_tests_it(catalog)
     assert [p.selectivity for p in predicates] == [0.3]
     (join,) = found.joins
     assert join.selectivity == 0.05
-
-
-def test_a_join_with_two_ai_predicates_in_its_on_plans_both_predicates(catalog):
+    # a join with two AI predicates in its ON plans both
     with quail.Session(CONFIG, tokenizer=TOKENIZER) as session:
         for name, provider in catalog.providers.items():
             session.register(name, provider)

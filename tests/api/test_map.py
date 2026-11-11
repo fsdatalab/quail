@@ -45,28 +45,26 @@ def test_a_map_writes_one_answer_per_document(session):
     assert question_text(head) == turn[0] + quail.SHARED_PRE
     # the tail opens with the separator after the document
     assert question_text(tail).endswith(SUMMARY + turn[1] + "ANSWER:")
-
-
-@pytest.mark.parametrize("function", ["AI.MAP", "ai_map"])
-def test_an_unnamed_map_returns_each_answer_under_its_sql_name(session, function):
-    query = session.sql(
-        f"SELECT r.id, {function}(r.body, '{SUMMARY}') FROM reviews r")
-    oracle = Oracle(maps=lambda _spec, document: f"summary {document}")
-    table = finish(query, oracle).collect()
-    rows = zip(table.column(0).to_pylist(), table.column(1).to_pylist())
-    assert sorted(rows) == [(1, "summary 0"), (2, "summary 1"), (3, "summary 2")]
-    assert "map" in table.column_names[1].lower()
-    assert not table.column_names[1].startswith("__quail_")
-
-
-def test_a_map_without_a_limit_writes_up_to_256_tokens(session):
+    # without a limit a map writes up to 256 tokens
     query = session.sql(
         f"SELECT r.id, AI.MAP(r.body, '{SUMMARY}') AS summary FROM reviews r")
     (node,) = _maps(query.plan())
     assert node.spec.max_answer_tokens == 256
+    # an unnamed map returns each answer under its SQL name
+    for function in ("AI.MAP", "ai_map"):
+        query = session.sql(
+            f"SELECT r.id, {function}(r.body, '{SUMMARY}') FROM reviews r")
+        oracle = Oracle(maps=lambda _spec, document: f"summary {document}")
+        table = finish(query, oracle).collect()
+        rows = zip(table.column(0).to_pylist(), table.column(1).to_pylist())
+        assert sorted(rows) == [
+            (1, "summary 0"), (2, "summary 1"), (3, "summary 2")], function
+        assert "map" in table.column_names[1].lower(), function
+        assert not table.column_names[1].startswith("__quail_"), function
 
 
-def test_a_map_after_a_filter_reads_only_its_survivors(session):
+def test_a_map_shares_the_pipeline_of_the_filter_or_classification_before_it(
+        session):
     query = session.sql(
         f"SELECT r.id, AI.MAP(r.body, '{SUMMARY}', 64) AS summary FROM reviews r "
         f"WHERE AI_FILTER(PROMPT('Is this review negative?\\n\\n{{0}}', r.body)) "
@@ -80,9 +78,6 @@ def test_a_map_after_a_filter_reads_only_its_survivors(session):
     oracle = Oracle(filters=lambda alias, document, position: document != 0)
     assert finish(query, oracle).collect().to_pylist() == [
         {"r.id": 2, "summary": "summary 1"}]
-
-
-def test_a_map_after_a_classification_shares_its_pipeline(session):
     query = session.sql(
         "SELECT r.id, AI.CLASSIFY(PROMPT('What is the tone?\\n\\n{0}', r.body), "
         f"ARRAY['positive', 'negative']) AS tone, "
@@ -94,15 +89,14 @@ def test_a_map_after_a_classification_shares_its_pipeline(session):
         classify.node_id]] == [classify.node_id, node.node_id]
 
 
-@pytest.mark.parametrize("sql, message", [
-    (f"SELECT r.id FROM reviews r WHERE AI_MAP(r.body, '{SUMMARY}')",
-     "not supported"),
-    (f"SELECT r.id, AI.MAP(r.body, '{SUMMARY}', 0) AS s FROM reviews r",
-     "positive integer"),
-])
-def test_a_malformed_map_is_refused(session, sql, message):
-    with pytest.raises(CompileError, match=message):
-        session.sql(sql).plan()
+def test_a_malformed_map_is_refused(session):
+    for sql, message in (
+            (f"SELECT r.id FROM reviews r WHERE AI_MAP(r.body, '{SUMMARY}')",
+             "not supported"),
+            (f"SELECT r.id, AI.MAP(r.body, '{SUMMARY}', 0) AS s FROM reviews r",
+             "positive integer")):
+        with pytest.raises(CompileError, match=message):
+            session.sql(sql).plan()
 
 
 def test_the_planner_may_map_only_the_documents_a_join_keeps(session):
@@ -120,28 +114,24 @@ def test_the_planner_may_map_only_the_documents_a_join_keeps(session):
     assert [column.above_joins for column in lifted.found.maps] == [True]
 
 
-@pytest.mark.parametrize("form,dialect", [("call", "bq"), ("cte", "snowflake")])
-def test_a_plain_test_keeps_only_matching_map_answers(session, form, dialect):
+def test_a_plain_test_keeps_only_matching_map_answers(session):
     call = "AI.MAP(r.body, 'Name the topic.', 16)"
     select = f"SELECT r.id, {call} AS topic FROM reviews r"
-    if form == "cte":
-        sql = (f"WITH m AS ({select}) SELECT m.id, m.topic FROM m "
-               "WHERE m.topic = 'topic 1'")
-    else:
-        sql = f"{select} WHERE {call} = 'topic 1'"
-    query = session.sql(sql, dialect=dialect)
-    plan = query.plan()
-    (node,) = _maps(plan)
-    (test,) = [node for node in plan.nodes if node.type_name == "quail.filter"]
-    assert test.inputs[0].source.node_id == node.node_id
-    assert [member.node_id for member in plan.graph.pipelines()[node.node_id]] == [
-        node.node_id, test.node_id]
-    rows = finish(query, Oracle()).collect().to_pylist()
-    assert [list(row.values()) for row in rows] == [[2, "topic 1"]]
-
-
-def test_a_map_only_used_by_a_test_is_computed_once(session):
-    call = "AI.MAP(r.body, 'Name the topic.', 16)"
+    for form, dialect, sql in (
+            ("call", "bq", f"{select} WHERE {call} = 'topic 1'"),
+            ("cte", "snowflake", f"WITH m AS ({select}) SELECT m.id, m.topic FROM m "
+                                 "WHERE m.topic = 'topic 1'")):
+        query = session.sql(sql, dialect=dialect)
+        plan = query.plan()
+        (node,) = _maps(plan)
+        (test,) = [node for node in plan.nodes if node.type_name == "quail.filter"]
+        assert test.inputs[0].source.node_id == node.node_id, form
+        assert [member.node_id
+                for member in plan.graph.pipelines()[node.node_id]] == [
+            node.node_id, test.node_id], form
+        rows = finish(query, Oracle()).collect().to_pylist()
+        assert [list(row.values()) for row in rows] == [[2, "topic 1"]], form
+    # a map only tests read is computed once
     query = session.sql(f"SELECT r.id FROM reviews r WHERE LENGTH({call}) > 3 "
                         f"AND {call} LIKE '% 1'")
     assert len(_maps(query.plan())) == 1
@@ -149,28 +139,31 @@ def test_a_map_only_used_by_a_test_is_computed_once(session):
         .collect().to_pylist() == [{"r.id": 2}]
 
 
-@pytest.mark.parametrize("kind, call, field", [
+COLUMN_OPERATORS = [
     ("label", "AI.CLASSIFY(PROMPT('Topic? {0}', r.body), ARRAY['a', 'b'])", ""),
     ("extract", "AI.EXTRACT(r.body, {'topic': 'Topic?'})", "['topic']"),
     ("map", "AI.MAP(r.body, 'Topic?', 16)", ""),
     ("features", "AI.SAE_FEATURES(PROMPT('Topic? {0}', r.body), {'pooling': 'last'})",
      ""),
-])
-def test_every_column_operator_supports_a_plain_result_test(session, kind, call,
-                                                           field):
-    model = "qwen3.5-2b-sae-bf16" if kind == "features" else "qwen3-4b-fp8"
-    with quail.Session(EngineConfig(model=model, device="h100-sxm"),
-                       tokenizer=TOKENIZER) as value:
-        value.register("reviews", session.catalog.get("reviews"))
-        query = value.sql(f"SELECT r.id, {call} AS value FROM reviews r "
-                          f"WHERE HINT({call}{field} IS NOT NULL, "
-                          "{'selectivity': 0.4})")
-        (test,) = column_tests(operators_of(query))
-        # the test follows the column operator whose answer it reads
-        assert test.call.kind == kind
-        assert test.selectivity == 0.4
-        plan = query.plan()
-        (condition,) = [node for node in plan.nodes if node.type_name == "quail.filter"]
-        producer = next(node for node in plan.nodes
-                        if node.node_id == condition.inputs[0].source.node_id)
-        assert producer.spec.name == test.name
+]
+
+
+def test_every_column_operator_supports_a_plain_result_test(session):
+    for kind, call, field in COLUMN_OPERATORS:
+        model = "qwen3.5-2b-sae-bf16" if kind == "features" else "qwen3-4b-fp8"
+        with quail.Session(EngineConfig(model=model, device="h100-sxm"),
+                           tokenizer=TOKENIZER) as value:
+            value.register("reviews", session.catalog.get("reviews"))
+            query = value.sql(f"SELECT r.id, {call} AS value FROM reviews r "
+                              f"WHERE HINT({call}{field} IS NOT NULL, "
+                              "{'selectivity': 0.4})")
+            (test,) = column_tests(operators_of(query))
+            # the test follows the column operator whose answer it reads
+            assert test.call.kind == kind
+            assert test.selectivity == 0.4, kind
+            plan = query.plan()
+            (condition,) = [
+                node for node in plan.nodes if node.type_name == "quail.filter"]
+            producer = next(node for node in plan.nodes
+                            if node.node_id == condition.inputs[0].source.node_id)
+            assert producer.spec.name == test.name, kind

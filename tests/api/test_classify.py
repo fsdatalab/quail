@@ -123,7 +123,7 @@ def test_classify_plans_filters_and_returns_labels(session):
         [("refund", 0.1), ("shipping", 0.8), ("praise", 0.1)]]
 
 
-def test_classify_probabilities_beside_an_extract(session):
+def test_probabilities_come_back_beside_an_extract_and_only_when_read(session):
     # an extract in the same query projects the label through the label
     # tables; the probability map must come back as a map there too
     alone = session.sql(
@@ -146,9 +146,6 @@ def test_classify_probabilities_beside_an_extract(session):
     assert rows.column("asked").to_pylist() == [{"item": "refund"},
                                                 {"item": None}]
 
-
-
-def test_probabilities_nothing_reads_are_not_computed(session):
     asked = f"{TOPIC}, {{'probabilities': true}})"
     read = session.sql(f"SELECT d.id, {asked} AS topic FROM documents d")
     # DataFusion groups the labels above the region, which then returns
@@ -174,6 +171,7 @@ def test_probabilities_nothing_reads_are_not_computed(session):
     assert rows.to_pylist() == [{"x.topic": "praise", "n": 2}]
     rows = finish(tested, _labels(["refund", "praise"])).collect()
     assert rows.column("d.id").to_pylist() == [9]
+
 
 def _classify_then_filter(session, *, filters=1, later_filters=()):
     tests = [("topic", ("refund", "shipping"))]
@@ -217,6 +215,17 @@ def test_sql_classifies_and_tests_labels(session):
         "AI.CLASSIFY(PROMPT('Number {0}', d.body), ['1', '2']) IN (1) ORDER BY d.id")
     # DataFusion owns SQL coercion; numeric label strings can be compared to numbers.
     assert finish(numeric, Oracle(labels=lambda *_: "1")).to_rows() == [(7,), (9,)]
+    # plain tests of a label read the classification its membership test uses
+    call = "AI.CLASSIFY(PROMPT('Topic? {0}', d.body), ARRAY['a', 'b'])"
+    query = session.sql(
+        f"SELECT d.id FROM documents d WHERE {call} IN ('a', 'b') "
+        f"AND {call} < 'b' AND {call} IS NOT NULL")
+    assert len(operators_of(query).classifies) == 1
+    (classify,) = [node for node in query.plan().nodes if isinstance(node, AiClassify)]
+    tested = {reference.column for found in column_tests(operators_of(query))
+              for reference in found.condition.references}
+    assert tested == {classify.spec.name}
+    assert finish(query, _labels(["a", "b"])).collect().to_pylist() == [{"d.id": 7}]
 
 
 def test_sql_classifies_the_rows_a_join_keeps(session, tmp_path):
@@ -323,17 +332,3 @@ def test_streamed_classifications_share_one_pipeline(session):
     assert result.collect().num_rows == 0
     # the second test on topic drops the last document before kind
     assert scorer.calls == [("topic", [[0], [1]])]
-def test_plain_label_tests_share_the_classification_used_by_membership(session):
-    call = "AI.CLASSIFY(PROMPT('Topic? {0}', d.body), ARRAY['a', 'b'])"
-    query = session.sql(
-        f"SELECT d.id FROM documents d WHERE {call} IN ('a', 'b') "
-        f"AND {call} < 'b' AND {call} IS NOT NULL")
-    assert len(operators_of(query).classifies) == 1
-    (classify,) = [node for node in query.plan().nodes if isinstance(node, AiClassify)]
-    # every label test reads the one classification's column
-    tested = {reference.column for found in column_tests(operators_of(query))
-              for reference in found.condition.references}
-    assert tested == {classify.spec.name}
-    assert finish(query, _labels(["a", "b"])).collect().to_pylist() == [{"d.id": 7}]
-
-
