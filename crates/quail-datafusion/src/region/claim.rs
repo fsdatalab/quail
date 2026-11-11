@@ -299,7 +299,20 @@ fn claim_needed(
                 .collect(),
             None => restore,
         };
-        let claimed = claim_needed(chain, fetch, renamed)?;
+        let mut claimed = claim_needed(chain, fetch, renamed)?;
+        let names: Vec<String> = restore
+            .iter()
+            .map(|expr| match expr {
+                Expr::Alias(alias) => alias.name.clone(),
+                other => other.schema_name().to_string(),
+            })
+            .collect();
+        let shared = names
+            .iter()
+            .any(|name| names.iter().filter(|other| *other == name).count() > 1);
+        if shared {
+            claimed = without_filters(claimed)?;
+        }
         return Ok(LogicalPlan::Projection(Projection::try_new(
             restore,
             Arc::new(claimed),
@@ -581,6 +594,20 @@ thread_local! {
     /// How many inputs the claim on this thread has named: a query's
     /// inputs are numbered from zero each time it is claimed.
     static NEXT_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `plan` with each of its regions taking no dynamic filter
+/// ([`ModelRegion::takes_filters`]).
+fn without_filters(plan: LogicalPlan) -> Result<LogicalPlan> {
+    plan.transform_down(|node| match as_node::<ModelRegion>(&node) {
+        Some(region) if region.takes_filters => {
+            let mut region = region.clone();
+            region.takes_filters = false;
+            Ok(Transformed::yes(extension_node(region)))
+        }
+        _ => Ok(Transformed::no(node)),
+    })
+    .map(|done| done.data)
 }
 
 /// The run of `AiNode`s at `plan`'s root over its input as rows

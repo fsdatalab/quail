@@ -423,3 +423,53 @@ def test_a_table_name_with_underscores_keeps_its_rows_in_a_region():
                              quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
     finally:
         session.close()
+
+
+def _yes_context(tables):
+    """Return a session and a context whose model answers yes to everything."""
+    session = quail.Session(CONFIG, tokenizer=TOKENIZER)
+    oracle = Oracle(filters=lambda *_: True, joins=lambda *_: True)
+    oracle.catalog = session.catalog
+    context = quail.SessionContext(
+        session, physical_executor=oracle_executor(oracle))
+    for name, table in tables.items():
+        context.register(name, quail.DocumentProvider.from_table(table, id_col="id"))
+    return session, context
+
+
+def _sorted_rows(table):
+    return sorted(zip(*(column.to_pylist() for column in table.columns)))
+
+
+def test_a_join_above_a_region_of_two_ids_keeps_every_pair(monkeypatch):
+    monkeypatch.setenv("DATAFUSION_OPTIMIZER_ENABLE_DYNAMIC_FILTER_PUSHDOWN", "true")
+    session, context = _yes_context({
+        "r": pa.table({"id": ["r0", "r1"], "body": ["a", "b"]}),
+        "t": pa.table({"id": ["t0", "t1"], "body": ["c", "d"]}),
+        "v": pa.table({"id": ["v0", "v1"], "rid": ["r0", "r1"]}),
+    })
+    # the region returns r.id and t.id; the join's filter of r.id must
+    # not reach it reading t.id
+    rows = _sorted_rows(context.sql(
+        "SELECT r.id, t.id, v.id FROM r CROSS JOIN t JOIN v ON v.rid = r.id "
+        "WHERE AI.IF(PROMPT('q: {0}', concat(r.body, ' ', t.body)))"))
+    session.close()
+    assert rows == [("r0", "t0", "v0"), ("r0", "t1", "v0"),
+                    ("r1", "t0", "v1"), ("r1", "t1", "v1")]
+
+
+def test_a_join_filter_keeps_a_document_while_it_keeps_one_of_its_copies(
+        monkeypatch):
+    monkeypatch.setenv("DATAFUSION_OPTIMIZER_ENABLE_DYNAMIC_FILTER_PUSHDOWN", "true")
+    session, context = _yes_context({
+        "r": pa.table({"id": ["r0", "r1", "r2", "r3"], "stars": [1, 2, 3, 4]}),
+        # d0 and d2 hold the same text, so one answer serves both
+        "d": pa.table({"id": ["d0", "d1", "d2", "d3"],
+                       "name": ["a", "b", "a", "d"],
+                       "rid": ["r0", "r1", "r2", "r3"]}),
+    })
+    rows = _sorted_rows(context.sql(
+        "SELECT r.id, d.id FROM r JOIN d ON r.id = d.rid "
+        "WHERE r.stars >= 2 AND AI.IF(PROMPT('ok? {0}', d.name))"))
+    session.close()
+    assert rows == [("r1", "d1"), ("r2", "d2"), ("r3", "d3")]

@@ -19,6 +19,7 @@ import contextlib
 import threading
 from collections.abc import Callable, Iterable, Sequence
 
+import numpy as np
 import pyarrow as pa
 
 from quail.execution.types import output_table
@@ -30,8 +31,11 @@ class _Region(threading.local):
     hint = None
     # alias -> the table the hint holds rows of
     tables = {}
-    # table -> (the hint's generation, whether each row is kept)
+    # alias -> (the hint's generation, whether each row is kept)
     keep = {}
+    # alias -> each row's first row with the same document, for a table
+    # the plan deduplicates
+    first = {}
 
 
 _REGION = _Region()
@@ -43,7 +47,8 @@ def finished_rows():
 
 
 @contextlib.contextmanager
-def reporting(rows, hint=None, tables: dict | None = None):
+def reporting(rows, hint=None, tables: dict | None = None,
+              first: dict | None = None):
     """Report to rows, and skip the rows of tables by hint, while the block runs.
 
     Args:
@@ -54,17 +59,23 @@ def reporting(rows, hint=None, tables: dict | None = None):
             ``tables()`` names the tables it holds rows of, and
             ``generation()`` changes whenever a test tightens.
         tables: Each scan alias's table name.
+        first: For each alias the plan deduplicates, each row's first
+            row with the same document. One answer serves every copy,
+            so a document is skipped only when the hint drops them all.
     """
     region = _REGION
-    previous = region.rows, region.hint, region.tables, region.keep
+    previous = (region.rows, region.hint, region.tables, region.keep,
+                region.first)
     held = set() if hint is None else set(hint.tables())
     region.rows, region.hint, region.keep = rows, hint, {}
+    region.first = first or {}
     region.tables = {alias: table for alias, table in (tables or {}).items()
                      if table in held}
     try:
         yield rows
     finally:
-        region.rows, region.hint, region.tables, region.keep = previous
+        (region.rows, region.hint, region.tables, region.keep,
+         region.first) = previous
 
 
 @contextlib.contextmanager
@@ -130,9 +141,16 @@ def keeps(alias, document: int) -> bool:
     if table is None:
         return True
     generation = region.hint.generation()
-    found = region.keep.get(table)
+    found = region.keep.get(alias)
     if found is None or found[0] != generation:
-        found = region.keep[table] = (generation, region.hint.keep(table))
+        keep = np.asarray(region.hint.keep(table), dtype=bool)
+        first = region.first.get(alias)
+        if first is not None:
+            # a document is kept while the hint keeps one of its copies
+            any_copy = np.zeros(len(keep), dtype=bool)
+            np.logical_or.at(any_copy, first, keep)
+            keep = any_copy[first]
+        found = region.keep[alias] = (generation, keep)
     return bool(found[1][document])
 
 

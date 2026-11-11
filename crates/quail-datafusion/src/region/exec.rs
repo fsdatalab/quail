@@ -242,7 +242,7 @@ impl ExecutionPlan for ModelRegionExec {
             })
             .collect();
         let propagation = FilterPushdownPropagation::with_parent_pushdown_result(filters);
-        if phase != FilterPushdownPhase::Post || dynamic.is_empty() {
+        if phase != FilterPushdownPhase::Post || dynamic.is_empty() || !self.region.takes_filters {
             return Ok(propagation);
         }
         let mut exec = self.with_inputs(self.inputs.clone());
