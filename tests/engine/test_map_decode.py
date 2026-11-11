@@ -869,3 +869,31 @@ def test_a_map_answer_stops_once_its_test_is_decided(monkeypatch):
     assert decoder.rows_fed[0] < sum(map(len, wanted))
     assert not decoder.active
     assert not arena.accounting.owned
+
+
+def test_an_answers_text_so_far_is_its_tokens_decoded_from_the_first():
+    class ByteTokenizer:
+        """Decode token t as byte t, so a character may span tokens."""
+
+        calls = []
+
+        def decode_batch(self, batch):
+            self.calls.extend(len(tokens) for tokens in batch)
+            return [bytes(int(token) for token in tokens).decode(
+                "utf-8", errors="replace") for tokens in batch]
+
+    answer = "naïve café ☕ costs 3€, déjà vu".encode()
+    tokenizer = ByteTokenizer()
+    decoder = SimpleNamespace(
+        partial_texts={}, tokenizer=tokenizer,
+        tokens=[np.array([list(answer)])], written=[np.zeros(1, dtype=np.int64)])
+    for written in range(1, len(answer) + 1):
+        decoder.written[0][0] = written
+        ((text, length),) = MapDecoder._partial_texts(decoder, 0, [0])
+        # the longest prefix of the tokens that ends on a whole character
+        whole = max(n for n in range(written + 1)
+                    if not answer[:n].decode("utf-8", errors="replace").endswith("�"))
+        assert (text, length) == (answer[:whole].decode(), whole), written
+    # each step decodes the new tokens and the piece before them, not
+    # the answer from its first token
+    assert max(tokenizer.calls) <= 8
