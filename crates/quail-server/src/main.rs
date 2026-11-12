@@ -1,6 +1,9 @@
 //! `quail-server --model <model> --device <device> [--gpus <n>]
 //! [--backend <backend>] [--listen <address>] [--data <directory>]`
 //!
+//! With `QUAIL_SERVER_TOKEN` set, the server refuses every call whose
+//! `authorization` header is not `Bearer <token>`.
+//!
 //! Starts a GPU worker per GPU and serves a Quail session over Arrow
 //! Flight ([`quail_server::QuailService`]) at the address, by default
 //! `127.0.0.1:50051`. Submitted queries and their rows are kept in the
@@ -39,6 +42,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(USAGE.into());
     }
     let address = listen.parse()?;
+    // a token is a secret, so it comes from the environment
+    let token = std::env::var("QUAIL_SERVER_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty());
     // the session starts its workers before the server accepts a query
     let session = Arc::new(Session::new(&config)?);
     let queue = Queue::open(std::path::Path::new(&data), Arc::clone(&session))?;
@@ -49,7 +56,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     tokio::runtime::Runtime::new()?.block_on(
         Server::builder()
-            .add_service(FlightServiceServer::new(service))
+            .add_service(FlightServiceServer::with_interceptor(
+                service,
+                move |request| quail_server::check_token(token.as_deref(), request),
+            ))
             .serve_with_shutdown(address, stopped()),
     )?;
     queue.close();

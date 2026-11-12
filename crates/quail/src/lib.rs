@@ -54,8 +54,8 @@ use tokio::sync::mpsc::unbounded_channel;
 
 use crate::executor::RegionCall;
 pub use crate::executor::{
-    EngineRegion, Executor, InputHint, Ready, RegionEngine, RegionRan, RegionSink, Scan,
-    ScannedTable, region_json,
+    EngineRegion, Executor, InputHint, Observer, RegionEngine, RegionEvent, RegionRan, RegionSink,
+    Scan, ScannedTable, region_json,
 };
 
 /// The model and hardware a [`Session`] runs on.
@@ -144,10 +144,10 @@ impl Session {
         self.runner.edit_plan(envelope);
     }
 
-    /// Call `ready` each time the workers have the model loaded for a
-    /// region, as [`Executor::when_ready`] does.
-    pub fn when_ready(&self, ready: Option<Ready>) {
-        self.runner.when_ready(ready);
+    /// Tell `observer` what happens as each model region runs, as
+    /// [`Executor::observe`] does.
+    pub fn observe(&self, observer: Option<Observer>, answers: bool) {
+        self.runner.observe(observer, answers);
     }
 
     /// Stop the running query, as [`Executor::interrupt`] does.
@@ -470,6 +470,19 @@ impl Session {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok((schema, batches, explained))
+    }
+
+    /// The report and the operator port rows of a region that ran, as
+    /// [`Executor::region_report`] gives them.
+    ///
+    /// # Errors
+    ///
+    /// The planned region or a worker's results do not read.
+    pub fn region_report(
+        &self,
+        region: &RegionRan,
+    ) -> Result<(serde_json::Value, Vec<shared::Table>)> {
+        self.runner.region_report(region)
     }
 
     /// Plan each model region of a query without running it, region by

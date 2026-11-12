@@ -73,7 +73,7 @@ from quail.physical import (
     ClassifySpec,
 )
 from quail.physical.plan import graph_from_envelope
-from quail.progress import answer_sink
+from quail.progress import answer_sink, set_answer_sink
 
 # the most seconds an operator above a region may take to tighten the
 # region's hint after receiving a row; a slower one fails the test
@@ -717,9 +717,16 @@ def _serve(model, path, description=None):
             state["texts"] = payload["texts"]
             state["columns"] = payload["columns"]
             model.arena = state["gpu"].arena
-            serve_region(state, payload,
-                         graph_from_envelope(payload["physical_plan"]), end,
-                         region["wanted"], region["hinted"])
+            # as the GPU worker does, send each answer to a listener
+            if region["listening"][1]:
+                set_answer_sink(
+                    lambda event: end.ask(json.dumps({"answer": [event]})))
+            try:
+                serve_region(state, payload,
+                             graph_from_envelope(payload["physical_plan"]), end,
+                             region["wanted"], region["hinted"])
+            finally:
+                set_answer_sink(None)
         except Exception:
             end.fail(traceback.format_exc())
 

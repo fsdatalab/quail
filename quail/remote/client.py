@@ -8,7 +8,7 @@ the session has an endpoint.
 from __future__ import annotations
 
 import json
-import time
+import os
 from collections.abc import Iterator
 from dataclasses import dataclass, fields
 
@@ -18,7 +18,8 @@ import pyarrow.flight as flight
 from quail.catalog.providers import ScanRequest
 from quail.execution.result import QueryResult
 
-DEFAULT_POLL_S = 1.0
+DEFAULT_WAIT_S = 1.0
+TOKEN_VARIABLE = "QUAIL_SERVER_TOKEN"
 FINISHED_STATES = frozenset({"succeeded", "failed", "cancelled"})
 
 
@@ -38,6 +39,14 @@ class QueryStatus:
         finished_at: Seconds since 1970 when the query finished.
         num_rows: How many rows the query returned.
         progress: The running model region's progress, while it runs.
+        revision: A number that grows each time the status changes.
+        plans: Each model region's plan once planned: its ``text`` and
+            the planner's ``estimated_seconds``.
+        ready: Whether the workers have had the model loaded.
+        num_answers: How many answer events the run has given so far.
+        tables: The operator port tables saved once the query
+            succeeded: each one's ``region``, ``node``, ``port``, and
+            ``num_rows``.
     """
 
     id: str
@@ -50,7 +59,12 @@ class QueryStatus:
     started_at: float | None = None
     finished_at: float | None = None
     num_rows: int | None = None
-    progress: dict | None = None
+    progress: list | None = None
+    revision: int = 0
+    plans: tuple = ()
+    ready: bool = False
+    num_answers: int = 0
+    tables: tuple = ()
 
     @property
     def done(self) -> bool:
@@ -77,12 +91,16 @@ class ServerClient:
     """Arrow Flight calls to one Quail Server.
 
     Args:
-        endpoint: The server's address, such as ``grpc://127.0.0.1:8642``.
+        endpoint: The server's address, such as ``grpc://127.0.0.1:50051``.
+        token: The server's token; ``QUAIL_SERVER_TOKEN`` when omitted.
     """
 
-    def __init__(self, endpoint: str):
+    def __init__(self, endpoint: str, token: str | None = None):
         self.endpoint = endpoint
         self._flight = flight.FlightClient(endpoint)
+        token = token if token is not None else os.environ.get(TOKEN_VARIABLE)
+        self._options = flight.FlightCallOptions(headers=[] if not token else [
+            (b"authorization", f"Bearer {token}".encode())])
 
     def close(self) -> None:
         """Close the connection."""
@@ -90,14 +108,16 @@ class ServerClient:
 
     def _act(self, name: str, body) -> bytes:
         text = body if isinstance(body, str) else json.dumps(body)
-        answer, = self._flight.do_action(flight.Action(name, text.encode()))
+        answer, = self._flight.do_action(
+            flight.Action(name, text.encode()), self._options)
         return answer.body.to_pybytes()
 
     def upload(self, name: str, reader: pa.RecordBatchReader,
                id_col: str) -> None:
         """Register ``reader``'s rows on the server as the table ``name``."""
         descriptor = flight.FlightDescriptor.for_path(name, id_col)
-        writer, _ = self._flight.do_put(descriptor, reader.schema)
+        writer, _ = self._flight.do_put(
+            descriptor, reader.schema, self._options)
         try:
             for batch in reader:
                 writer.write_batch(batch)
@@ -113,9 +133,42 @@ class ServerClient:
         return _status(self._act("submit", {
             key: value for key, value in asked.items() if value is not None}))
 
-    def status(self, query_id: str) -> QueryStatus:
-        """Return a submission's status."""
-        return _status(self._act("status", query_id))
+    def status(self, query_id: str, *, after: int | None = None,
+               wait_s: float = 0.0) -> QueryStatus:
+        """Return a submission's status.
+
+        Args:
+            query_id: The submission's id.
+            after: A revision. The server answers once the status is
+                newer, or after ``wait_s`` seconds at the latest.
+            wait_s: The most seconds the server waits, 60 at most.
+        """
+        if after is None:
+            return _status(self._act("status", query_id))
+        return _status(self._act("status", {
+            "id": query_id, "after": after, "wait_s": wait_s}))
+
+    def answers(self, query_id: str, *, after: int = 0,
+                limit: int = 1000) -> dict:
+        """Return a run's answer events from the one numbered ``after`` on.
+
+        Returns:
+            ``answers``, the events as the engine reported them, and
+            ``next``, the number to pass as ``after`` for the events
+            that follow.
+        """
+        return json.loads(self._act("answers", {
+            "id": query_id, "after": after, "limit": limit}))
+
+    def report(self, query_id: str) -> list[dict]:
+        """Return each model region's report of a query that succeeded."""
+        return json.loads(self._act("report", query_id))["regions"]
+
+    def table(self, query_id: str, index: int) -> pa.Table:
+        """Return the operator port table a status lists at ``index``."""
+        ticket = flight.Ticket(json.dumps({
+            "query_id": query_id, "table": index}).encode())
+        return self._flight.do_get(ticket, self._options).read_all()
 
     def cancel(self, query_id: str) -> QueryStatus:
         """Stop a submission."""
@@ -135,7 +188,7 @@ class ServerClient:
     def result_batches(self, query_id: str) -> pa.RecordBatchReader:
         """Return the saved rows of a submission that succeeded."""
         ticket = flight.Ticket(json.dumps({"query_id": query_id}).encode())
-        return self._flight.do_get(ticket).to_reader()
+        return self._flight.do_get(ticket, self._options).to_reader()
 
 
 class QueryRun:
@@ -152,44 +205,57 @@ class QueryRun:
         """Return the query's status now."""
         return self._client.status(self.id)
 
-    def watch(self, poll_s: float = DEFAULT_POLL_S) -> Iterator[QueryStatus]:
-        """Yield the query's status every ``poll_s`` seconds until it finishes."""
+    def watch(self, wait_s: float = DEFAULT_WAIT_S) -> Iterator[QueryStatus]:
+        """Yield the query's status each time it changes, until it finishes.
+
+        Args:
+            wait_s: The most seconds between two statuses.
+        """
+        status = self.status()
         while True:
-            status = self.status()
             yield status
             if status.done:
                 return
-            time.sleep(poll_s)
+            status = self._client.status(
+                self.id, after=status.revision, wait_s=wait_s)
 
     def cancel(self) -> QueryStatus:
         """Stop the query."""
         return self._client.cancel(self.id)
 
-    def wait(self, poll_s: float = DEFAULT_POLL_S) -> QueryStatus:
+    def answers(self, after: int = 0, limit: int = 1000) -> dict:
+        """Return the run's answer events, as ``ServerClient.answers`` does."""
+        return self._client.answers(self.id, after=after, limit=limit)
+
+    def report(self) -> list[dict]:
+        """Return each model region's report, once the query succeeded."""
+        return self._client.report(self.id)
+
+    def wait(self, wait_s: float = DEFAULT_WAIT_S) -> QueryStatus:
         """Wait for the query to finish; return its last status."""
-        for status in self.watch(poll_s):
+        for status in self.watch(wait_s):
             pass
         return status
 
-    def stream_result(self, poll_s: float = DEFAULT_POLL_S
+    def stream_result(self, wait_s: float = DEFAULT_WAIT_S
                       ) -> pa.RecordBatchReader:
         """Wait for the query, then stream its rows.
 
         Raises:
             QueryFailedError: The query failed or was cancelled.
         """
-        status = self.wait(poll_s)
+        status = self.wait(wait_s)
         if status.state != "succeeded":
             raise QueryFailedError(status)
         return self._client.result_batches(self.id)
 
-    def result(self, poll_s: float = DEFAULT_POLL_S) -> QueryResult:
+    def result(self, wait_s: float = DEFAULT_WAIT_S) -> QueryResult:
         """Wait for the query, then return its rows.
 
         Raises:
             QueryFailedError: The query failed or was cancelled.
         """
-        return QueryResult.from_table(self.stream_result(poll_s).read_all())
+        return QueryResult.from_table(self.stream_result(wait_s).read_all())
 
 
 class RemoteConnection:

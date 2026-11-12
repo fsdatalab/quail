@@ -15,6 +15,7 @@ import pytest
 from helpers.sessions import CONFIG
 
 import quail
+import quail.remote.client
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 SERVER = REPOSITORY / "target" / "debug" / "quail-server"
@@ -41,13 +42,16 @@ class _Client(flight.FlightClient):
 
 
 @contextlib.contextmanager
-def serving(data, delay=0.0):
+def serving(data, delay=0.0, token=""):
     """A Flight client of a server on `data` whose workers answer from an oracle.
 
     Args:
         data: The server's data directory.
         delay: Seconds each filter answer takes.
+        token: The server's token; without one it takes every call.
     """
+    options = flight.FlightCallOptions(headers=[] if not token else [
+        (b"authorization", f"Bearer {token}".encode())])
     with socket.socket() as found:
         found.bind(("127.0.0.1", 0))
         port = found.getsockname()[1]
@@ -55,20 +59,21 @@ def serving(data, delay=0.0):
         [str(SERVER), "--model", "qwen3-4b-fp8", "--device", "h100-sxm",
          "--listen", f"127.0.0.1:{port}", "--data", str(data)],
         env={**os.environ, "QUAIL_WORKER": f"{sys.executable} {WORKER}",
-             "QUAIL_ORACLE_DELAY": str(delay)})
+             "QUAIL_ORACLE_DELAY": str(delay),
+             "QUAIL_SERVER_TOKEN": token})
     try:
         client = _Client(f"grpc://127.0.0.1:{port}")
         deadline = time.monotonic() + 60
         while True:
             try:
-                list(client.list_actions())
+                list(client.list_actions(options))
                 break
             except flight.FlightUnavailableError:
                 assert server.poll() is None, "quail-server exited"
                 assert time.monotonic() < deadline, "quail-server did not start"
                 time.sleep(0.1)
         descriptor = flight.FlightDescriptor.for_path("reviews", "id")
-        writer, _ = client.do_put(descriptor, REVIEWS.schema)
+        writer, _ = client.do_put(descriptor, REVIEWS.schema, options)
         writer.write_table(REVIEWS)
         writer.close()
         yield client
@@ -121,11 +126,53 @@ def test_a_session_with_an_endpoint_uploads_its_tables_and_runs_its_queries(
         assert query.collect().to_pydict() == {"r.id": ["r0", "r2", "r4"]}
         assert "ModelRegionExec" in query.explain()
         run = query.submit(query_id="named")
-        assert run.wait(poll_s=0.05).num_rows == 3
+        assert run.wait(wait_s=0.05).num_rows == 3
         assert session.get_run("named").result().count() == 3
         failed = session.sql("SELECT * FROM missing").submit()
         with pytest.raises(quail.QueryFailedError, match="missing"):
-            failed.result(poll_s=0.05)
+            failed.result(wait_s=0.05)
+
+
+def test_a_run_shows_its_plan_its_answers_its_report_and_its_port_tables(
+        tmp_path):
+    with serving(tmp_path) as client, quail.Session(
+            CONFIG, endpoint=client.endpoint) as session:
+        run = session.sql(QUERY).submit(query_id="shown")
+        seen = list(run.watch(wait_s=5))
+        last = seen[-1]
+        assert last.state == "succeeded" and last.ready
+        # the status changed at least when planned, ready, and finished
+        assert len({status.revision for status in seen}) >= 3
+        (plan,) = last.plans
+        assert "AiFilter" in plan["text"] and plan["estimated_seconds"] > 0
+        # the oracle answers its six documents as one chunk: one event
+        events = run.answers()
+        assert last.num_answers == events["next"] == 1
+        (event,) = events["answers"]
+        assert event["kind"] == "filter" and [
+            passed for _row, _stage, passed in event["documents"]
+        ] == [True, False, True, False, True, False]
+        assert run.answers(after=1) == {"answers": [], "next": 1}
+        (report,) = run.report()
+        assert report["fresh_tokens"] > 0 and report["wall_s"] > 0
+        assert last.tables and all(
+            session._remote.client.table("shown", index).num_rows
+            == saved["num_rows"] for index, saved in enumerate(last.tables))
+    # a server started again still has the answers and the report
+    with serving(tmp_path) as client:
+        assert _act(client, "answers", {"id": "shown"})["next"] == 1
+        assert _act(client, "report", "shown")["regions"][0]["fresh_tokens"] > 0
+
+
+def test_a_server_with_a_token_refuses_a_call_without_it(tmp_path):
+    with serving(tmp_path, token="secret") as client:
+        with pytest.raises(flight.FlightUnauthenticatedError):
+            _act(client, "list", "")
+        with quail.Session(CONFIG, endpoint=client.endpoint) as session:
+            with pytest.raises(flight.FlightUnauthenticatedError):
+                session.sql("SELECT 1").submit()
+        found = quail.remote.client.ServerClient(client.endpoint, token="secret")
+        assert found.submissions() == []
 
 
 def test_a_submission_keeps_its_status_and_rows_when_the_server_restarts(tmp_path):

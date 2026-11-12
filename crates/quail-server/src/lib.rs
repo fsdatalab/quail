@@ -13,9 +13,23 @@
 //!   submission, and `timeout_s`. `status`, with an id as its body,
 //!   returns the submission's status, and the running region's
 //!   progress; `cancel` stops it; `list` returns every submission.
-//!   A status is JSON ([`queue::Submission`]).
+//!   A status is JSON ([`queue::Submission`]): it has each model
+//!   region's plan once planned, and a `revision` that grows with each
+//!   change. `status` with the JSON body `{"id", "after", "wait_s"}`
+//!   answers once the revision is past `after`, or after `wait_s`
+//!   seconds at the latest.
+//! - `DoAction` `answers`, with the JSON body `{"id", "after",
+//!   "limit"}`, returns the answer events of a submission's run from
+//!   the event numbered `after` on, while it runs and after: JSON with
+//!   `answers` and `next`.
+//! - `DoAction` `report`, with an id as its body, returns each model
+//!   region's report of a submission that succeeded.
 //! - `DoGet` with the ticket `{"query_id": id}` returns the rows of a
-//!   submission that succeeded.
+//!   submission that succeeded. With `"table": n` as well, it returns
+//!   the rows of the operator port the status lists at `n` of `tables`.
+//!
+//! A server started with a token refuses every call whose
+//! `authorization` header is not `Bearer <token>` ([`check_token`]).
 //! - `DoAction` `explain`, whose body is JSON with `sql` and optionally
 //!   `dialect`, returns DataFusion's plan, with each model region as
 //!   one operator.
@@ -87,8 +101,25 @@ fn query_status(error: DataFusionError) -> Status {
     }
 }
 
+/// Refuse a call whose `authorization` header is not `Bearer <token>`;
+/// with no token every call passes.
+///
+/// # Errors
+///
+/// The header is missing or names another token.
+pub fn check_token<T>(token: Option<&str>, request: Request<T>) -> Result<Request<T>, Status> {
+    let Some(token) = token else {
+        return Ok(request);
+    };
+    let sent = (request.metadata().get("authorization")).and_then(|sent| sent.to_str().ok());
+    match sent.and_then(|sent| sent.strip_prefix("Bearer ")) == Some(token) {
+        true => Ok(request),
+        false => Err(Status::unauthenticated("this server needs its token")),
+    }
+}
+
 /// The server's actions, each with what it does.
-const ACTIONS: [(&str, &str); 5] = [
+const ACTIONS: [(&str, &str); 7] = [
     (
         "explain",
         "Return a query's plan; the body is JSON with sql, dialect",
@@ -97,7 +128,18 @@ const ACTIONS: [(&str, &str); 5] = [
         "submit",
         "Queue a query; the body is JSON with sql, dialect, id, timeout_s",
     ),
-    ("status", "Return a submission's status, by id"),
+    (
+        "status",
+        "Return a submission's status, by id or JSON with id, after, wait_s",
+    ),
+    (
+        "answers",
+        "Return a run's answer events; the body is JSON with id, after, limit",
+    ),
+    (
+        "report",
+        "Return each region's report of a submission, by id",
+    ),
     ("cancel", "Stop a submission, by id"),
     ("list", "Return every submission"),
 ];
@@ -135,9 +177,15 @@ impl FlightService for QuailService {
         // a ticket that is JSON names a submission; any other is SQL
         let submitted = serde_json::from_str::<serde_json::Value>(&query)
             .ok()
-            .and_then(|ticket| ticket["query_id"].as_str().map(str::to_string));
+            .and_then(|ticket| {
+                let id = ticket["query_id"].as_str()?.to_string();
+                Some((id, ticket["table"].as_u64()))
+            });
         let (schema, batches) = match submitted {
-            Some(id) => self.queue.rows(&id).map_err(Status::not_found)?,
+            Some((id, None)) => self.queue.rows(&id).map_err(Status::not_found)?,
+            Some((id, Some(index))) => (self.queue)
+                .table(&id, index as usize)
+                .map_err(Status::not_found)?,
             None => {
                 self.blocking(move |session| session.sql_in_dialect(&query, None))
                     .await?
@@ -235,10 +283,40 @@ impl FlightService for QuailService {
                     .map_err(Status::invalid_argument)?;
                 json(serde_json::json!(found))
             }
-            "status" => json(
-                (self.queue.status(&body))
-                    .ok_or_else(|| Status::not_found(format!("no submission {body}")))?,
-            ),
+            "status" => {
+                // a body that is JSON waits for a newer revision
+                let asked = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .filter(serde_json::Value::is_object);
+                let found = match asked {
+                    None => self.queue.status(&body),
+                    Some(asked) => {
+                        let queue = Arc::clone(&self.queue);
+                        let wait = asked["wait_s"].as_f64().unwrap_or(0.0).clamp(0.0, 60.0);
+                        tokio::task::spawn_blocking(move || {
+                            queue.status_after(
+                                asked["id"].as_str().unwrap_or_default(),
+                                asked["after"].as_u64().unwrap_or(0),
+                                std::time::Duration::from_secs_f64(wait),
+                            )
+                        })
+                        .await
+                        .map_err(|error| Status::internal(error.to_string()))?
+                    }
+                };
+                json(found.ok_or_else(|| Status::not_found("no such submission"))?)
+            }
+            "answers" => {
+                let asked: serde_json::Value = serde_json::from_str(&body)
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
+                let found = self.queue.answers(
+                    asked["id"].as_str().unwrap_or_default(),
+                    asked["after"].as_u64().unwrap_or(0) as usize,
+                    asked["limit"].as_u64().unwrap_or(1000) as usize,
+                );
+                json(found.map_err(Status::not_found)?)
+            }
+            "report" => self.queue.report(&body).map_err(Status::not_found)?,
             "cancel" => json(serde_json::json!(
                 self.queue.cancel(&body).map_err(Status::not_found)?
             )),

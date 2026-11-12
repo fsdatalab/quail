@@ -2,9 +2,12 @@
 //! keeps each query's status and rows on disk.
 //!
 //! Each submission has a directory under the server's data directory:
-//! `status.json`, and `result.arrow` once it succeeded. A server that
-//! starts on the same directory lists the earlier submissions, and
-//! marks one that had not finished as failed.
+//! `status.json`, and once it succeeded `result.arrow` (its rows),
+//! `report.json` (each model region's report), `table-<n>.arrow` (the
+//! rows of each operator port, as `status.json` lists them), and
+//! `answers.json` (the answer events of its run). A server that starts
+//! on the same directory lists the earlier submissions, and marks one
+//! that had not finished as failed.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -13,8 +16,8 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use quail::Session;
 use quail::shared::{Table, read_table, write_table};
+use quail::{Observer, RegionEvent, Session};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -41,6 +44,41 @@ pub struct Submission {
     pub finished_at: Option<f64>,
     /// How many rows the query returned.
     pub num_rows: Option<usize>,
+    /// A number that grows each time this status changes.
+    #[serde(default)]
+    pub revision: u64,
+    /// Each model region's plan, once it is planned.
+    #[serde(default)]
+    pub plans: Vec<PlanShown>,
+    /// Whether the workers have had the model loaded for a region.
+    #[serde(default)]
+    pub ready: bool,
+    /// How many answer events the run has given so far.
+    #[serde(default)]
+    pub num_answers: usize,
+    /// The operator port tables saved once the query succeeded; a
+    /// table's place in this list names it.
+    #[serde(default)]
+    pub tables: Vec<SavedTable>,
+}
+
+/// One model region's plan, as the status shows it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanShown {
+    /// The plan as the planner's explain writes it.
+    pub text: String,
+    /// The seconds the planner expects the region to take.
+    pub estimated_seconds: f64,
+}
+
+/// The rows of one operator port of a region that ran.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedTable {
+    /// Which of the query's model regions, in run order.
+    pub region: usize,
+    pub node: String,
+    pub port: String,
+    pub num_rows: usize,
 }
 
 impl Submission {
@@ -61,6 +99,8 @@ struct State {
     waiting: VecDeque<String>,
     /// The running submission, and why it was stopped, once it was.
     running: Option<(String, Option<String>)>,
+    /// The answer events of the submissions run since the server started.
+    answers: BTreeMap<String, Arc<Vec<Value>>>,
     closed: bool,
 }
 
@@ -97,7 +137,7 @@ impl Queue {
                 found.state = "failed".into();
                 found.error = Some(STOPPED.into());
                 found.finished_at = Some(now());
-                save(directory, &found)?;
+                save(directory, &mut found)?;
             }
             state.submissions.insert(found.id.clone(), found);
         }
@@ -153,8 +193,14 @@ impl Queue {
             started_at: None,
             finished_at: None,
             num_rows: None,
+            revision: 0,
+            plans: Vec::new(),
+            ready: false,
+            num_answers: 0,
+            tables: Vec::new(),
         };
-        save(&self.directory, &found).map_err(|error| error.to_string())?;
+        let mut found = found;
+        save(&self.directory, &mut found).map_err(|error| error.to_string())?;
         state.submissions.insert(id.clone(), found.clone());
         state.waiting.push_back(id);
         self.changed.notify_all();
@@ -171,6 +217,161 @@ impl Queue {
             status["progress"] = json!(self.session.progress());
         }
         Some(status)
+    }
+
+    /// A submission's status once its revision is past `after`, or
+    /// after `wait` at the latest; None for an unknown id.
+    pub fn status_after(&self, id: &str, after: u64, wait: Duration) -> Option<Value> {
+        let deadline = std::time::Instant::now() + wait;
+        let mut state = self.state.lock().expect("the queue lock");
+        loop {
+            let found = state.submissions.get(id)?;
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if found.revision > after || found.finished() || left.is_zero() {
+                break;
+            }
+            state = (self.changed.wait_timeout(state, left))
+                .expect("the queue lock")
+                .0;
+        }
+        drop(state);
+        self.status(id)
+    }
+
+    /// The answer events of a submission's run from the event numbered
+    /// `after` on, `limit` at most: JSON with `answers` and `next`, the
+    /// number of the event after the last one returned.
+    ///
+    /// # Errors
+    ///
+    /// The id is unknown.
+    pub fn answers(&self, id: &str, after: usize, limit: usize) -> Result<Value, String> {
+        let held = {
+            let state = self.state.lock().expect("the queue lock");
+            if !state.submissions.contains_key(id) {
+                return Err(format!("no submission {id}"));
+            }
+            state.answers.get(id).cloned()
+        };
+        // an earlier server's run left its events in a file
+        let events = match held {
+            Some(events) => events,
+            None => {
+                let path = self.directory.join(id).join("answers.json");
+                let saved = std::fs::read(path).ok();
+                Arc::new(
+                    saved
+                        .and_then(|text| serde_json::from_slice(&text).ok())
+                        .unwrap_or_default(),
+                )
+            }
+        };
+        let start = after.min(events.len());
+        let end = start.saturating_add(limit).min(events.len());
+        Ok(json!({"answers": &events[start..end], "next": end}))
+    }
+
+    /// The report of each model region of a submission that succeeded,
+    /// as JSON text: `{"regions": [...]}`.
+    ///
+    /// # Errors
+    ///
+    /// The id is unknown, or the submission has no report.
+    pub fn report(&self, id: &str) -> Result<String, String> {
+        self.succeeded(id)?;
+        std::fs::read_to_string(self.directory.join(id).join("report.json"))
+            .map_err(|error| format!("the submission {id} has no report: {error}"))
+    }
+
+    /// The rows of the operator port a submission's status lists at
+    /// `index` of its `tables`.
+    ///
+    /// # Errors
+    ///
+    /// The id is unknown, or the submission has no such table.
+    pub fn table(&self, id: &str, index: usize) -> Result<Table, String> {
+        self.succeeded(id)?;
+        let path = self.directory.join(id).join(format!("table-{index}.arrow"));
+        read_table(&path, false).map_err(|error| error.to_string())
+    }
+
+    fn succeeded(&self, id: &str) -> Result<(), String> {
+        let found = (self.status(id)).ok_or_else(|| format!("no submission {id}"))?;
+        match found["state"] == "succeeded" {
+            true => Ok(()),
+            false => Err(format!(
+                "the submission {id} is {}, and has no results",
+                found["state"]
+            )),
+        }
+    }
+
+    /// Record what a region of the running submission `id` did.
+    fn observed(&self, id: &str, event: RegionEvent<'_>) {
+        let mut state = self.state.lock().expect("the queue lock");
+        let state = &mut *state;
+        let Some(found) = state.submissions.get_mut(id) else {
+            return;
+        };
+        match event {
+            RegionEvent::Planned {
+                explained,
+                estimated_seconds,
+            } => {
+                found.plans.push(PlanShown {
+                    text: explained.to_string(),
+                    estimated_seconds,
+                });
+                let _ = save(&self.directory, found);
+            }
+            RegionEvent::Ready => {
+                found.ready = true;
+                let _ = save(&self.directory, found);
+            }
+            // answers come often: they are saved when the query ends
+            RegionEvent::Answers(answered) => {
+                let events = state.answers.entry(id.to_string()).or_default();
+                Arc::make_mut(events).push(answered.clone());
+                found.num_answers = events.len();
+                found.revision += 1;
+            }
+        }
+        self.changed.notify_all();
+    }
+
+    /// Save the report and the operator port tables of each region the
+    /// submission `id` ran, and its answer events; returns the tables.
+    fn save_regions(&self, id: &str) -> datafusion::common::Result<Vec<SavedTable>> {
+        let home = self.directory.join(id);
+        let mut reports = Vec::new();
+        let mut saved = Vec::new();
+        for (region, ran) in self.session.take_regions().iter().enumerate() {
+            let (report, tables) = self.session.region_report(ran)?;
+            reports.push(report);
+            for table in tables {
+                let metadata = table.0.metadata();
+                let named = |key: &str| metadata.get(key).cloned().unwrap_or_default();
+                let path = home.join(format!("table-{}.arrow", saved.len()));
+                let _ = std::fs::remove_file(&path);
+                write_table(&path, &table)?;
+                saved.push(SavedTable {
+                    region,
+                    node: named("quail.node"),
+                    port: named("quail.port"),
+                    num_rows: table.1.iter().map(|batch| batch.num_rows()).sum(),
+                });
+            }
+        }
+        std::fs::write(
+            home.join("report.json"),
+            json!({"regions": reports}).to_string(),
+        )?;
+        let events = {
+            let state = self.state.lock().expect("the queue lock");
+            state.answers.get(id).cloned().unwrap_or_default()
+        };
+        std::fs::write(home.join("answers.json"), json!(*events).to_string())?;
+        Ok(saved)
     }
 
     /// Every submission, oldest first.
@@ -284,16 +485,24 @@ impl Queue {
                     }
                 })
             });
+            let observer: Observer = {
+                let (queue, id) = (Arc::clone(&self), found.id.clone());
+                Arc::new(move |event| queue.observed(&id, event))
+            };
+            self.session.observe(Some(observer), true);
             let ran = (self
                 .session
                 .sql_in_dialect(&found.sql, found.dialect.as_deref()))
             .and_then(|table| {
-                let rows = table.1.iter().map(|batch| batch.num_rows()).sum();
+                let rows: usize = table.1.iter().map(|batch| batch.num_rows()).sum();
                 let path = self.directory.join(&found.id).join("result.arrow");
                 let _ = std::fs::remove_file(&path);
                 write_table(&path, &table)?;
-                Ok(rows)
+                Ok((rows, self.save_regions(&found.id)?))
             });
+            self.session.observe(None, false);
+            // a query that failed leaves its regions behind
+            drop(self.session.take_regions());
             drop(done);
             if let Some(watcher) = watcher {
                 let _ = watcher.join();
@@ -308,9 +517,10 @@ impl Queue {
                 .expect("the submission");
             found.finished_at = Some(now());
             match (ran, stopped) {
-                (Ok(rows), _) => {
+                (Ok((rows, tables)), _) => {
                     found.state = "succeeded".into();
                     found.num_rows = Some(rows);
+                    found.tables = tables;
                 }
                 (Err(_), Some(reason)) if reason == "cancelled" => {
                     found.state = "cancelled".into();
@@ -326,12 +536,14 @@ impl Queue {
                 }
             }
             let _ = save(&self.directory, found);
+            self.changed.notify_all();
         }
     }
 }
 
-/// Write a submission's status, whole or not at all.
-fn save(directory: &Path, found: &Submission) -> std::io::Result<()> {
+/// Write a submission's status, whole or not at all, as a new revision.
+fn save(directory: &Path, found: &mut Submission) -> std::io::Result<()> {
+    found.revision += 1;
     let home = directory.join(&found.id);
     std::fs::create_dir_all(&home)?;
     let written = home.join("status.json.new");

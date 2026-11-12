@@ -107,8 +107,9 @@ pub struct Executor {
     /// A plan's envelope to run in place of the planner's, for a query
     /// of one region.
     edited: Mutex<Option<serde_json::Value>>,
-    /// Called once the workers are ready to run a region.
-    ready: Mutex<Option<Ready>>,
+    /// Told what happens as a region runs on the workers, and whether
+    /// the workers send it the model's answers.
+    observer: Mutex<Option<(Observer, bool)>>,
     /// Stops the workers, for an executor that runs on them.
     interrupter: Option<crate::workers::Interrupter>,
     /// The running region's latest progress, as its worker counted it:
@@ -116,8 +117,24 @@ pub struct Executor {
     progress: Arc<Mutex<Option<serde_json::Value>>>,
 }
 
-/// Called once the workers have the model loaded for a region.
-pub type Ready = Arc<dyn Fn() + Send + Sync>;
+/// What an [`Observer`] is told as a model region runs on the workers.
+#[derive(Debug, Clone, Copy)]
+pub enum RegionEvent<'a> {
+    /// The region is planned: its plan as the planner's explain writes
+    /// it, and the seconds the planner expects the region to take.
+    Planned {
+        explained: &'a str,
+        estimated_seconds: f64,
+    },
+    /// The workers have the model loaded; the region runs next.
+    Ready,
+    /// Answers the model gave, as the worker's engine reports them: a
+    /// JSON object whose `kind` is "filter", "join", "score", or "evict".
+    Answers(&'a serde_json::Value),
+}
+
+/// Called with each [`RegionEvent`], on the thread that runs the region.
+pub type Observer = Arc<dyn Fn(RegionEvent<'_>) + Send + Sync>;
 
 impl std::fmt::Debug for Executor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -228,7 +245,7 @@ impl Executor {
             planning: Some((planner, settings)),
             regions: Mutex::new(Vec::new()),
             edited: Mutex::new(None),
-            ready: Mutex::new(None),
+            observer: Mutex::new(None),
         })
     }
 
@@ -257,7 +274,7 @@ impl Executor {
             planning,
             regions: Mutex::new(Vec::new()),
             edited: Mutex::new(None),
-            ready: Mutex::new(None),
+            observer: Mutex::new(None),
         }
     }
 }
@@ -286,10 +303,12 @@ impl Executor {
         *self.edited.lock().expect("the edited lock") = envelope;
     }
 
-    /// Call `ready` each time the workers have the model loaded for a
-    /// region, before the region runs; None calls nothing.
-    pub fn when_ready(&self, ready: Option<Ready>) {
-        *self.ready.lock().expect("the ready lock") = ready;
+    /// Tell `observer` what happens as each region runs on the workers;
+    /// None tells nobody. With `answers`, the workers also send the
+    /// model's answers as it gives them, one message for each chunk.
+    pub fn observe(&self, observer: Option<Observer>, answers: bool) {
+        *self.observer.lock().expect("the observer lock") =
+            observer.map(|observer| (observer, answers));
     }
 
     /// What the planner's explain reads of a planned region, as
@@ -340,28 +359,26 @@ impl Executor {
         Ok(request)
     }
 
-    /// What the planner's explain reads of a region that ran: its
-    /// [`Executor::explain_request`] with the run's report and each
-    /// node's measured metrics.
+    /// The report of a region that ran, as a query's result carries it,
+    /// and the rows of each operator port the workers returned, each
+    /// tagged with its node and port.
     ///
     /// # Errors
     ///
     /// The planned region or a worker's results do not read.
-    pub(crate) fn analyzed_request(
+    pub fn region_report(
         &self,
         region: &RegionRan,
-        verbose: bool,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<(serde_json::Value, Vec<crate::shared::Table>)> {
         use serde_json::{Value, json};
         let read = |error: serde_json::Error| DataFusionError::External(Box::new(error));
         let planned: Value = serde_json::from_str(&region.planned).map_err(read)?;
-        let mut request = self.explain_request(&planned, verbose)?;
         let envelope = &planned["envelope"];
         let graph: quail_planner::physical::PhysicalGraph =
             serde_json::from_value(envelope["graph"].clone()).map_err(read)?;
         let usd_per_hour = (self.planning.as_ref())
             .and_then(|(_, settings)| settings.device["usd_per_hour"].as_f64());
-        let (mut measured, _) = crate::report::region_report(
+        let (mut measured, tables) = crate::report::region_report(
             &graph,
             &region.ran,
             region.seconds,
@@ -389,6 +406,26 @@ impl Executor {
             measured.as_object().expect("a report"),
             region.total_seconds,
         );
+        Ok((report, tables))
+    }
+
+    /// What the planner's explain reads of a region that ran: its
+    /// [`Executor::explain_request`] with the run's report and each
+    /// node's measured metrics.
+    ///
+    /// # Errors
+    ///
+    /// The planned region or a worker's results do not read.
+    pub(crate) fn analyzed_request(
+        &self,
+        region: &RegionRan,
+        verbose: bool,
+    ) -> Result<serde_json::Value> {
+        use serde_json::{Value, json};
+        let read = |error: serde_json::Error| DataFusionError::External(Box::new(error));
+        let planned: Value = serde_json::from_str(&region.planned).map_err(read)?;
+        let mut request = self.explain_request(&planned, verbose)?;
+        let (report, _) = self.region_report(region)?;
         let metrics: serde_json::Map<String, Value> = (report["node_metrics"].as_object())
             .into_iter()
             .flatten()
@@ -828,6 +865,23 @@ impl Executor {
                         source_rows.insert(name.clone(), positions);
                     }
                 }
+                let observer = self.observer.lock().expect("the observer lock").clone();
+                if let Some((observer, _)) = &observer {
+                    let read =
+                        |error: serde_json::Error| DataFusionError::External(Box::new(error));
+                    let planned: serde_json::Value = serde_json::from_str(&found).map_err(read)?;
+                    // a refusal has no plan to show; the run reports it
+                    if planned.get("envelope").is_some() {
+                        let request = self.explain_request(&planned, false)?;
+                        let request = serde_json::from_value(request).map_err(read)?;
+                        let explained = quail_planner::explain::explain_text(&request)
+                            .map_err(DataFusionError::Execution)?;
+                        observer(RegionEvent::Planned {
+                            explained: &explained,
+                            estimated_seconds: planned["estimated_seconds"].as_f64().unwrap_or(0.0),
+                        });
+                    }
+                }
                 let ran = run_on_workers(
                     workers,
                     found,
@@ -837,7 +891,7 @@ impl Executor {
                     held,
                     conformed,
                     rows,
-                    self.ready.lock().expect("the ready lock").clone(),
+                    observer,
                     Arc::clone(&self.progress),
                 )?;
                 self.regions.lock().expect("the regions lock").push(ran);
@@ -881,7 +935,7 @@ fn run_on_workers(
     hint: Option<InputHint>,
     conformed: impl Fn(RecordBatch) -> Result<RecordBatch> + Send + Sync + 'static,
     rows: &RowSender,
-    ready: Option<Ready>,
+    observer: Option<(Observer, bool)>,
     progress: Arc<Mutex<Option<serde_json::Value>>>,
 ) -> Result<RegionRan> {
     let read = |error: serde_json::Error| DataFusionError::External(Box::new(error));
@@ -934,7 +988,7 @@ fn run_on_workers(
     let listening = crate::region_run::Listening {
         hinted,
         progress: true,
-        answers: false,
+        answers: matches!(observer, Some((_, true))),
     };
     *progress.lock().expect("the progress lock") = None;
     let sender = rows.clone();
@@ -943,9 +997,15 @@ fn run_on_workers(
         let _ = sender.send(RegionRows::Batch(Ok(conformed(batch)?)));
         Ok(())
     });
+    let listener = observer.clone();
     let ask: crate::workers::Ask = Box::new(move |question| {
         if let Some(counted) = question.get("progress") {
             *progress.lock().expect("the progress lock") = Some(counted.clone());
+        }
+        if let (Some(events), Some((observer, _))) = (question.get("answer"), &listener) {
+            for event in events.as_array().into_iter().flatten() {
+                observer(RegionEvent::Answers(event));
+            }
         }
         match &hint {
             Some(hint) if question.get("hint").is_some() => hint.answer(question),
@@ -958,8 +1018,8 @@ fn run_on_workers(
     workers.check_interrupted()?;
     let entered = std::time::Instant::now();
     let boots = workers.boot(&setup)?;
-    if let Some(ready) = ready {
-        ready();
+    if let Some((observer, _)) = &observer {
+        observer(RegionEvent::Ready);
     }
     let started = std::time::Instant::now();
     let ran =

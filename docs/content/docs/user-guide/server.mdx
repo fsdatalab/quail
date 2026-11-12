@@ -26,9 +26,10 @@ target/debug/quail-server --model qwen3-4b-fp8 --device h100-sxm
 The server starts one GPU worker process per GPU. The first query
 loads the model; later queries reuse it.
 
-The server has no access token and no encryption. Listen on another
-address, such as `--listen 0.0.0.0:50051`, only on a trusted private
-network.
+Set `QUAIL_SERVER_TOKEN` on the server to refuse every call without
+that token. Set the same variable on the client; `Session` sends it.
+The server does not encrypt, so listen on another address, such as
+`--listen 0.0.0.0:50051`, only on a trusted private network.
 
 ## Submit a query
 
@@ -76,7 +77,7 @@ Use `query.collect()` when you only need rows and want to wait for them.
 ## Inspect a query
 
 `run.status()` returns the current status. `run.watch()` yields it
-until the query finishes.
+each time it changes, until the query finishes.
 
 | State | Meaning |
 | --- | --- |
@@ -86,7 +87,30 @@ until the query finishes.
 
 While a model region runs, `status.progress` holds its counts.
 `query.explain()` returns the server's plan, with each model region as
-one operator. A remote result holds rows only; it has no report.
+one operator.
+
+| Call | What it returns |
+| --- | --- |
+| `status.plans` | Each model region's plan once planned: its `text` and the planner's `estimated_seconds`. |
+| `run.answers(after=0)` | The model's answers so far, while the query runs and after. Pass the returned `next` as `after` to read the ones that follow. |
+| `run.report()` | Each model region's report, once the query succeeded. See [Metrics](/docs/user-guide/metrics). |
+| `status.tables` | The rows each operator returned, saved once the query succeeded. |
+
+E.g., print each filter answer as the model gives it:
+
+```python
+seen = 0
+for status in run.watch():
+    page = run.answers(after=seen)
+    seen = page["next"]
+    for event in page["answers"]:
+        if event["kind"] == "filter":
+            print(event["alias"], event["documents"])
+```
+
+An answer event is what the engine reports for one chunk: its `kind` is
+`filter`, `join`, `score`, or `evict`. A filter event lists each
+document's row, the last stage that asked it, and whether it passed.
 
 ## Reconnect to a query
 
@@ -124,10 +148,12 @@ submit it again with a new ID.
 | `DoPut`, path `[table, id column]` | Registers the uploaded rows as a table. |
 | `DoGet`, ticket is SQL | Runs the query and returns its rows. |
 | `DoAction` `submit` | Queues a query. Body: JSON with `sql`, and optionally `dialect`, `id`, `timeout_s`. |
-| `DoAction` `status`, `cancel` | Body: the query ID. Returns the status as JSON. |
+| `DoAction` `status`, `cancel` | Body: the query ID. Returns the status as JSON. `status` also takes JSON with `id`, `after`, and `wait_s`, and answers once the status's `revision` is past `after`. |
+| `DoAction` `answers` | Body: JSON with `id`, `after`, `limit`. Returns the run's answer events and `next`. |
+| `DoAction` `report` | Body: the query ID. Returns each model region's report. |
 | `DoAction` `list` | Returns every submitted query. |
 | `DoAction` `explain` | Body: JSON with `sql`, and optionally `dialect`. Returns the plan. |
-| `DoGet`, ticket `{"query_id": id}` | Returns the saved rows of a query that succeeded. |
+| `DoGet`, ticket `{"query_id": id}` | Returns the saved rows of a query that succeeded. With `"table": n`, returns the operator rows the status lists at `n` of `tables`. |
 
 E.g., run a query with `pyarrow.flight`:
 

@@ -118,15 +118,18 @@ impl NativeSession {
     /// a region, before the region runs; None calls nothing.
     #[pyo3(signature = (ready=None))]
     fn when_ready(&self, ready: Option<Py<PyAny>>) {
-        self.session.when_ready(ready.map(|ready| {
-            let call: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
-                Python::attach(|py| {
-                    // a hook that fails must not stop the region
-                    let _ = ready.call0(py);
-                });
+        let observer = ready.map(|ready| {
+            let call: quail::Observer = std::sync::Arc::new(move |event| {
+                if matches!(event, quail::RegionEvent::Ready) {
+                    Python::attach(|py| {
+                        // a hook that fails must not stop the region
+                        let _ = ready.call0(py);
+                    });
+                }
             });
             call
-        }));
+        });
+        self.session.observe(observer, false);
     }
 
     /// What each model region of the last query ran on the workers, in
