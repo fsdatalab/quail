@@ -41,13 +41,6 @@ enum Step {
 }
 
 impl Above {
-    /// Whether the operators keep every row the region returns.
-    pub(crate) fn keeps_rows(&self) -> bool {
-        self.steps
-            .iter()
-            .all(|step| matches!(step, Step::Projection(_)))
-    }
-
     /// The operators over `region`.
     ///
     /// # Errors

@@ -166,7 +166,7 @@ impl DisplayAs for ModelRegionExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(f, "ModelRegionExec")?;
                 let mut details = Vec::new();
-                if let Some(fetch) = self.fetch.or(self.region.fetch) {
+                if let Some(fetch) = self.fetch {
                     details.push(format!("fetch={fetch}"));
                 }
                 if !self.hint.is_empty() {

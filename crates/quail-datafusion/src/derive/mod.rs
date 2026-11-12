@@ -77,10 +77,7 @@ pub fn derive_region(
     {
         return compile_error(found.message());
     }
-    let mut operators = derive_operators(&plan, turn, layout)?;
-    if let Some(fetch) = region.fetch {
-        operators = operators.limited(fetch as i64);
-    }
+    let operators = derive_operators(&plan, turn, layout)?;
     let ored = operators
         .filters
         .iter()

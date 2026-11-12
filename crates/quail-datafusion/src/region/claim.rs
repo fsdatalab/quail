@@ -73,7 +73,7 @@ pub fn claim_model_regions(plan: LogicalPlan, session: &dyn Session) -> Result<L
     }
     NEXT_ROWS.with(|next| next.set(0));
     let plan = super::unread::drop_unread_nodes(plan)?;
-    let claimed = number_regions(drop_unread_probabilities(claim_regions(plan, None)?)?)?;
+    let claimed = number_regions(drop_unread_probabilities(claim_regions(plan)?)?)?;
     // DataFusion 55.2's two leaf-expression rules fail on the join the
     // claim builds above a region: they move a struct field read below the
     // join and then name the region's `r.id` beside the table's. The
@@ -230,21 +230,13 @@ fn without_probabilities(call: &Expr) -> Option<(Expr, Expr)> {
 }
 
 /// Claim the model regions of an optimized plan.
-///
-/// `fetch` is the most rows the operators above read from `plan`, when
-/// a `Limit` above passes them on through projections only; a region
-/// there may stop the model once it has that many.
-fn claim_regions(plan: LogicalPlan, fetch: Option<usize>) -> Result<LogicalPlan> {
-    claim_needed(plan, fetch, None)
+fn claim_regions(plan: LogicalPlan) -> Result<LogicalPlan> {
+    claim_needed(plan, None)
 }
 
 /// [`claim_regions`], where the operator above reads only the `needed`
 /// columns of `plan`, or every one when None.
-fn claim_needed(
-    plan: LogicalPlan,
-    fetch: Option<usize>,
-    needed: Option<Vec<Column>>,
-) -> Result<LogicalPlan> {
+fn claim_needed(plan: LogicalPlan, needed: Option<Vec<Column>>) -> Result<LogicalPlan> {
     if !calls_ai(&plan)? {
         return Ok(plan);
     }
@@ -255,7 +247,7 @@ fn claim_needed(
             let LogicalPlan::Subquery(mut found) = subquery else {
                 return Ok(Transformed::no(subquery));
             };
-            found.subquery = Arc::new(claim_regions(Arc::unwrap_or_clone(found.subquery), None)?);
+            found.subquery = Arc::new(claim_regions(Arc::unwrap_or_clone(found.subquery))?);
             Ok(Transformed::yes(LogicalPlan::Subquery(found)))
         })?
         .data;
@@ -284,7 +276,7 @@ fn claim_needed(
                 .collect(),
             None => restore,
         };
-        let claimed = claim_needed(chain, fetch, renamed)?;
+        let claimed = claim_needed(chain, renamed)?;
         return Ok(LogicalPlan::Projection(Projection::try_new(
             restore,
             Arc::new(claimed),
@@ -306,20 +298,17 @@ fn claim_needed(
             }
             needed
         });
-        let refused = match claim_run(&plan, fetch, needed.clone(), false)? {
+        let refused = match claim_run(&plan, needed.clone(), false)? {
             Ok(claimed) => return Ok(claimed),
             Err(refused) => refused,
         };
         // DataFusion can compute an expression the region does not read
-        if let Ok(claimed) = claim_run(&plan, fetch, needed.clone(), true)? {
+        if let Ok(claimed) = claim_run(&plan, needed.clone(), true)? {
             return Ok(claimed);
         }
         // a run no region takes is tried in smaller parts
         return match simpler_run(&plan)? {
-            Some(simpler) => {
-                let fetch = fetch.filter(|_| as_node::<AiNode>(&simpler).is_some());
-                claim_needed(simpler, fetch, needed)
-            }
+            Some(simpler) => claim_needed(simpler, needed),
             None => plan_err!("{refused}"),
         };
     }
@@ -334,33 +323,16 @@ fn claim_needed(
             plan.display()
         );
     }
-    let passed = passed_fetch(&plan, fetch);
     let inputs = plan
         .inputs()
         .into_iter()
         .cloned()
         .map(|input| {
             let read = super::lowering::read_from(&plan, &input, needed.as_deref());
-            claim_needed(input, passed, read)
+            claim_needed(input, read)
         })
         .collect::<Result<Vec<_>>>()?;
     plan.with_new_exprs(plan.expressions(), inputs)
-}
-
-/// The most rows `plan`'s operator reads from its input, when it is a
-/// `Limit`, or passes `fetch` on from above without changing the rows.
-fn passed_fetch(plan: &LogicalPlan, fetch: Option<usize>) -> Option<usize> {
-    use datafusion::logical_expr::{FetchType, SkipType};
-    match plan {
-        LogicalPlan::Limit(limit) => match (limit.get_skip_type(), limit.get_fetch_type()) {
-            (Ok(SkipType::Literal(skip)), Ok(FetchType::Literal(Some(rows)))) => {
-                Some(skip + fetch.map_or(rows, |above| above.min(rows)))
-            }
-            _ => None,
-        },
-        LogicalPlan::Projection(_) | LogicalPlan::SubqueryAlias(_) => fetch,
-        _ => None,
-    }
 }
 
 /// Quail's binder's error for `plan` as a region, if it has one.
@@ -665,7 +637,6 @@ fn is_table(plan: &LogicalPlan) -> bool {
 /// the run's expressions of one table's columns before the region.
 fn claim_run(
     plan: &LogicalPlan,
-    fetch: Option<usize>,
     needed: Option<Vec<Column>>,
     precompute: bool,
 ) -> Result<std::result::Result<LogicalPlan, String>> {
@@ -701,12 +672,8 @@ fn claim_run(
         return Ok(Err(error.to_string()));
     }
     let mut region = ModelRegion::new(bound);
-    // a fetch counts the rows the region returns, not the rows a lifted
-    // test or UNNEST keeps of them
-    region.fetch =
-        fetch.filter(|_| above.keeps_rows() && !crate::ai::any_filters_on_or(&region.plan));
     for (name, input) in inputs {
-        let mut input = claim_regions(input, None)?;
+        let mut input = claim_regions(input)?;
         if numbered_inputs.contains(&name) {
             input = extension_node(SharedInput::try_new(input, true)?);
         }
