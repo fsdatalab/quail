@@ -10,6 +10,7 @@
 //! classes. Derived attributes, such as a node's outputs, come from the
 //! Rust methods that the planner uses.
 
+use quail_planner::constants as shared;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -72,7 +73,10 @@ const ANSWER: [Field; 7] = [
     ("tail_text", Some("\"\"")),
     ("preamble_token_ids", Some("[]")),
     ("preamble_text", Some("\"\"")),
-    ("max_answer_tokens", Some("64")),
+    (
+        "max_answer_tokens",
+        Some(shared::EXTRACT_MAX_ANSWER_TOKENS_JSON),
+    ),
 ];
 
 macro_rules! fields {
@@ -262,7 +266,7 @@ static KINDS: &[Kind] = &[
         node: false,
         fields: fields!(SPEC; "pair_fraction" = Some("1.0"), "draws" = Some("1"),
             "labels" = EMPTY, "label_token_ids" = EMPTY, "label_word_starts" = EMPTY,
-            "scoring" = Some("\"letters\""), "probabilities" = NO, "join_layout" = NONE,
+            "scoring" = Some(shared::LETTERS_SCORING_JSON), "probabilities" = NO, "join_layout" = NONE,
             "frame_tokens" = ZERO, "state_tail_tokens" = ZERO,
             "question_header_token_ids" = EMPTY, "separator_tokens" = ZERO),
     },
@@ -270,19 +274,22 @@ static KINDS: &[Kind] = &[
         class: "ExtractSpec",
         tag: "quail.physical.nodes.extract.ExtractSpec",
         node: false,
-        fields: fields!(SPEC; "question" = S, "max_answer_tokens" = Some("64"),
-            "draft_tokens" = Some("63"), "draft_policy" = Some("\"adaptive\""),
-            "expected_answer_tokens" = Some("16"), "round_cost_per_token" = FLOAT,
-            "top_tokens" = Some("1024"), "first_window_chars" = Some("64"),
-            "window_chars" = Some("512"), "state_tail_tokens" = ZERO,
+        fields: fields!(SPEC; "question" = S, "max_answer_tokens" = Some(shared::EXTRACT_MAX_ANSWER_TOKENS_JSON),
+            "draft_tokens" = Some(shared::EXTRACT_DRAFT_TOKENS_JSON),
+            "draft_policy" = Some(shared::EXTRACT_DRAFT_POLICY_JSON),
+            "expected_answer_tokens" = Some(shared::EXTRACT_ANSWER_TOKENS_JSON),
+            "round_cost_per_token" = FLOAT,
+            "top_tokens" = Some(shared::EXTRACT_TOP_TOKENS_JSON),
+            "first_window_chars" = Some(shared::FIRST_WINDOW_CHARS_JSON),
+            "window_chars" = Some(shared::WINDOW_CHARS_JSON), "state_tail_tokens" = ZERO,
             "question_header_token_ids" = EMPTY, "read_slots" = EMPTY),
     },
     Kind {
         class: "MapSpec",
         tag: "quail.physical.nodes.map.MapSpec",
         node: false,
-        fields: fields!(SPEC; "max_answer_tokens" = Some("256"),
-            "expected_answer_tokens" = Some("64")),
+        fields: fields!(SPEC; "max_answer_tokens" = Some(shared::DEFAULT_MAP_ANSWER_TOKENS_JSON),
+            "expected_answer_tokens" = Some(shared::MAP_ANSWER_TOKENS_JSON)),
     },
     Kind {
         class: "SaeFeaturesSpec",

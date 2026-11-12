@@ -11,14 +11,15 @@ time as the writing reaches it.
 import re
 from dataclasses import dataclass
 
+import _quail_native
 import numpy as np
 
 from quail.backends.quail.executor.extract.vocabulary import Vocabulary
 
 # the source characters an ExtractSpec tokenizes in its first window and
 # in each later one, unless the plan sets them
-FIRST_WINDOW_CHARS = 64
-WINDOW_CHARS = 512
+FIRST_WINDOW_CHARS = _quail_native.FIRST_WINDOW_CHARS
+WINDOW_CHARS = _quail_native.WINDOW_CHARS
 
 NEG = float("-inf")
 

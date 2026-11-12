@@ -28,6 +28,7 @@ from quail_b.labels import GroundTruthCollection, PredicateLabels
 from quail_b.minimum import DocumentTokens, token_metrics
 from quail_b.prompts import DISCUSS_ASPECT, F1
 from quail_b.queries import get_query
+from quail_b.rendering import ANSWER_CUE
 from quail_b.scoring import evaluate
 
 # IMDB-3 is F1 on the reviews, then the DISCUSS_ASPECT join with the aspects
@@ -260,7 +261,7 @@ def test_a_map_query_reports_every_answer_and_its_pieces(tmp_path):
                 turn[0] + quail.SHARED_PRE), query_id
             assert [piece["id"] for piece in pieces["maps"]] == [
                 m.id for m in spec.info.maps], query_id
-            assert all(question_text(piece["tail"]).endswith("ANSWER:")
+            assert all(question_text(piece["tail"]).endswith(ANSWER_CUE.strip())
                        for piece in pieces["maps"]), query_id
 
 

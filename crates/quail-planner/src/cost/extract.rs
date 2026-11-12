@@ -3,7 +3,7 @@
 //! Each document's work is a record of scalars; the table's work sums
 //! them as numpy sums an array.
 
-use crate::constants::SAMPLE_DOCUMENTS;
+use crate::constants::SAMPLE_ROWS;
 use std::collections::BTreeMap;
 
 use crate::cost::budgets::parallel_copies;
@@ -321,7 +321,7 @@ fn column(records: &[(Work, f64, f64)], field: impl Fn(&Work) -> &Quantity) -> f
 
 /// The work, fed tokens, and readout rows of every document.
 ///
-/// A table of more than `SAMPLE_DOCUMENTS` documents sums evenly
+/// A table of more than `SAMPLE_ROWS` documents sums evenly
 /// spaced documents and scales the sum to the table.
 ///
 /// # Errors
@@ -333,11 +333,11 @@ pub fn table_work(
     inputs: &ExtractInputs,
 ) -> Result<(Work, f64, f64), String> {
     let n = lengths.len();
-    let indices: Vec<usize> = if n <= SAMPLE_DOCUMENTS {
+    let indices: Vec<usize> = if n <= SAMPLE_ROWS {
         (0..n).collect()
     } else {
-        (0..SAMPLE_DOCUMENTS)
-            .map(|i| i * (n - 1) / (SAMPLE_DOCUMENTS - 1))
+        (0..SAMPLE_ROWS)
+            .map(|i| i * (n - 1) / (SAMPLE_ROWS - 1))
             .collect()
     };
     let sampled: Vec<f64> = indices.iter().map(|i| lengths[*i]).collect();
@@ -361,8 +361,8 @@ pub fn table_work(
     };
     let mut fed = numpy_sum(&records.iter().map(|r| r.1).collect::<Vec<_>>());
     let mut rows = numpy_sum(&records.iter().map(|r| r.2).collect::<Vec<_>>());
-    if n > SAMPLE_DOCUMENTS {
-        let scale = n as f64 / SAMPLE_DOCUMENTS as f64;
+    if n > SAMPLE_ROWS {
+        let scale = n as f64 / SAMPLE_ROWS as f64;
         work = &work * scale;
         fed *= scale;
         rows *= scale;

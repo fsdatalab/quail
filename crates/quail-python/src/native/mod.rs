@@ -1258,6 +1258,8 @@ pub fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module.add("NULL_DOCUMENT", shared::NULL_DOCUMENT)?;
         module.add("LABEL_PREFIX", shared::LABEL_PREFIX)?;
         module.add("DEFAULT_SELECTIVITY", shared::DEFAULT_SELECTIVITY)?;
+        module.add("FIRST_WINDOW_CHARS", shared::FIRST_WINDOW_CHARS)?;
+        module.add("WINDOW_CHARS", shared::WINDOW_CHARS)?;
         module.add("GDN_STATE_ELEMENT_BYTES", specs::GDN_STATE_ELEMENT_BYTES)?;
         module.add("CONV_STATE_ELEMENT_BYTES", specs::CONV_STATE_ELEMENT_BYTES)?;
         module.add("ACT_BYTES_PER_HIDDEN", specs::ACT_BYTES_PER_HIDDEN)?;

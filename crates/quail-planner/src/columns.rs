@@ -1,5 +1,6 @@
 //! Each column operator's priced spec.
 
+use crate::constants;
 use crate::constants::{EXTRACT_ANSWER_TOKENS, MAP_ANSWER_TOKENS};
 use crate::cost::budgets::chunk_budget;
 use crate::cost::extract::{self, ExtractInputs};
@@ -111,14 +112,14 @@ fn extract_spec(
         ],
         share_prefixes: false,
         question: call.question.clone(),
-        max_answer_tokens: 64,
-        draft_tokens: 63,
-        draft_policy: "adaptive".to_string(),
+        max_answer_tokens: constants::EXTRACT_MAX_ANSWER_TOKENS,
+        draft_tokens: constants::EXTRACT_DRAFT_TOKENS,
+        draft_policy: constants::EXTRACT_DRAFT_POLICY.to_string(),
         expected_answer_tokens: EXTRACT_ANSWER_TOKENS,
         round_cost_per_token: 0.0,
-        top_tokens: 1024,
-        first_window_chars: 64,
-        window_chars: 512,
+        top_tokens: constants::EXTRACT_TOP_TOKENS,
+        first_window_chars: constants::FIRST_WINDOW_CHARS,
+        window_chars: constants::WINDOW_CHARS,
         state_tail_tokens: 0,
         question_header_token_ids: Vec::new(),
         read_slots: Vec::new(),

@@ -567,7 +567,7 @@ fn answer_specs(
             "preamble_token_ids": lowered.preamble_token_ids,
             // vLLM adds the model's beginning-of-text token itself
             "preamble_text": without_bos(&call.prompt.preamble, &context.model.bos_text),
-            "max_answer_tokens": 64,
+            "max_answer_tokens": crate::constants::EXTRACT_MAX_ANSWER_TOKENS,
         });
         if name == "RequestExtractSpec" {
             fields["question"] = Value::from(call.question.clone());
