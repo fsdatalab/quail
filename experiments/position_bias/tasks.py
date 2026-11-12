@@ -92,6 +92,13 @@ TASKS = {
         criterion=("the excerpt argues that the cited case's reasoning does "
                    "not apply here."),
         role=None, k=15),
+    "sales_outcome": Task(
+        name="sales_outcome", query_id="SALES-5", table="sales_calls",
+        column="transcript", predicate_key="",
+        noun="sales call",
+        criterion=("the customer is likely to sign a contract and buy, judging "
+                   "by their commitment, urgency, and remaining objections."),
+        role=None, k=25),
 }
 
 
@@ -115,9 +122,54 @@ class TaskData:
         return list(self.texts)
 
 
+def load_sales_outcomes() -> TaskData:
+    """Each sampled deal's latest call, labeled by whether the deal was won.
+
+    A deal is won when its CRMArena-Pro opportunity links to a contract
+    the customer signed (status Activated, with a customer signed date).
+    The deal ids follow quail_b.data._sales_rows: deals sorted by
+    opportunity id, then permuted with DATA_SEED.
+    """
+    import sqlite3
+
+    import numpy as np
+
+    from quail_b import data as quailb_data
+    from quail_b.data import load_table
+
+    won = {}
+    for domain in quailb_data.SALES_DOMAINS:
+        path = quailb_data._download(quailb_data.CRMARENA_URL.format(
+            commit=quailb_data.CRMARENA_COMMIT, domain=domain))
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            signed = {row[0] for row in connection.execute(
+                "SELECT o.Id FROM Opportunity o JOIN Contract c "
+                "ON c.Id = o.ContractID__c WHERE c.Status = 'Activated' "
+                "AND c.CustomerSignedDate IS NOT NULL")}
+        finally:
+            connection.close()
+        deals = sorted({row[0] for row in quailb_data._sales_source_calls(domain)})
+        order = np.random.default_rng(quailb_data.DATA_SEED).permutation(len(deals))
+        for index in order[:quailb_data._n_sales_deals(domain, SCALE_FACTOR)]:
+            won[f"sd{domain}{index:04d}"] = deals[index] in signed
+    latest = {}
+    for row in load_table("sales_calls", scale_factor=SCALE_FACTOR).to_pylist():
+        if (row["deal_id"] not in latest
+                or row["call_index"] > latest[row["deal_id"]]["call_index"]):
+            latest[row["deal_id"]] = row
+    rows = sorted(latest.values(), key=lambda row: row["id"])
+    return TaskData(TASKS["sales_outcome"],
+                    {row["id"]: row["transcript"] for row in rows},
+                    {row["id"]: won[row["deal_id"]] for row in rows})
+
+
 def load_task(task: Task) -> TaskData:
     """Load a task's table and reference labels from the QUAIL-B bucket."""
     from quail_b.benchmark import load_benchmark
+
+    if task.name == "sales_outcome":
+        return load_sales_outcomes()
 
     benchmark = load_benchmark([task.query_id], scale_factor=SCALE_FACTOR)
     table = benchmark.tables[task.table]
