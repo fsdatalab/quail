@@ -7,7 +7,7 @@ SortPreservingMergeExec: [first_fix@2 ASC NULLS LAST, trajectory_id@0 ASC NULLS 
           RepartitionExec: partitioning=Hash([trajectory_id@0], 4), input_partitions=4
             AggregateExec: mode=Partial, gby=[trajectory_id@0 as trajectory_id], aggr=[count(Int64(1)), min(t.turn_index), max(t.token_count)]
               RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
-                ModelRegionExec
+                ModelRegionExec: calls=[ai_filter], tables=[agent_traces]
 
 model region:
 logical:

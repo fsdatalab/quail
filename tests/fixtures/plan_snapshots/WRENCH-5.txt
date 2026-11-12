@@ -6,9 +6,10 @@ SortPreservingMergeExec: [flagged@1 DESC NULLS LAST, model@0 ASC NULLS LAST]
         RepartitionExec: partitioning=Hash([model@0], 4), input_partitions=4
           AggregateExec: mode=Partial, gby=[model@0 as model], aggr=[count(Int64(1))]
             RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
-              ModelRegionExec
-                FilterExec: mode@1 = baseline, projection=[model@0, transcript@2, id@3]
-                  DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
+              ModelRegionExec: calls=[ai_filter], tables=[wrench_runs@w]
+                CoalescePartitionsExec
+                  FilterExec: mode@1 = baseline, projection=[model@0, transcript@2, id@3]
+                    DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
 
 model region:
 logical:

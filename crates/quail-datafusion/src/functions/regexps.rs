@@ -57,7 +57,8 @@ impl FunctionRewrite for SnowflakeRegexpLike {
         let Expr::ScalarFunction(ScalarFunction { func, mut args }) = expr else {
             return Ok(Transformed::no(expr));
         };
-        if func.name() != "regexp_like" || args.len() < 2 {
+        // the analyzer may run twice: an anchored pattern stays as it is
+        if func.name() != "regexp_like" || args.len() < 2 || is_anchored(&args[1]) {
             return Ok(Transformed::no(Expr::ScalarFunction(ScalarFunction {
                 func,
                 args,
@@ -85,6 +86,17 @@ fn anchored(pattern: Expr) -> Expr {
         ))
     };
     concat(concat(lit(ANCHOR_START), pattern), lit(ANCHOR_END))
+}
+
+/// Whether [`anchored`] wrote `pattern`.
+fn is_anchored(pattern: &Expr) -> bool {
+    match pattern {
+        Expr::Literal(ScalarValue::Utf8(Some(text)), _) => {
+            text.starts_with(ANCHOR_START) && text.ends_with(ANCHOR_END)
+        }
+        Expr::BinaryExpr(concat) => *concat.right == lit(ANCHOR_END),
+        _ => false,
+    }
 }
 
 #[cfg(test)]

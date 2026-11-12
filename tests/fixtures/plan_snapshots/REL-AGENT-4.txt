@@ -1,7 +1,7 @@
 DataFusion:
 SortExec: TopK(fetch=20), expr=[recovered_score@1 DESC NULLS LAST, id@0 ASC NULLS LAST], preserve_partitioning=[false]
   CooperativeExec
-    ModelRegionExec: hint=[DynamicFilter [ empty ]]
+    ModelRegionExec: hint=[DynamicFilter [ empty ]], calls=[ai_score], tables=[agent_traces]
 
 model region:
 logical:

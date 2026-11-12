@@ -7,9 +7,10 @@ SortPreservingMergeExec: [test_steps@1 DESC NULLS LAST, trace_id@0 ASC NULLS LAS
           RepartitionExec: partitioning=Hash([trace_id@0], 4), input_partitions=4
             AggregateExec: mode=Partial, gby=[trace_id@0 as trace_id], aggr=[count(Int64(1))]
               RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
-                ModelRegionExec
-                  FilterExec: role@1 = assistant, projection=[trace_id@0, content@2, id@3]
-                    DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
+                ModelRegionExec: calls=[ai_filter], tables=[issue_messages@m]
+                  CoalescePartitionsExec
+                    FilterExec: role@1 = assistant, projection=[trace_id@0, content@2, id@3]
+                      DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
 
 model region:
 logical:

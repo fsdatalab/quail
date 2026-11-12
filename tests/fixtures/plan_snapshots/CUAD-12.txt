@@ -18,7 +18,7 @@ SortPreservingMergeExec: [contracts@1 DESC NULLS LAST, governing_law_state@0 ASC
 
 {0}"), c.text),make_array(struct(Utf8("New York"), Utf8("")), struct(Utf8("California"), Utf8("")), struct(Utf8("Delaware"), Utf8("")), struct(Utf8("Texas"), Utf8("")), struct(Utf8("Florida"), Utf8("")), struct(Utf8("another state or country"), Utf8("a governing law other than those five")), struct(Utf8("not stated"), Utf8("the contract names no governing law"))))], aggr=[count(Int64(1))]
             RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
-              ModelRegionExec
+              ModelRegionExec: calls=[ai_classify, ai_filter], tables=[contracts]
 
 model region:
 logical:

@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
@@ -11,7 +12,7 @@ use datafusion::catalog::Session;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion::common::{DataFusionError, Result, internal_err};
+use datafusion::common::{DataFusionError, Result, exec_err, internal_err};
 use datafusion::execution::context::QueryPlanner;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
@@ -19,17 +20,19 @@ use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
 use datafusion::physical_expr::expressions::DynamicFilterPhysicalExpr;
 use datafusion::physical_expr::utils::collect_columns;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
-use datafusion::physical_plan::execute_stream;
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::distribution_requirements::InputDistributionRequirements;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, EvaluationType};
 use datafusion::physical_plan::filter_pushdown::{
     ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
 };
+use datafusion::physical_plan::limit::LimitStream;
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::{
     RecordBatchReceiverStreamBuilder, RecordBatchStreamAdapter,
 };
 use datafusion::physical_plan::{
-    ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
-    PlanProperties, ReplaceChildrenOptions,
+    ChildrenPropertiesMode, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
+    Partitioning, PlanProperties, ReplaceChildrenOptions,
 };
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
 use futures::SinkExt;
@@ -103,6 +106,7 @@ pub struct ModelRegionExec {
     filter_columns: Option<BTreeSet<String>>,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl ModelRegionExec {
@@ -119,7 +123,9 @@ impl ModelRegionExec {
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
-        );
+        )
+        // the region runs on tasks of its own and buffers their rows
+        .with_evaluation_type(EvaluationType::Eager);
         Self {
             region,
             runner,
@@ -129,6 +135,7 @@ impl ModelRegionExec {
             filter_columns: None,
             schema,
             properties: Arc::new(properties),
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 
@@ -164,7 +171,7 @@ impl DisplayAs for ModelRegionExec {
     fn fmt_as(&self, format: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         match format {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "ModelRegionExec")?;
+                write!(f, "ModelRegionExec: ")?;
                 let mut details = Vec::new();
                 if let Some(fetch) = self.fetch {
                     details.push(format!("fetch={fetch}"));
@@ -178,12 +185,10 @@ impl DisplayAs for ModelRegionExec {
                         .collect();
                     details.push(format!("hint=[{}]", tests.join(", ")));
                 }
-                if details.is_empty() {
-                    return Ok(());
-                }
-                write!(f, ": {}", details.join(", "))
+                details.push(self.region.summary());
+                write!(f, "{}", details.join(", "))
             }
-            DisplayFormatType::TreeRender => write!(f, ""),
+            DisplayFormatType::TreeRender => write!(f, "{}", self.region.summary()),
         }
     }
 }
@@ -201,9 +206,13 @@ impl ExecutionPlan for ModelRegionExec {
         self.inputs.iter().collect()
     }
 
-    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+    fn input_distribution_requirements(&self) -> InputDistributionRequirements {
         // `execute` reads each input as one stream
-        vec![false; self.inputs.len()]
+        InputDistributionRequirements::new(vec![Distribution::SinglePartition; self.inputs.len()])
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
@@ -311,9 +320,11 @@ impl ExecutionPlan for ModelRegionExec {
                     futures::channel::mpsc::channel::<Result<RecordBatch>>(BUFFERED_BATCHES);
                 let (arrived, waiting) = oneshot::channel::<()>();
                 let context = Arc::clone(&context);
+                let ended = Arc::new(AtomicBool::new(false));
+                let finished = Arc::clone(&ended);
                 builder.spawn(async move {
                     let mut arrived = Some(arrived);
-                    let mut found = match execute_stream(input, context) {
+                    let mut found = match input.execute(0, context) {
                         Ok(found) => found,
                         Err(error) => {
                             let _ = batches.send(Err(error)).await;
@@ -329,9 +340,10 @@ impl ExecutionPlan for ModelRegionExec {
                             let _ = arrived.send(());
                         }
                     }
+                    finished.store(true, Ordering::Release);
                     Ok(())
                 });
-                streams.push((name.clone(), Box::new(BlockingReceiver(received))));
+                streams.push((name.clone(), Box::new(BlockingReceiver { received, ended })));
                 first.push(waiting);
             }
             let sender = builder.tx();
@@ -346,10 +358,7 @@ impl ExecutionPlan for ModelRegionExec {
                 // region to the thread that called DataFusion
                 SpawnedTask::spawn_blocking(move || {
                     let batches = runner.run(&region, streams, fetch, &hint)?;
-                    for batch in (Limited {
-                        batches,
-                        remaining: fetch,
-                    }) {
+                    for batch in batches {
                         // the receiver is gone once DataFusion stops reading
                         if sender
                             .blocking_send(batch.and_then(with_struct_nulls))
@@ -367,9 +376,16 @@ impl ExecutionPlan for ModelRegionExec {
             builder.build()
         };
         let batches = stream::once(async move { start() }).flatten();
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
+        let batches = Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&self.schema),
             batches,
+        ));
+        // cuts the rows off at the fetch and counts them for EXPLAIN ANALYZE
+        Ok(Box::pin(LimitStream::new(
+            batches,
+            0,
+            self.fetch,
+            BaselineMetrics::new(&self.metrics, partition),
         )))
     }
 }
@@ -420,42 +436,22 @@ fn with_struct_nulls(batch: RecordBatch) -> Result<RecordBatch> {
 ///
 /// The thread that runs a region may be inside the tokio runtime, where
 /// tokio's blocking receive panics, so this waits with `futures`' executor.
-struct BlockingReceiver(futures::channel::mpsc::Receiver<Result<RecordBatch>>);
+struct BlockingReceiver {
+    received: futures::channel::mpsc::Receiver<Result<RecordBatch>>,
+    /// Whether the input ended; a cancelled query closes the channel too.
+    ended: Arc<AtomicBool>,
+}
 
 impl Iterator for BlockingReceiver {
     type Item = Result<RecordBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        futures::executor::block_on(self.0.next())
-    }
-}
-
-/// A region's batches cut off after `remaining` rows, when DataFusion
-/// pushed a limit into the region.
-struct Limited {
-    batches: RegionBatches,
-    remaining: Option<usize>,
-}
-
-impl Iterator for Limited {
-    type Item = Result<RecordBatch>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining == Some(0) {
-            return None;
+        match futures::executor::block_on(self.received.next()) {
+            None if !self.ended.swap(true, Ordering::AcqRel) => Some(exec_err!(
+                "the query was cancelled while a model region read its input"
+            )),
+            found => found,
         }
-        let batch = match self.batches.next()? {
-            Ok(batch) => batch,
-            Err(error) => return Some(Err(error)),
-        };
-        Some(Ok(match &mut self.remaining {
-            Some(remaining) => {
-                let rows = batch.num_rows().min(*remaining);
-                *remaining -= rows;
-                batch.slice(0, rows)
-            }
-            None => batch,
-        }))
     }
 }
 

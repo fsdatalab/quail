@@ -45,6 +45,11 @@ pub use functions::field_access::StructFieldAccess;
 pub use functions::regexps::SnowflakeRegexpLike;
 pub use functions::{AI_FUNCTION_NAMES, is_ai_call, quail_functions};
 pub use quail_planner::constants::SPAN_SUFFIX;
+
+/// Quail's own error as a DataFusion error a host can downcast.
+pub fn external(error: quail_planner::error::CompileError) -> datafusion::error::DataFusionError {
+    datafusion::error::DataFusionError::External(Box::new(error))
+}
 pub use region::ModelRegion;
 pub use region::claim::claim_model_regions;
 pub use region::exec::{

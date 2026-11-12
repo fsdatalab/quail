@@ -42,7 +42,7 @@ use std::sync::Arc;
 use datafusion::arrow::datatypes::{DataType, Field};
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::common::{Column, Result, plan_err};
+use datafusion::common::{Column, Result, internal_err, plan_err};
 use datafusion::logical_expr::expr_rewriter::strip_outer_reference;
 use datafusion::logical_expr::simplify::SimplifyContext;
 use datafusion::logical_expr::utils::{conjunction, split_conjunction};
@@ -90,7 +90,13 @@ impl OptimizerRule for LowerAiCalls {
         if !crate::region::claim::calls_ai_function(&plan)? {
             return Ok(Transformed::no(plan));
         }
-        Ok(Transformed::yes(crate::region::claim::lower_regions(plan)?))
+        // a call no operator can lower stays, and the plan with it
+        let lowered = crate::region::claim::lower_regions(plan.clone())?;
+        Ok(if lowered == plan {
+            Transformed::no(plan)
+        } else {
+            Transformed::yes(lowered)
+        })
     }
 }
 
@@ -495,7 +501,7 @@ fn add_column(input: LogicalPlan, call: Expr, name: &str) -> Result<LogicalPlan>
     let mut fields = vec![field(&call, name.to_string())?];
     if function_name(&call) == Some("ai_extract") {
         let Expr::ScalarFunction(found) = &call else {
-            unreachable!("a call")
+            return internal_err!("an AI call is a function call");
         };
         let spans = Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
             quail_function("ai_extract_span"),
@@ -635,7 +641,10 @@ fn lower_filter(filter: &Filter, columns: &mut Columns) -> Result<Transformed<Lo
     }
     let names: Vec<String> = added.iter().map(|(_, name)| name.clone()).collect();
     input = with_tests(input, &names, &written)?;
-    match boolean_filter(conjunction(tests).expect("a test"), &Arc::new(input))? {
+    match boolean_filter(
+        conjunction(tests).unwrap_or(datafusion::logical_expr::lit(true)),
+        &Arc::new(input),
+    )? {
         Some(test) => Ok(Transformed::yes(LogicalPlan::Filter(test))),
         None => Ok(Transformed::no(LogicalPlan::Filter(filter.clone()))),
     }
@@ -756,7 +765,7 @@ fn combine_prompt_documents(
         .cloned()
         .map(Expr::is_null)
         .reduce(Expr::or)
-        .expect("two documents or more");
+        .unwrap_or(datafusion::logical_expr::lit(false));
     let combined = datafusion::functions::string::expr_fn::concat(documents);
     let document =
         datafusion::logical_expr::when(absent, lit(datafusion::common::ScalarValue::Utf8(None)))
@@ -806,7 +815,7 @@ pub(crate) fn precompute_prompt_arguments(projection: Projection) -> Result<Proj
                         return Ok(Transformed::no(expr));
                     }
                     let Expr::ScalarFunction(mut call) = expr else {
-                        unreachable!()
+                        return internal_err!("an AI call is a function call");
                     };
                     let document_call = matches!(
                         call.name(),

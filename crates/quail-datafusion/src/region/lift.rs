@@ -347,8 +347,8 @@ fn take_row_tests(
             join.right = Arc::new(right);
             Ok(LogicalPlan::Join(join))
         }
-        LogicalPlan::Extension(_) if as_node::<AiNode>(&plan).is_some() => {
-            let node = as_node::<AiNode>(&plan).expect("an AiNode").clone();
+        LogicalPlan::Extension(_) if let Some(node) = as_node::<AiNode>(&plan) => {
+            let node = node.clone();
             let rows = node.semantics == Semantics::Rows;
             let below_fixed = fixed || node.fetch.is_some() || !rows;
             let input = take_row_tests(node.input.as_ref().clone(), answers, below_fixed, lifted)?;

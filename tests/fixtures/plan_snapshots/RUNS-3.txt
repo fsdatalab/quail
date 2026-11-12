@@ -1,9 +1,12 @@
 DataFusion:
-ModelRegionExec
-  FilterExec: resolved@3 = 1, projection=[id@0, patch@1, instance_id@2]
-    DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
-  FilterExec: resolved@3 = 0, projection=[id@0, patch@1, instance_id@2]
-    DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
+CooperativeExec
+  ModelRegionExec: calls=[ai_filter], tables=[issue_runs@s, issue_runs@f]
+    CoalescePartitionsExec
+      FilterExec: resolved@3 = 1, projection=[id@0, patch@1, instance_id@2]
+        DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
+    CoalescePartitionsExec
+      FilterExec: resolved@3 = 0, projection=[id@0, patch@1, instance_id@2]
+        DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
 
 model region:
 logical:

@@ -301,8 +301,7 @@ fn push_down(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
                     None
                 }
             }
-            LogicalPlan::Extension(_) if ai_join(&input).is_some() => {
-                let join = ai_join(&input).expect("an AI join");
+            LogicalPlan::Extension(_) if let Some(join) = ai_join(&input) => {
                 let sides = join_sides(&join.input);
                 let fits = sides.is_some_and(|(left, right)| {
                     moving.tables.is_subset(&left) || moving.tables.is_subset(&right)

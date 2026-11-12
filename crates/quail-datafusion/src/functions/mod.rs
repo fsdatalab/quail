@@ -63,7 +63,7 @@ enum FunctionKind {
 
 /// One Quail function: an AI function, `PROMPT`, or `HINT`.
 #[derive(Debug, PartialEq, Eq, Hash)]
-struct QuailFunction {
+pub(crate) struct QuailFunction {
     name: &'static str,
     kind: FunctionKind,
     signature: Signature,

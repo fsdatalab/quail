@@ -1,7 +1,7 @@
 DataFusion:
 SortExec: TopK(fetch=20), expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]
   CooperativeExec
-    ModelRegionExec: hint=[DynamicFilter [ empty ]]
+    ModelRegionExec: hint=[DynamicFilter [ empty ]], calls=[ai_extract, ai_filter], tables=[contracts]
 
 model region:
 logical:

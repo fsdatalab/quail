@@ -117,7 +117,7 @@ impl Executor {
         let planner = tokenizer_file
             .map(|path| Planner::new(std::path::Path::new(&path)))
             .transpose()
-            .map_err(|error| DataFusionError::Plan(format!("CompileError: {}", error.message())))?
+            .map_err(quail_datafusion::external)?
             .map(Arc::new);
         Self::with_planner(engine, planner)
     }
@@ -386,8 +386,7 @@ impl Executor {
     /// One region's operators and DataFusion plan.
     fn request(&self, region: &ModelRegion) -> Result<(Operators, LogicalPlan)> {
         let (turn, layout) = &self.prompting;
-        derive::derive_region(region, turn, layout)
-            .map_err(|error| DataFusionError::Plan(format!("CompileError: {}", error.message())))
+        derive::derive_region(region, turn, layout).map_err(quail_datafusion::external)
     }
 
     /// Plan a region in Rust, or None when Python plans it: a region that
@@ -421,9 +420,7 @@ impl Executor {
         }
         // planning reads, and tokenizes, each input's documents first
         let started = std::time::Instant::now();
-        let compile = |error: quail_planner::error::CompileError| {
-            DataFusionError::Plan(format!("CompileError: {}", error.message()))
-        };
+        let compile = |error: quail_planner::error::CompileError| quail_datafusion::external(error);
         let (outcome, scans) = planner
             .plan(&operators, tables, settings)
             .map_err(compile)?;
@@ -747,8 +744,8 @@ pub fn region_json(
     operators: &Operators,
     plan: &datafusion::logical_expr::LogicalPlan,
 ) -> Result<String> {
-    let operators = crate::planning::operators_json(operators)
-        .map_err(|error| DataFusionError::Plan(format!("CompileError: {}", error.message())))?;
+    let operators =
+        crate::planning::operators_json(operators).map_err(quail_datafusion::external)?;
     // calls a typo apart; calls that differ only in spelling are refused
     let warnings: Vec<String> = quail_datafusion::derive::similar::similar_calls(plan)
         .iter()

@@ -7,7 +7,7 @@ SortPreservingMergeExec: [flagged_steps@1 DESC NULLS LAST, run_id@0 ASC NULLS LA
           RepartitionExec: partitioning=Hash([run_id@0], 4), input_partitions=4
             AggregateExec: mode=Partial, gby=[run_id@0 as run_id], aggr=[count(Int64(1))]
               RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
-                ModelRegionExec
+                ModelRegionExec: calls=[ai_filter], tables=[wrench_steps]
 
 model region:
 logical:

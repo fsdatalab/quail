@@ -6,7 +6,7 @@
 //! let state = SessionStateBuilder::new().with_default_features().build();
 //! let state = QuailExtension::new(runner).register(state)?;
 //! let context = SessionContext::new_with_state(state);
-//! context.sql("SELECT r.id FROM reviews r WHERE ai_filter(prompt('Negative? {0}', r.body))")
+//! context.sql("SELECT r.id FROM reviews r WHERE AI.IF(PROMPT('Negative? {0}', r.body))")
 //! ```
 //!
 //! A host with its own `QueryPlanner` calls [`QuailExtension::register_rules`]
@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use datafusion::common::Result;
+use datafusion::common::{Result, plan_err};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::context::SessionState;
 use datafusion::execution::registry::FunctionRegistry;
@@ -25,8 +25,9 @@ use datafusion::optimizer::AnalyzerRule;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_planner::ExtensionPlanner;
 
-use crate::functions::quail_functions;
+use crate::functions::{QuailFunction, quail_functions};
 use crate::region::exec::{ModelRegionPlanner, QuailQueryPlanner, RegionRunner};
+use crate::region::filter_guard::{BEFORE_RULE, GuardRegionFilters};
 use crate::rules::{logical_rules, with_quail_rules};
 use crate::{LowerAiCalls, SnowflakeRegexpLike, StructFieldAccess};
 
@@ -64,16 +65,14 @@ impl QuailExtension {
         Ok(self)
     }
 
-    /// Add Quail to `state`, with Quail's query planner.
+    /// Add Quail to `state`, with Quail's query planner in place of the
+    /// host's.
     ///
     /// # Errors
     ///
-    /// A Quail function's name is taken by one `state` cannot replace.
+    /// The host has its own function under one of Quail's names.
     pub fn register(&self, state: SessionState) -> Result<SessionState> {
-        let state = self.register_rules(state)?;
-        Ok(SessionStateBuilder::new_from_existing(state)
-            .with_query_planner(Arc::new(QuailQueryPlanner::new(Arc::clone(&self.runner))))
-            .build())
+        self.registered(state, true)
     }
 
     /// Add Quail's functions and rules to `state`, keeping its query
@@ -83,51 +82,75 @@ impl QuailExtension {
     /// `LowerAiCalls` runs first, on the plan as DataFusion's SQL planner
     /// bound it, before the host's analyzer rules such as type coercion.
     /// Quail's optimizer rules join the host's, as [`crate::rules`]
-    /// explains, unless [`Self::with_logical_rules`] names the list.
+    /// explains, unless [`Self::with_logical_rules`] names the list. The
+    /// host's session id, function rewrites, and other rules stay.
+    /// `regexp_like` gains the names `rlike` and `regexp_contains`.
     ///
     /// # Errors
     ///
-    /// A Quail function's name is taken by one `state` cannot replace.
+    /// The host has its own function under one of Quail's names.
     pub fn register_rules(&self, state: SessionState) -> Result<SessionState> {
-        let mut analyzer: Vec<Arc<dyn AnalyzerRule + Send + Sync>> = vec![Arc::new(LowerAiCalls)];
-        analyzer.extend(
-            state
-                .analyzer()
-                .rules
-                .iter()
-                .filter(|rule| rule.name() != "lower_ai_calls")
-                .cloned(),
-        );
+        self.registered(state, false)
+    }
+
+    fn registered(&self, state: SessionState, planner: bool) -> Result<SessionState> {
+        let functions = quail_functions();
+        for function in &functions {
+            if let Ok(found) = state.udf(function.name())
+                && found.inner().downcast_ref::<QuailFunction>().is_none()
+            {
+                return plan_err!(
+                    "the session already has a function named {}",
+                    function.name()
+                );
+            }
+        }
+        let first = state
+            .analyzer()
+            .rules
+            .iter()
+            .all(|rule| rule.name() != LowerAiCalls.name());
         let optimizer = match &self.rules {
             Some(names) => logical_rules(names)?,
             None => with_quail_rules(state.optimizers()),
         };
-        // the guard names the columns a region's dynamic filters may read,
-        // before DataFusion pushes those filters down
-        let guard: Arc<dyn PhysicalOptimizerRule + Send + Sync> =
-            Arc::new(crate::region::filter_guard::GuardRegionFilters);
-        let mut physical: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> = state
-            .physical_optimizers()
-            .iter()
-            .filter(|rule| rule.name() != guard.name())
-            .cloned()
-            .collect();
-        let position = physical
-            .iter()
-            .position(|rule| rule.name() == crate::region::filter_guard::BEFORE_RULE)
-            .unwrap_or(physical.len());
-        physical.insert(position, guard);
-        let mut state = SessionStateBuilder::new_from_existing(state)
-            .with_analyzer_rules(analyzer)
-            .with_optimizer_rules(optimizer)
-            .with_physical_optimizer_rules(physical)
-            .build();
-        for function in quail_functions() {
+        // a builder made from a state forgets its session id
+        let session_id = state.session_id().to_string();
+        let mut builder = SessionStateBuilder::new_from_existing(state).with_session_id(session_id);
+        if let Some(analyzer) = builder.analyzer() {
+            analyzer
+                .rules
+                .retain(|rule| rule.name() != LowerAiCalls.name());
+            analyzer.rules.insert(0, Arc::new(LowerAiCalls));
+        }
+        if let Some(found) = builder.optimizer() {
+            found.rules = optimizer;
+        }
+        if let Some(physical) = builder.physical_optimizers() {
+            let physical = &mut physical.rules;
+            // the guard names the columns a region's dynamic filters may
+            // read, before DataFusion pushes those filters down
+            let guard = Arc::new(GuardRegionFilters);
+            physical.retain(|rule| rule.name() != guard.name());
+            let position = physical
+                .iter()
+                .position(|rule| rule.name() == BEFORE_RULE)
+                .unwrap_or(physical.len());
+            physical.insert(position, guard);
+        }
+        if planner {
+            builder = builder
+                .with_query_planner(Arc::new(QuailQueryPlanner::new(Arc::clone(&self.runner))));
+        }
+        let mut state = builder.build();
+        for function in functions {
             state.register_udf(function)?;
         }
         state.register_udf(crate::functions::regexps::regexp_functions())?;
-        state.register_expr_planner(Arc::new(StructFieldAccess))?;
-        state.register_function_rewrite(Arc::new(SnowflakeRegexpLike))?;
+        if first {
+            state.register_expr_planner(Arc::new(StructFieldAccess))?;
+            state.register_function_rewrite(Arc::new(SnowflakeRegexpLike))?;
+        }
         Ok(state)
     }
 

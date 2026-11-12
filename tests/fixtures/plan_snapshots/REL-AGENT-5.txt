@@ -19,7 +19,7 @@ SortPreservingMergeExec: [n@1 DESC NULLS LAST, test_result@0 ASC NULLS LAST]
 
 {0}"), t.trace),make_array(struct(Utf8("bug fixed, tests pass"), Utf8("the reported bug no longer occurs and other tests pass")), struct(Utf8("bug still occurs"), Utf8("the reported bug still happens")), struct(Utf8("bug fixed, other tests fail"), Utf8("the reported bug no longer occurs but other tests fail")), struct(Utf8("run errored"), Utf8("the run crashed or errored before testing anything"))))], aggr=[count(Int64(1)), count(DISTINCT t.trajectory_id)]
               RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
-                ModelRegionExec
+                ModelRegionExec: calls=[ai_classify, ai_classify], tables=[agent_traces]
 
 model region:
 logical:

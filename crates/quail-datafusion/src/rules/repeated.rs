@@ -171,7 +171,9 @@ fn expose(
             read,
         )),
         LogicalPlan::Extension(_) => {
-            let node = as_node::<AiNode>(plan).expect("an AiNode between them");
+            let Some(node) = as_node::<AiNode>(plan) else {
+                return Ok(None);
+            };
             Some((extension_node(node.with_input(exposed)?), read))
         }
         LogicalPlan::Projection(projection) => {

@@ -23,7 +23,7 @@ Instruction: answer TRUE if the agent has implemented a plausible fix that direc
 
 Instruction: answer TRUE if the agent has implemented a plausible fix that directly addresses the reported issue. Answer FALSE otherwise."), t.trace))), count(Int64(1))]
               RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
-                ModelRegionExec
+                ModelRegionExec: calls=[ai_score], tables=[agent_traces]
 
 model region:
 logical:

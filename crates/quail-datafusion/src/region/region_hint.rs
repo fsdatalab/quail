@@ -16,9 +16,10 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, RecordBatch};
+use datafusion::arrow::array::{Array, ArrayRef, RecordBatch};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::DataType;
+use datafusion::common::cast::{as_boolean_array, as_float64_array};
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column as LogicalColumn, Result};
 use datafusion::logical_expr::{Expr, LogicalPlan, Operator};
@@ -449,10 +450,7 @@ fn decide(
     let num_rows = rows.num_rows();
     if let Some(values) = input_values(test, columns, input, rows)? {
         let values = cast(&values, &DataType::Boolean)?;
-        let values = values
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .expect("a boolean array");
+        let values = as_boolean_array(&values)?;
         return Ok((0..num_rows)
             .map(|row| Truth::of((!values.is_null(row)).then(|| values.value(row))))
             .collect());
@@ -511,10 +509,7 @@ fn decide(
                 return Ok(vec![Truth::Undecided; num_rows]);
             };
             let values = cast(&values, &DataType::Float64)?;
-            let values = values
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .expect("a float array");
+            let values = as_float64_array(&values)?;
             Ok((0..num_rows)
                 .map(|row| {
                     if values.is_null(row) {

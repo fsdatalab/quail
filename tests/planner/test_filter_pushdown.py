@@ -61,8 +61,12 @@ def _rows_and_read(session, sql) -> tuple[list, set]:
 
 def _region_reads_the_filtered_table(query) -> None:
     lines = [line.strip() for line in query.explain().splitlines()]
-    region = lines.index("ModelRegionExec")
-    assert lines[region + 1].startswith("FilterExec: stars@"), lines
+    region = next(index for index, line in enumerate(lines)
+                  if line.startswith("ModelRegionExec"))
+    # DataFusion gathers the filtered table's partitions for the region
+    below = [line for line in lines[region + 1:]
+             if not line.startswith("CoalescePartitionsExec")]
+    assert below[0].startswith("FilterExec: stars@"), lines
 
 
 def test_a_filter_above_an_ai_filter_or_classification_runs_before_the_model(

@@ -2,7 +2,7 @@ DataFusion:
 GlobalLimitExec: skip=10, fetch=10
   SortExec: TopK(fetch=20), expr=[token_count@1 ASC NULLS LAST, id@0 ASC NULLS LAST], preserve_partitioning=[false]
     CooperativeExec
-      ModelRegionExec: hint=[DynamicFilter [ empty ]]
+      ModelRegionExec: hint=[DynamicFilter [ empty ]], calls=[ai_filter], tables=[agent_traces]
 
 model region:
 logical:

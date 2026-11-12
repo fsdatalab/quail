@@ -138,7 +138,7 @@ pub(super) fn precompute_plain_expressions(plan: LogicalPlan) -> Result<LogicalP
                 Ok(found.data)
             })
             .collect::<Result<Vec<_>>>()?;
-        let joined = conjunction(terms).expect("a term");
+        let joined = conjunction(terms).unwrap_or(datafusion::logical_expr::lit(true));
         Ok(if changed {
             Transformed::yes(joined)
         } else {

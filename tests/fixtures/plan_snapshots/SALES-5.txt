@@ -1,8 +1,10 @@
 DataFusion:
 SortExec: TopK(fetch=25), expr=[commit_score@1 DESC NULLS LAST, id@0 ASC NULLS LAST], preserve_partitioning=[false]
-  ModelRegionExec: hint=[DynamicFilter [ empty ]]
-    FilterExec: deal_stage@1 = Negotiation, projection=[id@0, transcript@2]
-      DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
+  CooperativeExec
+    ModelRegionExec: hint=[DynamicFilter [ empty ]], calls=[ai_score], tables=[sales_calls@c]
+      CoalescePartitionsExec
+        FilterExec: deal_stage@1 = Negotiation, projection=[id@0, transcript@2]
+          DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
 
 model region:
 logical:

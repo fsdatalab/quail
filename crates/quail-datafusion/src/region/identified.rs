@@ -7,8 +7,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
-use datafusion::common::{Constraints, Result};
+use datafusion::common::{Constraints, Result, Statistics};
 use datafusion::datasource::{TableProvider, TableType};
+use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, LogicalPlan, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 
@@ -65,8 +66,29 @@ impl TableProvider for IdentifiedTable {
         self.inner.table_type()
     }
 
+    fn get_table_definition(&self) -> Option<&str> {
+        self.inner.get_table_definition()
+    }
+
     fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
         self.inner.get_logical_plan()
+    }
+
+    fn get_column_default(&self, column: &str) -> Option<&Expr> {
+        self.inner.get_column_default(column)
+    }
+
+    fn statistics(&self) -> Option<Statistics> {
+        self.inner.statistics()
+    }
+
+    async fn insert_into(
+        &self,
+        state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: InsertOp,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.inner.insert_into(state, input, insert_op).await
     }
 
     async fn scan(

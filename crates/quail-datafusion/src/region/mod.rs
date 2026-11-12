@@ -20,6 +20,7 @@ pub mod region_hint;
 pub(crate) mod shared;
 mod unread;
 
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use std::collections::HashSet;
 use std::fmt;
 
@@ -60,6 +61,28 @@ impl ModelRegion {
     }
 }
 
+impl ModelRegion {
+    /// The region's AI calls and the tables it reads, for EXPLAIN:
+    /// `calls=[ai_filter], tables=[reviews]`.
+    pub fn summary(&self) -> String {
+        let (mut calls, mut tables) = (Vec::new(), Vec::new());
+        let _ = self.plan.apply(|node| {
+            if let Some(found) = crate::extension::as_node::<crate::ai::AiNode>(node) {
+                calls.extend(crate::functions::function_name(&found.call).map(str::to_string));
+            }
+            if let LogicalPlan::TableScan(scan) = node {
+                tables.push(scan.table_name.to_string());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        format!(
+            "calls=[{}], tables=[{}]",
+            calls.join(", "),
+            tables.join(", ")
+        )
+    }
+}
+
 impl UserDefinedLogicalNodeCore for ModelRegion {
     fn name(&self) -> &str {
         "ModelRegion"
@@ -89,7 +112,7 @@ impl UserDefinedLogicalNodeCore for ModelRegion {
 
     fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
         // Quail's explain shows the region's plan
-        write!(f, "ModelRegion")
+        write!(f, "ModelRegion: {}", self.summary())
     }
 
     fn with_exprs_and_inputs(&self, exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> Result<Self> {

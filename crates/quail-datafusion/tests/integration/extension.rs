@@ -107,6 +107,47 @@ impl QueryPlanner for HostPlanner {
     }
 }
 
+/// A host's own function rewrite, which changes nothing.
+#[derive(Debug)]
+struct HostRewrite;
+
+impl datafusion::logical_expr::expr_rewriter::FunctionRewrite for HostRewrite {
+    fn name(&self) -> &str {
+        "host_rewrite"
+    }
+
+    fn rewrite(
+        &self,
+        expr: datafusion::logical_expr::Expr,
+        _schema: &datafusion::common::DFSchema,
+        _config: &datafusion::config::ConfigOptions,
+    ) -> Result<datafusion::common::tree_node::Transformed<datafusion::logical_expr::Expr>> {
+        Ok(datafusion::common::tree_node::Transformed::no(expr))
+    }
+}
+
+#[test]
+fn adding_quail_keeps_the_hosts_session_id_and_function_rewrites() -> Result<()> {
+    use datafusion::execution::FunctionRegistry;
+    let mut host = SessionStateBuilder::new()
+        .with_default_features()
+        .with_session_id("host".to_string())
+        .build();
+    host.register_function_rewrite(Arc::new(HostRewrite))?;
+    let extension = QuailExtension::new(Arc::new(KeepsFirstReview));
+    // adding Quail twice adds each of its hooks once
+    let state = extension.register(extension.register(host)?)?;
+    assert_eq!(state.session_id(), "host");
+    let rewrites: Vec<&str> = state
+        .analyzer()
+        .function_rewrites
+        .iter()
+        .map(|rewrite| rewrite.name())
+        .collect();
+    assert_eq!(rewrites, ["host_rewrite", "snowflake_regexp_like"]);
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_host_with_its_own_query_planner_claims_regions_and_adds_quails_planner() -> Result<()> {
     let quail = QuailExtension::new(Arc::new(KeepsFirstReview));

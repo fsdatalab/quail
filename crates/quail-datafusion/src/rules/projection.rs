@@ -42,7 +42,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::common::{DFSchema, Result};
+use datafusion::common::{DFSchema, Result, internal_err};
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{
     Expr, ExprSchemable, LogicalPlan, Projection, UserDefinedLogicalNodeCore,
@@ -369,11 +369,8 @@ impl Reads<'_> {
 /// `AiNode`, an extraction's spans call of the same arguments included,
 /// and each node that makes `new` adding the columns of its types.
 pub(crate) fn replace_call(plan: LogicalPlan, old: &Expr, new: &Expr) -> Result<LogicalPlan> {
-    let Expr::ScalarFunction(old) = old else {
-        unreachable!("an AI call")
-    };
-    let Expr::ScalarFunction(new) = new else {
-        unreachable!("an AI call")
+    let (Expr::ScalarFunction(old), Expr::ScalarFunction(new)) = (old, new) else {
+        return internal_err!("an AI call is a function call");
     };
     let extraction = old.name() == "ai_extract";
     let rewrite = |expr: Expr| -> Result<Expr> {

@@ -1,7 +1,9 @@
 DataFusion:
-ModelRegionExec
-  FilterExec: role@1 = user, projection=[id@0, content@2]
-    DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
+CooperativeExec
+  ModelRegionExec: calls=[ai_filter], tables=[support_messages@u]
+    CoalescePartitionsExec
+      FilterExec: role@1 = user, projection=[id@0, content@2]
+        DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
 
 model region:
 logical:
