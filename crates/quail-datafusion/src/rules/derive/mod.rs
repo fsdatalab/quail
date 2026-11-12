@@ -7,41 +7,34 @@
 //! The rule gives each node what it can use of that, so the executor
 //! skips the rest:
 //!
-//! - **filters.** A term `q` of a `Filter` that reads a node's answer
-//!   becomes the node's filter when the node can decide it
-//!   ([`AiNode::accepts_test`]), `σ_q(AI(R; p)) ⇒ AI(R; p ∧ q)`, and
-//!   leaves the `Filter`. A term the node cannot decide stays, and
-//!   DataFusion runs it on the answers.
-//! - **fetch.** A `LIMIT` of `k` rows after an `OFFSET` of `m` becomes
-//!   the fetch `k + m` of the node whose rows it reads,
-//!   `Limit_k(AI(R; n)) ⇒ AI(R; n = min(k, n))`, and stays when it has
-//!   an offset.
+//! - **filters.** A test of a node's answer that the node can decide
+//!   ([`AiNode::accepts_test`]) becomes its filter,
+//!   `σ_q(AI(R; p)) ⇒ AI(R; p ∧ q)`, and leaves the `Filter`.
+//! - **fetch.** How many rows are enough: a `LIMIT`, one row of each
+//!   key of a `DISTINCT` or a semi-join, or `k` of each group under
+//!   `HAVING COUNT(*) >= k`, `Limit_k(AI(R; n)) ⇒ AI(R; n = min(k, n))`.
+//! - **guard.** Where a column node's answer is read: a `CASE` reads a
+//!   branch only where its condition holds.
 //! - **projection.** An `AI.IF` node whose answer only its own filter
 //!   reads returns no column, and a read of the answer above `σ_b` is
 //!   the constant the filter keeps.
 //!
-//! A term or a limit reaches its node through the operators between
-//! them that return the same rows: a SELECT list, a derived table's
-//! alias, another `Filter`, another `AiNode` of rows without a fetch,
-//! and, for a term, an inner join's side or an outer join's preserved
-//! side. A node with a fetch takes no new filter and lets none pass
-//! below it: limiting rows before a test is not limiting them after.
-//! A limit stops at any operator that can change how many rows there
-//! are, at a node that does not accept a fetch
-//! ([`AiNode::accepts_fetch`]), and at a node with a per-key fetch.
+//! The first three come from one pass down the plan ([`demand`]): each
+//! operator says what the plan above needs of its input's rows, so a
+//! need reaches a node through any operators that pass it on. The
+//! projection steps, the guard of an `AI.IF` in an OR
+//! ([`super::or_guards`]), and the substring precheck
+//! ([`super::substring`]) follow it.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
 use datafusion::common::Result;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::expr_rewriter::NamePreserver;
-use datafusion::logical_expr::utils::{conjunction, split_conjunction};
-use datafusion::logical_expr::{Expr, Filter, JoinType, LogicalPlan, lit};
+use datafusion::logical_expr::{Expr, LogicalPlan, lit};
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
-use super::repeated::{through_alias, through_projection};
-
+mod demand;
 mod fetch;
 use crate::ai::{AiNode, Semantics};
 use crate::extension::{as_node, extension_node};
@@ -102,28 +95,20 @@ impl Derive {
     }
 }
 
-/// A step of the rule: the option it derives and its rewrite.
+/// A step of the rule after the demand pass: the option it derives and
+/// its rewrite.
 type Step = (
     DeriveOption,
     fn(LogicalPlan) -> Result<Transformed<LogicalPlan>>,
 );
 
-/// The steps in the order they run. A later step reads what an earlier
-/// one set: a fetch follows the filters, and a guard follows both.
-const STEPS: [Step; 9] = [
-    // a subquery's filters reach its nodes where the query wrote them,
-    // before DataFusion makes the subquery a join
-    (DeriveOption::Filters, |plan| {
-        plan.transform_up_with_subqueries(filter_down)
-    }),
+/// The steps after the demand pass, in the order they run. A later step
+/// reads what an earlier one set: a guard follows the filters.
+const STEPS: [Step; 4] = [
     (DeriveOption::Projection, drop_unread_answers),
-    (DeriveOption::Fetch, fetch::distinct_fetches),
-    (DeriveOption::Fetch, fetch::limit_fetches),
     (DeriveOption::Projection, super::projection::projections),
-    (DeriveOption::Guard, super::guards::case_guards),
     (DeriveOption::Guard, super::or_guards::or_guards),
     (DeriveOption::Filters, super::substring::substring_prechecks),
-    (DeriveOption::Fetch, fetch::key_fetches),
 ];
 
 impl OptimizerRule for Derive {
@@ -139,8 +124,15 @@ impl OptimizerRule for Derive {
         plan: LogicalPlan,
         _config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
-        let mut plan = plan;
-        let mut changed = false;
+        let wants = |option: DeriveOption| self.only.is_none_or(|only| only == option);
+        let options = demand::Options {
+            filters: wants(DeriveOption::Filters),
+            fetch: wants(DeriveOption::Fetch),
+            guard: wants(DeriveOption::Guard),
+        };
+        let done = demand::demand_pass(plan, options)?;
+        let mut changed = done.transformed;
+        let mut plan = done.data;
         for (option, step) in STEPS {
             if self.only.is_none_or(|only| only == option) {
                 let done = step(plan)?;
@@ -149,106 +141,6 @@ impl OptimizerRule for Derive {
             }
         }
         Ok(Transformed::new_transformed(plan, changed))
-    }
-}
-
-/// Offer each term of a `Filter` to the `AiNode`s below it.
-fn filter_down(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
-    let LogicalPlan::Filter(filter) = &plan else {
-        return Ok(Transformed::no(plan));
-    };
-    let mut input = filter.input.as_ref().clone();
-    let mut kept = Vec::new();
-    for term in split_conjunction(&filter.predicate) {
-        match offer(&input, term)? {
-            Some(below) => input = below,
-            None => kept.push(term.clone()),
-        }
-    }
-    if input == *filter.input {
-        return Ok(Transformed::no(plan));
-    }
-    Ok(Transformed::yes(match conjunction(kept) {
-        Some(predicate) => LogicalPlan::Filter(Filter::try_new(predicate, Arc::new(input))?),
-        None => input,
-    }))
-}
-
-/// `plan` with `term`, a test of its rows, as the filter of the `AiNode`
-/// whose answer the term reads; None when no node takes it.
-fn offer(plan: &LogicalPlan, term: &Expr) -> Result<Option<LogicalPlan>> {
-    let below = |input: &LogicalPlan, term: &Expr| -> Result<Option<LogicalPlan>> {
-        match offer(input, term)? {
-            Some(input) => Ok(Some(crate::extension::with_inputs(plan, vec![input])?)),
-            None => Ok(None),
-        }
-    };
-    match plan {
-        LogicalPlan::Extension(_) => {
-            let Some(node) = as_node::<AiNode>(plan) else {
-                return Ok(None);
-            };
-            if node.fetch.is_some() || node.semantics != Semantics::Rows {
-                return Ok(None);
-            }
-            let columns = term.column_refs();
-            if !columns
-                .iter()
-                .any(|column| column.relation.is_none() && node.is_field(&column.name))
-            {
-                return below(&node.input, term);
-            }
-            let returned: BTreeSet<String> = node
-                .returned_fields()
-                .iter()
-                .map(|field| field.name().clone())
-                .collect();
-            let reads_returned = columns
-                .iter()
-                .any(|column| column.relation.is_none() && returned.contains(&column.name));
-            if !(reads_returned && node.accepts_test(term)) {
-                return Ok(None);
-            }
-            let mut taking = node.clone();
-            taking.filter = conjunction(taking.filter.take().into_iter().chain([term.clone()]));
-            Ok(Some(extension_node(taking.checked()?)))
-        }
-        LogicalPlan::Projection(projection) => match through_projection(term, projection) {
-            Some(term) => below(&projection.input, &term),
-            None => Ok(None),
-        },
-        LogicalPlan::SubqueryAlias(alias) => match through_alias(term, alias) {
-            Some(term) => below(&alias.input, &term),
-            None => Ok(None),
-        },
-        LogicalPlan::Filter(filter) => below(&filter.input, term),
-        LogicalPlan::Join(join) => {
-            let (keeps_left, keeps_right) = match join.join_type {
-                JoinType::Inner => (true, true),
-                JoinType::Left => (true, false),
-                JoinType::Right => (false, true),
-                _ => (false, false),
-            };
-            let columns = term.column_refs();
-            let within = |side: &LogicalPlan| {
-                columns
-                    .iter()
-                    .all(|column| side.schema().has_column(column))
-            };
-            let (left, right) = (join.left.as_ref(), join.right.as_ref());
-            let inputs = if keeps_left && within(left) {
-                offer(left, term)?.map(|left| vec![left, right.clone()])
-            } else if keeps_right && within(right) {
-                offer(right, term)?.map(|right| vec![left.clone(), right])
-            } else {
-                None
-            };
-            match inputs {
-                Some(inputs) => Ok(Some(crate::extension::with_inputs(plan, inputs)?)),
-                None => Ok(None),
-            }
-        }
-        _ => Ok(None),
     }
 }
 
