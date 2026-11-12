@@ -239,7 +239,6 @@ class JoinOperator(ModelOperator):
                     gpu_s=gpu_seconds(own_spans),
                     chunks=len(own_spans),
                     extension={
-                        "answers": [rows],
                         **({"borrowed_prefix_tokens": stats["borrowed_tokens"]}
                            if j == 0 and stats.get("borrowed_tokens") else {}),
                         **({"pack_s": round(stats["pack_s"], 3)}

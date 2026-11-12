@@ -6,6 +6,7 @@
 mod budgets;
 mod cost;
 mod physical;
+mod workers;
 
 use std::io::Cursor;
 
@@ -1110,158 +1111,6 @@ fn region_stages(graph: &str, gpus: usize) -> PyResult<String> {
     serde_json::to_string(&cut).map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
-/// Decode the coordinator's inputs before starting any GPU listeners.
-#[pyfunction]
-fn validate_stages(
-    graph: &str,
-    stages: &str,
-    groupings: std::collections::HashMap<String, Vec<Vec<i64>>>,
-) -> PyResult<()> {
-    let graph: quail_planner::physical::PhysicalGraph = from_json(graph)?;
-    let _: Vec<quail_planner::stages::Stage> = from_json(stages)?;
-    quail_planner::physical::validate_graph(&graph.nodes, &graph.root)
-        .map_err(PyValueError::new_err)?;
-    // Extraction above checks the group keys and document ids as well.
-    drop(groupings);
-    Ok(())
-}
-
-/// Run a region's stages on GPU servers, as `crate::stages::run_stages`
-/// runs them.
-///
-/// `graph` is the region's compute graph as JSON; `stages` is the plan's
-/// `stages` setting as JSON; `groupings` gives, by alias, lists of each
-/// document's group, for a table hashed by a key other than its ids;
-/// `servers` names each GPU's Unix socket; `report(table)` takes each
-/// finished table as a pyarrow Table over the pages the GPU's server
-/// shared; `ask(question)` takes a server's question as JSON and
-/// returns its answer, as JSON or a pyarrow Table.
-#[pyfunction]
-fn run_stages(
-    py: Python<'_>,
-    graph: &str,
-    stages: &str,
-    groupings: std::collections::HashMap<String, Vec<Vec<i64>>>,
-    servers: Vec<std::path::PathBuf>,
-    report: Py<PyAny>,
-    ask: Py<PyAny>,
-) -> PyResult<()> {
-    let graph: quail_planner::physical::PhysicalGraph = from_json(graph)?;
-    let cut: Vec<quail_planner::stages::Stage> = from_json(stages)?;
-    let external = |error: PyErr| DataFusionError::External(Box::new(error));
-    let region = crate::stages::Region {
-        report: Box::new(move |(schema, batches)| {
-            Python::attach(|py| {
-                report.call1(py, (to_pyarrow(py, schema, batches)?,))?;
-                Ok::<_, PyErr>(())
-            })
-            .map_err(external)
-        }),
-        ask: Box::new(move |question| {
-            Python::attach(|py| {
-                let answer = ask.call1(py, (question.to_string(),))?;
-                answer_from_python(answer.bind(py))
-            })
-            .map_err(external)
-        }),
-    };
-    py.detach(|| crate::stages::run_stages(&graph, cut, groupings, &servers, region))
-        .map_err(python_error)
-}
-
-/// A Python answer to a stage server's question: JSON text, or a
-/// pyarrow Table read over the same buffers.
-fn answer_from_python(answer: &Bound<'_, PyAny>) -> PyResult<crate::stages::Answer> {
-    if let Ok(text) = answer.extract::<String>() {
-        return Ok(crate::stages::Answer::Json(from_json(&text)?));
-    }
-    Ok(crate::stages::Answer::Table(table_from_python(answer)?))
-}
-
-fn table_from_python(value: &Bound<'_, PyAny>) -> PyResult<crate::stages::Table> {
-    let reader = crate::pyarrow::stream_from_pyarrow(value)?;
-    let schema = datafusion::arrow::array::RecordBatchReader::schema(&reader);
-    let batches = reader
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|error| python_error(error.into()))?;
-    Ok((schema, batches))
-}
-
-/// One GPU's server end of a region's stages, as
-/// `crate::stages::StageListener`: it listens at `path` once made.
-#[pyclass(name = "StageServer", module = "_quail_native")]
-struct StageServer {
-    listener: crate::stages::StageListener,
-}
-
-#[pymethods]
-impl StageServer {
-    #[new]
-    fn new(path: std::path::PathBuf) -> PyResult<Self> {
-        let listener = crate::stages::StageListener::bind(&path).map_err(python_error)?;
-        Ok(StageServer { listener })
-    }
-
-    /// The next stage and its inputs' rows as pyarrow Tables, or None
-    /// once the region ended.
-    #[allow(clippy::type_complexity)]
-    fn next_stage<'py>(
-        &mut self,
-        py: Python<'py>,
-    ) -> PyResult<Option<(usize, Vec<Bound<'py, PyAny>>)>> {
-        let listener = &mut self.listener;
-        let Some((stage, inputs)) = py.detach(|| listener.next_stage()).map_err(python_error)?
-        else {
-            return Ok(None);
-        };
-        let tables = inputs
-            .into_iter()
-            .map(|(schema, batches)| to_pyarrow(py, schema, batches))
-            .collect::<PyResult<Vec<_>>>()?;
-        Ok(Some((stage, tables)))
-    }
-
-    /// Send a stage's output tables, which ends the stage.
-    fn reply(&mut self, py: Python<'_>, outputs: Vec<Bound<'_, PyAny>>) -> PyResult<()> {
-        let outputs = outputs
-            .iter()
-            .map(table_from_python)
-            .collect::<PyResult<Vec<_>>>()?;
-        let listener = &mut self.listener;
-        py.detach(|| listener.reply(&outputs)).map_err(python_error)
-    }
-
-    /// Send a table the running stage finished.
-    fn finished(&mut self, py: Python<'_>, table: &Bound<'_, PyAny>) -> PyResult<()> {
-        let table = table_from_python(table)?;
-        let listener = &mut self.listener;
-        py.detach(|| listener.finished(&table))
-            .map_err(python_error)
-    }
-
-    /// Ask the region a question, as JSON, while a stage runs; returns
-    /// its answer as JSON text or a pyarrow Table.
-    fn ask<'py>(&mut self, py: Python<'py>, question: &str) -> PyResult<Bound<'py, PyAny>> {
-        let question: serde_json::Value = from_json(question)?;
-        let listener = &mut self.listener;
-        match py
-            .detach(|| listener.ask(&question))
-            .map_err(python_error)?
-        {
-            crate::stages::Answer::Json(value) => {
-                Ok(pyo3::types::PyString::new(py, &value.to_string()).into_any())
-            }
-            crate::stages::Answer::Table((schema, batches)) => to_pyarrow(py, schema, batches),
-        }
-    }
-
-    /// Send why a stage failed.
-    fn fail(&mut self, py: Python<'_>, error: &str) -> PyResult<()> {
-        let listener = &mut self.listener;
-        py.detach(|| listener.fail(error)).map_err(python_error)
-    }
-}
-
 /// The `_quail_native` module. A Rust program that embeds Python adds it
 /// with `pyo3::append_to_inittab!` before Python starts.
 #[pymodule]
@@ -1278,7 +1127,7 @@ pub fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PrefixIndex>()?;
     module.add_class::<NativePlanner>()?;
     module.add_class::<NativeFinishedRows>()?;
-    module.add_class::<StageServer>()?;
+    workers::register(module)?;
     module.add_class::<cost::CostModel>()?;
     budgets::register(module)?;
     module.add_function(wrap_pyfunction!(explain_plan, module)?)?;
@@ -1313,8 +1162,6 @@ pub fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(limited_operators, module)?)?;
     module.add_function(wrap_pyfunction!(execution_report, module)?)?;
     module.add_function(wrap_pyfunction!(region_stages, module)?)?;
-    module.add_function(wrap_pyfunction!(validate_stages, module)?)?;
-    module.add_function(wrap_pyfunction!(run_stages, module)?)?;
     module.add_function(wrap_pyfunction!(read_and_write_plan, module)?)
 }
 

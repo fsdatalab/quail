@@ -71,7 +71,7 @@ pub struct ScanInputs {
     /// The token store of the scan's document column.
     pub tokens: Arc<TokenStore>,
     /// The value columns, in the scan's order, over the rows' buffers.
-    pub columns: crate::stages::Table,
+    pub columns: crate::shared::Table,
 }
 
 /// A planned region as JSON, and what its scans read.
@@ -415,7 +415,7 @@ impl Planner {
 }
 
 /// The columns `names` of the rows, over the rows' buffers.
-fn value_columns(names: &[String], rows: &TableRows) -> Result<crate::stages::Table, CompileError> {
+fn value_columns(names: &[String], rows: &TableRows) -> Result<crate::shared::Table, CompileError> {
     let missing = |name: &String| CompileError::new(format!("no column {name}"));
     let indices = names
         .iter()
@@ -442,10 +442,10 @@ fn value_columns(names: &[String], rows: &TableRows) -> Result<crate::stages::Ta
 /// `columns` with the [`NULL_DOCUMENT`] column, when a document of the
 /// scan is NULL: the executor asks the model about no such row.
 fn with_null_documents(
-    columns: crate::stages::Table,
+    columns: crate::shared::Table,
     column: &ScanColumn,
     rows: &TableRows,
-) -> Result<crate::stages::Table, CompileError> {
+) -> Result<crate::shared::Table, CompileError> {
     let built = match column {
         ScanColumn::Expression(expression) => Some(PhysicalValue::new(expression)?),
         ScanColumn::Unnamed(_) => None,

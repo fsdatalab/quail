@@ -85,9 +85,8 @@ def fever_oracle(capacity, empty):
 def fever_executor(session, monkeypatch, gpus, check=None, capacity=1,
                    empty=False):
     """Return a physical executor that runs the FEVER fakes on one or two GPUs."""
-    from helpers.fakes import thread_servers
+    from helpers.fakes import run_on_threads
 
-    from quail.backends.quail.graph import execute_staged_graph
     from quail.specs import H100_SXM
 
     def execute(request):
@@ -112,8 +111,7 @@ def fever_executor(session, monkeypatch, gpus, check=None, capacity=1,
             states.append(state)
         payload = {**request.plan["settings"], **extra,
                    "columns": request.column_tables()}
-        report = execute_staged_graph(
-            payload, graph, gpus, thread_servers(states, payload, graph), H100_SXM)
+        report = run_on_threads(states, payload, graph, H100_SXM)
         assert all(not state["gpu"].arena.accounting.owned for state in states)
         for node in graph.nodes:
             if isinstance(node, AiJoin):

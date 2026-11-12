@@ -122,6 +122,7 @@ def _locate_chunk(index, length, ends) -> tuple[int, int]:
 class ArrowTokenDocuments(Sequence):
     def __init__(self, array, character_offsets=None):
         self._array = array
+        self.character_offsets = character_offsets
         self._chunks = tuple(array.chunks) if hasattr(array, "chunks") \
             else (array,)
         self._ends = []
@@ -224,6 +225,11 @@ class TokenStore(Sequence):
 
     def __reduce__(self):
         return TokenStore, (self._table,)
+
+    @property
+    def table(self) -> pa.Table:
+        """Return the store's columns, over the buffers Rust built."""
+        return self._table
 
     @property
     def lengths(self) -> TokenLengths:
@@ -350,9 +356,29 @@ def decode_token_documents(value):
     return value
 
 
-def decode_payload_documents(documents):
-    return {alias: decode_token_documents(value)
-            for alias, value in documents.items()}
+def token_table(documents) -> pa.Table:
+    """Return token documents as a table another process can read.
+
+    ``documents_from_table`` reads the documents back over the table's
+    buffers.
+    """
+    if isinstance(documents, TokenStore):
+        return documents.table
+    if isinstance(documents, ArrowTokenDocuments):
+        columns = {"tokens": documents._array}
+        if documents.character_offsets is not None:
+            columns["offsets"] = documents.character_offsets
+        return pa.table(columns)
+    return _token_lists(documents)
+
+
+def documents_from_table(table: pa.Table):
+    """Return the token documents ``token_table`` wrote."""
+    if TokenStore._token_column in table.column_names:
+        return TokenStore(table)
+    return ArrowTokenDocuments(
+        table.column("tokens"),
+        table.column("offsets") if "offsets" in table.column_names else None)
 
 
 def _token_array(document):

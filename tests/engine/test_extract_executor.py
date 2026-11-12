@@ -20,7 +20,7 @@ from helpers.extract_fakes import (
     make_spec as make_extract_spec,
 )
 from helpers.extract_reference import AnswerState, Decoder
-from helpers.fakes import fake_pipeline, fake_readout, run_graph, thread_servers
+from helpers.fakes import fake_pipeline, fake_readout, run_graph, run_on_threads
 from helpers.kv_checker import Setup, make_arena
 from test_kv_reads import named
 from test_map_decode import cpu_staging, events_torch
@@ -33,7 +33,6 @@ from quail.backends.quail.executor.operators import operator_types
 from quail.backends.quail.executor.operators.extract import ExtractOperator
 from quail.backends.quail.executor.region import RegionExecution
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
-from quail.backends.quail.graph import execute_staged_graph
 from quail.backends.quail.worker import _execution_state
 from quail.builtins import built_in_registry
 from quail.physical import (
@@ -500,9 +499,7 @@ def test_extractions_on_several_gpus_keep_spans_and_free_kv(monkeypatch, gpus):
         "stages": json.loads(_quail_native.region_stages(graph.to_json(), gpus)),
     }
     states = [_execution_state(gpu, payload, registry) for gpu in gpu_states]
-    result = execute_staged_graph(payload, graph, gpus,
-                                  thread_servers(states, payload, graph),
-                                  DEVICES["h100-sxm"])
+    result = run_on_threads(states, payload, graph, DEVICES["h100-sxm"])
     for node in nodes[1:]:
         actual = result["_outputs"][PortRef(node.node_id, "rows:c")].sort_by("c")
         assert actual.equals(expected[node.node_id].outputs["rows:c"].table())

@@ -2,19 +2,16 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
-import os
-import tempfile
 import time
 
-import _quail_native
 import pyarrow as pa
 
 from quail.backends.quail.executor.memory import memory_report, merge_memory_reports
 from quail.backends.quail.executor.operators.filter import stop_keys
 from quail.backends.quail.retention import apply_retention
 from quail.common.pairs import FIRST_DOCUMENT, columns_key
+from quail.common.tokens import documents_from_table, token_table
 from quail.execution.finished import finished_rows, hinted_tables, region_hint
 from quail.execution.metrics import NodeResult, scalar_node_metrics
 from quail.execution.runner import (
@@ -25,6 +22,9 @@ from quail.execution.stages import (
     answer_hint,
     merged_run,
     payload_first_rows,
+    plain,
+    ran_from_message,
+    ran_message,
     serve_stages,
 )
 from quail.execution.types import export_physical_outputs
@@ -142,29 +142,56 @@ def execution_measurements(context: ExecutionContext) -> dict:
     }
 
 
-def serve_region(state, payload, graph: PhysicalGraph, server, wanted,
-                 hinted: dict | None = None) -> dict:
-    """Serve a region's stages on one GPU until the region ends.
+# the tables of a runtime payload, each a mapping from alias
+_PAYLOAD_TABLES = ("documents", "texts", "columns")
+
+
+def region_tables(payload: dict) -> list:
+    """Return a payload's documents, texts, and columns as named tables.
+
+    A worker reads them over the same pages, by the names
+    ``payload_tables`` reads.
+    """
+    tables = []
+    for alias, documents in payload.get("documents", {}).items():
+        tables.append((f"documents:{alias}", token_table(documents)))
+    for alias, texts in payload.get("texts", {}).items():
+        tables.append((f"texts:{alias}", pa.table({"text": texts})))
+    for alias, columns in payload.get("columns", {}).items():
+        tables.append((f"columns:{alias}", columns))
+    return tables
+
+
+def payload_tables(tables: dict) -> dict:
+    """Return the documents, texts, and columns of ``region_tables``' tables."""
+    payload = {name: {} for name in _PAYLOAD_TABLES}
+    for name, table in tables.items():
+        kind, alias = name.split(":", 1)
+        payload[kind][alias] = (
+            documents_from_table(table) if kind == "documents"
+            else table.column("text") if kind == "texts" else table)
+    return payload
+
+
+def serve_region(state, payload, graph: PhysicalGraph, end, wanted,
+                 hinted: dict | None = None) -> None:
+    """Serve a begun region's stages on one GPU, then say what the GPU ran.
 
     Args:
         state: The GPU executor's state for the query.
         payload: The query's runtime payload.
         graph: The region's graph.
-        server: The ``StageServer`` listening for the region's stages.
+        end: The worker's ``WorkerEnd``, which has read the region.
         wanted: The (node, port) pairs the region's FinishedRows reads.
         hinted: Each scan alias's table name, for the tables the
             region's hint holds rows of.
-
-    Returns:
-        The results of each node the GPU ran under "results", beside the
-        GPU's KV counters and memory report.
     """
     context = execution_context(state, payload, graph)
     torch, arena = state["gpu"].torch, state["gpu"].arena
     try:
         with torch.inference_mode():
             results = serve_stages(
-                server, context, compute_subgraph(graph), payload["stages"],
+                end, context, compute_subgraph(graph), payload["stages"],
                 wanted, hinted, payload_first_rows(payload) if hinted else None)
         torch.cuda.synchronize()
         # execute_staged_graph times the region, so the files fall inside it
@@ -172,12 +199,12 @@ def serve_region(state, payload, graph: PhysicalGraph, server, wanted,
     finally:
         for key in arena.resident_keys():
             arena.free_key(key)
-    return {"results": results, **execution_measurements(context)}
+    end.ran(*ran_message(results, execution_measurements(context)))
 
 
-def execute_staged_graph(payload, graph: PhysicalGraph, gpus: int, serve,
+def execute_staged_graph(payload, graph: PhysicalGraph, gpus: int, workers,
                          device) -> dict:
-    """Run a region's stages on one server per GPU and report the run.
+    """Run a region's stages on one worker per GPU and report the run.
 
     Each row a stage finishes goes to the region's FinishedRows, when
     the region reports to one.
@@ -186,14 +213,8 @@ def execute_staged_graph(payload, graph: PhysicalGraph, gpus: int, serve,
         payload: The query's runtime payload, with the plan's stages
             under "stages".
         graph: The region's graph.
-        gpus: How many GPUs, one server each.
-        serve: Callable(paths, wanted, hinted) that starts a server
-            listening at each socket path and returns an owned handle.
-            Its ``finish`` waits for each server's result; ``abort``
-            stops every server without waiting indefinitely for a
-            coordinator connection. wanted lists the (node, port) pairs
-            FinishedRows reads; hinted gives each scan alias's table
-            name, for the tables the region's hint holds rows of.
+        gpus: How many GPUs, one worker each.
+        workers: The GPUs' ``_quail_native.Workers``.
         device: The GPUs' device spec.
     """
     compute = compute_subgraph(graph)
@@ -207,7 +228,7 @@ def execute_staged_graph(payload, graph: PhysicalGraph, gpus: int, serve,
         if rows is not None:
             rows.report(table)
 
-    # the servers' threads ask; the hint and the sinks are this thread's
+    # the workers' threads ask; the hint and the sinks are this thread's
     hint, sinks = region_hint(), (progress_sink(), answer_sink())
 
     def ask(question: str):
@@ -219,29 +240,19 @@ def execute_staged_graph(payload, graph: PhysicalGraph, gpus: int, serve,
                 sink(*found[name])
         return "null"
 
-    # No listener exists until Python preparation and native decoding succeed.
-    graph_json = compute.to_json()
-    stages_json = json.dumps(payload["stages"])
-    groupings = stage_groupings(graph, payload)
-    _quail_native.validate_stages(graph_json, stages_json, groupings)
+    region = json.dumps({
+        "query": {name: value for name, value in payload.items()
+                  if name not in _PAYLOAD_TABLES},
+        "wanted": wanted, "hinted": hinted_tables(),
+        "listening": [sink is not None for sink in sinks],
+    }, default=plain)
     started = time.perf_counter()
-    # the tables the stages share are files beside the sockets; in
-    # /dev/shm a file is memory only
-    memory = "/dev/shm" if os.path.isdir("/dev/shm") else None
-    with tempfile.TemporaryDirectory(dir=memory, prefix="quail-") as directory:
-        paths = [os.path.join(directory, f"gpu{index}.sock") for index in range(gpus)]
-        servers = serve(paths, wanted, hinted_tables())
-        try:
-            _quail_native.run_stages(graph_json, stages_json, groupings, paths,
-                                     report, ask)
-            outputs = servers.finish()
-        except BaseException:
-            # A listener may never have received its coordinator connection.
-            # Receiving its result here would wait forever in accept().
-            with contextlib.suppress(BaseException):
-                servers.abort()
-            raise
+    ran = workers.run_region(
+        region, region_tables(payload), compute.to_json(),
+        json.dumps(payload["stages"]), stage_groupings(graph, payload),
+        report, ask)
     wall = time.perf_counter() - started
+    outputs = [ran_from_message(text, tables) for text, tables in ran]
     result = merged_run(compute, [output["results"] for output in outputs])
     report = graph_report(graph, result, wall, device, gpus=gpus,
                           gpu_timing=payload.get("gpu_timing", False))

@@ -149,6 +149,7 @@ type = "layers"
 layers = [
     "quail.server",
     "quail.api",
+    "quail.worker",
     "quail.builtins",
     "quail.baselines",
     "quail.extensions",

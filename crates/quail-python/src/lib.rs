@@ -37,6 +37,7 @@ pub mod pyarrow;
 pub mod results;
 pub mod shared;
 pub mod stages;
+pub mod workers;
 
 use std::path::PathBuf;
 use std::sync::Arc;

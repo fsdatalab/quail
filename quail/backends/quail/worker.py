@@ -1,16 +1,17 @@
 """Load and run Quail models on the machine's GPUs.
 
-Each GPU has one child process, with its own CUDA context and arena,
-which keeps its model loaded between queries. A child serves its
-partition of a region's stages to Rust over a Unix socket; the query's
-documents reach it through a file both processes map.
+Each GPU has one worker process, with its own CUDA context and arena,
+which keeps its model loaded between queries. Rust starts the workers
+and sends each its partition of a region's stages
+(``quail_python::workers``); this module is the process that runs.
 """
 
 import atexit
 import json
-import os
+import sys
 import time
-from contextlib import ExitStack, suppress
+import traceback
+from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Any
 
@@ -29,17 +30,17 @@ from quail.backends.quail.executor.readout import (
     DecisionHead,
 )
 from quail.backends.quail.executor.warmup import warm_kernels
-from quail.backends.quail.graph import execute_staged_graph, serve_region
-from quail.backends.quail.shared import opened, share
+from quail.backends.quail.graph import (
+    execute_staged_graph,
+    payload_tables,
+    serve_region,
+)
 from quail.backends.resources import freeze_loaded_objects, release_models
 from quail.common import budgets
-from quail.common.tokens import decode_payload_documents
 from quail.execution.types import PhysicalResponse
 from quail.physical import Scan
 from quail.physical.plan import graph_from_envelope
 from quail.progress import (
-    answer_sink,
-    progress_sink,
     say,
     set_answer_sink,
     set_gpu_index,
@@ -47,7 +48,8 @@ from quail.progress import (
 )
 from quail.specs.files import resolve_model_path
 
-# Children outlive sessions so later queries can reuse their loaded models.
+# The workers and the configuration they load. They outlive sessions,
+# so later queries reuse their loaded models.
 _WORKERS = None
 
 
@@ -337,8 +339,8 @@ def _boot_gpu(gpu, backend, gpu_context, chunk_tokens, true_ids, false_ids,
 
 
 def release_quail_request(state: dict) -> None:
-    """Release the GPU child processes and the models they loaded."""
-    _close_children()
+    """Release the GPU worker processes and the models they loaded."""
+    _close_workers()
     state.clear()
 
 
@@ -346,7 +348,7 @@ def _execution_state(gpu, payload, registry) -> dict:
     """Return the executor's state for one GPU and query."""
     return {
         "gpu": gpu,
-        "documents": decode_payload_documents(payload["documents"]),
+        "documents": payload["documents"],
         "texts": payload.get("texts", {}),
         "columns": payload.get("columns", {}),
         "runtimes": registry.runtimes,
@@ -357,203 +359,110 @@ def _execution_state(gpu, payload, registry) -> dict:
 
 
 @dataclass
-class ChildState:
-    """GPU resources and the bound query of one worker process."""
+class WorkerState:
+    """The GPU resources of one worker process."""
 
     gpu_index: int
+    registry_of: Any = None
     gpu: LoadedGpu | None = None
     registry: Any = None
-    model_path: str | None = None
 
 
-def _child_main(gpu_index, conn):
-    import os as _os
-    _os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
+def main(path: str, gpu_index: int, registry_of) -> None:
+    """Run a GPU worker: answer Quail's messages until it is done with us.
+
+    Args:
+        path: The socket Quail listens at for this worker.
+        gpu_index: Which of the session's GPUs this worker runs.
+        registry_of: Callable(extension module names) that returns the
+            registry of the session's models, devices, and backends.
+    """
     set_gpu_index(gpu_index)
-    state = ChildState(gpu_index)
-    while True:
+    state = WorkerState(gpu_index, registry_of=registry_of)
+    end = _quail_native.WorkerEnd(path)
+    while (message := end.next()) is not None:
         try:
-            kind, data = conn.recv()
-        except EOFError:
-            break
-        if kind == "shutdown":
-            break
-        try:
-            if kind == "boot":
-                state.registry = data["registry"]
-                state.model_path = data["model_path"]
-                conn.send(("ok", _child_boot(state, data)))
-            elif kind == "region":
-                # the first reply says the socket listens, the second
-                # carries what the child ran once the region ended
-                server = _quail_native.StageServer(data["socket"])
-                conn.send(("ok", None))
-                conn.send(("ok", _child_region(state, data, server)))
+            if message[0] == "boot":
+                end.booted(json.dumps(_boot_worker(state, json.loads(message[1]))))
+            elif message[0] == "region":
+                _serve_region(state, json.loads(message[1]), message[2], end)
         except Exception:
-            import traceback
-            conn.send(("err", traceback.format_exc()))
+            end.fail(traceback.format_exc())
 
 
-def _child_boot(state, sub):
-    envelope = sub["physical_plan"]
+def _boot_worker(state, setup) -> dict:
+    """Prepare this worker's GPU for a plan; returns the boot record."""
+    if state.registry is None:
+        state.registry = state.registry_of(setup["extensions"])
     registry = state.registry
-    spec = registry.model(sub["model"])
-    device = registry.device(envelope["device"])
-    backend = registry.backend(envelope["backend"])
     gpu, state.gpu = state.gpu, None
     state.gpu, boot = _boot_gpu(
-        gpu, backend, GpuContext(
-            gpu_index=state.gpu_index, gpus=sub["gpus"],
-            model=spec, device=device, query_settings={}),
-        sub["chunk_tokens"], sub["true_ids"], sub["false_ids"],
-        sub.get("arena_pages"), model_path=state.model_path)
+        gpu, registry.backend(setup["backend"]), GpuContext(
+            gpu_index=state.gpu_index, gpus=setup["gpus"],
+            model=registry.model(setup["model"]),
+            device=registry.device(setup["device"]), query_settings={}),
+        setup["chunk_tokens"], setup["true_ids"], setup["false_ids"],
+        setup.get("arena_pages"), model_path=setup["model_path"])
     return boot
 
 
-def _child_region(state, data, server) -> bytes:
-    """Serve one region's stages on this child's GPU until the region ends.
-
-    Returns:
-        What the child ran, as a ``share`` message.
-    """
-    payload = opened(data["query"])
+def _serve_region(state, region, tables, end) -> None:
+    """Serve one region's stages on this worker's GPU until the region ends."""
+    payload = {**region["query"], **payload_tables(tables)}
     graph = graph_from_envelope(payload["physical_plan"])
-    progress, answers = data["listening"]
+    progress, answers = region["listening"]
     # the listeners are in the region's process: each event is sent there
     if progress:
-        set_progress_sink(lambda *event: server.ask(json.dumps({"progress": event})))
+        set_progress_sink(lambda *event: end.ask(json.dumps({"progress": event})))
     if answers:
-        set_answer_sink(lambda event: server.ask(json.dumps({"answer": [event]})))
+        set_answer_sink(lambda event: end.ask(json.dumps({"answer": [event]})))
     try:
-        ran = serve_region(_execution_state(state.gpu, payload, state.registry),
-                           payload, graph, server, data["wanted"], data["hinted"])
+        serve_region(_execution_state(state.gpu, payload, state.registry),
+                     payload, graph, end, region["wanted"], region["hinted"])
     finally:
         set_progress_sink(None)
         set_answer_sink(None)
-    return share(ran, f"{data['socket']}.ran")
 
 
-class GpuWorkers:
-    """The child process and pipe of each GPU, for one configuration.
+def _close_workers():
+    global _WORKERS
+    found, _WORKERS = _WORKERS, None
+    if found is not None:
+        found[1].close()
+
+
+atexit.register(_close_workers)
+
+
+def _ensure_workers(gpus, configuration):
+    """Return live workers for the configuration, replacing any others.
 
     Args:
-        count: How many GPUs, one child each.
+        gpus: How many GPUs, one worker process each.
         configuration: The model, device, backend, and GPU count the
-            children were started for.
+            workers load.
     """
-
-    def __init__(self, count, configuration):
-        import multiprocessing as mp
-
-        self.configuration = configuration
-        self.children = []
-        context = mp.get_context("spawn")
+    global _WORKERS
+    if (_WORKERS is None or _WORKERS[0] != configuration
+            or not _WORKERS[1].alive()):
+        _close_workers()
+        workers = _quail_native.Workers(gpus)
         try:
-            for gpu in range(count):
-                parent_conn, child_conn = context.Pipe()
-                try:
-                    process = context.Process(
-                        target=_child_main, args=(gpu, child_conn), daemon=True)
-                    process.start()
-                except BaseException:
-                    parent_conn.close()
-                    raise
-                finally:
-                    child_conn.close()
-                self.children.append((process, parent_conn))
+            workers.spawn([sys.executable, "-m", "quail.worker"])
+            workers.connect()
         except BaseException:
-            self.close(terminate=True)
+            workers.close()
             raise
-
-    @property
-    def alive(self) -> bool:
-        return bool(self.children) and all(
-            process.is_alive() for process, _ in self.children)
-
-    def round(self, kind, subs):
-        """Send one message to each child and collect their replies."""
-        self.send(kind, subs)
-        return self.receive()
-
-    def send(self, kind, subs):
-        """Send one message to each child."""
-        for (_, conn), sub in zip(self.children, subs):
-            conn.send((kind, sub))
-
-    def receive(self):
-        """Collect one reply from each child."""
-        # every reply is read before an error is raised, so the pipes
-        # stay in step with the children for the next message
-        replies = [conn.recv() for _, conn in self.children]
-        for status, data in replies:
-            if status != "ok":
-                raise RuntimeError(f"GPU child failed:\n{data}")
-        return [data for _, data in replies]
-
-    def close(self, *, terminate=False):
-        """Stop children, including listeners still waiting for a connection.
-
-        Closing the pipe wakes idle children without a potentially blocking
-        send. Active children get bounded grace, then terminate/kill fallbacks.
-        """
-        children, self.children = self.children, []
-        for process, conn in children:
-            conn.close()
-            if terminate and process.is_alive():
-                process.terminate()
-        for process, _ in children:
-            process.join(timeout=1)
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=1)
-            if process.is_alive():
-                process.kill()
-                process.join(timeout=1)
-            if not process.is_alive():
-                process.close()
+        _WORKERS = (configuration, workers)
+    return _WORKERS[1]
 
 
-class RegionServers:
-    """Own the in-flight region on a worker pool, separately from its results."""
-
-    def __init__(self, workers):
-        self.workers = workers
-
-    def finish(self):
-        """Collect results only after the coordinator has ended every server."""
-        return [opened(ran) for ran in self.workers.receive()]
-
-    def abort(self):
-        """Discard this pool without receiving from unconnected listeners."""
-        self.workers.close(terminate=True)
-
-
-def _close_children(terminate=False):
-    global _WORKERS
-    workers, _WORKERS = _WORKERS, None
-    if workers is not None:
-        workers.close(terminate=terminate)
-
-
-atexit.register(_close_children)
-
-
-def _ensure_children(count, configuration) -> GpuWorkers:
-    """Return live children for the configuration, replacing any others."""
-    global _WORKERS
-    if (_WORKERS is None or _WORKERS.configuration != configuration
-            or not _WORKERS.alive):
-        _close_children()
-        _WORKERS = GpuWorkers(count, configuration)
-    return _WORKERS
-
-
-def _boot_children(envelope, registry) -> dict:
-    """Start or reuse each GPU's child and prepare it for the plan.
+def _boot_workers(envelope, registry) -> dict:
+    """Start or reuse each GPU's worker and prepare it for the plan.
 
     Returns:
-        The children under "workers", and the boot record of the run:
-        the slowest child's, with the seconds the model's files and the
+        The workers under "workers", and the boot record of the run:
+        the slowest worker's, with the seconds the model's files and the
         whole boot took.
     """
     gpus = envelope["gpus"]
@@ -561,16 +470,18 @@ def _boot_children(envelope, registry) -> dict:
     started = time.perf_counter()
     model_path = resolve_model_path(spec.hf_name, spec.revision)
     model_files_s = time.perf_counter() - started
-    workers = _ensure_children(gpus, (
+    workers = _ensure_workers(gpus, (
         envelope["model"], envelope["device"], envelope["backend"], gpus))
     settings = envelope["settings"]
     setup = {
-        "model": envelope["model"], "physical_plan": envelope, "gpus": gpus,
+        **{key: envelope[key] for key in ("model", "device", "backend", "gpus")},
         **{key: settings[key] for key in ("chunk_tokens", "true_ids", "false_ids")},
         "arena_pages": settings.get("arena_pages"),
-        "registry": registry, "model_path": model_path,
+        "model_path": model_path,
+        # a worker imports the session's extensions by module name
+        "extensions": list(registry.extension_modules),
     }
-    boots = workers.round("boot", [setup] * gpus)
+    boots = [json.loads(boot) for boot in workers.boot(json.dumps(setup))]
     boot_s = round(time.perf_counter() - started, 2)
     say(f"all {gpus} GPUs ready" if gpus > 1 else "the GPU is ready")
     return {
@@ -587,39 +498,29 @@ def _boot_children(envelope, registry) -> dict:
 
 def prepare_quail_request(context) -> None:
     """Boot the GPUs from the plan alone; the documents can arrive later."""
-    context.runtime_state["booted"] = _boot_children(
+    context.runtime_state["booted"] = _boot_workers(
         context.request.plan, context.registry)
 
 
 def execute_quail_request(context):
-    """Run one Quail request on the GPUs' child processes."""
+    """Run one Quail request on the GPUs' worker processes."""
     payload = quail_runtime_payload(context.request, context.graph)
     envelope, registry = context.request.plan, context.registry
     # a boot prepared for this request is used once
     booted = (context.runtime_state.pop("booted", None)
-              or _boot_children(envelope, registry))
-    workers, boot = booted["workers"], booted["boot"]
-
-    def serve(paths, wanted, hinted):
-        servers = RegionServers(workers)
-        query = share(payload, os.path.join(os.path.dirname(paths[0]), "query"))
-        listening = (progress_sink() is not None, answer_sink() is not None)
-        try:
-            workers.round("region", [
-                {"query": query, "socket": path, "wanted": wanted,
-                 "hinted": hinted, "listening": listening} for path in paths])
-        except BaseException:
-            # The other children may already be waiting in accept().
-            with suppress(BaseException):
-                servers.abort()
-            raise
-        return servers
-
-    report = execute_staged_graph(
-        payload, context.graph, envelope["gpus"], serve,
-        registry.device(envelope["device"]))
+              or _boot_workers(envelope, registry))
+    try:
+        report = execute_staged_graph(
+            payload, context.graph, envelope["gpus"], booted["workers"],
+            registry.device(envelope["device"]))
+    except BaseException:
+        # a worker may be partway through the region: start afresh
+        _close_workers()
+        raise
+    boot = booted["boot"]
     report["boot_s"] = boot["boot_s"]
     report["boot_kind"] = boot["kind"]
     report["boot"] = boot
     outputs = report.pop("_outputs")
     return PhysicalResponse(outputs, report)
+

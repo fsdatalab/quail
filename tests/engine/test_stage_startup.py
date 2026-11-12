@@ -1,23 +1,43 @@
-"""CPU tests of how a region starts and reaches its GPU stage servers."""
+"""CPU tests of how a region starts on its GPU workers and what a failure leaves."""
 
 import json
-import multiprocessing as mp
-import os
-import queue
-import signal
-import socket
 import sys
 import threading
-import time
-from types import SimpleNamespace
 
 import _quail_native
+import pyarrow as pa
 import pytest
-from test_kv_reads import named
 
-from quail.backends.quail import graph as staged
-from quail.backends.quail.worker import GpuWorkers, RegionServers
 from quail.physical import PhysicalGraph, PortRef, Scan
+
+RAN = json.dumps({"metrics": {}})
+# one stage that reads the scan whole, as a region on one GPU has
+STAGES = json.dumps([{
+    "key": "", "nodes": ["node"], "outputs": [],
+    "inputs": [{"node_id": "scan:r", "port": "rows:r", "stage": None,
+                "hashed": False}]}])
+
+# a worker process that says where it read the region's table from
+WORKER_TEXT = """
+import json, os, sys
+import _quail_native
+
+end = _quail_native.WorkerEnd(sys.argv[1])
+found = {"gpu": os.environ["CUDA_VISIBLE_DEVICES"], "index": sys.argv[2]}
+while (message := end.next()) is not None:
+    if message[0] == "region":
+        table = message[2]["documents:r"]
+        address = table.column("id").chunk(0).buffers()[1].address
+        with open("/proc/self/maps") as maps:
+            mapped = [line.split()[0].split("-") for line in maps
+                      if "/region" in line]
+        found["in_file"] = any(
+            int(start, 16) <= address < int(end_, 16) for start, end_ in mapped)
+        found["total"] = sum(table.column("id").to_pylist())
+        end.ready()
+    elif message[0] == "end":
+        end.ran(json.dumps(found), [])
+"""
 
 
 def graph():
@@ -27,220 +47,83 @@ def graph():
     )
 
 
+def _worker(path, seen, failing):
+    """Answer Quail as a worker does; fail the stages of the regions in failing."""
+    end = _quail_native.WorkerEnd(path)
+    regions = 0
+    while (message := end.next()) is not None:
+        seen.append(message[0])
+        if message[0] == "region":
+            regions += 1
+            end.ready()
+        elif message[0] == "stage" and regions in failing:
+            end.fail("the stage went wrong")
+        elif message[0] == "stage":
+            end.outputs([])
+        elif message[0] == "end":
+            end.ran(RAN, [])
+
+
 @pytest.fixture
-def setup(monkeypatch):
-    # These tests exercise startup, not compute selection or GPU execution.
-    monkeypatch.setattr(staged, "compute_subgraph", lambda value: value)
-    monkeypatch.setattr(staged, "finished_rows", lambda: None)
-    return {"stages": []}, graph()
+def workers():
+    """One worker on a thread: (the workers, what it saw, the regions it fails)."""
+    found = _quail_native.Workers(1)
+    seen, failing = [], set()
+    thread = threading.Thread(
+        target=_worker, args=(str(found.paths[0]), seen, failing), daemon=True)
+    thread.start()
+    found.connect()
+    yield found, seen, failing
+    found.close()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
 
 
-def forbidden_serve(*_args):
-    pytest.fail("invalid coordinator inputs must not start listeners")
+def _run(workers, stages=STAGES, groupings=None):
+    return workers.run_region("{}", [], graph().to_json(), stages,
+                              groupings or {}, lambda table: None,
+                              lambda question: "null")
 
 
-def test_invalid_inputs_fail_before_any_listener_starts(setup, monkeypatch):
-    payload, plan = setup
-    for stages in [None, "not stages", {}, [{"key": "r"}]]:
+def test_a_region_that_does_not_decode_reaches_no_worker(workers):
+    found, seen, _ = workers
+    for stages in ["null", '"not stages"', "{}", '[{"key": "r"}]']:
         with pytest.raises(ValueError):
-            staged.execute_staged_graph(dict(payload, stages=stages), plan, 2,
-                                        forbidden_serve, None)
-            pytest.fail(f"stages {stages!r} were accepted")
-
-    # a failure while grouping is raised as it is
-    sentinel = RuntimeError("grouping preparation sentinel")
-
-    def fail(*_args):
-        raise sentinel
-
-    monkeypatch.setattr(staged, "stage_groupings", fail)
-    with pytest.raises(RuntimeError) as caught:
-        staged.execute_staged_graph(payload, plan, 2, forbidden_serve, None)
-    assert caught.value is sentinel
-
-    monkeypatch.setattr(staged, "stage_groupings", lambda *_: {"r": [["not an id"]]})
+            _run(found, stages)
     with pytest.raises(TypeError):
-        staged.execute_staged_graph(payload, plan, 2, forbidden_serve, None)
+        _run(found, groupings={"r": [["not an id"]]})
+    assert seen == []
 
 
-def _wait_in_accept(path, connection, ignore_terminate):
-    if ignore_terminate:
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    with socket.socket(socket.AF_UNIX) as listener:
-        listener.bind(path)
-        listener.listen()
-        connection.send(("ok", None))
-        listener.accept()  # No coordinator connects in this regression.
-
-
-def check_coordinator_failure_aborts_unconnected_children(setup, monkeypatch,
-                                                         ignore_terminate):
-    payload, plan = setup
-    context = mp.get_context("spawn")
-    workers = GpuWorkers.__new__(GpuWorkers)
-    workers.children = []
-    pids = []
-    failed_at = []
-    sentinel = RuntimeError("coordinator startup sentinel")
-
-    def serve(paths, _wanted, _hinted):
-        for path in paths:
-            parent, child = context.Pipe()
-            process = context.Process(target=_wait_in_accept,
-                                      args=(path, child, ignore_terminate), daemon=True)
-            process.start()
-            child.close()
-            workers.children.append((process, parent))
-            pids.append(process.pid)
-        for _, connection in workers.children:
-            assert connection.poll(10), "CPU listener did not start"
-            assert connection.recv() == ("ok", None)
-        handle = RegionServers(workers)
-        # Cleanup must never try to collect a result from accept().
-        handle.finish = lambda: pytest.fail("receive called during abort")
-        return handle
-
-    def fail(*_args):
-        failed_at.append(time.monotonic())
-        raise sentinel
-
-    monkeypatch.setattr(_quail_native, "run_stages", fail)
-    try:
-        with pytest.raises(RuntimeError) as caught:
-            staged.execute_staged_graph(payload, plan, 2, serve, None)
-        assert caught.value is sentinel
-        assert time.monotonic() - failed_at[0] < 8, "abort did not finish promptly"
-        assert not workers.children
-        for pid in pids:
-            with pytest.raises(ProcessLookupError):
-                os.kill(pid, 0)
-    finally:
-        workers.close(terminate=True)
-
-
-def test_coordinator_failure_aborts_unconnected_children(setup, monkeypatch):
-    for ignore_terminate in [False, True]:
-        named(
-            f"ignore_terminate={ignore_terminate}",
-            check_coordinator_failure_aborts_unconnected_children,
-            setup=setup, monkeypatch=monkeypatch, ignore_terminate=ignore_terminate)
-
-
-def test_a_coordinator_or_result_failure_aborts_the_servers_and_keeps_its_error(
-        setup, monkeypatch):
-    # a failing abort does not replace the coordinator's error
-    payload, plan = setup
-    sentinel = RuntimeError("original coordinator error")
-
-    def fail(*_args):
-        raise sentinel
-
-    def abort():
-        raise RuntimeError("secondary abort error")
-
-    monkeypatch.setattr(_quail_native, "run_stages", fail)
-    with pytest.raises(RuntimeError) as caught:
-        staged.execute_staged_graph(
-            payload, plan, 2,
-            lambda *_: SimpleNamespace(abort=abort, finish=forbidden_serve), None)
-    assert caught.value is sentinel
-
-    # a failing result also aborts the servers
-    sentinel = RuntimeError("server result sentinel")
-    aborted = []
-
-    def finish():
-        raise sentinel
-
-    monkeypatch.setattr(_quail_native, "run_stages", lambda *_: None)
-    handle = SimpleNamespace(finish=finish, abort=lambda: aborted.append(True))
-    with pytest.raises(RuntimeError) as caught:
-        staged.execute_staged_graph(payload, plan, 2, lambda *_: handle, None)
-    assert caught.value is sentinel
-    assert aborted == [True]
-
-
-def test_partial_socket_failure_ends_peers_before_and_after_bad_path(tmp_path):
-    """A failed middle connection must not strand the later listener."""
-    paths = [str(tmp_path / name)
-             for name in ("first.sock", "missing.sock", "last.sock")]
-    received = queue.Queue()
-    listeners = []
-    threads = []
-
-    def receive(listener):
-        try:
-            with listener.accept()[0] as stream:
-                stream.settimeout(3)
-                # The end frame is tiny; make no assumptions about recv boundaries.
-                with stream.makefile("rb") as reader:
-                    count = reader.read(8)
-                    assert len(count) == 8, "coordinator dropped a partial connection"
-                    body = reader.read(int.from_bytes(count, "little"))
-                    received.put(json.loads(body))
-        except BaseException as error:
-            received.put(error)
-
-    try:
-        for path in (paths[0], paths[2]):
-            listener = socket.socket(socket.AF_UNIX)
-            listener.settimeout(3)
-            listener.bind(path)
-            listener.listen()
-            listeners.append(listener)
-            thread = threading.Thread(target=receive, args=(listener,), daemon=True)
-            thread.start()
-            threads.append(thread)
-        with pytest.raises(RuntimeError, match="missing.sock"):
-            _quail_native.run_stages(graph().to_json(), "[]", {}, paths,
-                                         lambda _: None, lambda _: "null")
-        replies = [received.get(timeout=5) for _ in threads]
-        assert replies == [{"end": True}, {"end": True}]
-    finally:
-        for listener in listeners:
-            listener.close()
-        for thread in threads:
-            thread.join(timeout=5)
-            assert not thread.is_alive()
-
-
-def _read_shared(message, connection):
-    import numpy as np
-
-    from quail.backends.quail.shared import opened
-
-    found = opened(message)
-    table = found["table"]
-    with open("/proc/self/maps") as maps:
-        mapped = [line.split()[0].split("-") for line in maps
-                  if line.rstrip().endswith("shared (deleted)")
-                  or line.rstrip().endswith("shared")]
-    address = table.column("id").chunk(0).buffers()[1].address
-    connection.send((
-        table.column("id").to_pylist(), found["count"],
-        int(np.asarray(found["array"]).sum()),
-        any(int(start, 16) <= address < int(end, 16) for start, end in mapped)))
+def test_a_failed_stage_is_the_regions_error_and_the_workers_run_the_next(workers):
+    found, seen, failing = workers
+    failing.add(1)
+    with pytest.raises(RuntimeError, match="the stage went wrong"):
+        _run(found)
+    # the worker was told the region ended, and serves the next one
+    assert seen == ["region", "stage", "end"]
+    assert [json.loads(ran) for ran, _ in _run(found)] == [json.loads(RAN)]
+    assert seen == ["region", "stage", "end"] * 2
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="reads /proc/self/maps")
-def test_another_process_reads_a_shared_value_over_the_files_mapped_pages(tmp_path):
-    import numpy as np
-    import pyarrow as pa
-
-    from quail.backends.quail.shared import share
-
-    value = {"table": pa.table({"id": pa.array(range(1000), pa.int32())}),
-             "array": np.arange(100), "count": 3}
-    message = share(value, str(tmp_path / "shared"))
-    # the message names the file; the buffers are not in it
-    assert len(message) < 1000
-    context = mp.get_context("spawn")
-    parent, child = context.Pipe()
-    process = context.Process(target=_read_shared, args=(message, child))
-    process.start()
+def test_a_worker_process_reads_a_regions_table_over_the_files_mapped_pages(
+        tmp_path):
+    script = tmp_path / "worker.py"
+    script.write_text(WORKER_TEXT)
+    found = _quail_native.Workers(2)
     try:
-        ids, count, total, in_file = parent.recv()
+        found.spawn([sys.executable, str(script)])
+        found.connect()
+        assert found.alive()
+        table = pa.table({"id": pa.array(range(1000), pa.int32())})
+        ran = found.run_region(
+            "{}", [("documents:r", table)], graph().to_json(), "[]", {},
+            lambda table: None, lambda question: "null")
     finally:
-        process.join(timeout=30)
-    assert (ids, count, total) == (list(range(1000)), 3, 4950)
-    assert in_file
+        found.close()
+    # each worker sees its own GPU and maps the one file the table is in
+    assert [json.loads(text) for text, _ in ran] == [
+        {"gpu": str(gpu), "index": str(gpu), "in_file": True, "total": 499500}
+        for gpu in range(2)]
+    assert not found.alive()

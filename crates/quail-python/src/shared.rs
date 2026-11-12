@@ -53,18 +53,21 @@ pub fn write_table(path: &Path, (schema, batches): &Table) -> Result<()> {
     Ok(())
 }
 
-/// Read the table at `path` over the file's mapped pages, and remove
-/// the file's name; the pages live as long as a batch reads them.
+/// Read the table at `path` over the file's mapped pages; the pages
+/// live as long as a batch reads them. `remove` removes the file's
+/// name, for a table no other process reads.
 ///
 /// # Errors
 ///
 /// The file does not open or map, or is not an Arrow IPC file.
-pub fn read_table(path: &Path) -> Result<Table> {
+pub fn read_table(path: &Path, remove: bool) -> Result<Table> {
     let file = File::open(path)?;
     // the writer finished the file before it sent its path, and no one
     // writes it again
     let mapped = unsafe { Mmap::map(&file) }?;
-    std::fs::remove_file(path)?;
+    if remove {
+        std::fs::remove_file(path)?;
+    }
     let length = mapped.len();
     let start = NonNull::new(mapped.as_ptr().cast_mut())
         .ok_or_else(|| failure("a shared table mapped at no address"))?;
@@ -135,7 +138,7 @@ mod tests {
         let path = directory("shared").join("table");
         write_table(&path, &(Arc::clone(&schema), vec![batch.clone()])).unwrap();
         let size = std::fs::metadata(&path).unwrap().len() as usize;
-        let (found, batches) = read_table(&path).unwrap();
+        let (found, batches) = read_table(&path, true).unwrap();
         assert_eq!(found, schema);
         assert_eq!(batches, vec![batch]);
         assert!(!path.exists());
@@ -156,7 +159,7 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         let path = directory("empty").join("table");
         write_table(&path, &(Arc::clone(&schema), vec![])).unwrap();
-        let (found, batches) = read_table(&path).unwrap();
+        let (found, batches) = read_table(&path, true).unwrap();
         assert_eq!(found, schema);
         assert!(batches.is_empty());
     }
@@ -165,8 +168,8 @@ mod tests {
     fn a_file_that_is_not_arrow_is_an_error() {
         let path = directory("bad").join("table");
         std::fs::write(&path, b"short").unwrap();
-        assert!(read_table(&path).is_err());
+        assert!(read_table(&path, true).is_err());
         std::fs::write(&path, vec![7u8; 4096]).unwrap();
-        assert!(read_table(&path).is_err());
+        assert!(read_table(&path, true).is_err());
     }
 }

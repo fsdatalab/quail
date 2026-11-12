@@ -8,6 +8,7 @@ length, and the join frame is [FRAME] * length.
 import json
 import random
 import threading
+import traceback
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -399,7 +400,7 @@ def fake_readout(**attributes):
 def run_graph(state, payload, graph) -> dict:
     """Run a graph on one executor state, as a region on one GPU runs.
 
-    The graph is one stage, served on a thread.
+    The graph is one stage, which a thread serves as a worker.
 
     Args:
         state: The executor's state, as ``graph_state`` builds it.
@@ -414,71 +415,40 @@ def run_graph(state, payload, graph) -> dict:
     payload = {
         **payload, "gpu_timing": state.get("gpu_timing", False),
         "stages": json.loads(_quail_native.region_stages(graph.to_json(), 1))}
-    return execute_staged_graph(
-        payload, graph, 1, thread_servers([state], payload, graph),
-        state["device"])
+    return run_on_threads([state], payload, graph, state["device"])
 
 
-def thread_servers(states, payload, graph):
-    """Return a serve callable that runs each GPU's server on a thread.
+def run_on_threads(states, payload, graph, device) -> dict:
+    """Run a region's stages on workers that each serve a GPU on a thread.
 
-    Each thread serves its partition of the region's stages with the
-    executor state given for that GPU, as a GPU child does.
+    Each thread answers the region as a worker process does, with the
+    executor state given for that GPU.
 
     Args:
         states: Per GPU, the executor's state, as ``graph_state`` builds it.
         payload: The query's runtime payload.
         graph: The region's graph.
+        device: The GPUs' device spec.
     """
-    def serve(paths, wanted, hinted):
-        threads = [_Serving(state, payload, graph, _quail_native.StageServer(path),
-                            wanted, hinted)
-                   for state, path in zip(states, paths, strict=True)]
-        for thread in threads:
-            thread.start()
-
-        class Servers:
-            def finish(self):
-                for thread in threads:
-                    thread.join(timeout=30)
-                    assert not thread.is_alive(), "stage server did not finish"
-                for thread in threads:
-                    if thread.error is not None:
-                        raise thread.error
-                return [thread.result for thread in threads]
-
-            def abort(self):
-                import contextlib
-                import socket
-
-                # Wake servers that did not get a coordinator connection.
-                # Already-connected peers see EOF when the coordinator exits.
-                message = b'{"end": true}'
-                for path in paths:
-                    with contextlib.suppress(OSError), socket.socket(
-                            socket.AF_UNIX) as connection:
-                        connection.settimeout(0.2)
-                        connection.connect(path)
-                        connection.sendall(len(message).to_bytes(8, "little") + message)
-                for thread in threads:
-                    thread.join(timeout=2)
-                    assert not thread.is_alive(), "stage server did not abort"
-
-        return Servers()
-
-    return serve
+    workers = _quail_native.Workers(len(states))
+    try:
+        for state, path in zip(states, workers.paths, strict=True):
+            threading.Thread(target=_serve,
+                             args=(state, payload, graph, str(path)),
+                             daemon=True).start()
+        workers.connect()
+        return execute_staged_graph(payload, graph, len(states), workers, device)
+    finally:
+        workers.close()
 
 
-class _Serving(threading.Thread):
-    """One GPU's server on a thread, keeping its result or its error."""
-
-    def __init__(self, state, payload, graph, server, wanted, hinted):
-        super().__init__(daemon=True)
-        self.arguments = (state, payload, graph, server, wanted, hinted)
-        self.result = self.error = None
-
-    def run(self):
+def _serve(state, payload, graph, path):
+    """Serve each region Quail begins until it closes the connection."""
+    end = _quail_native.WorkerEnd(path)
+    while (message := end.next()) is not None:
         try:
-            self.result = serve_region(*self.arguments)
-        except BaseException as error:
-            self.error = error
+            region = json.loads(message[1])
+            serve_region(state, payload, graph, end, region["wanted"],
+                         region["hinted"])
+        except Exception:
+            end.fail(traceback.format_exc())

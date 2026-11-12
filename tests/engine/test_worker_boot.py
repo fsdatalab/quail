@@ -60,7 +60,8 @@ ENVELOPE = {
     "gpus": 1,
     "settings": {"chunk_tokens": 8192, "true_ids": [1], "false_ids": [2]},
 }
-SETUP = {"physical_plan": ENVELOPE, "model": "qwen3-4b-fp8", "gpus": 1,
+SETUP = {"model": "qwen3-4b-fp8", "device": "h100-sxm", "backend": "quail",
+         "gpus": 1, "model_path": None, "extensions": [],
          **ENVELOPE["settings"]}
 
 
@@ -71,7 +72,7 @@ def test_a_prepared_boot_is_used_by_one_request(monkeypatch):
         boots.append(envelope)
         return {"workers": None, "boot": {"boot_s": 3.0, "kind": "cold"}}
 
-    monkeypatch.setattr(worker, "_boot_children", boot)
+    monkeypatch.setattr(worker, "_boot_workers", boot)
     monkeypatch.setattr(worker, "quail_runtime_payload", lambda *a: {})
     monkeypatch.setattr(worker, "execute_staged_graph",
                         lambda *a: {"_outputs": {}, "wall_s": 1.0})
@@ -88,11 +89,11 @@ def test_a_prepared_boot_is_used_by_one_request(monkeypatch):
     assert len(boots) == 2
 
 
-def test_a_child_reuses_its_model_and_an_arena_resize_releases_pieces_that_write_kv(
+def test_a_worker_reuses_its_model_and_an_arena_resize_releases_pieces_that_write_kv(
         booted, monkeypatch):
-    state = worker.ChildState(0, registry=built_in_registry())
+    state = worker.WorkerState(0, registry=built_in_registry())
 
-    assert worker._child_boot(state, SETUP)["kind"] == "cold"
+    assert worker._boot_worker(state, SETUP)["kind"] == "cold"
     gpu = state.gpu
     assert memory_report(gpu)["memory_bytes"] == {
         "weights": 8 * 2**30, "kv": 0, "state": 0,
@@ -111,7 +112,7 @@ def test_a_child_reuses_its_model_and_an_arena_resize_releases_pieces_that_write
     old_query = weakref.ref(query)
     del query
 
-    assert worker._child_boot(state, SETUP)["kind"] == "warm"
+    assert worker._boot_worker(state, SETUP)["kind"] == "warm"
     assert old_query() is None
     assert execution.query.loaded_model is loaded
     assert execution.query.async_answers is gpu.async_ans

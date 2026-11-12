@@ -3,10 +3,10 @@
 Rust's ``quail_python::stages`` runs partition p of each stage on the server of
 GPU p: a process, or a test's thread, holding every document and one
 execution context for the region. Rust sends a stage's input rows; the
-server runs the stage's nodes with the single-GPU runner, sends each
+worker runs the stage's nodes with the single-GPU runner, sends each
 table it finishes for the region's FinishedRows as soon as it has it,
 and sends back the rows later stages read. The region's hint stays in
-the region's process: the server asks it over the same connection.
+the region's process: the worker asks it over the same connection.
 """
 
 from __future__ import annotations
@@ -14,12 +14,13 @@ from __future__ import annotations
 import json
 import time
 import traceback
+from dataclasses import asdict
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from quail.execution.finished import first_rows, reporting
+from quail.execution.finished import finished_table, first_rows, reporting
 from quail.execution.metrics import NodeMetrics, NodeResult, RunResult
 from quail.execution.rows import Rows
 from quail.execution.runner import ExecutionContext, GenericRunner
@@ -33,10 +34,10 @@ _HINT_SECONDS = 0.005
 
 
 class ServedHint:
-    """The region's ``InputHint``, asked over a stage server's connection.
+    """The region's ``InputHint``, asked over a worker's connection.
 
     Args:
-        server: The ``StageServer`` of the running region.
+        server: The ``WorkerEnd`` of the running region.
         tables: The names of the tables the hint holds rows of.
     """
 
@@ -94,7 +95,7 @@ def serve_stages(server, context: ExecutionContext, graph: PhysicalGraph,
     """Run each stage Rust sends until the region ends.
 
     Args:
-        server: The ``StageServer`` listening for the region's stages.
+        server: The ``WorkerEnd`` that has read the region.
         context: The region's execution context on this GPU.
         graph: The region's compute graph.
         stages: The plan's stages, as its "stages" setting holds them.
@@ -112,8 +113,9 @@ def serve_stages(server, context: ExecutionContext, graph: PhysicalGraph,
     wanted = {tuple(pair) for pair in wanted or ()}
     hint = None if hinted is None else ServedHint(server, set(hinted.values()))
     results = {}
-    while (request := server.next_stage()) is not None:
-        stage, tables = request
+    server.ready()
+    while (message := server.next()) is not None and message[0] == "stage":
+        _, stage, tables = message
         try:
             rows = _StageRows(server, wanted)
             with reporting(rows if reports else None, hint, hinted, first):
@@ -122,8 +124,56 @@ def serve_stages(server, context: ExecutionContext, graph: PhysicalGraph,
             server.fail(traceback.format_exc())
             continue
         results.update(ran)
-        server.reply(outputs)
+        server.outputs(outputs)
     return results
+
+
+def plain(value):
+    """Return a numpy value as the Python value JSON writes."""
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    raise TypeError(f"{type(value).__name__} is not JSON")
+
+
+def ran_message(results: dict, measurements: dict) -> tuple[str, list]:
+    """Return what a worker ran as the JSON and tables it sends.
+
+    Args:
+        results: Node id -> NodeResult, of Arrow tables.
+        measurements: The worker's KV counters and memory report.
+
+    Returns:
+        The measurements and each node's metrics as JSON, and each
+        node's output tables, tagged with node and port.
+    """
+    tables = [finished_table(node_id, port, table)
+              for node_id, result in results.items()
+              for port, table in result.outputs.items()]
+    metrics = {node_id: asdict(result.metrics)
+               for node_id, result in results.items()}
+    return json.dumps({**measurements, "metrics": metrics}, default=plain), tables
+
+
+def ran_from_message(text: str, tables: list) -> dict:
+    """Return what a worker ran from ``ran_message``'s JSON and tables.
+
+    Returns:
+        Node id -> NodeResult under "results", beside the worker's KV
+        counters and memory report.
+    """
+    ran = json.loads(text)
+    outputs = {node_id: {} for node_id in ran["metrics"]}
+    for table in tables:
+        metadata = dict(table.schema.metadata)
+        node_id = metadata.pop(b"quail.node").decode()
+        port = metadata.pop(b"quail.port").decode()
+        outputs[node_id][port] = table.replace_schema_metadata(metadata or None)
+    ran["results"] = {
+        node_id: NodeResult(outputs[node_id], NodeMetrics(**metrics))
+        for node_id, metrics in ran.pop("metrics").items()}
+    return ran
 
 
 def payload_first_rows(payload: dict) -> dict:
