@@ -1,10 +1,28 @@
-"""Progress messages for the long steps of a query, on the "quail" logger."""
+"""Progress messages for the long steps of a query, on the "quail" logger.
+
+On a terminal a running count is one bar that updates in place, and the
+messages are colored. Anywhere else, such as a log file or a Modal log,
+the same messages are plain lines and a count logs a line at each tenth
+of its total.
+"""
 
 import contextlib
 import logging
 import os
 import sys
 import time
+
+from rich.console import Console
+from rich.markup import escape
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
+from rich.progress import Progress as Bar
 
 _GPU_INDEX = None
 # names the run in every line's prefix, such as a benchmark's query
@@ -26,27 +44,38 @@ class _GpuFilter(logging.Filter):
         return True
 
 
-class _StdoutHandler(logging.StreamHandler):
-    """Write to the sys.stdout of the moment, so output capture sees it."""
+_CONSOLES: dict = {}
 
-    @property
-    def stream(self):
-        return sys.stdout
 
-    @stream.setter
-    def stream(self, value):
-        pass
+def console() -> Console:
+    """Return the console of the sys.stdout of the moment, so output capture sees it."""
+    found = _CONSOLES.get(id(sys.stdout))
+    if found is None or found.file is not sys.stdout:
+        _CONSOLES.clear()
+        found = _CONSOLES[id(sys.stdout)] = Console(file=sys.stdout, highlight=False)
+    return found
+
+
+class _ConsoleHandler(logging.Handler):
+    """Write each message to `console()`: styled on a terminal, plain elsewhere."""
+
+    def emit(self, record):
+        found = console()
+        stamp = time.strftime("%m-%d %H:%M:%S", time.localtime(record.created))
+        # a record of a child logger skips this logger's filter; format()
+        # adds a logged exception's traceback
+        text = f"[quail]{getattr(record, 'gpu', '')} {self.format(record)}"
+        if found.is_terminal:
+            found.print(f"[dim]{stamp}[/dim]", escape(text), soft_wrap=True)
+        else:
+            # a log file keeps one unwrapped line per message
+            print(f"{record.levelname} {stamp} {text}", file=found.file, flush=True)
 
 
 logger = logging.getLogger("quail")
 if not logger.handlers:
     # INFO lines reach stdout unless the program configures the logger itself
-    _handler = _StdoutHandler()
-    _handler.setFormatter(logging.Formatter(
-        "%(levelname)s %(asctime)s [quail]%(gpu)s %(message)s",
-        datefmt="%m-%d %H:%M:%S",
-    ))
-    logger.addHandler(_handler)
+    logger.addHandler(_ConsoleHandler())
     logger.addFilter(_GpuFilter())
     logger.setLevel(logging.INFO)
     logger.propagate = False
@@ -115,7 +144,12 @@ def quiet():
 
 
 class Progress:
-    """Report a running count, logging at most once every `every` seconds."""
+    """Report a running count: a bar on a terminal, lines anywhere else.
+
+    The progress sink hears the count at most once every `every` seconds.
+    A line is logged no more often than that, and for a count with a
+    total only when another tenth of it is done.
+    """
 
     def __init__(self, label: str, total: int | None = None,
                  unit: str = "documents", every: float = 5.0, *, emit=say):
@@ -127,18 +161,38 @@ class Progress:
         self.done = 0
         self.started = time.perf_counter()
         self._last = self.started
+        self._logged = 0
+        self._bar = self._task = None
+        if emit is say and not _QUIET and total and console().is_terminal:
+            self._bar = Bar(
+                TextColumn(r"\[quail] {task.description}"), BarColumn(),
+                MofNCompleteColumn(), TextColumn(unit), TaskProgressColumn(),
+                TimeElapsedColumn(), TimeRemainingColumn(),
+                console=console(), transient=True)
+            self._task = self._bar.add_task(label, total=total)
+            self._bar.start()
 
     def update(self, done: int) -> None:
-        """Record the count and log a line when enough time has passed."""
+        """Record the count; move the bar, or log a line when one is due."""
+        if self._bar is not None:
+            self._bar.advance(self._task, done - self.done)
         self.done = done
         now = time.perf_counter()
-        if now - self._last >= self.every:
-            self._last = now
+        if now - self._last < self.every:
+            return
+        self._last = now
+        self._report()
+        # a tenth of the total since the last line, or any change without one
+        step = (self.total or 0) / 10
+        if self._bar is None and done - self._logged >= step:
+            self._logged = done
             self.emit(self._line(self.label, now))
-            self._report()
 
     def finish(self, label: str, extra: str = "") -> None:
         """Log the final line under a past tense label."""
+        if self._bar is not None:
+            self._bar.stop()
+            self._bar = None
         line = self._line(label, time.perf_counter())
         self.emit(f"{line}, {extra}" if extra else line)
         self._report()

@@ -2677,6 +2677,7 @@ dependencies = [
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
     { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'emscripten' or sys_platform == 'win32'" },
     { name = "pyarrow" },
+    { name = "rich" },
     { name = "transformers" },
     { name = "vllm", marker = "sys_platform == 'linux'" },
 ]
@@ -2709,6 +2710,7 @@ requires-dist = [
     { name = "numpy", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'", specifier = "==2.3.5" },
     { name = "numpy", marker = "sys_platform == 'emscripten' or sys_platform == 'win32'", specifier = "==2.5.2" },
     { name = "pyarrow", specifier = "==25.0.1" },
+    { name = "rich", specifier = "==15.0.0" },
     { name = "starlette", marker = "extra == 'server'", specifier = "==1.6.0" },
     { name = "transformers", specifier = "==5.15.0" },
     { name = "uvicorn", marker = "extra == 'server'", specifier = "==0.52.4" },
