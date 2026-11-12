@@ -15,7 +15,6 @@ from quail.labels import (
     SET_CHOICE_SCORING,
     TREE_SCORING,
     decodable,
-    word_starts,
 )
 from quail.logical import LabelWork, effective_selectivity
 from quail.logical.prompts import PROMPT_LAYOUTS
@@ -141,7 +140,7 @@ class ClassifyScoring(ClassifyStatistics):
         if spec.scoring == DECISION_SCORING:
             return spec
         head, tail = spec.prompt_token_parts
-        labels, starts = spec.label_token_ids, spec.label_word_starts
+        labels = spec.label_token_ids
         lettered = None
         lower = self.lower or (lambda prompt: lower_prompt(prompt, self.tokenizer))
         lettered_prompt = lower(call.prompt).lettered
@@ -151,10 +150,9 @@ class ClassifyScoring(ClassifyStatistics):
             lettered = (len(letter_head), len(letter_tail) - 1, letter_ids)
         scoring, estimated = self.choose(
             spec.expected_rows, len(head), len(tail) - 1, labels, resident,
-            lettered, probabilities=spec.probabilities, starts=starts)
+            lettered, probabilities=spec.probabilities)
         if scoring == LETTERS_SCORING:
             head, tail, labels = letter_head, letter_tail, letter_ids
-            starts = ()
         if scoring == DECODE_SCORING and not decodable(labels):
             raise ClassifyRefusedError(
                 f"the {scoring!r} rule cannot decode the labels of "
@@ -165,7 +163,7 @@ class ClassifyScoring(ClassifyStatistics):
         return replace(
             spec, estimated_seconds=estimated.seconds,
             prompt_token_parts=(head, tail), label_token_ids=labels,
-            label_word_starts=starts, scoring=scoring,
+            scoring=scoring,
             draws=self.draws if scoring == LETTERS_SCORING else 1)
 
     @property
@@ -175,7 +173,7 @@ class ClassifyScoring(ClassifyStatistics):
         return canvas.rows if canvas is not None else 0
 
     def estimate(self, scoring, expected_rows, head_tokens, frame_tokens, labels,
-                 resident, starts=()) -> classify_cost.ClassifyCost:
+                 resident) -> classify_cost.ClassifyCost:
         """Estimate one scoring rule using this table's lengths and budgets.
 
         Args:
@@ -185,7 +183,6 @@ class ClassifyScoring(ClassifyStatistics):
             frame_tokens: Number of prompt tokens written after each document.
             labels: Token sequence for each label.
             resident: Whether document KV is already available.
-            starts: Per label, which tokens begin a new word.
 
         Returns:
             Estimated execution time, work, and token counts.
@@ -194,7 +191,7 @@ class ClassifyScoring(ClassifyStatistics):
             scoring, expected_rows, head_tokens, frame_tokens, labels,
             lengths=self.lengths, shared=self.shared, chunk=self.chunk,
             model=self.model, device=self.device, resident=resident,
-            draws=self.draws, starts=starts, gpus=self.gpus)
+            draws=self.draws, gpus=self.gpus)
 
     def estimate_spec(self, spec: ClassifySpec,
                       resident=False) -> classify_cost.ClassifyCost:
@@ -214,7 +211,7 @@ class ClassifyScoring(ClassifyStatistics):
                 answer_rows=len(spec.label_token_ids) + 1, gpus=self.gpus)
         return self.estimate(
             spec.scoring, spec.expected_rows, len(head), len(tail) - 1,
-            spec.label_token_ids, resident, spec.label_word_starts)
+            spec.label_token_ids, resident)
 
     def reestimate(self, spec: ClassifySpec, *, resident=False) -> ClassifySpec:
         """Update a classification's estimated time for this table.
@@ -230,7 +227,7 @@ class ClassifyScoring(ClassifyStatistics):
                        estimated_seconds=self.estimate_spec(spec, resident).seconds)
 
     def choose(self, expected_rows, head_tokens, frame_tokens, labels, resident,
-               lettered=None, probabilities=False, starts=()
+               lettered=None, probabilities=False
                ) -> tuple[str, classify_cost.ClassifyCost]:
         """Choose the supported scoring rule with the lowest estimated time.
 
@@ -251,7 +248,6 @@ class ClassifyScoring(ClassifyStatistics):
             lettered: Tuple of head length, frame length, and label letter
                 token sequences, or None if the prompt has no lettered form.
             probabilities: Whether every label's probability is required.
-            starts: Per label, which tokens begin a new word.
 
         Returns:
             A tuple containing the method name and its estimated cost.
@@ -273,12 +269,11 @@ class ClassifyScoring(ClassifyStatistics):
                 "another's prefix)", 1, 0)
         best = None
         for scoring in candidates:
-            head, frame, ids, flags = (
-                (head_tokens, frame_tokens, labels, starts)
-                if scoring != LETTERS_SCORING else (*lettered, ()))
+            head, frame, ids = (
+                (head_tokens, frame_tokens, labels)
+                if scoring != LETTERS_SCORING else lettered)
             estimated = self.estimate(
-                scoring, expected_rows, head, frame, ids, resident, flags
-            )
+                scoring, expected_rows, head, frame, ids, resident)
             key = (estimated.seconds, estimated.suffix_tokens)
             if best is None or key < best[0]:
                 best = (key, scoring, estimated)
@@ -332,8 +327,6 @@ class ClassifyBuilder(ClassifyStatistics):
             prompt_token_parts=(head, tail),
             labels=tuple(call.labels),
             label_token_ids=labels,
-            label_word_starts=word_starts(
-                labels, getattr(self.tokenizer, "decode", None)),
             scoring="", probabilities=call.probabilities,
         ), Work()
 

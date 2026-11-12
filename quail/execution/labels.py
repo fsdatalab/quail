@@ -1,11 +1,10 @@
 """Score label tokens and match decoded text to labels.
 
 The letters rule reads one token per label. The trie_tree rule scores
-each label through the end of the word that tells it apart, and gives
-a label that starts another the answers whose longest matching label
-it is. The trie_decode rule (GreedyDecoder) picks one allowed token at
-each node where the labels split and never compares complete label
-scores.
+each label up to the trie node that tells it apart, and gives a label
+that starts another the answers whose longest matching label it is.
+The trie_decode rule (GreedyDecoder) picks one allowed token at each
+node where the labels split and never compares complete label scores.
 """
 
 import math

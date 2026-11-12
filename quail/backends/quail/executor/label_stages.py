@@ -90,7 +90,7 @@ def label_requests(spec, targets=None) -> LabelRequests:
     if targets is None:
         targets = sorted({token for label in ids for token in label})
     if spec.scoring == "trie_tree":
-        read = read_nodes(ids, spec.label_word_starts)
+        read = read_nodes(ids)
         paths = trie_paths(ids, read)
         tokens = [cue if node == () else node[-1]
                   for nodes, _, _ in paths for node in nodes]

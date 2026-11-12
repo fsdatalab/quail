@@ -18,10 +18,6 @@ class ClassifySpec(InferenceSpec):
         labels: Labels in query order.
         label_token_ids: Token ids for each label: its letter for the
             letters rule, its text for the trie rules.
-        label_word_starts: Per label, which of its tokens begin a new
-            word, from ``quail.labels.word_starts``; empty marks none.
-            The trie_tree rule reads a label through the end of the
-            word that tells it apart.
         scoring: The label scoring rule: letters, trie_tree, or trie_decode.
             The planner leaves it empty until the choose_classify_implementation rule
             picks one.
@@ -45,7 +41,6 @@ class ClassifySpec(InferenceSpec):
     draws: int = 1
     labels: tuple[str, ...] = ()
     label_token_ids: tuple[tuple[Token, ...], ...] = ()
-    label_word_starts: tuple[tuple[bool, ...], ...] = ()
     scoring: str = "letters"
     probabilities: bool = False
     join_layout: tuple[tuple[Token, ...], tuple[Token, ...]] | None = None

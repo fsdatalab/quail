@@ -82,9 +82,6 @@ def test_classify_plans_filters_and_returns_labels(session):
     (test,) = [n for n in plan.nodes if isinstance(n, Filter)]
     assert classify.spec.labels == ("refund", "shipping", "praise")
     assert classify.spec.label_token_ids[0] == tuple(_bytes("refund"))
-    # a tokenizer without decode marks no word start
-    assert classify.spec.label_word_starts == tuple(
-        (False,) * len(ids) for ids in classify.spec.label_token_ids)
     assert test.predicate == RegularPredicate(
         ColumnRef("d", "documents", "topic"), "in", ("refund", "shipping"))
     codecs = session.registry.codecs
