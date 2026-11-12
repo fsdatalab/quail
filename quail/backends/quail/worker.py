@@ -622,6 +622,4 @@ def execute_quail_request(context):
     report["boot_kind"] = boot["kind"]
     report["boot"] = boot
     outputs = report.pop("_outputs")
-    report.pop("filters", None)
-    report.pop("joins", None)
     return PhysicalResponse(outputs, report)

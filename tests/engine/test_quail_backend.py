@@ -67,14 +67,6 @@ def test_pair_join_and_gpu_timing_run_through_the_quail_graph(monkeypatch):
         cross, _, _, _ = run_graph_on_arena(
             monkeypatch, two_alias_graph(pipelined))
         survivors = [d for d, truth in enumerate(filter_truth) if all(truth)]
-        stage = result["joins"][0]
-        assert sorted(stage["anchor_index"]) == survivors
-        members = stage["anchor_partners"]
-        for local, document in enumerate(stage["anchor_index"]):
-            mine = sorted(allowed[document])
-            assert list(members[local]) == mine
-            assert stage["rows"].get(local, []) == [
-                join_truth[("r", document)][i] for i in mine]
         table = result["_outputs"][PortRef("group:0", "join_answers:0")]
         assert _pairs(table) == sorted(
             (d, i) for d in survivors for i in allowed[d])

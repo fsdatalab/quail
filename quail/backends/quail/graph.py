@@ -19,7 +19,6 @@ from quail.execution.finished import finished_rows, hinted_tables, region_hint
 from quail.execution.metrics import NodeResult, scalar_node_metrics
 from quail.execution.runner import (
     ExecutionContext,
-    GenericRunner,
     compute_subgraph,
 )
 from quail.execution.stages import (
@@ -143,26 +142,6 @@ def execution_measurements(context: ExecutionContext) -> dict:
     }
 
 
-def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
-    """Execute one Quail model graph on one GPU executor."""
-    context = execution_context(state, payload, graph)
-    torch = state["gpu"].torch
-    arena = state["gpu"].arena
-    started = time.perf_counter()
-    with torch.inference_mode():
-        result = GenericRunner().run(compute_subgraph(graph), context)
-    torch.cuda.synchronize()
-    wall = time.perf_counter() - started
-    arena.write_trace_files()
-    for key in arena.resident_keys():
-        arena.free_key(key)
-    report = graph_report(graph, result, wall, state["device"],
-                          gpu_timing=state.get("gpu_timing", False))
-    measurements = execution_measurements(context)
-    report.update(kv_manager=measurements["kv_manager"], **measurements["memory"])
-    return report
-
-
 def serve_region(state, payload, graph: PhysicalGraph, server, wanted,
                  hinted: dict | None = None) -> dict:
     """Serve a region's stages on one GPU until the region ends.
@@ -219,7 +198,8 @@ def execute_staged_graph(payload, graph: PhysicalGraph, gpus: int, serve,
     """
     compute = compute_subgraph(graph)
     rows = finished_rows()
-    wanted = [] if rows is None else [
+    # None when no one takes the region's rows as they finish
+    wanted = None if rows is None else [
         (node.node_id, port.name) for node in compute.nodes
         for port in node.outputs if rows.wants(node.node_id, port.name)]
 
@@ -301,10 +281,7 @@ def stage_groupings(graph: PhysicalGraph, payload) -> dict:
 
 def graph_report(graph, result, wall, device, *, gpus=1, gpu_timing=False):
     """Collect graph outputs, execution metrics, and GPU cost."""
-    filters, joins = model_answers(graph, result)
     report = {
-        "filters": filters,
-        "joins": joins,
         "_outputs": export_physical_outputs(compute_subgraph(graph), result),
         "wall_s": round(wall, 2),
         "fresh_tokens": result.metrics.fresh_tokens,
@@ -347,19 +324,6 @@ def throughput(graph, metrics, seconds: float) -> dict:
         node.num_documents for node in graph.nodes if isinstance(node, Scan)
     )
     return {"documents_per_second": documents / seconds}
-
-
-def model_answers(graph, result) -> tuple[dict, list]:
-    """Collect predicate answers in execution order."""
-    filters, joins = {}, []
-    for node in graph.topological_nodes():
-        if isinstance(node, AiFilter):
-            filters.setdefault(node.alias, []).append(
-                result.nodes[node.node_id].outputs[f"filter_answers:{node.alias}"])
-        elif isinstance(node, AiJoin):
-            joins.append(result.nodes[node.node_id].outputs[
-                f"join_answers:{node.written_position}"])
-    return {alias: pa.concat_tables(tables) for alias, tables in filters.items()}, joins
 
 
 # the fields the report shows of each executed join and barrier

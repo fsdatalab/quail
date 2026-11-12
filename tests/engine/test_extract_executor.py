@@ -20,7 +20,7 @@ from helpers.extract_fakes import (
     make_spec as make_extract_spec,
 )
 from helpers.extract_reference import AnswerState, Decoder
-from helpers.fakes import fake_pipeline, fake_readout, thread_servers
+from helpers.fakes import fake_pipeline, fake_readout, run_graph, thread_servers
 from helpers.kv_checker import Setup, make_arena
 from test_kv_reads import named
 from test_map_decode import cpu_staging, events_torch
@@ -33,7 +33,7 @@ from quail.backends.quail.executor.operators import operator_types
 from quail.backends.quail.executor.operators.extract import ExtractOperator
 from quail.backends.quail.executor.region import RegionExecution
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
-from quail.backends.quail.graph import execute_single_graph, execute_staged_graph
+from quail.backends.quail.graph import execute_staged_graph
 from quail.backends.quail.worker import _execution_state
 from quail.builtins import built_in_registry
 from quail.physical import (
@@ -581,7 +581,7 @@ def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
              "chunk_tokens": 400,
              "documents": {"c": [tables.tokenizer(text) for text in DOCS]},
              "texts": {"c": list(DOCS)}, "gpu_timing": True}
-    report = execute_single_graph(
+    report = run_graph(
         state, {"filter_limit": None, "retention": {}}, graph)
     table = report["_outputs"][PortRef("ai-extract:ends", "rows:c")].to_pydict()
     assert table["c"] == [0, 1]
@@ -658,7 +658,7 @@ def test_a_filter_on_answers_drops_documents_before_the_next_question(
              "device": DEVICES["h100-sxm"], "chunk_tokens": 400,
              "documents": {"c": [tables.tokenizer(text) for text in DOCS]},
              "texts": {"c": list(DOCS)}}
-    report = execute_single_graph(
+    report = run_graph(
         state, {"filter_limit": None, "retention": {}}, graph)
     outputs = report["_outputs"]
     first = outputs[PortRef("ai-extract:ends", "rows:c")].to_pydict()
@@ -749,7 +749,7 @@ def test_a_filter_after_an_extraction_rewinds_the_kv_past_the_answer(
              "device": DEVICES["h100-sxm"], "chunk_tokens": 400,
              "documents": {"c": [tables.tokenizer(text) for text in DOCS]},
              "texts": {"c": list(DOCS)}}
-    report = execute_single_graph(
+    report = run_graph(
         state, {"filter_limit": None, "retention": {}}, graph)
     outputs = report["_outputs"]
     assert outputs[PortRef("ai-extract:ends", "rows:c")].to_pydict()["ends"] == [
@@ -817,7 +817,7 @@ def test_a_limit_ends_the_pipeline_once_enough_documents_pass(monkeypatch, limit
              "runtimes": built_in_registry().runtimes,
              "device": DEVICES["h100-sxm"], "chunk_tokens": chunk,
              "documents": {"c": documents}, "texts": {"c": list(texts)}}
-    report = execute_single_graph(
+    report = run_graph(
         state, {"filter_limit": limit, "retention": {}}, graph)
     outputs = report["_outputs"]
     kept = outputs[PortRef("filter:c:0", "rows:c")].to_pydict()

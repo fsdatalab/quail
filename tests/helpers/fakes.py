@@ -5,6 +5,7 @@ filter stage s asks [QUESTION + s], partner i streams [PARTNER + i] *
 length, and the join frame is [FRAME] * length.
 """
 
+import json
 import random
 import threading
 from contextlib import nullcontext
@@ -18,7 +19,7 @@ from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.arena import KVArena
 from quail.backends.quail.executor.models.base import ModelPipeline
 from quail.backends.quail.executor.pages import PageArena
-from quail.backends.quail.graph import execute_single_graph, serve_region
+from quail.backends.quail.graph import execute_staged_graph, serve_region
 from quail.builtins import built_in_registry
 from quail.common.expressions import ColumnRef
 from quail.physical import (
@@ -303,7 +304,7 @@ def run_graph_on_arena(monkeypatch, graph, *, num_documents=14, num_partners=4,
         "device": DEVICES["h100-sxm"],
         "chunk_tokens": 120, "documents": documents, **extra,
     }
-    result = execute_single_graph(state, SETTINGS, graph)
+    result = run_graph(state, SETTINGS, graph)
     assert not arena.accounting.owned
     return result, model, filter_truth, join_truth
 
@@ -393,6 +394,29 @@ def fake_readout(**attributes):
         "trailing_rows": 1, "normalize": False, "dtype": None,
         "submit": lambda value, rows_per_answer=None: value,
         "result": lambda value: value, **attributes})
+
+
+def run_graph(state, payload, graph) -> dict:
+    """Run a graph on one executor state, as a region on one GPU runs.
+
+    The graph is one stage, served on a thread.
+
+    Args:
+        state: The executor's state, as ``graph_state`` builds it.
+        payload: The query's runtime payload, without its stages.
+        graph: The region's graph.
+    """
+    # the region sends each scan's document ids, so a scan built
+    # without its count takes it from the documents
+    graph = PhysicalGraph(tuple(
+        node.replace(num_documents=len(state["documents"][node.alias]))
+        if isinstance(node, Scan) else node for node in graph.nodes), graph.root)
+    payload = {
+        **payload, "gpu_timing": state.get("gpu_timing", False),
+        "stages": json.loads(_quail_native.region_stages(graph.to_json(), 1))}
+    return execute_staged_graph(
+        payload, graph, 1, thread_servers([state], payload, graph),
+        state["device"])
 
 
 def thread_servers(states, payload, graph):

@@ -98,7 +98,8 @@ def serve_stages(server, context: ExecutionContext, graph: PhysicalGraph,
         context: The region's execution context on this GPU.
         graph: The region's compute graph.
         stages: The plan's stages, as its "stages" setting holds them.
-        wanted: The (node, port) pairs the region's FinishedRows reads.
+        wanted: The (node, port) pairs the region's FinishedRows reads;
+            None when no one takes the region's rows as they finish.
         hinted: Each scan alias's table name, for the tables the
             region's hint holds rows of; None when it has no hint.
         first: For each alias the plan deduplicates, each row's first
@@ -107,14 +108,15 @@ def serve_stages(server, context: ExecutionContext, graph: PhysicalGraph,
     Returns:
         Node id -> NodeResult, of Arrow tables, of each node this server ran.
     """
-    wanted = {tuple(pair) for pair in wanted}
+    reports = wanted is not None
+    wanted = {tuple(pair) for pair in wanted or ()}
     hint = None if hinted is None else ServedHint(server, set(hinted.values()))
     results = {}
     while (request := server.next_stage()) is not None:
         stage, tables = request
         try:
             rows = _StageRows(server, wanted)
-            with reporting(rows if wanted else None, hint, hinted, first):
+            with reporting(rows if reports else None, hint, hinted, first):
                 outputs, ran = run_stage(context, graph, stages[stage], tables, rows)
         except Exception:
             server.fail(traceback.format_exc())

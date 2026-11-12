@@ -18,12 +18,12 @@ from helpers.fakes import (
     fake_pipeline,
     fake_readout,
     fake_torch,
+    run_graph,
 )
 from test_kv_reads import named
 
 from quail.backends.quail import QuailModelExecution
 from quail.backends.quail.executor import chunk as chunk_mod
-from quail.backends.quail.graph import execute_single_graph
 from quail.builtins import built_in_registry
 from quail.execution.finished import reporting
 from quail.physical import (
@@ -222,7 +222,7 @@ def test_streamed_classification_labels_survivors_with_their_kv_resident(
         "runtimes": built_in_registry().runtimes, "device": DEVICES["h100-sxm"],
         "chunk_tokens": 120, "documents": documents,
     }
-    result = execute_single_graph(
+    result = run_graph(
         state, SETTINGS, fused_graph(classify_only=classify_only))
     assert not arena.accounting.owned
 
@@ -394,7 +394,7 @@ def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
                 handed.extend(table.to_pylist())
 
     with reporting(Taken()):
-        result = execute_single_graph(state, SETTINGS, graph)
+        result = run_graph(state, SETTINGS, graph)
     assert not arena.accounting.owned
     # each anchor's labeled pairs are handed on as the anchor settles
     assert sorted(handed, key=lambda row: (row["r"], row["p"])) == [
@@ -493,7 +493,7 @@ def test_a_filter_after_a_classification_asks_over_the_resident_kv(monkeypatch):
         "runtimes": built_in_registry().runtimes, "device": DEVICES["h100-sxm"],
         "chunk_tokens": 120, "documents": documents,
     }
-    result = execute_single_graph(state, SETTINGS, graph)
+    result = run_graph(state, SETTINGS, graph)
     outputs, metrics = result["_outputs"], result["node_metrics"]
     passed = [d for d in range(num_documents) if filter_truth[d][0]]
     accepted = [d for d in passed if label_truth[d] == 0]
@@ -699,7 +699,7 @@ def _run_recorded_region(monkeypatch, region):
         "runtimes": built_in_registry().runtimes, "device": DEVICES["h100-sxm"],
         "chunk_tokens": 120, "documents": documents,
     }
-    result = execute_single_graph(state, SETTINGS, graph)
+    result = run_graph(state, SETTINGS, graph)
     assert not arena.accounting.owned
     return result, model
 

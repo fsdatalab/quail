@@ -692,10 +692,7 @@ def oracle_executor(oracle: Oracle, **report):
     """
     def execute(request):
         from helpers.fakes import graph_state, thread_servers
-        from quail.backends.quail.graph import (
-            execute_single_graph,
-            execute_staged_graph,
-        )
+        from quail.backends.quail.graph import execute_staged_graph
         from quail.execution.types import PhysicalResponse
         from quail.physical import Scan
         from quail.specs import DEVICES
@@ -711,7 +708,7 @@ def oracle_executor(oracle: Oracle, **report):
         payload = {
             "filter_limit": None, "columns": request.column_tables(),
             "deduplicate": request.plan["settings"].get("deduplicate", {}),
-            "stages": request.plan["settings"].get("stages")}
+            "stages": request.plan["settings"]["stages"]}
         states = []
         for model in [oracle] if request.gpus == 1 else [
                 copy.copy(oracle) for _ in range(request.gpus)]:
@@ -720,12 +717,9 @@ def oracle_executor(oracle: Oracle, **report):
             state["columns"] = payload["columns"]
             model.arena = state["gpu"].arena
             states.append(state)
-        if payload["stages"] is None:
-            result = execute_single_graph(states[0], payload, graph)
-        else:
-            result = execute_staged_graph(
-                payload, graph, request.gpus,
-                thread_servers(states, payload, graph), DEVICES["h100-sxm"])
+        result = execute_staged_graph(
+            payload, graph, request.gpus,
+            thread_servers(states, payload, graph), DEVICES["h100-sxm"])
         outputs = result.pop("_outputs")
         return PhysicalResponse(outputs, {
             **result, "wall_s": 1.0, "boot_s": 0.5, "fresh_tokens": 1234, **report})

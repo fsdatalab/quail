@@ -2,7 +2,7 @@
 
 import pyarrow as pa
 import pytest
-from helpers.fakes import graph_state
+from helpers.fakes import graph_state, run_graph
 from helpers.oracle import Oracle
 from helpers.sessions import TOKENIZER
 
@@ -10,7 +10,6 @@ import quail
 from bench import quailb
 from quail.api.config import EngineConfig
 from quail.api.execute import execute_query
-from quail.backends.quail.graph import execute_single_graph
 from quail.execution.metrics import NodeMetrics
 from quail.execution.types import PhysicalResponse
 from quail.physical import (
@@ -101,7 +100,7 @@ def fever_executor(session, monkeypatch, gpus, check=None, capacity=1,
             state = graph_state(model, documents)
             model.arena = state["gpu"].arena
             state.update(extra)
-            report = execute_single_graph(state, request.plan["settings"], graph)
+            report = run_graph(state, request.plan["settings"], graph)
             assert not state["gpu"].arena.accounting.owned
             return PhysicalResponse(report.pop("_outputs"), report)
         states = []
