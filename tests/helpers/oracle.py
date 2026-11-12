@@ -707,12 +707,12 @@ def _serve(model, path, description=None):
                 continue
             region = json.loads(message[1])
             payload = {**region["query"], **payload_tables(message[2])}
-            if not model.documents:
-                # no request named the oracle's documents: the region's are
-                model.documents = payload["documents"]
-                model.texts = {alias: payload["texts"].get(alias)
-                               for alias in payload["documents"]}
-                model.source_rows = {}
+            # the oracle answers about the region's documents
+            model.documents = payload["documents"]
+            model.texts = {alias: payload["texts"].get(alias)
+                           for alias in payload["documents"]}
+            model.source_rows = {alias: rows.to_pylist() for alias, rows
+                                 in payload["source_rows"].items()}
             state = graph_state(model, payload["documents"])
             state["texts"] = payload["texts"]
             state["columns"] = payload["columns"]
@@ -744,22 +744,12 @@ class OracleWorkers:
                        **report}
         self._workers = None
 
-    def start_workers(self, request) -> dict:
-        """Start a worker per GPU of the request; returns them with a boot record."""
-        from quail.physical import Scan
-
+    def start_workers(self, gpus: int) -> dict:
+        """Start a worker per GPU; returns them with a boot record."""
         oracle = self.oracle
-        scans = [node for node in graph_from_envelope(request.plan).nodes
-                 if isinstance(node, Scan)]
-        oracle.documents = {node.alias: request.inputs[node.input_id].documents
-                            for node in scans}
-        oracle.texts = {node.alias: request.inputs[node.input_id].texts
-                        for node in scans}
-        oracle.source_rows = {alias: rows.to_pylist()
-                              for alias, rows in request.source_rows.items()}
-        models = [oracle] if request.gpus == 1 else [
-            copy.copy(oracle) for _ in range(request.gpus)]
-        self._workers = workers = _quail_native.Workers(request.gpus)
+        models = [oracle] if gpus == 1 else [
+            copy.copy(oracle) for _ in range(gpus)]
+        self._workers = workers = _quail_native.Workers(gpus)
         for model, path in zip(models, workers.paths, strict=True):
             threading.Thread(target=_serve, args=(model, str(path)),
                              daemon=True).start()
@@ -780,16 +770,23 @@ class OracleWorkers:
         """
         from helpers.fakes import run_on_workers
         from quail.execution.types import PhysicalResponse
+        from quail.physical import Scan
         from quail.specs import DEVICES
 
-        booted = self.start_workers(request)
+        scans = [node for node in graph_from_envelope(request.plan).nodes
+                 if isinstance(node, Scan)]
+        booted = self.start_workers(request.gpus)
         try:
-            oracle = self.oracle
             payload = {
                 "physical_plan": request.plan, **request.plan["settings"],
-                "documents": oracle.documents, "columns": request.column_tables(),
-                "texts": {alias: texts for alias, texts in oracle.texts.items()
-                          if texts is not None}}
+                "documents": {node.alias: request.inputs[node.input_id].documents
+                              for node in scans},
+                "columns": request.column_tables(),
+                "texts": {node.alias: request.inputs[node.input_id].texts
+                          for node in scans
+                          if request.inputs[node.input_id].texts is not None},
+                "source_rows": {alias: pa.table({"row": rows})
+                                for alias, rows in request.source_rows.items()}}
             result = run_on_workers(
                 booted["workers"], payload, graph_from_envelope(request.plan),
                 DEVICES[request.plan["device"]])

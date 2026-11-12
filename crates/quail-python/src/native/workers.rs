@@ -43,20 +43,14 @@ fn tables_to_python<'py>(py: Python<'py>, tables: Vec<Table>) -> PyResult<Vec<Bo
 /// `crate::workers::Workers`.
 #[pyclass(name = "Workers", module = "_quail_native")]
 pub(super) struct Workers {
-    workers: Option<crate::workers::Workers>,
+    workers: Option<Arc<Mutex<crate::workers::Workers>>>,
 }
 
 impl Workers {
-    /// Hand the workers to a session, which owns them from then on.
-    pub(super) fn take(&mut self) -> PyResult<crate::workers::Workers> {
+    /// The workers, which a session may share with this object.
+    pub(super) fn shared(&self) -> PyResult<Arc<Mutex<crate::workers::Workers>>> {
         self.workers
-            .take()
-            .ok_or_else(|| PyRuntimeError::new_err("the GPU workers are closed"))
-    }
-
-    fn open(&mut self) -> PyResult<&mut crate::workers::Workers> {
-        self.workers
-            .as_mut()
+            .clone()
             .ok_or_else(|| PyRuntimeError::new_err("the GPU workers are closed"))
     }
 }
@@ -68,41 +62,46 @@ impl Workers {
     fn new(gpus: usize) -> PyResult<Self> {
         let workers = crate::workers::Workers::bind(gpus).map_err(python_error)?;
         Ok(Workers {
-            workers: Some(workers),
+            workers: Some(Arc::new(Mutex::new(workers))),
         })
     }
 
     /// Each worker's socket, by GPU.
     #[getter]
     fn paths(&mut self) -> PyResult<Vec<PathBuf>> {
-        Ok(self.open()?.paths().to_vec())
+        let shared = self.shared()?;
+        let workers = shared.lock().expect("the workers lock");
+        Ok(workers.paths().to_vec())
     }
 
     /// Start one process per GPU: `command`, then the worker's socket
     /// and its GPU's index.
     fn spawn(&mut self, command: Vec<String>) -> PyResult<()> {
-        self.open()?.spawn(&command).map_err(python_error)
+        let shared = self.shared()?;
+        let mut workers = shared.lock().expect("the workers lock");
+        workers.spawn(&command).map_err(python_error)
     }
 
     /// Wait for every worker to connect.
     fn connect(&mut self, py: Python<'_>) -> PyResult<()> {
-        let workers = self.open()?;
-        py.detach(|| workers.connect()).map_err(python_error)
+        let shared = self.shared()?;
+        py.detach(|| shared.lock().expect("the workers lock").connect())
+            .map_err(python_error)
     }
 
     /// Whether the workers are open and every process is running.
     fn alive(&mut self) -> bool {
         self.workers
-            .as_mut()
-            .is_some_and(crate::workers::Workers::alive)
+            .as_ref()
+            .is_some_and(|shared| shared.lock().expect("the workers lock").alive())
     }
 
     /// What Quail plans the regions of `config` with; both are JSON.
     fn describe(&mut self, py: Python<'_>, config: &str) -> PyResult<String> {
         let config: serde_json::Value = from_json(config)?;
-        let workers = self.open()?;
+        let shared = self.shared()?;
         let described = py
-            .detach(|| workers.describe(&config))
+            .detach(|| shared.lock().expect("the workers lock").describe(&config))
             .map_err(python_error)?;
         Ok(described.to_string())
     }
@@ -111,8 +110,10 @@ impl Workers {
     /// worker's boot record are JSON.
     fn boot(&mut self, py: Python<'_>, setup: &str) -> PyResult<Vec<String>> {
         let setup: serde_json::Value = from_json(setup)?;
-        let workers = self.open()?;
-        let booted = py.detach(|| workers.boot(&setup)).map_err(python_error)?;
+        let shared = self.shared()?;
+        let booted = py
+            .detach(|| shared.lock().expect("the workers lock").boot(&setup))
+            .map_err(python_error)?;
         Ok(booted.iter().map(ToString::to_string).collect())
     }
 
@@ -179,9 +180,10 @@ impl Workers {
                 .map_err(external)
             }),
         };
-        let workers = self.open()?;
+        let shared = self.shared()?;
         let ran = py
             .detach(|| {
+                let mut workers = shared.lock().expect("the workers lock");
                 workers.run_region(&region, &tables, |connections| {
                     crate::stages::run_stages(&graph, cut, groupings, connections, calls)
                 })
@@ -240,10 +242,9 @@ impl Workers {
             operators: &found,
             operators_json: operators,
             scans: &scans,
+            source_rows: &source_rows,
         };
-        let finished = Arc::new(Mutex::new(
-            planned.finished_rows(source_rows).map_err(invalid)?,
-        ));
+        let finished = Arc::new(Mutex::new(planned.finished_rows().map_err(invalid)?));
         let external = |error: PyErr| DataFusionError::External(Box::new(error));
         let hand_on: Arc<dyn Fn(RecordBatch) -> datafusion::common::Result<()> + Send + Sync> =
             Arc::new(move |rows: RecordBatch| {
@@ -272,11 +273,17 @@ impl Workers {
             progress: listening.0,
             answers: listening.1,
         };
-        let workers = self.open()?;
+        let shared = self.shared()?;
         let ran = py
             .detach(|| {
+                let mut workers = shared.lock().expect("the workers lock");
                 crate::region_run::run_region(
-                    workers, &planned, &listening, &finished, hand_on, ask,
+                    &mut workers,
+                    &planned,
+                    &listening,
+                    &finished,
+                    hand_on,
+                    ask,
                 )
             })
             .map_err(python_error)?;

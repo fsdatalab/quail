@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
-use arrow::array::{Array, ArrayRef, RecordBatch};
+use arrow::array::{Array, ArrayRef, Int32Array, RecordBatch};
 use arrow::compute::concat;
 use datafusion::common::{DataFusionError, Result};
 use quail_datafusion::derive::expressions::PhysicalValue;
@@ -39,6 +39,9 @@ pub struct Planned<'a> {
     pub operators_json: &'a str,
     /// What each scan reads.
     pub scans: &'a [Scanned],
+    /// By alias, each document's row in the registered table, for a
+    /// scan that reads some of a table's rows.
+    pub source_rows: &'a BTreeMap<String, Vec<i32>>,
 }
 
 impl Planned<'_> {
@@ -64,13 +67,10 @@ impl Planned<'_> {
     /// What the region's rows are built from: its operators, every port
     /// its run returns, and each scan's number of documents.
     ///
-    /// `source_rows` gives, by alias, each document's row in the
-    /// registered table, for a scan that reads some of a table's rows.
-    ///
     /// # Errors
     ///
     /// The plan's graph does not decode.
-    pub fn answer_request(&self, source_rows: BTreeMap<String, Vec<i32>>) -> Result<AnswerRequest> {
+    pub fn answer_request(&self) -> Result<AnswerRequest> {
         let ports = (self.compute()?.nodes.iter())
             .flat_map(|node| {
                 node.output_ports().into_iter().map(|port| OutputPort {
@@ -99,7 +99,7 @@ impl Planned<'_> {
             operators: self.operators_json.to_string(),
             ports,
             num_documents,
-            source_rows,
+            source_rows: self.source_rows.clone(),
         })
     }
 
@@ -147,8 +147,8 @@ impl Planned<'_> {
     /// # Errors
     ///
     /// The graph does not decode, or a column has no source.
-    pub fn finished_rows(&self, source_rows: BTreeMap<String, Vec<i32>>) -> Result<FinishedRows> {
-        FinishedRows::new(&self.answer_request(source_rows)?, &self.sources()?).map_err(failure)
+    pub fn finished_rows(&self) -> Result<FinishedRows> {
+        FinishedRows::new(&self.answer_request()?, &self.sources()?).map_err(failure)
     }
 }
 
@@ -221,7 +221,16 @@ pub fn run_region(
         "query": query, "wanted": wanted, "hinted": listening.hinted,
         "listening": [listening.progress, listening.answers],
     });
-    let tables = request_tables(envelope, planned.operators, planned.scans).map_err(compile)?;
+    let mut tables = request_tables(envelope, planned.operators, planned.scans).map_err(compile)?;
+    // a worker may name a document by its row in the registered table
+    for (alias, positions) in planned.source_rows {
+        let positions: ArrayRef = Arc::new(Int32Array::from(positions.clone()));
+        let batch = RecordBatch::try_from_iter([("row", positions)])?;
+        tables.push((
+            format!("source_rows:{alias}"),
+            (batch.schema(), vec![batch]),
+        ));
+    }
     let deduplicated: Vec<String> = match settings.get("deduplicate") {
         Some(Value::Object(found)) => found.keys().cloned().collect(),
         _ => Vec::new(),

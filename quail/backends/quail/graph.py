@@ -142,7 +142,7 @@ def execution_measurements(context: ExecutionContext) -> dict:
 
 
 # the tables of a runtime payload, each a mapping from alias
-_PAYLOAD_TABLES = ("documents", "texts", "columns")
+_PAYLOAD_TABLES = ("documents", "texts", "columns", "source_rows")
 
 
 def payload_tables(tables: dict) -> dict:
@@ -152,7 +152,8 @@ def payload_tables(tables: dict) -> dict:
         kind, alias = name.split(":", 1)
         payload[kind][alias] = (
             documents_from_table(table) if kind == "documents"
-            else table.column("text") if kind == "texts" else table)
+            else table.column("text") if kind == "texts"
+            else table.column("row") if kind == "source_rows" else table)
     return payload
 
 

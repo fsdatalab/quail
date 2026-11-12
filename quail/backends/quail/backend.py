@@ -8,8 +8,11 @@ from typing import Any
 from quail.backends.base import GpuContext
 from quail.backends.quail.executor.models import supported_archs
 from quail.backends.quail.executor.runtime import QuailModelExecution
+from quail.backends.quail.graph import region_report
 from quail.backends.quail.worker import (
+    boot_record,
     prepare_quail_request,
+    quail_workers,
     release_quail_request,
     run_quail_region,
 )
@@ -65,6 +68,32 @@ class QuailBackend:
             under "_outputs".
         """
         return run_quail_region(envelope, registry, runtime_state, **region)
+
+    def workers(self, config):
+        """Return the GPUs' workers for a session's configuration."""
+        return quail_workers(config.model, config.device, config.backend,
+                             config.gpus)
+
+    def report_region(self, plan, ran: list, boots: list, seconds: float,
+                      device) -> dict:
+        """Report a region's run on workers that Rust drove.
+
+        Args:
+            plan: The region's physical plan.
+            ran: Per worker, what it ran: its counters as JSON and its
+                nodes' output tables.
+            boots: Each worker's boot record.
+            seconds: Seconds the region took on the workers.
+            device: The GPUs' device spec.
+
+        Returns:
+            The run's report, with its outputs under "_outputs".
+        """
+        report = region_report(plan.graph, ran, seconds, device, gpus=plan.gpus,
+                               gpu_timing=plan.settings.get("gpu_timing", False))
+        boot = boot_record(boots)
+        report.update(boot_s=boot["boot_s"], boot_kind=boot["kind"], boot=boot)
+        return report
 
     def release_request(self, state) -> None:
         """Release the GPU processes and the model loaded for one configuration."""

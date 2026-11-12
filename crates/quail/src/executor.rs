@@ -20,7 +20,7 @@ use datafusion::datasource::TableType;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::logical_expr::{Expr, LogicalPlan};
 use datafusion::physical_plan::ExecutionPlan;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use quail_datafusion::{
     IdentifiedTable, InputRows, InputStream, ModelRegion, RegionBatches, RegionColumns, RegionHint,
@@ -68,8 +68,8 @@ pub trait RegionEngine: Send + Sync + std::fmt::Debug {
 /// What runs a region's model calls.
 enum Runs {
     Engine(Arc<dyn RegionEngine>),
-    /// Quail's GPU workers, which this executor owns.
-    Workers(Mutex<Workers>),
+    /// Quail's GPU workers.
+    Workers(Arc<Mutex<Workers>>),
 }
 
 impl std::fmt::Debug for Runs {
@@ -103,6 +103,28 @@ pub struct Executor {
     /// The planner and configuration Rust plans each region with, then
     /// calls the engine's `execute`; None calls `run_region`.
     pub(crate) planning: Option<(Arc<Planner>, Settings)>,
+    /// What each region of the running query ran on the workers.
+    regions: Mutex<Vec<RegionRan>>,
+}
+
+/// One region's run on the GPU workers.
+#[derive(Debug)]
+pub struct RegionRan {
+    /// The planned region, as [`outcome_json`] writes it, with its
+    /// logical plan, planning seconds, and region id.
+    pub planned: String,
+    /// What each scan read.
+    pub scans: Vec<ScanInputs>,
+    /// The rows of each input the region read, by table name.
+    pub inputs: Vec<InputRows>,
+    /// The region's rows, with Quail's names for its columns.
+    pub rows: RecordBatch,
+    /// What each worker ran: its counters and its nodes' outputs.
+    pub ran: Vec<crate::workers::Ran>,
+    /// Each worker's boot record.
+    pub boots: Vec<serde_json::Value>,
+    /// Seconds the region took on the workers.
+    pub seconds: f64,
 }
 
 impl Executor {
@@ -120,21 +142,35 @@ impl Executor {
         let mut workers = Workers::bind(config.gpus)?;
         workers.spawn(&worker_command())?;
         workers.connect()?;
-        Self::on_workers(workers, config)
+        Self::on_workers(Arc::new(Mutex::new(workers)), config)
     }
 
     /// An executor for `config` that runs model regions on `workers`,
-    /// which are connected.
+    /// which are connected; it asks one what Quail plans with.
     ///
     /// # Errors
     ///
     /// A worker refuses the configuration, or what it describes does
     /// not read.
-    pub fn on_workers(workers: Workers, config: &EngineConfig) -> Result<Self> {
-        let described = workers.describe(&serde_json::json!({
-            "model": config.model, "device": config.device,
-            "gpus": config.gpus, "backend": config.backend,
-        }))?;
+    pub fn on_workers(workers: Arc<Mutex<Workers>>, config: &EngineConfig) -> Result<Self> {
+        let described = workers
+            .lock()
+            .expect("the workers lock")
+            .describe(&serde_json::json!({
+                "model": config.model, "device": config.device,
+                "gpus": config.gpus, "backend": config.backend,
+            }))?;
+        Self::described(workers, &described)
+    }
+
+    /// An executor that runs model regions on `workers`, planning with
+    /// what a worker described: the model's chat turn and prompt
+    /// layout, the rules, the tokenizer file, and the planning settings.
+    ///
+    /// # Errors
+    ///
+    /// The description does not read.
+    pub fn described(workers: Arc<Mutex<Workers>>, described: &serde_json::Value) -> Result<Self> {
         let read = |error: serde_json::Error| DataFusionError::External(Box::new(error));
         let field = |name: &str| described[name].clone();
         let turn: (String, String) = serde_json::from_value(field("turn")).map_err(read)?;
@@ -145,12 +181,13 @@ impl Executor {
         let planner =
             Planner::new(std::path::Path::new(&tokenizer)).map_err(quail_datafusion::external)?;
         Ok(Self {
-            runs: Runs::Workers(Mutex::new(workers)),
+            runs: Runs::Workers(workers),
             rules,
             prompting: (turn, layout),
             caller: Mutex::new(None),
             execution: Mutex::new(()),
             planning: Some((Arc::new(planner), settings)),
+            regions: Mutex::new(Vec::new()),
         })
     }
 
@@ -175,6 +212,7 @@ impl Executor {
             caller: Mutex::new(None),
             execution: Mutex::new(()),
             planning,
+            regions: Mutex::new(Vec::new()),
         }
     }
 }
@@ -197,6 +235,12 @@ impl Drop for CallerGuard<'_> {
 }
 
 impl Executor {
+    /// What each region of the last query ran on the workers, in the
+    /// order the regions ran; the executor keeps none of it.
+    pub fn take_regions(&self) -> Vec<RegionRan> {
+        std::mem::take(&mut *self.regions.lock().expect("the regions lock"))
+    }
+
     pub(crate) fn enter(&self, sender: UnboundedSender<RegionCall>) -> Result<CallerGuard<'_>> {
         let thread = std::thread::current().id();
         if self
@@ -214,6 +258,7 @@ impl Executor {
             DataFusionError::Execution("the executor's previous query panicked".into())
         })?;
         *self.caller.lock().expect("the caller lock") = Some((thread, sender));
+        self.regions.lock().expect("the regions lock").clear();
         Ok(CallerGuard {
             executor: self,
             _execution: execution,
@@ -467,6 +512,9 @@ impl Executor {
             .plan(&operators, tables, settings)
             .map_err(compile)?;
         let mut planned = outcome_json(&outcome).map_err(compile)?;
+        if settings.gpu_timing && planned.get("envelope").is_some() {
+            planned["envelope"]["settings"]["gpu_timing"] = true.into();
+        }
         planned["logical"] = logical.into();
         planned["planning_s"] = started.elapsed().as_secs_f64().into();
         Ok(Some((planned.to_string(), scans)))
@@ -578,7 +626,24 @@ impl Executor {
                     )
                 })?;
                 let conformed = move |batch| conform(batch, &names, schema.inner());
-                return run_on_workers(workers, &found, &scans, held, conformed, rows);
+                let mut source_rows = BTreeMap::new();
+                for ((name, batches), input) in inputs.iter().zip(&region.inputs) {
+                    if let Some(positions) = source_positions(name, input, batches)? {
+                        source_rows.insert(name.clone(), positions);
+                    }
+                }
+                let ran = run_on_workers(
+                    workers,
+                    found,
+                    scans,
+                    inputs.to_vec(),
+                    &source_rows,
+                    held,
+                    conformed,
+                    rows,
+                )?;
+                self.regions.lock().expect("the regions lock").push(ran);
+                return Ok(());
             }
         };
         let returned = engine.run(EngineRegion {
@@ -601,28 +666,33 @@ impl Executor {
 }
 
 /// Run a region Rust planned on the executor's workers, sending its
-/// rows, as `conformed` gives them the region's schema, to `rows`.
+/// rows, as `conformed` gives them the region's schema, to `rows`;
+/// returns what the region ran.
 ///
 /// `found` is the planned region as [`outcome_json`] writes it, and
-/// `scans` what its scans read. Each worker boots for the plan first;
-/// a worker that has the model loaded takes no time.
+/// `scans` what its scans read. `source_rows` gives, by input name,
+/// each row's position in the registered table. Each worker boots for
+/// the plan first; a worker that has the model loaded takes no time.
+#[allow(clippy::too_many_arguments)]
 fn run_on_workers(
     workers: &Mutex<Workers>,
-    found: &str,
-    scans: &[ScanInputs],
+    found: String,
+    scans: Vec<ScanInputs>,
+    inputs: Vec<InputRows>,
+    source_rows: &BTreeMap<String, Vec<i32>>,
     hint: Option<InputHint>,
     conformed: impl Fn(RecordBatch) -> Result<RecordBatch> + Send + Sync + 'static,
     rows: &RowSender,
-) -> Result<()> {
+) -> Result<RegionRan> {
     let read = |error: serde_json::Error| DataFusionError::External(Box::new(error));
-    let found: serde_json::Value = serde_json::from_str(found).map_err(read)?;
-    if let Some(refusal) = found.get("refusal") {
+    let plan: serde_json::Value = serde_json::from_str(&found).map_err(read)?;
+    if let Some(refusal) = plan.get("refusal") {
         return Err(DataFusionError::External(
             format!("RefusalError: {refusal}").into(),
         ));
     }
-    let envelope = &found["envelope"];
-    let operators_json = found["operators"].as_str().unwrap_or_default();
+    let envelope = &plan["envelope"];
+    let operators_json = plan["operators"].as_str().unwrap_or_default();
     let operators: Operators = serde_json::from_str(operators_json).map_err(read)?;
     let scanned: Vec<crate::request::Scanned> = scans
         .iter()
@@ -634,11 +704,16 @@ fn run_on_workers(
             (scan.alias.clone(), tokens, scan.columns.clone())
         })
         .collect();
+    // the workers and the answers name a scan by its alias
+    let by_alias: BTreeMap<String, Vec<i32>> = (operators.scans.iter())
+        .filter_map(|scan| Some((scan.alias.clone(), source_rows.get(&scan.provider)?.clone())))
+        .collect();
     let planned = crate::region_run::Planned {
         envelope,
         operators: &operators,
         operators_json,
         scans: &scanned,
+        source_rows: &by_alias,
     };
     let settings = &envelope["settings"];
     let setup = serde_json::json!({
@@ -649,7 +724,7 @@ fn run_on_workers(
         // the worker finds the model's files and imports no extension
         "model_path": null, "extensions": [],
     });
-    let finished = Arc::new(Mutex::new(planned.finished_rows(Default::default())?));
+    let finished = Arc::new(Mutex::new(planned.finished_rows()?));
     let hinted = hint.as_ref().map(|hint| {
         (operators.scans.iter())
             .filter(|scan| hint.rows.contains_key(&scan.provider))
@@ -672,9 +747,23 @@ fn run_on_workers(
         _ => Ok(crate::workers::Answer::Json(serde_json::Value::Null)),
     });
     let mut workers = workers.lock().expect("the workers lock");
-    workers.boot(&setup)?;
-    crate::region_run::run_region(&mut workers, &planned, &listening, &finished, on_rows, ask)?;
-    Ok(())
+    let boots = workers.boot(&setup)?;
+    let started = std::time::Instant::now();
+    let ran =
+        crate::region_run::run_region(&mut workers, &planned, &listening, &finished, on_rows, ask)?;
+    let seconds = started.elapsed().as_secs_f64();
+    let rows = (finished.lock().expect("the rows lock"))
+        .rows()
+        .map_err(crate::workers::failure)?;
+    Ok(RegionRan {
+        planned: found,
+        scans,
+        inputs,
+        rows,
+        ran,
+        boots,
+        seconds,
+    })
 }
 
 impl RegionRunner for Executor {
@@ -853,16 +942,13 @@ fn with_region_id(payload: String, id: Option<usize>) -> Result<String> {
     Ok(payload.to_string())
 }
 
-/// An input's rows in the order of the registered table it holds rows of,
-/// found by the table's id column; the rows unchanged for any other input.
-///
-/// DataFusion scans and filters in parallel, so the rows reach the region
-/// in no fixed order.
-fn in_source_order(
+/// An input's rows as one batch, and each row's position in the
+/// registered table the input holds rows of, found by the table's id
+/// column; None for an input that is no such table's rows.
+fn source_lookup(
     input: &datafusion::logical_expr::LogicalPlan,
     batches: &[RecordBatch],
-) -> Result<Vec<RecordBatch>> {
-    use datafusion::arrow::compute::{concat_batches, sort_to_indices, take_record_batch};
+) -> Result<Option<(RecordBatch, datafusion::arrow::array::UInt64Array)>> {
     use datafusion::arrow::datatypes::DataType;
     use datafusion::common::Constraint;
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
@@ -879,13 +965,13 @@ fn in_source_order(
         Ok(TreeNodeRecursion::Continue)
     })?;
     let Some(provider) = source else {
-        return Ok(batches.to_vec());
+        return Ok(None);
     };
     let table = provider
         .downcast_ref::<IdentifiedTable>()
         .expect("an identified table");
     let Some(scanned) = table.inner().downcast_ref::<ScannedTable>() else {
-        return Ok(batches.to_vec());
+        return Ok(None);
     };
     let key = scanned
         .constraints
@@ -895,14 +981,14 @@ fn in_source_order(
             _ => None,
         });
     let Some(key) = key.map(|index| scanned.schema.field(index).name().clone()) else {
-        return Ok(batches.to_vec());
+        return Ok(None);
     };
     let Some(first) = batches.first() else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     let rows = concat_batches(&first.schema(), batches)?;
     let Ok(column) = rows.schema().index_of(&key) else {
-        return Ok(batches.to_vec());
+        return Ok(None);
     };
     let texts = |values: &ArrayRef| -> Result<Vec<Option<String>>> {
         let values = cast(values, &DataType::Utf8)?;
@@ -928,12 +1014,46 @@ fn in_source_order(
             next += 1;
         }
     }
-    let found: datafusion::arrow::array::UInt64Array = texts(rows.column(column))?
+    let found = texts(rows.column(column))?
         .into_iter()
         .map(|value| value.and_then(|value| positions.get(&value).copied()))
         .collect();
+    Ok(Some((rows, found)))
+}
+
+/// An input's rows in the order of the registered table it holds rows of,
+/// found by the table's id column; the rows unchanged for any other input.
+///
+/// DataFusion scans and filters in parallel, so the rows reach the region
+/// in no fixed order.
+fn in_source_order(
+    input: &datafusion::logical_expr::LogicalPlan,
+    batches: &[RecordBatch],
+) -> Result<Vec<RecordBatch>> {
+    use datafusion::arrow::compute::{sort_to_indices, take_record_batch};
+    let Some((rows, found)) = source_lookup(input, batches)? else {
+        return Ok(batches.to_vec());
+    };
     let order = sort_to_indices(&found, None, None)?;
     Ok(vec![take_record_batch(&rows, &order)?])
+}
+
+/// Each row's position in the registered table, for an input named
+/// `<table>@<alias>` that holds some of a registered table's rows; None
+/// for any other input. A row the table does not hold is -1.
+fn source_positions(
+    name: &str,
+    input: &datafusion::logical_expr::LogicalPlan,
+    batches: &[RecordBatch],
+) -> Result<Option<Vec<i32>>> {
+    if !name.contains(quail_planner::operators::INPUT_SEPARATOR) {
+        return Ok(None);
+    }
+    Ok(source_lookup(input, batches)?.map(|(_, found)| {
+        (found.iter())
+            .map(|position| position.map_or(-1, |position| position as i32))
+            .collect()
+    }))
 }
 
 /// Materialize each named table once, projecting the union of columns all

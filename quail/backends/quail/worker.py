@@ -479,6 +479,22 @@ def _boot_workers(envelope, registry) -> dict:
     }
 
 
+def quail_workers(model: str, device: str, backend: str, gpus: int):
+    """Return the GPUs' workers for a configuration, starting them if needed."""
+    return _ensure_workers(gpus, (model, device, backend, gpus))
+
+
+def boot_record(boots: list) -> dict:
+    """Return a run's boot record from each worker's.
+
+    The slowest worker's record; the run is a cold start when any
+    worker's was.
+    """
+    slowest = max(boots, key=lambda boot: boot["boot_s"])
+    return {**slowest, "kind": ("cold" if any(boot["kind"] == "cold" for boot in boots)
+                                else "warm")}
+
+
 def prepare_quail_request(context) -> None:
     """Boot the GPUs from the plan alone; the documents can arrive later."""
     context.runtime_state["booted"] = _boot_workers(

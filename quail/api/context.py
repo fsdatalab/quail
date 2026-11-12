@@ -32,7 +32,7 @@ from collections.abc import Callable
 import pyarrow as pa
 
 from quail.api.compile import DATAFUSION_DIALECTS, compile_message
-from quail.api.engine import Engine
+from quail.api.engine import Engine, engine_description
 from quail.catalog import ScanRequest, TableProvider
 
 
@@ -54,7 +54,7 @@ class SessionContext:
             returns the PhysicalResponse, for tests without a GPU.
         workers: Optional ``_quail_native.Workers``, connected. Rust
             then runs each model region on them itself and calls no
-            Python engine; the context takes the workers.
+            Python engine.
 
     Raises:
         ImportError: The ``_quail_native`` module is not built.
@@ -71,9 +71,8 @@ class SessionContext:
                             run_query=run_query)
             self._native = NativeSession(engine, session.planner)
         else:
-            config = session.config
-            self._native = NativeSession.on_workers(
-                workers, config.model, config.device, config.gpus, config.backend)
+            description = engine_description(Engine(session, order=order))
+            self._native = NativeSession.on_workers(workers, json.dumps(description))
         for name, provider in session.catalog.providers.items():
             self._register_table(name, provider)
 
@@ -102,6 +101,16 @@ class SessionContext:
             return self._native.sql(text, DATAFUSION_DIALECTS[dialect])
         except RuntimeError as error:
             raise RuntimeError(compile_message(error, text)) from None
+
+    def take_regions(self) -> list:
+        """Return what each model region of the last query ran on the workers.
+
+        Each is (the planned region as JSON, its scans by alias, the rows
+        of each input it read by table name, its rows, per worker what it
+        ran, each worker's boot record as JSON, the seconds it took).
+        The context keeps none of it.
+        """
+        return self._native.take_regions()
 
     def region_plans(self, text: str) -> list[dict]:
         """Return each model region Rust derives, as a dict.

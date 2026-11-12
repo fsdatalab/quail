@@ -1,6 +1,7 @@
 """Run a query in the current process."""
 
 import atexit
+import json
 import os
 import time
 
@@ -144,6 +145,23 @@ def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
     results, region_tables, region_s = [], [], []
     region_results = {}
     started = time.perf_counter()
+    from quail.api.query import backend_refusal
+
+    session = query.session
+    # Rust runs the regions of Quail's own backend on GPU workers
+    # itself. An edited plan, a caller that waits for the model, and a
+    # request backend go through the Python engine.
+    workers_of = getattr(physical_executor, "start_workers", None)
+    rust_runs = (
+        plan is None and on_backend_ready is None and on_execution_ready is None
+        and query.num_regions > 0
+        and session.config.backend == "quail" and backend_refusal(session) is None
+        and (physical_executor is None or workers_of is not None))
+    if rust_runs:
+        table, context = _run_in_rust(query, physical_executor, results,
+                                      region_tables, region_s, region_results)
+        return _query_result(query, context, table, whole, started, results,
+                             region_tables, region_s, region_results)
 
     def run_query(region, on_rows=None, hint=None):
         if region.region_id is None or region.region_id in region_results:
@@ -162,6 +180,79 @@ def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
 
     context = SessionContext(query.session, order=query.order, run_query=run_query)
     table = context.sql(query.text, query.dialect)
+    return _query_result(query, context, table, whole, started, results,
+                         region_tables, region_s, region_results)
+
+
+def _run_in_rust(query, source, results, region_tables, region_s, region_results):
+    """Run a query whose model regions Rust runs on GPU workers.
+
+    Each region's QueryResult is built from what Rust kept of its run.
+
+    Args:
+        query: The Query.
+        source: None for the GPUs' workers, or a test's stand-in, as
+            ``_run_on_workers`` takes it.
+        results: Filled with each region's QueryResult, in run order.
+        region_tables: Filled with each region's rows.
+        region_s: Filled with each region's seconds.
+        region_results: Filled with each region's result by region id.
+
+    Returns:
+        The query's rows and the SessionContext that ran it.
+    """
+    from quail.api.context import SessionContext
+    from quail.api.region_inputs import region_query
+
+    session = query.session
+    config, registry = session.config, session.registry
+    backend = registry.backend(config.backend)
+    if source is None:
+        problem = gpu_problem()
+        if problem is not None:
+            raise RuntimeError(
+                f"cannot run the model on this machine: {problem}. "
+                "Run your Session on a machine with a CUDA GPU "
+                "and the backend installed.")
+        workers = backend.workers(config)
+    else:
+        workers = source.start_workers(config.gpus)["workers"]
+    try:
+        context = SessionContext(session, order=query.order, workers=workers)
+        table = context.sql(query.text, query.dialect)
+        regions = context.take_regions()
+    finally:
+        if source is not None:
+            source.close()
+    for planned, scans, inputs, relation, ran, boots, seconds in regions:
+        found = json.loads(planned)
+        region = region_query(
+            session, found["operators"], logical=found.get("logical", ""),
+            order=query.order, tables=inputs, keep_order=True,
+            region_id=found.get("region_id"))
+        region.adopt_plan(found, scans)
+        report = backend.report_region(
+            region.plan(), ran, [json.loads(boot) for boot in boots], seconds,
+            registry.device(config.device))
+        if source is not None:
+            report.update(source.report)
+        response = PhysicalResponse(report.pop("_outputs"), report)
+        result = region.finish(response, seconds, relation=relation)
+        result.report.update(
+            planning_s=round(region.planning_s, 4),
+            input_ready_s=round(region.planning_s, 4),
+            physical_prepare_s=0.0, model_wall_s=result.report["wall_s"],
+            finish_s=0.0, worker_total_s=round(seconds, 4))
+        results.append(result)
+        region_tables.append(result.collect())
+        region_s.append(seconds)
+        region_results[region.region_id] = result
+    return table, context
+
+
+def _query_result(query, context, table, whole, started, results, region_tables,
+                  region_s, region_results):
+    """Return a query's result from its rows and its regions' results."""
     if len(results) != 1:
         result = QueryResult.from_table(table, report={
             "regions": [region_results[key].report for key in sorted(region_results)]
@@ -232,15 +323,15 @@ def _execute_region(query, physical_executor, plan, on_backend_ready,
         physical_executor is None or workers_of is not None)
     physical_prepare_started = time.perf_counter()
     request = (query._prepare_physical()
-               if has_compute and (not on_workers or workers_of) else None)
+               if has_compute and not on_workers else None)
     physical_prepare_s = time.perf_counter() - physical_prepare_started
     if on_execution_ready is not None:
         on_execution_ready()
     started = time.perf_counter()
     relation = finished = None
     if on_workers:
-        response, relation = _run_on_workers(query, plan, physical_executor, request,
-                                         on_rows, hint)
+        response, relation = _run_on_workers(query, plan, physical_executor,
+                                             on_rows, hint)
     elif has_compute:
         finished = query.finished_rows(on_rows)
         tables = {scan["alias"]: scan["provider"] for scan in query.facts()["scans"]}
@@ -277,17 +368,16 @@ def _execute_region(query, physical_executor, plan, on_backend_ready,
     return result
 
 
-def _run_on_workers(query, plan, source, request, on_rows, hint):
+def _run_on_workers(query, plan, source, on_rows, hint):
     """Run a region of Quail's backend on GPU workers.
 
     Args:
         query: The region's query.
         plan: Its physical plan.
         source: None for the GPUs' workers, or a test's stand-in:
-            ``start_workers(request)`` returns workers and a boot record
+            ``start_workers(gpus)`` returns workers and a boot record
             as the backend's boot does, ``report`` holds report fields to
             set, and ``close()`` stops the workers.
-        request: The PhysicalRequest, for a stand-in.
         on_rows: Optional callable(pyarrow Table) handed the region's
             rows as they finish.
         hint: The region's ``InputHint``, or None.
@@ -316,7 +406,7 @@ def _run_on_workers(query, plan, source, request, on_rows, hint):
     else:
         try:
             rows, report = backend.run_region(
-                envelope, registry, {"booted": source.start_workers(request)},
+                envelope, registry, {"booted": source.start_workers(plan.gpus)},
                 **region)
         finally:
             source.close()

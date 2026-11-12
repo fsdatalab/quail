@@ -440,6 +440,8 @@ def region_tables(payload: dict) -> list:
         tables.append((f"texts:{alias}", pa.table({"text": texts})))
     for alias, columns in payload.get("columns", {}).items():
         tables.append((f"columns:{alias}", columns))
+    for alias, rows in payload.get("source_rows", {}).items():
+        tables.append((f"source_rows:{alias}", rows))
     return tables
 
 
@@ -464,7 +466,8 @@ def run_on_workers(workers, payload, graph, device) -> dict:
     sinks = (progress_sink(), answer_sink())
     region = json.dumps({
         "query": {name: value for name, value in payload.items()
-                  if name not in ("documents", "texts", "columns")},
+                  if name not in ("documents", "texts", "columns",
+                                  "source_rows")},
         "wanted": wanted, "hinted": hinted_tables(),
         "listening": [sink is not None for sink in sinks]}, default=plain)
     started = time.perf_counter()

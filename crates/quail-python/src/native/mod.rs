@@ -44,31 +44,68 @@ impl NativeSession {
     }
 
     /// Create a session that runs model regions on `workers` itself,
-    /// as `crate::Executor::on_workers` describes: the session takes
-    /// the workers, and no Python engine runs a region.
+    /// as `crate::Executor::described` describes; no Python engine runs
+    /// a region. `description` is what a worker describes of the
+    /// session's configuration, as JSON.
     #[staticmethod]
-    fn on_workers(
-        py: Python<'_>,
-        workers: &mut workers::Workers,
-        model: String,
-        device: String,
-        gpus: usize,
-        backend: String,
-    ) -> PyResult<Self> {
-        let workers = workers.take()?;
-        let config = crate::EngineConfig {
-            model,
-            device,
-            gpus,
-            backend,
-        };
+    fn on_workers(py: Python<'_>, workers: &workers::Workers, description: &str) -> PyResult<Self> {
+        let workers = workers.shared()?;
+        let description: serde_json::Value = from_json(description)?;
         let session = py
             .detach(|| {
-                let executor = crate::Executor::on_workers(workers, &config)?;
+                let executor = crate::Executor::described(workers, &description)?;
                 crate::Session::with_executor(std::sync::Arc::new(executor))
             })
             .map_err(python_error)?;
         Ok(Self { session })
+    }
+
+    /// What each model region of the last query ran on the workers, in
+    /// the order the regions ran: the planned region as JSON, its scans
+    /// as [`crate::scans_to_pyarrow`] gives them, the rows of each input
+    /// it read by table name, its rows, per worker what it ran as JSON
+    /// with its nodes' output tables, each worker's boot record as JSON,
+    /// and the seconds it took. The session keeps none of it.
+    #[allow(clippy::type_complexity)]
+    fn take_regions<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Vec<Bound<'py, pyo3::types::PyTuple>>> {
+        let mut regions = Vec::new();
+        for region in self.session.take_regions() {
+            let inputs = pyo3::types::PyDict::new(py);
+            for (name, batches) in region.inputs {
+                if let Some(first) = batches.first() {
+                    inputs.set_item(name, to_pyarrow(py, first.schema(), batches)?)?;
+                }
+            }
+            let ran = region
+                .ran
+                .into_iter()
+                .map(|(ran, tables)| {
+                    let tables = tables
+                        .into_iter()
+                        .map(|(schema, batches)| to_pyarrow(py, schema, batches))
+                        .collect::<PyResult<Vec<_>>>()?;
+                    Ok((ran.to_string(), tables))
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            let boots: Vec<String> = region.boots.iter().map(ToString::to_string).collect();
+            let rows = to_pyarrow(py, region.rows.schema(), vec![region.rows])?;
+            regions.push(pyo3::types::PyTuple::new(
+                py,
+                [
+                    pyo3::types::PyString::new(py, &region.planned).into_any(),
+                    crate::scans_to_pyarrow(py, &region.scans)?.into_any(),
+                    inputs.into_any(),
+                    rows,
+                    ran.into_pyobject(py)?.into_any(),
+                    boots.into_pyobject(py)?.into_any(),
+                    region.seconds.into_pyobject(py)?.into_any(),
+                ],
+            )?);
+        }
+        Ok(regions)
     }
 
     /// Register a table by its schema, given as the IPC stream bytes of

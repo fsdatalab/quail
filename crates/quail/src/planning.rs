@@ -37,6 +37,9 @@ pub struct Settings {
     pub device: serde_json::Value,
     pub gpus: i64,
     pub canvas_draws: i64,
+    /// Whether a run reports its GPU seconds and chunks.
+    #[serde(default)]
+    pub gpu_timing: bool,
     #[serde(default)]
     pub attention: Option<String>,
     #[serde(default)]

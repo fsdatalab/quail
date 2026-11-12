@@ -53,7 +53,8 @@ use tokio::sync::mpsc::unbounded_channel;
 
 use crate::executor::RegionCall;
 pub use crate::executor::{
-    EngineRegion, Executor, InputHint, RegionEngine, RegionSink, Scan, ScannedTable, region_json,
+    EngineRegion, Executor, InputHint, RegionEngine, RegionRan, RegionSink, Scan, ScannedTable,
+    region_json,
 };
 
 /// The model and hardware a [`Session`] runs on.
@@ -134,6 +135,12 @@ impl Session {
             runtime: Some(Runtime::new()?),
             runner: executor,
         })
+    }
+
+    /// What each model region of the last query ran on the workers, in
+    /// the order the regions ran; the session keeps none of it.
+    pub fn take_regions(&self) -> Vec<RegionRan> {
+        self.runner.take_regions()
     }
 
     /// The DataFusion context, for registering tables or functions.
