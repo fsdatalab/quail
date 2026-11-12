@@ -211,7 +211,7 @@ impl Extracted {
             .cloned()
             .map(|input| self.lower(input, columns))
             .collect::<Result<Vec<_>>>()?;
-        let plan = plan.with_new_exprs(plan.expressions(), inputs)?;
+        let plan = crate::extension::with_inputs(&plan, inputs)?;
         let plan = self.lower_arguments(plan, columns)?;
         // an operator that is no filter, inner join, or SELECT list reads
         // its calls from a SELECT list below it

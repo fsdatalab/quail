@@ -94,5 +94,5 @@ fn drop_unread(plan: LogicalPlan, read: Option<&BTreeSet<String>>) -> Result<Log
         .into_iter()
         .map(|input| drop_unread(input.clone(), below.as_ref()))
         .collect::<Result<Vec<_>>>()?;
-    plan.with_new_exprs(plan.expressions(), inputs)
+    crate::extension::with_inputs(&plan, inputs)
 }

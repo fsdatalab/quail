@@ -8,7 +8,7 @@ use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, ScalarValue};
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
-use quail_planner::constants::DEFAULT_MAP_ANSWER_TOKENS;
+use quail_planner::constants::{DEFAULT_MAP_ANSWER_TOKENS, MAX_MAP_ANSWER_TOKENS};
 use quail_planner::error::{CompileError, compile_error};
 use quail_planner::expressions::{column_alias_of, column_name, explain_call, repr_str};
 use quail_planner::physical::{
@@ -495,9 +495,11 @@ impl Binder {
         let limit = match args.get(2) {
             None => DEFAULT_MAP_ANSWER_TOKENS,
             Some(found) => match integer_of(found) {
-                Some(limit) if limit >= 0 => limit,
+                Some(limit) if (1..=MAX_MAP_ANSWER_TOKENS).contains(&limit) => limit,
                 _ => {
-                    return compile_error("The AI.MAP token limit must be a positive integer.");
+                    return compile_error(format!(
+                        "The AI.MAP token limit must be an integer from 1 to {MAX_MAP_ANSWER_TOKENS}."
+                    ));
                 }
             },
         };

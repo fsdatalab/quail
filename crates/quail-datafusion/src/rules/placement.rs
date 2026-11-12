@@ -233,7 +233,7 @@ fn mover(node: &LogicalPlan) -> Option<Mover> {
 
 /// `node`, whose one input was `input`, over `below` instead.
 fn with_input(node: &LogicalPlan, below: LogicalPlan) -> Result<LogicalPlan> {
-    node.with_new_exprs(node.expressions(), vec![below])
+    crate::extension::with_inputs(node, vec![below])
 }
 
 /// The tables each input of a join holds.
@@ -280,80 +280,80 @@ fn push_down(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
             .iter()
             .any(|expr| !expr_answers(expr).is_disjoint(&moving.added))
     };
-    let moved =
-        match &input {
-            LogicalPlan::Join(join) => {
-                let (left, right) = (plan_tables(&join.left), plan_tables(&join.right));
-                let (keeps_left, keeps_right) = preserved_sides(join.join_type);
-                if keeps_left && moving.tables.is_subset(&left) {
-                    let below = with_input(&node, join.left.as_ref().clone())?;
-                    Some(input.with_new_exprs(
-                        input.expressions(),
-                        vec![below, join.right.as_ref().clone()],
-                    )?)
-                } else if keeps_right && moving.tables.is_subset(&right) {
-                    let below = with_input(&node, join.right.as_ref().clone())?;
-                    Some(input.with_new_exprs(
-                        input.expressions(),
-                        vec![join.left.as_ref().clone(), below],
-                    )?)
-                } else {
-                    None
-                }
+    let moved = match &input {
+        LogicalPlan::Join(join) => {
+            let (left, right) = (plan_tables(&join.left), plan_tables(&join.right));
+            let (keeps_left, keeps_right) = preserved_sides(join.join_type);
+            if keeps_left && moving.tables.is_subset(&left) {
+                let below = with_input(&node, join.left.as_ref().clone())?;
+                Some(crate::extension::with_inputs(
+                    &input,
+                    vec![below, join.right.as_ref().clone()],
+                )?)
+            } else if keeps_right && moving.tables.is_subset(&right) {
+                let below = with_input(&node, join.right.as_ref().clone())?;
+                Some(crate::extension::with_inputs(
+                    &input,
+                    vec![join.left.as_ref().clone(), below],
+                )?)
+            } else {
+                None
             }
-            LogicalPlan::Extension(_) if let Some(join) = ai_join(&input) => {
-                let sides = join_sides(&join.input);
-                let fits = sides.is_some_and(|(left, right)| {
-                    moving.tables.is_subset(&left) || moving.tables.is_subset(&right)
-                });
-                // a classification of joined rows reads the pairs the join keeps
-                let same_pair = moving.pairs && expr_tables(&join.call, &[]) == moving.tables;
-                if fits && !same_pair {
-                    let below = with_input(&node, join.input.as_ref().clone())?;
-                    Some(with_input(&input, below)?)
-                } else {
-                    None
-                }
+        }
+        LogicalPlan::Extension(_) if let Some(join) = ai_join(&input) => {
+            let sides = join_sides(&join.input);
+            let fits = sides.is_some_and(|(left, right)| {
+                moving.tables.is_subset(&left) || moving.tables.is_subset(&right)
+            });
+            // a classification of joined rows reads the pairs the join keeps
+            let same_pair = moving.pairs && expr_tables(&join.call, &[]) == moving.tables;
+            if fits && !same_pair {
+                let below = with_input(&node, join.input.as_ref().clone())?;
+                Some(with_input(&input, below)?)
+            } else {
+                None
             }
-            LogicalPlan::Filter(filter) => {
-                let answers = plan_answers(&filter.input);
-                let below_tables = expr_tables(&filter.predicate, &answers);
-                // a test of the same table's answers belongs to the table's stack
-                if reads_added(&input) || (!moving.pairs && below_tables == moving.tables) {
-                    None
-                } else {
-                    let below = with_input(&node, filter.input.as_ref().clone())?;
-                    Some(with_input(&input, below)?)
-                }
+        }
+        LogicalPlan::Filter(filter) => {
+            let answers = plan_answers(&filter.input);
+            let below_tables = expr_tables(&filter.predicate, &answers);
+            // a test of the same table's answers belongs to the table's stack
+            if reads_added(&input) || (!moving.pairs && below_tables == moving.tables) {
+                None
+            } else {
+                let below = with_input(&node, filter.input.as_ref().clone())?;
+                Some(with_input(&input, below)?)
             }
-            // a SELECT list that passes on every column the node reads,
-            // whatever else it computes, such as a field of another
-            // node's answer
-            LogicalPlan::Projection(projection)
-                if projection
-                    .expr
-                    .iter()
-                    .all(|expr| matches!(expr, Expr::Column(_)))
-                    || as_node::<AiNode>(&node).is_some_and(|ai| {
-                        ai.reads().iter().all(|read| {
-                            projection.expr.iter().any(
-                                |passed| matches!(passed, Expr::Column(found) if found == read),
-                            )
-                        })
-                    }) =>
-            {
-                let below = with_input(&node, projection.input.as_ref().clone())?;
-                let mut exprs = projection.expr.clone();
-                for name in &moving.added {
-                    exprs.push(Expr::Column(Column::from_name(name.clone())));
-                }
-                Some(LogicalPlan::Projection(Projection::try_new(
-                    exprs,
-                    Arc::new(below),
-                )?))
+        }
+        // a SELECT list that passes on every column the node reads,
+        // whatever else it computes, such as a field of another
+        // node's answer
+        LogicalPlan::Projection(projection)
+            if projection
+                .expr
+                .iter()
+                .all(|expr| matches!(expr, Expr::Column(_)))
+                || as_node::<AiNode>(&node).is_some_and(|ai| {
+                    ai.reads().iter().all(|read| {
+                        projection
+                            .expr
+                            .iter()
+                            .any(|passed| matches!(passed, Expr::Column(found) if found == read))
+                    })
+                }) =>
+        {
+            let below = with_input(&node, projection.input.as_ref().clone())?;
+            let mut exprs = projection.expr.clone();
+            for name in &moving.added {
+                exprs.push(Expr::Column(Column::from_name(name.clone())));
             }
-            _ => None,
-        };
+            Some(LogicalPlan::Projection(Projection::try_new(
+                exprs,
+                Arc::new(below),
+            )?))
+        }
+        _ => None,
+    };
     Ok(match moved {
         Some(plan) => Transformed::new(plan, true, TreeNodeRecursion::Stop),
         None => Transformed::no(node),

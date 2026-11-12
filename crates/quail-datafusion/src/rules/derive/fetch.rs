@@ -67,9 +67,10 @@ pub(super) fn distinct_fetches(plan: LogicalPlan) -> Result<Transformed<LogicalP
         };
         let keys = input.schema().columns();
         match enough(input, Enough::Distinct(keys), Vec::new())? {
-            Some((input, _)) => Ok(Transformed::yes(
-                node.with_new_exprs(node.expressions(), vec![input])?,
-            )),
+            Some((input, _)) => Ok(Transformed::yes(crate::extension::with_inputs(
+                &node,
+                vec![input],
+            )?)),
             None => Ok(Transformed::no(node)),
         }
     })
@@ -133,7 +134,7 @@ pub(super) fn key_fetches(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>>
         for (operator, index) in above.into_iter().rev() {
             let mut inputs: Vec<LogicalPlan> = operator.inputs().into_iter().cloned().collect();
             inputs[index] = input;
-            input = operator.with_new_exprs(operator.expressions(), inputs)?;
+            input = crate::extension::with_inputs(operator, inputs)?;
         }
         Ok(Transformed::yes(input))
     })
@@ -238,7 +239,7 @@ fn enough(
             let Some((input, changed)) = enough(&projection.input, need, filters)? else {
                 return Ok(None);
             };
-            let rebuilt = plan.with_new_exprs(plan.expressions(), vec![input])?;
+            let rebuilt = crate::extension::with_inputs(plan, vec![input])?;
             Ok(Some((rebuilt, changed)))
         }
         LogicalPlan::SubqueryAlias(alias) => {
@@ -252,7 +253,7 @@ fn enough(
             let Some((input, changed)) = enough(&alias.input, need, filters)? else {
                 return Ok(None);
             };
-            let rebuilt = plan.with_new_exprs(plan.expressions(), vec![input])?;
+            let rebuilt = crate::extension::with_inputs(plan, vec![input])?;
             Ok(Some((rebuilt, changed)))
         }
         LogicalPlan::Filter(filter) if !matches!(need, Enough::Rows(_)) => {

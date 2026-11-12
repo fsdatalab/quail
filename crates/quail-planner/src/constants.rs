@@ -87,6 +87,8 @@ number!(
     /// The answer limit of an AI.MAP call written without one.
     DEFAULT_MAP_ANSWER_TOKENS, DEFAULT_MAP_ANSWER_TOKENS_JSON: i64 = 256
 );
+/// The largest answer limit an AI.MAP call may write.
+pub const MAX_MAP_ANSWER_TOKENS: i64 = 32_768;
 /// The most units `order_steps` tries every order of. Past it, the
 /// search takes each next unit by rank.
 pub const MAX_EXACT_UNITS: usize = 10;

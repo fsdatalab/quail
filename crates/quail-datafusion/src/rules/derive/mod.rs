@@ -179,7 +179,7 @@ fn filter_down(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
 fn offer(plan: &LogicalPlan, term: &Expr) -> Result<Option<LogicalPlan>> {
     let below = |input: &LogicalPlan, term: &Expr| -> Result<Option<LogicalPlan>> {
         match offer(input, term)? {
-            Some(input) => Ok(Some(plan.with_new_exprs(plan.expressions(), vec![input])?)),
+            Some(input) => Ok(Some(crate::extension::with_inputs(plan, vec![input])?)),
             None => Ok(None),
         }
     };
@@ -244,7 +244,7 @@ fn offer(plan: &LogicalPlan, term: &Expr) -> Result<Option<LogicalPlan>> {
                 None
             };
             match inputs {
-                Some(inputs) => Ok(Some(plan.with_new_exprs(plan.expressions(), inputs)?)),
+                Some(inputs) => Ok(Some(crate::extension::with_inputs(plan, inputs)?)),
                 None => Ok(None),
             }
         }

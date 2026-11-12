@@ -141,7 +141,7 @@ fn guard_below(
     let rebuilt = |found: Option<(LogicalPlan, bool)>| -> Result<Option<(LogicalPlan, bool)>> {
         match found {
             Some((input, extracts)) => Ok(Some((
-                plan.with_new_exprs(plan.expressions(), vec![input])?,
+                crate::extension::with_inputs(plan, vec![input])?,
                 extracts,
             ))),
             None => Ok(None),

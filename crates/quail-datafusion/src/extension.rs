@@ -16,6 +16,7 @@
 
 use std::sync::Arc;
 
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Result, plan_err};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::context::SessionState;
@@ -159,6 +160,18 @@ impl QuailExtension {
     pub fn extension_planner(&self) -> Arc<dyn ExtensionPlanner + Send + Sync> {
         Arc::new(ModelRegionPlanner::new(Arc::clone(&self.runner)))
     }
+}
+
+/// `plan`'s operator over other inputs, its expressions as they are.
+///
+/// `LogicalPlan::with_new_exprs` cannot rebuild a `DISTINCT ON` with an
+/// `ORDER BY`; this keeps the operator and replaces its inputs alone.
+pub(crate) fn with_inputs(plan: &LogicalPlan, inputs: Vec<LogicalPlan>) -> Result<LogicalPlan> {
+    let mut inputs = inputs.into_iter();
+    plan.clone()
+        .map_children(|input| Ok(Transformed::yes(inputs.next().unwrap_or(input))))?
+        .data
+        .recompute_schema()
 }
 
 /// A plan whose root is `node`, one of Quail's extension nodes.

@@ -380,7 +380,7 @@ fn take_row_tests(
                 .cloned()
                 .map(|input| take_row_tests(input, answers, fixed, lifted))
                 .collect::<Result<Vec<_>>>()?;
-            other.with_new_exprs(other.expressions(), inputs)
+            crate::extension::with_inputs(&other, inputs)
         }
     }
 }

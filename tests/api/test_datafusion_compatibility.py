@@ -311,6 +311,14 @@ def test_a_limit_over_an_or_filter_stays_above_the_region():
         assert ("r", 3) not in oracle.asked
 
 
+def test_distinct_on_over_an_ai_filter_keeps_the_first_row_of_each_key():
+    query = (f"SELECT DISTINCT ON (r.stars) r.stars, r.id FROM r WHERE {PREDICATE} "
+             "ORDER BY r.stars, r.id")
+    for context, truth in constant_models():
+        expected = [(1, "r0"), (2, "r1"), (3, "r2"), (4, "r3")] if truth else []
+        assert _rows(context.sql(query)) == expected, truth
+
+
 def test_an_ai_filter_that_is_also_selected_asks_the_model_once():
     for negated in (False, True):
         oracle = Oracle(filters={"r": {"q1:": [1, 0, 1, 0]}})

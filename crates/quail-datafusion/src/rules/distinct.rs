@@ -71,7 +71,7 @@ fn edit_distinct(
         let Some(edited) = walk(below, edit)? else {
             return Ok(None);
         };
-        Ok(Some(plan.with_new_exprs(plan.expressions(), vec![edited])?))
+        Ok(Some(crate::extension::with_inputs(plan, vec![edited])?))
     }
     Ok(match walk(&plan, &edit)? {
         Some(edited) => Transformed::yes(edited),

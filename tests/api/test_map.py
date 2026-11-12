@@ -94,7 +94,10 @@ def test_a_malformed_map_is_refused(session):
             (f"SELECT r.id FROM reviews r WHERE AI_MAP(r.body, '{SUMMARY}')",
              "not supported"),
             (f"SELECT r.id, AI.MAP(r.body, '{SUMMARY}', 0) AS s FROM reviews r",
-             "positive integer")):
+             "an integer from 1 to 32768"),
+            # a limit the planner would size its answer rows by
+            (f"SELECT r.id, AI.MAP(r.body, '{SUMMARY}', 4294967296) AS s "
+             "FROM reviews r", "an integer from 1 to 32768")):
         with pytest.raises(CompileError, match=message):
             session.sql(sql).plan()
 

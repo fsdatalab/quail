@@ -336,7 +336,7 @@ fn claim_needed(plan: LogicalPlan, needed: Option<Vec<Column>>) -> Result<Logica
             claim_needed(input, read)
         })
         .collect::<Result<Vec<_>>>()?;
-    plan.with_new_exprs(plan.expressions(), inputs)
+    crate::extension::with_inputs(&plan, inputs)
 }
 
 /// Quail's binder's error for `plan` as a region, if it has one.

@@ -351,7 +351,7 @@ Quail can reorder AI calls to reduce estimated work. Set
 
 `AI.MAP(input, instruction[, max_tokens])` writes a `STRING` answer
 for each document. `input` is a text column; `instruction` is a string
-literal. `max_tokens` is a positive integer, with a default of 256.
+literal. `max_tokens` is an integer from 1 to 32768, with a default of 256.
 An answer ends when the model finishes or reaches this limit. The answer
 has no whitespace around it, so `AI.MAP(...) = 'yes'` and
 `AI.MAP(...) ILIKE 'price%'` compare the words the model wrote.
