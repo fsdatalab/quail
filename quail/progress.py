@@ -22,8 +22,6 @@ from rich.progress import (
     SpinnerColumn,
     TaskProgressColumn,
     TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
 )
 from rich.progress import Progress as Bar
 from rich.text import Text
@@ -95,6 +93,25 @@ class _RateColumn(ProgressColumn):
         if task.speed is None:
             return Text("")
         return Text(f"{task.speed:,.0f} {task.fields['unit']}/s", style="bold")
+
+
+def _clock(seconds: float) -> str:
+    """Write a duration as minutes and seconds, with hours when it has them: 1:04."""
+    minutes, seconds = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+class _TimeColumn(ProgressColumn):
+    """The time a count has run and the time it has left: 0:46 elapsed, 1:04 left."""
+
+    def render(self, task):
+        text = f"{_clock(task.elapsed or 0)} elapsed"
+        if task.time_remaining is not None:
+            text += f", {_clock(task.time_remaining)} left"
+        return Text(text, style="dim")
 
 
 logger = logging.getLogger("quail")
@@ -204,8 +221,7 @@ class Progress:
                 TextColumn(" "), SpinnerColumn(), TextColumn("{task.description}"),
                 BarColumn(complete_style="green", finished_style="green"),
                 _CountColumn(), TaskProgressColumn("{task.percentage:>3.0f}%"),
-                _RateColumn(), TimeElapsedColumn(), TextColumn("[dim]left[/dim]"),
-                TimeRemainingColumn(), console=console(), transient=True)
+                _RateColumn(), _TimeColumn(), console=console(), transient=True)
             self._task = self._bar.add_task(label, total=total, unit=unit)
             self._bar.start()
 
