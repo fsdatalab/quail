@@ -86,6 +86,14 @@ QUERIES = {
         "SELECT u.id FROM u WHERE EXISTS "
         f"(SELECT 1 FROM r WHERE r.id = u.id AND {PREDICATE})"
     ),
+    "EXISTS of an AI pair under OR": (
+        f"SELECT r.id FROM r WHERE EXISTS (SELECT 1 FROM u WHERE {PAIR}) "
+        "OR r.stars > 3"
+    ),
+    "ON with an OR of a pair test and a one-table test": (
+        "SELECT r.id, u.name FROM r JOIN u "
+        f"ON r.id = u.id AND ({PAIR} OR {PREDICATE})"
+    ),
     "scalar subquery count AI": (
         f"SELECT (SELECT COUNT(*) FROM r WHERE {PREDICATE}) AS n"
     ),
@@ -148,6 +156,9 @@ def expected_rows(truth):
         "cross join + AI pair filter": PAIRS if truth else [],
         "IN subquery with AI": [("r1",), ("r2",)] if truth else [],
         "EXISTS correlated AI": [("r1",), ("r2",)] if truth else [],
+        "EXISTS of an AI pair under OR": IDS if truth else [("r3",)],
+        "ON with an OR of a pair test and a one-table test":
+            [("r1", "x"), ("r2", "y")] if truth else [],
         "scalar subquery count AI": [(4 if truth else 0,)],
         "CTE": kept,
         "UNION of two AI selects": IDS if truth else [("r3",)],

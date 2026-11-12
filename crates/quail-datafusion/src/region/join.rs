@@ -151,9 +151,19 @@ pub(super) fn lower_outer_join(
         .map(|column| {
             let read = match left.column(&column).or_else(|| right.column(&column)) {
                 Some(read) => read,
-                // a mark join's mark is the restoring join's own
-                None if restored.schema().has_column(&column) => column.clone(),
-                None => return internal_err!("outer AI join cannot restore column {column}"),
+                // a mark join's mark is the restoring join's own, under the
+                // restoring join's qualifier; every other column is renamed
+                None => match restored
+                    .schema()
+                    .columns()
+                    .into_iter()
+                    .find(|found| found.name == column.name)
+                {
+                    Some(found) => found,
+                    None => {
+                        return internal_err!("outer AI join cannot restore column {column}");
+                    }
+                },
             };
             Ok(Expr::Column(read).alias_qualified(column.relation, column.name))
         })

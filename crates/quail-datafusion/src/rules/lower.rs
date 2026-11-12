@@ -709,6 +709,23 @@ fn lower_join(join: &Join, columns: &mut Columns) -> Result<Transformed<LogicalP
     let Some(predicate) = &join.filter else {
         return Ok(Transformed::no(LogicalPlan::Join(join.clone())));
     };
+    // an OR of AI tests in an inner join's ON keeps the same pairs as a
+    // WHERE above the join, where one term may read one table alone
+    let is_or = |term: &Expr| {
+        matches!(hinted(term), Expr::BinaryExpr(found) if found.op == Operator::Or)
+            && is_join_predicate(term)
+    };
+    let (ors, on): (Vec<&Expr>, Vec<&Expr>) = split_conjunction(predicate)
+        .into_iter()
+        .partition(|term| is_or(term));
+    if let Some(ors) = conjunction(ors.into_iter().cloned())
+        && join.join_type == JoinType::Inner
+    {
+        let mut kept = join.clone();
+        kept.filter = conjunction(on.into_iter().cloned());
+        let above = Filter::try_new(ors, Arc::new(LogicalPlan::Join(kept)))?;
+        return lower_filter(&above, columns);
+    }
     let (asked, rest, num_terms) = split_asked(predicate);
     if asked.is_empty() || join.join_type != JoinType::Inner {
         return Ok(Transformed::no(LogicalPlan::Join(join.clone())));
