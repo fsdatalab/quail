@@ -80,7 +80,8 @@ class QuailScorer:
 def run_model_task(model: str, task_name: str, smoke: bool = False) -> dict:
     """Run one model on one task and save the record to the volume.
 
-    Pointwise scoring uses the task's QUAIL-B-style AI.SCORE prompt.
+    Pointwise scoring uses the task's QUAIL-B-style AI.SCORE prompt and
+    a LOTUS-style one.
     Quickselect and the swap test compare pairs with the LOTUS pairwise
     prompt read by AI.CLASSIFY, as lotus_swap does.
     """
@@ -108,6 +109,8 @@ def run_model_task(model: str, task_name: str, smoke: bool = False) -> dict:
                           lotus_swap.pair_document,
                           seeds=(0,) if smoke else (0, 1, 2),
                           num_swap_pairs=40 if smoke else 2000,
+                          pointwise_lotus_template=lotus_swap.pointwise_template(
+                              task_name),
                           log=lambda line: print(f"[{model}] {line}",
                                                  flush=True))
     record.update(model=model, smoke=smoke,

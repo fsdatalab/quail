@@ -87,6 +87,39 @@ TASK_NAMES = ("sales", "support", "legal", "legal_passages")
 NUM_SAMPLED_PAIRS = 5000
 
 
+# LOTUS publishes no pointwise prompt; this is its pairwise instruction
+# reworded for one document, answered TRUE or FALSE
+LOTUS_POINTWISE_INSTRUCTION_TEXT = (
+    "Your job is to decide whether the document answers the user's "
+    "question.\nCarefully read the user's question and the document "
+    "provided below.\nAnswer TRUE if the document answers the question, "
+    "FALSE otherwise.")
+POINTWISE_QUESTION_TEXTS = {
+    "sales": (
+        "Does the customer in this sales call commit to buying, such as "
+        "accepting the terms, agreeing to sign, or asking for the contract "
+        "or paperwork? Interest, questions, or agreeing to another meeting "
+        "do not count."),
+    "support": (
+        "Does this customer message express frustration or dissatisfaction "
+        "with the agent, such as repeating a request, objecting to a "
+        "refusal, or complaining about the service?"),
+    "legal": (
+        "Does this excerpt argue that the cited case's reasoning does not "
+        "apply here?"),
+    "sales_outcome": (
+        "Is the customer in this sales call likely to sign a contract and "
+        "buy, judging by their commitment, urgency, and remaining "
+        "objections?"),
+}
+
+
+def pointwise_template(task: str) -> str:
+    """The AI.SCORE prompt for one record, in the style of the LOTUS prompt."""
+    return (LOTUS_POINTWISE_INSTRUCTION_TEXT + "\n\nQuestion: "
+            + POINTWISE_QUESTION_TEXTS[task] + "\n\nDocument:\n{0}")
+
+
 def pair_template(task: str) -> str:
     """The AI.CLASSIFY prompt for one task: instruction, question, documents."""
     return (LOTUS_INSTRUCTION_TEXT + "\n\nQuestion: " + QUESTION_TEXTS[task]

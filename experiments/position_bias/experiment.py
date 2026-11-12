@@ -97,10 +97,12 @@ def swap_summary(rows: list[dict]) -> dict:
 
 def run_task(data: TaskData, scorer: Scorer, pair_scorer, make_pair_document, *,
              seeds: Sequence[int] = SEEDS, num_swap_pairs: int = NUM_SWAP_PAIRS,
-             log=print) -> dict:
+             log=print, pointwise_lotus_template: str | None = None) -> dict:
     """Run pointwise top-k, the swap test, and quickselect under each rule.
 
-    Pointwise scoring uses `scorer` with the task's pointwise template.
+    Pointwise scoring uses `scorer` with the task's QUAIL-B-style
+    template, saved as "pointwise", and, when given, with
+    `pointwise_lotus_template`, saved as "pointwise_lotus".
     Pairs use `pair_scorer`: it takes pair documents, built by
     `make_pair_document`, and returns P(first wins) for each.
 
@@ -111,14 +113,18 @@ def run_task(data: TaskData, scorer: Scorer, pair_scorer, make_pair_document, *,
     record = {"task": task.name, "k": task.k, "num_records": len(data.ids),
               "num_relevant": sum(data.labels.values())}
 
-    start = time.perf_counter()
-    scores = dict(zip(data.ids, scorer(task.pointwise_template,
-                                       [data.texts[key] for key in data.ids])))
-    top = top_by_score(scores, task.k)
-    record["pointwise"] = {"seconds": time.perf_counter() - start,
-                           "scores": scores, "top": top,
-                           "precision": precision(top, data.labels)}
-    log(f"{task.name}: pointwise precision {record['pointwise']['precision']:.3f}")
+    templates = {"pointwise": task.pointwise_template}
+    if pointwise_lotus_template is not None:
+        templates["pointwise_lotus"] = pointwise_lotus_template
+    for name, template in templates.items():
+        start = time.perf_counter()
+        scores = dict(zip(data.ids, scorer(template,
+                                           [data.texts[key] for key in data.ids])))
+        top = top_by_score(scores, task.k)
+        record[name] = {"seconds": time.perf_counter() - start, "template": template,
+                        "scores": scores, "top": top,
+                        "precision": precision(top, data.labels)}
+        log(f"{task.name}: {name} precision {record[name]['precision']:.3f}")
 
     cache = PairCache(data, pair_scorer, make_pair_document)
     pairs = sample_swap_pairs(data, num_swap_pairs)

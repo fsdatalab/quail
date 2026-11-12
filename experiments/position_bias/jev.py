@@ -23,7 +23,11 @@ import httpx
 import modal
 
 from experiments.position_bias.experiment import run_task
-from experiments.position_bias.lotus_swap import JevChooser, pair_document
+from experiments.position_bias.lotus_swap import (
+    JevChooser,
+    pair_document,
+    pointwise_template,
+)
 from experiments.position_bias.tasks import TASKS, load_task
 
 MODEL = "jev-1.13.0"
@@ -35,7 +39,8 @@ RESULTS = modal.Volume.from_name("quail-results")
 
 def jev_instructions(template: str) -> str:
     """The template's text around the document placeholder."""
-    return template.replace("\n\n{0}\n\n", "\n\n")
+    return (template.replace("\n\nDocument:\n{0}", "")
+            .replace("\n\n{0}\n\n", "\n\n"))
 
 
 async def _request(client, semaphore, api_key, state, instructions) -> tuple:
@@ -105,6 +110,7 @@ def main():
         scorer = JevScorer(args.concurrency)
         record = run_task(load_task(TASKS[name]), scorer, JevChooser(name),
                           pair_document,
+                          pointwise_lotus_template=pointwise_template(name),
                           log=lambda line: print(f"[{MODEL}] {line}", flush=True))
         record.update(model=MODEL, input_tokens=scorer.input_tokens)
         local = LOCAL_DIR / f"{name}_lotus.json"
