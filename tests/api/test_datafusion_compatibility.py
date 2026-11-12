@@ -322,6 +322,14 @@ def test_a_limit_over_an_or_filter_stays_above_the_region():
         assert ("r", 3) not in oracle.asked
 
 
+def test_a_prepared_statements_parameter_in_a_score_test_takes_its_value():
+    for context, _ in constant_models():
+        context.sql(f"PREPARE scored AS SELECT r.id FROM r WHERE {SCORE} > $1")
+        # every score is 0.5
+        assert sorted(_rows(context.sql("EXECUTE scored(0.4)"))) == IDS
+        assert _rows(context.sql("EXECUTE scored(0.6)")) == []
+
+
 def test_distinct_on_over_an_ai_filter_keeps_the_first_row_of_each_key():
     query = (f"SELECT DISTINCT ON (r.stars) r.stars, r.id FROM r WHERE {PREDICATE} "
              "ORDER BY r.stars, r.id")

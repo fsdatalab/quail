@@ -111,6 +111,12 @@ impl OptimizerRule for Recomputed {
         plan: LogicalPlan,
         config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
+        // PREPARE optimizes a plan whose parameters EXECUTE fills in later,
+        // through the expressions each operator lists. An `AiNode` holds a
+        // test it absorbed outside that list, so the rules wait for values.
+        if !plan.get_parameter_names()?.is_empty() {
+            return Ok(Transformed::no(plan));
+        }
         let rewritten = self.0.rewrite(plan, config)?;
         if !rewritten.transformed {
             return Ok(rewritten);
