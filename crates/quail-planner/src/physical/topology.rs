@@ -213,7 +213,7 @@ impl PhysicalNode {
     }
 
     /// Whether the node is a model call carrying a spec.
-    fn is_inference(&self) -> bool {
+    pub fn is_inference(&self) -> bool {
         matches!(
             self,
             PhysicalNode::AiScore(_)

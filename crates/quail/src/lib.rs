@@ -30,6 +30,7 @@ mod executor;
 pub mod finished;
 pub mod planning;
 pub mod region_run;
+pub mod report;
 pub mod request;
 pub mod results;
 pub mod shared;

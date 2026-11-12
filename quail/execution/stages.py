@@ -21,7 +21,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from quail.execution.finished import finished_table, first_rows, reporting
-from quail.execution.metrics import NodeMetrics, NodeResult, RunResult
+from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.rows import Rows
 from quail.execution.runner import ExecutionContext, GenericRunner
 from quail.execution.types import output_table
@@ -156,26 +156,6 @@ def ran_message(results: dict, measurements: dict) -> tuple[str, list]:
     return json.dumps({**measurements, "metrics": metrics}, default=plain), tables
 
 
-def ran_from_message(text: str, tables: list) -> dict:
-    """Return what a worker ran from ``ran_message``'s JSON and tables.
-
-    Returns:
-        Node id -> NodeResult under "results", beside the worker's KV
-        counters and memory report.
-    """
-    ran = json.loads(text)
-    outputs = {node_id: {} for node_id in ran["metrics"]}
-    for table in tables:
-        metadata = dict(table.schema.metadata)
-        node_id = metadata.pop(b"quail.node").decode()
-        port = metadata.pop(b"quail.port").decode()
-        outputs[node_id][port] = table.replace_schema_metadata(metadata or None)
-    ran["results"] = {
-        node_id: NodeResult(outputs[node_id], NodeMetrics(**metrics))
-        for node_id, metrics in ran.pop("metrics").items()}
-    return ran
-
-
 def payload_first_rows(payload: dict) -> dict:
     """Each deduplicated alias's first rows, from a runtime payload."""
     return first_rows(payload.get("columns", {}), payload.get("deduplicate", {}))
@@ -288,32 +268,3 @@ def distinct_rows(table: pa.Table, names: list[str]) -> pa.Table:
     first = positions.group_by(names, use_threads=False).aggregate(
         [("position", "min")]).column("position_min").to_numpy()
     return table if len(first) == table.num_rows else table.take(np.sort(first))
-
-
-def merged_run(graph: PhysicalGraph, parts: list[dict]) -> RunResult:
-    """Merge each GPU's node results into one run of the region.
-
-    A port's rows are every GPU's rows, each set of ids once; a node's
-    metrics are the sum over the GPUs.
-
-    Args:
-        graph: The region's compute graph.
-        parts: Per GPU, node id -> NodeResult of Arrow tables.
-    """
-    nodes = {}
-    for node in graph.nodes:
-        found = [part[node.node_id] for part in parts if node.node_id in part]
-        if not found:
-            continue
-        outputs = {}
-        for port in node.outputs:
-            table = pa.concat_tables([result.outputs[port.name] for result in found],
-                                     promote_options="permissive")
-            outputs[port.name] = (distinct_rows(table, _id_columns(table))
-                                  if port.value_type is ValueType.ROWS else table)
-        nodes[node.node_id] = NodeResult(
-            outputs, sum((result.metrics for result in found), NodeMetrics()))
-    root = graph.root
-    return RunResult(nodes[root.node_id].outputs[root.port], nodes,
-                     sum((result.metrics for result in nodes.values()), NodeMetrics()))
-

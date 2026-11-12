@@ -4,36 +4,33 @@ from __future__ import annotations
 
 import json
 
-from quail.backends.quail.executor.memory import memory_report, merge_memory_reports
+import _quail_native
+
+from quail.backends.quail.executor.memory import memory_report
 from quail.backends.quail.retention import apply_retention
 from quail.common.pairs import columns_key
 from quail.common.tokens import documents_from_table
-from quail.execution.metrics import NodeResult, scalar_node_metrics
+from quail.execution.metrics import NodeResult
 from quail.execution.runner import (
     ExecutionContext,
     compute_subgraph,
 )
 from quail.execution.stages import (
     answer_hint,
-    merged_run,
     payload_first_rows,
-    ran_from_message,
     ran_message,
     serve_stages,
 )
-from quail.execution.types import export_physical_outputs
 from quail.physical import (
     AiClassify,
     AiExtract,
     AiFilter,
-    AiInference,
     AiJoin,
     AiMap,
     AiSaeFeatures,
     AiScore,
-    Barrier,
     PhysicalGraph,
-    Scan,
+    PortRef,
 )
 
 
@@ -204,6 +201,9 @@ def region_report(graph: PhysicalGraph, ran: list, wall: float, device, *,
                   gpus: int, gpu_timing: bool = False) -> dict:
     """Report a region's run from what each worker ran.
 
+    Rust merges the workers' outputs and metrics
+    (``quail::report::region_report``).
+
     Args:
         graph: The region's graph.
         ran: Per worker, what it ran as ``ran_message`` wrote it.
@@ -211,90 +211,18 @@ def region_report(graph: PhysicalGraph, ran: list, wall: float, device, *,
         device: The GPUs' device spec.
         gpus: How many GPUs.
         gpu_timing: Whether to report GPU seconds and chunks.
+
+    Returns:
+        The report, with the run's output tables under "_outputs".
     """
-    outputs = [ran_from_message(text, tables) for text, tables in ran]
-    result = merged_run(compute_subgraph(graph),
-                        [output["results"] for output in outputs])
-    report = graph_report(graph, result, wall, device, gpus=gpus,
-                          gpu_timing=gpu_timing)
-    report.update(
-        kv_manager={name: _summed([output["kv_manager"][name] for output in outputs])
-                    for name in outputs[0]["kv_manager"]},
-        **merge_memory_reports([output["memory"] for output in outputs]))
+    text, tables = _quail_native.region_report(
+        graph.to_json(), ran, wall, device.usd_per_hour, gpus, gpu_timing)
+    report = json.loads(text)
+    outputs = {}
+    for table in tables:
+        metadata = dict(table.schema.metadata)
+        ref = PortRef(metadata.pop(b"quail.node").decode(),
+                      metadata.pop(b"quail.port").decode())
+        outputs[ref] = table.replace_schema_metadata(metadata or None)
+    report["_outputs"] = outputs
     return report
-
-
-def _summed(values: list):
-    """Sum counters, and counters by alias alias by alias."""
-    if isinstance(values[0], dict):
-        return {key: sum(value.get(key, 0) for value in values)
-                for key in set().union(*values)}
-    return sum(values)
-
-
-def graph_report(graph, result, wall, device, *, gpus=1, gpu_timing=False):
-    """Collect graph outputs, execution metrics, and GPU cost."""
-    report = {
-        "_outputs": export_physical_outputs(compute_subgraph(graph), result),
-        "wall_s": round(wall, 2),
-        "fresh_tokens": result.metrics.fresh_tokens,
-        "cached_tokens": result.metrics.cached_tokens,
-        "evaluated_documents": result.metrics.evaluated_documents,
-        "evaluated_document_pairs": result.metrics.evaluated_document_pairs,
-        "usd_per_query": (
-            None if device.usd_per_hour is None
-            else wall / 3600 * gpus * device.usd_per_hour
-        ),
-        "backend_metrics": {"inferences": [
-            dict(value.metrics.extension)
-            for node_id, value in result.nodes.items()
-            if isinstance(graph.node(node_id), AiInference)
-        ]},
-        "node_metrics": scalar_node_metrics(result.nodes),
-        "executed_join_plan": executed_join_plan(graph),
-    }
-    report.update(throughput(graph, result.metrics, wall))
-    if gpu_timing:
-        report["gpu_s"] = round(result.metrics.gpu_s, 3)
-        report["chunks"] = result.metrics.chunks
-    return report
-
-
-def throughput(graph, metrics, seconds: float) -> dict:
-    """Return the run's throughput under one key.
-
-    A run that evaluated document pairs reports evaluated pairs per
-    second. Any other run reports input document rows, summed over
-    every scan and counted before filters, per second.
-    """
-    seconds = max(seconds, 1e-9)
-    if metrics.evaluated_document_pairs:
-        return {
-            "document_pairs_per_second":
-                metrics.evaluated_document_pairs / seconds,
-        }
-    documents = sum(
-        node.num_documents for node in graph.nodes if isinstance(node, Scan)
-    )
-    return {"documents_per_second": documents / seconds}
-
-
-# the fields the report shows of each executed join and barrier
-_JOIN_FIELDS = {
-    AiJoin.type_name: (
-        "written_position", "exec_index", "anchor", "partners", "semantics",
-        "selectivity", "expected_rows", "anchor_frame_tokens", "pair_tail_tokens",
-        "anchor_resident", "tuple_tokens", "pairs_from", "keep_kv", "attention",
-        "share_prefixes"),
-    Barrier.type_name: ("next_anchor", "aliases"),
-}
-
-
-def executed_join_plan(graph) -> list[dict]:
-    """Describe the join nodes executed from the saved graph."""
-    return [
-        {"type": node.type_name, "id": node.node_id,
-         **{name: getattr(node, name) for name in _JOIN_FIELDS[node.type_name]}}
-        for node in graph.topological_nodes()
-        if node.type_name in _JOIN_FIELDS
-    ]

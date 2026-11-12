@@ -342,8 +342,40 @@ fn request_tables<'py>(
         .collect()
 }
 
+/// The report of a region's run on its workers, as
+/// `crate::report::region_report` writes it.
+///
+/// `graph` is the region's graph as JSON; `ran` gives, per worker, what
+/// it ran as JSON and its nodes' output tables; `wall` is the seconds
+/// the region took; `usd_per_hour` prices one GPU.
+///
+/// Returns the report as JSON, and the run's output tables, one per
+/// port, each tagged with its node and port.
+#[pyfunction]
+#[pyo3(signature = (graph, ran, wall, usd_per_hour, gpus, gpu_timing))]
+fn region_report<'py>(
+    py: Python<'py>,
+    graph: &str,
+    ran: Vec<(String, Vec<Bound<'py, PyAny>>)>,
+    wall: f64,
+    usd_per_hour: Option<f64>,
+    gpus: i64,
+    gpu_timing: bool,
+) -> PyResult<(String, Vec<Bound<'py, PyAny>>)> {
+    let graph: PhysicalGraph = from_json(graph)?;
+    let ran = ran
+        .iter()
+        .map(|(found, tables)| Ok((from_json(found)?, tables_from_python(tables)?)))
+        .collect::<PyResult<Vec<crate::workers::Ran>>>()?;
+    let (report, outputs) = py
+        .detach(|| crate::report::region_report(&graph, &ran, wall, usd_per_hour, gpus, gpu_timing))
+        .map_err(python_error)?;
+    Ok((report.to_string(), tables_to_python(py, outputs)?))
+}
+
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Workers>()?;
     module.add_class::<WorkerEnd>()?;
+    module.add_function(wrap_pyfunction!(region_report, module)?)?;
     module.add_function(wrap_pyfunction!(request_tables, module)?)
 }

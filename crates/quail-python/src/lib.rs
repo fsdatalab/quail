@@ -20,7 +20,9 @@ use std::sync::Arc;
 use datafusion::common::{DataFusionError, Result};
 use pyo3::prelude::*;
 pub use quail::{EngineConfig, Executor, Session, region_json};
-pub use quail::{finished, planning, region_run, request, results, shared, stages, workers};
+pub use quail::{
+    finished, planning, region_run, report, request, results, shared, stages, workers,
+};
 
 pub use crate::engine::{
     executor_with_engine, executor_with_planner, register_python_table, scans_to_pyarrow,
