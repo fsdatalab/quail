@@ -124,7 +124,13 @@ impl ScalarUDFImpl for QuailFunction {
         Ok(Arc::new(Field::new(self.name, data_type, true)))
     }
 
-    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        // a hint on a test DataFusion evaluates is the test itself
+        if self.kind == FunctionKind::Hint
+            && let Some(test) = args.args.into_iter().next()
+        {
+            return Ok(test);
+        }
         exec_err!(
             "{} runs only inside a model region; claim_model_regions did not claim it",
             self.name

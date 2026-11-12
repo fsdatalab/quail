@@ -107,6 +107,14 @@ impl std::fmt::Debug for Session {
 /// chained causes: these are otherwise lost once the error leaves Python.
 pub(crate) fn python_failure(error: PyErr) -> DataFusionError {
     let text = Python::attach(|py| {
+        // a refusal or a compile error is Quail's answer to the query, in
+        // one sentence; any other failure carries its traceback
+        let kind = error.get_type(py).name().map(|name| name.to_string());
+        if let Ok(kind) = kind
+            && (kind == "RefusalError" || kind == "CompileError")
+        {
+            return format!("{kind}: {}", error.value(py));
+        }
         let formatted = py
             .import("traceback")
             .and_then(|module| module.call_method1("format_exception", (error.value(py),)))

@@ -307,6 +307,13 @@ pub fn bind_prompt(
     layout: &PromptLayout,
 ) -> Result<Prompt, CompileError> {
     check_placeholders(template, args.len())?;
+    // one table's filter reads one document: several columns are one
+    // computed document, which DataFusion builds before the region
+    if args.len() > 1 {
+        return Err(CompileError::unsupported(
+            "This filter must read a materialized document expression.",
+        ));
+    }
     let (_, canonical) = split_frame(template, SHARED_PRE)?;
     let (frame, template) = split_frame(template, layout.document_label)?;
     let (preamble, tail) = split_template(&template);
