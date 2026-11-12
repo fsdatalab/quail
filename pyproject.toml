@@ -148,8 +148,8 @@ name = "Packages import downward only"
 type = "layers"
 layers = [
     "quail.server",
-    "quail.api",
     "quail.worker",
+    "quail.api",
     "quail.builtins",
     "quail.baselines",
     "quail.extensions",

@@ -368,7 +368,7 @@ class WorkerState:
     registry: Any = None
 
 
-def main(path: str, gpu_index: int, registry_of) -> None:
+def main(path: str, gpu_index: int, registry_of, describe) -> None:
     """Run a GPU worker: answer Quail's messages until it is done with us.
 
     Args:
@@ -376,13 +376,17 @@ def main(path: str, gpu_index: int, registry_of) -> None:
         gpu_index: Which of the session's GPUs this worker runs.
         registry_of: Callable(extension module names) that returns the
             registry of the session's models, devices, and backends.
+        describe: Callable(configuration) that returns what Quail plans
+            the configuration's regions with.
     """
     set_gpu_index(gpu_index)
     state = WorkerState(gpu_index, registry_of=registry_of)
     end = _quail_native.WorkerEnd(path)
     while (message := end.next()) is not None:
         try:
-            if message[0] == "boot":
+            if message[0] == "describe":
+                end.described(json.dumps(describe(json.loads(message[1]))))
+            elif message[0] == "boot":
                 end.booted(json.dumps(_boot_worker(state, json.loads(message[1]))))
             elif message[0] == "region":
                 _serve_region(state, json.loads(message[1]), message[2], end)

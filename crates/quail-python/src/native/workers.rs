@@ -87,6 +87,16 @@ impl Workers {
             .is_some_and(crate::workers::Workers::alive)
     }
 
+    /// What Quail plans the regions of `config` with; both are JSON.
+    fn describe(&mut self, py: Python<'_>, config: &str) -> PyResult<String> {
+        let config: serde_json::Value = from_json(config)?;
+        let workers = self.open()?;
+        let described = py
+            .detach(|| workers.describe(&config))
+            .map_err(python_error)?;
+        Ok(described.to_string())
+    }
+
     /// Prepare every worker's GPU for a plan; `setup` and each
     /// worker's boot record are JSON.
     fn boot(&mut self, py: Python<'_>, setup: &str) -> PyResult<Vec<String>> {
@@ -192,8 +202,9 @@ impl WorkerEnd {
     }
 
     /// The next message, or None once Quail is done with the worker:
-    /// ("boot", setup JSON), ("region", region JSON, tables by name),
-    /// ("stage", index, input tables), or ("end",).
+    /// ("describe", configuration JSON), ("boot", setup JSON),
+    /// ("region", region JSON, tables by name), ("stage", index, input
+    /// tables), or ("end",).
     fn next<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyTuple>>> {
         let end = &mut self.end;
         let message = py.detach(|| end.read()).map_err(python_error)?;
@@ -201,6 +212,7 @@ impl WorkerEnd {
         let kind = |name: &str| PyString::new(py, name).into_any();
         let parts = match message {
             crate::workers::Message::Shutdown => return Ok(None),
+            Message::Describe(config) => vec![kind("describe"), text(config)],
             Message::Boot(setup) => vec![kind("boot"), text(setup)],
             Message::Region(region, tables) => {
                 let named = PyDict::new(py);
@@ -217,6 +229,14 @@ impl WorkerEnd {
             Message::End => vec![kind("end")],
         };
         Ok(Some(PyTuple::new(py, parts)?))
+    }
+
+    /// Answer a describe with what Quail plans with, as JSON.
+    fn described(&mut self, py: Python<'_>, description: &str) -> PyResult<()> {
+        let description: serde_json::Value = from_json(description)?;
+        let end = &mut self.end;
+        py.detach(|| end.described(&description))
+            .map_err(python_error)
     }
 
     /// Answer a boot with its record, as JSON.

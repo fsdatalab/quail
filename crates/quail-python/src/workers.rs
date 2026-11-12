@@ -4,6 +4,9 @@
 //! A worker is a Python process that runs the model. Quail starts it,
 //! and the two talk over one Unix socket for the worker's life:
 //!
+//! - `describe` asks what Quail plans a configuration's regions with:
+//!   the model's prompt layout, tokenizer, and planning settings. The
+//!   models are defined in Python, so a worker answers.
 //! - `boot` prepares the worker's GPU for a plan; the worker answers
 //!   with how long each part of the boot took.
 //! - `region` begins a region: its plan and settings as JSON, and its
@@ -150,6 +153,14 @@ impl Connection {
 
 /// What Quail asks of a worker.
 impl Connection {
+    /// What Quail plans the regions of `config` with.
+    fn describe(&mut self, config: &Value) -> Result<Value> {
+        self.send(&json!({"describe": config}))?;
+        self.flush()?;
+        let mut header = self.receive()?;
+        Ok(header["described"].take())
+    }
+
     /// Prepare the worker's GPU for a plan; returns its boot record.
     fn boot(&mut self, setup: &Value) -> Result<Value> {
         self.send(&json!({"boot": setup}))?;
@@ -215,6 +226,8 @@ impl Connection {
 
 /// What a worker reads next from Quail.
 pub enum Message {
+    /// A configuration to describe.
+    Describe(Value),
     Boot(Value),
     /// A region's description and its tables, by name.
     Region(Value, Vec<(String, Table)>),
@@ -260,6 +273,9 @@ impl WorkerEnd {
             Err(error) => return Err(error),
         };
         let mut header: Value = serde_json::from_slice(&frame).map_err(failure)?;
+        if header.get("describe").is_some() {
+            return Ok(Message::Describe(header["describe"].take()));
+        }
         if header.get("boot").is_some() {
             return Ok(Message::Boot(header["boot"].take()));
         }
@@ -292,6 +308,15 @@ impl WorkerEnd {
             self.connection.send_table(table)?;
         }
         self.connection.flush()
+    }
+
+    /// Answer a describe with what Quail plans the configuration with.
+    ///
+    /// # Errors
+    ///
+    /// The connection fails.
+    pub fn described(&mut self, description: &Value) -> Result<()> {
+        self.reply(&json!({"described": description}), &[])
     }
 
     /// Answer a boot with its record.
@@ -500,6 +525,18 @@ impl Workers {
         alive(&mut self.processes)
     }
 
+    /// What Quail plans the regions of `config` with, as the first
+    /// worker describes it.
+    ///
+    /// # Errors
+    ///
+    /// There is no worker, the worker refuses the configuration, or
+    /// its connection fails.
+    pub fn describe(&self, config: &Value) -> Result<Value> {
+        let worker = (self.connections.first()).ok_or_else(|| failure("there is no GPU worker"))?;
+        worker.lock().expect("the worker lock").describe(config)
+    }
+
     /// Prepare every worker's GPU for a plan, at the same time; returns
     /// each worker's boot record.
     ///
@@ -636,6 +673,9 @@ mod tests {
             let mut seen = Vec::new();
             loop {
                 match end.read().unwrap() {
+                    Message::Describe(config) => {
+                        end.described(&json!({"layout": config["model"]})).unwrap()
+                    }
                     Message::Boot(setup) => end.booted(&json!({"model": setup["model"]})).unwrap(),
                     Message::Region(region, tables) => {
                         seen.push(format!("{} {}", region["name"], tables[0].0));
@@ -655,6 +695,8 @@ mod tests {
             }
         });
         workers.connect().unwrap();
+        let described = workers.describe(&json!({"model": "m"})).unwrap();
+        assert_eq!(described, json!({"layout": "m"}));
         let booted = workers.boot(&json!({"model": "m"})).unwrap();
         assert_eq!(booted, vec![json!({"model": "m"})]);
 
