@@ -78,8 +78,12 @@ QUESTION_TEXTS = {
     "legal_passages": (
         "Which legal passage most strongly supports a court's consideration "
         "of an argument raised late or not preserved?"),
+    "sales_outcome": (
+        "In which sales call is the customer more likely to sign a contract "
+        "and buy, judging by their commitment, urgency, and remaining "
+        "objections?"),
 }
-TASK_NAMES = tuple(QUESTION_TEXTS)
+TASK_NAMES = ("sales", "support", "legal", "legal_passages")
 NUM_SAMPLED_PAIRS = 5000
 
 

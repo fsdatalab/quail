@@ -127,41 +127,47 @@ def load_sales_outcomes() -> TaskData:
 
     A deal is won when its CRMArena-Pro opportunity links to a contract
     the customer signed (status Activated, with a customer signed date).
-    The deal ids follow quail_b.data._sales_rows: deals sorted by
-    opportunity id, then permuted with DATA_SEED.
+    A won deal's record is its latest call dated before the signing
+    date, so the call cannot report the signed contract; a won deal with
+    no such call is left out. Records are keyed by QUAIL-B deal id, which
+    follows quail_b.data._sales_rows: deals sorted by opportunity id,
+    then permuted with DATA_SEED.
     """
     import sqlite3
 
     import numpy as np
 
     from quail_b import data as quailb_data
-    from quail_b.data import load_table
 
-    won = {}
+    texts, labels = {}, {}
     for domain in quailb_data.SALES_DOMAINS:
         path = quailb_data._download(quailb_data.CRMARENA_URL.format(
             commit=quailb_data.CRMARENA_COMMIT, domain=domain))
         connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
-            signed = {row[0] for row in connection.execute(
-                "SELECT o.Id FROM Opportunity o JOIN Contract c "
-                "ON c.Id = o.ContractID__c WHERE c.Status = 'Activated' "
-                "AND c.CustomerSignedDate IS NOT NULL")}
+            signed_on = dict(connection.execute(
+                "SELECT o.Id, c.CustomerSignedDate FROM Opportunity o "
+                "JOIN Contract c ON c.Id = o.ContractID__c "
+                "WHERE c.Status = 'Activated' AND c.CustomerSignedDate IS NOT NULL"))
         finally:
             connection.close()
-        deals = sorted({row[0] for row in quailb_data._sales_source_calls(domain)})
+        calls = {}
+        for deal, _, _, created, _, body in quailb_data._sales_source_calls(domain):
+            calls.setdefault(deal, []).append((created, body))
+        deals = sorted(calls)
         order = np.random.default_rng(quailb_data.DATA_SEED).permutation(len(deals))
         for index in order[:quailb_data._n_sales_deals(domain, SCALE_FACTOR)]:
-            won[f"sd{domain}{index:04d}"] = deals[index] in signed
-    latest = {}
-    for row in load_table("sales_calls", scale_factor=SCALE_FACTOR).to_pylist():
-        if (row["deal_id"] not in latest
-                or row["call_index"] > latest[row["deal_id"]]["call_index"]):
-            latest[row["deal_id"]] = row
-    rows = sorted(latest.values(), key=lambda row: row["id"])
-    return TaskData(TASKS["sales_outcome"],
-                    {row["id"]: row["transcript"] for row in rows},
-                    {row["id"]: won[row["deal_id"]] for row in rows})
+            deal = deals[index]
+            dated = sorted(calls[deal])
+            if deal in signed_on:
+                # ISO dates compare as strings; created times carry a time
+                dated = [call for call in dated if call[0][:10] < signed_on[deal][:10]]
+                if not dated:
+                    continue
+            key = f"sd{domain}{index:04d}"
+            texts[key] = dated[-1][1]
+            labels[key] = deal in signed_on
+    return TaskData(TASKS["sales_outcome"], texts, labels)
 
 
 def load_task(task: Task) -> TaskData:

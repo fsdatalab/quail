@@ -77,8 +77,14 @@ class QuailScorer:
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=8 * 3600,
               volumes=VOLUMES)
-def run_model_task(model: str, task_name: str, smoke: bool = False) -> dict:
-    """Run one model on one task and save the record to the volume."""
+def run_model_task(model: str, task_name: str, smoke: bool = False,
+                   lotus: bool = False) -> dict:
+    """Run one model on one task and save the record to the volume.
+
+    With `lotus`, quickselect and the swap test compare pairs with the
+    LOTUS pairwise prompt read by AI.CLASSIFY, as lotus_swap does, and
+    the record is saved as {task}_lotus.json.
+    """
     import time
     from contextlib import ExitStack
 
@@ -97,14 +103,22 @@ def run_model_task(model: str, task_name: str, smoke: bool = False) -> dict:
         session = stack.enter_context(quail.Session(
             quail.EngineConfig(model=model, device="h100-sxm")))
         scorer = QuailScorer(session)
+        pair_options = {}
+        if lotus:
+            from experiments.position_bias import lotus_swap
+            pair_options = dict(
+                pair_scorer=lotus_swap.QuailChooser(
+                    session, lotus_swap.pair_template(task_name)),
+                make_pair_document=lotus_swap.pair_document)
         record = run_task(data, scorer, seeds=(0,) if smoke else (0, 1, 2),
-                          num_swap_pairs=40 if smoke else 2000,
+                          num_swap_pairs=40 if smoke else 2000, **pair_options,
                           log=lambda line: print(f"[{model}] {line}",
                                                  flush=True))
-    record.update(model=model, smoke=smoke,
+    record.update(model=model, smoke=smoke, lotus=lotus,
                   wall_seconds=time.perf_counter() - start)
     if not smoke:
-        path = Path(f"/results/position_bias/{model}/{task_name}.json")
+        suffix = "_lotus" if lotus else ""
+        path = Path(f"/results/position_bias/{model}/{task_name}{suffix}.json")
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(record))
         results.commit()
@@ -113,9 +127,9 @@ def run_model_task(model: str, task_name: str, smoke: bool = False) -> dict:
 
 @app.local_entrypoint()
 def main(models: str = ",".join(MODELS), tasks: str = ",".join(TASK_NAMES),
-         smoke: bool = False):
+         smoke: bool = False, lotus: bool = False):
     """Start every (model, task), print each function call id, then wait."""
-    calls = [(model, task, run_model_task.spawn(model, task, smoke))
+    calls = [(model, task, run_model_task.spawn(model, task, smoke, lotus))
              for model in models.split(",") for task in tasks.split(",")]
     for model, task, call in calls:
         print(f"{model} {task}: {call.object_id}", flush=True)
