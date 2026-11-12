@@ -5,8 +5,9 @@
 //! the region is planned; this module runs the stages the plan holds.
 //! Partition p of every stage runs on the server of GPU p, a process
 //! that holds every document and the GPU's KV; this module sends it the
-//! stage's input rows and reads back the rows the stage writes, as Arrow
-//! IPC over a Unix socket. DataFusion moves the rows between stages: a
+//! stage's input rows and reads back the rows the stage writes. Each
+//! table crosses in a file both processes map ([`crate::shared`]); the
+//! Unix socket carries only the file's path. DataFusion moves the rows between stages: a
 //! hashed input goes through a `RepartitionExec` on the key's ids, so a
 //! document reaches the same GPU in every stage that reads it by its
 //! key; a broadcast input goes through a `CoalescePartitionsExec`,
@@ -22,8 +23,6 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use arrow::ipc::reader::StreamReader;
-use arrow::ipc::writer::StreamWriter;
 use datafusion::arrow::array::{Int32Array, RecordBatch};
 use datafusion::arrow::compute::{TakeOptions, take};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -43,8 +42,8 @@ use quail_planner::stages::Stage;
 /// reads.
 const KEY: &str = "quail.key";
 
-/// A table's schema and batches.
-pub type Table = (SchemaRef, Vec<RecordBatch>);
+pub use crate::shared::Table;
+use crate::shared::{read_table, write_table};
 
 /// What one partition of a stage wrote: each output port's rows, in the
 /// order of the stage's outputs.
@@ -62,17 +61,20 @@ enum Ready {
     Whole(Arc<Table>),
 }
 
-/// The connection to one GPU's server.
+/// One end of the connection between the region and a GPU's server.
 struct Server {
     reader: BufReader<UnixStream>,
     writer: BufWriter<UnixStream>,
+    /// The path each table this end writes starts with.
+    shared: String,
+    num_written: usize,
 }
 
 /// What a server sends back for one stage.
 struct Reply {
     outputs: Vec<Table>,
-    /// Each finished table, tagged with its node and port, as Arrow IPC.
-    finished: Vec<Vec<u8>>,
+    /// Each finished table, tagged with its node and port.
+    finished: Vec<Table>,
 }
 
 fn failure(error: impl std::fmt::Display) -> DataFusionError {
@@ -106,30 +108,37 @@ fn header_count(header: &serde_json::Value, name: &str) -> Result<usize> {
         .ok_or_else(|| failure(format!("a stage header has no valid {name} count")))
 }
 
-fn table_bytes((schema, batches): &Table) -> Result<Vec<u8>> {
-    let mut writer = StreamWriter::try_new(Vec::new(), schema)?;
-    for batch in batches {
-        writer.write(batch)?;
-    }
-    writer.finish()?;
-    Ok(writer.into_inner()?)
-}
-
-fn read_table(bytes: &[u8]) -> Result<Table> {
-    let reader = StreamReader::try_new(bytes, None)?;
-    let schema = reader.schema();
-    let batches = reader.collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok((schema, batches))
-}
-
 impl Server {
-    fn connect(path: &PathBuf) -> Result<Self> {
-        let stream = UnixStream::connect(path)
-            .map_err(|error| failure(format!("cannot reach {}: {error}", path.display())))?;
+    /// An end of `stream`, the socket at `socket`, whose tables' files
+    /// are named after the socket and `end`.
+    fn new(stream: UnixStream, socket: &Path, end: &str) -> Result<Self> {
         Ok(Server {
             reader: BufReader::new(stream.try_clone()?),
             writer: BufWriter::new(stream),
+            shared: format!("{}.{end}", socket.display()),
+            num_written: 0,
         })
+    }
+
+    fn connect(path: &PathBuf) -> Result<Self> {
+        let stream = UnixStream::connect(path)
+            .map_err(|error| failure(format!("cannot reach {}: {error}", path.display())))?;
+        Server::new(stream, path, "region")
+    }
+
+    /// Share a table with the other end: write it to a file and send
+    /// the file's path.
+    fn send_table(&mut self, table: &Table) -> Result<()> {
+        let path = format!("{}.{}", self.shared, self.num_written);
+        self.num_written += 1;
+        write_table(Path::new(&path), table)?;
+        write_frame(&mut self.writer, path.as_bytes())
+    }
+
+    /// Read a table the other end shared, over the file's mapped pages.
+    fn receive_table(&mut self) -> Result<Table> {
+        let path = String::from_utf8(read_frame(&mut self.reader)?).map_err(failure)?;
+        read_table(Path::new(&path))
     }
 
     /// Run one stage on the server's GPU over its inputs' rows.
@@ -137,7 +146,7 @@ impl Server {
         let header = serde_json::json!({"stage": stage, "inputs": inputs.len()}).to_string();
         write_frame(&mut self.writer, header.as_bytes())?;
         for input in inputs {
-            write_frame(&mut self.writer, &table_bytes(input)?)?;
+            self.send_table(input)?;
         }
         self.writer.flush()?;
         let header: serde_json::Value =
@@ -150,10 +159,10 @@ impl Server {
         let outputs = header_count(&header, "outputs")?;
         let finished = header_count(&header, "finished")?;
         let outputs = (0..outputs)
-            .map(|_| read_table(&read_frame(&mut self.reader)?))
+            .map(|_| self.receive_table())
             .collect::<Result<Vec<_>>>()?;
         let finished = (0..finished)
-            .map(|_| read_frame(&mut self.reader))
+            .map(|_| self.receive_table())
             .collect::<Result<Vec<_>>>()?;
         Ok(Reply { outputs, finished })
     }
@@ -170,6 +179,7 @@ impl Server {
 /// stages [`Server`] sends and writes back what each wrote.
 pub struct StageListener {
     listener: UnixListener,
+    socket: PathBuf,
     connection: Option<Server>,
 }
 
@@ -182,6 +192,7 @@ impl StageListener {
     pub fn bind(path: &Path) -> Result<Self> {
         Ok(StageListener {
             listener: UnixListener::bind(path)?,
+            socket: path.to_path_buf(),
             connection: None,
         })
     }
@@ -189,10 +200,7 @@ impl StageListener {
     fn connection(&mut self) -> Result<&mut Server> {
         if self.connection.is_none() {
             let (stream, _) = self.listener.accept()?;
-            self.connection = Some(Server {
-                reader: BufReader::new(stream.try_clone()?),
-                writer: BufWriter::new(stream),
-            });
+            self.connection = Some(Server::new(stream, &self.socket, "server")?);
         }
         Ok(self.connection.as_mut().expect("a connection"))
     }
@@ -212,7 +220,7 @@ impl StageListener {
         }
         let stage = header_count(&header, "stage")?;
         let inputs = (0..header_count(&header, "inputs")?)
-            .map(|_| read_table(&read_frame(&mut connection.reader)?))
+            .map(|_| connection.receive_table())
             .collect::<Result<Vec<_>>>()?;
         Ok(Some((stage, inputs)))
     }
@@ -227,7 +235,7 @@ impl StageListener {
         let header = serde_json::json!({"outputs": outputs.len(), "finished": finished.len()});
         write_frame(&mut connection.writer, header.to_string().as_bytes())?;
         for table in outputs.iter().chain(finished) {
-            write_frame(&mut connection.writer, &table_bytes(table)?)?;
+            connection.send_table(table)?;
         }
         connection.writer.flush()?;
         Ok(())
@@ -247,8 +255,8 @@ impl StageListener {
     }
 }
 
-/// Hands a finished table, as Arrow IPC, to the region's rows.
-pub type Report = Box<dyn Fn(Vec<u8>) -> Result<()> + Send + Sync>;
+/// Hands a finished table to the region's rows.
+pub type Report = Box<dyn Fn(Table) -> Result<()> + Send + Sync>;
 
 /// A region's stages running on its GPUs' servers.
 struct Staged {
@@ -642,11 +650,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn malformed_frames_and_tables_return_errors() {
+    fn malformed_frames_return_errors() {
         let length = u64::MAX.to_le_bytes();
         assert!(read_frame(&mut length.as_slice()).is_err());
         assert!(read_frame(&mut &[0u8; 3][..]).is_err());
-        assert!(read_table(b"not Arrow IPC").is_err());
     }
 
     #[test]

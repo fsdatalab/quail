@@ -1132,8 +1132,9 @@ fn validate_stages(
 /// `graph` is the region's compute graph as JSON; `stages` is the plan's
 /// `stages` setting as JSON; `groupings` gives, by alias, lists of each
 /// document's group, for a table hashed by a key other than its ids;
-/// `servers` names each GPU's Unix socket; `report(data)` takes each
-/// finished table as Arrow IPC bytes.
+/// `servers` names each GPU's Unix socket; `report(table)` takes each
+/// finished table as a pyarrow Table over the pages the GPU's server
+/// shared.
 #[pyfunction]
 fn run_stages(
     py: Python<'_>,
@@ -1145,9 +1146,9 @@ fn run_stages(
 ) -> PyResult<()> {
     let graph: quail_planner::physical::PhysicalGraph = from_json(graph)?;
     let cut: Vec<quail_planner::stages::Stage> = from_json(stages)?;
-    let report: crate::stages::Report = Box::new(move |table: Vec<u8>| {
+    let report: crate::stages::Report = Box::new(move |(schema, batches)| {
         Python::attach(|py| {
-            report.call1(py, (pyo3::types::PyBytes::new(py, &table),))?;
+            report.call1(py, (to_pyarrow(py, schema, batches)?,))?;
             Ok::<_, PyErr>(())
         })
         .map_err(|error| DataFusionError::External(Box::new(error)))

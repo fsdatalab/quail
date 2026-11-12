@@ -35,6 +35,7 @@ pub mod native;
 pub mod planning;
 pub mod pyarrow;
 pub mod results;
+pub mod shared;
 pub mod stages;
 
 use std::path::PathBuf;

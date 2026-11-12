@@ -204,9 +204,9 @@ def execute_staged_graph(payload, graph: PhysicalGraph, gpus: int, serve,
         (node.node_id, port.name) for node in compute.nodes
         for port in node.outputs if rows.wants(node.node_id, port.name)]
 
-    def report(data: bytes) -> None:
+    def report(table: pa.Table) -> None:
         if rows is not None:
-            rows.report(pa.ipc.open_stream(data).read_all())
+            rows.report(table)
 
     # No listener exists until Python preparation and native decoding succeed.
     graph_json = compute.to_json()
@@ -214,7 +214,10 @@ def execute_staged_graph(payload, graph: PhysicalGraph, gpus: int, serve,
     groupings = stage_groupings(graph, payload)
     _quail_native.validate_stages(graph_json, stages_json, groupings)
     started = time.perf_counter()
-    with tempfile.TemporaryDirectory() as directory:
+    # the tables the stages share are files beside the sockets; in
+    # /dev/shm a file is memory only
+    memory = "/dev/shm" if os.path.isdir("/dev/shm") else None
+    with tempfile.TemporaryDirectory(dir=memory, prefix="quail-") as directory:
         paths = [os.path.join(directory, f"gpu{index}.sock") for index in range(gpus)]
         servers = serve(paths, wanted)
         try:
