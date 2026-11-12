@@ -4,6 +4,7 @@ members = [
     "crates/quail-datafusion",
     "crates/quail-planner",
     "crates/quail",
+    "crates/quail-server",
     "crates/quail-python",
 ]
 
