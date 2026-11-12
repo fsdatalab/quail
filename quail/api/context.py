@@ -72,7 +72,8 @@ class SessionContext:
             self._native = NativeSession(engine, session.planner)
         else:
             description = engine_description(Engine(session, order=order))
-            self._native = NativeSession.on_workers(workers, json.dumps(description))
+            self._native = NativeSession.on_workers(
+                workers, json.dumps(description), session.planner)
         for name, provider in session.catalog.providers.items():
             self._register_table(name, provider)
 
@@ -101,6 +102,14 @@ class SessionContext:
             return self._native.sql(text, DATAFUSION_DIALECTS[dialect])
         except RuntimeError as error:
             raise RuntimeError(compile_message(error, text)) from None
+
+    def edit_plan(self, plan) -> None:
+        """Run an edited PhysicalPlan in place of the next region's own plan."""
+        self._native.edit_plan(json.dumps(plan.to_envelope()))
+
+    def when_ready(self, ready: Callable | None) -> None:
+        """Call ``ready()`` each time the workers have the model loaded for a region."""
+        self._native.when_ready(ready)
 
     def take_regions(self) -> list:
         """Return what each model region of the last query ran on the workers.

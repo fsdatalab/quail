@@ -53,8 +53,8 @@ use tokio::sync::mpsc::unbounded_channel;
 
 use crate::executor::RegionCall;
 pub use crate::executor::{
-    EngineRegion, Executor, InputHint, RegionEngine, RegionRan, RegionSink, Scan, ScannedTable,
-    region_json,
+    EngineRegion, Executor, InputHint, Ready, RegionEngine, RegionRan, RegionSink, Scan,
+    ScannedTable, region_json,
 };
 
 /// The model and hardware a [`Session`] runs on.
@@ -135,6 +135,18 @@ impl Session {
             runtime: Some(Runtime::new()?),
             runner: executor,
         })
+    }
+
+    /// Run an edited plan's envelope in place of the planner's plan
+    /// for the next model region, as [`Executor::edit_plan`] does.
+    pub fn edit_plan(&self, envelope: Option<serde_json::Value>) {
+        self.runner.edit_plan(envelope);
+    }
+
+    /// Call `ready` each time the workers have the model loaded for a
+    /// region, as [`Executor::when_ready`] does.
+    pub fn when_ready(&self, ready: Option<Ready>) {
+        self.runner.when_ready(ready);
     }
 
     /// What each model region of the last query ran on the workers, in

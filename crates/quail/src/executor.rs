@@ -87,7 +87,6 @@ impl std::fmt::Debug for Runs {
 /// It is the [`RegionRunner`] a [`crate::Session`] runs model regions
 /// on. To add Quail to a DataFusion session of your own, register
 /// `QuailExtension::new(Arc::new(Executor::open(&config)?))`.
-#[derive(Debug)]
 pub struct Executor {
     runs: Runs,
     /// The optimizer rules each model region runs, by name, in order.
@@ -105,6 +104,23 @@ pub struct Executor {
     pub(crate) planning: Option<(Arc<Planner>, Settings)>,
     /// What each region of the running query ran on the workers.
     regions: Mutex<Vec<RegionRan>>,
+    /// A plan's envelope to run in place of the planner's, for a query
+    /// of one region.
+    edited: Mutex<Option<serde_json::Value>>,
+    /// Called once the workers are ready to run a region.
+    ready: Mutex<Option<Ready>>,
+}
+
+/// Called once the workers have the model loaded for a region.
+pub type Ready = Arc<dyn Fn() + Send + Sync>;
+
+impl std::fmt::Debug for Executor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Executor")
+            .field("runs", &self.runs)
+            .field("rules", &self.rules)
+            .finish_non_exhaustive()
+    }
 }
 
 /// One region's run on the GPU workers.
@@ -125,6 +141,9 @@ pub struct RegionRan {
     pub boots: Vec<serde_json::Value>,
     /// Seconds the region took on the workers.
     pub seconds: f64,
+    /// Seconds from the planned region to its last row: the workers'
+    /// boot and the run.
+    pub total_seconds: f64,
 }
 
 impl Executor {
@@ -160,17 +179,24 @@ impl Executor {
                 "model": config.model, "device": config.device,
                 "gpus": config.gpus, "backend": config.backend,
             }))?;
-        Self::described(workers, &described)
+        Self::described(workers, &described, None)
     }
 
     /// An executor that runs model regions on `workers`, planning with
     /// what a worker described: the model's chat turn and prompt
     /// layout, the rules, the tokenizer file, and the planning settings.
     ///
+    /// `planner` is a planner for the described tokenizer, which keeps
+    /// the tables it tokenized for later queries; None makes a new one.
+    ///
     /// # Errors
     ///
     /// The description does not read.
-    pub fn described(workers: Arc<Mutex<Workers>>, described: &serde_json::Value) -> Result<Self> {
+    pub fn described(
+        workers: Arc<Mutex<Workers>>,
+        described: &serde_json::Value,
+        planner: Option<Arc<Planner>>,
+    ) -> Result<Self> {
         let read = |error: serde_json::Error| DataFusionError::External(Box::new(error));
         let field = |name: &str| described[name].clone();
         let turn: (String, String) = serde_json::from_value(field("turn")).map_err(read)?;
@@ -178,16 +204,23 @@ impl Executor {
         let rules: Vec<String> = serde_json::from_value(field("rules")).map_err(read)?;
         let tokenizer: String = serde_json::from_value(field("tokenizer_file")).map_err(read)?;
         let settings: Settings = serde_json::from_value(field("settings")).map_err(read)?;
-        let planner =
-            Planner::new(std::path::Path::new(&tokenizer)).map_err(quail_datafusion::external)?;
+        let planner = match planner {
+            Some(planner) => planner,
+            None => Arc::new(
+                Planner::new(std::path::Path::new(&tokenizer))
+                    .map_err(quail_datafusion::external)?,
+            ),
+        };
         Ok(Self {
             runs: Runs::Workers(workers),
             rules,
             prompting: (turn, layout),
             caller: Mutex::new(None),
             execution: Mutex::new(()),
-            planning: Some((Arc::new(planner), settings)),
+            planning: Some((planner, settings)),
             regions: Mutex::new(Vec::new()),
+            edited: Mutex::new(None),
+            ready: Mutex::new(None),
         })
     }
 
@@ -213,6 +246,8 @@ impl Executor {
             execution: Mutex::new(()),
             planning,
             regions: Mutex::new(Vec::new()),
+            edited: Mutex::new(None),
+            ready: Mutex::new(None),
         }
     }
 }
@@ -235,6 +270,18 @@ impl Drop for CallerGuard<'_> {
 }
 
 impl Executor {
+    /// Run `envelope`, an edited plan's, in place of the plan the
+    /// planner makes for the next region; None runs the planner's.
+    pub fn edit_plan(&self, envelope: Option<serde_json::Value>) {
+        *self.edited.lock().expect("the edited lock") = envelope;
+    }
+
+    /// Call `ready` each time the workers have the model loaded for a
+    /// region, before the region runs; None calls nothing.
+    pub fn when_ready(&self, ready: Option<Ready>) {
+        *self.ready.lock().expect("the ready lock") = ready;
+    }
+
     /// What each region of the last query ran on the workers, in the
     /// order the regions ran; the executor keeps none of it.
     pub fn take_regions(&self) -> Vec<RegionRan> {
@@ -512,8 +559,13 @@ impl Executor {
             .plan(&operators, tables, settings)
             .map_err(compile)?;
         let mut planned = outcome_json(&outcome).map_err(compile)?;
-        if settings.gpu_timing && planned.get("envelope").is_some() {
-            planned["envelope"]["settings"]["gpu_timing"] = true.into();
+        if planned.get("envelope").is_some() {
+            if let Some(edited) = self.edited.lock().expect("the edited lock").take() {
+                planned["envelope"] = edited;
+            }
+            if settings.gpu_timing {
+                planned["envelope"]["settings"]["gpu_timing"] = true.into();
+            }
         }
         planned["logical"] = logical.into();
         planned["planning_s"] = started.elapsed().as_secs_f64().into();
@@ -641,6 +693,7 @@ impl Executor {
                     held,
                     conformed,
                     rows,
+                    self.ready.lock().expect("the ready lock").clone(),
                 )?;
                 self.regions.lock().expect("the regions lock").push(ran);
                 return Ok(());
@@ -683,6 +736,7 @@ fn run_on_workers(
     hint: Option<InputHint>,
     conformed: impl Fn(RecordBatch) -> Result<RecordBatch> + Send + Sync + 'static,
     rows: &RowSender,
+    ready: Option<Ready>,
 ) -> Result<RegionRan> {
     let read = |error: serde_json::Error| DataFusionError::External(Box::new(error));
     let plan: serde_json::Value = serde_json::from_str(&found).map_err(read)?;
@@ -747,7 +801,11 @@ fn run_on_workers(
         _ => Ok(crate::workers::Answer::Json(serde_json::Value::Null)),
     });
     let mut workers = workers.lock().expect("the workers lock");
+    let entered = std::time::Instant::now();
     let boots = workers.boot(&setup)?;
+    if let Some(ready) = ready {
+        ready();
+    }
     let started = std::time::Instant::now();
     let ran =
         crate::region_run::run_region(&mut workers, &planned, &listening, &finished, on_rows, ask)?;
@@ -763,6 +821,7 @@ fn run_on_workers(
         ran,
         boots,
         seconds,
+        total_seconds: entered.elapsed().as_secs_f64(),
     })
 }
 

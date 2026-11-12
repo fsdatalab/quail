@@ -48,16 +48,48 @@ impl NativeSession {
     /// a region. `description` is what a worker describes of the
     /// session's configuration, as JSON.
     #[staticmethod]
-    fn on_workers(py: Python<'_>, workers: &workers::Workers, description: &str) -> PyResult<Self> {
+    #[pyo3(signature = (workers, description, planner=None))]
+    fn on_workers(
+        py: Python<'_>,
+        workers: &workers::Workers,
+        description: &str,
+        planner: Option<PyRef<'_, NativePlanner>>,
+    ) -> PyResult<Self> {
+        // the session's planner keeps the tables it tokenized
+        let planner = planner.map(|found| std::sync::Arc::clone(&found.planner));
         let workers = workers.shared()?;
         let description: serde_json::Value = from_json(description)?;
         let session = py
             .detach(|| {
-                let executor = crate::Executor::described(workers, &description)?;
+                let executor = crate::Executor::described(workers, &description, planner)?;
                 crate::Session::with_executor(std::sync::Arc::new(executor))
             })
             .map_err(python_error)?;
         Ok(Self { session })
+    }
+
+    /// Run an edited plan's envelope, as JSON, in place of the
+    /// planner's plan for the next model region; None runs the
+    /// planner's.
+    #[pyo3(signature = (envelope=None))]
+    fn edit_plan(&self, envelope: Option<&str>) -> PyResult<()> {
+        self.session.edit_plan(envelope.map(from_json).transpose()?);
+        Ok(())
+    }
+
+    /// Call `ready()` each time the workers have the model loaded for
+    /// a region, before the region runs; None calls nothing.
+    #[pyo3(signature = (ready=None))]
+    fn when_ready(&self, ready: Option<Py<PyAny>>) {
+        self.session.when_ready(ready.map(|ready| {
+            let call: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+                Python::attach(|py| {
+                    // a hook that fails must not stop the region
+                    let _ = ready.call0(py);
+                });
+            });
+            call
+        }));
     }
 
     /// What each model region of the last query ran on the workers, in
@@ -102,6 +134,7 @@ impl NativeSession {
                     ran.into_pyobject(py)?.into_any(),
                     boots.into_pyobject(py)?.into_any(),
                     region.seconds.into_pyobject(py)?.into_any(),
+                    region.total_seconds.into_pyobject(py)?.into_any(),
                 ],
             )?);
         }

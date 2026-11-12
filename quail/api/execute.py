@@ -149,17 +149,22 @@ def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
 
     session = query.session
     # Rust runs the regions of Quail's own backend on GPU workers
-    # itself. An edited plan, a caller that waits for the model, and a
-    # request backend go through the Python engine.
+    # itself. A request backend, and a callable that stands in for one,
+    # go through the Python engine.
     workers_of = getattr(physical_executor, "start_workers", None)
     rust_runs = (
-        plan is None and on_backend_ready is None and on_execution_ready is None
-        and query.num_regions > 0
+        query.num_regions > 0
         and session.config.backend == "quail" and backend_refusal(session) is None
         and (physical_executor is None or workers_of is not None))
     if rust_runs:
-        table, context = _run_in_rust(query, physical_executor, results,
-                                      region_tables, region_s, region_results)
+        def ready():
+            for called in (on_backend_ready, on_execution_ready):
+                if called is not None:
+                    called()
+
+        table, context = _run_in_rust(
+            query, physical_executor, plan, ready, results, region_tables,
+            region_s, region_results)
         return _query_result(query, context, table, whole, started, results,
                              region_tables, region_s, region_results)
 
@@ -184,15 +189,22 @@ def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
                          region_tables, region_s, region_results)
 
 
-def _run_in_rust(query, source, results, region_tables, region_s, region_results):
+def _run_in_rust(query, source, plan, ready, results, region_tables, region_s,
+                 region_results):
     """Run a query whose model regions Rust runs on GPU workers.
 
     Each region's QueryResult is built from what Rust kept of its run.
 
     Args:
         query: The Query.
-        source: None for the GPUs' workers, or a test's stand-in, as
-            ``_run_on_workers`` takes it.
+        source: None for the GPUs' workers, or a test's stand-in:
+            ``start_workers(gpus)`` returns workers under "workers",
+            ``report`` holds report fields to set, and ``close()`` stops
+            the workers.
+        plan: An edited PhysicalPlan to run in place of the planner's,
+            for a query of one region, or None.
+        ready: Callable() called once the workers have the model loaded
+            for a region.
         results: Filled with each region's QueryResult, in run order.
         region_tables: Filled with each region's rows.
         region_s: Filled with each region's seconds.
@@ -217,20 +229,30 @@ def _run_in_rust(query, source, results, region_tables, region_s, region_results
         workers = backend.workers(config)
     else:
         workers = source.start_workers(config.gpus)["workers"]
+    if plan is not None:
+        if isinstance(plan, Refusal) or not hasattr(plan, "graph"):
+            raise TypeError("plan must be a PhysicalPlan")
+        plan.graph.validate(runtime_keys=set(registry.runtimes))
+        plan.graph.validate_backend(plan.backend)
     try:
         context = SessionContext(session, order=query.order, workers=workers)
+        context.when_ready(ready)
+        if plan is not None:
+            context.edit_plan(plan)
         table = context.sql(query.text, query.dialect)
         regions = context.take_regions()
     finally:
         if source is not None:
             source.close()
-    for planned, scans, inputs, relation, ran, boots, seconds in regions:
+    for planned, scans, inputs, relation, ran, boots, seconds, total_s in regions:
         found = json.loads(planned)
         region = region_query(
             session, found["operators"], logical=found.get("logical", ""),
             order=query.order, tables=inputs, keep_order=True,
             region_id=found.get("region_id"))
         region.adopt_plan(found, scans)
+        if plan is not None:
+            region._plan = plan
         report = backend.report_region(
             region.plan(), ran, [json.loads(boot) for boot in boots], seconds,
             registry.device(config.device))
@@ -242,10 +264,11 @@ def _run_in_rust(query, source, results, region_tables, region_s, region_results
             planning_s=round(region.planning_s, 4),
             input_ready_s=round(region.planning_s, 4),
             physical_prepare_s=0.0, model_wall_s=result.report["wall_s"],
-            finish_s=0.0, worker_total_s=round(seconds, 4))
+            finish_s=0.0, worker_total_s=round(total_s, 4))
         results.append(result)
         region_tables.append(result.collect())
-        region_s.append(seconds)
+        # the boot is the region's time, not DataFusion's
+        region_s.append(total_s)
         region_results[region.region_id] = result
     return table, context
 
