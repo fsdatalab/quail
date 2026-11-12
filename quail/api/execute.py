@@ -221,6 +221,8 @@ def _run_in_rust(query, source, plan, ready, results, region_tables, region_s,
     session = query.session
     config, registry = session.config, session.registry
     backend = registry.backend(config.backend)
+    # the GPU check imports torch, which is startup as well
+    startup_started = time.perf_counter()
     if source is None:
         problem = gpu_problem()
         if problem is not None:
@@ -228,7 +230,6 @@ def _run_in_rust(query, source, plan, ready, results, region_tables, region_s,
                 f"cannot run the model on this machine: {problem}. "
                 "Run your Session on a machine with a CUDA GPU "
                 "and the backend installed.")
-    startup_started = time.perf_counter()
     if source is None:
         workers = backend.workers(config)
     else:
