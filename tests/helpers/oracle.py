@@ -423,6 +423,11 @@ class OracleFilter(FilterOperator):
         operator.ids = list(region.document_ids())
         operator.groups = filter_stop_groups(
             region.context.state, node, pipeline_rows(node, region.inputs))
+        # a key stops once a document passes the chain's last filter, as
+        # the production loop counts survivors of its last stage
+        for earlier in chain:
+            if isinstance(earlier, OracleFilter):
+                earlier.groups = None
         operator.answers, operator.finished = {}, []
         return operator
 

@@ -12,6 +12,7 @@ from quail.execution.finished import held, report_outputs
 from quail.execution.guard import guarded, present_join_inputs, reads_null_documents
 from quail.execution.metrics import NodeMetrics, NodeResult, RunResult
 from quail.physical import (
+    AiFilter,
     ExecutionLocation,
     PhysicalGraph,
     PhysicalNode,
@@ -113,6 +114,11 @@ class GenericRunner:
                 for member in pipeline:
                     pipelines[member.node_id] = (member,)
         ordered = graph.topological_nodes()
+        late = _without_early_stops(ordered, pipelines)
+        ordered = [late.get(node.node_id, node) for node in ordered]
+        pipelines = {
+            node_id: tuple(late.get(member.node_id, member) for member in pipeline)
+            for node_id, pipeline in pipelines.items()}
         for node in ordered:
             pipeline = pipelines.get(node.node_id)
             if pipeline is not None:
@@ -199,6 +205,25 @@ class GenericRunner:
         for node in graph.topological_nodes():
             metrics = metrics + node_results[node.node_id].metrics
         return RunResult(values[root], node_results, metrics)
+
+
+def _without_early_stops(ordered, pipelines) -> dict:
+    """Return node id -> a filter without its stop key, where it would stop too soon.
+
+    A key stops once a document passes the last filter that carries the
+    key. A filter before it stops the key at the same point only when
+    the two run in one pipeline, which counts the documents that pass
+    its last filter.
+    """
+    last = {node.alias: node.node_id for node in ordered
+            if isinstance(node, AiFilter) and node.stop_key}
+    return {
+        node.node_id: node.replace(stop_key=())
+        for node in ordered
+        if isinstance(node, AiFilter) and node.stop_key
+        and last[node.alias] != node.node_id
+        and last[node.alias] not in {
+            member.node_id for member in pipelines.get(node.node_id, ())}}
 
 
 def _renumbered(guard, deduplicated):
