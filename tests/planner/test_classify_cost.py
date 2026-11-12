@@ -8,7 +8,7 @@ from helpers.rust_cost import classify_estimate, cost_model, native
 from helpers.work import scan, stream
 
 from quail.common.work import Work
-from quail.labels import label_trie
+from quail.labels import read_nodes
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 
 # a one-token label; two that share a first token and split there; two
@@ -87,7 +87,7 @@ def test_expected_work_matches_every_label_assignment(rust, lengths, labels, win
     model = WINDOWED if window else QWEN3_4B_FP8.name
     cost = _cost(rust, lengths, labels, model=model, shared=shared or (),
                  resident=resident)
-    runs = native.CostModel.label_nodes([list(label) for label in labels], [])[2]
+    runs = native.CostModel.label_nodes([list(label) for label in labels])[2]
     outcomes = list(itertools.product(runs, repeat=len(lengths)))
     expected = dict.fromkeys(asdict(Work()), 0.0)
     for picked in outcomes:
@@ -103,7 +103,9 @@ def test_expected_work_matches_every_label_assignment(rust, lengths, labels, win
 
 def test_one_round_rules_are_priced_like_filters(rust):
     lengths = (10, 20, 30)
-    for scoring, suffix in (("letters", 1), ("trie_tree", len(label_trie(LABELS)))):
+    # the trie reads the root, (20,) and (30, 31), where labels split,
+    # and also feeds (30,), the forced token before (30, 31)
+    for scoring, suffix, rows in (("letters", 1, 1), ("trie_tree", 4, 3)):
         cost = _cost(rust, lengths, scoring=scoring)
         work = Work()
         for length in lengths:
@@ -117,7 +119,7 @@ def test_one_round_rules_are_priced_like_filters(rust):
         assert cost.seconds == pytest.approx(
             rust.unrounded_seconds(asdict(work), QWEN3_4B_FP8.name, H100_SXM.name,
                                    CHUNK, 0.0, 0)
-            + _readout_seconds(rust, len(lengths) * suffix, cost.passes))
+            + _readout_seconds(rust, len(lengths) * rows, cost.passes))
         assert cost.suffix_tokens == len(lengths) * suffix
         assert cost.rounds == 1
 
@@ -131,3 +133,10 @@ def test_parallel_classification_divides_time_by_the_copies_in_use(
     assert parallel.work == serial.work
     assert parallel.seconds == pytest.approx(
         serial.seconds / min(num_documents, gpus))
+
+
+def test_trie_tree_reads_only_the_nodes_where_labels_split():
+    # (30,) has one child, so the root already tells its label apart;
+    # (20,) splits, and the label (40,) ends where (40, 41) continues
+    labels = ((10,), (20, 21), (20, 22), (30, 31, 32), (40,), (40, 41))
+    assert read_nodes(labels) == {(), (20,), (40,)}

@@ -45,7 +45,6 @@ tagged_struct! {
         draws: i64,
         labels: Vec<String>,
         label_token_ids: Vec<TokenIds>,
-        label_word_starts: Vec<Vec<bool>>,
         scoring: String,
         probabilities: bool,
         /// A joined classification's anchor and partner layouts.

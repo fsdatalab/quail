@@ -51,13 +51,10 @@ def test_the_rust_sums_label_nodes_and_length_summaries_match_pythons():
         assert native.CostModel.numpy_sum(values.tolist()) == float(np.sum(values))
 
     for label_ids in LABEL_SETS:
-        for starts in ((), tuple((True,) + (False,) * (len(ids) - 1)
-                                 for ids in label_ids)):
-            read = python_labels.read_nodes(label_ids, starts)
-            found = native.CostModel.label_nodes(
-                label_ids, [list(flags) for flags in starts])
-            assert plain(found[:2]) == plain((
-                sorted(read), sorted(python_labels.fed_nodes(read))))
+        read = python_labels.read_nodes(label_ids)
+        found = native.CostModel.label_nodes(label_ids)
+        assert plain(found[:2]) == plain((
+            sorted(read), sorted(python_labels.fed_nodes(read))))
 
     rng = np.random.default_rng(3)
     columns = (

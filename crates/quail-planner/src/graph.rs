@@ -1037,13 +1037,8 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         let expected_rows = expected_rows * column.asked_fraction();
         if column.call.kind == "label" {
             let table = classify_statistics(context, &column.alias(), &[])?;
-            let (spec, work) = table.prepare(
-                &column.call,
-                &column.name,
-                expected_rows,
-                context.tokenizer,
-                context.decode,
-            )?;
+            let (spec, work) =
+                table.prepare(&column.call, &column.name, expected_rows, context.tokenizer)?;
             if let Some(scoring) = self.scoring.as_mut() {
                 scoring.work = &scoring.work + &work;
             }

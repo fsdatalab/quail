@@ -265,7 +265,7 @@ static KINDS: &[Kind] = &[
         tag: "quail.physical.nodes.classify.ClassifySpec",
         node: false,
         fields: fields!(SPEC; "pair_fraction" = Some("1.0"), "draws" = Some("1"),
-            "labels" = EMPTY, "label_token_ids" = EMPTY, "label_word_starts" = EMPTY,
+            "labels" = EMPTY, "label_token_ids" = EMPTY,
             "scoring" = Some(shared::LETTERS_SCORING_JSON), "probabilities" = NO, "join_layout" = NONE,
             "frame_tokens" = ZERO, "state_tail_tokens" = ZERO,
             "question_header_token_ids" = EMPTY, "separator_tokens" = ZERO),

@@ -18,7 +18,7 @@ use crate::context::PlanningContext;
 use crate::error::{CompileError, Refusal};
 use crate::expressions::{argument_alias, column_name, repr_str};
 use crate::lowering::{
-    Decoder, LoweredPrompt, Tokenizer, choice_token_parts, classify_prompt_tokens, lower_prompt,
+    LoweredPrompt, Tokenizer, choice_token_parts, classify_prompt_tokens, lower_prompt,
     option_spellings,
 };
 use crate::prompts::prompt_layout;
@@ -33,40 +33,6 @@ pub fn decodable(labels: &[Vec<i64>]) -> bool {
     !labels
         .iter()
         .any(|label| (1..label.len()).any(|depth| ids.contains(&label[..depth])))
-}
-
-/// Which tokens of each label begin a new word, as `word_starts`.
-///
-/// # Errors
-///
-/// The decoder fails.
-pub fn word_starts(
-    labels: &[Vec<i64>],
-    decode: Option<&Decoder>,
-) -> Result<Vec<Vec<bool>>, CompileError> {
-    let Some(decode) = decode else {
-        return Ok(labels.iter().map(|ids| vec![false; ids.len()]).collect());
-    };
-    let mut flags = Vec::new();
-    for ids in labels {
-        let pieces: Vec<String> = ids
-            .iter()
-            .map(|token| decode(std::slice::from_ref(token)))
-            .collect::<Result<_, _>>()?;
-        flags.push(
-            (0..ids.len())
-                .map(|depth| {
-                    depth > 0
-                        && pieces[depth]
-                            .chars()
-                            .next()
-                            .is_some_and(char::is_whitespace)
-                        && pieces[depth - 1].chars().any(char::is_alphanumeric)
-                })
-                .collect(),
-        );
-    }
-    Ok(flags)
 }
 
 /// A classification no scoring rule can run, as `ClassifyRefusedError`.
@@ -195,7 +161,6 @@ fn base_spec(
         draws: 1,
         labels: labels_of(call),
         label_token_ids: Vec::new(),
-        label_word_starts: Vec::new(),
         scoring: LETTERS_SCORING.to_string(),
         probabilities: false,
         join_layout: None,
@@ -252,14 +217,12 @@ impl ClassifyTable {
         frame: i64,
         labels: &[Vec<i64>],
         resident: bool,
-        starts: &[Vec<bool>],
     ) -> Result<ClassifyCost, CompileError> {
         classify::estimate(
             &self.inputs(expected_rows, head, frame, resident),
             scoring,
             labels,
             self.draws,
-            starts,
         )
         .map_err(CompileError::new)
     }
@@ -295,7 +258,6 @@ impl ClassifyTable {
             tail - 1,
             &spec.label_token_ids,
             resident,
-            &spec.label_word_starts,
         )
     }
 
@@ -314,7 +276,6 @@ impl ClassifyTable {
         resident: bool,
         lettered: Option<&(i64, i64, Vec<Vec<i64>>)>,
         probabilities: bool,
-        starts: &[Vec<bool>],
     ) -> Result<(String, ClassifyCost), CompileError> {
         let mut candidates = Vec::new();
         if lettered.is_some() {
@@ -337,17 +298,9 @@ impl ClassifyTable {
         for scoring in candidates {
             let estimated = match (scoring, lettered) {
                 (LETTERS_SCORING, Some((head, frame, ids))) => {
-                    self.estimate(scoring, expected_rows, *head, *frame, ids, resident, &[])?
+                    self.estimate(scoring, expected_rows, *head, *frame, ids, resident)?
                 }
-                _ => self.estimate(
-                    scoring,
-                    expected_rows,
-                    head,
-                    frame,
-                    labels,
-                    resident,
-                    starts,
-                )?,
+                _ => self.estimate(scoring, expected_rows, head, frame, labels, resident)?,
             };
             let key = (estimated.seconds, estimated.suffix_tokens);
             if best.as_ref().is_none_or(|(found, _, _)| key < *found) {
@@ -377,8 +330,7 @@ impl ClassifyTable {
             spec.prompt_token_parts[0].clone(),
             spec.prompt_token_parts[1].clone(),
         );
-        let (mut labels, mut starts) =
-            (spec.label_token_ids.clone(), spec.label_word_starts.clone());
+        let mut labels = spec.label_token_ids.clone();
         let mut lettered = None;
         let mut letter_parts = None;
         if let Some(prompt) = lower_prompt(&call.prompt, tokenizer)?.lettered {
@@ -398,12 +350,10 @@ impl ClassifyTable {
             resident,
             lettered.as_ref(),
             spec.probabilities,
-            &starts,
         )?;
         if scoring == LETTERS_SCORING {
             let (letter_head, letter_tail, letter_ids) = letter_parts.expect("a lettered prompt");
             (head, tail, labels) = (letter_head, letter_tail, letter_ids);
-            starts = Vec::new();
         }
         if scoring == DECODE_SCORING && !decodable(&labels) {
             return refused(format!(
@@ -418,7 +368,6 @@ impl ClassifyTable {
         chosen.estimated_work = estimated.work.values();
         chosen.prompt_token_parts = vec![head, tail];
         chosen.label_token_ids = labels;
-        chosen.label_word_starts = starts;
         chosen.draws = if scoring == LETTERS_SCORING {
             self.draws
         } else {
@@ -440,7 +389,6 @@ impl ClassifyTable {
         name: &str,
         expected_rows: f64,
         tokenizer: &Tokenizer,
-        decode: Option<&Decoder>,
     ) -> Result<(ClassifySpec, Work), CompileError> {
         let lowered = lower_prompt(&call.prompt, tokenizer)?;
         if self.model.attention_mask == "set" {
@@ -466,7 +414,6 @@ impl ClassifyTable {
             call,
         );
         spec.prompt_token_parts = vec![head, tail];
-        spec.label_word_starts = word_starts(&labels, decode)?;
         spec.label_token_ids = labels;
         spec.scoring = String::new();
         spec.probabilities = call.probabilities;
@@ -529,7 +476,7 @@ impl ClassifyTable {
         let note = label_parts(&prompt, &self.alias).1;
         let partner_label = label_parts(&prompt, partner).0;
         let block = round_half_even(partner_tokens) + tail.len() as i64 - 1;
-        let suffixes: Vec<i64> = suffix_lengths(LETTERS_SCORING, &labels, 0, 1, &[])
+        let suffixes: Vec<i64> = suffix_lengths(LETTERS_SCORING, &labels, 0, 1)
             .map_err(CompileError::new)?
             .into_iter()
             .map(|length| block + length)
@@ -775,7 +722,7 @@ pub fn classify_spec(
 ) -> Result<ClassifySpec, CompileError> {
     let table = classify_statistics(context, alias, &[])?;
     Ok(table
-        .prepare(call, name, expected_rows, context.tokenizer, context.decode)?
+        .prepare(call, name, expected_rows, context.tokenizer)?
         .0)
 }
 

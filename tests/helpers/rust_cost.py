@@ -60,4 +60,4 @@ def classify_estimate(rust, scoring, expected_rows, head_tokens, frame_tokens,
     return Cost(*rust.classify_estimate(
         scoring, expected_rows, head_tokens, frame_tokens,
         [list(label) for label in labels], list(lengths), list(shared), chunk,
-        model, device, resident, draws, [], gpus))
+        model, device, resident, draws, gpus))

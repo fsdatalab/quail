@@ -6,7 +6,7 @@ from dataclasses import dataclass
 # the classification's labels.
 # every label is one letter token, read at one row
 LETTERS_SCORING = "letters"
-# every trie node once, in one request: tree attention only
+# the nodes where the labels split, in one request: tree attention only
 TREE_SCORING = "trie_tree"
 # one token per round along the greedy path: fewest tokens, most rounds
 DECODE_SCORING = "trie_decode"
@@ -44,33 +44,22 @@ def choice_nodes(label_ids) -> set:
     return {node for node, tokens in trie.items() if len(tokens) > 1}
 
 
-def read_nodes(label_ids, starts=()) -> set:
+def read_nodes(label_ids) -> set:
     """Return the trie nodes whose rows the trie_tree rule reads.
 
     The root is read, and so is every node where the labels split: two
     or more children, or a label that ends where another continues.
-    After a read node, the next node is read while its token continues
-    the chosen word, so a label is scored through the end of the word
-    that tells it apart. Nodes after that are fed, when a later read
-    needs their KV, but never read.
+    Every other node has one possible next token, so a label is scored
+    only up to the node that tells it apart. Nodes after a read are fed
+    when a later read needs their KV, but never read.
 
     Args:
         label_ids: One token id sequence per label.
-        starts: Per label, which tokens begin a new word, from
-            the planner. Empty marks no token, so every node is read.
     """
     trie = label_trie(label_ids)
     ends = {tuple(ids) for ids in label_ids}
-    read = {()}
-    for index, ids in enumerate(label_ids):
-        ids = tuple(ids)
-        flags = starts[index] if starts else (False,) * len(ids)
-        for depth in range(1, len(ids)):
-            node = ids[:depth]
-            if (len(trie[node]) > 1 or node in ends
-                    or (ids[:depth - 1] in read and not flags[depth])):
-                read.add(node)
-    return read
+    return {()} | {node for node, tokens in trie.items()
+                   if len(tokens) > 1 or node in ends}
 
 
 @dataclass(frozen=True)

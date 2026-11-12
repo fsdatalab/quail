@@ -11,8 +11,8 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
                                                                     est. rows   est. pass   est. time
-  AiClassify: genre over r                                                                    17.7 ms
-    rule=letters, labels=21, label tokens=21
+  AiClassify: genre over r                                                                    16.1 ms
+    rule=trie_tree, labels=21, label tokens=139
     AiFilter: r                                                           9.6                 17.5 ms
       KV rewind=on
       predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')          12       80.1%

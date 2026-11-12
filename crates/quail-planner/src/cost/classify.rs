@@ -31,14 +31,13 @@ pub fn suffix_lengths(
     labels: &[Vec<i64>],
     canvas_rows: i64,
     draws: i64,
-    starts: &[Vec<bool>],
 ) -> Result<Vec<i64>, String> {
     match scoring {
         LETTERS_SCORING => Ok(vec![
             1 + canvas_rows;
             if canvas_rows != 0 { draws as usize } else { 1 }
         ]),
-        TREE_SCORING => Ok(vec![fed_nodes(&read_nodes(labels, starts)?).len() as i64]),
+        TREE_SCORING => Ok(vec![fed_nodes(&read_nodes(labels)?).len() as i64]),
         DECODE_SCORING => {
             let fed = decode_round_tokens(labels)?;
             let rounds = fed.iter().map(Vec::len).max().unwrap_or(0);
@@ -267,7 +266,6 @@ pub fn estimate(
     scoring: &str,
     labels: &[Vec<i64>],
     draws: i64,
-    starts: &[Vec<bool>],
 ) -> Result<ClassifyCost, String> {
     let model = inputs.model;
     let canvas_rows = model
@@ -275,13 +273,13 @@ pub fn estimate(
         .as_ref()
         .map(|canvas| canvas.rows)
         .unwrap_or(0);
-    let suffixes = suffix_lengths(scoring, labels, canvas_rows, draws, starts)?;
+    let suffixes = suffix_lengths(scoring, labels, canvas_rows, draws)?;
     let mut runs = None;
     let mut answer_rows = None;
     if scoring == DECODE_SCORING {
         runs = Some(decode_round_tokens(labels)?);
     } else if scoring == TREE_SCORING {
-        answer_rows = Some(read_nodes(labels, starts)?.len() as f64);
+        answer_rows = Some(read_nodes(labels)?.len() as f64);
     }
     let targets: BTreeSet<i64> = labels.iter().flatten().copied().collect();
     let head_rows = if labels.iter().all(|ids| ids.len() == 1) {

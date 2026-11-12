@@ -35,19 +35,21 @@ pub fn label_trie(label_ids: &[Vec<i64>]) -> Result<BTreeMap<Node, Vec<i64>>, St
 /// # Errors
 ///
 /// A label has no tokens.
-pub fn read_nodes(label_ids: &[Vec<i64>], starts: &[Vec<bool>]) -> Result<BTreeSet<Node>, String> {
+pub fn read_nodes(label_ids: &[Vec<i64>]) -> Result<BTreeSet<Node>, String> {
     let trie = label_trie(label_ids)?;
-    let ends: BTreeSet<Node> = label_ids.iter().cloned().collect();
-    let mut read: BTreeSet<Node> = BTreeSet::from([Vec::new()]);
-    for (index, ids) in label_ids.iter().enumerate() {
+    // the root, each node with two or more next tokens, and each label
+    // that ends where another continues; any other node has one next token
+    let mut read: BTreeSet<Node> = trie
+        .into_iter()
+        .filter(|(_, tokens)| tokens.len() > 1)
+        .map(|(node, _)| node)
+        .collect();
+    read.insert(Vec::new());
+    let ends: BTreeSet<&Vec<i64>> = label_ids.iter().collect();
+    for ids in label_ids {
         for depth in 1..ids.len() {
-            let node = ids[..depth].to_vec();
-            let starts_word = starts.get(index).map(|flags| flags[depth]).unwrap_or(false);
-            if trie[&node].len() > 1
-                || ends.contains(&node)
-                || (read.contains(&ids[..depth - 1]) && !starts_word)
-            {
-                read.insert(node);
+            if ends.contains(&ids[..depth].to_vec()) {
+                read.insert(ids[..depth].to_vec());
             }
         }
     }

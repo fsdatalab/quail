@@ -198,8 +198,8 @@ impl CostModel {
     /// The label trie helpers: the read nodes, the fed nodes, and the
     /// decode round tokens, as sorted lists.
     #[staticmethod]
-    fn label_nodes(labels: Vec<Vec<i64>>, starts: Vec<Vec<bool>>) -> PyResult<LabelNodes> {
-        let read = labels::read_nodes(&labels, &starts).map_err(PyValueError::new_err)?;
+    fn label_nodes(labels: Vec<Vec<i64>>) -> PyResult<LabelNodes> {
+        let read = labels::read_nodes(&labels).map_err(PyValueError::new_err)?;
         let fed = labels::fed_nodes(&read);
         let rounds = labels::decode_round_tokens(&labels).map_err(PyValueError::new_err)?;
         Ok((
@@ -227,7 +227,6 @@ impl CostModel {
         device: &str,
         resident: bool,
         draws: i64,
-        starts: Vec<Vec<bool>>,
         gpus: i64,
     ) -> PyResult<(f64, f64, Bound<'py, PyDict>, f64, usize)> {
         let inputs = ClassifyInputs {
@@ -242,8 +241,8 @@ impl CostModel {
             resident,
             gpus,
         };
-        let cost = classify::estimate(&inputs, scoring, &labels, draws, &starts)
-            .map_err(PyValueError::new_err)?;
+        let cost =
+            classify::estimate(&inputs, scoring, &labels, draws).map_err(PyValueError::new_err)?;
         Ok((
             cost.seconds,
             cost.passes,
