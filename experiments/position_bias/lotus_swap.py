@@ -210,6 +210,32 @@ class QuailChooser:
 @app.function(image=image, gpu="H100!", memory=98304, timeout=12 * 3600,
               volumes=VOLUMES)
 def swap_model(model: str, task: str = "sales", num_pairs: int = 0) -> dict:
+    """Run the LOTUS swap test for one model and task in its own container."""
+    return swap_in_process(model, task, num_pairs)
+
+
+@app.function(image=image, gpu="H100!", memory=98304, timeout=12 * 3600,
+              volumes=VOLUMES)
+def swap_models(models: list[str], task: str) -> dict:
+    """Run the LOTUS swap test for several models, one after another.
+
+    Quail releases one model's engine before it loads the next, so the
+    models share this container's GPU in turn.
+
+    Returns:
+        Model -> its summary, or the error text when it failed.
+    """
+    summaries = {}
+    for model in models:
+        try:
+            summaries[model] = swap_in_process(model, task, 0)
+        except Exception as error:     # run the remaining models
+            summaries[model] = repr(error)
+            print(f"[{model} {task}] failed: {error!r}", flush=True)
+    return summaries
+
+
+def swap_in_process(model: str, task: str = "sales", num_pairs: int = 0) -> dict:
     """Run the LOTUS swap test for one model and task, and save it.
 
     Args:
@@ -246,8 +272,22 @@ def swap_model(model: str, task: str = "sales", num_pairs: int = 0) -> dict:
 
 @app.local_entrypoint()
 def main(models: str = ",".join(MODELS), tasks: str = "sales",
-         num_pairs: int = 0):
-    """Start one call per model and task, and print each function call id."""
+         num_pairs: int = 0, one_container: bool = False):
+    """Start one call per model and task, and print each function call id.
+
+    With `one_container`, each task runs every model in one call.
+    """
+    if one_container:
+        calls = [(task, swap_models.spawn(models.split(","), task))
+                 for task in tasks.split(",")]
+        for task, call in calls:
+            print(f"{task}: {call.object_id}", flush=True)
+        for task, call in calls:
+            for model, summary in call.get().items():
+                rate = (summary if isinstance(summary, str)
+                        else f"same slot {summary['all']['same_slot_rate']:.4f}")
+                print(f"{model} {task}: {rate}", flush=True)
+        return
     calls = [(f"{model} {task}", swap_model.spawn(model, task, num_pairs))
              for task in tasks.split(",") for model in models.split(",")]
     for model, call in calls:
