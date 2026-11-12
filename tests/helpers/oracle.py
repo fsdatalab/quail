@@ -16,9 +16,13 @@ shape.
 from __future__ import annotations
 
 import copy
+import json
+import threading
 import time
+import traceback
 from functools import partial
 
+import _quail_native
 import numpy as np
 import pyarrow as pa
 
@@ -680,6 +684,27 @@ class OracleFeatures(OracleDocuments):
         return self.oracle._sae_features(self.node, ids)
 
 
+def _serve(model, path):
+    """Serve each region as a GPU worker does, answering from the oracle."""
+    from helpers.fakes import graph_state
+    from quail.backends.quail.graph import payload_tables, serve_region
+
+    end = _quail_native.WorkerEnd(path)
+    while (message := end.next()) is not None:
+        try:
+            region = json.loads(message[1])
+            payload = {**region["query"], **payload_tables(message[2])}
+            state = graph_state(model, payload["documents"])
+            state["texts"] = payload["texts"]
+            state["columns"] = payload["columns"]
+            model.arena = state["gpu"].arena
+            serve_region(state, payload,
+                         graph_from_envelope(payload["physical_plan"]), end,
+                         region["wanted"], region["hinted"])
+        except Exception:
+            end.fail(traceback.format_exc())
+
+
 def oracle_executor(oracle: Oracle, **report):
     """Return a physical executor that runs each request's graph on the oracle.
 
@@ -691,10 +716,11 @@ def oracle_executor(oracle: Oracle, **report):
         **report: Report fields the response carries, such as wall_s.
     """
     def execute(request):
-        from helpers.fakes import graph_state, run_on_threads
+        from quail.backends import BackendExecutionContext
+        from quail.backends.quail.worker import execute_quail_request
+        from quail.builtins import built_in_registry
         from quail.execution.types import PhysicalResponse
         from quail.physical import Scan
-        from quail.specs import DEVICES
 
         graph = graph_from_envelope(request.plan)
         scans = [node for node in graph.nodes if isinstance(node, Scan)]
@@ -704,25 +730,25 @@ def oracle_executor(oracle: Oracle, **report):
                         for node in scans}
         oracle.source_rows = {alias: rows.to_pylist()
                               for alias, rows in request.source_rows.items()}
-        payload = {
-            "filter_limit": None, "columns": request.column_tables(),
-            "documents": oracle.documents,
-            "texts": {alias: texts for alias, texts in oracle.texts.items()
-                      if texts is not None},
-            "deduplicate": request.plan["settings"].get("deduplicate", {}),
-            "stages": request.plan["settings"]["stages"]}
-        states = []
-        for model in [oracle] if request.gpus == 1 else [
-                copy.copy(oracle) for _ in range(request.gpus)]:
-            state = graph_state(model, oracle.documents)
-            state["texts"] = oracle.texts
-            state["columns"] = payload["columns"]
-            model.arena = state["gpu"].arena
-            states.append(state)
-        result = run_on_threads(states, payload, graph, DEVICES["h100-sxm"])
-        outputs = result.pop("_outputs")
-        return PhysicalResponse(outputs, {
-            **result, "wall_s": 1.0, "boot_s": 0.5, "fresh_tokens": 1234, **report})
+        models = [oracle] if request.gpus == 1 else [
+            copy.copy(oracle) for _ in range(request.gpus)]
+        # the request runs as on GPUs, with each worker a thread that
+        # answers from the oracle
+        workers = _quail_native.Workers(request.gpus)
+        try:
+            for model, path in zip(models, workers.paths, strict=True):
+                threading.Thread(target=_serve, args=(model, str(path)),
+                                 daemon=True).start()
+            workers.connect()
+            booted = {"workers": workers, "boot": {"boot_s": 0.5, "kind": "warm"}}
+            response = execute_quail_request(BackendExecutionContext(
+                request=request, graph=graph, registry=built_in_registry(),
+                gpus=request.gpus, runtime_state={"booted": booted}))
+        finally:
+            workers.close()
+        return PhysicalResponse(response.outputs, {
+            **response.metrics, "wall_s": 1.0, "boot_s": 0.5,
+            "fresh_tokens": 1234, **report})
 
     execute.oracle = oracle
     return execute
