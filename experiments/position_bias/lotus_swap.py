@@ -1,26 +1,32 @@
-"""Swap test with the LOTUS pairwise prompt over every pair of SALES-5 rows.
+"""Swap test with the LOTUS pairwise prompt, asking each pair in both orders.
 
-SALES-5 keeps the 225 sales calls in the Negotiation stage, so there
-are 225 * 224 / 2 = 25,200 unordered pairs. Each pair is asked in both
-orders with the LOTUS pairwise instruction, and the answer is read
-from the first token: AI.CLASSIFY over "Document 1" and "Document 2"
-with probabilities, so P(Document 1) is the probability that the
-first record wins. Jev answers the same text as a choice question.
+Sales asks every pair of the 225 SALES-5 calls (the Negotiation
+stage), 225 * 224 / 2 = 25,200 unordered pairs. Support and Legal ask
+5,000 pairs sampled from the task's records. Each pair is asked in
+both orders with the LOTUS pairwise instruction, and the answer is
+read from the first token: AI.CLASSIFY over "Document 1" and
+"Document 2" with probabilities, so P(Document 1) is the probability
+that the first record wins. Jev answers the same text as a choice
+question.
 
     uv run modal run --detach -m experiments.position_bias.lotus_swap \
         2>&1 | tee results/position_bias/lotus_swap.log
+    uv run modal run --detach -m experiments.position_bias.lotus_swap \
+        --tasks support,legal 2>&1 | tee results/position_bias/lotus_swap_2.log
 
     read -s TYPESAFE_API_KEY
     export TYPESAFE_API_KEY
-    uv run python -m experiments.position_bias.lotus_swap --jev
+    uv run python -m experiments.position_bias.lotus_swap --jev --tasks sales
 
-Records: /results/position_bias/lotus_swap/{model}.json on the
-quail-results volume.
+Records: /results/position_bias/lotus_swap/{model}.json for Sales and
+/results/position_bias/lotus_swap/{task}/{model}.json for the others,
+on the quail-results volume.
 """
 
 import argparse
 import itertools
 import json
+import random
 import time
 from pathlib import Path
 
@@ -45,7 +51,6 @@ MODELS = ("decision-2.0-kai-0.6b-bf16", "qwen3-0.6b-bf16", "d1-2b-bf16",
           "lfm2-2.6b-bf16", "qwen3-4b-fp8", "qwen3.8-27b-fp8",
           "qwen3.6-35b-a3b-fp8")
 JEV_MODEL = "jev-1.13.0"
-RECORD_DIR = "/results/position_bias/lotus_swap"
 LABELS = ("Document 1", "Document 2")
 # rows per AI.CLASSIFY query; bounds the host memory of one batch
 BATCH_ROWS = 4096
@@ -57,13 +62,35 @@ LOTUS_INSTRUCTION_TEXT = (
     "document such as \"Document NUMBER\".\nNUMBER must be either 1 or 2, "
     "depending on which document is most relevant.\nYou must pick a number "
     "and cannot say things like \"None\" or \"Neither\".")
-QUESTION_TEXT = (
-    "Which sales call most clearly shows that the customer commits to "
-    "buying, such as accepting the terms, agreeing to sign, or asking for "
-    "the contract or paperwork? Interest, questions, or agreeing to "
-    "another meeting do not count.")
-PAIR_TEMPLATE = (LOTUS_INSTRUCTION_TEXT + "\n\nQuestion: " + QUESTION_TEXT
-                 + "\n\n{0}")
+QUESTION_TEXTS = {
+    "sales": (
+        "Which sales call most clearly shows that the customer commits to "
+        "buying, such as accepting the terms, agreeing to sign, or asking "
+        "for the contract or paperwork? Interest, questions, or agreeing to "
+        "another meeting do not count."),
+    "support": (
+        "Which customer message most clearly expresses frustration or "
+        "dissatisfaction with the agent, such as repeating a request, "
+        "objecting to a refusal, or complaining about the service?"),
+    "legal": (
+        "Which excerpt most clearly argues that the cited case's reasoning "
+        "does not apply here?"),
+}
+TASK_NAMES = tuple(QUESTION_TEXTS)
+NUM_SAMPLED_PAIRS = 5000
+
+
+def pair_template(task: str) -> str:
+    """The AI.CLASSIFY prompt for one task: instruction, question, documents."""
+    return (LOTUS_INSTRUCTION_TEXT + "\n\nQuestion: " + QUESTION_TEXTS[task]
+            + "\n\n{0}")
+
+
+def record_path(task: str, model: str) -> str:
+    """The record's path on the volume, relative to its root."""
+    if task == "sales":
+        return f"position_bias/lotus_swap/{model}.json"
+    return f"position_bias/lotus_swap/{task}/{model}.json"
 
 
 def pair_document(first: str, second: str) -> str:
@@ -71,34 +98,49 @@ def pair_document(first: str, second: str) -> str:
     return f"Document 1:\n{first}\n\nDocument 2:\n{second}"
 
 
-def load_negotiation_calls():
-    """The SALES-5 rows: (ids, id -> transcript, id -> commits label)."""
+def load_pairs(task: str):
+    """One task's unordered pairs, texts, and labels.
+
+    Returns:
+        (pairs, id -> text, id -> label). Sales gives every pair of the
+        SALES-5 calls; the other tasks give NUM_SAMPLED_PAIRS distinct
+        pairs drawn uniformly with seed 0.
+    """
     import pyarrow.compute as pc
 
     from experiments.position_bias.tasks import TASKS, load_task
-
-    data = load_task(TASKS["sales"])
     from quail_b.data import load_table
 
-    calls = load_table("sales_calls", scale_factor=0.1)
-    kept = calls.filter(pc.equal(calls["deal_stage"], "Negotiation"))
-    ids = [str(value) for value in kept["id"].to_pylist()]
-    return ids, {key: data.texts[key] for key in ids}, \
+    data = load_task(TASKS[task])
+    if task == "sales":
+        calls = load_table("sales_calls", scale_factor=0.1)
+        kept = calls.filter(pc.equal(calls["deal_stage"], "Negotiation"))
+        ids = [str(value) for value in kept["id"].to_pylist()]
+        pairs = list(itertools.combinations(ids, 2))
+    else:
+        rng = random.Random(0)
+        ids = data.ids
+        chosen = set()
+        while len(chosen) < NUM_SAMPLED_PAIRS:
+            first, second = rng.sample(ids, 2)
+            chosen.add(tuple(sorted((first, second))))
+        pairs = sorted(chosen)
+    return pairs, {key: data.texts[key] for key in ids}, \
         {key: data.labels[key] for key in ids}
 
 
-def run_swap(ids, texts, labels, choose) -> dict:
-    """Ask every unordered pair in both orders and summarize the answers.
+def run_swap(pairs, texts, labels, choose, template) -> dict:
+    """Ask each unordered pair in both orders and summarize the answers.
 
     Args:
-        ids: Record ids; every pair (a, b) with a before b is asked.
+        pairs: Unordered (a, b) pairs; (a, b) is asked, then (b, a).
         texts: Id -> text.
         labels: Id -> whether the record is relevant.
         choose: Takes documents and returns P(Document 1) for each.
+        template: The prompt, recorded with the answers.
     """
     from experiments.position_bias.experiment import swap_summary
 
-    pairs = list(itertools.combinations(ids, 2))
     documents = ([pair_document(texts[a], texts[b]) for a, b in pairs]
                  + [pair_document(texts[b], texts[a]) for a, b in pairs])
     start = time.perf_counter()
@@ -108,17 +150,18 @@ def run_swap(ids, texts, labels, choose) -> dict:
     rows = [{"a": a, "b": b, "label_a": labels[a], "label_b": labels[b],
              "p_forward": p, "p_backward": q}
             for (a, b), p, q in zip(pairs, forward, backward)]
-    return {"num_records": len(ids), "num_relevant": sum(labels.values()),
+    return {"num_records": len(texts), "num_relevant": sum(labels.values()),
             "num_pairs": len(pairs), "seconds": seconds,
-            "template": PAIR_TEMPLATE, "rows": rows,
+            "template": template, "rows": rows,
             "summary": swap_summary(rows)}
 
 
 class QuailChooser:
     """P(Document 1) from AI.CLASSIFY's probabilities in one Quail session."""
 
-    def __init__(self, session):
+    def __init__(self, session, template: str):
         self.session = session
+        self.template = template
         self.num_batches = 0
 
     def __call__(self, documents) -> list[float]:
@@ -127,7 +170,7 @@ class QuailChooser:
 
         import quail
 
-        quoted = PAIR_TEMPLATE.replace("'", "''")
+        quoted = self.template.replace("'", "''")
         options = ", ".join(f"'{label}'" for label in LABELS)
         probabilities = []
         for start in range(0, len(documents), BATCH_ROWS):
@@ -152,33 +195,35 @@ class QuailChooser:
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=12 * 3600,
               volumes=VOLUMES)
-def swap_model(model: str, num_records: int = 0) -> dict:
-    """Run the LOTUS swap test for one model and save it to the volume.
+def swap_model(model: str, task: str = "sales", num_pairs: int = 0) -> dict:
+    """Run the LOTUS swap test for one model and task, and save it.
 
     Args:
         model: The Quail model.
-        num_records: Use only the first this many calls; 0 uses all
-            225 and saves the record.
+        task: "sales", "support", or "legal".
+        num_pairs: Ask only the first this many pairs and save nothing;
+            0 asks them all and saves the record to the volume.
     """
     from contextlib import ExitStack
 
     import quail
 
-    ids, texts, labels = load_negotiation_calls()
-    if num_records:
-        relevant = [key for key in ids if labels[key]]
-        ids = list(dict.fromkeys(ids[:num_records] + relevant[:2]))
+    pairs, texts, labels = load_pairs(task)
+    if num_pairs:
+        pairs = pairs[:num_pairs]
+    template = pair_template(task)
     with ExitStack() as stack:
         session = stack.enter_context(quail.Session(
             quail.EngineConfig(model=model, device="h100-sxm")))
-        record = run_swap(ids, texts, labels, QuailChooser(session))
-    record["model"] = model
+        record = run_swap(pairs, texts, labels,
+                          QuailChooser(session, template), template)
+    record.update(model=model, task=task)
     summary = record["summary"]
-    print(f"[{model}] same slot: tied {summary['tied']['same_slot_rate']:.4f}, "
+    print(f"[{model} {task}] same slot: tied {summary['tied']['same_slot_rate']:.4f}, "
           f"mixed {summary['mixed']['same_slot_rate']:.4f}, "
           f"bias {summary['all']['bias']:+.3f}", flush=True)
-    if not num_records:
-        path = Path(RECORD_DIR) / f"{model}.json"
+    if not num_pairs:
+        path = Path("/results") / record_path(task, model)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(record))
         results.commit()
@@ -186,24 +231,25 @@ def swap_model(model: str, num_records: int = 0) -> dict:
 
 
 @app.local_entrypoint()
-def main(models: str = ",".join(MODELS), num_records: int = 0):
-    """Start one call per model and print each function call id."""
-    calls = [(model, swap_model.spawn(model, num_records))
-             for model in models.split(",")]
+def main(models: str = ",".join(MODELS), tasks: str = "sales",
+         num_pairs: int = 0):
+    """Start one call per model and task, and print each function call id."""
+    calls = [(f"{model} {task}", swap_model.spawn(model, task, num_pairs))
+             for task in tasks.split(",") for model in models.split(",")]
     for model, call in calls:
         print(f"{model}: {call.object_id}", flush=True)
     for model, call in calls:
         try:
             summary = call.get()
-        except Exception as error:     # report every model, then go on
+        except Exception as error:     # report every run, then go on
             print(f"{model}: failed: {error!r}", flush=True)
             continue
         print(f"{model}: tied {summary['tied']['same_slot_rate']:.4f} "
               f"mixed {summary['mixed']['same_slot_rate']:.4f}", flush=True)
 
 
-def jev_main():
-    """Run the swap test against Jev and upload the record to the volume."""
+def jev_main(task: str):
+    """Run the swap test on one task against Jev and upload the record."""
     import asyncio
     import os
 
@@ -212,7 +258,7 @@ def jev_main():
     api_key = os.environ["TYPESAFE_API_KEY"]
     question = {"type": "choice",
                 "instructions": LOTUS_INSTRUCTION_TEXT + "\n\nQuestion: "
-                + QUESTION_TEXT,
+                + QUESTION_TEXTS[task],
                 "criteria": {"1": LABELS[0], "2": LABELS[1]}}
 
     async def ask(client, semaphore, document):
@@ -246,15 +292,16 @@ def jev_main():
             return await asyncio.gather(*(ask(client, semaphore, document)
                                           for document in documents))
 
-    ids, texts, labels = load_negotiation_calls()
-    record = run_swap(ids, texts, labels,
-                      lambda documents: asyncio.run(choose_all(documents)))
-    record["model"] = JEV_MODEL
-    local = Path("results/position_bias/lotus_swap") / f"{JEV_MODEL}.json"
+    pairs, texts, labels = load_pairs(task)
+    record = run_swap(pairs, texts, labels,
+                      lambda documents: asyncio.run(choose_all(documents)),
+                      pair_template(task))
+    record.update(model=JEV_MODEL, task=task)
+    local = Path("results") / record_path(task, JEV_MODEL)
     local.parent.mkdir(parents=True, exist_ok=True)
     local.write_text(json.dumps(record))
     with results.batch_upload(force=True) as upload:
-        upload.put_file(str(local), f"/position_bias/lotus_swap/{JEV_MODEL}.json")
+        upload.put_file(str(local), "/" + record_path(task, JEV_MODEL))
     print(json.dumps(record["summary"], indent=1))
 
 
@@ -262,5 +309,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--jev", action="store_true",
                         help="run against the Jev API instead of Modal")
-    if parser.parse_args().jev:
-        jev_main()
+    parser.add_argument("--tasks", default="sales")
+    arguments = parser.parse_args()
+    if arguments.jev:
+        for name in arguments.tasks.split(","):
+            jev_main(name)
