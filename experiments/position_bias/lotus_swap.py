@@ -306,29 +306,39 @@ def main(models: str = ",".join(MODELS), tasks: str = "sales",
               flush=True)
 
 
-def jev_main(task: str):
-    """Run the swap test on one task against Jev and upload the record."""
-    import asyncio
-    import os
+class JevChooser:
+    """P(Document 1) from Jev's choice answers, many requests at a time."""
 
-    import httpx
+    def __init__(self, task: str, concurrency: int = 64):
+        import os
 
-    api_key = os.environ["TYPESAFE_API_KEY"]
-    question = {"type": "choice",
-                "instructions": LOTUS_INSTRUCTION_TEXT + "\n\nQuestion: "
-                + QUESTION_TEXTS[task],
-                "criteria": {"1": LABELS[0], "2": LABELS[1]}}
+        self.api_key = os.environ["TYPESAFE_API_KEY"]
+        self.concurrency = concurrency
+        self.question = {"type": "choice",
+                         "instructions": LOTUS_INSTRUCTION_TEXT + "\n\nQuestion: "
+                         + QUESTION_TEXTS[task],
+                         "criteria": {"1": LABELS[0], "2": LABELS[1]}}
 
-    async def ask(client, semaphore, document):
+    def __call__(self, documents) -> list[float]:
+        """Return P(Document 1) for each pair document."""
+        import asyncio
+
+        return asyncio.run(self._choose_all(documents))
+
+    async def _ask(self, client, semaphore, document) -> float:
+        import asyncio
+
+        import httpx
+
         payload = {"model": JEV_MODEL, "state": document,
-                   "questions": {"winner": question}}
+                   "questions": {"winner": self.question}}
         delay = 0.25
         async with semaphore:
             for _ in range(12):
                 try:
                     response = await client.post(
                         "https://api.typesafe.ai/v1/systemone",
-                        headers={"Authorization": f"Bearer {api_key}"},
+                        headers={"Authorization": f"Bearer {self.api_key}"},
                         json=payload)
                 except httpx.HTTPError:
                     await asyncio.sleep(delay)
@@ -343,17 +353,22 @@ def jev_main(task: str):
                 return float(answer["probabilities"]["1"])
         raise RuntimeError("Jev request retries exhausted")
 
-    async def choose_all(documents):
-        semaphore = asyncio.Semaphore(64)
-        async with httpx.AsyncClient(
-                timeout=120, limits=httpx.Limits(max_connections=64)) as client:
-            return await asyncio.gather(*(ask(client, semaphore, document)
+    async def _choose_all(self, documents) -> list[float]:
+        import asyncio
+
+        import httpx
+
+        semaphore = asyncio.Semaphore(self.concurrency)
+        limits = httpx.Limits(max_connections=self.concurrency)
+        async with httpx.AsyncClient(timeout=120, limits=limits) as client:
+            return await asyncio.gather(*(self._ask(client, semaphore, document)
                                           for document in documents))
 
+
+def jev_main(task: str):
+    """Run the swap test on one task against Jev and upload the record."""
     pairs, texts, labels = load_pairs(task)
-    record = run_swap(pairs, texts, labels,
-                      lambda documents: asyncio.run(choose_all(documents)),
-                      pair_template(task))
+    record = run_swap(pairs, texts, labels, JevChooser(task), pair_template(task))
     record.update(model=JEV_MODEL, task=task)
     local = Path("results") / record_path(task, JEV_MODEL)
     local.parent.mkdir(parents=True, exist_ok=True)

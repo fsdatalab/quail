@@ -12,8 +12,6 @@ from dataclasses import dataclass
 import pyarrow.compute as pc
 
 SCALE_FACTOR = 0.1
-PAIR_SEPARATOR = "\n\nRECORD 2:\n"
-PAIR_HEAD = "RECORD 1:\n"
 
 
 @dataclass(frozen=True)
@@ -48,15 +46,6 @@ class Task:
         return (f"Judge strictly from the {self.noun} above whether "
                 f"{self.criterion}\n\n{{0}}\n\nInstruction: answer TRUE if "
                 f"{self.short_criterion}, FALSE otherwise.")
-
-    @property
-    def pair_template(self) -> str:
-        """The AI.SCORE prompt for one pair: TRUE when RECORD 1 wins."""
-        question = (f"Two {self.noun}s are shown above as RECORD 1 and "
-                    f"RECORD 2. Judge strictly from them which one more "
-                    f"clearly shows that {self.criterion}")
-        return (question + "\n\n{0}\n\nInstruction: answer TRUE if RECORD 1 "
-                "shows this more clearly than RECORD 2, FALSE otherwise.")
 
     @property
     def short_criterion(self) -> str:
@@ -186,11 +175,6 @@ def load_task(task: Task) -> TaskData:
     truth = benchmark.ground_truth
     labels = {key: bool(truth.answer(task.predicate_key, key)) for key in ids}
     return TaskData(task, texts, labels)
-
-
-def pair_document(first: str, second: str) -> str:
-    """The document of one comparison: RECORD 1, then RECORD 2."""
-    return PAIR_HEAD + first + PAIR_SEPARATOR + second
 
 
 def sample_swap_pairs(data: TaskData, num_pairs: int,

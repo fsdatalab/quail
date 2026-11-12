@@ -12,7 +12,7 @@ import time
 from collections.abc import Callable, Sequence
 
 from experiments.position_bias.quickselect import RULES, precision, quickselect
-from experiments.position_bias.tasks import TaskData, pair_document, sample_swap_pairs
+from experiments.position_bias.tasks import TaskData, sample_swap_pairs
 
 Scorer = Callable[[str, Sequence[str]], list[float]]
 
@@ -28,10 +28,8 @@ class PairCache:
         seconds: Time spent in the scorer.
     """
 
-    def __init__(self, data: TaskData, scorer: Scorer, pair_scorer=None,
-                 make_pair_document=pair_document):
+    def __init__(self, data: TaskData, pair_scorer, make_pair_document):
         self.data = data
-        self.scorer = scorer
         self.pair_scorer = pair_scorer
         self.make_pair_document = make_pair_document
         self.probabilities: dict[tuple[str, str], float] = {}
@@ -46,10 +44,7 @@ class PairCache:
             documents = [self.make_pair_document(texts[first], texts[second])
                          for first, second in missing]
             start = time.perf_counter()
-            if self.pair_scorer is not None:
-                scores = self.pair_scorer(documents)
-            else:
-                scores = self.scorer(self.data.task.pair_template, documents)
+            scores = self.pair_scorer(documents)
             self.seconds += time.perf_counter() - start
             self.probabilities.update(zip(missing, scores))
         return [self.probabilities[pair] for pair in pairs]
@@ -100,13 +95,13 @@ def swap_summary(rows: list[dict]) -> dict:
     return summary
 
 
-def run_task(data: TaskData, scorer: Scorer, *, seeds: Sequence[int] = SEEDS,
-             num_swap_pairs: int = NUM_SWAP_PAIRS, log=print, pair_scorer=None,
-             make_pair_document=pair_document) -> dict:
+def run_task(data: TaskData, scorer: Scorer, pair_scorer, make_pair_document, *,
+             seeds: Sequence[int] = SEEDS, num_swap_pairs: int = NUM_SWAP_PAIRS,
+             log=print) -> dict:
     """Run pointwise top-k, the swap test, and quickselect under each rule.
 
-    Pairs are scored with `scorer` and the task's pair template, unless
-    `pair_scorer` is given: it takes pair documents, built by
+    Pointwise scoring uses `scorer` with the task's pointwise template.
+    Pairs use `pair_scorer`: it takes pair documents, built by
     `make_pair_document`, and returns P(first wins) for each.
 
     Returns:
@@ -125,7 +120,7 @@ def run_task(data: TaskData, scorer: Scorer, *, seeds: Sequence[int] = SEEDS,
                            "precision": precision(top, data.labels)}
     log(f"{task.name}: pointwise precision {record['pointwise']['precision']:.3f}")
 
-    cache = PairCache(data, scorer, pair_scorer, make_pair_document)
+    cache = PairCache(data, pair_scorer, make_pair_document)
     pairs = sample_swap_pairs(data, num_swap_pairs)
     forward = cache(pairs)
     backward = cache([(b, a) for a, b in pairs])

@@ -1,15 +1,15 @@
 """Run the position-bias experiment against the Jev API.
 
-Jev answers a `noul` question about a state with P(TRUE). The state
-is the document Quail would score (one record, or RECORD 1 and RECORD
-2), and the instructions are the AI.SCORE template with the document
-placeholder removed.
+Pointwise, Jev answers a `noul` question about one record with P(TRUE);
+the instructions are the task's AI.SCORE template with the document
+placeholder removed. Pairs use the LOTUS pairwise prompt as a choice
+question (lotus_swap.JevChooser), read as P(Document 1).
 
     read -s TYPESAFE_API_KEY
     export TYPESAFE_API_KEY
     uv run python -m experiments.position_bias.jev --tasks sales,support,legal
 
-Records: /results/position_bias/jev-1.13.0/{task}.json on the
+Records: /results/position_bias/jev-1.13.0/{task}_lotus.json on the
 quail-results volume.
 """
 
@@ -23,6 +23,7 @@ import httpx
 import modal
 
 from experiments.position_bias.experiment import run_task
+from experiments.position_bias.lotus_swap import JevChooser, pair_document
 from experiments.position_bias.tasks import TASKS, load_task
 
 MODEL = "jev-1.13.0"
@@ -102,13 +103,14 @@ def main():
     LOCAL_DIR.mkdir(parents=True, exist_ok=True)
     for name in args.tasks.split(","):
         scorer = JevScorer(args.concurrency)
-        record = run_task(load_task(TASKS[name]), scorer,
+        record = run_task(load_task(TASKS[name]), scorer, JevChooser(name),
+                          pair_document,
                           log=lambda line: print(f"[{MODEL}] {line}", flush=True))
         record.update(model=MODEL, input_tokens=scorer.input_tokens)
-        local = LOCAL_DIR / f"{name}.json"
+        local = LOCAL_DIR / f"{name}_lotus.json"
         local.write_text(json.dumps(record))
         with RESULTS.batch_upload(force=True) as upload:
-            upload.put_file(str(local), f"/position_bias/{MODEL}/{name}.json")
+            upload.put_file(str(local), f"/position_bias/{MODEL}/{name}_lotus.json")
 
 
 if __name__ == "__main__":
