@@ -162,11 +162,12 @@ def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
                 if called is not None:
                     called()
 
-        table, context = _run_in_rust(
+        table, context, startup_s = _run_in_rust(
             query, physical_executor, plan, ready, results, region_tables,
             region_s, region_results)
-        return _query_result(query, context, table, whole, started, results,
-                             region_tables, region_s, region_results)
+        # starting the workers is model startup, not query time
+        return _query_result(query, context, table, whole, started + startup_s,
+                             results, region_tables, region_s, region_results)
 
     def run_query(region, on_rows=None, hint=None):
         if region.region_id is None or region.region_id in region_results:
@@ -211,7 +212,8 @@ def _run_in_rust(query, source, plan, ready, results, region_tables, region_s,
         region_results: Filled with each region's result by region id.
 
     Returns:
-        The query's rows and the SessionContext that ran it.
+        The query's rows, the SessionContext that ran it, and the
+        seconds it took to start the workers.
     """
     from quail.api.context import SessionContext
     from quail.api.region_inputs import region_query
@@ -226,9 +228,12 @@ def _run_in_rust(query, source, plan, ready, results, region_tables, region_s,
                 f"cannot run the model on this machine: {problem}. "
                 "Run your Session on a machine with a CUDA GPU "
                 "and the backend installed.")
+    startup_started = time.perf_counter()
+    if source is None:
         workers = backend.workers(config)
     else:
         workers = source.start_workers(config.gpus)["workers"]
+    startup_s = time.perf_counter() - startup_started
     if plan is not None:
         if isinstance(plan, Refusal) or not hasattr(plan, "graph"):
             raise TypeError("plan must be a PhysicalPlan")
@@ -270,7 +275,7 @@ def _run_in_rust(query, source, plan, ready, results, region_tables, region_s,
         # the boot is the region's time, not DataFusion's
         region_s.append(total_s)
         region_results[region.region_id] = result
-    return table, context
+    return table, context, startup_s
 
 
 def _query_result(query, context, table, whole, started, results, region_tables,
