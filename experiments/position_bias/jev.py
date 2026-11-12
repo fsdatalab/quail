@@ -9,7 +9,8 @@ placeholder removed.
     export TYPESAFE_API_KEY
     uv run python -m experiments.position_bias.jev --tasks sales,support,legal
 
-Records: results/position_bias/jev-1.13.0/{task}.json.
+Records: /results/position_bias/jev-1.13.0/{task}.json on the
+quail-results volume.
 """
 
 import argparse
@@ -19,6 +20,7 @@ import os
 from pathlib import Path
 
 import httpx
+import modal
 
 from experiments.position_bias.experiment import run_task
 from experiments.position_bias.tasks import TASKS, load_task
@@ -27,6 +29,7 @@ MODEL = "jev-1.13.0"
 URL = "https://api.typesafe.ai/v1/systemone"
 LOCAL_DIR = Path("results/position_bias") / MODEL
 QUESTION = "answer"
+RESULTS = modal.Volume.from_name("quail-results")
 
 
 def jev_instructions(template: str) -> str:
@@ -102,7 +105,10 @@ def main():
         record = run_task(load_task(TASKS[name]), scorer,
                           log=lambda line: print(f"[{MODEL}] {line}", flush=True))
         record.update(model=MODEL, input_tokens=scorer.input_tokens)
-        (LOCAL_DIR / f"{name}.json").write_text(json.dumps(record))
+        local = LOCAL_DIR / f"{name}.json"
+        local.write_text(json.dumps(record))
+        with RESULTS.batch_upload(force=True) as upload:
+            upload.put_file(str(local), f"/position_bias/{MODEL}/{name}.json")
 
 
 if __name__ == "__main__":

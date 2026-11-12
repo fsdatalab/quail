@@ -11,7 +11,7 @@ AI.SCORE, so a score is P(RECORD 1 wins).
         --models qwen3-4b-fp8 --tasks legal --smoke
 
 Records: /results/position_bias/{model}/{task}.json on the
-quail-results volume, copied to results/position_bias/ locally.
+quail-results volume. The entrypoint prints each function call id.
 """
 
 import json
@@ -25,7 +25,7 @@ try:
 except ImportError:    # a container without the local quail package
     image = None
 
-app = modal.App("quail-position-bias")
+app = modal.App("quail-milestone1")
 hf_cache = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)
 kernel_cache = modal.Volume.from_name("quail-kernel-cache",
                                       create_if_missing=True)
@@ -38,7 +38,6 @@ MODELS = ("decision-2.0-kai-0.6b-bf16", "qwen3-0.6b-bf16", "d1-2b-bf16",
           "lfm2-2.6b-bf16", "qwen3-4b-fp8", "qwen3.8-27b-fp8",
           "qwen3.6-35b-a3b-fp8")
 TASK_NAMES = ("sales", "support", "legal")
-LOCAL_DIR = Path("results/position_bias")
 # rows per AI.SCORE query; bounds the host memory of one batch
 BATCH_ROWS = 4096
 
@@ -115,20 +114,19 @@ def run_model_task(model: str, task_name: str, smoke: bool = False) -> dict:
 @app.local_entrypoint()
 def main(models: str = ",".join(MODELS), tasks: str = ",".join(TASK_NAMES),
          smoke: bool = False):
-    """Run every (model, task) in parallel and save the records locally."""
-    pairs = [(model, task) for model in models.split(",")
-             for task in tasks.split(",")]
-    for (model, task), record in zip(pairs, run_model_task.starmap(
-            [(model, task, smoke) for model, task in pairs],
-            return_exceptions=True)):
-        if isinstance(record, Exception):
-            print(f"{model} {task}: failed: {record!r}")
+    """Start every (model, task), print each function call id, then wait."""
+    calls = [(model, task, run_model_task.spawn(model, task, smoke))
+             for model in models.split(",") for task in tasks.split(",")]
+    for model, task, call in calls:
+        print(f"{model} {task}: {call.object_id}", flush=True)
+    for model, task, call in calls:
+        try:
+            record = call.get()
+        except Exception as error:     # report every run, then go on
+            print(f"{model} {task}: failed: {error!r}", flush=True)
             continue
-        directory = LOCAL_DIR / ("smoke" if smoke else "") / model
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / f"{task}.json").write_text(json.dumps(record))
         best = {entry["rule"]: entry["precision"]
                 for entry in record["quickselect"]}
         print(f"{model} {task}: pointwise {record['pointwise']['precision']:.3f}, "
               f"quickselect {best}, bias "
-              f"{record['swap']['summary']['all']['bias']:+.3f}")
+              f"{record['swap']['summary']['all']['bias']:+.3f}", flush=True)
