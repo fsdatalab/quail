@@ -249,6 +249,17 @@ impl AiNode {
     /// its own answers and its input's columns, not one that reads
     /// another call's answer.
     pub fn accepts_test(&self, term: &Expr) -> bool {
+        // DataFusion decorrelates a subquery it finds in a `Filter`, not
+        // one a node holds
+        let subquery = |expr: &Expr| {
+            Ok(matches!(
+                expr,
+                Expr::Exists(_) | Expr::InSubquery(_) | Expr::ScalarSubquery(_)
+            ))
+        };
+        if datafusion::common::tree_node::TreeNode::exists(term, subquery).unwrap_or(true) {
+            return false;
+        }
         let one_table = self
             .call
             .column_refs()

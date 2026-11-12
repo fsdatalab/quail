@@ -86,6 +86,10 @@ QUERIES = {
         "SELECT u.id FROM u WHERE EXISTS "
         f"(SELECT 1 FROM r WHERE r.id = u.id AND {PREDICATE})"
     ),
+    "AI answer IN a correlated subquery of AI answers": (
+        f"SELECT r.id FROM r WHERE {CLASSIFY} IN (SELECT "
+        "AI.CLASSIFY(PROMPT('q1: {0}', u.name), ['a', 'b']) FROM u WHERE u.id = r.id)"
+    ),
     "EXISTS of an AI pair under OR": (
         f"SELECT r.id FROM r WHERE EXISTS (SELECT 1 FROM u WHERE {PAIR}) "
         "OR r.stars > 3"
@@ -156,6 +160,7 @@ def expected_rows(truth):
         "cross join + AI pair filter": PAIRS if truth else [],
         "IN subquery with AI": [("r1",), ("r2",)] if truth else [],
         "EXISTS correlated AI": [("r1",), ("r2",)] if truth else [],
+        "AI answer IN a correlated subquery of AI answers": [("r1",), ("r2",)],
         "EXISTS of an AI pair under OR": IDS if truth else [("r3",)],
         "ON with an OR of a pair test and a one-table test":
             [("r1", "x"), ("r2", "y")] if truth else [],
