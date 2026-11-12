@@ -109,6 +109,11 @@ pub struct Executor {
     edited: Mutex<Option<serde_json::Value>>,
     /// Called once the workers are ready to run a region.
     ready: Mutex<Option<Ready>>,
+    /// Stops the workers, for an executor that runs on them.
+    interrupter: Option<crate::workers::Interrupter>,
+    /// The running region's latest progress, as its worker counted it:
+    /// the label, how many are done, how many in all, and their unit.
+    progress: Arc<Mutex<Option<serde_json::Value>>>,
 }
 
 /// Called once the workers have the model loaded for a region.
@@ -211,7 +216,10 @@ impl Executor {
                     .map_err(quail_datafusion::external)?,
             ),
         };
+        let interrupter = workers.lock().expect("the workers lock").interrupter();
         Ok(Self {
+            interrupter: Some(interrupter),
+            progress: Arc::new(Mutex::new(None)),
             runs: Runs::Workers(workers),
             rules,
             prompting: (turn, layout),
@@ -239,6 +247,8 @@ impl Executor {
         planning: Option<(Arc<Planner>, Settings)>,
     ) -> Self {
         Self {
+            interrupter: None,
+            progress: Arc::new(Mutex::new(None)),
             runs: Runs::Engine(engine),
             rules: rules.unwrap_or_else(quail_datafusion::default_rule_names),
             prompting,
@@ -391,6 +401,21 @@ impl Executor {
             .collect();
         request["run"] = json!({"report": report, "metrics": metrics});
         Ok(request)
+    }
+
+    /// Stop the running query: its workers are killed, so the region
+    /// they run fails, and the next region starts them again with the
+    /// models to load. Does nothing for an executor over an engine.
+    pub fn interrupt(&self) {
+        if let Some(interrupter) = &self.interrupter {
+            interrupter.interrupt();
+        }
+    }
+
+    /// The running region's latest progress, as its worker counted it:
+    /// `[label, done, total, unit]`; None before a worker counts.
+    pub fn progress(&self) -> Option<serde_json::Value> {
+        self.progress.lock().expect("the progress lock").clone()
     }
 
     /// What each region of the last query ran on the workers, in the
@@ -805,6 +830,7 @@ impl Executor {
                     conformed,
                     rows,
                     self.ready.lock().expect("the ready lock").clone(),
+                    Arc::clone(&self.progress),
                 )?;
                 self.regions.lock().expect("the regions lock").push(ran);
                 return Ok(());
@@ -848,6 +874,7 @@ fn run_on_workers(
     conformed: impl Fn(RecordBatch) -> Result<RecordBatch> + Send + Sync + 'static,
     rows: &RowSender,
     ready: Option<Ready>,
+    progress: Arc<Mutex<Option<serde_json::Value>>>,
 ) -> Result<RegionRan> {
     let read = |error: serde_json::Error| DataFusionError::External(Box::new(error));
     let plan: serde_json::Value = serde_json::from_str(&found).map_err(read)?;
@@ -898,20 +925,28 @@ fn run_on_workers(
     });
     let listening = crate::region_run::Listening {
         hinted,
-        progress: false,
+        progress: true,
         answers: false,
     };
+    *progress.lock().expect("the progress lock") = None;
     let sender = rows.clone();
     let on_rows = Arc::new(move |batch: RecordBatch| {
         // the receiver is gone once DataFusion stops reading
         let _ = sender.send(RegionRows::Batch(Ok(conformed(batch)?)));
         Ok(())
     });
-    let ask: crate::workers::Ask = Box::new(move |question| match &hint {
-        Some(hint) if question.get("hint").is_some() => hint.answer(question),
-        _ => Ok(crate::workers::Answer::Json(serde_json::Value::Null)),
+    let ask: crate::workers::Ask = Box::new(move |question| {
+        if let Some(counted) = question.get("progress") {
+            *progress.lock().expect("the progress lock") = Some(counted.clone());
+        }
+        match &hint {
+            Some(hint) if question.get("hint").is_some() => hint.answer(question),
+            _ => Ok(crate::workers::Answer::Json(serde_json::Value::Null)),
+        }
     });
     let mut workers = workers.lock().expect("the workers lock");
+    // a query that was stopped left its workers dead
+    workers.revive()?;
     let entered = std::time::Instant::now();
     let boots = workers.boot(&setup)?;
     if let Some(ready) = ready {

@@ -12,6 +12,7 @@ arrow-flight = "59.3.2"
 datafusion = { version = "55.2.0", default-features = false, features = ["sql", "nested_expressions"] }
 futures = "0.3"
 quail = { path = "../quail" }
+serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "signal"] }
 tonic = "0.14"

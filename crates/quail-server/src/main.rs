@@ -1,20 +1,22 @@
 //! `quail-server --model <model> --device <device> [--gpus <n>]
-//! [--backend <backend>] [--listen <address>]`
+//! [--backend <backend>] [--listen <address>] [--data <directory>]`
 //!
 //! Starts a GPU worker per GPU and serves a Quail session over Arrow
 //! Flight ([`quail_server::QuailService`]) at the address, by default
-//! `127.0.0.1:50051`. Ctrl-C or SIGTERM stops the server and its
-//! workers.
+//! `127.0.0.1:50051`. Submitted queries and their rows are kept in the
+//! data directory, by default `quail-server-data`. Ctrl-C or SIGTERM
+//! stops the server and its workers.
 
 use std::sync::Arc;
 
 use arrow_flight::flight_service_server::FlightServiceServer;
 use quail::{EngineConfig, Session};
 use quail_server::QuailService;
+use quail_server::queue::Queue;
 use tonic::transport::Server;
 
 const USAGE: &str = "usage: quail-server --model <model> --device <device> \
-[--gpus <n>] [--backend <backend>] [--listen <address>]";
+[--gpus <n>] [--backend <backend>] [--listen <address>] [--data <directory>]";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut options = std::collections::HashMap::new();
@@ -32,21 +34,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.backend = backend;
     }
     let listen = take("listen").unwrap_or_else(|| "127.0.0.1:50051".to_string());
+    let data = take("data").unwrap_or_else(|| "quail-server-data".to_string());
     if !options.is_empty() {
         return Err(USAGE.into());
     }
     let address = listen.parse()?;
     // the session starts its workers before the server accepts a query
     let session = Arc::new(Session::new(&config)?);
+    let queue = Queue::open(std::path::Path::new(&data), Arc::clone(&session))?;
+    let service = QuailService::new(session, Arc::clone(&queue));
     println!(
         "Quail Server: {} on {}, at {listen}",
         config.model, config.device
     );
     tokio::runtime::Runtime::new()?.block_on(
         Server::builder()
-            .add_service(FlightServiceServer::new(QuailService::new(session)))
+            .add_service(FlightServiceServer::new(service))
             .serve_with_shutdown(address, stopped()),
     )?;
+    queue.close();
     // the session's workers stop, and their sockets go, as it drops
     Ok(())
 }

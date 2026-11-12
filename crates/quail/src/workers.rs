@@ -429,7 +429,9 @@ pub struct Workers {
     directory: Directory,
     listeners: Vec<UnixListener>,
     paths: Vec<PathBuf>,
-    processes: Vec<Child>,
+    processes: Arc<Mutex<Vec<Child>>>,
+    /// The command the processes were started with, to start them again.
+    command: Option<Vec<String>>,
     connections: Vec<Arc<Mutex<Connection>>>,
     num_regions: usize,
 }
@@ -457,7 +459,8 @@ impl Workers {
             directory,
             listeners,
             paths,
-            processes: Vec::new(),
+            processes: Arc::new(Mutex::new(Vec::new())),
+            command: None,
             connections: Vec::new(),
             num_regions: 0,
         })
@@ -486,8 +489,12 @@ impl Workers {
                 .env("CUDA_VISIBLE_DEVICES", gpu.to_string())
                 .spawn()
                 .map_err(|error| failure(format!("cannot start {program}: {error}")))?;
-            self.processes.push(process);
+            self.processes
+                .lock()
+                .expect("the processes lock")
+                .push(process);
         }
+        self.command = Some(command.to_vec());
         Ok(())
     }
 
@@ -505,7 +512,7 @@ impl Workers {
                     Err(error) if error.kind() == ErrorKind::WouldBlock => {}
                     Err(error) => return Err(error.into()),
                 }
-                if !alive(&mut self.processes) {
+                if !alive(&mut self.processes.lock().expect("the processes lock")) {
                     return Err(failure("a GPU worker exited before it connected"));
                 }
                 if started.elapsed() > PATIENCE {
@@ -520,9 +527,36 @@ impl Workers {
         Ok(())
     }
 
+    /// A handle that stops the worker processes from another thread,
+    /// while a region holds the workers.
+    pub fn interrupter(&self) -> Interrupter {
+        Interrupter(Arc::clone(&self.processes))
+    }
+
+    /// Start the worker processes again, with the command they were
+    /// started with, when one has exited; the models load again.
+    ///
+    /// # Errors
+    ///
+    /// The workers were not started by a command, or do not start.
+    pub fn revive(&mut self) -> Result<()> {
+        if self.alive() {
+            return Ok(());
+        }
+        let command = (self.command.clone())
+            .ok_or_else(|| failure("a GPU worker exited, and Quail did not start it"))?;
+        self.connections.clear();
+        for mut process in self.processes.lock().expect("the processes lock").drain(..) {
+            let _ = process.kill();
+            let _ = process.wait();
+        }
+        self.spawn(&command)?;
+        self.connect()
+    }
+
     /// Whether every worker process is running.
     pub fn alive(&mut self) -> bool {
-        alive(&mut self.processes)
+        alive(&mut self.processes.lock().expect("the processes lock"))
     }
 
     /// What Quail plans the regions of `config` with, as the first
@@ -616,6 +650,20 @@ impl Workers {
     }
 }
 
+/// Stops a session's worker processes: the region they run fails, and
+/// the next region starts them again.
+#[derive(Debug, Clone)]
+pub struct Interrupter(Arc<Mutex<Vec<Child>>>);
+
+impl Interrupter {
+    /// Kill every worker process.
+    pub fn interrupt(&self) {
+        for process in self.0.lock().expect("the processes lock").iter_mut() {
+            let _ = process.kill();
+        }
+    }
+}
+
 fn alive(processes: &mut [Child]) -> bool {
     processes
         .iter_mut()
@@ -635,10 +683,11 @@ impl Drop for Workers {
         let running = |processes: &mut [Child]| {
             (processes.iter_mut()).any(|process| matches!(process.try_wait(), Ok(None)))
         };
-        while running(&mut self.processes) && started.elapsed() < Duration::from_secs(1) {
+        let mut processes = self.processes.lock().expect("the processes lock");
+        while running(&mut processes) && started.elapsed() < Duration::from_secs(1) {
             std::thread::sleep(POLL);
         }
-        for process in &mut self.processes {
+        for process in processes.iter_mut() {
             let _ = process.kill();
             let _ = process.wait();
         }

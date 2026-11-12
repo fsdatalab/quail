@@ -7,11 +7,23 @@
 //!   unique; Quail names each row a model region returns by it.
 //! - `DoGet` with a ticket that is a SQL query runs it and returns its
 //!   rows.
+//! - `DoAction` `submit` queues a query and returns its status at once.
+//!   Its body is JSON: `sql`, and optionally `id`, which names the
+//!   submission, and `timeout_s`. `status`, with an id as its body,
+//!   returns the submission's status, and the running region's
+//!   progress; `cancel` stops it; `list` returns every submission.
+//!   A status is JSON ([`queue::Submission`]).
+//! - `DoGet` with the ticket `{"query_id": id}` returns the rows of a
+//!   submission that succeeded.
 //! - `DoAction` `explain` with a SQL query returns DataFusion's plan,
 //!   with each model region as one operator.
 //!
 //! One query runs at a time; another waits its turn. The server sends a
-//! query's rows once the query has finished.
+//! query's rows once the query has finished. A submission's status and
+//! rows are files in the server's data directory ([`queue`]), so a
+//! server started on the same directory still has them.
+
+pub mod queue;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -34,14 +46,17 @@ use tonic::{Request, Response, Status, Streaming};
 /// The Flight service of one session.
 pub struct QuailService {
     session: Arc<Session>,
+    queue: Arc<queue::Queue>,
     num_uploads: AtomicUsize,
 }
 
 impl QuailService {
-    /// A service that runs every query on `session`.
-    pub fn new(session: Arc<Session>) -> Self {
+    /// A service that runs every query on `session` and keeps its
+    /// submissions in `queue`.
+    pub fn new(session: Arc<Session>, queue: Arc<queue::Queue>) -> Self {
         QuailService {
             session,
+            queue,
             num_uploads: AtomicUsize::new(0),
         }
     }
@@ -70,6 +85,18 @@ fn query_status(error: DataFusionError) -> Status {
     }
 }
 
+/// The server's actions, each with what it does.
+const ACTIONS: [(&str, &str); 5] = [
+    ("explain", "Return the plan of a SQL query"),
+    (
+        "submit",
+        "Queue a query; the body is JSON with sql, id, timeout_s",
+    ),
+    ("status", "Return a submission's status, by id"),
+    ("cancel", "Stop a submission, by id"),
+    ("list", "Return every submission"),
+];
+
 fn text(bytes: &[u8], what: &str) -> Result<String, Status> {
     String::from_utf8(bytes.to_vec())
         .map_err(|_| Status::invalid_argument(format!("{what} is not UTF-8 text")))
@@ -90,9 +117,17 @@ impl FlightService for QuailService {
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
         let query = text(&request.into_inner().ticket, "the ticket")?;
-        let (schema, batches) = self
-            .blocking(move |session| session.sql_in_dialect(&query, None))
-            .await?;
+        // a ticket that is JSON names a submission; any other is SQL
+        let submitted = serde_json::from_str::<serde_json::Value>(&query)
+            .ok()
+            .and_then(|ticket| ticket["query_id"].as_str().map(str::to_string));
+        let (schema, batches) = match submitted {
+            Some(id) => self.queue.rows(&id).map_err(Status::not_found)?,
+            None => {
+                self.blocking(move |session| session.sql_in_dialect(&query, None))
+                    .await?
+            }
+        };
         let rows = FlightDataEncoderBuilder::new()
             .with_schema(schema)
             .build(stream::iter(batches.into_iter().map(Ok)))
@@ -167,18 +202,41 @@ impl FlightService for QuailService {
         request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
         let action = request.into_inner();
-        if action.r#type != "explain" {
-            return Err(Status::invalid_argument(format!(
-                "unknown action {}; the server has explain",
-                action.r#type
-            )));
-        }
-        let query = text(&action.body, "the query")?;
-        let plan = self
-            .blocking(move |session| session.explain(&query, None))
-            .await?;
+        let body = text(&action.body, "the action's body")?;
+        let json = |value: serde_json::Value| value.to_string();
+        let answer = match action.r#type.as_str() {
+            "explain" => {
+                self.blocking(move |session| session.explain(&body, None))
+                    .await?
+            }
+            "submit" => {
+                let asked: serde_json::Value = serde_json::from_str(&body)
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
+                let sql = (asked["sql"].as_str())
+                    .ok_or_else(|| Status::invalid_argument("a submission needs sql"))?;
+                let id = asked["id"].as_str().map(str::to_string);
+                let found = (self.queue)
+                    .submit(sql, id, asked["timeout_s"].as_f64())
+                    .map_err(Status::invalid_argument)?;
+                json(serde_json::json!(found))
+            }
+            "status" => json(
+                (self.queue.status(&body))
+                    .ok_or_else(|| Status::not_found(format!("no submission {body}")))?,
+            ),
+            "cancel" => json(serde_json::json!(
+                self.queue.cancel(&body).map_err(Status::not_found)?
+            )),
+            "list" => json(serde_json::json!(self.queue.list())),
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "unknown action {other}; the server has {}",
+                    ACTIONS.map(|(name, _)| name).join(", ")
+                )));
+            }
+        };
         let found = arrow_flight::Result {
-            body: plan.into_bytes().into(),
+            body: answer.into_bytes().into(),
         };
         Ok(Response::new(stream::once(async { Ok(found) }).boxed()))
     }
@@ -187,11 +245,13 @@ impl FlightService for QuailService {
         &self,
         _request: Request<Empty>,
     ) -> Result<Response<Self::ListActionsStream>, Status> {
-        let explain = ActionType {
-            r#type: "explain".into(),
-            description: "Return the plan of a SQL query".into(),
-        };
-        Ok(Response::new(stream::once(async { Ok(explain) }).boxed()))
+        let actions = ACTIONS.map(|(name, description)| {
+            Ok(ActionType {
+                r#type: name.into(),
+                description: description.into(),
+            })
+        });
+        Ok(Response::new(stream::iter(actions).boxed()))
     }
 
     async fn handshake(

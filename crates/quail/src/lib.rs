@@ -150,6 +150,17 @@ impl Session {
         self.runner.when_ready(ready);
     }
 
+    /// Stop the running query, as [`Executor::interrupt`] does.
+    pub fn interrupt(&self) {
+        self.runner.interrupt();
+    }
+
+    /// The running region's latest progress, as [`Executor::progress`]
+    /// gives it.
+    pub fn progress(&self) -> Option<serde_json::Value> {
+        self.runner.progress()
+    }
+
     /// What each model region of the last query ran on the workers, in
     /// the order the regions ran; the session keeps none of it.
     pub fn take_regions(&self) -> Vec<RegionRan> {
