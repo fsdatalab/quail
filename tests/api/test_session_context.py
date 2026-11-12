@@ -563,7 +563,8 @@ def test_an_ai_call_of_a_null_document_is_null_and_asks_no_model():
         # a pair with a NULL document has no score
         "SELECT r.id, v.id, AI.SCORE(PROMPT('q: {0} {1}', r.body, v.name)) AS s "
         "FROM r CROSS JOIN v":
-            [("r0", "v0", 0.5), ("r0", "v1", 0.5), ("r1", "v0", None), ("r1", "v1", None)],
+            [("r0", "v0", 0.5), ("r0", "v1", 0.5),
+             ("r1", "v0", None), ("r1", "v1", None)],
         # a NULL written without a type is a NULL document too
         "SELECT AI.IF(PROMPT('q: {0}', NULL)) AS k": [(None,)],
         # v1 has no partner; its row has no document, so no answer
