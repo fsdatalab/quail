@@ -75,6 +75,9 @@ QUESTION_TEXTS = {
     "legal": (
         "Which excerpt most clearly argues that the cited case's reasoning "
         "does not apply here?"),
+    "legal_passages": (
+        "Which legal passage most strongly supports a court's consideration "
+        "of an argument raised late or not preserved?"),
 }
 TASK_NAMES = tuple(QUESTION_TEXTS)
 NUM_SAMPLED_PAIRS = 5000
@@ -111,6 +114,12 @@ def load_pairs(task: str):
     from experiments.position_bias.tasks import TASKS, load_task
     from quail_b.data import load_table
 
+    if task == "legal_passages":
+        # no QUAIL-B labels for this question; every record is unlabeled
+        passages = load_table("citation_passages", scale_factor=0.1)
+        ids = [str(value) for value in passages["id"].to_pylist()]
+        texts = dict(zip(ids, passages["passage_text"].to_pylist()))
+        return sample_pairs(ids), texts, dict.fromkeys(ids, False)
     data = load_task(TASKS[task])
     if task == "sales":
         calls = load_table("sales_calls", scale_factor=0.1)
@@ -118,15 +127,20 @@ def load_pairs(task: str):
         ids = [str(value) for value in kept["id"].to_pylist()]
         pairs = list(itertools.combinations(ids, 2))
     else:
-        rng = random.Random(0)
         ids = data.ids
-        chosen = set()
-        while len(chosen) < NUM_SAMPLED_PAIRS:
-            first, second = rng.sample(ids, 2)
-            chosen.add(tuple(sorted((first, second))))
-        pairs = sorted(chosen)
+        pairs = sample_pairs(ids)
     return pairs, {key: data.texts[key] for key in ids}, \
         {key: data.labels[key] for key in ids}
+
+
+def sample_pairs(ids) -> list[tuple[str, str]]:
+    """NUM_SAMPLED_PAIRS distinct unordered pairs, drawn uniformly with seed 0."""
+    rng = random.Random(0)
+    chosen = set()
+    while len(chosen) < NUM_SAMPLED_PAIRS:
+        first, second = rng.sample(list(ids), 2)
+        chosen.add(tuple(sorted((first, second))))
+    return sorted(chosen)
 
 
 def run_swap(pairs, texts, labels, choose, template) -> dict:
