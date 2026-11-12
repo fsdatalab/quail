@@ -29,3 +29,7 @@ results/torchprof_*.json.gz
 # subagent git worktrees, created and removed per run
 .claude/worktrees/
 docs/out/
+
+# position-bias records live on the quail-results volume under
+# /results/position_bias; local copies and run logs are not versioned
+results/position_bias/
