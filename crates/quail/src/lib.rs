@@ -429,6 +429,33 @@ impl Session {
             .collect()
     }
 
+    /// Run a query, like `EXPLAIN ANALYZE`: its schema and rows, and
+    /// for each model region that ran, the plan as
+    /// [`Session::explain_regions`] gives it with each node's measured
+    /// rows, time, and tokens beside the estimates, then the run's
+    /// totals.
+    ///
+    /// # Errors
+    ///
+    /// The query fails, or a region's results do not read.
+    pub fn explain_analyze(
+        &self,
+        query: &str,
+        dialect: Option<&str>,
+        verbose: bool,
+    ) -> Result<(SchemaRef, Vec<RecordBatch>, Vec<String>)> {
+        let read = |error: serde_json::Error| DataFusionError::External(Box::new(error));
+        let (schema, batches) = self.sql_in_dialect(query, dialect)?;
+        let explained = (self.take_regions().iter())
+            .map(|region| {
+                let request = self.runner.analyzed_request(region, verbose)?;
+                let request = serde_json::from_value(request).map_err(read)?;
+                quail_planner::explain::explain_text(&request).map_err(DataFusionError::Execution)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((schema, batches, explained))
+    }
+
     /// Plan each model region of a query without running it, region by
     /// region: (the region as [`region_json`] writes it, its planned
     /// region as JSON when Rust plans it). A region's inputs that call no

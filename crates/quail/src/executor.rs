@@ -330,6 +330,69 @@ impl Executor {
         Ok(request)
     }
 
+    /// What the planner's explain reads of a region that ran: its
+    /// [`Executor::explain_request`] with the run's report and each
+    /// node's measured metrics.
+    ///
+    /// # Errors
+    ///
+    /// The planned region or a worker's results do not read.
+    pub(crate) fn analyzed_request(
+        &self,
+        region: &RegionRan,
+        verbose: bool,
+    ) -> Result<serde_json::Value> {
+        use serde_json::{Value, json};
+        let read = |error: serde_json::Error| DataFusionError::External(Box::new(error));
+        let planned: Value = serde_json::from_str(&region.planned).map_err(read)?;
+        let mut request = self.explain_request(&planned, verbose)?;
+        let envelope = &planned["envelope"];
+        let graph: quail_planner::physical::PhysicalGraph =
+            serde_json::from_value(envelope["graph"].clone()).map_err(read)?;
+        let usd_per_hour = (self.planning.as_ref())
+            .and_then(|(_, settings)| settings.device["usd_per_hour"].as_f64());
+        let (mut measured, _) = crate::report::region_report(
+            &graph,
+            &region.ran,
+            region.seconds,
+            usd_per_hour,
+            envelope["gpus"].as_i64().unwrap_or(1),
+            envelope["settings"]["gpu_timing"]
+                .as_bool()
+                .unwrap_or(false),
+        )?;
+        // the root's rows are the region's
+        let root = graph.root.node_id.clone();
+        measured["node_metrics"][&root]["output_rows"] = json!(region.rows.num_rows());
+        let seconds = |boot: &Value| boot["boot_s"].as_f64().unwrap_or(0.0);
+        let slowest =
+            (region.boots.iter()).max_by(|one, two| seconds(one).total_cmp(&seconds(two)));
+        if let Some(boot) = slowest {
+            measured["boot_s"] = boot["boot_s"].clone();
+            measured["boot_kind"] = boot["kind"].clone();
+            measured["boot"] = boot.clone();
+        }
+        let report = crate::results::execution_report(
+            envelope["backend"].as_str().unwrap_or_default(),
+            planned["estimated_seconds"].as_f64().unwrap_or(0.0),
+            envelope["settings"]["order_rule"].as_str(),
+            measured.as_object().expect("a report"),
+            region.total_seconds,
+        );
+        let metrics: serde_json::Map<String, Value> = (report["node_metrics"].as_object())
+            .into_iter()
+            .flatten()
+            .map(|(node, fields)| {
+                let pairs: Vec<Value> = (fields.as_object().into_iter().flatten())
+                    .map(|(field, value)| json!([field, value]))
+                    .collect();
+                (node.clone(), Value::Array(pairs))
+            })
+            .collect();
+        request["run"] = json!({"report": report, "metrics": metrics});
+        Ok(request)
+    }
+
     /// What each region of the last query ran on the workers, in the
     /// order the regions ran; the executor keeps none of it.
     pub fn take_regions(&self) -> Vec<RegionRan> {

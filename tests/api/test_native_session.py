@@ -58,3 +58,26 @@ def test_rust_explains_a_region_as_the_python_query_does():
             expected = session.sql(text).explain()
             (found,) = quail.SessionContext(session)._native.explain_regions(text)
         assert found == expected, text
+
+
+def test_rust_explain_analyze_shows_measured_rows_beside_the_estimates():
+    text = QUERIES[0]
+    with _session() as session:
+        workers = _quail_native.Workers(CONFIG.gpus)
+        threading.Thread(
+            target=_serve, daemon=True,
+            args=(_oracle(), str(workers.paths[0]),
+                  engine_description(Engine(session)))).start()
+        workers.connect()
+        context = quail.SessionContext(session, workers=workers)
+        table, (explained,) = context._native.explain_analyze(text)
+    assert table.num_rows == 2
+    lines = explained.splitlines()
+    header = next(line for line in lines if "est. rows" in line)
+    assert header.split()[:3] == ["est.", "rows", "rows"]
+    # four reviews are read and the two at even positions pass
+    filtered = next(line for line in lines if "AiFilter: r" in line)
+    assert filtered.split()[3] == "2"
+    scanned = next(line for line in lines if "Scan reviews as r" in line)
+    assert scanned.split()[4:6] == ["4", "4"]
+    assert any("startup" in line and "warm" in line for line in lines)

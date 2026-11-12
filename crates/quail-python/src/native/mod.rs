@@ -85,6 +85,26 @@ impl NativeSession {
         .map_err(python_error)
     }
 
+    /// Run a query and explain each model region that ran with its
+    /// measurements, as `crate::Session::explain_analyze` does; returns
+    /// the query's rows and each region's text.
+    #[pyo3(signature = (query, dialect=None, verbose=false))]
+    fn explain_analyze<'py>(
+        &self,
+        py: Python<'py>,
+        query: &str,
+        dialect: Option<String>,
+        verbose: bool,
+    ) -> PyResult<(Bound<'py, PyAny>, Vec<String>)> {
+        let (schema, batches, explained) = py
+            .detach(|| {
+                self.session
+                    .explain_analyze(query, dialect.as_deref(), verbose)
+            })
+            .map_err(python_error)?;
+        Ok((to_pyarrow(py, schema, batches)?, explained))
+    }
+
     /// Run an edited plan's envelope, as JSON, in place of the
     /// planner's plan for the next model region; None runs the
     /// planner's.
