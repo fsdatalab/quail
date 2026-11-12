@@ -75,7 +75,7 @@ class QuailScorer:
         return scores
 
 
-@app.function(image=image, gpu="H100!", memory=98304, timeout=8 * 3600,
+@app.function(image=image, gpu="B200", memory=98304, timeout=8 * 3600,
               volumes=VOLUMES)
 def run_model_task(model: str, task_name: str, smoke: bool = False) -> dict:
     """Run one model on one task and save the record to the volume.
@@ -101,7 +101,7 @@ def run_model_task(model: str, task_name: str, smoke: bool = False) -> dict:
     start = time.perf_counter()
     with ExitStack() as stack:
         session = stack.enter_context(quail.Session(
-            quail.EngineConfig(model=model, device="h100-sxm")))
+            quail.EngineConfig(model=model, device="b200")))
         from experiments.position_bias import lotus_swap
         record = run_task(data, QuailScorer(session),
                           lotus_swap.QuailChooser(
