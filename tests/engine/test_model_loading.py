@@ -130,25 +130,18 @@ def test_model_files_are_resolved_once_and_cached_before_children_start(
         assert configuration == ("qwen3-4b-fp8", "h100-sxm", "quail", 8)
         return SimpleNamespace(round=round_fn)
 
-    def run_graph(*args):
-        assert events == ["resolve", "children", "boot"]
-        events.append("query")
-        return {"_outputs": {}, "boot_s": 0.0, "wall_s": 7.0}
-
     clock = iter([10.0, 12.0, 15.0])
     monkeypatch.setattr(worker.time, "perf_counter", lambda: next(clock))
     monkeypatch.setattr(worker, "resolve_model_path", resolve)
     monkeypatch.setattr(worker, "_ensure_children", ensure)
-    monkeypatch.setattr(worker, "execute_staged_graph", run_graph)
-    result = worker.execute_quail_multi({
-        "documents": {}, "gpus": 8, "model": "qwen3-4b-fp8",
-        "physical_plan": {"device": "h100-sxm", "backend": "quail"},
-        "chunk_tokens": 100, "true_ids": [1], "false_ids": [2],
-    }, registry, object())
-    assert events == ["resolve", "children", "boot", "query"]
-    assert result.metrics["boot_s"] == 5.0
-    assert result.metrics["boot"]["model_files_s"] == 2.0
-    assert result.metrics["wall_s"] == 7.0
+    booted = worker._boot_children({
+        "gpus": 8, "model": "qwen3-4b-fp8", "device": "h100-sxm",
+        "backend": "quail",
+        "settings": {"chunk_tokens": 100, "true_ids": [1], "false_ids": [2]},
+    }, registry)
+    assert events == ["resolve", "children", "boot"]
+    assert booted["boot"]["boot_s"] == 5.0
+    assert booted["boot"]["model_files_s"] == 2.0
 
 
 def test_a_base_model_without_a_turn_close_ends_answers_at_its_config_eos(

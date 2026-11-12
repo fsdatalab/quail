@@ -169,7 +169,7 @@ class PhysicalPlan:
         settings = self.settings
         if "stages" in settings:
             settings = {**settings, "stages": json.loads(
-                _quail_native.region_stages(edited.to_json()))}
+                _quail_native.region_stages(edited.to_json(), self.gpus))}
         return replace(self, nodes=edited.nodes, root=edited.root,
                        settings=settings, **fields)
 

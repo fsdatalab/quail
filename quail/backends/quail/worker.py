@@ -1,11 +1,14 @@
-"""Load and run Quail models on the process's GPUs.
+"""Load and run Quail models on the machine's GPUs.
 
-One GPU runs in the calling process. Several GPUs use one child process
-per GPU, each with its own CUDA context and arena; each child serves
-its partition of the region's stages to Rust over a Unix socket.
+Each GPU has one child process, with its own CUDA context and arena,
+which keeps its model loaded between queries. A child serves its
+partition of a region's stages to Rust over a Unix socket; the query's
+documents reach it through a file both processes map.
 """
 
 import atexit
+import json
+import os
 import time
 from contextlib import ExitStack, suppress
 from dataclasses import dataclass
@@ -25,20 +28,23 @@ from quail.backends.quail.executor.readout import (
     AsyncDecisionScores,
     DecisionHead,
 )
-from quail.backends.quail.executor.state import GpuRuntime
 from quail.backends.quail.executor.warmup import warm_kernels
-from quail.backends.quail.graph import (
-    execute_single_graph,
-    execute_staged_graph,
-    serve_region,
-)
+from quail.backends.quail.graph import execute_staged_graph, serve_region
+from quail.backends.quail.shared import opened, share
 from quail.backends.resources import freeze_loaded_objects, release_models
 from quail.common import budgets
 from quail.common.tokens import decode_payload_documents
 from quail.execution.types import PhysicalResponse
 from quail.physical import Scan
 from quail.physical.plan import graph_from_envelope
-from quail.progress import detail, say, set_gpu_index
+from quail.progress import (
+    answer_sink,
+    progress_sink,
+    say,
+    set_answer_sink,
+    set_gpu_index,
+    set_progress_sink,
+)
 from quail.specs.files import resolve_model_path
 
 # Children outlive sessions so later queries can reuse their loaded models.
@@ -59,7 +65,6 @@ class LoadedGpu:
         self.F = F
         self.spec = spec
         self._warmed = False
-        self.prepared_boot = None
 
         set_gpu_index(gpu_index)
         free, total = torch.cuda.mem_get_info()
@@ -305,26 +310,6 @@ def quail_runtime_payload(request, graph) -> dict:
     }
 
 
-def _single_gpu_context(registry, envelope):
-    """Build the GPU context for the single-GPU boot path."""
-    return GpuContext(
-        gpu_index=0,
-        gpus=envelope["gpus"],
-        model=registry.model(envelope["model"]),
-        device=registry.device(envelope["device"]),
-        query_settings={},
-    )
-
-
-def _boot_for_query(runtime_state, backend, gpu_context,
-                    chunk_tokens, true_ids, false_ids, arena_pages=None):
-    """Load or reuse the process's GPU, bind a query, warm kernels."""
-    gpu, boot = _boot_gpu(runtime_state.pop("gpu", None), backend, gpu_context,
-                          chunk_tokens, true_ids, false_ids, arena_pages)
-    runtime_state["gpu"] = gpu
-    return gpu, boot
-
-
 def _boot_gpu(gpu, backend, gpu_context, chunk_tokens, true_ids, false_ids,
               arena_pages=None, *, model_path=None):
     """Prepare a GPU for a query, releasing it when preparation fails.
@@ -351,73 +336,14 @@ def _boot_gpu(gpu, backend, gpu_context, chunk_tokens, true_ids, false_ids,
     return gpu, boot
 
 
-def prepare_quail_request(context) -> None:
-    """Boot one GPU from the plan alone; the documents can arrive later."""
-    if context.gpus != 1:
-        return
-    envelope = context.request.plan
-    settings = dict(envelope["settings"])
-    registry = context.registry
-    gpu, boot = _boot_for_query(
-        context.runtime_state, registry.backend(envelope["backend"]),
-        _single_gpu_context(registry, envelope), settings["chunk_tokens"],
-        settings["true_ids"], settings["false_ids"],
-        settings.get("arena_pages"))
-    gpu.prepared_boot = boot
-
-
-def execute_quail_request(context):
-    """Run one Quail request from a backend execution context."""
-    payload = quail_runtime_payload(context.request, context.graph)
-    if context.gpus == 1:
-        backend = context.registry.backend(context.request.plan["backend"])
-        return execute_quail_payload(
-            payload, context.registry, context.graph, backend,
-            context.runtime_state,
-        )
-    return execute_quail_multi(payload, context.registry, context.graph)
-
-
 def release_quail_request(state: dict) -> None:
-    """Release the GPU child processes and the model loaded in this process."""
+    """Release the GPU child processes and the models they loaded."""
     _close_children()
-    release_models(state)
-
-
-def execute_quail_payload(payload, registry, graph, backend, runtime_state):
-    """Execute one Quail payload on the worker's own GPU."""
-    gpu_context = _single_gpu_context(registry, payload["physical_plan"])
-
-    gpu = runtime_state.get("gpu")
-    boot = None
-    if isinstance(gpu, LoadedGpu):
-        boot = gpu.prepared_boot
-        gpu.prepared_boot = None
-    if boot is None:
-        gpu, boot = _boot_for_query(
-            runtime_state, backend, gpu_context, payload["chunk_tokens"],
-            payload["true_ids"], payload["false_ids"],
-            payload.get("arena_pages"))
-    detail("running the query")
-
-    report = execute_single(gpu, payload, registry, graph)
-    outputs = report.pop("_outputs")
-    report.pop("filters", None)
-    report.pop("joins", None)
-    report["boot_s"] = boot["boot_s"]
-    report["boot_kind"] = boot["kind"]
-    report["boot"] = boot
-    return PhysicalResponse(outputs, report)
-
-
-def execute_single(gpu: GpuRuntime, payload: dict, registry, graph) -> dict:
-    """Execute the typed Quail graph on one GPU."""
-    state = _execution_state(gpu, payload, registry)
-    return execute_single_graph(state, payload, graph)
+    state.clear()
 
 
 def _execution_state(gpu, payload, registry) -> dict:
-    """Return the single-GPU executor's state for one worker and query."""
+    """Return the executor's state for one GPU and query."""
     return {
         "gpu": gpu,
         "documents": decode_payload_documents(payload["documents"]),
@@ -484,12 +410,27 @@ def _child_boot(state, sub):
     return boot
 
 
-def _child_region(state, data, server) -> dict:
-    """Serve one region's stages on this child's GPU until the region ends."""
-    payload = data["query"]
+def _child_region(state, data, server) -> bytes:
+    """Serve one region's stages on this child's GPU until the region ends.
+
+    Returns:
+        What the child ran, as a ``share`` message.
+    """
+    payload = opened(data["query"])
     graph = graph_from_envelope(payload["physical_plan"])
-    return serve_region(_execution_state(state.gpu, payload, state.registry),
-                        payload, graph, server, data["wanted"])
+    progress, answers = data["listening"]
+    # the listeners are in the region's process: each event is sent there
+    if progress:
+        set_progress_sink(lambda *event: server.ask(json.dumps({"progress": event})))
+    if answers:
+        set_answer_sink(lambda event: server.ask(json.dumps({"answer": [event]})))
+    try:
+        ran = serve_region(_execution_state(state.gpu, payload, state.registry),
+                           payload, graph, server, data["wanted"], data["hinted"])
+    finally:
+        set_progress_sink(None)
+        set_answer_sink(None)
+    return share(ran, f"{data['socket']}.ran")
 
 
 class GpuWorkers:
@@ -580,7 +521,7 @@ class RegionServers:
 
     def finish(self):
         """Collect results only after the coordinator has ended every server."""
-        return self.workers.receive()
+        return [opened(ran) for ran in self.workers.receive()]
 
     def abort(self):
         """Discard this pool without receiving from unconnected listeners."""
@@ -607,30 +548,66 @@ def _ensure_children(count, configuration) -> GpuWorkers:
     return _WORKERS
 
 
-def execute_quail_multi(payload, registry, graph):
-    """Execute the typed Quail graph as stages on GPU child processes."""
-    gpus = payload["gpus"]
-    spec = registry.model(payload["model"])
+def _boot_children(envelope, registry) -> dict:
+    """Start or reuse each GPU's child and prepare it for the plan.
+
+    Returns:
+        The children under "workers", and the boot record of the run:
+        the slowest child's, with the seconds the model's files and the
+        whole boot took.
+    """
+    gpus = envelope["gpus"]
+    spec = registry.model(envelope["model"])
     started = time.perf_counter()
     model_path = resolve_model_path(spec.hf_name, spec.revision)
     model_files_s = time.perf_counter() - started
-    envelope = payload["physical_plan"]
     workers = _ensure_children(gpus, (
-        payload["model"], envelope["device"], envelope["backend"], gpus))
-    setup = {key: payload[key] for key in (
-        "model", "physical_plan", "gpus", "chunk_tokens", "true_ids", "false_ids",
-    )}
-    setup["arena_pages"] = payload.get("arena_pages")
-    setup.update(registry=registry, model_path=model_path)
+        envelope["model"], envelope["device"], envelope["backend"], gpus))
+    settings = envelope["settings"]
+    setup = {
+        "model": envelope["model"], "physical_plan": envelope, "gpus": gpus,
+        **{key: settings[key] for key in ("chunk_tokens", "true_ids", "false_ids")},
+        "arena_pages": settings.get("arena_pages"),
+        "registry": registry, "model_path": model_path,
+    }
     boots = workers.round("boot", [setup] * gpus)
     boot_s = round(time.perf_counter() - started, 2)
-    say(f"all {gpus} GPUs ready; running the query")
+    say(f"all {gpus} GPUs ready" if gpus > 1 else "the GPU is ready")
+    return {
+        "workers": workers,
+        "boot": {
+            **max(boots, key=lambda boot: boot["boot_s"]),
+            "kind": ("cold" if any(boot["kind"] == "cold" for boot in boots)
+                     else "warm"),
+            "model_files_s": round(model_files_s, 2),
+            "boot_s": boot_s,
+        },
+    }
 
-    def serve(paths, wanted):
+
+def prepare_quail_request(context) -> None:
+    """Boot the GPUs from the plan alone; the documents can arrive later."""
+    context.runtime_state["booted"] = _boot_children(
+        context.request.plan, context.registry)
+
+
+def execute_quail_request(context):
+    """Run one Quail request on the GPUs' child processes."""
+    payload = quail_runtime_payload(context.request, context.graph)
+    envelope, registry = context.request.plan, context.registry
+    # a boot prepared for this request is used once
+    booted = (context.runtime_state.pop("booted", None)
+              or _boot_children(envelope, registry))
+    workers, boot = booted["workers"], booted["boot"]
+
+    def serve(paths, wanted, hinted):
         servers = RegionServers(workers)
+        query = share(payload, os.path.join(os.path.dirname(paths[0]), "query"))
+        listening = (progress_sink() is not None, answer_sink() is not None)
         try:
-            workers.round("region", [{"query": payload, "socket": path,
-                                      "wanted": wanted} for path in paths])
+            workers.round("region", [
+                {"query": query, "socket": path, "wanted": wanted,
+                 "hinted": hinted, "listening": listening} for path in paths])
         except BaseException:
             # The other children may already be waiting in accept().
             with suppress(BaseException):
@@ -639,15 +616,11 @@ def execute_quail_multi(payload, registry, graph):
         return servers
 
     report = execute_staged_graph(
-        payload, graph, gpus, serve, registry.device(envelope["device"]))
-    slowest = max(boots, key=lambda boot: boot["boot_s"])
-    report["boot_s"] = boot_s
-    report["boot_kind"] = "cold" if any(b["kind"] == "cold" for b in boots) else "warm"
-    report["boot"] = {
-        **slowest,
-        "model_files_s": round(model_files_s, 2),
-        "boot_s": boot_s,
-    }
+        payload, context.graph, envelope["gpus"], serve,
+        registry.device(envelope["device"]))
+    report["boot_s"] = boot["boot_s"]
+    report["boot_kind"] = boot["kind"]
+    report["boot"] = boot
     outputs = report.pop("_outputs")
     report.pop("filters", None)
     report.pop("joins", None)

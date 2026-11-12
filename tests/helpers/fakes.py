@@ -406,9 +406,9 @@ def thread_servers(states, payload, graph):
         payload: The query's runtime payload.
         graph: The region's graph.
     """
-    def serve(paths, wanted):
+    def serve(paths, wanted, hinted):
         threads = [_Serving(state, payload, graph, _quail_native.StageServer(path),
-                            wanted)
+                            wanted, hinted)
                    for state, path in zip(states, paths, strict=True)]
         for thread in threads:
             thread.start()
@@ -448,9 +448,9 @@ def thread_servers(states, payload, graph):
 class _Serving(threading.Thread):
     """One GPU's server on a thread, keeping its result or its error."""
 
-    def __init__(self, state, payload, graph, server, wanted):
+    def __init__(self, state, payload, graph, server, wanted, hinted):
         super().__init__(daemon=True)
-        self.arguments = (state, payload, graph, server, wanted)
+        self.arguments = (state, payload, graph, server, wanted, hinted)
         self.result = self.error = None
 
     def run(self):

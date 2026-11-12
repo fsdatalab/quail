@@ -1,4 +1,4 @@
-"""CPU regressions for failure before all GPU stage servers connect."""
+"""CPU tests of how a region starts and reaches its GPU stage servers."""
 
 import json
 import multiprocessing as mp
@@ -6,6 +6,7 @@ import os
 import queue
 import signal
 import socket
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -82,7 +83,7 @@ def check_coordinator_failure_aborts_unconnected_children(setup, monkeypatch,
     failed_at = []
     sentinel = RuntimeError("coordinator startup sentinel")
 
-    def serve(paths, _wanted):
+    def serve(paths, _wanted, _hinted):
         for path in paths:
             parent, child = context.Pipe()
             process = context.Process(target=_wait_in_accept,
@@ -191,7 +192,8 @@ def test_partial_socket_failure_ends_peers_before_and_after_bad_path(tmp_path):
             thread.start()
             threads.append(thread)
         with pytest.raises(RuntimeError, match="missing.sock"):
-            _quail_native.run_stages(graph().to_json(), "[]", {}, paths, lambda _: None)
+            _quail_native.run_stages(graph().to_json(), "[]", {}, paths,
+                                         lambda _: None, lambda _: "null")
         replies = [received.get(timeout=5) for _ in threads]
         assert replies == [{"end": True}, {"end": True}]
     finally:
@@ -200,3 +202,45 @@ def test_partial_socket_failure_ends_peers_before_and_after_bad_path(tmp_path):
         for thread in threads:
             thread.join(timeout=5)
             assert not thread.is_alive()
+
+
+def _read_shared(message, connection):
+    import numpy as np
+
+    from quail.backends.quail.shared import opened
+
+    found = opened(message)
+    table = found["table"]
+    with open("/proc/self/maps") as maps:
+        mapped = [line.split()[0].split("-") for line in maps
+                  if line.rstrip().endswith("shared (deleted)")
+                  or line.rstrip().endswith("shared")]
+    address = table.column("id").chunk(0).buffers()[1].address
+    connection.send((
+        table.column("id").to_pylist(), found["count"],
+        int(np.asarray(found["array"]).sum()),
+        any(int(start, 16) <= address < int(end, 16) for start, end in mapped)))
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="reads /proc/self/maps")
+def test_another_process_reads_a_shared_value_over_the_files_mapped_pages(tmp_path):
+    import numpy as np
+    import pyarrow as pa
+
+    from quail.backends.quail.shared import share
+
+    value = {"table": pa.table({"id": pa.array(range(1000), pa.int32())}),
+             "array": np.arange(100), "count": 3}
+    message = share(value, str(tmp_path / "shared"))
+    # the message names the file; the buffers are not in it
+    assert len(message) < 1000
+    context = mp.get_context("spawn")
+    parent, child = context.Pipe()
+    process = context.Process(target=_read_shared, args=(message, child))
+    process.start()
+    try:
+        ids, count, total, in_file = parent.recv()
+    finally:
+        process.join(timeout=30)
+    assert (ids, count, total) == (list(range(1000)), 3, 4950)
+    assert in_file

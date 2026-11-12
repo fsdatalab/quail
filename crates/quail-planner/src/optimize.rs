@@ -93,9 +93,10 @@ pub fn search_plan(
     };
     plan.settings
         .insert("candidates".into(), Value::Array(comparison));
-    if context.gpus > 1 && plan.backend == "quail" {
+    if plan.backend == "quail" {
         let graph = plan.envelope().graph;
-        let cut = crate::stages::stages(&graph).map_err(CompileError::new)?;
+        let cut = crate::stages::stages(&graph, context.gpus.max(1) as usize)
+            .map_err(CompileError::new)?;
         let cut =
             serde_json::to_value(cut).map_err(|error| CompileError::new(error.to_string()))?;
         plan.settings.insert("stages".into(), cut);

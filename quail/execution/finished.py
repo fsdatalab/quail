@@ -22,6 +22,7 @@ from collections.abc import Callable, Iterable, Sequence
 import numpy as np
 import pyarrow as pa
 
+from quail.common.pairs import FIRST_DOCUMENT
 from quail.execution.types import output_table
 
 
@@ -128,6 +129,25 @@ def finished_table(node_id: str, port: str, table: pa.Table) -> pa.Table:
 def region_hint():
     """Return the running region's ``InputHint``, or None."""
     return _REGION.hint
+
+
+def hinted_tables() -> dict | None:
+    """Each scan alias's table name, for the tables the hint holds rows of.
+
+    None when the running region has no hint.
+    """
+    return None if _REGION.hint is None else dict(_REGION.tables)
+
+
+def first_rows(columns: dict, aliases) -> dict:
+    """Each alias's first row with the same document, for each row.
+
+    Args:
+        columns: Each scan's value table, by alias.
+        aliases: The aliases the plan deduplicates.
+    """
+    return {alias: columns[alias].column(FIRST_DOCUMENT).to_numpy()
+            for alias in aliases if alias in columns}
 
 
 def keeps(alias, document: int) -> bool:

@@ -1,5 +1,7 @@
 """quail.SessionContext: DataFusion binds the query, Quail runs each model region."""
 
+import threading
+
 import pyarrow as pa
 import pytest
 from helpers.oracle import Oracle, finish, oracle_executor
@@ -203,8 +205,13 @@ def test_each_operator_hands_on_its_first_rows_before_the_region_finishes():
 def _check_first_rows_precede_the_last_answer(family, text, truth):
     """Run `text` on a new session and check rows arrive before it finishes."""
     events = []
+    arrived = threading.Event()
 
     def answered(value):
+        # rows cross to the region while the model goes on: an answer
+        # after the first gives them a moment to arrive
+        if "answered" in events:
+            arrived.wait(0.2)
         events.append("answered")
         return value
 
@@ -228,6 +235,7 @@ def _check_first_rows_precede_the_last_answer(family, text, truth):
     def on_rows(table):
         events.append("rows")
         batches.append(table)
+        arrived.set()
 
     assert Engine(session, run).execute(planned, {}, on_rows) is None, family
     # the first rows went on before the model gave its last answer

@@ -720,7 +720,7 @@ def oracle_executor(oracle: Oracle, **report):
             state["columns"] = payload["columns"]
             model.arena = state["gpu"].arena
             states.append(state)
-        if request.gpus == 1:
+        if payload["stages"] is None:
             result = execute_single_graph(states[0], payload, graph)
         else:
             result = execute_staged_graph(

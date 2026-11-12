@@ -13,6 +13,10 @@
 //! once per partition. A Barrier starts a stage, keyed by the next
 //! anchor, that reads the join answers so far whole.
 //!
+//! On one GPU nothing is spread: the region is one stage of every node,
+//! which reads each scan whole, so its nodes run in the order and the
+//! chains of the plan.
+//!
 //! The planner cuts the stages once, into the plan's `stages` setting;
 //! explain prints them and the run reads them.
 
@@ -100,12 +104,12 @@ impl CutNode {
 }
 
 /// Cut a graph's compute nodes, the nodes on the GPU executor or a
-/// backend and the nodes they read, into stages.
+/// backend and the nodes they read, into stages for `gpus` GPUs.
 ///
 /// # Errors
 ///
 /// The graph is invalid, or a node reads a port no scan or stage writes.
-pub fn stages(graph: &PhysicalGraph) -> Result<Vec<Stage>, String> {
+pub fn stages(graph: &PhysicalGraph, gpus: usize) -> Result<Vec<Stage>, String> {
     crate::physical::validate_graph(&graph.nodes, &graph.root)?;
     let by_id: BTreeMap<&str, &PhysicalNode> =
         graph.nodes.iter().map(|node| (node.id(), node)).collect();
@@ -131,7 +135,38 @@ pub fn stages(graph: &PhysicalGraph) -> Result<Vec<Stage>, String> {
         .filter(|index| compute.contains(graph.nodes[*index].id()))
         .map(|index| CutNode::of(&graph.nodes[index]))
         .collect();
+    if gpus == 1 {
+        return Ok(whole(&nodes));
+    }
     cut(&nodes)
+}
+
+/// Nodes, in topological order, as one stage that reads each scan whole;
+/// no stage when no node computes.
+fn whole(nodes: &[CutNode]) -> Vec<Stage> {
+    let (scans, inside): (Vec<&CutNode>, Vec<&CutNode>) =
+        nodes.iter().partition(|node| node.role == Role::Scan);
+    if inside.is_empty() {
+        return Vec::new();
+    }
+    let mut inputs: Vec<StageInput> = Vec::new();
+    for source in inside.iter().flat_map(|node| &node.inputs) {
+        let input = StageInput {
+            node_id: source.node_id.clone(),
+            port: source.port.clone(),
+            stage: None,
+            hashed: false,
+        };
+        if scans.iter().any(|scan| scan.id == source.node_id) && !inputs.contains(&input) {
+            inputs.push(input);
+        }
+    }
+    vec![Stage {
+        key: String::new(),
+        nodes: inside.iter().map(|node| node.id.clone()).collect(),
+        inputs,
+        outputs: Vec::new(),
+    }]
 }
 
 /// Cut nodes, in topological order, into stages.
@@ -287,7 +322,7 @@ mod tests {
             nodes: vec![scan.clone()],
             root: port("scan:r", "rows:r"),
         };
-        assert!(stages(&graph).is_ok());
+        assert!(stages(&graph, 2).is_ok());
         for (source, expected) in [("scan:r", "cycle"), ("missing", "missing output")] {
             let mut malformed = graph.clone();
             malformed.nodes[0].inputs_mut().push(InputPort {
@@ -296,12 +331,12 @@ mod tests {
                 source: port(source, "rows:r"),
                 schema: Vec::new(),
             });
-            assert!(stages(&malformed).unwrap_err().contains(expected));
+            assert!(stages(&malformed, 2).unwrap_err().contains(expected));
         }
         let mut duplicate = graph;
         duplicate.nodes.push(scan);
         assert!(
-            stages(&duplicate)
+            stages(&duplicate, 2)
                 .unwrap_err()
                 .contains("duplicate physical node id")
         );

@@ -168,6 +168,11 @@ def answer_sink():
     return _ANSWER_SINK
 
 
+def progress_sink():
+    """Return the progress sink, or None when nobody is listening."""
+    return _SINK
+
+
 def say(message: str, *, done: bool = False) -> None:
     """Log one progress message at INFO, unless inside quiet().
 

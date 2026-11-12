@@ -13,6 +13,11 @@
 //! key; a broadcast input goes through a `CoalescePartitionsExec`,
 //! collected once and handed whole to every partition.
 //!
+//! While a stage runs, its server sends each table it finishes as soon
+//! as it has it, and may ask the region a question, such as whether the
+//! tests above the region still keep a row; the region answers before
+//! the stage goes on.
+//!
 //! A stage's partition starts once all of its inputs have ended, and a
 //! server runs one stage at a time; the stages form a DAG, so every
 //! call a server receives can finish.
@@ -70,11 +75,23 @@ struct Server {
     num_written: usize,
 }
 
-/// What a server sends back for one stage.
-struct Reply {
-    outputs: Vec<Table>,
-    /// Each finished table, tagged with its node and port.
-    finished: Vec<Table>,
+/// What the region answers a server's question with.
+pub enum Answer {
+    Json(serde_json::Value),
+    Table(Table),
+}
+
+/// Takes a finished table, tagged with its node and port.
+pub type Report = Box<dyn Fn(Table) -> Result<()> + Send + Sync>;
+
+/// Answers a server's question.
+pub type Ask = Box<dyn Fn(&serde_json::Value) -> Result<Answer> + Send + Sync>;
+
+/// What a region does for its servers while its stages run.
+pub struct Region {
+    /// Called with one table at a time.
+    pub report: Report,
+    pub ask: Ask,
 }
 
 fn failure(error: impl std::fmt::Display) -> DataFusionError {
@@ -141,30 +158,48 @@ impl Server {
         read_table(Path::new(&path))
     }
 
-    /// Run one stage on the server's GPU over its inputs' rows.
-    fn call(&mut self, stage: usize, inputs: &[Table]) -> Result<Reply> {
+    /// Run one stage on the server's GPU over its inputs' rows, and
+    /// return the rows of its outputs.
+    fn call(&mut self, stage: usize, inputs: &[Table], region: &Region) -> Result<Vec<Table>> {
         let header = serde_json::json!({"stage": stage, "inputs": inputs.len()}).to_string();
         write_frame(&mut self.writer, header.as_bytes())?;
         for input in inputs {
             self.send_table(input)?;
         }
         self.writer.flush()?;
-        let header: serde_json::Value =
-            serde_json::from_slice(&read_frame(&mut self.reader)?).map_err(failure)?;
-        if let Some(error) = header.get("error").and_then(|error| error.as_str()) {
-            return Err(failure(format!(
-                "stage {stage} failed on its GPU:\n{error}"
-            )));
+        loop {
+            let header: serde_json::Value =
+                serde_json::from_slice(&read_frame(&mut self.reader)?).map_err(failure)?;
+            if let Some(error) = header.get("error").and_then(|error| error.as_str()) {
+                return Err(failure(format!(
+                    "stage {stage} failed on its GPU:\n{error}"
+                )));
+            }
+            if header.get("finished").is_some() {
+                (region.report)(self.receive_table()?)?;
+            } else if let Some(question) = header.get("ask") {
+                self.answer((region.ask)(question)?)?;
+            } else {
+                return (0..header_count(&header, "outputs")?)
+                    .map(|_| self.receive_table())
+                    .collect();
+            }
         }
-        let outputs = header_count(&header, "outputs")?;
-        let finished = header_count(&header, "finished")?;
-        let outputs = (0..outputs)
-            .map(|_| self.receive_table())
-            .collect::<Result<Vec<_>>>()?;
-        let finished = (0..finished)
-            .map(|_| self.receive_table())
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Reply { outputs, finished })
+    }
+
+    fn answer(&mut self, answer: Answer) -> Result<()> {
+        match answer {
+            Answer::Json(value) => {
+                let header = serde_json::json!({"answer": value}).to_string();
+                write_frame(&mut self.writer, header.as_bytes())?;
+            }
+            Answer::Table(table) => {
+                write_frame(&mut self.writer, br#"{"table": true}"#)?;
+                self.send_table(&table)?;
+            }
+        }
+        self.writer.flush()?;
+        Ok(())
     }
 
     /// Tell the server the region is over.
@@ -225,20 +260,56 @@ impl StageListener {
         Ok(Some((stage, inputs)))
     }
 
-    /// Send what a stage wrote: its outputs' rows and its finished rows.
+    /// Send the rows of a stage's outputs, which ends the stage.
     ///
     /// # Errors
     ///
     /// The connection fails.
-    pub fn reply(&mut self, outputs: &[Table], finished: &[Table]) -> Result<()> {
+    pub fn reply(&mut self, outputs: &[Table]) -> Result<()> {
         let connection = self.connection()?;
-        let header = serde_json::json!({"outputs": outputs.len(), "finished": finished.len()});
+        let header = serde_json::json!({"outputs": outputs.len()});
         write_frame(&mut connection.writer, header.to_string().as_bytes())?;
-        for table in outputs.iter().chain(finished) {
+        for table in outputs {
             connection.send_table(table)?;
         }
         connection.writer.flush()?;
         Ok(())
+    }
+
+    /// Send a table the running stage finished, tagged with its node
+    /// and port.
+    ///
+    /// # Errors
+    ///
+    /// The connection fails.
+    pub fn finished(&mut self, table: &Table) -> Result<()> {
+        let connection = self.connection()?;
+        write_frame(&mut connection.writer, br#"{"finished": true}"#)?;
+        connection.send_table(table)?;
+        connection.writer.flush()?;
+        Ok(())
+    }
+
+    /// Ask the region a question while a stage runs, and wait for its
+    /// answer.
+    ///
+    /// # Errors
+    ///
+    /// The connection fails, or the region ends it without an answer.
+    pub fn ask(&mut self, question: &serde_json::Value) -> Result<Answer> {
+        let connection = self.connection()?;
+        let header = serde_json::json!({"ask": question}).to_string();
+        write_frame(&mut connection.writer, header.as_bytes())?;
+        connection.writer.flush()?;
+        let mut header: serde_json::Value =
+            serde_json::from_slice(&read_frame(&mut connection.reader)?).map_err(failure)?;
+        if header.get("table").is_some() {
+            return Ok(Answer::Table(connection.receive_table()?));
+        }
+        match header.get_mut("answer") {
+            Some(answer) => Ok(Answer::Json(answer.take())),
+            None => Err(failure("the region ended before it answered")),
+        }
     }
 
     /// Send why a stage failed.
@@ -255,9 +326,6 @@ impl StageListener {
     }
 }
 
-/// Hands a finished table to the region's rows.
-pub type Report = Box<dyn Fn(Table) -> Result<()> + Send + Sync>;
-
 /// A region's stages running on its GPUs' servers.
 struct Staged {
     stages: Vec<Stage>,
@@ -267,7 +335,7 @@ struct Staged {
     /// Alias -> each document's key, for a table hashed by a key other
     /// than its ids.
     keys: HashMap<String, Int32Array>,
-    report: Arc<Mutex<Report>>,
+    region: Arc<Region>,
     task: Arc<TaskContext>,
     runs: Mutex<HashMap<(usize, usize), Once<Written>>>,
     inputs: Mutex<HashMap<(usize, usize), Once<Ready>>>,
@@ -311,28 +379,20 @@ impl Staged {
             });
         }
         let server = Arc::clone(&self.servers[partition]);
-        let reply = tokio::task::spawn_blocking(move || {
-            server.lock().expect("the server lock").call(stage, &tables)
+        let region = Arc::clone(&self.region);
+        let outputs = tokio::task::spawn_blocking(move || {
+            (server.lock().expect("the server lock")).call(stage, &tables, &region)
         })
         .await
         .map_err(failure)??;
-        if reply.outputs.len() != self.stages[stage].outputs.len() {
+        if outputs.len() != self.stages[stage].outputs.len() {
             return Err(failure(format!(
                 "stage {stage} returned {} outputs, expected {}",
-                reply.outputs.len(),
+                outputs.len(),
                 self.stages[stage].outputs.len()
             )));
         }
-        let report = Arc::clone(&self.report);
-        let finished = reply.finished;
-        tokio::task::spawn_blocking(move || {
-            // one report at a time: the region's rows take one table at once
-            let report = report.lock().expect("the report lock");
-            finished.into_iter().try_for_each(&*report)
-        })
-        .await
-        .map_err(failure)??;
-        Ok(Arc::new(reply.outputs))
+        Ok(Arc::new(outputs))
     }
 
     /// One stage input, collected once its writers have all ended.
@@ -540,8 +600,9 @@ fn grouped_keys(
 /// `graph` holds the region's compute nodes; `groupings` gives, by
 /// alias, the groups [`grouped_keys`] reads for a table whose rows go to
 /// a GPU by a key other than their id. Each table a stage finishes goes
-/// to `report`, one at a time. Every server is told the region ended,
-/// whether or not it failed.
+/// to `region.report`, one at a time, and each question a server asks
+/// to `region.ask`. Every server is told the region ended, whether or
+/// not it failed.
 ///
 /// # Errors
 ///
@@ -551,7 +612,7 @@ pub fn run_stages(
     cut: Vec<Stage>,
     groupings: HashMap<String, Vec<Vec<i64>>>,
     servers: &[PathBuf],
-    report: Report,
+    region: Region,
 ) -> Result<()> {
     if !cut.is_empty() && servers.is_empty() {
         return Err(failure("a stage has no GPU servers"));
@@ -618,7 +679,17 @@ pub fn run_stages(
         servers,
         scans,
         keys,
-        report: Arc::new(Mutex::new(report)),
+        region: Arc::new(Region {
+            report: {
+                // the region's rows take one table at a time
+                let (report, one) = (region.report, Mutex::new(()));
+                Box::new(move |table| {
+                    let _held = one.lock().expect("the report lock");
+                    report(table)
+                })
+            },
+            ask: region.ask,
+        }),
         task: SessionContext::new().task_ctx(),
         runs: Mutex::new(HashMap::new()),
         inputs: Mutex::new(HashMap::new()),

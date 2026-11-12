@@ -34,7 +34,7 @@ INVALID_GRAPHS = (
 
 
 def test_stage_cut_rejects_each_invalid_graph_and_accepts_a_valid_one():
-    assert json.loads(native.region_stages(json.dumps(_graph()))) == []
+    assert json.loads(native.region_stages(json.dumps(_graph()), 2)) == []
     # Keep a regression to stack overflow isolated from the pytest process.
     script_text = """
 import resource
@@ -42,7 +42,7 @@ import sys
 import _quail_native
 resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 try:
-    _quail_native.region_stages(sys.argv[1])
+    _quail_native.region_stages(sys.argv[1], 2)
 except ValueError as error:
     assert sys.argv[2] in str(error), str(error)
 else:

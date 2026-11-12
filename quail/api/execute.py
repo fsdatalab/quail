@@ -5,8 +5,7 @@ import os
 import time
 
 from quail.backends import BackendExecutionContext
-from quail.common.pairs import FIRST_DOCUMENT, columns_key
-from quail.execution.finished import reporting
+from quail.execution.finished import first_rows, reporting
 from quail.execution.result import QueryResult
 from quail.execution.types import PhysicalRequest, PhysicalResponse
 from quail.physical import ExecutionLocation, Scan
@@ -238,11 +237,8 @@ def _execute_region(query, physical_executor, plan, on_backend_ready,
         tables = {scan["alias"]: scan["provider"] for scan in query.facts()["scans"]}
         first = {}
         if hint is not None:
-            first = {
-                alias: request.relations[columns_key(alias)].column(
-                    FIRST_DOCUMENT).to_numpy()
-                for alias in plan.settings.get("deduplicate", {})
-                if columns_key(alias) in request.relations}
+            first = first_rows(request.column_tables(),
+                               plan.settings.get("deduplicate", {}))
         with reporting(None if on_rows is None else finished, hint, tables,
                        first):
             response = (physical_executor(request) if physical_executor is not None

@@ -1100,13 +1100,13 @@ fn parse_expression<'py>(
     }
 }
 
-/// Cut a plan's graph, as JSON, into stages for several GPUs, as the
+/// Cut a plan's graph, as JSON, into stages for `gpus` GPUs, as the
 /// planner cuts it into the plan's `stages` setting; returns the stages
 /// as JSON.
 #[pyfunction]
-fn region_stages(graph: &str) -> PyResult<String> {
+fn region_stages(graph: &str, gpus: usize) -> PyResult<String> {
     let graph: quail_planner::physical::PhysicalGraph = from_json(graph)?;
-    let cut = quail_planner::stages::stages(&graph).map_err(PyValueError::new_err)?;
+    let cut = quail_planner::stages::stages(&graph, gpus).map_err(PyValueError::new_err)?;
     serde_json::to_string(&cut).map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
@@ -1134,7 +1134,8 @@ fn validate_stages(
 /// document's group, for a table hashed by a key other than its ids;
 /// `servers` names each GPU's Unix socket; `report(table)` takes each
 /// finished table as a pyarrow Table over the pages the GPU's server
-/// shared.
+/// shared; `ask(question)` takes a server's question as JSON and
+/// returns its answer, as JSON or a pyarrow Table.
 #[pyfunction]
 fn run_stages(
     py: Python<'_>,
@@ -1143,18 +1144,47 @@ fn run_stages(
     groupings: std::collections::HashMap<String, Vec<Vec<i64>>>,
     servers: Vec<std::path::PathBuf>,
     report: Py<PyAny>,
+    ask: Py<PyAny>,
 ) -> PyResult<()> {
     let graph: quail_planner::physical::PhysicalGraph = from_json(graph)?;
     let cut: Vec<quail_planner::stages::Stage> = from_json(stages)?;
-    let report: crate::stages::Report = Box::new(move |(schema, batches)| {
-        Python::attach(|py| {
-            report.call1(py, (to_pyarrow(py, schema, batches)?,))?;
-            Ok::<_, PyErr>(())
-        })
-        .map_err(|error| DataFusionError::External(Box::new(error)))
-    });
-    py.detach(|| crate::stages::run_stages(&graph, cut, groupings, &servers, report))
+    let external = |error: PyErr| DataFusionError::External(Box::new(error));
+    let region = crate::stages::Region {
+        report: Box::new(move |(schema, batches)| {
+            Python::attach(|py| {
+                report.call1(py, (to_pyarrow(py, schema, batches)?,))?;
+                Ok::<_, PyErr>(())
+            })
+            .map_err(external)
+        }),
+        ask: Box::new(move |question| {
+            Python::attach(|py| {
+                let answer = ask.call1(py, (question.to_string(),))?;
+                answer_from_python(answer.bind(py))
+            })
+            .map_err(external)
+        }),
+    };
+    py.detach(|| crate::stages::run_stages(&graph, cut, groupings, &servers, region))
         .map_err(python_error)
+}
+
+/// A Python answer to a stage server's question: JSON text, or a
+/// pyarrow Table read over the same buffers.
+fn answer_from_python(answer: &Bound<'_, PyAny>) -> PyResult<crate::stages::Answer> {
+    if let Ok(text) = answer.extract::<String>() {
+        return Ok(crate::stages::Answer::Json(from_json(&text)?));
+    }
+    Ok(crate::stages::Answer::Table(table_from_python(answer)?))
+}
+
+fn table_from_python(value: &Bound<'_, PyAny>) -> PyResult<crate::stages::Table> {
+    let reader = crate::pyarrow::stream_from_pyarrow(value)?;
+    let schema = datafusion::arrow::array::RecordBatchReader::schema(&reader);
+    let batches = reader
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| python_error(error.into()))?;
+    Ok((schema, batches))
 }
 
 /// One GPU's server end of a region's stages, as
@@ -1191,30 +1221,38 @@ impl StageServer {
         Ok(Some((stage, tables)))
     }
 
-    /// Send a stage's output tables and finished tables.
-    fn reply(
-        &mut self,
-        py: Python<'_>,
-        outputs: Vec<Bound<'_, PyAny>>,
-        finished: Vec<Bound<'_, PyAny>>,
-    ) -> PyResult<()> {
-        let tables = |values: Vec<Bound<'_, PyAny>>| {
-            values
-                .iter()
-                .map(|value| {
-                    let reader = crate::pyarrow::stream_from_pyarrow(value)?;
-                    let schema = datafusion::arrow::array::RecordBatchReader::schema(&reader);
-                    let batches = reader
-                        .collect::<std::result::Result<Vec<_>, _>>()
-                        .map_err(|error| python_error(error.into()))?;
-                    Ok((schema, batches))
-                })
-                .collect::<PyResult<Vec<crate::stages::Table>>>()
-        };
-        let (outputs, finished) = (tables(outputs)?, tables(finished)?);
+    /// Send a stage's output tables, which ends the stage.
+    fn reply(&mut self, py: Python<'_>, outputs: Vec<Bound<'_, PyAny>>) -> PyResult<()> {
+        let outputs = outputs
+            .iter()
+            .map(table_from_python)
+            .collect::<PyResult<Vec<_>>>()?;
         let listener = &mut self.listener;
-        py.detach(|| listener.reply(&outputs, &finished))
+        py.detach(|| listener.reply(&outputs)).map_err(python_error)
+    }
+
+    /// Send a table the running stage finished.
+    fn finished(&mut self, py: Python<'_>, table: &Bound<'_, PyAny>) -> PyResult<()> {
+        let table = table_from_python(table)?;
+        let listener = &mut self.listener;
+        py.detach(|| listener.finished(&table))
             .map_err(python_error)
+    }
+
+    /// Ask the region a question, as JSON, while a stage runs; returns
+    /// its answer as JSON text or a pyarrow Table.
+    fn ask<'py>(&mut self, py: Python<'py>, question: &str) -> PyResult<Bound<'py, PyAny>> {
+        let question: serde_json::Value = from_json(question)?;
+        let listener = &mut self.listener;
+        match py
+            .detach(|| listener.ask(&question))
+            .map_err(python_error)?
+        {
+            crate::stages::Answer::Json(value) => {
+                Ok(pyo3::types::PyString::new(py, &value.to_string()).into_any())
+            }
+            crate::stages::Answer::Table((schema, batches)) => to_pyarrow(py, schema, batches),
+        }
     }
 
     /// Send why a stage failed.
