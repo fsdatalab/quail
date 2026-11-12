@@ -37,41 +37,28 @@ pub(crate) fn string_literal(expr: &Expr) -> Option<String> {
     }
 }
 
-/// A SQL literal as a JSON value, or None.
-fn literal_value(expr: &Expr) -> Option<Value> {
+/// A numeric SQL literal cast to `to`, or None.
+fn numeric_literal(expr: &Expr, to: &DataType) -> Option<ScalarValue> {
     match expr {
-        Expr::Literal(value, _) => scalar_value(value),
-        Expr::Negative(inner) => match literal_value(inner)? {
-            Value::Number(number) => Some(match number.as_i64() {
-                Some(integer) => Value::from(-integer),
-                None => Value::from(-number.as_f64()?),
-            }),
-            _ => None,
-        },
+        Expr::Literal(value, _) if value.data_type().is_numeric() => value.cast_to(to).ok(),
+        Expr::Negative(inner) => numeric_literal(inner, to)?.arithmetic_negate().ok(),
         _ => None,
     }
 }
 
-fn scalar_value(value: &ScalarValue) -> Option<Value> {
-    Some(match value {
-        ScalarValue::Null => Value::Null,
-        ScalarValue::Boolean(Some(flag)) => Value::Bool(*flag),
-        ScalarValue::Int8(Some(v)) => Value::from(*v),
-        ScalarValue::Int16(Some(v)) => Value::from(*v),
-        ScalarValue::Int32(Some(v)) => Value::from(*v),
-        ScalarValue::Int64(Some(v)) => Value::from(*v),
-        ScalarValue::UInt8(Some(v)) => Value::from(*v),
-        ScalarValue::UInt16(Some(v)) => Value::from(*v),
-        ScalarValue::UInt32(Some(v)) => Value::from(*v),
-        ScalarValue::UInt64(Some(v)) => Value::from(*v),
-        ScalarValue::Float32(Some(v)) => Value::from(f64::from(*v)),
-        ScalarValue::Float64(Some(v)) => Value::from(*v),
-        ScalarValue::Decimal128(Some(v), _, scale) => {
-            Value::from(*v as f64 / 10f64.powi(i32::from(*scale)))
-        }
-        other if other.is_null() => Value::Null,
-        other => Value::String(other.try_as_str().flatten()?.to_string()),
-    })
+/// An integer SQL literal, or None.
+fn integer_of(expr: &Expr) -> Option<i64> {
+    let Expr::Literal(value, _) = expr else {
+        return None;
+    };
+    match value
+        .data_type()
+        .is_integer()
+        .then(|| value.cast_to(&DataType::Int64))?
+    {
+        Ok(ScalarValue::Int64(value)) => value,
+        _ => None,
+    }
 }
 
 /// The (key, value) pairs of an option object, `named_struct(k, v, ...)`.
@@ -92,7 +79,10 @@ fn sorted_keys(keys: &[&str]) -> String {
 }
 
 fn number_of(expr: &Expr) -> Option<f64> {
-    literal_value(expr)?.as_f64()
+    match numeric_literal(expr, &DataType::Float64)? {
+        ScalarValue::Float64(value) => value,
+        _ => None,
+    }
 }
 
 pub(super) fn parse_options(
@@ -506,7 +496,7 @@ impl Binder {
         };
         let limit = match args.get(2) {
             None => DEFAULT_MAP_ANSWER_TOKENS,
-            Some(found) => match literal_value(found).and_then(|value| value.as_i64()) {
+            Some(found) => match integer_of(found) {
                 Some(limit) if limit >= 0 => limit,
                 _ => {
                     return compile_error("The AI.MAP token limit must be a positive integer.");

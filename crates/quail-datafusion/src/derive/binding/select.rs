@@ -11,11 +11,7 @@ use quail_planner::physical::{Alias, ExtractStruct, ValueExpression};
 
 /// The name a SELECT list item returns its column by.
 pub(crate) fn output_name(expr: &Expr) -> String {
-    match expr {
-        Expr::Alias(alias) => alias.name.clone(),
-        Expr::Column(column) => column.name.clone(),
-        other => other.schema_name().to_string(),
-    }
+    expr.qualified_name().1
 }
 
 /// An expression without the AS names on it, and the name the query

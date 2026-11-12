@@ -546,10 +546,7 @@ impl UserDefinedLogicalNodeCore for AiNode {
         };
         // a rule that rewrites an expression may alias it to keep its name;
         // the node's schema does not name its expressions
-        let mut exprs = exprs.into_iter().map(|expr| match expr {
-            Expr::Alias(alias) => *alias.expr,
-            other => other,
-        });
+        let mut exprs = exprs.into_iter().map(Expr::unalias);
         let (Some(call), guard, None) = (exprs.next(), exprs.next(), exprs.next()) else {
             return internal_err!("AiNode has its call and an optional guard");
         };

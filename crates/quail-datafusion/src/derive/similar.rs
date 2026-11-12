@@ -149,24 +149,9 @@ fn is_typo(left: &str, right: &str) -> bool {
     {
         return false;
     }
-    let left: Vec<char> = left.chars().collect();
-    let right: Vec<char> = right.chars().collect();
-    (1..=2).contains(&distance(&left, &right))
-}
-
-/// The Levenshtein distance between two texts: the fewest characters
-/// changed, added, or removed to turn one into the other.
-fn distance(left: &[char], right: &[char]) -> usize {
-    let mut previous: Vec<usize> = (0..=right.len()).collect();
-    for (i, left_char) in left.iter().enumerate() {
-        let mut current = vec![i + 1; right.len() + 1];
-        for (j, right_char) in right.iter().enumerate() {
-            let replace = previous[j] + usize::from(left_char != right_char);
-            current[j + 1] = replace.min(previous[j + 1] + 1).min(current[j] + 1);
-        }
-        previous = current;
-    }
-    previous[right.len()]
+    (1..=2).contains(&datafusion::common::utils::datafusion_strsim::levenshtein(
+        &left, &right,
+    ))
 }
 
 #[cfg(test)]

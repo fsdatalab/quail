@@ -359,17 +359,6 @@ impl Possible {
     }
 }
 
-/// The operator with its sides swapped: `1 < a` is `a > 1`.
-fn swapped(op: Operator) -> Operator {
-    match op {
-        Operator::Lt => Operator::Gt,
-        Operator::LtEq => Operator::GtEq,
-        Operator::Gt => Operator::Lt,
-        Operator::GtEq => Operator::LtEq,
-        other => other,
-    }
-}
-
 /// What is known of an expression's value over the complete answers
 /// still possible.
 #[derive(Debug, Clone)]
@@ -632,7 +621,7 @@ fn compare(left: &Partial, op: Operator, right: &Partial) -> Possible {
             None => ANY,
         },
         (Partial::Known(_), Partial::Text(_) | Partial::Count { .. }) => {
-            compare(right, swapped(op), left)
+            compare(right, op.swap().unwrap_or(op), left)
         }
         _ => ANY,
     }

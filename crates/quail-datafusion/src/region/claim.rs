@@ -8,6 +8,7 @@ use datafusion::catalog::Session;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, Result, ScalarValue, plan_err};
 use datafusion::execution::SessionState;
+use datafusion::logical_expr::expr_rewriter::replace_col;
 use datafusion::logical_expr::{Expr, LogicalPlan, Projection};
 use datafusion::optimizer::Optimizer;
 use quail_planner::error::CompileError;
@@ -250,29 +251,12 @@ fn claim_needed(
     // Expression subqueries are not plan inputs. Claim their model work
     // explicitly, including scalar subqueries that DataFusion keeps intact.
     let plan = plan
-        .map_expressions(|expr| {
-            expr.transform_up(|expr| match expr {
-                Expr::ScalarSubquery(mut found) => {
-                    found.subquery =
-                        Arc::new(claim_regions(found.subquery.as_ref().clone(), None)?);
-                    Ok(Transformed::yes(Expr::ScalarSubquery(found)))
-                }
-                Expr::InSubquery(mut found) => {
-                    found.subquery.subquery = Arc::new(claim_regions(
-                        found.subquery.subquery.as_ref().clone(),
-                        None,
-                    )?);
-                    Ok(Transformed::yes(Expr::InSubquery(found)))
-                }
-                Expr::Exists(mut found) => {
-                    found.subquery.subquery = Arc::new(claim_regions(
-                        found.subquery.subquery.as_ref().clone(),
-                        None,
-                    )?);
-                    Ok(Transformed::yes(Expr::Exists(found)))
-                }
-                other => Ok(Transformed::no(other)),
-            })
+        .map_subqueries(|subquery| {
+            let LogicalPlan::Subquery(mut found) = subquery else {
+                return Ok(Transformed::no(subquery));
+            };
+            found.subquery = Arc::new(claim_regions(Arc::unwrap_or_clone(found.subquery), None)?);
+            Ok(Transformed::yes(LogicalPlan::Subquery(found)))
         })?
         .data;
     if !calls_ai(&plan)? {
@@ -500,22 +484,20 @@ pub(super) fn select_list(plan: LogicalPlan, needed: Option<Vec<Column>>) -> Res
 /// Whether any operator in the subtree is an `AiNode`, or calls an AI
 /// function in its expressions or in an EXISTS or IN subquery.
 pub(super) fn calls_ai(plan: &LogicalPlan) -> Result<bool> {
-    plan.exists(|node| {
-        if as_node::<AiNode>(node).is_some() {
-            return Ok(true);
-        }
-        for expr in node.expressions() {
-            if expr.exists(|inner| match inner {
-                Expr::Exists(found) => calls_ai(&found.subquery.subquery),
-                Expr::InSubquery(found) => calls_ai(&found.subquery.subquery),
-                Expr::ScalarSubquery(found) => calls_ai(&found.subquery),
-                other => Ok(is_ai_call(other)),
-            })? {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    })
+    let mut found = false;
+    plan.apply_with_subqueries(|node| {
+        found = as_node::<AiNode>(node).is_some()
+            || node
+                .expressions()
+                .iter()
+                .any(|expr| expr.exists(|inner| Ok(is_ai_call(inner))).unwrap_or(false));
+        Ok(if found {
+            TreeNodeRecursion::Stop
+        } else {
+            TreeNodeRecursion::Continue
+        })
+    })?;
+    Ok(found)
 }
 
 /// Whether any operator in the subtree, or an EXISTS or IN subquery in
@@ -640,18 +622,8 @@ fn isolate_chain(plan: &LogicalPlan) -> Result<Option<(LogicalPlan, Vec<Expr>)>>
         .alias(name)?
         .build()?;
     let replacements = input.schema().columns();
-    let remap = |expr: Expr| -> Result<Expr> {
-        Ok(expr
-            .transform_up(|expr| {
-                if let Expr::Column(column) = &expr
-                    && let Some(index) = columns.iter().position(|found| found == column)
-                {
-                    return Ok(Transformed::yes(Expr::Column(replacements[index].clone())));
-                }
-                Ok(Transformed::no(expr))
-            })?
-            .data)
-    };
+    let renamed: HashMap<&Column, &Column> = columns.iter().zip(&replacements).collect();
+    let remap = |expr: Expr| replace_col(expr, &renamed);
     for node in nodes.iter().rev() {
         input = extension_node(node.map_expressions(remap)?.with_input(input)?);
     }

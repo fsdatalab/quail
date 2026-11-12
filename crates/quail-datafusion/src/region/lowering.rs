@@ -163,52 +163,16 @@ impl Extracted {
             return Ok(plan);
         }
         // an expression's subquery is a plan of its own
-        let mut failed = None;
         let plan = plan
-            .map_expressions(|expr| {
-                expr.transform_down(|inner| {
-                    let lowered = |body: &LogicalPlan, this: &mut Self, columns: &mut _| {
-                        this.lower(body.clone(), columns).map(Arc::new)
-                    };
-                    let done = match inner {
-                        Expr::ScalarSubquery(mut found) if found.outer_ref_columns.is_empty() => {
-                            lowered(&found.subquery, self, columns).map(|body| {
-                                found.subquery = body;
-                                Expr::ScalarSubquery(found)
-                            })
-                        }
-                        Expr::Exists(mut found) if found.subquery.outer_ref_columns.is_empty() => {
-                            lowered(&found.subquery.subquery, self, columns).map(|body| {
-                                found.subquery.subquery = body;
-                                Expr::Exists(found)
-                            })
-                        }
-                        Expr::InSubquery(mut found)
-                            if found.subquery.outer_ref_columns.is_empty() =>
-                        {
-                            lowered(&found.subquery.subquery, self, columns).map(|body| {
-                                found.subquery.subquery = body;
-                                Expr::InSubquery(found)
-                            })
-                        }
-                        other => return Ok(Transformed::no(other)),
-                    };
-                    match done {
-                        Ok(expr) => Ok(Transformed::yes(expr)),
-                        Err(error) => {
-                            failed = Some(error);
-                            Ok(Transformed::no(Expr::Literal(
-                                datafusion::common::ScalarValue::Null,
-                                None,
-                            )))
-                        }
-                    }
-                })
+            .map_uncorrelated_subqueries(|subquery| {
+                let LogicalPlan::Subquery(mut found) = subquery else {
+                    return Ok(Transformed::no(subquery));
+                };
+                found.subquery =
+                    Arc::new(self.lower(Arc::unwrap_or_clone(found.subquery), columns)?);
+                Ok(Transformed::yes(LogicalPlan::Subquery(found)))
             })?
             .data;
-        if let Some(error) = failed {
-            return Err(error);
-        }
         // VALUES has no input: each row is a SELECT list over one empty row
         if let LogicalPlan::Values(values) = &plan {
             let mut rows = Vec::new();

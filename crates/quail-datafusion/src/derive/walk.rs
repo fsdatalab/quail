@@ -5,7 +5,6 @@ use super::binding::unsupported;
 use crate::ai::{AiNode, Fetch, Semantics};
 use crate::extension::as_node;
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::common::Column;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::{Expr, Join, JoinType, LogicalPlan};
 use quail_planner::error::CompileError;
@@ -17,16 +16,10 @@ pub(super) fn with_select_list(plan: &LogicalPlan) -> LogicalPlan {
     if matches!(plan, LogicalPlan::Projection(_)) {
         return plan.clone();
     }
-    let columns: Vec<Expr> = plan
-        .schema()
-        .iter()
-        .map(|(qualifier, field)| {
-            Expr::Column(Column::new(qualifier.cloned(), field.name().clone()))
-        })
-        .collect();
-    datafusion::logical_expr::Projection::try_new(columns, std::sync::Arc::new(plan.clone()))
-        .map(LogicalPlan::Projection)
-        .unwrap_or_else(|_| plan.clone())
+    LogicalPlan::Projection(datafusion::logical_expr::Projection::new_from_schema(
+        std::sync::Arc::new(plan.clone()),
+        std::sync::Arc::clone(plan.schema()),
+    ))
 }
 
 // ---------------------------------------------------------------- the SELECT
@@ -320,10 +313,7 @@ impl<'a> Walk<'a> {
         if read == *inner {
             return expr.clone();
         }
-        let name = name.unwrap_or_else(|| match inner {
-            Expr::Column(column) => column.name.clone(),
-            other => other.schema_name().to_string(),
-        });
+        let name = name.unwrap_or_else(|| inner.qualified_name().1);
         match &read {
             Expr::Column(column) if column.name == name && !matches!(expr, Expr::Alias(_)) => read,
             _ => read.alias(name),
@@ -335,29 +325,17 @@ impl<'a> Walk<'a> {
 /// list's, or, where DataFusion removed one that passes its input on,
 /// the input's columns.
 fn derived_columns(plan: &LogicalPlan) -> Vec<(String, Expr)> {
-    let node = plan;
-    if !matches!(node, LogicalPlan::Projection(_)) {
-        return plan
-            .schema()
-            .iter()
-            .map(|(qualifier, field)| {
-                (
-                    field.name().clone(),
-                    Expr::Column(Column::new(qualifier.cloned(), field.name().clone())),
-                )
-            })
-            .collect();
-    }
-    match node {
+    match plan {
         LogicalPlan::Projection(projection) => projection
             .expr
             .iter()
-            .map(|expr| match expr {
-                Expr::Alias(alias) => (alias.name.clone(), alias.expr.as_ref().clone()),
-                Expr::Column(column) => (column.name.clone(), expr.clone()),
-                other => (other.schema_name().to_string(), other.clone()),
-            })
+            .map(|expr| (expr.qualified_name().1, expr.clone().unalias()))
             .collect(),
-        _ => Vec::new(),
+        _ => plan
+            .schema()
+            .columns()
+            .into_iter()
+            .map(|column| (column.name.clone(), Expr::Column(column)))
+            .collect(),
     }
 }

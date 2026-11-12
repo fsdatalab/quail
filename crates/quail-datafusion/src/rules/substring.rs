@@ -28,6 +28,7 @@ use std::sync::Arc;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Result, ScalarValue};
 use datafusion::logical_expr::expr::Like;
+use datafusion::logical_expr::expr_rewriter::unnormalize_col;
 use datafusion::logical_expr::utils::split_conjunction;
 use datafusion::logical_expr::{Expr, Filter, LogicalPlan};
 
@@ -149,17 +150,7 @@ fn escaped(text: &str) -> String {
 /// column names: DataFusion's `push_down_filter` renames a test's table
 /// as it moves it below a subquery alias.
 fn tests_below(plan: &LogicalPlan, test: &Expr) -> bool {
-    let named = |expr: &Expr| {
-        expr.clone()
-            .transform_up(|inner| match inner {
-                Expr::Column(column) => Ok(Transformed::yes(Expr::Column(
-                    datafusion::common::Column::new_unqualified(column.name),
-                ))),
-                other => Ok(Transformed::no(other)),
-            })
-            .map(|done| done.data)
-            .ok()
-    };
+    let named = |expr: &Expr| unnormalize_col(expr.clone());
     let wanted = named(test);
     let mut found = false;
     let _ = plan.apply(|node| {

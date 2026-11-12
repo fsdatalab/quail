@@ -42,6 +42,7 @@ use datafusion::arrow::datatypes::{DataType, Field};
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, Result, plan_err};
+use datafusion::logical_expr::expr_rewriter::strip_outer_reference;
 use datafusion::logical_expr::simplify::SimplifyContext;
 use datafusion::logical_expr::utils::{conjunction, split_conjunction};
 use datafusion::logical_expr::{
@@ -554,15 +555,7 @@ fn exists_gate(term: &Expr) -> Option<(LogicalPlan, Expr, bool)> {
     if !matches!(alias.input.as_ref(), LogicalPlan::TableScan(_)) || !is_asked(&filter.predicate) {
         return None;
     }
-    let predicate = filter
-        .predicate
-        .clone()
-        .transform_up(|expr| match expr {
-            Expr::OuterReferenceColumn(_, column) => Ok(Transformed::yes(Expr::Column(column))),
-            other => Ok(Transformed::no(other)),
-        })
-        .ok()?
-        .data;
+    let predicate = strip_outer_reference(filter.predicate.clone());
     Some((filter.input.as_ref().clone(), predicate, exists.negated))
 }
 
