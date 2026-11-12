@@ -13,8 +13,7 @@ from quail.execution.result import QueryResult
 from quail.extensions import ExtensionRegistry
 from quail.physical import ExtensionNode, PhysicalGraph, PhysicalNode
 from quail.physical.lowering import lower_prompt
-from quail.remote.client import QueryRun
-from quail.remote.records import QueryFailedError, QueryStatus
+from quail.remote.client import QueryFailedError, QueryRun, QueryStatus
 
 # the label before each document in a prompt
 SHARED_PRE = _quail_native.SHARED_PRE

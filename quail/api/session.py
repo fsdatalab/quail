@@ -21,9 +21,10 @@ class Session:
     """Register tables and run queries, here or on Quail Server.
 
     Without ``endpoint`` every query runs in this process. With one,
-    ``register`` describes each table for the server, ``sql`` returns
-    a query that ``submit()`` sends there, and ``get_run`` reattaches
-    to an accepted query by id. The query API is the same either way.
+    such as ``grpc://127.0.0.1:8642``, ``register`` uploads each table
+    to the server over Arrow Flight, ``sql`` returns a query that
+    ``submit()`` sends there, and ``get_run`` reattaches to a submitted
+    query by id. The query API is the same either way.
     """
 
     def __init__(self, config: EngineConfig, *,
@@ -73,20 +74,11 @@ class Session:
         """The Quail Server this session submits to, or None."""
         return None if self._remote is None else self._remote.client.endpoint
 
-    @property
-    def session_id(self) -> str | None:
-        """The id sent with every submission of a remote session, or None.
-
-        The server saves it on each record, so ``GET /v1/queries``
-        with ``session_id`` lists what this session submitted.
-        """
-        return None if self._remote is None else self._remote.session_id
-
     def close(self):
         """Wait for background tokenization and remove temporary token files.
 
-        Closing a remote session removes its staged uploads only; the
-        server keeps every accepted query and the inputs it needs.
+        Closing a remote session closes its connection only; the
+        server keeps its tables and every submitted query.
         """
         if self._remote is not None:
             self._remote.close()
@@ -100,11 +92,7 @@ class Session:
     def register(self, name: str, provider: TableProvider) -> None:
         """Register a table under ``name``.
 
-        On a remote session the provider must be one the server can
-        read: an in-memory table, a Parquet, IPC, or Arrow dataset
-        (uploaded as a snapshot), or a Hugging Face dataset (pinned to a
-        revision). Any other provider raises TypeError here rather than
-        running locally.
+        A remote session uploads the provider's rows to the server.
         """
         self.catalog.register(name, provider)
         if self._remote is not None:
@@ -122,12 +110,17 @@ class Session:
             A ``Query`` that this process plans and runs, or a
             ``RemoteQuery`` the server compiles when the session has an
             endpoint.
+
+        Raises:
+            ValueError: ``order`` is given on a remote session; the
+                server chooses each query's order.
         """
         if self._remote is not None:
             from quail.remote.client import RemoteQuery
 
-            return RemoteQuery(self, text, order=order,
-                               dialect=SQLDialect(dialect).value)
+            if order is not None:
+                raise ValueError("a remote session does not take order")
+            return RemoteQuery(self, text, dialect=SQLDialect(dialect).value)
         from quail.api.query import Query
 
         query = Query(self, text, SQLDialect(dialect).value, order=order)
@@ -135,11 +128,7 @@ class Session:
         return query
 
     def get_run(self, query_id: str):
-        """Reattach to a query the server already accepted.
-
-        Returns a QueryRun; it never resubmits or starts another
-        execution.
-        """
+        """Return the run of a query the server already has, by its id."""
         if self._remote is None:
             raise RuntimeError(
                 "get_run() needs a Session with an endpoint; a local "

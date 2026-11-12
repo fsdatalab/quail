@@ -1,206 +1,145 @@
-"""The client side of a remote Session: submit, watch, cancel, fetch.
+"""The client side of a remote Session: Arrow Flight calls to Quail Server.
 
-Uses only the standard library for HTTP, so a client installation
-needs no server extra. Control messages are JSON. Table data travels
-as Arrow IPC: an input snapshot is uploaded from its file, and a
-result is read as a stream of record batches. ``ServerClient`` wraps
-the routes; ``RemoteQuery`` and ``QueryRun`` are what ``Session.sql``
-and ``Session.get_run`` return when the session has an endpoint.
+``ServerClient`` wraps the server's Flight calls. ``RemoteQuery`` and
+``QueryRun`` are what ``Session.sql`` and ``Session.get_run`` return when
+the session has an endpoint.
 """
 
 from __future__ import annotations
 
-import http.client
 import json
-import os
-import tempfile
-import urllib.error
-import urllib.parse
-import urllib.request
-import uuid
+import time
 from collections.abc import Iterator
-from dataclasses import asdict
-from pathlib import Path
+from dataclasses import dataclass, fields
 
 import pyarrow as pa
-import pyarrow.ipc as ipc
+import pyarrow.flight as flight
 
+from quail.catalog.providers import ScanRequest
 from quail.execution.result import QueryResult
-from quail.progress import say
-from quail.remote.artifacts import read_answer_tables, result_from_parts
-from quail.remote.inputs import PreparedInput, describe
-from quail.remote.records import QueryFailedError, QueryStatus, ServerError
 
-DEFAULT_POLL_S = 30.0
-TOKEN_VARIABLE = "QUAIL_SERVER_TOKEN"
+DEFAULT_POLL_S = 1.0
+FINISHED_STATES = frozenset({"succeeded", "failed", "cancelled"})
 
 
-class _ResponseReader(ipc.RecordBatchStreamReader):
-    """An IPC stream reader that closes its HTTP response with itself."""
+@dataclass(frozen=True)
+class QueryStatus:
+    """The server's saved status of one submitted query.
 
-    def __init__(self, response):
-        self._response = response
-        try:
-            super().__init__(pa.PythonFile(response, mode="r"))
-        except BaseException:
-            response.close()
-            raise
+    Attributes:
+        id: The submission's id.
+        sql: The query.
+        state: "queued", "running", "succeeded", "failed", or "cancelled".
+        dialect: The SQL dialect, or None for Snowflake.
+        error: Why the query failed or was cancelled.
+        timeout_s: The most seconds the query may run.
+        submitted_at: Seconds since 1970 when the server took the query.
+        started_at: Seconds since 1970 when the query started.
+        finished_at: Seconds since 1970 when the query finished.
+        num_rows: How many rows the query returned.
+        progress: The running model region's progress, while it runs.
+    """
 
-    def close(self):
-        try:
-            super().close()
-        finally:
-            self._response.close()
+    id: str
+    sql: str
+    state: str
+    dialect: str | None = None
+    error: str | None = None
+    timeout_s: float | None = None
+    submitted_at: float | None = None
+    started_at: float | None = None
+    finished_at: float | None = None
+    num_rows: int | None = None
+    progress: dict | None = None
 
-    def read_next_batch(self):
-        return self.read_next_batch_with_custom_metadata()[0]
+    @property
+    def done(self) -> bool:
+        """Return whether the query has finished, whatever its state."""
+        return self.state in FINISHED_STATES
 
-    def read_next_batch_with_custom_metadata(self):
-        try:
-            return super().read_next_batch_with_custom_metadata()
-        except BaseException:
-            self.close()
-            raise
 
-    def read_all(self):
-        try:
-            return super().read_all()
-        finally:
-            self.close()
+class QueryFailedError(RuntimeError):
+    """Raised by result() when the query finished without rows."""
+
+    def __init__(self, status: QueryStatus):
+        self.status = status
+        super().__init__(
+            f"query {status.id} {status.state}: {status.error or status.state}")
+
+
+def _status(body: bytes) -> QueryStatus:
+    found = json.loads(body)
+    names = {field.name for field in fields(QueryStatus)}
+    return QueryStatus(**{name: found[name] for name in names if name in found})
 
 
 class ServerClient:
-    """HTTP calls to one Quail Server."""
+    """Arrow Flight calls to one Quail Server.
 
-    def __init__(self, endpoint: str, token: str | None = None,
-                 timeout_s: float = 120.0):
-        self.endpoint = endpoint.rstrip("/")
-        self.token = token if token is not None else os.environ.get(
-            TOKEN_VARIABLE)
-        self.timeout_s = timeout_s
+    Args:
+        endpoint: The server's address, such as ``grpc://127.0.0.1:8642``.
+    """
 
-    def _headers(self, extra: dict | None = None) -> dict:
-        headers = {"accept": "application/json"}
-        if self.token:
-            headers["authorization"] = f"Bearer {self.token}"
-        headers.update(extra or {})
-        return headers
+    def __init__(self, endpoint: str):
+        self.endpoint = endpoint
+        self._flight = flight.FlightClient(endpoint)
 
-    def _open(self, method: str, path: str, *, body=None, headers=None,
-              timeout: float | None = None):
-        """Send one request and return the open response."""
-        data = None
-        request_headers = self._headers(headers)
-        if body is not None and not isinstance(body, (bytes, bytearray)) \
-                and not hasattr(body, "read"):
-            data = json.dumps(body).encode("utf-8")
-            request_headers["content-type"] = "application/json"
-        elif body is not None:
-            data = body
-        request = urllib.request.Request(
-            self.endpoint + path, data=data, method=method,
-            headers=request_headers)
+    def close(self) -> None:
+        """Close the connection."""
+        self._flight.close()
+
+    def _act(self, name: str, body) -> bytes:
+        text = body if isinstance(body, str) else json.dumps(body)
+        answer, = self._flight.do_action(flight.Action(name, text.encode()))
+        return answer.body.to_pybytes()
+
+    def upload(self, name: str, reader: pa.RecordBatchReader,
+               id_col: str) -> None:
+        """Register ``reader``'s rows on the server as the table ``name``."""
+        descriptor = flight.FlightDescriptor.for_path(name, id_col)
+        writer, _ = self._flight.do_put(descriptor, reader.schema)
         try:
-            return urllib.request.urlopen(
-                request, timeout=timeout or self.timeout_s)
-        except urllib.error.HTTPError as error:
-            raise _server_error(error) from None
-        except (urllib.error.URLError, http.client.HTTPException,
-                OSError) as error:
-            raise ServerError(
-                f"cannot reach Quail Server at {self.endpoint}: "
-                f"{error}") from error
+            for batch in reader:
+                writer.write_batch(batch)
+        finally:
+            writer.close()
 
-    def _request(self, method: str, path: str, *, body=None, headers=None,
-                 timeout: float | None = None, raw: bool = False):
-        with self._open(method, path, body=body, headers=headers,
-                        timeout=timeout) as response:
-            payload = response.read()
-        if raw:
-            return payload
-        return json.loads(payload) if payload else None
+    def submit(self, sql: str, *, dialect: str | None = None,
+               query_id: str | None = None,
+               timeout_s: float | None = None) -> QueryStatus:
+        """Queue a query; submitting one id twice runs the query once."""
+        asked = {"sql": sql, "dialect": dialect, "id": query_id,
+                 "timeout_s": timeout_s}
+        return _status(self._act("submit", {
+            key: value for key, value in asked.items() if value is not None}))
 
-    def capabilities(self) -> dict:
-        return self._request("GET", "/v1/capabilities")
-
-    def has_input(self, content_id: str) -> bool:
-        try:
-            self._request("HEAD", f"/v1/inputs/{content_id}")
-        except ServerError as error:
-            if error.status == 404:
-                return False
-            raise
-        return True
-
-    def upload_input(self, prepared: PreparedInput) -> None:
-        """Upload one snapshot unless the server already has it."""
-        if prepared.upload_path is None or self.has_input(prepared.content_id):
-            return
-        size = prepared.upload_path.stat().st_size
-        with open(prepared.upload_path, "rb") as handle:
-            self._request(
-                "PUT", f"/v1/inputs/{prepared.content_id}", body=handle,
-                headers={"content-type": "application/vnd.apache.arrow.file",
-                         "content-length": str(size)},
-                timeout=max(self.timeout_s, size / (1 << 20)))
-
-    def submit(self, body: dict) -> QueryStatus:
-        return QueryStatus(**self._request("POST", "/v1/queries", body=body))
-
-    def status(self, query_id: str, *, after: int | None = None,
-               poll_s: float = 0.0) -> QueryStatus:
-        query = ""
-        if after is not None and poll_s > 0:
-            query = "?" + urllib.parse.urlencode(
-                {"after": after, "wait": f"{poll_s:g}"})
-        data = self._request("GET", f"/v1/queries/{query_id}{query}",
-                             timeout=self.timeout_s + poll_s)
-        return QueryStatus(**data)
+    def status(self, query_id: str) -> QueryStatus:
+        """Return a submission's status."""
+        return _status(self._act("status", query_id))
 
     def cancel(self, query_id: str) -> QueryStatus:
-        return QueryStatus(**self._request("POST", f"/v1/queries/{query_id}/cancel"))
+        """Stop a submission."""
+        return _status(self._act("cancel", query_id))
 
-    def answers(self, query_id: str, *, after: int = 0,
-                limit: int = 1000) -> dict:
-        query = urllib.parse.urlencode({"after": after, "limit": limit})
-        return self._request("GET", f"/v1/queries/{query_id}/answers?{query}")
+    def submissions(self) -> list[QueryStatus]:
+        """Return every submission the server has."""
+        return [_status(json.dumps(found))
+                for found in json.loads(self._act("list", ""))]
 
-    def file(self, query_id: str, name: str) -> bytes:
-        return self._request("GET", f"/v1/queries/{query_id}/files/{name}",
-                             raw=True)
+    def explain(self, sql: str, dialect: str | None = None) -> str:
+        """Return the server's plan of a query."""
+        asked = {"sql": sql} if dialect is None else {
+            "sql": sql, "dialect": dialect}
+        return self._act("explain", asked).decode()
 
-    def result_batches(self, query_id: str, *, limit: int | None = None
-                       ) -> pa.RecordBatchReader:
-        """Open the saved result as a stream of Arrow record batches.
-
-        The server sends at most limit rows. The connection stays open
-        until the reader is exhausted, closed, or fails.
-        """
-        query = "" if limit is None else "?" + urllib.parse.urlencode({"limit": limit})
-        response = self._open(
-            "GET", f"/v1/queries/{query_id}/result{query}",
-            headers={"accept": "application/vnd.apache.arrow.stream"})
-        return _ResponseReader(response)
-
-
-def _server_error(error: urllib.error.HTTPError) -> ServerError:
-    try:
-        detail = json.loads(error.read().decode("utf-8"))["error"]
-        message = f"{detail['type']}: {detail['message']}"
-    except (ValueError, KeyError, TypeError):
-        message = f"HTTP {error.code}"
-    failure = ServerError(message)
-    failure.status = error.code
-    return failure
-
-
-def _table(payload: bytes) -> pa.Table:
-    with ipc.open_file(pa.BufferReader(payload)) as reader:
-        return reader.read_all()
+    def result_batches(self, query_id: str) -> pa.RecordBatchReader:
+        """Return the saved rows of a submission that succeeded."""
+        ticket = flight.Ticket(json.dumps({"query_id": query_id}).encode())
+        return self._flight.do_get(ticket).to_reader()
 
 
 class QueryRun:
-    """A handle to one accepted execution on the server."""
+    """One query the server took: its status, and its rows once it succeeds."""
 
     def __init__(self, client: ServerClient, query_id: str):
         self._client = client
@@ -210,217 +149,120 @@ class QueryRun:
         return f"QueryRun({self.id!r})"
 
     def status(self) -> QueryStatus:
-        """Return the current saved status snapshot."""
+        """Return the query's status now."""
         return self._client.status(self.id)
 
     def watch(self, poll_s: float = DEFAULT_POLL_S) -> Iterator[QueryStatus]:
-        """Yield the current snapshot, then each newer revision, until done.
-
-        Intermediate progress snapshots may be skipped. A lost connection
-        raises ServerError; calling watch() again resumes from the
-        current snapshot.
-        """
-        status = self.status()
-        yield status
-        while not status.done:
-            newer = self._client.status(self.id, after=status.revision,
-                                        poll_s=poll_s)
-            if newer.revision > status.revision:
-                status = newer
-                yield status
-
-    def answers(self, after: int = 0, limit: int = 1000) -> dict:
-        """Return the answers saved so far, from entry ``after`` on.
-
-        Each entry's ``kind`` says what finished. A ``"filter"`` entry is
-        one chunk of documents: ``documents`` lists ``[row index, last
-        stage asked, passed]``, and a document passed the filter when it
-        passed its last stage. A ``"join"`` entry is one finished anchor:
-        ``document`` (its row index in the anchor table), ``matches`` (the
-        partner row index tuples that answered true), and ``asked`` (how
-        many pairs were evaluated; the rest answered false). A ``"score"``
-        entry is one batch of reranker scores: ``rows`` and ``scores``
-        line up. An ``"evict"`` entry is one document prefix dropped
-        from KV: ``alias``, ``document`` (its row index), and
-        ``tokens`` (the prefix length). ``next`` is the entry to ask
-        for next and ``done`` says whether more can still arrive.
-        """
-        return self._client.answers(self.id, after=after, limit=limit)
-
-    def stream_answers(self, poll_s: float = DEFAULT_POLL_S
-                       ) -> Iterator[dict]:
-        """Yield each saved answer entry as the server saves it.
-
-        Ends when the query is done and every saved entry was yielded.
-        See ``answers`` for the entry kinds.
-        """
-        seen = 0
-        for status in self.watch(poll_s):
-            saved = (status.progress or {}).get("answers_saved", 0)
-            if saved <= seen and not status.done:
-                continue
-            while True:
-                page = self.answers(after=seen)
-                yield from page["answers"]
-                seen = page["next"]
-                if not page["answers"]:
-                    break
+        """Yield the query's status every ``poll_s`` seconds until it finishes."""
+        while True:
+            status = self.status()
+            yield status
             if status.done:
                 return
+            time.sleep(poll_s)
 
     def cancel(self) -> QueryStatus:
-        """Ask the server to stop this query. Returns the snapshot after."""
+        """Stop the query."""
         return self._client.cancel(self.id)
 
     def wait(self, poll_s: float = DEFAULT_POLL_S) -> QueryStatus:
-        """Wait for the query to end and return its final snapshot.
-
-        Raises QueryFailedError when the record ended failed, interrupted,
-        or cancelled.
-        """
+        """Wait for the query to finish; return its last status."""
         for status in self.watch(poll_s):
-            if status.done:
-                break
-        if status.state != "succeeded":
-            raise QueryFailedError(status)
+            pass
         return status
 
-    def stream_result(self, poll_s: float = DEFAULT_POLL_S,
-                      limit: int | None = None) -> pa.RecordBatchReader:
-        """Wait for completion and stream at most limit result rows, batch by batch."""
-        self.wait(poll_s)
-        return self._client.result_batches(self.id, limit=limit)
+    def stream_result(self, poll_s: float = DEFAULT_POLL_S
+                      ) -> pa.RecordBatchReader:
+        """Wait for the query, then stream its rows.
 
-    def result(self, poll_s: float = DEFAULT_POLL_S) -> QueryResult:
-        """Wait for completion and return the saved result.
-
-        Raises QueryFailedError when the record ended failed, interrupted,
-        or cancelled.
+        Raises:
+            QueryFailedError: The query failed or was cancelled.
         """
         status = self.wait(poll_s)
-        files = status.result["files"]
-        table = self._client.result_batches(self.id).read_all()
-        report = json.loads(self._client.file(self.id, files["report"]))
-        answers = read_answer_tables(
-            files, lambda name: _table(self._client.file(self.id, name)))
-        return result_from_parts(table, report, answers)
+        if status.state != "succeeded":
+            raise QueryFailedError(status)
+        return self._client.result_batches(self.id)
+
+    def result(self, poll_s: float = DEFAULT_POLL_S) -> QueryResult:
+        """Wait for the query, then return its rows.
+
+        Raises:
+            QueryFailedError: The query failed or was cancelled.
+        """
+        return QueryResult.from_table(self.stream_result(poll_s).read_all())
 
 
 class RemoteConnection:
-    """What a Session with an endpoint holds: the client and its inputs.
+    """A remote Session's connection: its tables and queries on one server."""
 
-    ``session_id`` is chosen here and sent with every submission, so
-    the server can list the queries one client session submitted.
-    """
-
-    def __init__(self, endpoint: str, *, token: str | None = None,
-                 resolve_revision=None):
-        self.client = ServerClient(endpoint, token=token)
-        self.session_id = uuid.uuid4().hex
-        self._resolve_revision = resolve_revision
-        self._workdir = tempfile.TemporaryDirectory(prefix="quail-inputs-")
-        self.inputs: dict[str, PreparedInput] = {}
+    def __init__(self, endpoint: str):
+        self.client = ServerClient(endpoint)
 
     def register(self, name: str, provider) -> None:
-        options = {}
-        if self._resolve_revision is not None:
-            options["resolve_revision"] = self._resolve_revision
-        self.inputs[name] = describe(provider, Path(self._workdir.name),
-                                     **options)
+        """Upload a provider's rows as the server's table ``name``."""
+        reader = provider.scan(ScanRequest(columns=provider.columns))
+        try:
+            self.client.upload(name, reader, provider.id_col)
+        finally:
+            reader.close()
 
     def close(self) -> None:
-        self._workdir.cleanup()
+        """Close the connection; the server keeps its tables and queries."""
+        self.client.close()
 
     def run(self, query_id: str) -> QueryRun:
+        """Return the run of a query the server already has."""
         return QueryRun(self.client, query_id)
-
-    def submit(self, spec: dict, config: dict, *, query_id: str,
-               timeout_s: float | None) -> QueryRun:
-        for prepared in self.inputs.values():
-            self.client.upload_input(prepared)
-        body = {
-            **spec,
-            "config": config,
-            "inputs": {name: prepared.spec
-                       for name, prepared in self.inputs.items()},
-            "query_id": query_id,
-            "session_id": self.session_id,
-            "timeout_s": timeout_s,
-        }
-        status = self.client.submit(body)
-        return self.run(status.id)
 
 
 class RemoteQuery:
-    """A query held as text until the server compiles and plans it."""
+    """A SQL query that Quail Server plans and runs."""
 
-    def __init__(self, session, sql: str, *, order: str | None,
-                 dialect: str):
+    def __init__(self, session, sql: str, *, dialect: str):
         self.session = session
-        self.sql = sql
-        self.order = order
+        self.text = sql
         self.dialect = dialect
-
-    def _spec(self) -> dict:
-        return {"sql": self.sql, "order": self.order, "dialect": self.dialect}
 
     def submit(self, *, query_id: str | None = None,
                timeout_s: float | None = None) -> QueryRun:
-        """Submit to the server and return once it has saved the record.
+        """Queue the query on the server; return its run at once.
 
         Args:
-            query_id: The id the run will have; a new random one when
-                omitted. Submitting the same id and the same query
-                again returns the same run, so a retry after a lost
-                response is safe. The same id with a different query
-                is an error.
-            timeout_s: Execution time limit; the server default when
-                omitted.
+            query_id: A name for the submission. Submitting the same
+                query under one id twice runs it once.
+            timeout_s: The most seconds the query may run.
         """
-        run = self.session._remote.submit(
-            self._spec(), asdict(self.session.config),
-            query_id=query_id or uuid.uuid4().hex, timeout_s=timeout_s)
-        say(f"submitted query {run.id} to {self.session._remote.client.endpoint}")
-        return run
+        client = self.session._remote.client
+        status = client.submit(self.text, dialect=self.dialect,
+                               query_id=query_id, timeout_s=timeout_s)
+        return QueryRun(client, status.id)
 
     def run(self, plan=None, *, timeout_s: float | None = None) -> QueryResult:
-        """Submit, wait for the saved result, and return it.
-
-        Args:
-            plan: Must be None. Remote queries use the server's plan.
-            timeout_s: Execution time limit, or the server default.
+        """Run the query on the server and wait for its rows.
 
         Raises:
-            RuntimeError: If an edited plan is passed.
-            QueryFailedError: If the saved run does not succeed.
+            ValueError: ``plan`` is given; the server plans its queries.
+            QueryFailedError: The query failed or was cancelled.
         """
         if plan is not None:
-            raise RuntimeError(
-                "a remote query runs the server's plan; edited plans are "
-                "not supported with an endpoint")
+            raise ValueError("a remote query runs the server's plan")
         return self.submit(timeout_s=timeout_s).result()
 
     def collect(self, limit: int | None = None,
                 batch_rows: int = 65_536) -> pa.Table:
+        """Run the query and return its rows."""
         return self.run().collect(limit=limit, batch_rows=batch_rows)
 
     def execute_stream(self, batch_rows: int = 65_536,
                        limit: int | None = None) -> pa.RecordBatchReader:
-        """Submit, wait, and stream the result rows as Arrow record batches.
-
-        The server chooses the batch size; ``batch_rows`` is accepted for
-        the local signature and ignored.
-        """
-        if limit is not None and limit < 0:
-            raise ValueError("limit must be nonnegative")
-        return self.submit().stream_result(limit=limit)
+        """Run the query and stream its rows."""
+        return self.run().execute_stream(batch_rows=batch_rows, limit=limit)
 
     def explain(self, **_options) -> str:
-        raise RuntimeError(
-            "explain() is not available on a remote query before it runs; "
-            "submit() it and read run.status().plan['text']")
+        """Return the server's plan, each model region as one operator."""
+        return self.session._remote.client.explain(self.text, self.dialect)
 
     def plan(self):
+        """A remote query has no local plan; ``explain()`` shows the server's."""
         raise RuntimeError(
-            "plan() is not available on a remote query; the server plans "
-            "it and saves the plan on the run's status")
+            "a remote query is planned on the server; call explain()")

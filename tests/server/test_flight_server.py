@@ -12,6 +12,9 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.flight as flight
 import pytest
+from helpers.sessions import CONFIG
+
+import quail
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 SERVER = REPOSITORY / "target" / "debug" / "quail-server"
@@ -27,6 +30,14 @@ QUERY = ("SELECT r.id FROM reviews r "
 pytestmark = pytest.mark.skipif(
     not SERVER.exists(),
     reason="quail-server is not built; run cargo build --workspace")
+
+
+class _Client(flight.FlightClient):
+    """A Flight client that remembers the address it called."""
+
+    def __init__(self, endpoint):
+        super().__init__(endpoint)
+        self.endpoint = endpoint
 
 
 @contextlib.contextmanager
@@ -46,7 +57,7 @@ def serving(data, delay=0.0):
         env={**os.environ, "QUAIL_WORKER": f"{sys.executable} {WORKER}",
              "QUAIL_ORACLE_DELAY": str(delay)})
     try:
-        client = flight.FlightClient(f"grpc://127.0.0.1:{port}")
+        client = _Client(f"grpc://127.0.0.1:{port}")
         deadline = time.monotonic() + 60
         while True:
             try:
@@ -91,12 +102,30 @@ def test_a_client_uploads_a_table_and_reads_the_rows_of_an_ai_query(tmp_path):
     with serving(tmp_path) as client:
         # the oracle keeps the documents at even positions
         assert _rows(client, QUERY) == {"r.id": ["r0", "r2", "r4"]}
-        plan, = client.do_action(flight.Action("explain", QUERY.encode()))
+        plan, = client.do_action(
+            flight.Action("explain", json.dumps({"sql": QUERY}).encode()))
         assert "ModelRegionExec" in plan.body.to_pybytes().decode()
         # a query that does not plan is the client's error, and the next runs
         with pytest.raises(pa.ArrowInvalid, match="missing"):
             _rows(client, "SELECT * FROM missing")
         assert _rows(client, "SELECT count(*) AS n FROM reviews") == {"n": [6]}
+
+
+def test_a_session_with_an_endpoint_uploads_its_tables_and_runs_its_queries(
+        tmp_path):
+    with serving(tmp_path) as client, quail.Session(
+            CONFIG, endpoint=client.endpoint) as session:
+        session.register("notes", quail.DocumentProvider.from_table(
+            REVIEWS, id_col="id"))
+        query = session.sql(QUERY.replace("reviews", "notes"))
+        assert query.collect().to_pydict() == {"r.id": ["r0", "r2", "r4"]}
+        assert "ModelRegionExec" in query.explain()
+        run = query.submit(query_id="named")
+        assert run.wait(poll_s=0.05).num_rows == 3
+        assert session.get_run("named").result().count() == 3
+        failed = session.sql("SELECT * FROM missing").submit()
+        with pytest.raises(quail.QueryFailedError, match="missing"):
+            failed.result(poll_s=0.05)
 
 
 def test_a_submission_keeps_its_status_and_rows_when_the_server_restarts(tmp_path):

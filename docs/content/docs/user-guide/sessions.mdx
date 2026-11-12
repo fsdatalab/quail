@@ -55,7 +55,7 @@ when you also need the plan and metrics.
 Pass `endpoint` to submit queries to
 [Quail Server](/docs/user-guide/server).
 E.g., replace the session line above with
-`with quail.Session(config=config, endpoint="http://127.0.0.1:8642") as session:`.
+`with quail.Session(config=config, endpoint="grpc://127.0.0.1:50051") as session:`.
 
 `sql()` returns a [`RemoteQuery`](/docs/user-guide/server#submit-a-query).
 Accepted queries continue after the client exits. Save the query ID

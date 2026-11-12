@@ -2,34 +2,37 @@
 title: Quail Server
 ---
 
-Quail Server accepts SQL over HTTP. Submit queries through the Python
-`Session` API and retrieve them later by ID.
+Quail Server runs SQL sent over [Arrow Flight](https://arrow.apache.org/docs/format/Flight.html).
+Submit queries through the Python `Session` API and retrieve them later
+by ID. Any Arrow Flight client can call it too.
 
 ## Start the server
 
-On a machine with a [supported GPU](/docs/user-guide/models):
+On a machine with a [supported GPU](/docs/user-guide/models), from a
+repository checkout:
 
 ```bash
-uv pip install "quail-engine[server]"
-quail-server
+tools/build.sh
+cargo build --workspace --locked
+target/debug/quail-server --model qwen3-4b-fp8 --device h100-sxm
 ```
 
-Defaults: `127.0.0.1:8642`, one GPU, and data in `~/.quail/server`.
-The first query loads its model; later queries can reuse it.
-Use `quail-server --help` for configuration options.
+- `--model` and `--device` are required. The server runs one model.
+- `--gpus` defaults to 1 and `--backend` to `quail`.
+- `--listen` defaults to `127.0.0.1:50051`.
+- `--data` is the directory for submitted queries and their rows. It
+  defaults to `quail-server-data`.
 
-### Connect from another machine
+The server starts one GPU worker process per GPU. The first query
+loads the model; later queries reuse it.
 
-Set `QUAIL_SERVER_TOKEN` to an access token on both machines.
-Start the server with `quail-server --host 0.0.0.0`.
-
-Use `http://<host>:8642` only on a trusted private network.
-On an untrusted network, use an HTTPS reverse proxy to encrypt the token
-and query data.
+The server has no access token and no encryption. Listen on another
+address, such as `--listen 0.0.0.0:50051`, only on a trusted private
+network.
 
 ## Submit a query
 
-Install `quail-engine` on the client and pass the server URL as `endpoint`.
+Pass the server address as `endpoint`.
 E.g., submit a filter over two reviews:
 
 ```python
@@ -41,7 +44,7 @@ reviews = pa.table({
     "body": ["The ending was excellent.", "I liked the soundtrack."],
 })
 config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
-endpoint = "http://127.0.0.1:8642"
+endpoint = "grpc://127.0.0.1:50051"
 
 with quail.Session(config=config, endpoint=endpoint) as session:
     session.register("reviews", quail.DocumentProvider.from_table(reviews, id_col="id"))
@@ -60,53 +63,30 @@ with quail.Session(config=config, endpoint=endpoint) as session:
 
 `submit()` returns after the server saves the query. Save `run.id`.
 The query continues after the client exits.
-`run.result()` waits for completion and downloads the result.
+`run.result()` waits for the query and downloads its rows.
 Use `query.collect()` when you only need rows and want to wait for them.
 
-### Send input tables
-
-- Quail uploads `from_table`, `from_parquet`, `from_ipc`, and
-  `from_dataset` inputs. It uploads identical files only once.
-- For `from_hf`, the server downloads the Hugging Face data at the commit
-  selected during registration.
-- Custom providers and edited physical plans require a local session.
+- `register` uploads the provider's rows to the server.
+- The server keeps a table in memory. Register it again after the
+  server restarts.
+- The server runs queries on its own model, whatever the client's
+  `config` names.
+- `order` and edited physical plans require a local session.
 
 ## Inspect a query
 
-### Read its status
+`run.status()` returns the current status. `run.watch()` yields it
+until the query finishes.
 
-`run.status()` returns the current status. `run.watch()` yields updates.
-
-| States | Meaning |
+| State | Meaning |
 | --- | --- |
-| `queued`, `planning`, `running` | The query has not finished. |
-| `succeeded` | Results are available. |
-| `failed`, `interrupted`, `cancelled` | The query ended without a result. |
+| `queued`, `running` | The query has not finished. |
+| `succeeded` | Rows are available. |
+| `failed`, `cancelled` | The query ended without rows. `status.error` says why. |
 
-`status.phase` describes the current activity. `status.progress` holds
-execution counts. Either can be `None` before an update.
-
-### Read its plan and metrics
-
-E.g., inspect the plan after planning finishes:
-
-```python
-status = run.status()
-if status.plan is not None:
-    print(status.plan["text"])
-```
-
-After execution, use `result.explain()` and `result.report`.
-`query.explain()` is unavailable on a server session.
-See [Query results and plans](/docs/user-guide/results) and
-[Metrics](/docs/user-guide/metrics).
-
-### Inspect it in a browser
-
-Open `http://<host>:8642/` to list recent queries.
-Open `http://<host>:8642/queries/<query_id>` for one query's plan and status,
-including a preview of its first 20 result rows.
-Enter `QUAIL_SERVER_TOKEN` when the page asks for it.
+While a model region runs, `status.progress` holds its counts.
+`query.explain()` returns the server's plan, with each model region as
+one operator. A remote result holds rows only; it has no report.
 
 ## Reconnect to a query
 
@@ -120,38 +100,40 @@ with quail.Session(config=config, endpoint=endpoint) as session:
     print(saved.result().collect().to_pydict())
 ```
 
-To retry a submission after losing the HTTP reply, reuse its `query_id`
-in `submit()`. The server returns the existing query only if its SQL,
-inputs, configuration, and timeout match. Otherwise it reports
-`QueryIdConflictError`.
+To retry a submission after losing the reply, reuse its `query_id`
+in `submit()`. The server returns the existing query if its SQL and
+dialect match. Otherwise it refuses the id.
 
 ## Stop a query or handle a failure
 
 - Call `run.cancel()` to cancel.
-- Set `timeout_s` in `submit()` to limit time after the query leaves
-  the queue. The default is 1,000 seconds.
+- Set `timeout_s` in `submit()` to limit the time a query may run.
+  There is no default limit.
 - If the query does not succeed, `run.result()` raises `QueryFailedError`.
   Read `run.status().error` for the reason.
 
-After a server restart, queued queries resume. Queries that were planning
-or running become `interrupted`; submit them again with a new ID.
-Keep the server data directory to retain completed results.
+One query runs at a time; the others wait in the order submitted.
+After a restart on the same data directory, the server still has every
+finished query and its rows. A query that had not finished is `failed`;
+submit it again with a new ID.
 
-## Run the server on Modal
+## Call the server without Quail
 
-From a repository checkout with an authenticated Modal CLI, create the
-`quail-server-token` secret with `QUAIL_SERVER_TOKEN`. Include `HF_TOKEN`
-if the server needs gated model weights. Then deploy:
+| Flight call | What it does |
+| --- | --- |
+| `DoPut`, path `[table, id column]` | Registers the uploaded rows as a table. |
+| `DoGet`, ticket is SQL | Runs the query and returns its rows. |
+| `DoAction` `submit` | Queues a query. Body: JSON with `sql`, and optionally `dialect`, `id`, `timeout_s`. |
+| `DoAction` `status`, `cancel` | Body: the query ID. Returns the status as JSON. |
+| `DoAction` `list` | Returns every submitted query. |
+| `DoAction` `explain` | Body: JSON with `sql`, and optionally `dialect`. Returns the plan. |
+| `DoGet`, ticket `{"query_id": id}` | Returns the saved rows of a query that succeeded. |
 
-```bash
-modal deploy -m quail.server.modal_app 2>&1 | tee server-deploy.log
+E.g., run a query with `pyarrow.flight`:
+
+```python
+import pyarrow.flight as flight
+
+client = flight.FlightClient("grpc://127.0.0.1:50051")
+rows = client.do_get(flight.Ticket(b"SELECT count(*) FROM reviews")).read_all()
 ```
-
-The default deployment uses one H100 in the `quail-engine` app.
-Pass the printed endpoint URL to `Session` and set the same
-`QUAIL_SERVER_TOKEN` on the client.
-
-Inputs and results live on `quail-results` under `/results/quail-server/`.
-A restart restores the latest saved database copy; recent status updates
-can be lost. The container stops after 15 idle minutes.
-Its replacement loads the model on the next query.

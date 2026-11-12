@@ -155,6 +155,11 @@ impl Session {
         self.runner.interrupt();
     }
 
+    /// Let queries run again, as [`Executor::resume`] does.
+    pub fn resume(&self) {
+        self.runner.resume();
+    }
+
     /// The running region's latest progress, as [`Executor::progress`]
     /// gives it.
     pub fn progress(&self) -> Option<serde_json::Value> {

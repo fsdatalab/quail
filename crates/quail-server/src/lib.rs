@@ -8,15 +8,17 @@
 //! - `DoGet` with a ticket that is a SQL query runs it and returns its
 //!   rows.
 //! - `DoAction` `submit` queues a query and returns its status at once.
-//!   Its body is JSON: `sql`, and optionally `id`, which names the
+//!   Its body is JSON: `sql`, and optionally `dialect`, a DataFusion
+//!   dialect name ("Snowflake" by default), `id`, which names the
 //!   submission, and `timeout_s`. `status`, with an id as its body,
 //!   returns the submission's status, and the running region's
 //!   progress; `cancel` stops it; `list` returns every submission.
 //!   A status is JSON ([`queue::Submission`]).
 //! - `DoGet` with the ticket `{"query_id": id}` returns the rows of a
 //!   submission that succeeded.
-//! - `DoAction` `explain` with a SQL query returns DataFusion's plan,
-//!   with each model region as one operator.
+//! - `DoAction` `explain`, whose body is JSON with `sql` and optionally
+//!   `dialect`, returns DataFusion's plan, with each model region as
+//!   one operator.
 //!
 //! One query runs at a time; another waits its turn. The server sends a
 //! query's rows once the query has finished. A submission's status and
@@ -87,10 +89,13 @@ fn query_status(error: DataFusionError) -> Status {
 
 /// The server's actions, each with what it does.
 const ACTIONS: [(&str, &str); 5] = [
-    ("explain", "Return the plan of a SQL query"),
+    (
+        "explain",
+        "Return a query's plan; the body is JSON with sql, dialect",
+    ),
     (
         "submit",
-        "Queue a query; the body is JSON with sql, id, timeout_s",
+        "Queue a query; the body is JSON with sql, dialect, id, timeout_s",
     ),
     ("status", "Return a submission's status, by id"),
     ("cancel", "Stop a submission, by id"),
@@ -100,6 +105,16 @@ const ACTIONS: [(&str, &str); 5] = [
 fn text(bytes: &[u8], what: &str) -> Result<String, Status> {
     String::from_utf8(bytes.to_vec())
         .map_err(|_| Status::invalid_argument(format!("{what} is not UTF-8 text")))
+}
+
+/// The SQL and the dialect of an action's JSON body.
+fn asked_query(body: &str) -> Result<(String, Option<String>), Status> {
+    let asked: serde_json::Value =
+        serde_json::from_str(body).map_err(|error| Status::invalid_argument(error.to_string()))?;
+    let sql =
+        (asked["sql"].as_str()).ok_or_else(|| Status::invalid_argument("a query needs sql"))?;
+    let dialect = asked["dialect"].as_str().map(str::to_string);
+    Ok((sql.to_string(), dialect))
 }
 
 #[tonic::async_trait]
@@ -206,17 +221,17 @@ impl FlightService for QuailService {
         let json = |value: serde_json::Value| value.to_string();
         let answer = match action.r#type.as_str() {
             "explain" => {
-                self.blocking(move |session| session.explain(&body, None))
+                let (sql, dialect) = asked_query(&body)?;
+                self.blocking(move |session| session.explain(&sql, dialect.as_deref()))
                     .await?
             }
             "submit" => {
+                let (sql, dialect) = asked_query(&body)?;
                 let asked: serde_json::Value = serde_json::from_str(&body)
                     .map_err(|error| Status::invalid_argument(error.to_string()))?;
-                let sql = (asked["sql"].as_str())
-                    .ok_or_else(|| Status::invalid_argument("a submission needs sql"))?;
                 let id = asked["id"].as_str().map(str::to_string);
                 let found = (self.queue)
-                    .submit(sql, id, asked["timeout_s"].as_f64())
+                    .submit(&sql, dialect, id, asked["timeout_s"].as_f64())
                     .map_err(Status::invalid_argument)?;
                 json(serde_json::json!(found))
             }

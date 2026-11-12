@@ -22,7 +22,7 @@ use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -430,6 +430,8 @@ pub struct Workers {
     listeners: Vec<UnixListener>,
     paths: Vec<PathBuf>,
     processes: Arc<Mutex<Vec<Child>>>,
+    /// Whether the running query was told to stop.
+    interrupted: Arc<AtomicBool>,
     /// The command the processes were started with, to start them again.
     command: Option<Vec<String>>,
     connections: Vec<Arc<Mutex<Connection>>>,
@@ -460,6 +462,7 @@ impl Workers {
             listeners,
             paths,
             processes: Arc::new(Mutex::new(Vec::new())),
+            interrupted: Arc::new(AtomicBool::new(false)),
             command: None,
             connections: Vec::new(),
             num_regions: 0,
@@ -530,7 +533,22 @@ impl Workers {
     /// A handle that stops the worker processes from another thread,
     /// while a region holds the workers.
     pub fn interrupter(&self) -> Interrupter {
-        Interrupter(Arc::clone(&self.processes))
+        Interrupter {
+            processes: Arc::clone(&self.processes),
+            interrupted: Arc::clone(&self.interrupted),
+        }
+    }
+
+    /// Fail when the running query was told to stop.
+    ///
+    /// # Errors
+    ///
+    /// An [`Interrupter`] stopped the query and has not resumed.
+    pub fn check_interrupted(&self) -> Result<()> {
+        match self.interrupted.load(Ordering::SeqCst) {
+            true => Err(failure("the query was stopped")),
+            false => Ok(()),
+        }
     }
 
     /// Start the worker processes again, with the command they were
@@ -651,16 +669,31 @@ impl Workers {
 }
 
 /// Stops a session's worker processes: the region they run fails, and
-/// the next region starts them again.
+/// so does each region that starts before [`Interrupter::resume`].
 #[derive(Debug, Clone)]
-pub struct Interrupter(Arc<Mutex<Vec<Child>>>);
+pub struct Interrupter {
+    processes: Arc<Mutex<Vec<Child>>>,
+    interrupted: Arc<AtomicBool>,
+}
 
 impl Interrupter {
-    /// Kill every worker process.
+    /// Kill every worker process, and fail the regions that start
+    /// before [`Interrupter::resume`].
     pub fn interrupt(&self) {
-        for process in self.0.lock().expect("the processes lock").iter_mut() {
+        self.interrupted.store(true, Ordering::SeqCst);
+        for process in self
+            .processes
+            .lock()
+            .expect("the processes lock")
+            .iter_mut()
+        {
             let _ = process.kill();
         }
+    }
+
+    /// Let regions run again; the next one starts the workers.
+    pub fn resume(&self) {
+        self.interrupted.store(false, Ordering::SeqCst);
     }
 }
 

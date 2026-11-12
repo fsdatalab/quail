@@ -404,11 +404,19 @@ impl Executor {
     }
 
     /// Stop the running query: its workers are killed, so the region
-    /// they run fails, and the next region starts them again with the
-    /// models to load. Does nothing for an executor over an engine.
+    /// they run fails, and so does each region that starts before
+    /// [`Executor::resume`]. Does nothing for an executor over an engine.
     pub fn interrupt(&self) {
         if let Some(interrupter) = &self.interrupter {
             interrupter.interrupt();
+        }
+    }
+
+    /// Let regions run again after [`Executor::interrupt`]; the next
+    /// one starts the workers again, with the models to load.
+    pub fn resume(&self) {
+        if let Some(interrupter) = &self.interrupter {
+            interrupter.resume();
         }
     }
 
@@ -947,6 +955,7 @@ fn run_on_workers(
     let mut workers = workers.lock().expect("the workers lock");
     // a query that was stopped left its workers dead
     workers.revive()?;
+    workers.check_interrupted()?;
     let entered = std::time::Instant::now();
     let boots = workers.boot(&setup)?;
     if let Some(ready) = ready {

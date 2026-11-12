@@ -233,6 +233,8 @@ def _run_in_rust(query, source, plan, ready, results, region_tables, region_s,
         workers = backend.workers(config)
     else:
         workers = source.start_workers(config.gpus)["workers"]
+    # loading the tokenizer into the planner is startup as well
+    _ = session.planner
     startup_s = time.perf_counter() - startup_started
     if plan is not None:
         if isinstance(plan, Refusal) or not hasattr(plan, "graph"):

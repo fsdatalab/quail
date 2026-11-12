@@ -26,6 +26,9 @@ const STOPPED: &str = "the server stopped before the query finished";
 pub struct Submission {
     pub id: String,
     pub sql: String,
+    /// The SQL dialect the query is read in; None is Snowflake.
+    #[serde(default)]
+    pub dialect: Option<String>,
     /// "queued", "running", "succeeded", "failed", or "cancelled".
     pub state: String,
     /// Why the query failed or was cancelled.
@@ -121,6 +124,7 @@ impl Queue {
     pub fn submit(
         &self,
         sql: &str,
+        dialect: Option<String>,
         id: Option<String>,
         timeout_s: Option<f64>,
     ) -> Result<Submission, String> {
@@ -133,7 +137,7 @@ impl Queue {
             return Err(format!("{id:?} is not a submission id"));
         }
         if let Some(found) = state.submissions.get(&id) {
-            return match found.sql == sql {
+            return match found.sql == sql && found.dialect == dialect {
                 true => Ok(found.clone()),
                 false => Err(format!("the id {id} names another query")),
             };
@@ -141,6 +145,7 @@ impl Queue {
         let found = Submission {
             id: id.clone(),
             sql: sql.to_string(),
+            dialect,
             state: "queued".into(),
             error: None,
             timeout_s,
@@ -279,7 +284,10 @@ impl Queue {
                     }
                 })
             });
-            let ran = (self.session.sql_in_dialect(&found.sql, None)).and_then(|table| {
+            let ran = (self
+                .session
+                .sql_in_dialect(&found.sql, found.dialect.as_deref()))
+            .and_then(|table| {
                 let rows = table.1.iter().map(|batch| batch.num_rows()).sum();
                 let path = self.directory.join(&found.id).join("result.arrow");
                 let _ = std::fs::remove_file(&path);
@@ -292,6 +300,8 @@ impl Queue {
             }
             let mut state = self.state.lock().expect("the queue lock");
             let stopped = state.running.take().and_then(|(_, stopped)| stopped);
+            // under the lock, so no stop for this query comes after
+            self.session.resume();
             let found = state
                 .submissions
                 .get_mut(&found.id)
