@@ -38,7 +38,7 @@ from quail.common.tokens import decode_payload_documents
 from quail.execution.types import PhysicalResponse
 from quail.physical import Scan
 from quail.physical.plan import graph_from_envelope
-from quail.progress import say, set_gpu_index
+from quail.progress import detail, say, set_gpu_index
 from quail.specs.files import resolve_model_path
 
 # Children outlive sessions so later queries can reuse their loaded models.
@@ -398,7 +398,7 @@ def execute_quail_payload(payload, registry, graph, backend, runtime_state):
             runtime_state, backend, gpu_context, payload["chunk_tokens"],
             payload["true_ids"], payload["false_ids"],
             payload.get("arena_pages"))
-    say("running the query")
+    detail("running the query")
 
     report = execute_single(gpu, payload, registry, graph)
     outputs = report.pop("_outputs")

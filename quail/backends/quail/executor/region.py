@@ -87,6 +87,15 @@ class ChainRun:
     skip: Any = None
 
 
+def _chain_label(nodes) -> str:
+    """Name a chain by what it does: "classify ×3 over t" or "filter → map over r"."""
+    kinds = [node.type_name.rsplit("ai_", 1)[-1] for node in nodes]
+    steps = [kind if (count := len(list(group))) == 1 else f"{kind} ×{count}"
+             for kind, group in groupby(kinds)]
+    alias = (nodes[0].document_aliases or ("",))[0]
+    return f"{' → '.join(steps)} over {alias}"
+
+
 def pipeline_rows(first, inputs):
     """The rows, or ids, a chain's first operator reads."""
     alias = first.document_aliases[0]
@@ -227,7 +236,7 @@ class RegionExecution:
         """The GPU loop's settings for this chain."""
         first, operators = self.nodes[0], self.operators
         settings = ChainRun(
-            label=f"pipeline {(first.document_aliases or ('',))[0]}",
+            label=_chain_label(self.nodes),
             limit=self.context.state.get("filter_limit"),
             attention=(first.attention or None
                        if isinstance(first, (AiFilter, AiJoin)) else None))

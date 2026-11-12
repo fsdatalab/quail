@@ -22,7 +22,7 @@ from quail.backends.quail.executor.stages import (
     question_ends,
     state_share_points,
 )
-from quail.progress import Progress, logger
+from quail.progress import Progress, detail, logger
 
 ANSWER_ADMISSION_ENV = "QUAIL_ANSWER_ADMISSION"
 ANSWER_ADMISSION_MODES = ("headroom=0", "headroom")
@@ -1282,7 +1282,7 @@ class StageExecutor:
                 f"answers read {reads['alone'] + reads['own'] + reads['shared']:,} "
                 f"KV tokens ({reads['all']:,} without shared reads)")
         if details:
-            logger.info("    %s", "; ".join(details))
+            detail("    " + "; ".join(details))
         if self.decoder is not None and self.summary:
             curves = getattr(self.answer_admission, "bucket_curves", None)
             directory = os.environ.get(HEADROOM_TRACE_ENV)

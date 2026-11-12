@@ -23,7 +23,7 @@ from quail.backends.quail.executor.state import QueryExecutionState
 from quail.common.expressions import effective_selectivity
 from quail.common.tokens import prefix_tree
 from quail.physical import AiFilter, AiJoin, Filter, ValueType
-from quail.progress import logger
+from quail.progress import detail
 
 
 def shared_prefix_tree(name, prefixes, arena):
@@ -39,10 +39,9 @@ def shared_prefix_tree(name, prefixes, arena):
     """
     started = time.perf_counter()
     tree = prefix_tree(prefixes, arena.page_tokens)
-    logger.info(
-        "prefix sharing for %s: %s documents reuse %s tokens of earlier "
-        "documents (found in %.2f s)", name, f"{len(prefixes):,}",
-        f"{tree.shared_tokens:,}", time.perf_counter() - started)
+    detail(f"prefix sharing for {name}: {len(prefixes):,} documents reuse "
+           f"{tree.shared_tokens:,} tokens of earlier documents "
+           f"(found in {time.perf_counter() - started:.2f} s)")
     return tree
 
 

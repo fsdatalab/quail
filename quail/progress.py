@@ -1,9 +1,11 @@
 """Progress messages for the long steps of a query, on the "quail" logger.
 
-On a terminal a running count is one bar that updates in place, and the
-messages are colored. Anywhere else, such as a log file or a Modal log,
-the same messages are plain lines and a count logs a line at each tenth
-of its total.
+On a terminal a query shows its steps: one line for each, and for a
+running count one bar that updates in place with the count, the rate,
+and the time left. Details, such as how many forward passes a step
+took, are left out there. Anywhere else, such as a log file or a Modal
+log, every message is one plain line, details included, and a count
+logs a line at each tenth of its total.
 """
 
 import contextlib
@@ -16,13 +18,15 @@ from rich.console import Console
 from rich.markup import escape
 from rich.progress import (
     BarColumn,
-    MofNCompleteColumn,
+    ProgressColumn,
+    SpinnerColumn,
     TaskProgressColumn,
     TextColumn,
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
 from rich.progress import Progress as Bar
+from rich.text import Text
 
 _GPU_INDEX = None
 # names the run in every line's prefix, such as a benchmark's query
@@ -57,19 +61,40 @@ def console() -> Console:
 
 
 class _ConsoleHandler(logging.Handler):
-    """Write each message to `console()`: styled on a terminal, plain elsewhere."""
+    """Write each message to `console()`: a step on a terminal, else a plain line."""
 
     def emit(self, record):
         found = console()
-        stamp = time.strftime("%m-%d %H:%M:%S", time.localtime(record.created))
         # a record of a child logger skips this logger's filter; format()
         # adds a logged exception's traceback
-        text = f"[quail]{getattr(record, 'gpu', '')} {self.format(record)}"
-        if found.is_terminal:
-            found.print(f"[dim]{stamp}[/dim]", escape(text), soft_wrap=True)
-        else:
+        tag, text = getattr(record, "gpu", ""), self.format(record)
+        if not found.is_terminal:
+            stamp = time.strftime("%m-%d %H:%M:%S", time.localtime(record.created))
             # a log file keeps one unwrapped line per message
-            print(f"{record.levelname} {stamp} {text}", file=found.file, flush=True)
+            print(f"{record.levelname} {stamp} [quail]{tag} {text}",
+                  file=found.file, flush=True)
+        elif not getattr(record, "detail", False):
+            done = getattr(record, "done", False)
+            mark = "[green]✓[/green]" if done else "[dim]·[/dim]"
+            found.print(f"  {mark} [dim]{escape(tag)}[/dim]{escape(text.strip())}",
+                        soft_wrap=True)
+
+
+class _CountColumn(ProgressColumn):
+    """A count beside its total, with thousands separators: 743 of 1,772 documents."""
+
+    def render(self, task):
+        return Text(f"{int(task.completed):,} of {int(task.total):,} "
+                    f"{task.fields['unit']}")
+
+
+class _RateColumn(ProgressColumn):
+    """The rate the count is moving at, from its recent updates: 16 documents/s."""
+
+    def render(self, task):
+        if task.speed is None:
+            return Text("")
+        return Text(f"{task.speed:,.0f} {task.fields['unit']}/s", style="bold")
 
 
 logger = logging.getLogger("quail")
@@ -126,10 +151,21 @@ def answer_sink():
     return _ANSWER_SINK
 
 
-def say(message: str) -> None:
-    """Log one progress message at INFO, unless inside quiet()."""
+def say(message: str, *, done: bool = False) -> None:
+    """Log one progress message at INFO, unless inside quiet().
+
+    Args:
+        message: The step, such as "model ready".
+        done: Whether the message reports a finished step.
+    """
     if not _QUIET:
-        logger.info(message)
+        logger.info(message, extra={"done": done})
+
+
+def detail(message: str) -> None:
+    """Log a detail of the step before it, which a terminal leaves out."""
+    if not _QUIET:
+        logger.info(message, extra={"detail": True})
 
 
 @contextlib.contextmanager
@@ -165,11 +201,12 @@ class Progress:
         self._bar = self._task = None
         if emit is say and not _QUIET and total and console().is_terminal:
             self._bar = Bar(
-                TextColumn(r"\[quail] {task.description}"), BarColumn(),
-                MofNCompleteColumn(), TextColumn(unit), TaskProgressColumn(),
-                TimeElapsedColumn(), TimeRemainingColumn(),
-                console=console(), transient=True)
-            self._task = self._bar.add_task(label, total=total)
+                TextColumn(" "), SpinnerColumn(), TextColumn("{task.description}"),
+                BarColumn(complete_style="green", finished_style="green"),
+                _CountColumn(), TaskProgressColumn("{task.percentage:>3.0f}%"),
+                _RateColumn(), TimeElapsedColumn(), TextColumn("[dim]left[/dim]"),
+                TimeRemainingColumn(), console=console(), transient=True)
+            self._task = self._bar.add_task(label, total=total, unit=unit)
             self._bar.start()
 
     def update(self, done: int) -> None:
@@ -194,7 +231,11 @@ class Progress:
             self._bar.stop()
             self._bar = None
         line = self._line(label, time.perf_counter())
-        self.emit(f"{line}, {extra}" if extra else line)
+        line = f"{line}, {extra}" if extra else line
+        if self.emit is say:
+            say(line, done=True)
+        else:
+            self.emit(line)
         self._report()
 
     def _report(self) -> None:
