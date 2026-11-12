@@ -52,19 +52,28 @@ class SessionContext:
             its tables are the context's tables.
         physical_executor: Optional callable(PhysicalRequest) that
             returns the PhysicalResponse, for tests without a GPU.
+        workers: Optional ``_quail_native.Workers``, connected. Rust
+            then runs each model region on them itself and calls no
+            Python engine; the context takes the workers.
 
     Raises:
         ImportError: The ``_quail_native`` module is not built.
     """
 
     def __init__(self, session, physical_executor: Callable | None = None, *,
-                 order: str | None = None, run_query: Callable | None = None):
+                 order: str | None = None, run_query: Callable | None = None,
+                 workers=None):
         from _quail_native import NativeSession
 
         self.session = session
-        engine = Engine(session, physical_executor, order=order, run_query=run_query)
-        self._engine = engine
-        self._native = NativeSession(engine, session.planner)
+        if workers is None:
+            engine = Engine(session, physical_executor, order=order,
+                            run_query=run_query)
+            self._native = NativeSession(engine, session.planner)
+        else:
+            config = session.config
+            self._native = NativeSession.on_workers(
+                workers, config.model, config.device, config.gpus, config.backend)
         for name, provider in session.catalog.providers.items():
             self._register_table(name, provider)
 

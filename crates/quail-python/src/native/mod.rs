@@ -43,6 +43,34 @@ impl NativeSession {
         })
     }
 
+    /// Create a session that runs model regions on `workers` itself,
+    /// as `crate::Executor::on_workers` describes: the session takes
+    /// the workers, and no Python engine runs a region.
+    #[staticmethod]
+    fn on_workers(
+        py: Python<'_>,
+        workers: &mut workers::Workers,
+        model: String,
+        device: String,
+        gpus: usize,
+        backend: String,
+    ) -> PyResult<Self> {
+        let workers = workers.take()?;
+        let config = crate::EngineConfig {
+            model,
+            device,
+            gpus,
+            backend,
+        };
+        let session = py
+            .detach(|| {
+                let executor = crate::Executor::on_workers(workers, &config)?;
+                crate::Session::with_executor(std::sync::Arc::new(executor))
+            })
+            .map_err(python_error)?;
+        Ok(Self { session })
+    }
+
     /// Register a table by its schema, given as the IPC stream bytes of
     /// an empty table, and a function `scan(columns)` that returns
     /// those columns' rows as a pyarrow Table. `id_column` names the

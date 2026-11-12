@@ -18,6 +18,29 @@ import pyarrow as pa
 from quail.api.execute import execute_query
 
 
+def engine_description(engine) -> dict:
+    """Return what Rust plans an engine's regions with.
+
+    Returns:
+        The model's chat turn and prompt layout, the logical rules, the
+        tokenizer file, and the planning settings.
+
+    Raises:
+        RefusalError: The backend refuses the engine's configuration.
+    """
+    from quail.api.query import backend_refusal
+    from quail.physical.plan import RefusalError
+
+    refusal = backend_refusal(engine.session)
+    if refusal is not None:
+        raise RefusalError(refusal)
+    return {
+        "turn": list(engine.turn), "layout": engine.layout,
+        "rules": engine.rules, "tokenizer_file": engine.tokenizer_file,
+        "settings": json.loads(engine.settings),
+    }
+
+
 class Engine:
     """Plans and runs model regions on a Quail session's model.
 

@@ -6,10 +6,9 @@ describes a configuration to Quail, which plans in Rust and reads the
 models' definitions from here.
 """
 
-import json
 import sys
 
-from quail.api.engine import Engine
+from quail.api.engine import Engine, engine_description
 from quail.backends.quail.worker import main
 from quail.builtins import built_in_registry
 
@@ -34,18 +33,15 @@ def describe(config: dict) -> dict:
 
     Returns:
         The model's chat turn and prompt layout, the logical rules, the
-        tokenizer file, and the planning settings; the settings are
-        None when the backend refuses the configuration.
+        tokenizer file, and the planning settings.
+
+    Raises:
+        RefusalError: The backend refuses the configuration.
     """
     engine = Engine.open(config["model"], config["device"], config["gpus"],
                          config["backend"])
     try:
-        settings = engine.settings
-        return {
-            "turn": list(engine.turn), "layout": engine.layout,
-            "rules": engine.rules, "tokenizer_file": engine.tokenizer_file,
-            "settings": None if settings is None else json.loads(settings),
-        }
+        return engine_description(engine)
     finally:
         engine.close()
 

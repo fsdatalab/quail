@@ -42,11 +42,18 @@ fn tables_to_python<'py>(py: Python<'py>, tables: Vec<Table>) -> PyResult<Vec<Bo
 /// A session's GPU workers: one process per GPU, as
 /// `crate::workers::Workers`.
 #[pyclass(name = "Workers", module = "_quail_native")]
-struct Workers {
+pub(super) struct Workers {
     workers: Option<crate::workers::Workers>,
 }
 
 impl Workers {
+    /// Hand the workers to a session, which owns them from then on.
+    pub(super) fn take(&mut self) -> PyResult<crate::workers::Workers> {
+        self.workers
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("the GPU workers are closed"))
+    }
+
     fn open(&mut self) -> PyResult<&mut crate::workers::Workers> {
         self.workers
             .as_mut()

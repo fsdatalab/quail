@@ -684,16 +684,35 @@ class OracleFeatures(OracleDocuments):
         return self.oracle._sae_features(self.node, ids)
 
 
-def _serve(model, path):
-    """Serve each region as a GPU worker does, answering from the oracle."""
+def _serve(model, path, description=None):
+    """Serve each region as a GPU worker does, answering from the oracle.
+
+    Args:
+        model: The oracle this worker answers from.
+        path: The socket Quail listens at for this worker.
+        description: What the worker answers a describe with, as
+            ``engine_description`` returns it.
+    """
     from helpers.fakes import graph_state
     from quail.backends.quail.graph import payload_tables, serve_region
 
     end = _quail_native.WorkerEnd(path)
     while (message := end.next()) is not None:
         try:
+            if message[0] == "describe":
+                end.described(json.dumps(description))
+                continue
+            if message[0] == "boot":
+                end.booted(json.dumps({"boot_s": 0.5, "kind": "warm"}))
+                continue
             region = json.loads(message[1])
             payload = {**region["query"], **payload_tables(message[2])}
+            if not model.documents:
+                # no request named the oracle's documents: the region's are
+                model.documents = payload["documents"]
+                model.texts = {alias: payload["texts"].get(alias)
+                               for alias in payload["documents"]}
+                model.source_rows = {}
             state = graph_state(model, payload["documents"])
             state["texts"] = payload["texts"]
             state["columns"] = payload["columns"]

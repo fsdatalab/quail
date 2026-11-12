@@ -375,14 +375,17 @@ def _boot_worker(state, setup) -> dict:
     if state.registry is None:
         state.registry = state.registry_of(setup["extensions"])
     registry = state.registry
+    spec = registry.model(setup["model"])
     gpu, state.gpu = state.gpu, None
     state.gpu, boot = _boot_gpu(
         gpu, registry.backend(setup["backend"]), GpuContext(
-            gpu_index=state.gpu_index, gpus=setup["gpus"],
-            model=registry.model(setup["model"]),
+            gpu_index=state.gpu_index, gpus=setup["gpus"], model=spec,
             device=registry.device(setup["device"]), query_settings={}),
         setup["chunk_tokens"], setup["true_ids"], setup["false_ids"],
-        setup.get("arena_pages"), model_path=setup["model_path"])
+        setup.get("arena_pages"),
+        # a setup without the model's files has the worker find them
+        model_path=(setup["model_path"]
+                    or resolve_model_path(spec.hf_name, spec.revision)))
     return boot
 
 

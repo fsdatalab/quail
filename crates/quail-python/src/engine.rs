@@ -1,5 +1,9 @@
-//! The model region runner that calls Quail's Python executor, and the
-//! tables whose rows a Python provider returns.
+//! The model region runner, and the tables whose rows a Python
+//! provider returns.
+//!
+//! An [`Executor`] plans each model region and runs it on Quail's GPU
+//! workers ([`crate::workers`]). An executor made over a Python engine
+//! calls the engine instead, for a backend that is not Quail's own.
 
 use std::sync::{Arc, Mutex};
 use std::thread::ThreadId;
@@ -30,25 +34,43 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::planning::{PlannedRegion, Planner, ScanInputs, Settings, TableRows, outcome_json};
 use crate::pyarrow::{from_pyarrow, stream_from_pyarrow, to_pyarrow};
-use crate::{EngineConfig, python_failure, start_python};
+use crate::workers::Workers;
+use crate::{EngineConfig, python_failure};
 
-/// Runs each model region by calling the engine's
-/// `execute(planned, tables, sink, hint)` or `run_region(payload,
-/// tables, fetch)`; `planned` is the planned region's JSON and its scans,
-/// as [`scans_to_pyarrow`] hands them over. `execute` hands the sink each batch of finished rows as the
-/// region runs and returns None, or returns the rows; `run_region`
-/// returns them, as a pyarrow Table or RecordBatchReader.
+/// What runs a region's model calls.
+enum Runs {
+    /// A Python engine: its `execute(planned, tables, sink, hint)` runs
+    /// a region Rust planned, and `run_region(payload, tables, fetch)`
+    /// one it did not. `planned` is the planned region's JSON and its
+    /// scans, as [`scans_to_pyarrow`] hands them over. `execute` hands
+    /// the sink each batch of finished rows as the region runs and
+    /// returns None, or returns the rows; `run_region` returns them, as
+    /// a pyarrow Table or RecordBatchReader.
+    Engine(Py<PyAny>),
+    /// Quail's GPU workers, which this executor owns.
+    Workers(Mutex<Workers>),
+}
+
+impl std::fmt::Debug for Runs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Runs::Engine(_) => "Engine",
+            Runs::Workers(_) => "Workers",
+        })
+    }
+}
+
+/// Plans each model region and runs it: on Quail's GPU workers, or by
+/// calling a Python engine it was made over.
 ///
 /// It is the [`RegionRunner`] a [`crate::Session`] runs model regions
 /// on. To add Quail to a DataFusion session of your own, register
 /// `QuailExtension::new(Arc::new(Executor::open(&config)?))`.
 #[derive(Debug)]
 pub struct Executor {
-    pub(crate) engine: Py<PyAny>,
+    runs: Runs,
     /// The optimizer rules each model region runs, by name, in order.
     pub(crate) rules: Vec<String>,
-    /// Whether this executor opened its engine, and closes it.
-    owns_engine: bool,
     /// The model's chat-turn text and prompt layout, which each region's
     /// prompts are bound in.
     pub(crate) prompting: (Turn, String),
@@ -71,36 +93,52 @@ fn optional_string_attribute(engine: &Bound<'_, PyAny>, name: &str) -> PyResult<
 }
 
 impl Executor {
-    /// Open Quail's executor for `config`, starting Python if this process
-    /// has not, and loading it from the `quail` package.
+    /// Open Quail's executor for `config`: start a GPU worker per GPU
+    /// and ask one what Quail plans the configuration's regions with.
     ///
-    /// The interpreter finds `quail` on its own path, or in the virtual
-    /// environment `VIRTUAL_ENV` names.
+    /// A worker is the command `QUAIL_WORKER` names, or `python -m
+    /// quail.worker` with the Python of the virtual environment
+    /// `VIRTUAL_ENV` names, or `python3`.
     ///
     /// # Errors
     ///
-    /// Python cannot import `quail`, or Quail refuses the configuration.
+    /// A worker does not start, or Quail refuses the configuration.
     pub fn open(config: &EngineConfig) -> Result<Self> {
-        start_python()?;
-        let engine = Python::attach(|py| {
-            let engine = py
-                .import("quail.api.engine")?
-                .getattr("Engine")?
-                .call_method1(
-                    "open",
-                    (
-                        config.model.as_str(),
-                        config.device.as_str(),
-                        config.gpus,
-                        config.backend.as_str(),
-                    ),
-                )?;
-            Ok::<_, PyErr>(engine.unbind())
+        let mut workers = Workers::bind(config.gpus)?;
+        workers.spawn(&worker_command())?;
+        workers.connect()?;
+        Self::on_workers(workers, config)
+    }
+
+    /// An executor for `config` that runs model regions on `workers`,
+    /// which are connected.
+    ///
+    /// # Errors
+    ///
+    /// A worker refuses the configuration, or what it describes does
+    /// not read.
+    pub fn on_workers(workers: Workers, config: &EngineConfig) -> Result<Self> {
+        let described = workers.describe(&serde_json::json!({
+            "model": config.model, "device": config.device,
+            "gpus": config.gpus, "backend": config.backend,
+        }))?;
+        let read = |error: serde_json::Error| DataFusionError::External(Box::new(error));
+        let field = |name: &str| described[name].clone();
+        let turn: (String, String) = serde_json::from_value(field("turn")).map_err(read)?;
+        let layout: String = serde_json::from_value(field("layout")).map_err(read)?;
+        let rules: Vec<String> = serde_json::from_value(field("rules")).map_err(read)?;
+        let tokenizer: String = serde_json::from_value(field("tokenizer_file")).map_err(read)?;
+        let settings: Settings = serde_json::from_value(field("settings")).map_err(read)?;
+        let planner =
+            Planner::new(std::path::Path::new(&tokenizer)).map_err(quail_datafusion::external)?;
+        Ok(Self {
+            runs: Runs::Workers(Mutex::new(workers)),
+            rules,
+            prompting: (turn, layout),
+            caller: Mutex::new(None),
+            execution: Mutex::new(()),
+            planning: Some((Arc::new(planner), settings)),
         })
-        .map_err(python_failure)?;
-        let mut executor = Self::with_engine(engine)?;
-        executor.owns_engine = true;
-        Ok(executor)
     }
 
     /// An executor that runs model regions on `engine`, a Python object
@@ -149,9 +187,8 @@ impl Executor {
         };
         let rules = rules.unwrap_or_else(quail_datafusion::default_rule_names);
         Ok(Self {
-            engine,
+            runs: Runs::Engine(engine),
             rules,
-            owns_engine: false,
             prompting,
             caller: Mutex::new(None),
             execution: Mutex::new(()),
@@ -202,15 +239,20 @@ impl Executor {
     }
 }
 
-impl Drop for Executor {
-    fn drop(&mut self) {
-        if self.owns_engine {
-            Python::attach(|py| {
-                // a close that fails leaves nothing this executor can release
-                let _ = self.engine.call_method0(py, "close");
-            });
-        }
+/// The command that starts a GPU worker, before its socket and GPU
+/// index.
+fn worker_command() -> Vec<String> {
+    if let Ok(command) = std::env::var("QUAIL_WORKER") {
+        return command.split_whitespace().map(str::to_string).collect();
     }
+    let python = match std::env::var_os("VIRTUAL_ENV") {
+        Some(root) => std::path::PathBuf::from(root)
+            .join("bin/python")
+            .to_string_lossy()
+            .into_owned(),
+        None => "python3".to_string(),
+    };
+    vec![python, "-m".into(), "quail.worker".into()]
 }
 
 /// A region a DataFusion worker hands to the calling thread to run.
@@ -296,6 +338,47 @@ impl InputHint {
         }
         let (name, field) = answer.rsplit_once('.')?;
         Some((named(name)?, Some(field.to_string())))
+    }
+}
+
+impl InputHint {
+    /// Answer a worker's question about the hint, as a worker's
+    /// `ServedHint` asks it: the hint's generation, a table's kept
+    /// rows, whether a test reads an answer, or whether the tests
+    /// reject every answer that starts with a prefix.
+    fn answer(&self, question: &serde_json::Value) -> Result<crate::workers::Answer> {
+        use crate::workers::Answer;
+        let text = |name: &str| question[name].as_str().unwrap_or_default();
+        Ok(match text("hint") {
+            "generation" => Answer::Json(self.hint.generation().into()),
+            "keep" => {
+                let keep = match self.rows.get(text("table")) {
+                    Some(rows) => self.hint.keep(&self.columns, text("table"), rows)?,
+                    None => Vec::new(),
+                };
+                let keep: ArrayRef = Arc::new(BooleanArray::from(keep));
+                let batch = RecordBatch::try_from_iter([("keep", keep)])?;
+                Answer::Table((batch.schema(), vec![batch]))
+            }
+            "reads_answer" => Answer::Json(self.reads_answer(text("answer")).into()),
+            _ => {
+                let completion = &question["completion"];
+                let answers = quail_datafusion::derive::partial::Completions {
+                    prefix: text("prefix").to_string(),
+                    complete: completion["complete"].as_bool().unwrap_or(false),
+                    may_be_null: completion["may_be_null"].as_bool().unwrap_or(false),
+                    tails: serde_json::from_value(completion["tails"].clone()).unwrap_or(None),
+                    max_chars: (completion["max_chars"].as_u64()).map(|count| count as usize),
+                };
+                let rejects = match self.answer_column(text("answer")) {
+                    Some((index, field)) => {
+                        (self.hint).rejects_answer(index, field.as_deref(), &answers)?
+                    }
+                    None => false,
+                };
+                Answer::Json(rejects.into())
+            }
+        })
     }
 }
 
@@ -527,6 +610,18 @@ impl Executor {
             )?),
             Some(_) => None,
         };
+        let engine = match &self.runs {
+            Runs::Engine(engine) => engine,
+            Runs::Workers(workers) => {
+                let (found, scans) = planned.ok_or_else(|| {
+                    DataFusionError::NotImplemented(
+                        "a region that asks no model does not run on workers".into(),
+                    )
+                })?;
+                let conformed = move |batch| conform(batch, &names, schema.inner());
+                return run_on_workers(workers, &found, &scans, held, conformed, rows);
+            }
+        };
         let reader = Python::attach(|py| {
             // each input as a pyarrow Table, by the table name the region reads
             let mut tables = Vec::new();
@@ -540,14 +635,11 @@ impl Executor {
                     let found = (found, scans_to_pyarrow(py, &scans)?);
                     let sink = Bound::new(py, sink)?;
                     let hint = held.map(|hint| Bound::new(py, hint)).transpose()?;
-                    self.engine
-                        .call_method1(py, "execute", (found, tables, sink, hint))?
+                    engine.call_method1(py, "execute", (found, tables, sink, hint))?
                 }
-                None => self.engine.call_method1(
-                    py,
-                    "run_region",
-                    (payload.as_deref(), tables, fetch),
-                )?,
+                None => {
+                    engine.call_method1(py, "run_region", (payload.as_deref(), tables, fetch))?
+                }
             };
             // an engine that sent every row to the sink returns None
             let answer = answer.bind(py);
@@ -565,6 +657,83 @@ impl Executor {
         }
         Ok(())
     }
+}
+
+/// Run a region Rust planned on the executor's workers, sending its
+/// rows, as `conformed` gives them the region's schema, to `rows`.
+///
+/// `found` is the planned region as [`outcome_json`] writes it, and
+/// `scans` what its scans read. Each worker boots for the plan first;
+/// a worker that has the model loaded takes no time.
+fn run_on_workers(
+    workers: &Mutex<Workers>,
+    found: &str,
+    scans: &[ScanInputs],
+    hint: Option<InputHint>,
+    conformed: impl Fn(RecordBatch) -> Result<RecordBatch> + Send + Sync + 'static,
+    rows: &RowSender,
+) -> Result<()> {
+    let read = |error: serde_json::Error| DataFusionError::External(Box::new(error));
+    let found: serde_json::Value = serde_json::from_str(found).map_err(read)?;
+    if let Some(refusal) = found.get("refusal") {
+        return Err(DataFusionError::External(
+            format!("RefusalError: {refusal}").into(),
+        ));
+    }
+    let envelope = &found["envelope"];
+    let operators_json = found["operators"].as_str().unwrap_or_default();
+    let operators: Operators = serde_json::from_str(operators_json).map_err(read)?;
+    let scanned: Vec<crate::request::Scanned> = scans
+        .iter()
+        .map(|scan| {
+            let tokens = (
+                Arc::clone(scan.tokens.schema()),
+                scan.tokens.record_batches().to_vec(),
+            );
+            (scan.alias.clone(), tokens, scan.columns.clone())
+        })
+        .collect();
+    let planned = crate::region_run::Planned {
+        envelope,
+        operators: &operators,
+        operators_json,
+        scans: &scanned,
+    };
+    let settings = &envelope["settings"];
+    let setup = serde_json::json!({
+        "model": envelope["model"], "device": envelope["device"],
+        "backend": envelope["backend"], "gpus": envelope["gpus"],
+        "chunk_tokens": settings["chunk_tokens"], "true_ids": settings["true_ids"],
+        "false_ids": settings["false_ids"], "arena_pages": settings["arena_pages"],
+        // the worker finds the model's files and imports no extension
+        "model_path": null, "extensions": [],
+    });
+    let finished = Arc::new(Mutex::new(planned.finished_rows(Default::default())?));
+    let hinted = hint.as_ref().map(|hint| {
+        (operators.scans.iter())
+            .filter(|scan| hint.rows.contains_key(&scan.provider))
+            .map(|scan| (scan.alias.clone(), scan.provider.clone()))
+            .collect()
+    });
+    let listening = crate::region_run::Listening {
+        hinted,
+        progress: false,
+        answers: false,
+    };
+    let sender = rows.clone();
+    let on_rows = Arc::new(move |batch: RecordBatch| {
+        // the receiver is gone once DataFusion stops reading
+        let _ = sender.send(RegionRows::Batch(Ok(conformed(batch)?)));
+        Ok(())
+    });
+    let ask: crate::workers::Ask = Box::new(move |question| match &hint {
+        Some(hint) if question.get("hint").is_some() => hint.answer(question),
+        _ => Ok(crate::workers::Answer::Json(serde_json::Value::Null)),
+    });
+    let mut workers = workers.lock().expect("the workers lock");
+    workers.boot(&setup)?;
+    crate::region_run::run_region(&mut workers, &planned, &listening, &finished, on_rows, ask)?;
+    Ok(())
 }
 
 /// What each scan reads, by alias, as Python's `adopt_plan` takes it:
