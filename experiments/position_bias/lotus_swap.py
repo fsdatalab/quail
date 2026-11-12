@@ -232,15 +232,15 @@ def swap_model(model: str, task: str = "sales", num_pairs: int = 0) -> dict:
         record = run_swap(pairs, texts, labels,
                           QuailChooser(session, template), template)
     record.update(model=model, task=task)
-    summary = record["summary"]
-    print(f"[{model} {task}] same slot: tied {summary['tied']['same_slot_rate']:.4f}, "
-          f"mixed {summary['mixed']['same_slot_rate']:.4f}, "
-          f"bias {summary['all']['bias']:+.3f}", flush=True)
     if not num_pairs:
         path = Path("/results") / record_path(task, model)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(record))
         results.commit()
+    summary = record["summary"]
+    print(f"[{model} {task}] same slot: all "
+          f"{summary['all']['same_slot_rate']:.4f}, "
+          f"bias {summary['all']['bias']:+.3f}", flush=True)
     return summary
 
 
@@ -258,8 +258,8 @@ def main(models: str = ",".join(MODELS), tasks: str = "sales",
         except Exception as error:     # report every run, then go on
             print(f"{model}: failed: {error!r}", flush=True)
             continue
-        print(f"{model}: tied {summary['tied']['same_slot_rate']:.4f} "
-              f"mixed {summary['mixed']['same_slot_rate']:.4f}", flush=True)
+        print(f"{model}: same slot {summary['all']['same_slot_rate']:.4f}",
+              flush=True)
 
 
 def jev_main(task: str):
