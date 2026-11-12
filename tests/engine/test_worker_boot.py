@@ -65,30 +65,6 @@ SETUP = {"model": "qwen3-4b-fp8", "device": "h100-sxm", "backend": "quail",
          **ENVELOPE["settings"]}
 
 
-def test_a_prepared_boot_is_used_by_one_region(monkeypatch):
-    boots = []
-
-    def boot(envelope, registry):
-        boots.append(envelope)
-        return {"workers": None, "boot": {"boot_s": 3.0, "kind": "cold"}}
-
-    monkeypatch.setattr(worker, "_boot_workers", boot)
-    monkeypatch.setattr(worker, "run_planned_region",
-                        lambda *a, **k: (None, {"_outputs": {}, "wall_s": 1.0}))
-    registry = SimpleNamespace(device=lambda name: None)
-    state = {}
-
-    worker.prepare_quail_request(SimpleNamespace(
-        registry=registry, runtime_state=state,
-        request=SimpleNamespace(plan=ENVELOPE)))
-    assert len(boots) == 1
-    _, report = worker.run_quail_region(ENVELOPE, registry, state)
-    assert report["boot_kind"] == "cold"
-    assert len(boots) == 1
-    worker.run_quail_region(ENVELOPE, registry, state)
-    assert len(boots) == 2
-
-
 def test_a_worker_reuses_its_model_and_an_arena_resize_releases_pieces_that_write_kv(
         booted, monkeypatch):
     state = worker.WorkerState(0, registry=built_in_registry())

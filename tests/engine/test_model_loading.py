@@ -14,7 +14,6 @@ from quail.backends.quail.executor.model_loading import (
     retain_answer_head,
 )
 from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers, AsyncScores
-from quail.builtins import built_in_registry
 
 
 @pytest.fixture
@@ -86,7 +85,7 @@ def clear_model_paths():
     model_loading.resolve_model_path.cache_clear()
 
 
-def test_model_files_are_resolved_once_and_cached_before_children_start(
+def test_model_files_are_resolved_once_and_cached(
         monkeypatch, tmp_path, clear_model_paths):
     calls = []
 
@@ -106,45 +105,9 @@ def test_model_files_are_resolved_once_and_cached_before_children_start(
         "Qwen/model", "revision-a", include_weights=False) == first
     assert "*.safetensors" not in calls[2]["allow_patterns"]
 
-    # the files are cached before the GPU children start
-    from quail.backends.quail import worker
-
-    events = []
-    registry = built_in_registry()
-
-    def resolve(name, revision):
-        events.append("resolve")
-        assert revision == registry.model("qwen3-4b-fp8").revision
-        return str(tmp_path)
-
-    def boot(setup):
-        events.append("boot")
-        assert json.loads(setup)["model_path"] == str(tmp_path)
-        return [json.dumps({"boot_s": 3.0, "kind": "cold"})] * 8
-
-    def ensure(count, configuration):
-        events.append("children")
-        assert count == 8
-        assert configuration == ("qwen3-4b-fp8", "h100-sxm", "quail", 8)
-        return SimpleNamespace(boot=boot)
-
-    clock = iter([10.0, 12.0, 15.0])
-    monkeypatch.setattr(worker.time, "perf_counter", lambda: next(clock))
-    monkeypatch.setattr(worker, "resolve_model_path", resolve)
-    monkeypatch.setattr(worker, "_ensure_workers", ensure)
-    booted = worker._boot_workers({
-        "gpus": 8, "model": "qwen3-4b-fp8", "device": "h100-sxm",
-        "backend": "quail",
-        "settings": {"chunk_tokens": 100, "true_ids": [1], "false_ids": [2]},
-    }, registry)
-    assert events == ["resolve", "children", "boot"]
-    assert booted["boot"]["boot_s"] == 5.0
-    assert booted["boot"]["model_files_s"] == 2.0
-
 
 def test_a_base_model_without_a_turn_close_ends_answers_at_its_config_eos(
         tmp_path):
-    import json
 
     from helpers.sessions import TOKENIZER
 

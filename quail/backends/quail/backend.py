@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-from typing import Any
 
 from quail.backends.base import GpuContext
 from quail.backends.quail.executor.models import supported_archs
@@ -11,10 +10,8 @@ from quail.backends.quail.executor.runtime import QuailModelExecution
 from quail.backends.quail.graph import region_report
 from quail.backends.quail.worker import (
     boot_record,
-    prepare_quail_request,
     quail_workers,
     release_quail_request,
-    run_quail_region,
 )
 from quail.specs import DEVICES, SupportResult
 
@@ -55,19 +52,6 @@ class QuailBackend:
 
     def start(self, context: GpuContext) -> QuailModelExecution:
         return QuailModelExecution(context)
-
-    def prepare_request(self, context) -> None:
-        """Boot the GPU for a request before its documents are ready."""
-        prepare_quail_request(context)
-
-    def run_region(self, envelope, registry, runtime_state, **region) -> Any:
-        """Run a planned region on the GPUs' workers.
-
-        Returns:
-            The region's rows, and the run's report with its outputs
-            under "_outputs".
-        """
-        return run_quail_region(envelope, registry, runtime_state, **region)
 
     def workers(self, config):
         """Return the GPUs' workers for a session's configuration."""

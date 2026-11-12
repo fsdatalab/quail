@@ -339,24 +339,14 @@ def _execute_region(query, physical_executor, plan, on_backend_ready,
         _prepare_backend(plan, query.session.registry)
     if has_compute and on_backend_ready is not None:
         on_backend_ready()
-    # Quail's own backend runs a region on GPU workers, which Rust
-    # drives; a test's workers stand in for the GPUs'
-    workers_of = getattr(physical_executor, "start_workers", None)
-    on_workers = has_compute and plan.backend == "quail" and (
-        physical_executor is None or workers_of is not None)
     physical_prepare_started = time.perf_counter()
-    request = (query._prepare_physical()
-               if has_compute and not on_workers else None)
+    request = query._prepare_physical() if has_compute else None
     physical_prepare_s = time.perf_counter() - physical_prepare_started
     if on_execution_ready is not None:
         on_execution_ready()
     started = time.perf_counter()
-    relation = finished = None
-    if on_workers:
-        response, relation = _run_on_workers(query, plan, physical_executor,
-                                             on_rows, hint)
-    elif has_compute:
-        finished = query.finished_rows(on_rows)
+    finished = query.finished_rows(on_rows)
+    if has_compute:
         tables = {scan["alias"]: scan["provider"] for scan in query.facts()["scans"]}
         first = {}
         if hint is not None:
@@ -368,14 +358,13 @@ def _execute_region(query, physical_executor, plan, on_backend_ready,
             response = (physical_executor(request) if physical_executor is not None
                         else _execute_physical(request, query.session.registry))
     else:
-        finished = query.finished_rows(on_rows)
         response = PhysicalResponse(
             {}, {"wall_s": 0.0, "fresh_tokens": 0, "cached_tokens": 0})
     if not isinstance(response, PhysicalResponse):
         raise TypeError("a physical executor must return PhysicalResponse")
     coordinator_wall_s = time.perf_counter() - started
     finish_started = time.perf_counter()
-    result = query.finish(response, coordinator_wall_s, finished, relation)
+    result = query.finish(response, coordinator_wall_s, finished)
     finish_s = time.perf_counter() - finish_started
     model_wall_s = result.report["wall_s"]
     result.report.update(
@@ -389,52 +378,6 @@ def _execute_region(query, physical_executor, plan, on_backend_ready,
     result.report["worker_total_s"] = round(
         time.perf_counter() - total_started, 4)
     return result
-
-
-def _run_on_workers(query, plan, source, on_rows, hint):
-    """Run a region of Quail's backend on GPU workers.
-
-    Args:
-        query: The region's query.
-        plan: Its physical plan.
-        source: None for the GPUs' workers, or a test's stand-in:
-            ``start_workers(gpus)`` returns workers and a boot record
-            as the backend's boot does, ``report`` holds report fields to
-            set, and ``close()`` stops the workers.
-        on_rows: Optional callable(pyarrow Table) handed the region's
-            rows as they finish.
-        hint: The region's ``InputHint``, or None.
-
-    Returns:
-        The run's PhysicalResponse and the region's rows.
-    """
-    registry = query.session.registry
-    envelope = plan.to_envelope()
-    backend = registry.backend(plan.backend)
-    scans = query.facts()["scans"]
-    held = set() if hint is None else set(hint.tables())
-    region = {
-        "operators": query.operators,
-        "scans": query.scan_tables(),
-        "source_rows": {alias: found.to_pylist()
-                        for alias, found in query._alias_source_rows().items()},
-        "on_rows": on_rows, "hint": hint,
-        "hinted": None if hint is None else {
-            scan["alias"]: scan["provider"] for scan in scans
-            if scan["provider"] in held},
-    }
-    if source is None:
-        rows, report = backend.run_region(
-            envelope, registry, _BACKEND_STATE.bind(envelope, backend), **region)
-    else:
-        try:
-            rows, report = backend.run_region(
-                envelope, registry, {"booted": source.start_workers(plan.gpus)},
-                **region)
-        finally:
-            source.close()
-        report.update(source.report)
-    return PhysicalResponse(report.pop("_outputs"), report), rows
 
 
 def _prepare_backend(plan, registry) -> None:

@@ -30,11 +30,7 @@ from quail.backends.quail.executor.readout import (
     DecisionHead,
 )
 from quail.backends.quail.executor.warmup import warm_kernels
-from quail.backends.quail.graph import (
-    payload_tables,
-    run_planned_region,
-    serve_region,
-)
+from quail.backends.quail.graph import payload_tables, serve_region
 from quail.backends.resources import freeze_loaded_objects, release_models
 from quail.common import budgets
 from quail.physical.plan import graph_from_envelope
@@ -440,45 +436,6 @@ def _ensure_workers(gpus, configuration):
     return _WORKERS[1]
 
 
-def _boot_workers(envelope, registry) -> dict:
-    """Start or reuse each GPU's worker and prepare it for the plan.
-
-    Returns:
-        The workers under "workers", and the boot record of the run:
-        the slowest worker's, with the seconds the model's files and the
-        whole boot took.
-    """
-    gpus = envelope["gpus"]
-    spec = registry.model(envelope["model"])
-    started = time.perf_counter()
-    model_path = resolve_model_path(spec.hf_name, spec.revision)
-    model_files_s = time.perf_counter() - started
-    workers = _ensure_workers(gpus, (
-        envelope["model"], envelope["device"], envelope["backend"], gpus))
-    settings = envelope["settings"]
-    setup = {
-        **{key: envelope[key] for key in ("model", "device", "backend", "gpus")},
-        **{key: settings[key] for key in ("chunk_tokens", "true_ids", "false_ids")},
-        "arena_pages": settings.get("arena_pages"),
-        "model_path": model_path,
-        # a worker imports the session's extensions by module name
-        "extensions": list(registry.extension_modules),
-    }
-    boots = [json.loads(boot) for boot in workers.boot(json.dumps(setup))]
-    boot_s = round(time.perf_counter() - started, 2)
-    say(f"all {gpus} GPUs ready" if gpus > 1 else "the GPU is ready")
-    return {
-        "workers": workers,
-        "boot": {
-            **max(boots, key=lambda boot: boot["boot_s"]),
-            "kind": ("cold" if any(boot["kind"] == "cold" for boot in boots)
-                     else "warm"),
-            "model_files_s": round(model_files_s, 2),
-            "boot_s": boot_s,
-        },
-    }
-
-
 def quail_workers(model: str, device: str, backend: str, gpus: int):
     """Return the GPUs' workers for a configuration, starting them if needed."""
     return _ensure_workers(gpus, (model, device, backend, gpus))
@@ -493,41 +450,3 @@ def boot_record(boots: list) -> dict:
     slowest = max(boots, key=lambda boot: boot["boot_s"])
     return {**slowest, "kind": ("cold" if any(boot["kind"] == "cold" for boot in boots)
                                 else "warm")}
-
-
-def prepare_quail_request(context) -> None:
-    """Boot the GPUs from the plan alone; the documents can arrive later."""
-    context.runtime_state["booted"] = _boot_workers(
-        context.request.plan, context.registry)
-
-
-def run_quail_region(envelope, registry, runtime_state, **region):
-    """Run a planned region on the GPUs' worker processes.
-
-    Args:
-        envelope: The plan's envelope.
-        registry: The session's registry.
-        runtime_state: The backend's state, which may hold a boot
-            prepared for this region.
-        **region: What ``run_planned_region`` reads of the region.
-
-    Returns:
-        The region's rows, and the run's report with its outputs under
-        "_outputs".
-    """
-    # a boot prepared for this region is used once
-    booted = (runtime_state.pop("booted", None)
-              or _boot_workers(envelope, registry))
-    try:
-        rows, report = run_planned_region(
-            booted["workers"], envelope, registry.device(envelope["device"]),
-            **region)
-    except BaseException:
-        # a worker may be partway through the region: start afresh
-        _close_workers()
-        raise
-    boot = booted["boot"]
-    report["boot_s"] = boot["boot_s"]
-    report["boot_kind"] = boot["kind"]
-    report["boot"] = boot
-    return rows, report

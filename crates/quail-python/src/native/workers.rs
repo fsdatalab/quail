@@ -1,11 +1,9 @@
 //! The GPU workers ([`crate::workers`]) as Python sees them: `Workers`
 //! in the process that runs a region, `WorkerEnd` in each worker.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-
-use datafusion::arrow::array::RecordBatch;
 
 use datafusion::common::DataFusionError;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -192,109 +190,6 @@ impl Workers {
         ran.into_iter()
             .map(|(ran, tables)| Ok((ran.to_string(), tables_to_python(py, tables)?)))
             .collect()
-    }
-
-    /// Run a planned region on the workers and build its rows, as
-    /// `crate::region_run::run_region` does.
-    ///
-    /// `envelope` is the plan's envelope as JSON; `operators` the
-    /// operators it lowers, as JSON; `scans` gives, by alias, each
-    /// scan's token store and the columns of its rows, as pyarrow
-    /// Tables; `source_rows` gives, by alias, each document's row in the
-    /// registered table, for a scan that reads some of a table's rows.
-    /// `hinted` names, by alias, the tables the region's hint holds rows
-    /// of, or is None without a hint; `listening` says whether someone
-    /// takes progress counts and answers. `on_rows(table)` takes each
-    /// batch of region rows as it is built, when given; `ask(question)`
-    /// answers a worker's question, as JSON or a pyarrow Table.
-    ///
-    /// Returns the region's rows, and per worker what it ran as JSON
-    /// and its nodes' output tables.
-    #[pyo3(signature = (envelope, operators, scans, source_rows, hinted, listening, on_rows, ask))]
-    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-    fn run_planned<'py>(
-        &mut self,
-        py: Python<'py>,
-        envelope: &str,
-        operators: &str,
-        scans: HashMap<String, (Bound<'py, PyAny>, Bound<'py, PyAny>)>,
-        source_rows: BTreeMap<String, Vec<i32>>,
-        hinted: Option<BTreeMap<String, String>>,
-        listening: (bool, bool),
-        on_rows: Option<Py<PyAny>>,
-        ask: Py<PyAny>,
-    ) -> PyResult<(Bound<'py, PyAny>, Vec<(String, Vec<Bound<'py, PyAny>>)>)> {
-        let invalid = |error: DataFusionError| PyValueError::new_err(error.to_string());
-        let envelope: serde_json::Value = from_json(envelope)?;
-        let found: quail_planner::operators::Operators = from_json(operators)?;
-        let scans = scans
-            .into_iter()
-            .map(|(alias, (tokens, columns))| {
-                Ok((
-                    alias,
-                    table_from_python(&tokens)?,
-                    table_from_python(&columns)?,
-                ))
-            })
-            .collect::<PyResult<Vec<_>>>()?;
-        let planned = crate::region_run::Planned {
-            envelope: &envelope,
-            operators: &found,
-            operators_json: operators,
-            scans: &scans,
-            source_rows: &source_rows,
-        };
-        let finished = Arc::new(Mutex::new(planned.finished_rows().map_err(invalid)?));
-        let external = |error: PyErr| DataFusionError::External(Box::new(error));
-        let hand_on: Arc<dyn Fn(RecordBatch) -> datafusion::common::Result<()> + Send + Sync> =
-            Arc::new(move |rows: RecordBatch| {
-                let Some(on_rows) = &on_rows else {
-                    return Ok(());
-                };
-                Python::attach(|py| {
-                    on_rows.call1(py, (to_pyarrow(py, rows.schema(), vec![rows])?,))?;
-                    Ok::<_, PyErr>(())
-                })
-                .map_err(external)
-            });
-        let ask: crate::workers::Ask = Box::new(move |question| {
-            Python::attach(|py| {
-                let answer = ask.call1(py, (question.to_string(),))?;
-                let answer = answer.bind(py);
-                if let Ok(text) = answer.extract::<String>() {
-                    return Ok(Answer::Json(from_json(&text)?));
-                }
-                Ok::<_, PyErr>(Answer::Table(table_from_python(answer)?))
-            })
-            .map_err(external)
-        });
-        let listening = crate::region_run::Listening {
-            hinted,
-            progress: listening.0,
-            answers: listening.1,
-        };
-        let shared = self.shared()?;
-        let ran = py
-            .detach(|| {
-                let mut workers = shared.lock().expect("the workers lock");
-                crate::region_run::run_region(
-                    &mut workers,
-                    &planned,
-                    &listening,
-                    &finished,
-                    hand_on,
-                    ask,
-                )
-            })
-            .map_err(python_error)?;
-        let rows = (finished.lock().expect("the rows lock"))
-            .rows()
-            .map_err(PyValueError::new_err)?;
-        let ran = ran
-            .into_iter()
-            .map(|(ran, tables)| Ok((ran.to_string(), tables_to_python(py, tables)?)))
-            .collect::<PyResult<Vec<_>>>()?;
-        Ok((to_pyarrow(py, rows.schema(), vec![rows])?, ran))
     }
 
     /// Stop the workers: tell each to exit, then kill what is left.

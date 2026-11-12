@@ -3,10 +3,6 @@
 from __future__ import annotations
 
 import json
-import time
-from functools import partial
-
-import pyarrow as pa
 
 from quail.backends.quail.executor.memory import memory_report, merge_memory_reports
 from quail.backends.quail.retention import apply_retention
@@ -39,8 +35,6 @@ from quail.physical import (
     PhysicalGraph,
     Scan,
 )
-from quail.physical.plan import graph_from_envelope
-from quail.progress import answer_sink, progress_sink
 
 
 class RegionRuntime:
@@ -204,47 +198,6 @@ def answer_region(hint, sinks, question: str):
         if name in found and sink is not None:
             sink(*found[name])
     return "null"
-
-
-def run_planned_region(workers, envelope: dict, device, *, operators: str,
-                       scans: dict, source_rows: dict, on_rows=None, hint=None,
-                       hinted: dict | None = None) -> tuple[pa.Table, dict]:
-    """Run a planned region on the GPUs' workers and report the run.
-
-    Rust sends the region to the workers, runs its stages, and builds
-    its rows (``quail_python::region_run``).
-
-    Args:
-        workers: The GPUs' ``_quail_native.Workers``.
-        envelope: The plan's envelope.
-        device: The GPUs' device spec.
-        operators: The operators the plan lowers, as Rust's JSON.
-        scans: By alias, each scan's token store and the columns of its
-            rows, as pyarrow Tables.
-        source_rows: By alias, each document's row in the registered
-            table, for a scan that reads some of a table's rows.
-        on_rows: Optional callable(pyarrow Table) handed each batch of
-            the region's rows as it is built.
-        hint: The region's ``InputHint``, or None.
-        hinted: Each scan alias's table name, for the tables the hint
-            holds rows of; None without a hint.
-
-    Returns:
-        The region's rows, and the run's report with its outputs under
-        "_outputs".
-    """
-    # the workers' threads ask; the sinks are this thread's
-    sinks = (progress_sink(), answer_sink())
-    started = time.perf_counter()
-    rows, ran = workers.run_planned(
-        json.dumps(envelope), operators, scans, source_rows, hinted,
-        tuple(sink is not None for sink in sinks), on_rows,
-        partial(answer_region, hint, sinks))
-    wall = time.perf_counter() - started
-    graph = graph_from_envelope(envelope)
-    return rows, region_report(
-        graph, ran, wall, device, gpus=envelope["gpus"],
-        gpu_timing=envelope["settings"].get("gpu_timing", False))
 
 
 def region_report(graph: PhysicalGraph, ran: list, wall: float, device, *,
