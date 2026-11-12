@@ -282,6 +282,54 @@ impl Executor {
         *self.ready.lock().expect("the ready lock") = ready;
     }
 
+    /// What the planner's explain reads of a planned region, as
+    /// [`outcome_json`] writes the region: a
+    /// `quail_planner::explain::ExplainRequest` as JSON.
+    pub(crate) fn explain_request(
+        &self,
+        planned: &serde_json::Value,
+        verbose: bool,
+    ) -> Result<serde_json::Value> {
+        use serde_json::{Value, json};
+        let read = |error: serde_json::Error| DataFusionError::External(Box::new(error));
+        let operators: Value =
+            serde_json::from_str(planned["operators"].as_str().unwrap_or("null")).map_err(read)?;
+        let mut request = json!({
+            "logical": planned["logical"], "operators": operators, "verbose": verbose,
+        });
+        if let Some((_, settings)) = &self.planning {
+            request["model_spec"] = settings.model.clone();
+            request["usd_per_hour"] = settings.device["usd_per_hour"].clone();
+            let rules = (self.rules.iter().map(|rule| (rule, "logical"))).chain(
+                settings
+                    .physical_rules
+                    .iter()
+                    .map(|rule| (rule, "physical")),
+            );
+            request["rules"] = json!(rules.collect::<Vec<_>>());
+        }
+        if let Some(refusal) = planned.get("refusal") {
+            request["refusal"] = refusal.clone();
+            return Ok(request);
+        }
+        let envelope = &planned["envelope"];
+        let settings: Vec<(String, Value)> = envelope["settings"]
+            .as_object()
+            .map(|settings| settings.clone().into_iter().collect())
+            .unwrap_or_default();
+        let estimates: Vec<(String, Value)> = match &planned["estimates"] {
+            Value::Object(estimates) => estimates.clone().into_iter().collect(),
+            _ => Vec::new(),
+        };
+        request["physical"] = json!({
+            "backend": envelope["backend"], "model": envelope["model"],
+            "device": envelope["device"], "gpus": envelope["gpus"],
+            "settings": settings, "shown_settings": settings,
+            "graph": envelope["graph"], "estimates": estimates,
+        });
+        Ok(request)
+    }
+
     /// What each region of the last query ran on the workers, in the
     /// order the regions ran; the executor keeps none of it.
     pub fn take_regions(&self) -> Vec<RegionRan> {

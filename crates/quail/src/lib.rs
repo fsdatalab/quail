@@ -396,6 +396,38 @@ impl Session {
 }
 
 impl Session {
+    /// The plan of each model region of a query, as Quail's planner
+    /// explains it: DataFusion's plan of the region, then the physical
+    /// operators with their estimated rows and time. `verbose` adds the
+    /// run-time settings, node fields, and the rules.
+    ///
+    /// [`Session::explain`] gives DataFusion's plan of the whole query.
+    ///
+    /// # Errors
+    ///
+    /// The query does not plan, or a region does not bind.
+    pub fn explain_regions(
+        &self,
+        query: &str,
+        dialect: Option<&str>,
+        verbose: bool,
+    ) -> Result<Vec<String>> {
+        let read = |error: serde_json::Error| DataFusionError::External(Box::new(error));
+        self.plans(query, dialect)?
+            .into_iter()
+            .map(|(region, planned)| {
+                let Some((planned, _)) = planned else {
+                    // a region Rust does not plan shows its operators alone
+                    return Ok(region);
+                };
+                let planned: serde_json::Value = serde_json::from_str(&planned).map_err(read)?;
+                let request = self.runner.explain_request(&planned, verbose)?;
+                let request = serde_json::from_value(request).map_err(read)?;
+                quail_planner::explain::explain_text(&request).map_err(DataFusionError::Execution)
+            })
+            .collect()
+    }
+
     /// Plan each model region of a query without running it, region by
     /// region: (the region as [`region_json`] writes it, its planned
     /// region as JSON when Rust plans it). A region's inputs that call no

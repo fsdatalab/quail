@@ -68,6 +68,23 @@ impl NativeSession {
         Ok(Self { session })
     }
 
+    /// The plan of each model region of a query, as
+    /// `crate::Session::explain_regions` explains it.
+    #[pyo3(signature = (query, dialect=None, verbose=false))]
+    fn explain_regions(
+        &self,
+        py: Python<'_>,
+        query: &str,
+        dialect: Option<String>,
+        verbose: bool,
+    ) -> PyResult<Vec<String>> {
+        py.detach(|| {
+            self.session
+                .explain_regions(query, dialect.as_deref(), verbose)
+        })
+        .map_err(python_error)
+    }
+
     /// Run an edited plan's envelope, as JSON, in place of the
     /// planner's plan for the next model region; None runs the
     /// planner's.
