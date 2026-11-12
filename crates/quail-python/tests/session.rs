@@ -13,7 +13,6 @@ use datafusion::common::Result;
 use datafusion::datasource::MemTable;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
-use quail_python::Session;
 use quail_python::native::_quail_native;
 
 /// An engine on the test configuration whose model keeps reviews r0, r2,
@@ -73,7 +72,7 @@ fn reviews() -> Result<MemTable> {
 
 #[test]
 fn a_rust_program_creates_a_table_from_model_results() -> Result<()> {
-    let session = Session::with_engine(engine())?;
+    let session = quail_python::session_with_engine(engine())?;
     session.register_table("reviews", Arc::new(reviews()?))?;
     session.sql(
         "CREATE TABLE kept AS SELECT r.id FROM reviews r \
@@ -100,7 +99,7 @@ fn a_rust_program_creates_a_table_from_model_results() -> Result<()> {
 
 #[test]
 fn a_rust_program_runs_an_ai_filter_over_its_own_table() -> Result<()> {
-    let session = Session::with_engine(engine())?;
+    let session = quail_python::session_with_engine(engine())?;
     session.register_table("reviews", Arc::new(reviews()?))?;
     let batches =
         session.sql("SELECT r.id FROM reviews r WHERE AI.IF(PROMPT('q1: {0}', r.body))")?;

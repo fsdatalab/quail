@@ -2,7 +2,6 @@
 
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
-use quail_python::Executor;
 
 fn engine(attribute: &str, behavior: &str) -> Py<PyAny> {
     Python::initialize();
@@ -54,7 +53,8 @@ def make(attribute, behavior):
 fn optional_property_failures_preserve_the_exception_and_traceback() {
     for attribute in ["tokenizer_file", "settings"] {
         for behavior in ["runtime_error", "os_error", "cause", "context"] {
-            let error = Executor::with_engine(engine(attribute, behavior)).unwrap_err();
+            let error =
+                quail_python::executor_with_engine(engine(attribute, behavior)).unwrap_err();
             let message = error.to_string();
             assert!(
                 message.contains(&format!("sentinel: {attribute}")),
@@ -82,7 +82,8 @@ fn optional_property_failures_preserve_the_exception_and_traceback() {
 fn missing_and_none_optional_properties_retain_fallback() {
     for attribute in ["tokenizer_file", "settings"] {
         for behavior in ["missing", "none", "attribute_error"] {
-            Executor::with_engine(engine(attribute, behavior)).expect("fallback executor");
+            quail_python::executor_with_engine(engine(attribute, behavior))
+                .expect("fallback executor");
         }
     }
 }

@@ -91,7 +91,7 @@ fn queries_own_their_caller_route_until_success_or_failure() -> Result<()> {
         for fail_first in [false, true] {
             let engine = engine();
             Python::attach(|py| engine.bind(py).setattr("fail", fail_first).unwrap());
-            let executor = Arc::new(Executor::with_engine(Python::attach(|py| {
+            let executor = Arc::new(quail_python::executor_with_engine(Python::attach(|py| {
                 engine.clone_ref(py)
             }))?);
             let first = session(Arc::clone(&executor))?;

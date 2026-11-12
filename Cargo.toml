@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/quail-datafusion",
     "crates/quail-planner",
+    "crates/quail",
     "crates/quail-python",
 ]
 

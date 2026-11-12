@@ -33,13 +33,13 @@ struct NativeSession {
 #[pymethods]
 impl NativeSession {
     /// Create a session whose model regions run on `engine`, planned by
-    /// `planner` when given, as `crate::Session::with_planner` describes.
+    /// `planner` when given, as `crate::session_with_planner` describes.
     #[new]
     #[pyo3(signature = (engine, planner=None))]
     fn new(engine: Py<PyAny>, planner: Option<PyRef<'_, NativePlanner>>) -> PyResult<Self> {
         let planner = planner.map(|found| std::sync::Arc::clone(&found.planner));
         Ok(Self {
-            session: crate::Session::with_planner(engine, planner).map_err(python_error)?,
+            session: crate::session_with_planner(engine, planner).map_err(python_error)?,
         })
     }
 
@@ -86,9 +86,15 @@ impl NativeSession {
     ) -> PyResult<()> {
         let reader = StreamReader::try_new(Cursor::new(schema), None)
             .map_err(|error| python_error(error.into()))?;
-        self.session
-            .register_python_table(name, reader.schema(), scan, id_column, identity)
-            .map_err(python_error)
+        crate::register_python_table(
+            &self.session,
+            name,
+            reader.schema(),
+            scan,
+            id_column,
+            identity,
+        )
+        .map_err(python_error)
     }
 
     /// Run a query, read in `dialect` ("Snowflake" by default), and
