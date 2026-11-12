@@ -559,6 +559,8 @@ def test_an_ai_call_of_a_null_document_is_null_and_asks_no_model():
         "SELECT r.id FROM r WHERE AI.IF(PROMPT('q: {0}', r.body))": [("r0",)],
         "SELECT r.id FROM r WHERE NOT AI.IF(PROMPT('q: {0}', r.body))": [],
         f"SELECT r.id FROM r WHERE {call} IS NULL": [("r1",)],
+        # a NULL written without a type is a NULL document too
+        "SELECT AI.IF(PROMPT('q: {0}', NULL)) AS k": [(None,)],
         # v1 has no partner; its row has no document, so no answer
         f"SELECT v.id, {call} AS c FROM r RIGHT JOIN v ON {call} = v.name":
             [("v0", "a"), ("v1", None)],

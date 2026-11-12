@@ -461,7 +461,8 @@ fn with_null_documents(
                 .ok_or_else(|| CompileError::new(format!("no column {name}")))?,
             (ScanColumn::Expression(_), None) => unreachable!("an expression is built"),
         };
-        found |= values.null_count() > 0;
+        // an untyped NULL has no validity buffer: count what reads as NULL
+        found |= values.logical_null_count() > 0;
         masks.push(Arc::new(
             arrow::compute::is_null(&values).map_err(arrow_error)?,
         ));
