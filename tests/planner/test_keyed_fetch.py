@@ -139,7 +139,8 @@ def test_a_key_stops_only_once_a_document_passes_every_filter():
     # the first filter passes both reviews of a product; the second only
     # the later one, so the first must not stop the product at its first pass
     sql = (f"SELECT p.sku FROM products p WHERE p.number IN (SELECT r.product "
-           f"FROM reviews r WHERE {AI_IF} AND AI_FILTER(PROMPT('tone: {{0}}', r.body)))")
+           f"FROM reviews r WHERE {AI_IF} AND "
+           "AI_FILTER(PROMPT('tone: {0}', r.body)))")
     for rules in (LOGICAL_RULES, logical_rules_without(SEMI_JOIN_RULE)):
         session = _session(rules)
 
