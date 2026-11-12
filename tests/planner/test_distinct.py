@@ -1,8 +1,8 @@
 """DataFusion's DISTINCT rules in a model region.
 
-EliminateDistinct drops a DISTINCT that removes no row; derive
-gives the AI operator under a DISTINCT a fetch of one row per value of
-the selected columns. The tests of rows run each query with
+derive drops a DISTINCT that removes no row, and gives the AI operator
+under any other DISTINCT a fetch of one row per value of the selected
+columns. The tests of rows run each query with
 derive's fetch on and off and check that both return the same rows.
 """
 
@@ -34,6 +34,26 @@ def test_a_distinct_that_removes_no_row_is_eliminated(session):
             "WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) GROUP BY r.stars"):
         # DataFusion's plan of the region, as explain() shows it
         assert "Distinct" not in session.sql(text).logical, text
+
+
+def test_a_limit_above_a_distinct_of_unique_keys_stops_the_model(session):
+    session.register("aspects", quail.DocumentProvider.from_table(
+        pa.table({"id": ["a0", "a1"], "aspect": ["price", "speed"]}), id_col="id"))
+    for text in (
+            "SELECT DISTINCT r.id, r.body FROM reviews r "
+            "WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) LIMIT 1",
+            "SELECT DISTINCT r.id, a.id FROM reviews r JOIN aspects a "
+            "ON AI_FILTER(PROMPT('q2: {0} {1}', r.body, a.aspect)) LIMIT 1"):
+        (region,) = quail.SessionContext(session)._native.explain_regions(
+            text, None, False)
+        assert "Limit: 1" in region and "stop per key" not in region, text
+    # rows of one table read twice repeat, so that DISTINCT stays
+    text = ("SELECT DISTINCT u.id FROM (SELECT r.id FROM reviews r "
+            "WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) UNION ALL "
+            "SELECT r.id FROM reviews r) u")
+    passing = Oracle(filters=lambda alias, document, position: True)
+    found = finish(session.sql(text), passing).collect()
+    assert sorted(found.column(0).to_pylist()) == ["r0", "r1"]
 
 
 KEYED = pa.table({

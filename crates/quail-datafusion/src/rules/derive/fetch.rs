@@ -44,7 +44,7 @@ use datafusion::logical_expr::{
 
 use crate::ai::{AiNode, Fetch, Semantics};
 use crate::extension::{as_node, extension_node};
-use crate::rules::distinct::is_distinct;
+use crate::rules::distinct::{is_distinct, is_unique};
 
 /// How many rows of a plan are enough for the operator above it.
 enum Enough {
@@ -66,6 +66,10 @@ pub(super) fn distinct_fetches(plan: LogicalPlan) -> Result<Transformed<LogicalP
             _ => return Ok(Transformed::no(node)),
         };
         let keys = input.schema().columns();
+        // a DISTINCT that removes no row leaves, so a LIMIT reaches below
+        if is_unique(input, &keys.iter().cloned().collect()) {
+            return Ok(Transformed::yes(input.as_ref().clone()));
+        }
         match enough(input, Enough::Distinct(keys), Vec::new())? {
             Some((input, _)) => Ok(Transformed::yes(crate::extension::with_inputs(
                 &node,

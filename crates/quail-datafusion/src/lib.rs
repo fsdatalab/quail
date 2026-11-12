@@ -61,7 +61,6 @@ pub use region::identified::IdentifiedTable;
 pub use region::region_hint::{RegionColumn, RegionColumns, RegionHint};
 pub use region::shared::{ROW_COLUMN, SharedInput, SharedInputExec};
 pub use rules::derive::{Derive, DeriveOption};
-pub use rules::distinct::EliminateDistinct;
 pub use rules::lower::{LowerAiCalls, lower_ai_calls};
 pub use rules::placement::PlaceAiNodes;
 pub use rules::repeated::MergeRepeatedAiCalls;

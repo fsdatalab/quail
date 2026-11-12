@@ -2,7 +2,7 @@
 //!
 //! DataFusion's optimizer runs its own rules over the whole plan, each
 //! `AiNode` included, with Quail's rules among them. [`default_rule_names`]
-//! gives the default order: DataFusion's default rules, with Quail's four
+//! gives the default order: DataFusion's default rules, with Quail's three
 //! before `replace_distinct_aggregate`, which turns a `DISTINCT` into a
 //! GROUP BY, and `lower_ai_calls` after `decorrelate_lateral_join`.
 //! [`crate::claim_model_regions`] claims the model regions of the plan
@@ -37,12 +37,7 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::optimizer::{ApplyOrder, Optimizer, OptimizerConfig, OptimizerRule};
 
 /// Quail's own rules, in the order they run.
-pub const QUAIL_RULES: [&str; 4] = [
-    "eliminate_distinct",
-    "derive",
-    "place_ai_nodes",
-    "merge_repeated_ai_calls",
-];
+pub const QUAIL_RULES: [&str; 3] = ["derive", "place_ai_nodes", "merge_repeated_ai_calls"];
 
 /// The rule Quail's rules run before.
 const QUAIL_RULES_BEFORE: &str = "replace_distinct_aggregate";
@@ -54,12 +49,11 @@ const LOWERING_RULE: &str = "lower_ai_calls";
 const LOWERING_RULE_AFTER: &str = "decorrelate_lateral_join";
 
 #[cfg(test)]
-const EXPECTED_DEFAULT_RULES: [&str; 30] = [
+const EXPECTED_DEFAULT_RULES: [&str; 29] = [
     "rewrite_set_comparison",
     "optimize_unions",
     "unions_to_filter",
     "simplify_expressions",
-    "eliminate_distinct",
     "derive",
     "place_ai_nodes",
     "merge_repeated_ai_calls",
@@ -135,7 +129,6 @@ fn quail_rule(name: &str) -> Option<Arc<dyn OptimizerRule + Send + Sync>> {
 
 fn unchecked_rule(name: &str) -> Option<Arc<dyn OptimizerRule + Send + Sync>> {
     Some(match name {
-        "eliminate_distinct" => Arc::new(crate::rules::distinct::EliminateDistinct),
         "place_ai_nodes" => Arc::new(crate::rules::placement::PlaceAiNodes),
         name if name.starts_with("derive") => Arc::new(crate::rules::derive::Derive::named(name)?),
         "merge_repeated_ai_calls" => Arc::new(crate::rules::repeated::MergeRepeatedAiCalls),

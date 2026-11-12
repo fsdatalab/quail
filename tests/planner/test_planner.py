@@ -176,11 +176,11 @@ def test_explain_row_estimates_limits_and_verbose_fields(catalog):
     assert _cell(physical, "Limit: 10") == ["10"]
     assert "KV: not stored" in physical
 
-    rules = (LogicalRule("eliminate_distinct"),
+    rules = (LogicalRule("derive"),
              PhysicalRule("should_push_down_limit"), PhysicalRule("should_retain_kv"))
     assert "rules" not in explain(operators, plan, rules=rules)
     text = explain(operators, plan, verbose=True, rules=rules)
-    assert "  logical: eliminate_distinct" in text
+    assert "  logical: derive" in text
     assert "  physical: should_push_down_limit, should_retain_kv" in text
     assert ("refine each graph in order: should_push_down_limit, "
             "should_retain_kv") in text
