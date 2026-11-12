@@ -79,10 +79,9 @@ def workers():
     assert not thread.is_alive()
 
 
-def _run(workers, stages=STAGES, groupings=None):
+def _run(workers, stages=STAGES):
     return workers.run_region("{}", [], graph().to_json(), stages,
-                              groupings or {}, lambda table: None,
-                              lambda question: "null")
+                              lambda table: None, lambda question: "null")
 
 
 def test_a_region_that_does_not_decode_reaches_no_worker(workers):
@@ -90,8 +89,6 @@ def test_a_region_that_does_not_decode_reaches_no_worker(workers):
     for stages in ["null", '"not stages"', "{}", '[{"key": "r"}]']:
         with pytest.raises(ValueError):
             _run(found, stages)
-    with pytest.raises(TypeError):
-        _run(found, groupings={"r": [["not an id"]]})
     assert seen == []
 
 
@@ -118,7 +115,7 @@ def test_a_worker_process_reads_a_regions_table_over_the_files_mapped_pages(
         assert found.alive()
         table = pa.table({"id": pa.array(range(1000), pa.int32())})
         ran = found.run_region(
-            "{}", [("documents:r", table)], graph().to_json(), "[]", {},
+            "{}", [("documents:r", table)], graph().to_json(), "[]",
             lambda table: None, lambda question: "null")
     finally:
         found.close()

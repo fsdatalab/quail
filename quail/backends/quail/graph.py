@@ -8,9 +8,8 @@ import time
 import pyarrow as pa
 
 from quail.backends.quail.executor.memory import memory_report, merge_memory_reports
-from quail.backends.quail.executor.operators.filter import stop_keys
 from quail.backends.quail.retention import apply_retention
-from quail.common.pairs import FIRST_DOCUMENT, columns_key
+from quail.common.pairs import columns_key
 from quail.common.tokens import documents_from_table, token_table
 from quail.execution.finished import finished_rows, hinted_tables, region_hint
 from quail.execution.metrics import NodeResult, scalar_node_metrics
@@ -249,8 +248,7 @@ def execute_staged_graph(payload, graph: PhysicalGraph, gpus: int, workers,
     started = time.perf_counter()
     ran = workers.run_region(
         region, region_tables(payload), compute.to_json(),
-        json.dumps(payload["stages"]), stage_groupings(graph, payload),
-        report, ask)
+        json.dumps(payload["stages"]), report, ask)
     wall = time.perf_counter() - started
     outputs = [ran_from_message(text, tables) for text, tables in ran]
     result = merged_run(compute, [output["results"] for output in outputs])
@@ -269,25 +267,6 @@ def _summed(values: list):
         return {key: sum(value.get(key, 0) for value in values)
                 for key in set().union(*values)}
     return sum(values)
-
-
-def stage_groupings(graph: PhysicalGraph, payload) -> dict:
-    """Return, by alias, lists of each document's group for the stages' hash.
-
-    One list holds each document's first copy of its text, one each stop
-    key's group numbers; Rust's ``run_stages`` keys a document by the
-    smallest id it is grouped with.
-    """
-    columns = payload.get("columns", {})
-    scans = {node.alias: node.num_documents for node in graph.nodes
-             if isinstance(node, Scan)}
-    groupings = {alias: [columns[alias].column(FIRST_DOCUMENT).to_pylist()]
-                 for alias in payload.get("deduplicate", {})}
-    for node in graph.nodes:
-        if isinstance(node, AiFilter) and node.stop_key:
-            groupings.setdefault(node.alias, []).append(
-                list(stop_keys(payload, node).of(range(scans[node.alias]))))
-    return groupings
 
 
 def graph_report(graph, result, wall, device, *, gpus=1, gpu_timing=False):

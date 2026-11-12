@@ -111,9 +111,7 @@ impl Workers {
     /// `region` describes the region to each worker, as JSON, and
     /// `tables` holds its documents and columns as pyarrow Tables, by
     /// name. `graph` is the region's compute graph as JSON; `stages`
-    /// is the plan's `stages` setting as JSON; `groupings` gives, by
-    /// alias, lists of each document's group, for a table hashed by a
-    /// key other than its ids. `report(table)` takes each finished
+    /// is the plan's `stages` setting as JSON. `report(table)` takes each finished
     /// table as a pyarrow Table over the pages its worker shared;
     /// `ask(question)` takes a worker's question as JSON and returns
     /// its answer, as JSON or a pyarrow Table.
@@ -121,7 +119,7 @@ impl Workers {
     /// Returns, per worker, what it ran as JSON and its nodes' output
     /// tables. No worker hears of a region whose graph or stages do
     /// not decode.
-    #[pyo3(signature = (region, tables, graph, stages, groupings, report, ask))]
+    #[pyo3(signature = (region, tables, graph, stages, report, ask))]
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn run_region<'py>(
         &mut self,
@@ -130,7 +128,6 @@ impl Workers {
         tables: Vec<(String, Bound<'py, PyAny>)>,
         graph: &str,
         stages: &str,
-        groupings: HashMap<String, Vec<Vec<i64>>>,
         report: Py<PyAny>,
         ask: Py<PyAny>,
     ) -> PyResult<Vec<(String, Vec<Bound<'py, PyAny>>)>> {
@@ -143,6 +140,14 @@ impl Workers {
             .iter()
             .map(|(name, table)| Ok((name.clone(), table_from_python(table)?)))
             .collect::<PyResult<Vec<_>>>()?;
+        // a table the plan deduplicates or stops by a key spreads its
+        // documents over the GPUs by group
+        let deduplicated: Vec<String> = match region["query"].get("deduplicate") {
+            Some(serde_json::Value::Object(found)) => found.keys().cloned().collect(),
+            _ => Vec::new(),
+        };
+        let groupings = crate::request::stage_groupings(&graph, &deduplicated, &tables)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
         let external = |error: PyErr| DataFusionError::External(Box::new(error));
         let calls = Region {
             report: Box::new(move |(schema, batches)| {

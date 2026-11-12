@@ -2,12 +2,13 @@
 //! documents, its documents' text, and the value columns the executor
 //! reads.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, AsArray, Float32Array, Float64Array, Int32Array, RecordBatch};
 use arrow::compute::{cast, concat};
 use arrow::datatypes::{DataType, Field, Schema};
+use arrow::row::{RowConverter, SortField};
 use quail_datafusion::derive::expressions::PhysicalValue;
 use quail_planner::constants::NULL_DOCUMENT;
 use quail_planner::error::CompileError;
@@ -232,6 +233,68 @@ pub fn request_tables(
         }
     }
     Ok(tables)
+}
+
+/// By alias, lists of each document's group, for the stages' hash: a
+/// document goes to the GPU of the smallest document it is grouped
+/// with ([`crate::stages`]).
+///
+/// One list holds each document's first document, for a table the
+/// plan deduplicates; one holds each AI filter's stop key groups, so a
+/// key's documents reach one GPU.
+///
+/// # Errors
+///
+/// A table the plan groups has no columns, or lacks a grouped column.
+pub fn stage_groupings(
+    graph: &PhysicalGraph,
+    deduplicated: &[String],
+    tables: &[(String, Table)],
+) -> Result<HashMap<String, Vec<Vec<i64>>>, CompileError> {
+    let columns = |alias: &str| {
+        let name = format!("columns:{alias}");
+        (tables.iter())
+            .find(|(known, _)| *known == name)
+            .map(|(_, table)| table)
+            .ok_or_else(|| CompileError::new(format!("{alias} has no value columns")))
+    };
+    let held = |alias: &str, name: &str| {
+        column(columns(alias)?, name)?.ok_or_else(|| CompileError::new(format!("no column {name}")))
+    };
+    let mut groupings: HashMap<String, Vec<Vec<i64>>> = HashMap::new();
+    for alias in deduplicated {
+        let first = cast(&held(alias, FIRST_DOCUMENT)?, &DataType::Int64).map_err(arrow_error)?;
+        let first = first.as_primitive::<arrow::datatypes::Int64Type>();
+        groupings
+            .entry(alias.clone())
+            .or_default()
+            .push(first.values().to_vec());
+    }
+    for node in &graph.nodes {
+        let PhysicalNode::AiFilter(filter) = node else {
+            continue;
+        };
+        let (alias, key) = (&filter.attributes.alias, &filter.attributes.stop_key);
+        if key.is_empty() {
+            continue;
+        }
+        let values = key
+            .iter()
+            .map(|name| equality_keys(held(alias, name)?))
+            .collect::<Result<Vec<_>, _>>()?;
+        let fields = (values.iter())
+            .map(|values| SortField::new(values.data_type().clone()))
+            .collect();
+        let converter = RowConverter::new(fields).map_err(arrow_error)?;
+        let rows = converter.convert_columns(&values).map_err(arrow_error)?;
+        // a key's group is the first document with its values
+        let mut first: HashMap<&[u8], i64> = HashMap::new();
+        let groups = (rows.iter().enumerate())
+            .map(|(document, row)| *first.entry(row.data()).or_insert(document as i64))
+            .collect();
+        groupings.entry(alias.clone()).or_default().push(groups);
+    }
+    Ok(groupings)
 }
 
 #[cfg(test)]
