@@ -9,6 +9,7 @@
 //! whose type is not one of Quail's comes with its inputs, outputs, and
 //! fields, which its own Python class reports.
 
+use crate::constants::DEFAULT_SELECTIVITY;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::physical::{PhysicalNode, PortRef};
@@ -20,7 +21,7 @@ use crate::expressions::{column_name, condition_text, repr_float, repr_str};
 use crate::operators::table_name;
 use crate::operators::{Operators, SemanticJoin};
 use crate::stages::Stage;
-use crate::statistics::{DEFAULT_SELECTIVITY, OrTerm, RowFlow, effective_selectivity};
+use crate::statistics::{OrTerm, RowFlow, effective_selectivity};
 
 /// The mark beside a selectivity the planner assumed.
 const DEFAULT_MARK: &str = "*";

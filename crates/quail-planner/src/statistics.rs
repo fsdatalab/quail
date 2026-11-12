@@ -1,5 +1,6 @@
 //! Survivor and pair counts, and the arena's size.
 
+use crate::constants::DEFAULT_SELECTIVITY;
 use std::collections::BTreeMap;
 
 use crate::cost::budgets::arena_pages;
@@ -8,9 +9,6 @@ use crate::cost::statistics::AliasStats;
 
 use crate::context::PlanningContext;
 use crate::error::CompileError;
-
-/// The planner's selectivity when the query gives none.
-pub const DEFAULT_SELECTIVITY: f64 = 0.2;
 
 /// The selectivity the planner uses: the given one or the default.
 pub fn effective_selectivity(selectivity: Option<f64>) -> f64 {

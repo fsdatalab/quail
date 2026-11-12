@@ -27,14 +27,14 @@ __all__ = [
     "ScoreTest",
 ]
 
-DEFAULT_SELECTIVITY = 0.2
+DEFAULT_SELECTIVITY = _quail_native.DEFAULT_SELECTIVITY
 SCORE_COMPARISONS = ("<", "<=", ">", ">=")
 # the text before each label of a classification prompt
-LABEL_PREFIX = " "
-PROBABILITIES_SUFFIX = "_probabilities"
+LABEL_PREFIX = _quail_native.LABEL_PREFIX
+PROBABILITIES_SUFFIX = _quail_native.PROBABILITIES_SUFFIX
 # an "extract" call's second result column: the answer's character
 # span in the document
-SPAN_SUFFIX = "_span"
+SPAN_SUFFIX = _quail_native.SPAN_SUFFIX
 # the Arrow type of one feature list
 FEATURE_LIST = pa.list_(
     pa.struct([("feature", pa.int32()), ("strength", pa.float32())]))

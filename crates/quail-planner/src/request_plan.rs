@@ -5,6 +5,7 @@
 //! The request node and its specs are written as the JSON their Python
 //! codecs read, since only the request executor reads them.
 
+use crate::constants::LABEL_PREFIX;
 use crate::physical::{Node, PhysicalNode, PortRef, ScanAttributes, input_ports, port};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -16,7 +17,7 @@ use crate::expressions::{aliased_call, argument_alias, call_aliases};
 use crate::graph::has_label;
 use crate::lowering::answer_ids;
 use crate::operators::{Operators, SemanticColumn};
-use crate::prompts::{LABEL_PREFIX, join_label, prompt_layout, render_join_frame};
+use crate::prompts::{join_label, prompt_layout, render_join_frame};
 use crate::request_order::request_order;
 use crate::results::limit_node;
 use crate::search::label_calls;

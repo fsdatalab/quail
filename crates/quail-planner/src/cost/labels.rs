@@ -6,10 +6,6 @@ use std::collections::{BTreeMap, BTreeSet};
 /// A node of the label trie: the label tokens from the root.
 pub type Node = Vec<i64>;
 
-pub const LETTERS_SCORING: &str = "letters";
-pub const TREE_SCORING: &str = "trie_tree";
-pub const DECODE_SCORING: &str = "trie_decode";
-
 /// Each proper label prefix and the sorted tokens that can follow it.
 ///
 /// # Errors

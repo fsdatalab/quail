@@ -1,5 +1,6 @@
 //! Choose each table's step order, the join order, and the anchors.
 
+use crate::constants::{DEFAULT_SELECTIVITY, MAX_EXACT_UNITS};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::cost::budgets::parallel_copies;
@@ -26,8 +27,8 @@ use crate::plan_statistics::{
 };
 use crate::scores::score_join_work;
 use crate::statistics::{
-    DEFAULT_SELECTIVITY, OrTerm, RowFlow, cross_tuples, effective_selectivity,
-    predicate_asked_fraction, surviving_documents, thin,
+    OrTerm, RowFlow, cross_tuples, effective_selectivity, predicate_asked_fraction,
+    surviving_documents, thin,
 };
 
 pub const ASK: &str = "ask";
@@ -324,10 +325,6 @@ fn unit_spared(steps: &[TableStep], unit: &[usize]) -> f64 {
             .product(),
     }
 }
-
-/// The most units [`order_steps`] tries every order of. Past it, the
-/// search takes each next unit by rank.
-const MAX_EXACT_UNITS: usize = 10;
 
 /// Where a sequence of steps stands: the rows that reach the next step,
 /// the last step, and the prompts already scored.

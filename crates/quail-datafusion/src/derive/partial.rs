@@ -35,6 +35,7 @@
 //! finished answer, or an extraction with few places left to copy from.
 //! That decides any expression of the answer alone.
 
+use quail_planner::constants::MAX_LISTED;
 use std::sync::{Arc, OnceLock};
 
 use datafusion::arrow::array::{ArrayRef, AsArray, RecordBatch, StringArray};
@@ -46,9 +47,6 @@ use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use datafusion::prelude::SessionContext;
 use quail_planner::error::CompileError;
 use quail_planner::physical::Expression;
-
-/// The most complete answers DataFusion evaluates a condition on.
-const MAX_LISTED: usize = 1024;
 
 /// The column that holds each listed answer.
 pub(crate) const LISTED: &str = "answer";

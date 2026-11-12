@@ -2,6 +2,7 @@
 //! name them, and the Limit of the region's fetch that a physical plan
 //! ends with.
 
+use crate::constants::{PROBABILITIES_SUFFIX, SPAN_SUFFIX};
 use crate::physical::{
     LimitAttributes, ModelCall, Node, PhysicalNode, PortRef, Projected, ValueExpression,
     input_ports,
@@ -9,8 +10,7 @@ use crate::physical::{
 use serde_json::Value;
 
 use crate::expressions::{
-    PROBABILITIES_SUFFIX, SPAN_SUFFIX, call_aliases, column_name, column_references, packing,
-    projected_call, projected_name,
+    call_aliases, column_name, column_references, packing, projected_call, projected_name,
 };
 use crate::operators::Operators;
 

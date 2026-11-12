@@ -37,6 +37,7 @@
 //! from its input (`AiNode::necessary_children_exprs`), but not the
 //! columns the node adds or the fields of a struct column.
 
+use quail_planner::constants::SPAN_SUFFIX;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -47,7 +48,6 @@ use datafusion::logical_expr::{
     Expr, ExprSchemable, LogicalPlan, Projection, UserDefinedLogicalNodeCore,
 };
 
-use crate::SPAN_SUFFIX;
 use crate::ai::{AiNode, Fetch, Semantics};
 use crate::derive::unfolded;
 use crate::extension::{as_node, extension_node};

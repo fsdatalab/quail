@@ -36,6 +36,7 @@
 //! only a test reads it. A call anywhere else stays as DataFusion bound
 //! it.
 
+use quail_planner::constants::SPAN_SUFFIX;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{DataType, Field};
@@ -52,7 +53,6 @@ use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 use datafusion::optimizer::simplify_expressions::ExprSimplifier;
 use datafusion::optimizer::{AnalyzerRule, OptimizerConfig, OptimizerRule};
 
-use crate::SPAN_SUFFIX;
 use crate::ai::{AiNode, Semantics, Written, WrittenTest};
 use crate::extension::{as_node, extension_node};
 use crate::functions::column_call_kind;

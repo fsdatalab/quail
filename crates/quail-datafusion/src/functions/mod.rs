@@ -17,10 +17,6 @@ use datafusion::logical_expr::{
     Volatility,
 };
 
-/// The suffix of the column that holds an extraction's answer
-/// positions, `AI.EXTRACT_SPAN`, as in Quail's `SPAN_SUFFIX`.
-pub const SPAN_SUFFIX: &str = "_span";
-
 /// The AI functions, by their internal names.
 ///
 /// SQL may also write `AI.IF` for `ai_filter`, and `AI.<name>` or

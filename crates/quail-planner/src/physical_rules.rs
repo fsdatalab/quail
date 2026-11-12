@@ -1066,7 +1066,7 @@ fn should_stop_answers_early(graph: &PhysicalGraph, context: &PlanningContext) -
         };
         let reads = |column: &str| {
             column == name
-                || column == format!("{name}{}", crate::expressions::SPAN_SUFFIX)
+                || column == format!("{name}{}", crate::constants::SPAN_SUFFIX)
                 || name.starts_with(&format!("{column}."))
         };
         let mut tests = Vec::new();

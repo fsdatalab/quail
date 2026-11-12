@@ -1,11 +1,10 @@
 //! Classification costs.
 
+use crate::constants::{DECODE_SCORING, LETTERS_SCORING, TREE_SCORING};
 use std::collections::BTreeSet;
 
 use crate::cost::budgets::parallel_copies;
-use crate::cost::labels::{
-    DECODE_SCORING, LETTERS_SCORING, TREE_SCORING, decode_round_tokens, fed_nodes, read_nodes,
-};
+use crate::cost::labels::{decode_round_tokens, fed_nodes, read_nodes};
 use crate::cost::quantity::Quantity;
 use crate::cost::score::python_min;
 use crate::cost::sol::unrounded_seconds;

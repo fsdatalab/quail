@@ -287,7 +287,11 @@ fn claim_needed(plan: LogicalPlan, needed: Option<Vec<Column>>) -> Result<Logica
         let needed = needed.map(|mut needed| {
             let answers: Vec<Column> = needed
                 .iter()
-                .filter_map(|column| column.name.strip_suffix(crate::SPAN_SUFFIX))
+                .filter_map(|column| {
+                    column
+                        .name
+                        .strip_suffix(quail_planner::constants::SPAN_SUFFIX)
+                })
                 .map(Column::from_name)
                 .filter(|answer| plan.schema().has_column(answer))
                 .collect();

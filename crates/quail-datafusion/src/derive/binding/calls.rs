@@ -8,6 +8,7 @@ use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, ScalarValue};
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
+use quail_planner::constants::DEFAULT_MAP_ANSWER_TOKENS;
 use quail_planner::error::{CompileError, compile_error};
 use quail_planner::expressions::{column_alias_of, column_name, explain_call, repr_str};
 use quail_planner::physical::{
@@ -15,9 +16,6 @@ use quail_planner::physical::{
 };
 use quail_planner::prompts;
 use serde_json::Value;
-
-/// The answer limit of an AI.MAP call written without one.
-const DEFAULT_MAP_ANSWER_TOKENS: i64 = 256;
 
 pub(super) fn arguments(expr: &Expr) -> &[Expr] {
     match expr {

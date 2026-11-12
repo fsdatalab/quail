@@ -7,6 +7,7 @@
 //! oracles come from the caller, as do the tests of reference answers,
 //! which Arrow evaluates.
 
+use crate::constants::SPAN_SUFFIX;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cost::decode::DecodeCost;
@@ -23,9 +24,7 @@ use serde_json::{Map, Value, json};
 use crate::context::PlanningContext;
 use crate::error::CompileError;
 use crate::expressions::asked_call;
-use crate::expressions::{
-    SPAN_SUFFIX, aliased_call, call_aliases, condition_columns, condition_text, repr_str,
-};
+use crate::expressions::{aliased_call, call_aliases, condition_columns, condition_text, repr_str};
 use crate::lowering::LoweredPrompt;
 use crate::operators::{Operators, SemanticColumn};
 use crate::plan_statistics::plan_prompts;

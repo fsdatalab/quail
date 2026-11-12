@@ -4,6 +4,7 @@
 //! arguments into a `Prompt`: the text before the document, the text
 //! after it, and the pieces the planner tokenizes on their own.
 
+use crate::constants::LABEL_PREFIX;
 use std::collections::BTreeMap;
 
 use crate::physical::{Prompt, ValueExpression};
@@ -16,7 +17,6 @@ pub const SHARED_PRE: &str = "DOCUMENT:\n";
 const JOIN_QUESTION_SEP: &str = "\n\n";
 const TASK_INSTRUCTION: &str = "Evaluate TRUE or FALSE for the following question: ";
 const ANSWER_CUE: &str = "\nANSWER:";
-pub const LABEL_PREFIX: &str = " ";
 const CLASSIFY_INSTRUCTION: &str =
     "Answer with exactly one of the categories below for the following question: ";
 const LETTERS_INSTRUCTION: &str =

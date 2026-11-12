@@ -43,7 +43,8 @@ use datafusion::logical_expr::{Expr, LogicalPlan};
 pub use extension::QuailExtension;
 pub use functions::field_access::StructFieldAccess;
 pub use functions::regexps::SnowflakeRegexpLike;
-pub use functions::{AI_FUNCTION_NAMES, SPAN_SUFFIX, is_ai_call, quail_functions};
+pub use functions::{AI_FUNCTION_NAMES, is_ai_call, quail_functions};
+pub use quail_planner::constants::SPAN_SUFFIX;
 pub use region::ModelRegion;
 pub use region::claim::claim_model_regions;
 pub use region::exec::{

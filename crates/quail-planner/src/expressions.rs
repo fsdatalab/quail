@@ -2,14 +2,13 @@
 //! columns they read, their names and text, and the model calls they
 //! hold. DataFusion evaluates the values and conditions.
 
+use crate::constants::SPAN_SUFFIX;
 use crate::error::{CompileError, compile_error};
 use crate::physical::{
     Asked, ColumnRef, Equality, ExtractStruct, ModelCall, Projected, ValueExpression,
 };
 use serde_json::Value;
 
-pub const SPAN_SUFFIX: &str = "_span";
-pub const PROBABILITIES_SUFFIX: &str = "_probabilities";
 pub const DESCRIPTION_WORDS: usize = 25;
 pub const SCORE_COMPARISONS: [&str; 4] = ["<", "<=", ">", ">="];
 pub const MODEL_CALL_KINDS: [&str; 6] = ["boolean", "score", "label", "extract", "features", "map"];

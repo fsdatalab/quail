@@ -9,6 +9,7 @@
 //! runs the column placements and the plan search with the model's
 //! tokenizer.
 
+use quail_planner::constants::{NULL_DOCUMENT, SAMPLE_ROWS, WORK_FIELDS};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -26,10 +27,6 @@ use quail_planner::operators::{Scan, ScanColumn};
 use quail_planner::optimize::Selected;
 use quail_planner::physical::ValueExpression;
 use quail_planner::placements::{Alternative, placements};
-
-/// Rows the planner samples to estimate how many pairs a join's
-/// equalities keep.
-const SAMPLE_ROWS: usize = 1024;
 
 /// The configuration a region is planned for.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -442,10 +439,6 @@ fn value_columns(names: &[String], rows: &TableRows) -> Result<crate::stages::Ta
     Ok((schema, batches))
 }
 
-/// The value column that says which of a scan's documents are NULL, as
-/// `quail.common.pairs.NULL_DOCUMENT` names it.
-const NULL_DOCUMENT: &str = "__null_document";
-
 /// `columns` with the [`NULL_DOCUMENT`] column, when a document of the
 /// scan is NULL: the executor asks the model about no such row.
 fn with_null_documents(
@@ -677,19 +670,6 @@ fn is_column(expression: &ValueExpression) -> bool {
         _ => false,
     }
 }
-
-/// The field names of [`work_values`], in order.
-pub const WORK_FIELDS: [&str; 9] = [
-    "tokens",
-    "pairs",
-    "kv_written",
-    "kv_read",
-    "sliding_pairs",
-    "sliding_kv_read",
-    "state_written",
-    "state_read",
-    "sae_encoded",
-];
 
 /// A work's quantities in [`WORK_FIELDS`] order.
 pub fn work_values(

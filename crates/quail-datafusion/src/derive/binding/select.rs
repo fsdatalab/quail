@@ -2,9 +2,9 @@
 //! Check output names and reject a model result returned twice.
 
 use super::{Binder, contains, unsupported};
-use crate::SPAN_SUFFIX;
 use crate::functions::{ai_function_name, function_name};
 use datafusion::logical_expr::Expr;
+use quail_planner::constants::SPAN_SUFFIX;
 use quail_planner::error::CompileError;
 use quail_planner::expressions::{aliased_call, call_aliases, column_name, repr_list, repr_str};
 use quail_planner::physical::{Alias, ExtractStruct, ValueExpression};

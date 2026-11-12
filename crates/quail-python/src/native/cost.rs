@@ -1,5 +1,6 @@
 //! The Rust cost model, exposed to Python for tests.
 
+use quail_planner::constants::WORK_FIELDS;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -33,18 +34,6 @@ fn to_python<'py>(py: Python<'py>, value: &Quantity) -> PyResult<Bound<'py, PyAn
 
 /// Read nodes, fed nodes, and each label's decode round tokens.
 type LabelNodes = (Vec<Vec<i64>>, Vec<Vec<i64>>, Vec<Vec<i64>>);
-
-const WORK_FIELDS: [&str; 9] = [
-    "tokens",
-    "pairs",
-    "kv_written",
-    "kv_read",
-    "sliding_pairs",
-    "sliding_kv_read",
-    "state_written",
-    "state_read",
-    "sae_encoded",
-];
 
 fn work_from(fields: &Bound<'_, PyDict>) -> PyResult<Work> {
     let get = |name: &str| -> PyResult<Quantity> {

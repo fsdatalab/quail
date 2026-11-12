@@ -1,5 +1,6 @@
 //! AI.CLASSIFY's statistics, scoring rule, cost, and spec.
 
+use crate::constants::{DECODE_SCORING, LETTERS_SCORING, TREE_SCORING};
 use std::collections::BTreeSet;
 
 use crate::cost::budgets::{chunk_budget, tree_attention_allowed};
@@ -23,9 +24,6 @@ use crate::lowering::{
 use crate::prompts::prompt_layout;
 use crate::statistics::arena_capacity;
 
-pub const LETTERS_SCORING: &str = "letters";
-pub const TREE_SCORING: &str = "trie_tree";
-pub const DECODE_SCORING: &str = "trie_decode";
 pub const DECISION_SCORING: &str = "decision_choice";
 pub const SET_CHOICE_SCORING: &str = "set_choice";
 

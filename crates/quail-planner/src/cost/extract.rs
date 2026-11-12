@@ -3,6 +3,7 @@
 //! Each document's work is a record of scalars; the table's work sums
 //! them as numpy sums an array.
 
+use crate::constants::SAMPLE_DOCUMENTS;
 use std::collections::BTreeMap;
 
 use crate::cost::budgets::parallel_copies;
@@ -11,9 +12,6 @@ use crate::cost::quantity::{Quantity, numpy_sum};
 use crate::cost::sol::unrounded_seconds;
 use crate::cost::specs::{DeviceSpec, ModelSpec};
 use crate::cost::work::{Work, ask, scan, triangle};
-
-/// A larger table is priced from this many evenly spaced documents.
-pub const SAMPLE_DOCUMENTS: usize = 1024;
 
 fn scalar(value: f64) -> Quantity {
     Quantity::Scalar(value)

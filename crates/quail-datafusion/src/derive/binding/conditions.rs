@@ -1,6 +1,7 @@
 //! Bind conditions and join equalities.
 //! Read each answer a condition tests as its operator's column.
 
+use quail_planner::constants::SPAN_SUFFIX;
 use std::collections::BTreeSet;
 
 use super::calls::{arguments, is_call, parse_options, string_literal};
@@ -12,7 +13,7 @@ use datafusion::common::{Column, ScalarValue};
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use quail_planner::error::{CompileError, compile_error};
-use quail_planner::expressions::{SPAN_SUFFIX, column_alias_of, repr_list, repr_str};
+use quail_planner::expressions::{column_alias_of, repr_list, repr_str};
 use quail_planner::physical::{Equality, ModelCall, ValueExpression};
 use serde_json::Value;
 

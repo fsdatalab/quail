@@ -1249,6 +1249,19 @@ pub fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(prompt_layout, module)?)?;
     module.add_function(wrap_pyfunction!(read_specs, module)?)?;
     module.add("SHARED_PRE", quail_planner::prompts::SHARED_PRE)?;
+    // the names and numbers Python shares with the planner
+    {
+        use quail_planner::constants as shared;
+        use quail_planner::cost::specs;
+        module.add("SPAN_SUFFIX", shared::SPAN_SUFFIX)?;
+        module.add("PROBABILITIES_SUFFIX", shared::PROBABILITIES_SUFFIX)?;
+        module.add("NULL_DOCUMENT", shared::NULL_DOCUMENT)?;
+        module.add("LABEL_PREFIX", shared::LABEL_PREFIX)?;
+        module.add("DEFAULT_SELECTIVITY", shared::DEFAULT_SELECTIVITY)?;
+        module.add("GDN_STATE_ELEMENT_BYTES", specs::GDN_STATE_ELEMENT_BYTES)?;
+        module.add("CONV_STATE_ELEMENT_BYTES", specs::CONV_STATE_ELEMENT_BYTES)?;
+        module.add("ACT_BYTES_PER_HIDDEN", specs::ACT_BYTES_PER_HIDDEN)?;
+    }
     module.add_function(wrap_pyfunction!(bind_prompt, module)?)?;
     module.add_function(wrap_pyfunction!(column_placements, module)?)?;
     module.add_function(wrap_pyfunction!(prompt_lowering, module)?)?;

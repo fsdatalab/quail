@@ -21,11 +21,11 @@ LayerKind = Literal[
 
 # The recurrent state is kept in fp32 and the convolution columns in
 # bf16.
-GDN_STATE_ELEMENT_BYTES = 4
-CONV_STATE_ELEMENT_BYTES = 2
+GDN_STATE_ELEMENT_BYTES = _quail_native.GDN_STATE_ELEMENT_BYTES
+CONV_STATE_ELEMENT_BYTES = _quail_native.CONV_STATE_ELEMENT_BYTES
 
 # Peak per-token activation bytes per hidden dim.
-ACT_BYTES_PER_HIDDEN = 32
+ACT_BYTES_PER_HIDDEN = _quail_native.ACT_BYTES_PER_HIDDEN
 
 
 # Every random canvas token comes from this seed: a filter's fixed

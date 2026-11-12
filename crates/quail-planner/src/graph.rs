@@ -1,6 +1,7 @@
 //! Build the physical graph of one plan's operators in the chosen operator
 //! order.
 
+use crate::constants::SPAN_SUFFIX;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cost::budgets::pages;
@@ -20,7 +21,7 @@ use crate::context::PlanningContext;
 use crate::costs::question_tokens;
 use crate::error::{CompileError, Refusal};
 use crate::expressions::asked_call;
-use crate::expressions::{SPAN_SUFFIX, argument_alias, call_aliases, condition_columns, repr_str};
+use crate::expressions::{argument_alias, call_aliases, condition_columns, repr_str};
 use crate::operators::{ColumnTest, Operators, SemanticColumn};
 use crate::pricing::PlanPricer;
 use crate::results::limit_node;

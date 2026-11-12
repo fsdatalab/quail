@@ -11,6 +11,7 @@
 //! so each row is built once, and the region's fetch keeps the first
 //! rows built.
 
+use quail_planner::constants::PROBABILITIES_SUFFIX;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -22,9 +23,7 @@ use arrow::compute::{
     SortColumn, TakeOptions, cast, concat_batches, interleave, lexsort_to_indices, take,
 };
 use arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
-use quail_planner::expressions::{
-    PROBABILITIES_SUFFIX, asked_call, call_aliases, column_references,
-};
+use quail_planner::expressions::{asked_call, call_aliases, column_references};
 use quail_planner::operators::Operators;
 use quail_planner::results::{answer_columns, region_columns, region_structs, source_columns};
 use serde_json::Value;

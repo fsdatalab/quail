@@ -6,7 +6,7 @@ use super::binding::{Binder, check_labels};
 use super::relation::{JoinSpec, Relation, check_calls, check_joins};
 use super::walk::Walk;
 use super::{ByAlias, lookup, note, push};
-use crate::SPAN_SUFFIX;
+use quail_planner::constants::SPAN_SUFFIX;
 use quail_planner::error::CompileError;
 use quail_planner::expressions::{aliased_call, column_name, column_references, condition_columns};
 use quail_planner::operators::{ColumnTest, Operators, SemanticColumn};

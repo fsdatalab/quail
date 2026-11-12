@@ -1,5 +1,6 @@
 //! Each column operator's priced spec.
 
+use crate::constants::{EXTRACT_ANSWER_TOKENS, MAP_ANSWER_TOKENS};
 use crate::cost::budgets::chunk_budget;
 use crate::cost::extract::{self, ExtractInputs};
 use crate::cost::quantity::Quantity;
@@ -17,11 +18,6 @@ use crate::expressions::{argument_alias, column_name, repr_str};
 use crate::lowering::read_slot_offsets;
 use crate::operators::SemanticColumn;
 use crate::prompts::prompt_layout;
-
-/// The answer length `ExtractAssumptions` takes by default.
-pub const EXTRACT_ANSWER_TOKENS: i64 = 16;
-/// AI.MAP's guess at an answer's mean length; an answer limit below caps it.
-pub const MAP_ANSWER_TOKENS: i64 = 64;
 
 /// A column operator's spec.
 #[derive(Debug, Clone, PartialEq, Serialize)]

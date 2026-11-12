@@ -5,6 +5,7 @@
 //! They cross into Python as JSON. Each value and condition the
 //! executor computes is an `Expression`, which DataFusion evaluates.
 
+use crate::constants::{PROBABILITIES_SUFFIX, SPAN_SUFFIX};
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
@@ -15,7 +16,7 @@ use crate::physical::{
 use crate::tagged_struct;
 use serde_json::Value;
 
-use crate::expressions::{PROBABILITIES_SUFFIX, SPAN_SUFFIX, call_aliases, column_references};
+use crate::expressions::{call_aliases, column_references};
 
 tagged_struct! {
     /// An Arrow schema, as IPC bytes in base64.

@@ -391,7 +391,7 @@ impl Extracted {
             if !self.reserved.contains(&name)
                 && !self
                     .reserved
-                    .contains(&format!("{name}{}", crate::SPAN_SUFFIX))
+                    .contains(&format!("{name}{}", quail_planner::constants::SPAN_SUFFIX))
                 && !self.used.contains(&name)
             {
                 self.reserved.push(name.clone());
@@ -526,7 +526,7 @@ impl Extracted {
                     let mut name = self.fresh_call();
                     // a span column is its extraction's answer name with the suffix
                     if crate::functions::function_name(&call) == Some("ai_extract_span") {
-                        name.push_str(crate::SPAN_SUFFIX);
+                        name.push_str(quail_planner::constants::SPAN_SUFFIX);
                     }
                     name
                 });

@@ -9,6 +9,7 @@ key columns the request carries as ``columns:<alias>`` relations.
 
 from __future__ import annotations
 
+import _quail_native
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -21,7 +22,7 @@ COLUMNS_PREFIX = "columns:"
 FIRST_DOCUMENT = "__first_document"
 # the value column that is TRUE for each document of a scan that is
 # NULL, present only when one is; Rust's planner writes it
-NULL_DOCUMENT = "__null_document"
+NULL_DOCUMENT = _quail_native.NULL_DOCUMENT
 # the value column of a deduplicated rows input to an AI filter with a
 # stop key: the documents each key document stands for
 COPIES = "__copies"

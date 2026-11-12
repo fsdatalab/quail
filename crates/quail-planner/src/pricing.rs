@@ -656,7 +656,7 @@ impl PlanPricer {
                     draft_tokens: spec.draft_tokens,
                     draft_policy: spec.draft_policy.clone(),
                     round_cost_per_token: spec.round_cost_per_token,
-                    answer_tokens: crate::columns::EXTRACT_ANSWER_TOKENS,
+                    answer_tokens: crate::constants::EXTRACT_ANSWER_TOKENS,
                     recurrent: false,
                 };
                 let seconds = |shared: &[f64]| {

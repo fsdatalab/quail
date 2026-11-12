@@ -19,6 +19,7 @@ pub mod physical;
 
 pub mod classify;
 pub mod columns;
+pub mod constants;
 pub mod context;
 pub mod costs;
 pub mod edits;
