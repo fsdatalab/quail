@@ -6,7 +6,7 @@ from dataclasses import dataclass
 # the classification's labels.
 # every label is one letter token, read at one row
 LETTERS_SCORING = "letters"
-# every trie node once, in one request: tree attention only
+# the nodes where the labels split, in one request: tree attention only
 TREE_SCORING = "trie_tree"
 # one token per round along the greedy path: fewest tokens, most rounds
 DECODE_SCORING = "trie_decode"
@@ -46,36 +46,6 @@ def label_trie(label_ids) -> dict[tuple[int, ...], list[int]]:
     return {prefix: sorted(tokens) for prefix, tokens in children.items()}
 
 
-def word_starts(label_ids, decode) -> tuple[tuple[bool, ...], ...]:
-    """Return which tokens of each label begin a new word.
-
-    A token begins a word when its text starts with whitespace and the
-    token before it holds a letter or digit; a label's first token never
-    does. Punctuation such as "," joins the word after it.
-
-    Args:
-        label_ids: One token id sequence per label.
-        decode: Callable from a token id list to its text, as str or
-            bytes. None marks no token, so every trie node is read.
-    """
-    if decode is None:
-        return tuple((False,) * len(ids) for ids in label_ids)
-
-    def text(token) -> str:
-        piece = decode([token])
-        return (piece.decode("utf-8", errors="replace")
-                if isinstance(piece, bytes) else str(piece))
-
-    flags = []
-    for ids in label_ids:
-        pieces = [text(token) for token in ids]
-        flags.append(tuple(
-            depth > 0 and pieces[depth][:1].isspace()
-            and any(ch.isalnum() for ch in pieces[depth - 1])
-            for depth in range(len(ids))))
-    return tuple(flags)
-
-
 def choice_nodes(label_ids) -> set:
     """Return every trie node with two or more children.
 
@@ -86,33 +56,22 @@ def choice_nodes(label_ids) -> set:
     return {node for node, tokens in trie.items() if len(tokens) > 1}
 
 
-def read_nodes(label_ids, starts=()) -> set:
+def read_nodes(label_ids) -> set:
     """Return the trie nodes whose rows the trie_tree rule reads.
 
     The root is read, and so is every node where the labels split: two
     or more children, or a label that ends where another continues.
-    After a read node, the next node is read while its token continues
-    the chosen word, so a label is scored through the end of the word
-    that tells it apart. Nodes after that are fed, when a later read
-    needs their KV, but never read.
+    Every other node has one possible next token, so a label is scored
+    only up to the node that tells it apart. Nodes after a read are fed
+    when a later read needs their KV, but never read.
 
     Args:
         label_ids: One token id sequence per label.
-        starts: Per label, which tokens begin a new word, from
-            ``word_starts``. Empty marks no token, so every node is read.
     """
     trie = label_trie(label_ids)
     ends = {tuple(ids) for ids in label_ids}
-    read = {()}
-    for index, ids in enumerate(label_ids):
-        ids = tuple(ids)
-        flags = starts[index] if starts else (False,) * len(ids)
-        for depth in range(1, len(ids)):
-            node = ids[:depth]
-            if (len(trie[node]) > 1 or node in ends
-                    or (ids[:depth - 1] in read and not flags[depth])):
-                read.add(node)
-    return read
+    return {()} | {node for node, tokens in trie.items()
+                   if len(tokens) > 1 or node in ends}
 
 
 @dataclass(frozen=True)

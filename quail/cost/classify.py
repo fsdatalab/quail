@@ -27,7 +27,7 @@ from quail.labels import (
 
 
 def suffix_lengths(scoring: str, labels, canvas_rows: int = 0,
-                   draws: int = 1, starts=()) -> list[int]:
+                   draws: int = 1) -> list[int]:
     """Estimate the request lengths for a classification scoring rule.
 
     Args:
@@ -35,7 +35,6 @@ def suffix_lengths(scoring: str, labels, canvas_rows: int = 0,
         labels: Token sequence for each label.
         canvas_rows: Number of diffusion answer canvas rows.
         draws: Maximum number of diffusion draws per document.
-        starts: Per label, which tokens begin a new word.
 
     Returns:
         Request lengths in tokens, including the answer cue. The packed
@@ -49,7 +48,7 @@ def suffix_lengths(scoring: str, labels, canvas_rows: int = 0,
     if scoring == LETTERS_SCORING:
         return [1 + canvas_rows] * (draws if canvas_rows else 1)
     if scoring == TREE_SCORING:
-        return [len(fed_nodes(read_nodes(labels, starts)))]
+        return [len(fed_nodes(read_nodes(labels)))]
     if scoring == DECODE_SCORING:
         fed = decode_round_tokens(labels)
         return [max(counts[round_] for counts in fed if len(counts) > round_)
@@ -195,7 +194,7 @@ def estimate_suffixes(head_tokens: int, frame_tokens: int, suffixes, *,
 def estimate(scoring: str, expected_rows: float, head_tokens: int, frame_tokens: int,
              labels, *, lengths, shared, chunk: int,
              model, device, resident: bool = False, draws: int = 1,
-             starts=(), gpus: int = 1) -> ClassifyCost:
+             gpus: int = 1) -> ClassifyCost:
     """Estimate the cost of one classification scoring rule.
 
     Args:
@@ -211,7 +210,6 @@ def estimate(scoring: str, expected_rows: float, head_tokens: int, frame_tokens:
         device: Device specification.
         resident: Whether document KV is already available.
         draws: Maximum number of diffusion draws per document.
-        starts: Per label, which tokens begin a new word.
         gpus: Model copies sharing the documents evenly.
 
     Returns:
@@ -222,13 +220,13 @@ def estimate(scoring: str, expected_rows: float, head_tokens: int, frame_tokens:
     """
     canvas = model.answer_canvas
     canvas_rows = canvas.rows if canvas is not None else 0
-    suffixes = suffix_lengths(scoring, labels, canvas_rows, draws, starts)
+    suffixes = suffix_lengths(scoring, labels, canvas_rows, draws)
     runs = answer_rows = None
     if scoring == DECODE_SCORING:
         # a document stops decoding at the choice that decides its label
         runs = decode_round_tokens(labels)
     elif scoring == TREE_SCORING:
-        answer_rows = float(len(read_nodes(labels, starts)))
+        answer_rows = float(len(read_nodes(labels)))
     # one-token labels are all read at the cue row from their target
     # rows of the head; longer labels normalize over the vocabulary
     targets = {token for ids in labels for token in ids}

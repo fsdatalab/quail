@@ -20,7 +20,7 @@ physical: backend=quail, model=qwen3-4b-fp8, gpus=1
       contracts = count(*)
       Project: governing_law_state
         AiClassify: governing_law_state over c                                                      3.06 ms
-          rule=trie_decode, labels=7, label tokens=72
+          rule=trie_tree, labels=7, label tokens=72
           AiFilter: c                                                           1.6                 9.03 ms
             KV rewind=on
             predicate 1  PROMPT('DOCUMENT:\n{0}\n\nIs there a requir…')           6       26.3%
