@@ -706,6 +706,9 @@ def oracle_executor(oracle: Oracle, **report):
                               for alias, rows in request.source_rows.items()}
         payload = {
             "filter_limit": None, "columns": request.column_tables(),
+            "documents": oracle.documents,
+            "texts": {alias: texts for alias, texts in oracle.texts.items()
+                      if texts is not None},
             "deduplicate": request.plan["settings"].get("deduplicate", {}),
             "stages": request.plan["settings"]["stages"]}
         states = []

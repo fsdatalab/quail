@@ -20,7 +20,11 @@ from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.arena import KVArena
 from quail.backends.quail.executor.models.base import ModelPipeline
 from quail.backends.quail.executor.pages import PageArena
-from quail.backends.quail.graph import execute_staged_graph, serve_region
+from quail.backends.quail.graph import (
+    execute_staged_graph,
+    payload_tables,
+    serve_region,
+)
 from quail.builtins import built_in_registry
 from quail.common.expressions import ColumnRef
 from quail.physical import (
@@ -448,7 +452,11 @@ def _serve(state, payload, graph, path):
     while (message := end.next()) is not None:
         try:
             region = json.loads(message[1])
-            serve_region(state, payload, graph, end, region["wanted"],
-                         region["hinted"])
+            # the documents, texts, and columns the region sent replace
+            # the state's own, as a worker process reads them
+            sent = {name: found for name, found
+                    in payload_tables(message[2]).items() if found}
+            serve_region({**state, **sent}, payload, graph, end,
+                         region["wanted"], region["hinted"])
         except Exception:
             end.fail(traceback.format_exc())
