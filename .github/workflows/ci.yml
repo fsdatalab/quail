@@ -54,6 +54,9 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Rust tests
         run: cargo test
+      # the Flight server tests in pytest run this binary
+      - name: Build quail-server
+        run: cargo build --workspace
       - name: Lint (ruff)
         run: uv run --frozen ruff check quail bench calibrate tests experiments tools
       - name: Long string literals
