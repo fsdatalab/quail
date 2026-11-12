@@ -13,7 +13,7 @@ import pyarrow as pa
 from quail.api.execute import execute_query
 from quail.api.region_inputs import input_scans
 from quail.common.expressions import CompileError, SimilarCallWarning
-from quail.common.pairs import FIRST_DOCUMENT, NULL_DOCUMENT, columns_key
+from quail.common.pairs import columns_key
 from quail.common.tokens import ScanInput, TokenStore
 from quail.execution.finished import finished_table
 from quail.execution.metrics import NodeMetrics, NodeResult, scalar_node_metrics
@@ -470,63 +470,32 @@ class RegionQuery:
             raise RefusalError(plan)
         plan.graph.validate(runtime_keys=set(self.session.registry.runtimes))
         plan.graph.validate_backend(plan.backend)
+        envelope = plan.to_envelope()
+        # Rust builds what the workers read: each document's text, and
+        # the value columns with each table's first documents
+        tables = dict(_quail_native.request_tables(
+            json.dumps(envelope), self.operators,
+            {alias: (store.tokens.table, store.columns)
+             for alias, store in self._token_inputs.items()}))
         inputs = {}
-        documents = {scan["alias"]: decode_plan_value(json.dumps(scan["column"]))
-                     for scan in self.facts()["scans"]}
         for node in plan.nodes:
             if not isinstance(node, Scan):
                 continue
-            store = self._token_inputs[node.alias]
-            column = documents[node.alias]
+            texts = tables.get(f"texts:{node.alias}")
             inputs[node.input_id] = document_input(
-                store.tokens,
-                (
-                    column.evaluate(store)
-                    if {ref.column for ref in column.references}
-                    <= set(store.projected_columns)
-                    else None
-                ),
-            )
-        envelope = plan.to_envelope()
-        source_rows = self._alias_source_rows()
-        return PhysicalRequest(envelope, inputs, self._column_tables(),
-                               source_rows)
+                self._token_inputs[node.alias].tokens,
+                None if texts is None else texts.column("text"))
+        relations = {columns_key(name.split(":", 1)[1]): table
+                     for name, table in tables.items()
+                     if name.startswith("columns:")}
+        return PhysicalRequest(envelope, inputs, relations,
+                               self._alias_source_rows())
 
     def _alias_source_rows(self) -> dict:
         """Each filtered input's rows in its registered table, by scan alias."""
         return {scan["alias"]: self.source_rows[scan["provider"]]
                 for scan in self.facts()["scans"]
                 if scan["provider"] in self.source_rows}
-
-    def _column_tables(self) -> dict:
-        """One value table per alias whose columns the executor reads.
-
-        A scan's regular predicates, a HashJoin, an apply(), and a stop key
-        read values; the tables carry the columns they name. A table the
-        plan deduplicates also carries FIRST_DOCUMENT, computed from the
-        tokens and the row columns the deduplicate setting lists for it.
-        """
-        needed = {alias: dict.fromkeys(columns)
-                  for alias, columns in self.facts()["value_columns"].items()}
-        deduplicated = self.plan().settings.get("deduplicate", {})
-        for alias in deduplicated:
-            needed.setdefault(alias, {})
-        tables = {}
-        for alias, columns in needed.items():
-            store = self._token_inputs[alias]
-            values = {name: store.column(name) for name in columns}
-            if alias in deduplicated:
-                values[FIRST_DOCUMENT] = store.tokens.first_documents_with(
-                    [store.column(column) for column in deduplicated[alias]])
-            tables[columns_key(alias)] = pa.table(values)
-        # which documents are NULL, for every scan that has one
-        for alias, store in self._token_inputs.items():
-            if NULL_DOCUMENT in store.projected_columns:
-                key = columns_key(alias)
-                absent = store.column(NULL_DOCUMENT)
-                tables[key] = (pa.table({NULL_DOCUMENT: absent}) if key not in tables
-                               else tables[key].append_column(NULL_DOCUMENT, absent))
-        return tables
 
     def finished_rows(self, on_rows=None):
         """Return the FinishedRows that builds the region's rows from its run.

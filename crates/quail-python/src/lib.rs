@@ -34,6 +34,7 @@ pub mod finished;
 pub mod native;
 pub mod planning;
 pub mod pyarrow;
+pub mod request;
 pub mod results;
 pub mod shared;
 pub mod stages;

@@ -306,6 +306,11 @@ class ScanInput:
         """Return one value column."""
         return self._columns.column(name)
 
+    @property
+    def columns(self) -> pa.Table:
+        """Return the value columns kept for this scan."""
+        return self._columns
+
 
 class DocumentPrefixes(Sequence):
     """Add common prefix tokens when a document is accessed."""

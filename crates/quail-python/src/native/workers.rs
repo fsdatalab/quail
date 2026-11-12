@@ -293,7 +293,42 @@ impl WorkerEnd {
     }
 }
 
+/// The tables a planned region's workers read, by name, as
+/// `crate::request::request_tables` builds them.
+///
+/// `envelope` is the plan's envelope as JSON; `operators` the region's
+/// operators as JSON; `scans` gives, by alias, each scan's token store
+/// and the columns of its rows, as pyarrow Tables.
+#[pyfunction]
+fn request_tables<'py>(
+    py: Python<'py>,
+    envelope: &str,
+    operators: &str,
+    scans: HashMap<String, (Bound<'py, PyAny>, Bound<'py, PyAny>)>,
+) -> PyResult<Vec<(String, Bound<'py, PyAny>)>> {
+    let envelope: serde_json::Value = from_json(envelope)?;
+    let operators: quail_planner::operators::Operators = from_json(operators)?;
+    let scans = scans
+        .into_iter()
+        .map(|(alias, (tokens, columns))| {
+            Ok((
+                alias,
+                table_from_python(&tokens)?,
+                table_from_python(&columns)?,
+            ))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let tables = py
+        .detach(|| crate::request::request_tables(&envelope, &operators, &scans))
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    tables
+        .into_iter()
+        .map(|(name, (schema, batches))| Ok((name, to_pyarrow(py, schema, batches)?)))
+        .collect()
+}
+
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Workers>()?;
-    module.add_class::<WorkerEnd>()
+    module.add_class::<WorkerEnd>()?;
+    module.add_function(wrap_pyfunction!(request_tables, module)?)
 }
