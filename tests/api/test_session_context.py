@@ -545,7 +545,8 @@ def test_an_ai_call_in_a_correlated_subquery_is_answered():
 
 def test_an_ai_call_of_a_null_document_is_null_and_asks_no_model():
     session = quail.Session(CONFIG, tokenizer=TOKENIZER)
-    oracle = Oracle(labels=lambda spec, ids: "a", filters=lambda *_: True)
+    oracle = Oracle(labels=lambda spec, ids: "a", filters=lambda *_: True,
+                    scores=lambda *_: 0.5)
     oracle.catalog = session.catalog
     context = quail.SessionContext(
         session, physical_executor=oracle_executor(oracle))
@@ -559,6 +560,10 @@ def test_an_ai_call_of_a_null_document_is_null_and_asks_no_model():
         "SELECT r.id FROM r WHERE AI.IF(PROMPT('q: {0}', r.body))": [("r0",)],
         "SELECT r.id FROM r WHERE NOT AI.IF(PROMPT('q: {0}', r.body))": [],
         f"SELECT r.id FROM r WHERE {call} IS NULL": [("r1",)],
+        # a pair with a NULL document has no score
+        "SELECT r.id, v.id, AI.SCORE(PROMPT('q: {0} {1}', r.body, v.name)) AS s "
+        "FROM r CROSS JOIN v":
+            [("r0", "v0", 0.5), ("r0", "v1", 0.5), ("r1", "v0", None), ("r1", "v1", None)],
         # a NULL written without a type is a NULL document too
         "SELECT AI.IF(PROMPT('q: {0}', NULL)) AS k": [(None,)],
         # v1 has no partner; its row has no document, so no answer

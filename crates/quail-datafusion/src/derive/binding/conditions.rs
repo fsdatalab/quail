@@ -355,9 +355,14 @@ pub(crate) fn check_labels(
         .iter()
         .filter_map(|label| label.as_str().map(str::to_string))
         .collect();
+    // a call the query did not name has a name of Quail's
+    let subject = if name.starts_with("__quail") {
+        "an AI.CLASSIFY call".to_string()
+    } else {
+        repr_str(name)
+    };
     compile_error(format!(
-        "the filter on {} lists {}, which are not among its labels {}",
-        repr_str(name),
+        "the filter on {subject} lists {}, which are not among its labels {}",
         repr_list(&unknown),
         repr_list(&written)
     ))

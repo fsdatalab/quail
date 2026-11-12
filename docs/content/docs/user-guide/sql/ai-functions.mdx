@@ -271,8 +271,8 @@ WHERE AI.CLASSIFY(r.body, ARRAY['positive', 'negative', 'mixed'])
       IN ('negative', 'mixed');
 ```
 
-Use `=` to keep one label. A label outside the supplied array matches
-no rows.
+Use `=` to keep one label. A test that names a label outside the
+supplied array is an error.
 
 #### Classify joined rows
 

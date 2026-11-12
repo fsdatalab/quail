@@ -13,13 +13,15 @@ the answer column: TRUE or FALSE where it asked, NULL elsewhere.
 A row whose document is NULL is guarded the same way, whatever the
 plan: the model is not asked about it, a column node answers NULL for
 it, and an AI filter does not pass it. An AI join reads no such row:
-a pair with a NULL document does not match.
+a pair with a NULL document does not match. A column node over pairs
+is asked about the pairs of two documents and answers NULL for the rest.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
@@ -142,6 +144,71 @@ class Guarded:
         return NodeResult({**result.outputs, port: rows}, metrics)
 
 
+@dataclass
+class NullPairs:
+    """A pair column node's pairs with a NULL document, which it is not asked about.
+
+    Attributes:
+        node: The column node over two tables' rows.
+        present: Each input port's rows that have a document.
+        unasked: The pairs with a NULL document, with the values their
+            rows carry.
+    """
+
+    node: object
+    present: dict
+    unasked: Rows
+
+    def inputs(self, inputs: dict) -> dict:
+        """Return the node's inputs with only the rows that have a document."""
+        return {**inputs, **self.present}
+
+    def expanded(self, result: NodeResult) -> NodeResult:
+        """Add the unasked pairs to the node's rows, with NULL answers."""
+        port = self.node.rows_port
+        answered = result.outputs[port]
+        unasked = Rows({alias: self.unasked.ids[alias] for alias in answered.aliases})
+        for name in answered.column_names:
+            carried = (self.unasked.column(name) if name in self.unasked.column_names
+                       else pa.nulls(unasked.num_rows, answered.column(name).type))
+            unasked = unasked.with_column(name, carried)
+        rows = Rows.concat([answered, unasked])
+        metrics = replace(result.metrics, output_rows=rows.num_rows)
+        return NodeResult({**result.outputs, port: rows}, metrics)
+
+
+def _null_pairs(node, inputs: dict, context) -> NullPairs | None:
+    """Return the pairs a two-table column node is not asked about, if it has any."""
+    if isinstance(node, (AiFilter, AiJoin)) or not isinstance(node, DOCUMENT_NODES):
+        return None
+    sides = [inputs.get(port.name) for port in node.inputs]
+    if len(sides) != 2 or not all(
+            isinstance(side, Rows) and len(side.aliases) == 1 for side in sides):
+        return None
+    absent = []
+    for side in sides:
+        (alias,) = side.aliases
+        columns = context.sources.get(columns_key(alias))
+        absent.append(
+            np.zeros(side.num_rows, bool)
+            if columns is None or NULL_DOCUMENT not in columns.column_names
+            else pc.take(columns.column(NULL_DOCUMENT), side.ids[alias]).to_numpy(
+                zero_copy_only=False).astype(bool))
+    if not absent[0].any() and not absent[1].any():
+        return None
+    left = np.repeat(np.arange(sides[0].num_rows), sides[1].num_rows)
+    right = np.tile(np.arange(sides[1].num_rows), sides[0].num_rows)
+    unasked = absent[0][left] | absent[1][right]
+    first, second = sides[0].take(left[unasked]), sides[1].take(right[unasked])
+    pairs = Rows({**first.ids, **second.ids})
+    for carried in (first, second):
+        for name in carried.column_names:
+            pairs = pairs.with_column(name, carried.column(name))
+    present = {port.name: side.filter(pa.array(~mask))
+               for port, side, mask in zip(node.inputs, sides, absent)}
+    return NullPairs(node, present, pairs)
+
+
 def _document_alias(node) -> str | None:
     """Return the alias whose one document the node asks about, if it has one."""
     if isinstance(node, AiFilter):
@@ -153,9 +220,15 @@ def _document_alias(node) -> str | None:
 
 def reads_null_documents(node, context) -> bool:
     """Return whether the node asks about a table that has a NULL document."""
-    alias = _document_alias(node)
-    columns = None if alias is None else context.sources.get(columns_key(alias))
-    return columns is not None and NULL_DOCUMENT in columns.column_names
+    aliases = [_document_alias(node)]
+    if aliases == [None] and isinstance(node, DOCUMENT_NODES) and not isinstance(
+            node, AiFilter):
+        aliases = node.spec.aliases
+    return any(
+        alias is not None
+        and (columns := context.sources.get(columns_key(alias))) is not None
+        and NULL_DOCUMENT in columns.column_names
+        for alias in aliases)
 
 
 def present_join_inputs(node, inputs: dict, context) -> dict:
@@ -191,7 +264,7 @@ def present_join_inputs(node, inputs: dict, context) -> dict:
     return found
 
 
-def guarded(node, inputs: dict, context) -> Guarded | None:
+def guarded(node, inputs: dict, context) -> Guarded | NullPairs | None:
     """Evaluate a column node's guard over the rows it reads.
 
     Args:
@@ -204,11 +277,13 @@ def guarded(node, inputs: dict, context) -> Guarded | None:
         The rows and which of them the model is asked about, or None for
         a node without a guard.
     """
+    if (pairs := _null_pairs(node, inputs, context)) is not None:
+        return pairs
     guard = getattr(node, "guard", None)
     alternative = getattr(node, "alternative", None)
     answer = getattr(node, "answer", None)
     disjunction = getattr(node, "disjunction", None)
-    absent = reads_null_documents(node, context)
+    absent = _document_alias(node) is not None and reads_null_documents(node, context)
     if (guard is None and alternative is None and answer is None
             and disjunction is None and not absent):
         return None
