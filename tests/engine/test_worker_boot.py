@@ -65,7 +65,7 @@ SETUP = {"model": "qwen3-4b-fp8", "device": "h100-sxm", "backend": "quail",
          **ENVELOPE["settings"]}
 
 
-def test_a_prepared_boot_is_used_by_one_request(monkeypatch):
+def test_a_prepared_boot_is_used_by_one_region(monkeypatch):
     boots = []
 
     def boot(envelope, registry):
@@ -73,19 +73,19 @@ def test_a_prepared_boot_is_used_by_one_request(monkeypatch):
         return {"workers": None, "boot": {"boot_s": 3.0, "kind": "cold"}}
 
     monkeypatch.setattr(worker, "_boot_workers", boot)
-    monkeypatch.setattr(worker, "quail_runtime_payload", lambda *a: {})
-    monkeypatch.setattr(worker, "execute_staged_graph",
-                        lambda *a: {"_outputs": {}, "wall_s": 1.0})
+    monkeypatch.setattr(worker, "run_planned_region",
+                        lambda *a, **k: (None, {"_outputs": {}, "wall_s": 1.0}))
     registry = SimpleNamespace(device=lambda name: None)
-    context = SimpleNamespace(
-        registry=registry, runtime_state={}, graph=None,
-        request=SimpleNamespace(plan=ENVELOPE))
+    state = {}
 
-    worker.prepare_quail_request(context)
+    worker.prepare_quail_request(SimpleNamespace(
+        registry=registry, runtime_state=state,
+        request=SimpleNamespace(plan=ENVELOPE)))
     assert len(boots) == 1
-    assert worker.execute_quail_request(context).metrics["boot_kind"] == "cold"
+    _, report = worker.run_quail_region(ENVELOPE, registry, state)
+    assert report["boot_kind"] == "cold"
     assert len(boots) == 1
-    worker.execute_quail_request(context)
+    worker.run_quail_region(ENVELOPE, registry, state)
     assert len(boots) == 2
 
 

@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import json
 import time
+from functools import partial
 
 import pyarrow as pa
 
 from quail.backends.quail.executor.memory import memory_report, merge_memory_reports
 from quail.backends.quail.retention import apply_retention
 from quail.common.pairs import columns_key
-from quail.common.tokens import documents_from_table, token_table
-from quail.execution.finished import finished_rows, hinted_tables, region_hint
+from quail.common.tokens import documents_from_table
 from quail.execution.metrics import NodeResult, scalar_node_metrics
 from quail.execution.runner import (
     ExecutionContext,
@@ -21,7 +21,6 @@ from quail.execution.stages import (
     answer_hint,
     merged_run,
     payload_first_rows,
-    plain,
     ran_from_message,
     ran_message,
     serve_stages,
@@ -40,6 +39,7 @@ from quail.physical import (
     PhysicalGraph,
     Scan,
 )
+from quail.physical.plan import graph_from_envelope
 from quail.progress import answer_sink, progress_sink
 
 
@@ -145,22 +145,6 @@ def execution_measurements(context: ExecutionContext) -> dict:
 _PAYLOAD_TABLES = ("documents", "texts", "columns")
 
 
-def region_tables(payload: dict) -> list:
-    """Return a payload's documents, texts, and columns as named tables.
-
-    A worker reads them over the same pages, by the names
-    ``payload_tables`` reads.
-    """
-    tables = []
-    for alias, documents in payload.get("documents", {}).items():
-        tables.append((f"documents:{alias}", token_table(documents)))
-    for alias, texts in payload.get("texts", {}).items():
-        tables.append((f"texts:{alias}", pa.table({"text": texts})))
-    for alias, columns in payload.get("columns", {}).items():
-        tables.append((f"columns:{alias}", columns))
-    return tables
-
-
 def payload_tables(tables: dict) -> dict:
     """Return the documents, texts, and columns of ``region_tables``' tables."""
     payload = {name: {} for name in _PAYLOAD_TABLES}
@@ -193,7 +177,7 @@ def serve_region(state, payload, graph: PhysicalGraph, end, wanted,
                 end, context, compute_subgraph(graph), payload["stages"],
                 wanted, hinted, payload_first_rows(payload) if hinted else None)
         torch.cuda.synchronize()
-        # execute_staged_graph times the region, so the files fall inside it
+        # the region is timed until its end, so the files fall inside it
         arena.write_trace_files()
     finally:
         for key in arena.resident_keys():
@@ -201,59 +185,84 @@ def serve_region(state, payload, graph: PhysicalGraph, end, wanted,
     end.ran(*ran_message(results, execution_measurements(context)))
 
 
-def execute_staged_graph(payload, graph: PhysicalGraph, gpus: int, workers,
-                         device) -> dict:
-    """Run a region's stages on one worker per GPU and report the run.
-
-    Each row a stage finishes goes to the region's FinishedRows, when
-    the region reports to one.
+def answer_region(hint, sinks, question: str):
+    """Answer a worker's question from the region's hint and listeners.
 
     Args:
-        payload: The query's runtime payload, with the plan's stages
-            under "stages".
-        graph: The region's graph.
-        gpus: How many GPUs, one worker each.
-        workers: The GPUs' ``_quail_native.Workers``.
-        device: The GPUs' device spec.
+        hint: The region's ``InputHint``, or None.
+        sinks: The progress sink and the answer sink, each or None.
+        question: The question, as JSON.
+
+    Returns:
+        The answer as JSON text, or a table for a table's kept rows.
     """
-    compute = compute_subgraph(graph)
-    rows = finished_rows()
-    # None when no one takes the region's rows as they finish
-    wanted = None if rows is None else [
-        (node.node_id, port.name) for node in compute.nodes
-        for port in node.outputs if rows.wants(node.node_id, port.name)]
+    found = json.loads(question)
+    if "hint" in found:
+        return answer_hint(hint, found)
+    for sink, name in zip(sinks, ("progress", "answer"), strict=True):
+        if name in found and sink is not None:
+            sink(*found[name])
+    return "null"
 
-    def report(table: pa.Table) -> None:
-        if rows is not None:
-            rows.report(table)
 
-    # the workers' threads ask; the hint and the sinks are this thread's
-    hint, sinks = region_hint(), (progress_sink(), answer_sink())
+def run_planned_region(workers, envelope: dict, device, *, operators: str,
+                       scans: dict, source_rows: dict, on_rows=None, hint=None,
+                       hinted: dict | None = None) -> tuple[pa.Table, dict]:
+    """Run a planned region on the GPUs' workers and report the run.
 
-    def ask(question: str):
-        found = json.loads(question)
-        if "hint" in found:
-            return answer_hint(hint, found)
-        for sink, name in zip(sinks, ("progress", "answer"), strict=True):
-            if name in found and sink is not None:
-                sink(*found[name])
-        return "null"
+    Rust sends the region to the workers, runs its stages, and builds
+    its rows (``quail_python::region_run``).
 
-    region = json.dumps({
-        "query": {name: value for name, value in payload.items()
-                  if name not in _PAYLOAD_TABLES},
-        "wanted": wanted, "hinted": hinted_tables(),
-        "listening": [sink is not None for sink in sinks],
-    }, default=plain)
+    Args:
+        workers: The GPUs' ``_quail_native.Workers``.
+        envelope: The plan's envelope.
+        device: The GPUs' device spec.
+        operators: The operators the plan lowers, as Rust's JSON.
+        scans: By alias, each scan's token store and the columns of its
+            rows, as pyarrow Tables.
+        source_rows: By alias, each document's row in the registered
+            table, for a scan that reads some of a table's rows.
+        on_rows: Optional callable(pyarrow Table) handed each batch of
+            the region's rows as it is built.
+        hint: The region's ``InputHint``, or None.
+        hinted: Each scan alias's table name, for the tables the hint
+            holds rows of; None without a hint.
+
+    Returns:
+        The region's rows, and the run's report with its outputs under
+        "_outputs".
+    """
+    # the workers' threads ask; the sinks are this thread's
+    sinks = (progress_sink(), answer_sink())
     started = time.perf_counter()
-    ran = workers.run_region(
-        region, region_tables(payload), compute.to_json(),
-        json.dumps(payload["stages"]), report, ask)
+    rows, ran = workers.run_planned(
+        json.dumps(envelope), operators, scans, source_rows, hinted,
+        tuple(sink is not None for sink in sinks), on_rows,
+        partial(answer_region, hint, sinks))
     wall = time.perf_counter() - started
+    graph = graph_from_envelope(envelope)
+    return rows, region_report(
+        graph, ran, wall, device, gpus=envelope["gpus"],
+        gpu_timing=envelope["settings"].get("gpu_timing", False))
+
+
+def region_report(graph: PhysicalGraph, ran: list, wall: float, device, *,
+                  gpus: int, gpu_timing: bool = False) -> dict:
+    """Report a region's run from what each worker ran.
+
+    Args:
+        graph: The region's graph.
+        ran: Per worker, what it ran as ``ran_message`` wrote it.
+        wall: Seconds the region took.
+        device: The GPUs' device spec.
+        gpus: How many GPUs.
+        gpu_timing: Whether to report GPU seconds and chunks.
+    """
     outputs = [ran_from_message(text, tables) for text, tables in ran]
-    result = merged_run(compute, [output["results"] for output in outputs])
+    result = merged_run(compute_subgraph(graph),
+                        [output["results"] for output in outputs])
     report = graph_report(graph, result, wall, device, gpus=gpus,
-                          gpu_timing=payload.get("gpu_timing", False))
+                          gpu_timing=gpu_timing)
     report.update(
         kv_manager={name: _summed([output["kv_manager"][name] for output in outputs])
                     for name in outputs[0]["kv_manager"]},

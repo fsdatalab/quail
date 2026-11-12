@@ -9,9 +9,9 @@ from quail.backends.base import GpuContext
 from quail.backends.quail.executor.models import supported_archs
 from quail.backends.quail.executor.runtime import QuailModelExecution
 from quail.backends.quail.worker import (
-    execute_quail_request,
     prepare_quail_request,
     release_quail_request,
+    run_quail_region,
 )
 from quail.specs import DEVICES, SupportResult
 
@@ -57,9 +57,14 @@ class QuailBackend:
         """Boot the GPU for a request before its documents are ready."""
         prepare_quail_request(context)
 
-    def execute_request(self, context) -> Any:
-        """Run one Quail request inside a compute process."""
-        return execute_quail_request(context)
+    def run_region(self, envelope, registry, runtime_state, **region) -> Any:
+        """Run a planned region on the GPUs' workers.
+
+        Returns:
+            The region's rows, and the run's report with its outputs
+            under "_outputs".
+        """
+        return run_quail_region(envelope, registry, runtime_state, **region)
 
     def release_request(self, state) -> None:
         """Release the GPU processes and the model loaded for one configuration."""

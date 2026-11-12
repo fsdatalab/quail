@@ -103,14 +103,9 @@ impl CutNode {
     }
 }
 
-/// Cut a graph's compute nodes, the nodes on the GPU executor or a
-/// backend and the nodes they read, into stages for `gpus` GPUs.
-///
-/// # Errors
-///
-/// The graph is invalid, or a node reads a port no scan or stage writes.
-pub fn stages(graph: &PhysicalGraph, gpus: usize) -> Result<Vec<Stage>, String> {
-    crate::physical::validate_graph(&graph.nodes, &graph.root)?;
+/// A graph's compute nodes: the nodes on the GPU executor or a backend
+/// and the nodes they read, as indices in topological order.
+pub fn compute_nodes(graph: &PhysicalGraph) -> Vec<usize> {
     let by_id: BTreeMap<&str, &PhysicalNode> =
         graph.nodes.iter().map(|node| (node.id(), node)).collect();
     let mut pending: Vec<&str> = graph
@@ -122,17 +117,26 @@ pub fn stages(graph: &PhysicalGraph, gpus: usize) -> Result<Vec<Stage>, String> 
     let mut compute = BTreeSet::new();
     while let Some(id) = pending.pop() {
         if compute.insert(id) {
-            pending.extend(
-                by_id[id]
-                    .inputs()
-                    .iter()
-                    .map(|input| input.source.node_id.as_str()),
-            );
+            let inputs = by_id.get(id).map(|node| node.inputs()).unwrap_or_default();
+            pending.extend(inputs.iter().map(|input| input.source.node_id.as_str()));
         }
     }
-    let nodes: Vec<CutNode> = topological_nodes(&graph.nodes)
+    topological_nodes(&graph.nodes)
         .into_iter()
         .filter(|index| compute.contains(graph.nodes[*index].id()))
+        .collect()
+}
+
+/// Cut a graph's compute nodes, the nodes on the GPU executor or a
+/// backend and the nodes they read, into stages for `gpus` GPUs.
+///
+/// # Errors
+///
+/// The graph is invalid, or a node reads a port no scan or stage writes.
+pub fn stages(graph: &PhysicalGraph, gpus: usize) -> Result<Vec<Stage>, String> {
+    crate::physical::validate_graph(&graph.nodes, &graph.root)?;
+    let nodes: Vec<CutNode> = compute_nodes(graph)
+        .into_iter()
         .map(|index| CutNode::of(&graph.nodes[index]))
         .collect();
     if gpus == 1 {

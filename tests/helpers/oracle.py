@@ -705,25 +705,33 @@ def _serve(model, path):
             end.fail(traceback.format_exc())
 
 
-def oracle_executor(oracle: Oracle, **report):
-    """Return a physical executor that runs each request's graph on the oracle.
+class OracleWorkers:
+    """Workers that answer from an oracle, in place of the GPUs' workers.
 
-    A plan on several GPUs runs as stages, each GPU's on a thread with a
-    copy of the oracle; the copies share the lists of what was asked.
+    A query run with ``physical_executor=OracleWorkers(...)`` runs as on
+    GPUs: Rust sends each worker the region and its tables, and each
+    worker is a thread that answers from the oracle. A plan on several
+    GPUs gives each a copy of the oracle; the copies share the lists of
+    what was asked.
 
     Args:
         oracle: The oracle answering the model operators.
-        **report: Report fields the response carries, such as wall_s.
+        **report: Report fields the run carries, such as wall_s.
     """
-    def execute(request):
-        from quail.backends import BackendExecutionContext
-        from quail.backends.quail.worker import execute_quail_request
-        from quail.builtins import built_in_registry
-        from quail.execution.types import PhysicalResponse
+
+    def __init__(self, oracle: Oracle, **report):
+        self.oracle = oracle
+        self.report = {"wall_s": 1.0, "boot_s": 0.5, "fresh_tokens": 1234,
+                       **report}
+        self._workers = None
+
+    def start_workers(self, request) -> dict:
+        """Start a worker per GPU of the request; returns them with a boot record."""
         from quail.physical import Scan
 
-        graph = graph_from_envelope(request.plan)
-        scans = [node for node in graph.nodes if isinstance(node, Scan)]
+        oracle = self.oracle
+        scans = [node for node in graph_from_envelope(request.plan).nodes
+                 if isinstance(node, Scan)]
         oracle.documents = {node.alias: request.inputs[node.input_id].documents
                             for node in scans}
         oracle.texts = {node.alias: request.inputs[node.input_id].texts
@@ -732,26 +740,53 @@ def oracle_executor(oracle: Oracle, **report):
                               for alias, rows in request.source_rows.items()}
         models = [oracle] if request.gpus == 1 else [
             copy.copy(oracle) for _ in range(request.gpus)]
-        # the request runs as on GPUs, with each worker a thread that
-        # answers from the oracle
-        workers = _quail_native.Workers(request.gpus)
-        try:
-            for model, path in zip(models, workers.paths, strict=True):
-                threading.Thread(target=_serve, args=(model, str(path)),
-                                 daemon=True).start()
-            workers.connect()
-            booted = {"workers": workers, "boot": {"boot_s": 0.5, "kind": "warm"}}
-            response = execute_quail_request(BackendExecutionContext(
-                request=request, graph=graph, registry=built_in_registry(),
-                gpus=request.gpus, runtime_state={"booted": booted}))
-        finally:
-            workers.close()
-        return PhysicalResponse(response.outputs, {
-            **response.metrics, "wall_s": 1.0, "boot_s": 0.5,
-            "fresh_tokens": 1234, **report})
+        self._workers = workers = _quail_native.Workers(request.gpus)
+        for model, path in zip(models, workers.paths, strict=True):
+            threading.Thread(target=_serve, args=(model, str(path)),
+                             daemon=True).start()
+        workers.connect()
+        return {"workers": workers, "boot": {"boot_s": 0.5, "kind": "warm"}}
 
-    execute.oracle = oracle
-    return execute
+    def close(self) -> None:
+        """Stop the workers."""
+        workers, self._workers = self._workers, None
+        if workers is not None:
+            workers.close()
+
+    def __call__(self, request):
+        """Run a request's graph on the oracle, as a physical executor.
+
+        A test that wraps the executor in a callable of its own runs a
+        request this way.
+        """
+        from helpers.fakes import run_on_workers
+        from quail.execution.types import PhysicalResponse
+        from quail.specs import DEVICES
+
+        booted = self.start_workers(request)
+        try:
+            oracle = self.oracle
+            payload = {
+                "physical_plan": request.plan, **request.plan["settings"],
+                "documents": oracle.documents, "columns": request.column_tables(),
+                "texts": {alias: texts for alias, texts in oracle.texts.items()
+                          if texts is not None}}
+            result = run_on_workers(
+                booted["workers"], payload, graph_from_envelope(request.plan),
+                DEVICES[request.plan["device"]])
+        finally:
+            self.close()
+        return PhysicalResponse(result.pop("_outputs"), {**result, **self.report})
+
+
+def oracle_executor(oracle: Oracle, **report) -> OracleWorkers:
+    """Return workers that answer each request from the oracle.
+
+    Args:
+        oracle: The oracle answering the model operators.
+        **report: Report fields the run carries, such as wall_s.
+    """
+    return OracleWorkers(oracle, **report)
 
 
 def finish(query, oracle: Oracle, **report):

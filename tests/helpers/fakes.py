@@ -8,12 +8,15 @@ length, and the join frame is [FRAME] * length.
 import json
 import random
 import threading
+import time
 import traceback
 from contextlib import nullcontext
+from functools import partial
 from types import SimpleNamespace
 
 import _quail_native
 import numpy as np
+import pyarrow as pa
 
 from quail.backends.quail import QuailModelExecution
 from quail.backends.quail.executor import chunk as chunk_mod
@@ -21,12 +24,17 @@ from quail.backends.quail.executor.arena import KVArena
 from quail.backends.quail.executor.models.base import ModelPipeline
 from quail.backends.quail.executor.pages import PageArena
 from quail.backends.quail.graph import (
-    execute_staged_graph,
+    answer_region,
     payload_tables,
+    region_report,
     serve_region,
 )
 from quail.builtins import built_in_registry
 from quail.common.expressions import ColumnRef
+from quail.common.tokens import token_table
+from quail.execution.finished import finished_rows, hinted_tables, region_hint
+from quail.execution.runner import compute_subgraph
+from quail.execution.stages import plain
 from quail.physical import (
     AiFilter,
     AiJoin,
@@ -37,6 +45,7 @@ from quail.physical import (
     Scan,
     input_ports,
 )
+from quail.progress import answer_sink, progress_sink
 from quail.specs import DEVICES, MODELS
 
 DOC = 1000
@@ -422,6 +431,53 @@ def run_graph(state, payload, graph) -> dict:
     return run_on_threads([state], payload, graph, state["device"])
 
 
+def region_tables(payload: dict) -> list:
+    """Return a payload's documents, texts, and columns as named tables."""
+    tables = []
+    for alias, documents in payload.get("documents", {}).items():
+        tables.append((f"documents:{alias}", token_table(documents)))
+    for alias, texts in payload.get("texts", {}).items():
+        tables.append((f"texts:{alias}", pa.table({"text": texts})))
+    for alias, columns in payload.get("columns", {}).items():
+        tables.append((f"columns:{alias}", columns))
+    return tables
+
+
+def run_on_workers(workers, payload, graph, device) -> dict:
+    """Run a hand-built region's stages on workers and report the run.
+
+    A test that builds a graph without a query runs it here: the
+    region's rows go to the FinishedRows the test reports to, and the
+    workers ask the test's hint.
+
+    Args:
+        workers: The ``_quail_native.Workers`` to run on.
+        payload: The query's runtime payload, with its stages.
+        graph: The region's graph.
+        device: The GPUs' device spec.
+    """
+    compute = compute_subgraph(graph)
+    rows = finished_rows()
+    wanted = None if rows is None else [
+        (node.node_id, port.name) for node in compute.nodes
+        for port in node.outputs if rows.wants(node.node_id, port.name)]
+    sinks = (progress_sink(), answer_sink())
+    region = json.dumps({
+        "query": {name: value for name, value in payload.items()
+                  if name not in ("documents", "texts", "columns")},
+        "wanted": wanted, "hinted": hinted_tables(),
+        "listening": [sink is not None for sink in sinks]}, default=plain)
+    started = time.perf_counter()
+    ran = workers.run_region(
+        region, region_tables(payload), compute.to_json(),
+        json.dumps(payload["stages"]),
+        lambda table: None if rows is None else rows.report(table),
+        partial(answer_region, region_hint(), sinks))
+    return region_report(graph, ran, time.perf_counter() - started, device,
+                         gpus=len(workers.paths),
+                         gpu_timing=payload.get("gpu_timing", False))
+
+
 def run_on_threads(states, payload, graph, device) -> dict:
     """Run a region's stages on workers that each serve a GPU on a thread.
 
@@ -441,7 +497,7 @@ def run_on_threads(states, payload, graph, device) -> dict:
                              args=(state, payload, graph, str(path)),
                              daemon=True).start()
         workers.connect()
-        return execute_staged_graph(payload, graph, len(states), workers, device)
+        return run_on_workers(workers, payload, graph, device)
     finally:
         workers.close()
 

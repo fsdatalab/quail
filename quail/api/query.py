@@ -474,9 +474,7 @@ class RegionQuery:
         # Rust builds what the workers read: each document's text, and
         # the value columns with each table's first documents
         tables = dict(_quail_native.request_tables(
-            json.dumps(envelope), self.operators,
-            {alias: (store.tokens.table, store.columns)
-             for alias, store in self._token_inputs.items()}))
+            json.dumps(envelope), self.operators, self.scan_tables()))
         inputs = {}
         for node in plan.nodes:
             if not isinstance(node, Scan):
@@ -490,6 +488,11 @@ class RegionQuery:
                      if name.startswith("columns:")}
         return PhysicalRequest(envelope, inputs, relations,
                                self._alias_source_rows())
+
+    def scan_tables(self) -> dict:
+        """Each scan's token store and the columns of its rows, by alias."""
+        return {alias: (store.tokens.table, store.columns)
+                for alias, store in self._token_inputs.items()}
 
     def _alias_source_rows(self) -> dict:
         """Each filtered input's rows in its registered table, by scan alias."""
@@ -509,8 +512,8 @@ class RegionQuery:
                                           on_rows)
 
     def finish(self, response, coordinator_wall: float = 0.0,
-               finished=None) -> QueryResult:
-        """Build the region's rows from the run's outputs, with its report.
+               finished=None, relation: pa.Table | None = None) -> QueryResult:
+        """Return the region's result: its rows and the run's report.
 
         Args:
             response: The run's PhysicalResponse.
@@ -518,6 +521,7 @@ class RegionQuery:
             finished: The FinishedRows the run reported to, or None for
                 a new one. Every returned output is reported to it, so it
                 builds each row the run's operators did not report.
+            relation: The region's rows, when the run built them.
         """
         plan = self.plan()
         out = response.metrics
@@ -525,16 +529,9 @@ class RegionQuery:
             plan.backend, plan.estimated_seconds, plan.settings.get("order_rule"),
             json.dumps(out, default=str), coordinator_wall))
         tables = _output_tables(response.outputs)
-        if finished is None:
-            finished = self.finished_rows()
-        for node in plan.graph.topological_nodes():
-            for output in node.outputs:
-                table = tables.get((node.node_id, output.name))
-                if table is not None and finished.wants(node.node_id, output.name):
-                    finished.report(finished_table(node.node_id, output.name, table))
-        finished.finish()
-        rows = finished.rows()
-        result = QueryResult.from_table(rows, report=report)
+        if relation is None:
+            relation = self._built_rows(tables, finished)
+        result = QueryResult.from_table(relation, report=report)
         result.plan = plan.graph
         result.physical_plan = plan
         result.region_id = self.region_id
@@ -544,7 +541,7 @@ class RegionQuery:
             if isinstance(node, Limit):
                 # Rust keeps the region's first rows as it builds them
                 measured[node.node_id] = scalar_node_metrics({node.node_id: NodeResult(
-                    {}, NodeMetrics(output_rows=rows.num_rows))})[node.node_id]
+                    {}, NodeMetrics(output_rows=relation.num_rows))})[node.node_id]
         result.node_metrics = {
             node_id: NodeMetrics.from_scalars(metrics)
             for node_id, metrics in measured.items()}
@@ -562,6 +559,18 @@ class RegionQuery:
             report["observers"] = observer_reports
         self._collect_answers(result, plan, tables)
         return result
+
+    def _built_rows(self, tables: dict, finished=None) -> pa.Table:
+        """Build the region's rows from a run's output tables."""
+        if finished is None:
+            finished = self.finished_rows()
+        for node in self.plan().graph.topological_nodes():
+            for output in node.outputs:
+                table = tables.get((node.node_id, output.name))
+                if table is not None and finished.wants(node.node_id, output.name):
+                    finished.report(finished_table(node.node_id, output.name, table))
+        finished.finish()
+        return finished.rows()
 
     def _source_values(self, name: str, expression: str) -> pa.Table:
         """Return a source column's values for each document of its table.

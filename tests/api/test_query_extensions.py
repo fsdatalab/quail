@@ -30,8 +30,7 @@ def test_query_scans_provider_and_preserves_extension_objects(
     )
     calls = []
 
-    def execute(physical, registry):
-        assert registry is session.registry
+    def execute(physical):
         calls.append("execute")
         assert "extensions" not in physical.plan
         assert physical.plan["device"] == session.config.device
@@ -51,9 +50,11 @@ def test_query_scans_provider_and_preserves_extension_objects(
             {"wall_s": 1.0, "boot_s": 0.0, "fresh_tokens": 4},
         )
 
-    monkeypatch.setattr(runtime, "gpu_problem", lambda: None)
-    monkeypatch.setattr(runtime, "_execute_physical", execute)
-    monkeypatch.setattr(runtime, "_prepare_backend", lambda plan, registry: None)
+    original = runtime.execute_query
+    # Query.run binds execute_query at import, so patch it there
+    monkeypatch.setattr(
+        "quail.api.query.execute_query",
+        lambda q, plan=None: original(q, physical_executor=execute, plan=plan))
 
     session.register(
         "documents", quail.DocumentProvider.from_parquet(path, id_col="id")

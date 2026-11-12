@@ -31,14 +31,12 @@ from quail.backends.quail.executor.readout import (
 )
 from quail.backends.quail.executor.warmup import warm_kernels
 from quail.backends.quail.graph import (
-    execute_staged_graph,
     payload_tables,
+    run_planned_region,
     serve_region,
 )
 from quail.backends.resources import freeze_loaded_objects, release_models
 from quail.common import budgets
-from quail.execution.types import PhysicalResponse
-from quail.physical import Scan
 from quail.physical.plan import graph_from_envelope
 from quail.progress import (
     say,
@@ -290,28 +288,6 @@ def _boot_record(gpu, cold, warm_s, warm_tier, t_boot):
     return boot
 
 
-def quail_runtime_payload(request, graph) -> dict:
-    """Build private Quail scheduler state from a standard request."""
-    envelope = request.plan
-    documents = {}
-    texts = {}
-    for node in graph.nodes:
-        if not isinstance(node, Scan):
-            continue
-        documents[node.alias] = request.inputs[node.input_id].documents
-        if request.inputs[node.input_id].texts is not None:
-            texts[node.alias] = request.inputs[node.input_id].texts
-    return {
-        "physical_plan": envelope,
-        "model": envelope["model"],
-        "gpus": envelope["gpus"],
-        "documents": documents,
-        "texts": texts,
-        "columns": request.column_tables(),
-        **dict(envelope["settings"]),
-    }
-
-
 def _boot_gpu(gpu, backend, gpu_context, chunk_tokens, true_ids, false_ids,
               arena_pages=None, *, model_path=None):
     """Prepare a GPU for a query, releasing it when preparation fails.
@@ -506,17 +482,27 @@ def prepare_quail_request(context) -> None:
         context.request.plan, context.registry)
 
 
-def execute_quail_request(context):
-    """Run one Quail request on the GPUs' worker processes."""
-    payload = quail_runtime_payload(context.request, context.graph)
-    envelope, registry = context.request.plan, context.registry
-    # a boot prepared for this request is used once
-    booted = (context.runtime_state.pop("booted", None)
+def run_quail_region(envelope, registry, runtime_state, **region):
+    """Run a planned region on the GPUs' worker processes.
+
+    Args:
+        envelope: The plan's envelope.
+        registry: The session's registry.
+        runtime_state: The backend's state, which may hold a boot
+            prepared for this region.
+        **region: What ``run_planned_region`` reads of the region.
+
+    Returns:
+        The region's rows, and the run's report with its outputs under
+        "_outputs".
+    """
+    # a boot prepared for this region is used once
+    booted = (runtime_state.pop("booted", None)
               or _boot_workers(envelope, registry))
     try:
-        report = execute_staged_graph(
-            payload, context.graph, envelope["gpus"], booted["workers"],
-            registry.device(envelope["device"]))
+        rows, report = run_planned_region(
+            booted["workers"], envelope, registry.device(envelope["device"]),
+            **region)
     except BaseException:
         # a worker may be partway through the region: start afresh
         _close_workers()
@@ -525,6 +511,4 @@ def execute_quail_request(context):
     report["boot_s"] = boot["boot_s"]
     report["boot_kind"] = boot["kind"]
     report["boot"] = boot
-    outputs = report.pop("_outputs")
-    return PhysicalResponse(outputs, report)
-
+    return rows, report
