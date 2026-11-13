@@ -10,8 +10,8 @@ rows 2
 --- SELECT d.id FROM (SELECT r.id, r.stars FROM reviews r WHERE AI_FILTER(PROMPT('kind: {0}', r.body)) LIMIT 3) d WHERE d.stars > 3 ---
 plan
   __quail_answer_1 = ai_filter('kind: {0}', r.body), filter: __quail_answer_1, fetch: 3, returns: []
-asked 5 of 6
-  'kind: {0}': r0 FALSE, r1 TRUE, r2 TRUE, r3 FALSE, r4 TRUE
+asked 6 of 6
+  'kind: {0}': r0 FALSE, r1 TRUE, r2 TRUE, r3 FALSE, r4 TRUE, r5 TRUE
 rows 3
   r1
   r2

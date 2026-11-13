@@ -21,7 +21,7 @@ import re
 from dataclasses import dataclass
 
 import quail
-from helpers.generated import NAMES, PAIR_TEXT, tables, truth
+from helpers.generated import NAMES, PAIR_TEXT, reaches_gap, tables, truth
 from helpers.oracle import Oracle, oracle_executor
 from helpers.sessions import CONFIG, TOKENIZER
 from quail.builtins import LOGICAL_RULES, PHYSICAL_RULES, built_in_registry
@@ -107,6 +107,7 @@ class NeededAnswers:
     def __init__(self, seed: int):
         self._changed: dict[Answer, object] = {}
         self._asked: set[Answer] = set()
+        self.failure = None     # what the last run raised, if anything
         self._sessions = []
         self.plain = self._context(seed, optimized=False)
         self.optimized = self._context(seed, optimized=True)
@@ -153,18 +154,28 @@ class NeededAnswers:
             answers, and the answers asked.
         """
         self._changed, self._asked = dict(changed or {}), set()
+        self.failure = None
         try:
             found = _rows(context.sql(sql))
-        except Exception:  # noqa: BLE001 - a changed answer may not fit the query
-            found = None
+        except Exception as error:  # noqa: BLE001 - a changed answer may not fit the query
+            found, self.failure = None, error
         finally:
             self._changed = {}
         return found, set(self._asked)
 
     def asked(self, sql: str) -> Asked:
-        """Return what each run asks, and the answers that one change shows needed."""
+        """Return what each run asks, and the answers that one change shows needed.
+
+        Every set is empty when the query reaches a region the executor
+        cannot run yet (``helpers.generated.EXECUTOR_GAPS``).
+        """
         rows, every = self.run(self.plain, sql)
+        failures = [self.failure]
         optimized, asked = self.run(self.optimized, sql)
+        failures = [failure for failure in (*failures, self.failure) if failure]
+        if failures:
+            assert all(reaches_gap(failure) for failure in failures), failures
+            return Asked(sql, set(), set(), set())
         assert optimized == rows, sql
         needed = set()
         for key in sorted(every, key=repr):

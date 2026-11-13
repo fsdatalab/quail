@@ -139,12 +139,18 @@ def test_a_full_join_offers_its_classification_and_test_above_the_join():
 
 # an AI operator returns the added columns the SELECT list above it
 # reads, and an extraction asks only the fields the query reads
-EXTRACTED = pa.table({"id": ["r0", "r1", "r2"], "body": ["ab x", "cd", "ab y"]})
+EXTRACTED = pa.table({"id": ["r0", "r1", "r2"], "body": ["ab x", "cd e", "ab y"]})
 
 
 def test_an_extraction_returns_and_asks_only_what_the_query_reads():
+    bodies = dict(zip(*(EXTRACTED.column(name).to_pylist()
+                        for name in ("id", "body"))))
+
     def answer(kind, prompt, rows):
-        return None if rows[0] == "r1" else f"ab {prompt}"
+        # each question copies its own part of the text
+        first, last = bodies[rows[0]].split()
+        return None if rows[0] == "r1" else {
+            "which?": first, "what?": last, "who?": f"{first} {last}"}[prompt]
 
     questions = "{'w': 'which?', 'v': 'what?', 'u': 'who?'}"
     nested = f"(SELECT r.id, AI_EXTRACT(r.body, {questions}) AS e FROM reviews r) x"

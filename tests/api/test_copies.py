@@ -32,7 +32,7 @@ def test_a_filter_asks_once_per_text_and_a_join_once_per_pair_of_texts():
     self_join = ("SELECT a.id, b.id FROM reviews a JOIN reviews b "
                  "ON a.hotel = b.hotel "
                  "AND AI_FILTER(PROMPT('Do {0} and {1} agree?', a.body, b.body))")
-    with Transcripts({"reviews": REVIEWS}, _answer, pipelines=True) as runs:
+    with Transcripts({"reviews": REVIEWS}, _answer) as runs:
         filtered = runs.query(short)
     with Transcripts({"reviews": REVIEWS}, _answer) as runs:
         joined = runs.query(self_join)

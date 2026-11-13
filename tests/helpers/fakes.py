@@ -376,18 +376,6 @@ class FakeArena:
         pass
 
 
-def graph_state(model_execution, documents):
-    return {
-        "gpu": SimpleNamespace(torch=fake_torch(), arena=FakeArena(),
-                               pipeline=fake_pipeline(), execution=model_execution,
-                               spec=MODELS["qwen3-4b-fp8"]),
-        "runtimes": built_in_registry().runtimes,
-        "device": DEVICES["h100-sxm"],
-        "chunk_tokens": 8192,
-        "documents": documents,
-    }
-
-
 def plain_arena(pages=64):
     import torch
 
@@ -416,7 +404,7 @@ def run_graph(state, payload, graph) -> dict:
     The graph is one stage, which a thread serves as a worker.
 
     Args:
-        state: The executor's state, as ``graph_state`` builds it.
+        state: The executor's state: its "gpu", runtimes, device, and documents.
         payload: The query's runtime payload, without its stages.
         graph: The region's graph.
     """
@@ -488,7 +476,7 @@ def run_on_threads(states, payload, graph, device) -> dict:
     executor state given for that GPU.
 
     Args:
-        states: Per GPU, the executor's state, as ``graph_state`` builds it.
+        states: Per GPU, the executor's state, as ``run_graph`` takes it.
         payload: The query's runtime payload.
         graph: The region's graph.
         device: The GPUs' device spec.

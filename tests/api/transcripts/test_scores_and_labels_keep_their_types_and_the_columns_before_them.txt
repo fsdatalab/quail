@@ -3,12 +3,12 @@ plan
   s = ai_score('Refund? {0}', d.body)
   topic = ai_classify('Topic {0}', d.body, make_array('refund', 'praise'))
 asked 4 of 4
-  'Refund? {0}': d1 0.1, d2 0.2
+  'Refund? {0}': d1 0.125, d2 0.25
   'Topic {0}': d1 'refund', d2 'praise'
 columns d.id string, s double, topic string
 rows 2
-  d1, 0.1, 'refund'
-  d2, 0.2, 'praise'
+  d1, 0.125, 'refund'
+  d2, 0.25, 'praise'
 
 --- SELECT d.id, AI.SCORE(PROMPT('Refund? {0}', d.body)) AS s, AI.CLASSIFY(PROMPT('Topic {0}', d.body), ARRAY['refund','praise']) AS topic FROM documents d WHERE AI.SCORE(PROMPT('Refund? {0}', d.body)) >= 0.15 ---
 plan
@@ -16,11 +16,11 @@ plan
   s = ai_score('Refund? {0}', d.body)
   __quail_answer_1 = ai_score('Refund? {0}', d.body), filter: __quail_answer_1 >= Float64(0.15), returns: []
 asked 3 of 3
-  'Refund? {0}': d1 0.1, d2 0.2
+  'Refund? {0}': d1 0.125, d2 0.25
   'Topic {0}': d2 'praise'
 columns d.id string, s double, topic string
 rows 1
-  d2, 0.2, 'praise'
+  d2, 0.25, 'praise'
 
 --- SELECT d.id, AI.SCORE(PROMPT('Refund? {0}', d.body)) AS s, AI.CLASSIFY(PROMPT('Topic {0}', d.body), ARRAY['refund','praise']) AS topic FROM documents d WHERE AI.CLASSIFY(PROMPT('Topic {0}', d.body), ARRAY['refund','praise']) IN ('praise') AND AI.SCORE(PROMPT('Refund? {0}', d.body)) >= 0.15 ---
 plan
@@ -28,23 +28,23 @@ plan
   topic = ai_classify('Topic {0}', d.body, make_array('refund', 'praise')), filter: topic = 'praise'
   __quail_answer_1 = ai_score('Refund? {0}', d.body), filter: __quail_answer_1 >= Float64(0.15), returns: []
 asked 3 of 4
-  'Refund? {0}': d1 0.1, d2 0.2
+  'Refund? {0}': d1 0.125, d2 0.25
   'Topic {0}': d2 'praise'
 columns d.id string, s double, topic string
 rows 1
-  d2, 0.2, 'praise'
+  d2, 0.25, 'praise'
 
 --- SELECT d.id, AI.CLASSIFY(PROMPT('Topic {0}', d.body), ARRAY['refund','praise']) AS topic, AI.SCORE(PROMPT('Refund? {0}', d.body)) AS s FROM documents d  ---
 plan
   s = ai_score('Refund? {0}', d.body)
   topic = ai_classify('Topic {0}', d.body, make_array('refund', 'praise'))
 asked 4 of 4
-  'Refund? {0}': d1 0.1, d2 0.2
+  'Refund? {0}': d1 0.125, d2 0.25
   'Topic {0}': d1 'refund', d2 'praise'
 columns d.id string, topic string, s double
 rows 2
-  d1, 'refund', 0.1
-  d2, 'praise', 0.2
+  d1, 'refund', 0.125
+  d2, 'praise', 0.25
 
 --- SELECT d.id, AI.CLASSIFY(PROMPT('Topic {0}', d.body), ARRAY['refund','praise']) AS topic, AI.SCORE(PROMPT('Refund? {0}', d.body)) AS s FROM documents d WHERE AI.SCORE(PROMPT('Refund? {0}', d.body)) >= 0.15 ---
 plan
@@ -52,11 +52,11 @@ plan
   topic = ai_classify('Topic {0}', d.body, make_array('refund', 'praise'))
   __quail_answer_1 = ai_score('Refund? {0}', d.body), filter: __quail_answer_1 >= Float64(0.15), returns: []
 asked 3 of 3
-  'Refund? {0}': d1 0.1, d2 0.2
+  'Refund? {0}': d1 0.125, d2 0.25
   'Topic {0}': d2 'praise'
 columns d.id string, topic string, s double
 rows 1
-  d2, 'praise', 0.2
+  d2, 'praise', 0.25
 
 --- SELECT d.id, AI.CLASSIFY(PROMPT('Topic {0}', d.body), ARRAY['refund','praise']) AS topic, AI.SCORE(PROMPT('Refund? {0}', d.body)) AS s FROM documents d WHERE AI.CLASSIFY(PROMPT('Topic {0}', d.body), ARRAY['refund','praise']) IN ('praise') AND AI.SCORE(PROMPT('Refund? {0}', d.body)) >= 0.15 ---
 plan
@@ -64,11 +64,11 @@ plan
   topic = ai_classify('Topic {0}', d.body, make_array('refund', 'praise')), filter: topic = 'praise'
   __quail_answer_1 = ai_score('Refund? {0}', d.body), filter: __quail_answer_1 >= Float64(0.15), returns: []
 asked 3 of 4
-  'Refund? {0}': d1 0.1, d2 0.2
+  'Refund? {0}': d1 0.125, d2 0.25
   'Topic {0}': d2 'praise'
 columns d.id string, topic string, s double
 rows 1
-  d2, 'praise', 0.2
+  d2, 'praise', 0.25
 
 --- SELECT q.id, d.id, AI.CLASSIFY(PROMPT('Topic {0}', d.body), ARRAY['refund','praise']) AS topic, AI.SCORE(PROMPT('Relevance {0} {1}', q.text, d.body)) AS relevance FROM queries q CROSS JOIN documents d ---
 plan
@@ -76,10 +76,10 @@ plan
   topic = ai_classify('Topic {0}', d.body, make_array('refund', 'praise'))
 asked 6 of 8
   'Topic {0}': d1 'refund', d2 'praise'
-  'Relevance {0} {1}': q1+d1 0.2, q1+d2 0.3, q2+d1 0.3, q2+d2 0.4
+  'Relevance {0} {1}': q1+d1 0.25, q1+d2 0.375, q2+d1 0.375, q2+d2 0.5
 columns q.id string, d.id string, topic string, relevance double
 rows 4
-  q1, d1, 'refund', 0.2
-  q1, d2, 'praise', 0.3
-  q2, d1, 'refund', 0.3
-  q2, d2, 'praise', 0.4
+  q1, d1, 'refund', 0.25
+  q1, d2, 'praise', 0.375
+  q2, d1, 'refund', 0.375
+  q2, d2, 'praise', 0.5

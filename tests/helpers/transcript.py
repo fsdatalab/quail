@@ -92,17 +92,16 @@ class Transcripts:
         rules: The logical rules of the optimized run; every rule when None.
         config: The sessions' engine configuration; ``CONFIG`` when None.
         written: Whether to show where the executor stopped each map or
-            extraction answer, and how many answer tokens the model wrote,
-            one a character, of those the run with every pushdown off
-            wrote.
-        pipelines: Whether the oracle runs chains of operators, as the
-            GPU executor does.
+            extraction answer, and how many answer tokens the model wrote
+            of those the run with every pushdown off wrote.
+        chunk_tokens: The model's forward pass size, in place of the
+            plan's; a small one shows where the executor stops early.
     """
 
     def __init__(self, tables: dict[str, pa.Table], answer, rules=None, *,
-                 config=None, written=False, pipelines=False):
+                 config=None, written=False, chunk_tokens=None):
         self._answer = answer
-        self._pipelines = pipelines
+        self._chunk_tokens = chunk_tokens
         self._written = written
         self._oracles = {}
         self._unwritten: list[int] = []
@@ -152,13 +151,13 @@ class Transcripts:
         session = quail.Session(self._config, tokenizer=TOKENIZER,
                                 registry=registry)
         self._sessions.append(session)
-        oracle = Oracle(truth=self._truth, pipelines=self._pipelines)
+        oracle = Oracle(truth=self._truth, chunk_tokens=self._chunk_tokens)
         oracle.features = lambda spec, document: self._truth(
             "features", spec.query_template,
             oracle._texts(spec.aliases[:1], [document]))
         oracle.catalog = session.catalog
         if self._written:
-            oracle._written = self._writer(oracle._written)
+            oracle._written = self._stopped
         context = quail.SessionContext(
             session, physical_executor=oracle_executor(oracle))
         self._oracles[id(context)] = oracle
@@ -187,20 +186,16 @@ class Transcripts:
         self._asked.append((prompt, rows, answer))
         return answer
 
-    def _writer(self, write):
-        """Wrap the oracle's writer to mark each answer it stops early.
+    def _stopped(self, node, text, found) -> None:
+        """Mark an answer the executor stopped before its end.
 
-        The oracle writes map and extraction answers in the order it
+        The oracle reports map and extraction answers in the order it
         asked for them.
         """
-        def written(node, text, source):
-            found = write(node, text, source)
-            index = self._unwritten.pop(0)
-            if found != text:
-                prompt, rows, _ = self._asked[index]
-                self._asked[index] = (prompt, rows, _Stopped(text, found))
-            return found
-        return written
+        index = self._unwritten.pop(0)
+        if found != text:
+            prompt, rows, _ = self._asked[index]
+            self._asked[index] = (prompt, rows, _Stopped(text, found))
 
     def _run(self, context, sql: str, dialect: str, ordered: bool):
         self._asked = []

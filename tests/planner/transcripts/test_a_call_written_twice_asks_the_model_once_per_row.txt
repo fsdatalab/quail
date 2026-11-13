@@ -36,8 +36,8 @@ rows 6
 plan
   e = ai_extract(r.body, named_struct('w', 'When?')), filter: get_field(e, 'w') IS NOT NULL, returns: [e]
 asked 6 of 6
-  'When?': r0 'day 0', r1 NULL, r2 'day 2', r3 NULL, r4 'day 4', r5 NULL
+  'When?': r0 'b0', r1 NULL, r2 'b2', r3 NULL, r4 'b4', r5 NULL
 rows 3
-  r0, {'w': 'day 0'}
-  r2, {'w': 'day 2'}
-  r4, {'w': 'day 4'}
+  r0, {'w': 'b0'}
+  r2, {'w': 'b2'}
+  r4, {'w': 'b4'}

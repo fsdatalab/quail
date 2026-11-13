@@ -128,7 +128,8 @@ def test_scores_and_labels_keep_their_types_and_the_columns_before_them():
     def answer(kind, prompt, rows):
         if kind == "label":
             return "refund" if rows == ("d1",) else "praise"
-        return sum(int(row[1:]) for row in rows) / 10
+        # eighths: a float32, as the executor reads a score, holds them
+        return sum(int(row[1:]) for row in rows) / 8
 
     tables = {"documents": pa.table({"id": ["d1", "d2"],
                                      "body": ["refund please", "all good"]}),

@@ -67,7 +67,8 @@ def _answer(kind, prompt, rows):
     if kind == "extract":
         return CLAUSES[rows[0]]
     if kind == "score":
-        return 0.9 if "Tenant may" in rows[0] else 0.1
+        # scores a float32 holds exactly, as the executor reads them
+        return 0.875 if "Tenant may" in rows[0] else 0.125
     if kind == "label":
         return "lease" if rows[0] in ("1", "3") else "note"
     if len(rows) == 2:

@@ -1,8 +1,8 @@
 --- SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('kind: {0}', r.body)) LIMIT 2 ---
 plan
   __quail_answer_1 = ai_filter('kind: {0}', r.body), filter: __quail_answer_1, fetch: 2, returns: []
-asked 3 of 6
-  'kind: {0}': r0 FALSE, r1 TRUE, r2 TRUE
+asked 4 of 6
+  'kind: {0}': r0 FALSE, r1 TRUE, r2 TRUE, r3 FALSE
 rows 2
   r1
   r2
@@ -10,8 +10,8 @@ rows 2
 --- SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('kind: {0}', r.body)) LIMIT 2 OFFSET 1 ---
 plan
   __quail_answer_1 = ai_filter('kind: {0}', r.body), filter: __quail_answer_1, fetch: 3, returns: []
-asked 5 of 6
-  'kind: {0}': r0 FALSE, r1 TRUE, r2 TRUE, r3 FALSE, r4 TRUE
+asked 6 of 6
+  'kind: {0}': r0 FALSE, r1 TRUE, r2 TRUE, r3 FALSE, r4 TRUE, r5 TRUE
 rows 2
   r2
   r4
@@ -30,8 +30,8 @@ rows 4
 --- WITH kind AS (SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('kind: {0}', r.body))) SELECT kind.id FROM kind LIMIT 2 ---
 plan
   __quail_answer_1 = ai_filter('kind: {0}', r.body), filter: __quail_answer_1, fetch: 2, returns: []
-asked 3 of 6
-  'kind: {0}': r0 FALSE, r1 TRUE, r2 TRUE
+asked 4 of 6
+  'kind: {0}': r0 FALSE, r1 TRUE, r2 TRUE, r3 FALSE
 rows 2
   r1
   r2
@@ -39,8 +39,8 @@ rows 2
 --- SELECT r.id FROM reviews r WHERE r.stars > 3 AND AI_FILTER(PROMPT('kind: {0}', r.body)) LIMIT 2 ---
 plan
   __quail_answer_1 = ai_filter('kind: {0}', r.body), filter: __quail_answer_1, fetch: 2, returns: []
-asked 2 of 3
-  'kind: {0}': r1 TRUE, r2 TRUE
+asked 3 of 3
+  'kind: {0}': r1 TRUE, r2 TRUE, r4 TRUE
 rows 2
   r1
   r2
@@ -48,8 +48,8 @@ rows 2
 --- SELECT r.id FROM reviews r WHERE HINT(AI_FILTER(PROMPT('kind: {0}', r.body)), {'selectivity': 0.5}) LIMIT 2 ---
 plan
   __quail_answer_1 = ai_filter('kind: {0}', r.body), filter: __quail_answer_1, hint: named_struct('selectivity', Float64(0.5)), returns: []
-asked 3 of 6
-  'kind: {0}': r0 FALSE, r1 TRUE, r2 TRUE
+asked 4 of 6
+  'kind: {0}': r0 FALSE, r1 TRUE, r2 TRUE, r3 FALSE
 rows 2
   r1
   r2
@@ -58,8 +58,8 @@ rows 2
 plan
   __quail_answer_2 = ai_filter('long: {0}', r.body), filter: __quail_answer_2, fetch: 1, returns: []
   __quail_answer_1 = ai_filter('kind: {0}', r.body), filter: __quail_answer_1, returns: []
-asked 9 of 10
+asked 10 of 10
   'kind: {0}': r0 FALSE, r1 TRUE, r2 TRUE, r3 FALSE, r4 TRUE, r5 TRUE
-  'long: {0}': r1 FALSE, r2 FALSE, r4 TRUE
+  'long: {0}': r1 FALSE, r2 FALSE, r4 TRUE, r5 TRUE
 rows 1
   r4

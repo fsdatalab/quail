@@ -42,7 +42,8 @@ def _answer(kind, prompt, rows):
 
 
 def _transcript(*queries) -> str:
-    with Transcripts({"reviews": REVIEWS, "notes": NOTES}, _answer) as runs:
+    with Transcripts({"reviews": REVIEWS, "notes": NOTES}, _answer,
+                     chunk_tokens=256) as runs:
         return "\n".join(runs.query(sql) for sql in queries)
 
 

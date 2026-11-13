@@ -46,12 +46,12 @@ def sessions():
 
 
 def _answer(kind, prompt, rows):
-    """Pass rows 1, 2, 4, and 5, label even rows 'a', and date even rows."""
+    """Pass rows 1, 2, 4, and 5, label even rows 'a', and copy even rows' text."""
     index = int(rows[0][1:])
     if kind == "label":
         return "a" if index % 2 == 0 else "b"
     if kind == "extract":
-        return None if index % 2 else f"day {index}"
+        return None if index % 2 else f"b{index}"
     return index in (1, 2, 4, 5)
 
 

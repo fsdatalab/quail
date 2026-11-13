@@ -73,7 +73,7 @@ def _answer(kind, prompt, rows):
 
 
 def test_a_distinct_fetches_one_row_of_each_selected_value():
-    with Transcripts({"reviews": KEYED}, _answer) as runs:
+    with Transcripts({"reviews": KEYED}, _answer, chunk_tokens=256) as runs:
         assert_transcript("\n".join(runs.query(sql) for sql in (
             f"SELECT DISTINCT r.stars FROM reviews r WHERE {AI_IF}",
             # a filter on the DISTINCT's columns keeps the per-key fetch

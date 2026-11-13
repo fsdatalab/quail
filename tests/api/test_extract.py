@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pyarrow as pa
 import pytest
 from helpers import baselines as request_tests
-from helpers.oracle import question_text
+from helpers.oracle import Oracle, finish, question_text
 from helpers.planning import column_tests, operators_of
 from helpers.sessions import TOKENIZER
 from helpers.transcript import Transcripts, assert_transcript
@@ -236,14 +236,16 @@ def _answer(kind, prompt, rows):
     """The model's answers.
 
     The lease ends on March 3, 2027 in c1 and c3, whose rent is $2,000 in
-    c1; asked when it ends, c2 says June 1, 2030. c1 and c2 are leases;
-    c1 and c3 give "Rent" as the reason. The score of c<i> is i / 10.
+    c1; asked when it ends, c2 says June 1, 2030, which its text does
+    not hold, so the executor returns no answer. c1 and c2 are leases;
+    c1 gives "Rent" as the reason. The score of c<i> is i / 8, which
+    a float32, as the executor reads a score, holds exactly.
     """
     (row,) = rows
     if kind == "label":
         return "lease" if row in ("c1", "c2") else "deed"
     if kind == "score":
-        return int(row[1:]) / 10
+        return int(row[1:]) / 8
     if prompt in (QUESTION, "When?"):
         return "March 3, 2027" if row in ("c1", "c3") else None
     if prompt in ("How much?", "What is the rent?"):
@@ -251,7 +253,7 @@ def _answer(kind, prompt, rows):
     if prompt == "When does it end?":
         return {"c1": "March 3, 2027", "c2": "June 1, 2030"}.get(row)
     if prompt == "Why?":
-        return "Rent" if row in ("c1", "c3") else None
+        return "Rent" if row == "c1" else None
     raise AssertionError(prompt)
 
 
@@ -279,6 +281,15 @@ def test_an_extraction_returns_each_fields_answer_and_span():
               f"FROM contracts c WHERE {score} > 0.25")
     assert_transcript(_transcript(both, top, scored, columns=(both, top, scored),
                                   ordered=(top,)))
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "a region of no rows sends no text table, and ExtractOperator raises "
+    "'AI.EXTRACT needs the text' before it sees there is nothing to read"))
+def test_an_extraction_of_no_rows_returns_no_rows(session):
+    query = session.sql(f"SELECT c.id, {LEASE_ENDS} AS lease FROM contracts c "
+                        "WHERE c.id = 'none'")
+    assert finish(query, Oracle()).collect().num_rows == 0
 
 
 def test_a_span_column_runs_with_or_without_a_matching_extraction():

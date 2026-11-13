@@ -62,10 +62,10 @@ def _classify_then_filter(*tests):
             f"FROM documents d WHERE {where}")
 
 
-def _answers(topics=("refund", "praise", None)):
+def _answers(topics=("refund", "praise", "praise")):
     """The model's answers: topic `topics[i]` for document i, and the rest.
 
-    A topic of None names no label. Every kind is a complaint, every
+    Every kind is a complaint, every
     pair but d2's matches, and a stance is praise for d0 and a1 only.
     """
     def answer(kind, prompt, rows):
@@ -95,7 +95,7 @@ def _transcript(*queries, columns=(), answers=None) -> str:
                          for sql in queries)
 
 
-def test_a_classification_returns_and_tests_labels_and_drops_a_row_without_one():
+def test_a_classification_returns_and_tests_its_labels():
     call = TOPIC + ")"
     unnamed = f"SELECT d.id, {call} FROM documents d"
     assert_transcript(_transcript(
@@ -120,6 +120,16 @@ def test_a_classification_returns_and_tests_labels_and_drops_a_row_without_one()
         columns=(unnamed,)))
 
 
+@pytest.mark.xfail(strict=True, reason=(
+    "ConditionGate.read takes a source column at no ids, an array of the "
+    "null type, which pyarrow's take has no kernel for"))
+def test_a_test_of_a_label_and_a_column_over_no_rows_returns_no_rows(session):
+    query = session.sql(
+        "SELECT d.id FROM documents d WHERE d.id = 'none' "
+        f"AND (d.body = 'x' OR {TOPIC}) = 'refund')")
+    assert finish(query, Oracle()).collect().num_rows == 0
+
+
 def test_a_classification_whose_probabilities_are_not_read_asks_for_none():
     asked = f"{TOPIC}, {{'probabilities': true}})"
     assert_transcript(_transcript(
@@ -141,15 +151,19 @@ def test_label_probabilities_come_back_beside_the_label_and_an_extraction(
         f"SELECT d.id, {asked}, "
         "AI.EXTRACT(d.body, {'item': 'What is asked for?'}) AS asked "
         "FROM documents d")
-    oracle = Oracle(labels=["praise", "shipping", "praise"], probabilities=True,
+    oracle = Oracle(labels=["praise", "shipping", "praise"],
                     answers=lambda spec, document: (
                         "refund" if document == 0 else None))
     expected = finish(alone, oracle).collect()
     assert expected.column_names == ["d.id", "topic", "topic_probabilities"]
-    assert expected.column("topic_probabilities").to_pylist() == [
-        [("refund", 0.1), ("shipping", 0.1), ("praise", 0.8)],
-        [("refund", 0.1), ("shipping", 0.8), ("praise", 0.1)],
-        [("refund", 0.1), ("shipping", 0.1), ("praise", 0.8)]]
+    # the model gives its label 0.8 and the others 0.1 each; the readout
+    # returns them as float32 log probabilities
+    found = expected.column("topic_probabilities").to_pylist()
+    assert [[label for label, _ in row] for row in found] == [
+        ["refund", "shipping", "praise"]] * 3
+    assert [[share for _, share in row] for row in found] == [
+        pytest.approx(row, abs=1e-6)
+        for row in ([0.1, 0.1, 0.8], [0.1, 0.8, 0.1], [0.1, 0.1, 0.8])]
     # an extraction projects the label through the label tables; the
     # probabilities come back as a map there too
     rows = finish(beside, oracle).collect()

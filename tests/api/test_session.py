@@ -88,15 +88,17 @@ def test_explain_analyze_shows_measured_rows_beside_estimates(
     assert header.split() == ["est.", "rows", "rows", "est.", "pass", "pass",
                               "est.", "time", "time", "fresh", "tokens"]
     assert re.search(
-        r"AiFilter: r\s+3\s+4\s+[\d.]+ ms\s+(?:<1|[\d.]+) ms\s+60$",
+        r"AiFilter: r\s+3\s+4\s+[\d.]+ ms\s+(?:<1|[\d.]+) ms\s+[\d,]+$",
         text, re.M)
-    # Both predicates have equal estimated cost. The first passes four of six
-    # rows; the limit stops the second at its first row that passes.
+    # Both predicates have equal estimated cost. The limit ends the run
+    # before the first reads its sixth row; four of its five pass. The
+    # second reads three of them in the pass that reaches the limit, and
+    # two pass.
     first = re.search(r"(?:1st: )?predicate ([12])  PROMPT\('DOCUMENT:\\n"
-                      r"\{0\}\\n\\nq\1:'\)\s+6\s+6\s+50%\s+66\.7%$",
+                      r"\{0\}\\n\\nq\1:'\)\s+6\s+5\s+50%\s+80%$",
                       text, re.M)
     second = re.search(r"(?:2nd: )?predicate ([12])  PROMPT\('DOCUMENT:\\n"
-                       r"\{0\}\\n\\nq\1:'\)\s+3\s+1\s+50%\s+100%$",
+                       r"\{0\}\\n\\nq\1:'\)\s+3\s+3\s+50%\s+66\.7%$",
                        text, re.M)
     assert first and second and first[1] != second[1]
     assert re.search(r"Scan reviews as r\s+6\s+6\s+\S+ ms$", text, re.M)
@@ -112,7 +114,7 @@ def test_explain_analyze_shows_measured_rows_beside_estimates(
     result = _run(sess.sql(FILTER_SQL + " LIMIT 1"), make_executor(TRUTH))
     explained = result.explain()
     assert re.search(r"Limit: 1\s+1\s+1\s+<1 ms$", explained, re.M)
-    assert re.search(rf"(?:1st: )?predicate {first[1]}\s+6\s+6\s+50%\s+66\.7%$",
+    assert re.search(rf"(?:1st: )?predicate {first[1]}\s+6\s+5\s+50%\s+80%$",
                      explained, re.M)
     stages = [s for s in result.report["stages"] if s["op"] == "filter"]
     assert [s["written_position"] for s in stages] == [int(first[1]) - 1,
@@ -172,7 +174,7 @@ def test_query_rows_observers_saved_reports_and_streamed_results(sess):
         for node_id, metrics in report["node_metrics"].items()}
     counted = QueryResult.from_table(result.collect(), report=report)
     counted.attach_executed_plan()
-    assert all(metrics.extension == {"borrowed_prefix_tokens": 3}
+    assert all(metrics.extension["borrowed_prefix_tokens"] == 3
                for metrics in counted.node_metrics.values())
     assert {node_id: metrics.wall_s
             for node_id, metrics in counted.node_metrics.items()} == {

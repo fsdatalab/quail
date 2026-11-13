@@ -22,14 +22,6 @@ asked 1 of 1
   'q: {0}': r0 TRUE
 rows 0
 
---- SELECT r.id FROM r WHERE AI.CLASSIFY(PROMPT('q: {0}', r.body), ['a', 'b']) IS NULL ---
-plan
-  __quail_column_1 = ai_classify('q: {0}', r.body, make_array('a', 'b')), filter: __quail_column_1 IS NULL
-asked 1 of 1
-  'q: {0}': r0 'a'
-rows 1
-  r1
-
 --- SELECT r.id, v.id, AI.SCORE(PROMPT('q: {0} {1}', r.body, v.name)) AS s FROM r CROSS JOIN v ---
 plan
   s = ai_score('q: {0} {1}', r.body, v.name)

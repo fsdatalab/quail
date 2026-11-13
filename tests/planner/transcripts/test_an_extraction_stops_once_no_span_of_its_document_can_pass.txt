@@ -3,7 +3,7 @@ plan
   e = ai_extract(r.body, named_struct('w', 'When?')), filter: left(get_field(e, 'w'), Int64(7)) = 'March 3', returns: [e]
 asked 6 of 6
   'When?': r0 'March 3, 2020 was', r1 'May 2021' stopped at 'M', r2 'March 9' stopped at 'M', r3 'Jan 1' stopped at 'J', r4 'March 30', r5 'Apr 2' stopped at 'A'
-wrote 29 of 50 answer tokens
+wrote 27 of 48 answer tokens
 rows 2
   r0, {'w': 'March 3, 2020 was'}
   r4, {'w': 'March 30'}

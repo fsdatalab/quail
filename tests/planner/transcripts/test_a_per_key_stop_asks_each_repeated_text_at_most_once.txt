@@ -10,7 +10,7 @@ rows 2
 --- SELECT r.product FROM reviews r WHERE AI_FILTER(PROMPT('kind: {0}', r.body)) GROUP BY r.product HAVING COUNT(*) >= 2 ---
 plan
   __quail_answer_1 = ai_filter('kind: {0}', r.body), filter: __quail_answer_1, fetch: 2 per [product], returns: []
-asked 2 of 6
-  'kind: {0}': r0/r1/r3 TRUE, r4/r5 FALSE
+asked 3 of 6
+  'kind: {0}': r0/r1/r3 TRUE, r2 FALSE, r4/r5 FALSE
 rows 1
   1

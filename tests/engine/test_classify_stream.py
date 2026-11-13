@@ -781,6 +781,22 @@ class EvenDocuments:
         return [d % 2 == 0 for d in range(14)]
 
 
+class NoDocuments(EvenDocuments):
+    """A region's hint that keeps no document of reviews."""
+
+    def keep(self, table):
+        return [False] * 14
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "with every document skipped the GPU loop has nothing to pack and "
+    "raises 'nothing buildable and nothing in flight'"))
+def test_a_region_whose_hint_drops_every_document_returns_no_rows(monkeypatch):
+    with reporting(None, NoDocuments(), {"r": "reviews"}):
+        result, _ = _run_recorded_region(monkeypatch, "classify")
+    assert result["_outputs"][PortRef("classify:r", "rows:r")].num_rows == 0
+
+
 def test_classifications_alone_skip_the_documents_the_hint_drops(monkeypatch):
     with reporting(None, EvenDocuments(), {"r": "reviews"}):
         result, model = _run_recorded_region(monkeypatch, "classify")

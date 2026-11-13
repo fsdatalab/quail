@@ -247,6 +247,7 @@ def test_a_field_of_an_extracted_struct_is_selected_beside_a_joined_column(
         "AI.EXTRACT(r.body, STRUCT('Who wrote it?' AS who)) AS found "
         "FROM reviews r) x "
         "ORDER BY x.id", dialect="bq")
-    oracle = Oracle(answers=lambda spec, document: f"w{document}")
+    # an extraction copies its answer from the document
+    oracle = Oracle(answers=lambda spec, document: "abc"[document])
     rows = finish(query, oracle).to_rows()
-    assert rows == [("r0", 5, "w0"), ("r1", 2, "w1"), ("r2", 4, "w2")]
+    assert rows == [("r0", 5, "a"), ("r1", 2, "b"), ("r2", 4, "c")]

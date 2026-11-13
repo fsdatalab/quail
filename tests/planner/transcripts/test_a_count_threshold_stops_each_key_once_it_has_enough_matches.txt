@@ -1,24 +1,24 @@
 --- SELECT r.product FROM reviews r WHERE AI_FILTER(PROMPT('kind: {0}', r.body)) GROUP BY r.product HAVING COUNT(*) >= 2 ---
 plan
   __quail_answer_1 = ai_filter('kind: {0}', r.body), filter: __quail_answer_1, fetch: 2 per [product], returns: []
-asked 8 of 9
-  'kind: {0}': r0 TRUE, r1 TRUE, r3 TRUE, r4 FALSE, r5 FALSE, r6 TRUE, r7 FALSE, r8 FALSE
+asked 9 of 9
+  'kind: {0}': r0 TRUE, r1 TRUE, r2 FALSE, r3 TRUE, r4 FALSE, r5 FALSE, r6 TRUE, r7 FALSE, r8 FALSE
 rows 1
   1
 
 --- SELECT r.product FROM reviews r WHERE AI_FILTER(PROMPT('kind: {0}', r.body)) GROUP BY r.product HAVING COUNT(*) > 1 ---
 plan
   __quail_answer_1 = ai_filter('kind: {0}', r.body), filter: __quail_answer_1, fetch: 2 per [product], returns: []
-asked 8 of 9
-  'kind: {0}': r0 TRUE, r1 TRUE, r3 TRUE, r4 FALSE, r5 FALSE, r6 TRUE, r7 FALSE, r8 FALSE
+asked 9 of 9
+  'kind: {0}': r0 TRUE, r1 TRUE, r2 FALSE, r3 TRUE, r4 FALSE, r5 FALSE, r6 TRUE, r7 FALSE, r8 FALSE
 rows 1
   1
 
 --- SELECT r.product FROM reviews r WHERE AI_FILTER(PROMPT('kind: {0}', r.body)) GROUP BY r.product HAVING 2 <= COUNT(*) ---
 plan
   __quail_answer_1 = ai_filter('kind: {0}', r.body), filter: __quail_answer_1, fetch: 2 per [product], returns: []
-asked 8 of 9
-  'kind: {0}': r0 TRUE, r1 TRUE, r3 TRUE, r4 FALSE, r5 FALSE, r6 TRUE, r7 FALSE, r8 FALSE
+asked 9 of 9
+  'kind: {0}': r0 TRUE, r1 TRUE, r2 FALSE, r3 TRUE, r4 FALSE, r5 FALSE, r6 TRUE, r7 FALSE, r8 FALSE
 rows 1
   1
 

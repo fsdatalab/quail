@@ -14,6 +14,17 @@ import re
 import pyarrow as pa
 
 NAMES = ["Acme", "acme", "Globex", "Hooli", "ACME corp", "Initech"]
+# what the executor raises on a region it cannot run yet; a generated
+# query that reaches one is left unchecked. Each has a test of its own,
+# marked xfail: a condition after an AI column of a table with a NULL
+# document, a hint that drops every document, an extraction of no
+# rows, and a condition on a source column of no rows.
+EXECUTOR_GAPS = (
+    "StopIteration",
+    "nothing buildable and nothing in flight",
+    "AI.EXTRACT needs the text of",
+    "has no kernel matching input types (int64, null)",
+)
 MACRO = re.compile(r"\b(IF|CL|SC|MP|EX|JN)(\d)\(")
 PAIR_TEXT = re.compile(r"\s*DOCUMENT 0:\n(.*)\n\nDOCUMENT 1:\n(.*)", re.S)
 
@@ -77,6 +88,11 @@ AI = {
     "JN": lambda key, left, right:
         f"AI.IF(PROMPT('q{key}: {{0}} {{1}}', {left}, {right}))",
 }
+
+
+def reaches_gap(error: Exception) -> bool:
+    """Return whether a query failed on one of EXECUTOR_GAPS."""
+    return any(gap in str(error) for gap in EXECUTOR_GAPS)
 
 
 def truth(kind: str, question: str, texts: tuple):

@@ -45,7 +45,7 @@ def _transcript(reviews, passing, *queries, tone=()) -> str:
         return any(row in passing for row in rows[0].split("/"))
 
     tables = {"reviews": reviews, "products": (PRODUCTS, "sku")}
-    with Transcripts(tables, answer) as runs:
+    with Transcripts(tables, answer, chunk_tokens=256) as runs:
         return "\n".join(runs.query(sql) for sql in queries)
 
 

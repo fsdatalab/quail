@@ -43,7 +43,7 @@ def test_windows_run_in_datafusion_on_the_model_regions_rows(session):
     assert "WindowAggExec:" in explained and "SortExec:" in explained
     labels = ["good", "bad", "good", "bad", "good"]
     rows = _run(query, oracle_executor(Oracle(
-        labels=lambda spec, ids: labels[ids[0]], probabilities=True)))
+        labels=lambda spec, ids: labels[ids[0]])))
     # SUM over only NULL costs is NULL, as SQL defines it
     assert rows.to_rows() == [
         ("s1", "bad", None, 1, None), ("s0", "good", "bad", 2, 1.0),
@@ -63,7 +63,7 @@ def test_windows_run_in_datafusion_on_the_model_regions_rows(session):
     assert plan.nodes[0].predicates == ()
     assert "FilterExec: run_id@1 = a" in filtered.explain()
     rows = _run(filtered, oracle_executor(Oracle(
-        labels=lambda spec, ids: "good", probabilities=True)))
+        labels=lambda spec, ids: "good")))
     assert rows.to_rows() == [("s1", "good", None, 1, None),
                               ("s0", "good", "good", 2, 1.0),
                               ("s3", "good", "good", 3, 5.0)]
