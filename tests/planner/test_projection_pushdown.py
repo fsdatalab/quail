@@ -3,13 +3,12 @@
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-from helpers.oracle import Oracle, finish
 from helpers.planning import placements
-from helpers.sessions import CONFIG, TOKENIZER, _run, make_executor
+from helpers.sessions import TOKENIZER, _run, make_executor
+from helpers.transcript import Transcripts, assert_transcript
 
 import quail
 from quail.api.config import EngineConfig
-from quail.builtins import LOGICAL_RULES, built_in_registry, logical_rules_without
 
 
 def _session(tmp_path, tokenizer=TOKENIZER):
@@ -138,70 +137,28 @@ def test_a_full_join_offers_its_classification_and_test_above_the_join():
 
 
 
-# R5, π_Q(AI(R; P)) ⇒ π_Q(AI(R; P = Q[P])): an AI operator returns the
-# added columns the SELECT list above it reads
-PROJECTION_RULE = "derive.projection"
+# an AI operator returns the added columns the SELECT list above it
+# reads, and an extraction asks only the fields the query reads
 EXTRACTED = pa.table({"id": ["r0", "r1", "r2"], "body": ["ab x", "cd", "ab y"]})
 
 
-def _extract_session(rules) -> quail.Session:
-    session = quail.Session(CONFIG, tokenizer=TOKENIZER,
-                            registry=built_in_registry(logical_rules=rules))
-    session.register("reviews",
-                     quail.DocumentProvider.from_table(EXTRACTED, id_col="id"))
-    return session
+def test_an_extraction_returns_and_asks_only_what_the_query_reads():
+    def answer(kind, prompt, rows):
+        return None if rows[0] == "r1" else f"ab {prompt}"
 
-
-def test_an_extraction_returns_its_spans_only_when_the_query_reads_them():
-    sql = ("SELECT x.id, x.e FROM (SELECT r.id, AI_EXTRACT(r.body, {'w': 'which?'}) "
-           "AS e FROM reviews r) x")
-    found = []
-    for rules in (LOGICAL_RULES,
-                  logical_rules_without(PROJECTION_RULE)):
-        session = _extract_session(rules)
-        query = session.sql(sql)
-        node = next(line for line in query.logical.splitlines() if "AiNode" in line)
-        oracle = Oracle(answers=lambda spec, document: None if document == 1 else "ab")
-        rows = finish(query, oracle).collect().to_pylist()
-        found.append((node.endswith("returns: [e]"),
-                      sorted((row["x.id"], row["x.e"]["w"]) for row in rows)))
-        session.close()
-    # with the rule the node returns its answer without its spans
-    assert found[0] == (True, [("r0", "ab"), ("r1", None), ("r2", "ab")])
-    assert found[1] == (False, found[0][1])
-
-    # an extraction whose spans the query returns keeps them
-    session = _extract_session(LOGICAL_RULES)
-    query = session.sql(
-        "SELECT r.id, AI_EXTRACT(r.body, {'w': 'which?'}) AS e, "
-        "AI_EXTRACT_SPAN(r.body, {'w': 'which?'}) AS e_span FROM reviews r")
-    assert "returns:" not in query.logical
-    rows = finish(query, Oracle(answers=lambda spec, document: "ab")).collect()
-    assert "e_span" in rows.column_names
-    session.close()
-
-
-def test_an_extraction_asks_only_the_fields_the_query_reads():
     questions = "{'w': 'which?', 'v': 'what?', 'u': 'who?'}"
-    sql = (f"SELECT x.id, x.e.w AS w FROM (SELECT r.id, "
-           f"AI_EXTRACT(r.body, {questions}) AS e FROM reviews r) x")
-    found = []
-    for rules in (LOGICAL_RULES,
-                  logical_rules_without(PROJECTION_RULE)):
-        session = _extract_session(rules)
-        asked = []
-
-        def answer(spec, document, asked=asked):
-            asked.append(spec.name)
-            return None if document == 1 else f"ab {spec.name}"
-
-        rows = finish(session.sql(sql), Oracle(answers=answer)).collect()
-        found.append((sorted(asked), sorted(
-            (row["x.id"], row["w"]) for row in rows.to_pylist())))
-        session.close()
-    # with the rule each document is asked the one field the query reads,
-    # instead of all three, and that field's answers do not change
-    assert found[0][0] == ["e.w"] * 3
-    assert found[1][0] == sorted(["e.u", "e.v", "e.w"] * 3)
-    assert found[0][1] == [("r0", "ab e.w"), ("r1", None), ("r2", "ab e.w")]
-    assert found[1][1] == found[0][1]
+    nested = f"(SELECT r.id, AI_EXTRACT(r.body, {questions}) AS e FROM reviews r) x"
+    with Transcripts({"reviews": EXTRACTED}, answer) as runs:
+        assert_transcript("\n".join(runs.query(sql) for sql in (
+            # the answer without its spans
+            "SELECT x.id, x.e FROM (SELECT r.id, AI_EXTRACT(r.body, "
+            "{'w': 'which?'}) AS e FROM reviews r) x",
+            # the spans, when the query reads them
+            "SELECT r.id, AI_EXTRACT(r.body, {'w': 'which?'}) AS e, "
+            "AI_EXTRACT_SPAN(r.body, {'w': 'which?'}) AS e_span FROM reviews r",
+            # one field of three
+            f"SELECT x.id, x.e.w AS w FROM {nested}",
+            # a field read through a renamed answer
+            f"SELECT y.id, y.f.w AS w FROM (SELECT x.id, x.e AS f FROM {nested}) y",
+            # the answer read whole asks every field
+            f"SELECT x.id, x.e FROM {nested}")))

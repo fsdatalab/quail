@@ -1,0 +1,25 @@
+--- SELECT p.sku FROM products p WHERE p.number IN (SELECT r.product FROM reviews r WHERE AI_FILTER(PROMPT('kind: {0}', r.body))) ---
+plan
+  __quail_answer_1 = ai_filter('kind: {0}', r.body), filter: __quail_answer_1, fetch: 1 per [product], returns: []
+asked 4 of 6
+  'kind: {0}': r0 TRUE, r2 TRUE, r4 FALSE, r5 FALSE
+rows 2
+  p1
+  p2
+
+--- SELECT p.sku FROM products p WHERE EXISTS (SELECT 1 FROM reviews r WHERE r.product = p.number AND AI_FILTER(PROMPT('kind: {0}', r.body))) ---
+plan
+  __quail_answer_1 = ai_filter('kind: {0}', r.body), filter: __quail_answer_1, fetch: 1 per [product], returns: []
+asked 4 of 6
+  'kind: {0}': r0 TRUE, r2 TRUE, r4 FALSE, r5 FALSE
+rows 2
+  p1
+  p2
+
+--- SELECT p.sku FROM products p WHERE p.number IN (SELECT r.product FROM reviews r WHERE r.product > 1 AND AI_FILTER(PROMPT('kind: {0}', r.body))) ---
+plan
+  __quail_answer_1 = ai_filter('kind: {0}', r.body), filter: __quail_answer_1, fetch: 1 per [product], returns: []
+asked 3 of 4
+  'kind: {0}': r2 TRUE, r4 FALSE, r5 FALSE
+rows 1
+  p2

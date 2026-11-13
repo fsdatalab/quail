@@ -447,7 +447,15 @@ class OracleFilter(FilterOperator):
         one_by_one = ((finished_rows() is not None and sink is None)
                       or (oracle.tightens_after and (
                           sink is not None or finished_rows() is not None)))
+        # as the GPU loop does, the chain's last filter stops once enough
+        # documents pass it
+        nodes = getattr(self.region, "nodes", ())
+        limit = (self.region.context.state.get("filter_limit")
+                 if nodes and nodes[-1] is node else None)
+        num_passed = sum(1 for answer in self.answers.values() if answer[0])
         for local in documents:
+            if limit is not None and num_passed >= limit:
+                break
             document = self.ids[local]
             # a document that stands for copies has one group per copy
             found = (() if self.groups is None else self.groups[local]
@@ -466,6 +474,7 @@ class OracleFilter(FilterOperator):
                 oracle._answered(oracle._source(node.alias, document),
                                  partial(self.region.send_finished, self))
             if passed:
+                num_passed += 1
                 for group in found:
                     survivors[group] = survivors.get(group, 0) + 1
         if not one_by_one:

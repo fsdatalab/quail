@@ -1,0 +1,24 @@
+--- SELECT r.id, AI_FILTER(PROMPT('kind: {0}', r.body)) AS k FROM reviews r WHERE r.long OR AI_FILTER(PROMPT('kind: {0}', r.body)) ---
+plan
+  __quail_answer_1 = ai_filter('kind: {0}', r.body)
+asked 6 of 6
+  'kind: {0}': r0 TRUE, r1 FALSE, r2 TRUE, r3 FALSE, r4 TRUE, r5 FALSE
+rows 5
+  r0, TRUE
+  r2, TRUE
+  r3, FALSE
+  r4, TRUE
+  r5, FALSE
+
+--- SELECT r.id FROM reviews r WHERE (r.long OR AI_FILTER(PROMPT('kind: {0}', r.body))) AND AI_FILTER(PROMPT('kind: {0}', r.body)) IS NOT NULL ---
+plan
+  __quail_answer_2 = ai_filter('kind: {0}', r.body)
+  __quail_answer_1 = ai_filter('kind: {0}', r.body), guard: r.long IS NOT TRUE, filter: r.long OR __quail_answer_1, returns: []
+asked 8 of 11
+  'kind: {0}': r0 TRUE, r1 FALSE, r2 TRUE, r2 TRUE, r3 FALSE, r4 TRUE, r4 TRUE, r5 FALSE
+rows 5
+  r0
+  r2
+  r3
+  r4
+  r5

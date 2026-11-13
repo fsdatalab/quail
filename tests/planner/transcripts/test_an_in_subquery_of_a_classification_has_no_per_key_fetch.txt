@@ -1,0 +1,9 @@
+--- SELECT p.sku FROM products p WHERE p.number IN (SELECT r.product FROM reviews r WHERE AI_CLASSIFY(PROMPT('tone: {0}', r.body), ['a', 'b']) = 'a') ---
+plan
+  __quail_column_1 = ai_classify('tone: {0}', r.body, make_array('a', 'b')), filter: __quail_column_1 = 'a'
+asked 6 of 6
+  'tone: {0}': r0 'a', r1 'a', r2 'a', r3 'a', r4 'a', r5 'a'
+rows 3
+  p1
+  p2
+  p3

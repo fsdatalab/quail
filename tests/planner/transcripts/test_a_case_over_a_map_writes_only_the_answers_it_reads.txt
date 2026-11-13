@@ -1,0 +1,12 @@
+--- SELECT r.id, CASE WHEN r.id <> 'r0' AND r.long THEN AI_MAP(r.body, 'Summarize.') END AS s FROM reviews r ---
+plan
+  __quail_call_1 = ai_map(r.body, 'Summarize.'), guard: r.id != 'r0' IS TRUE AND r.long IS TRUE
+asked 2 of 6
+  'Summarize.': r3 'summary r3', r5 'summary r5'
+rows 6
+  r0, NULL
+  r1, NULL
+  r2, NULL
+  r3, 'summary r3'
+  r4, NULL
+  r5, 'summary r5'
