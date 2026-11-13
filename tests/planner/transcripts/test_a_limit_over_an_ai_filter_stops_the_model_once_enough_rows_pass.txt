@@ -16,6 +16,26 @@ rows 2
   r2
   r4
 
+--- SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('kind: {0}', r.body)) LIMIT 10 ---
+plan
+  __quail_answer_1 = ai_filter('kind: {0}', r.body), filter: __quail_answer_1, fetch: 10, returns: []
+asked 6 of 6
+  'kind: {0}': r0 FALSE, r1 TRUE, r2 TRUE, r3 FALSE, r4 TRUE, r5 TRUE
+rows 4
+  r1
+  r2
+  r4
+  r5
+
+--- WITH kind AS (SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('kind: {0}', r.body))) SELECT kind.id FROM kind LIMIT 2 ---
+plan
+  __quail_answer_1 = ai_filter('kind: {0}', r.body), filter: __quail_answer_1, fetch: 2, returns: []
+asked 3 of 6
+  'kind: {0}': r0 FALSE, r1 TRUE, r2 TRUE
+rows 2
+  r1
+  r2
+
 --- SELECT r.id FROM reviews r WHERE r.stars > 3 AND AI_FILTER(PROMPT('kind: {0}', r.body)) LIMIT 2 ---
 plan
   __quail_answer_1 = ai_filter('kind: {0}', r.body), filter: __quail_answer_1, fetch: 2, returns: []

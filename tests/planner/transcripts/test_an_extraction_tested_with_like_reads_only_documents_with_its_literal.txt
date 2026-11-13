@@ -1,0 +1,19 @@
+--- SELECT l.id, AI_EXTRACT(l.text, {'year': 'When does it end?'}) AS e FROM leases l WHERE AI_EXTRACT(l.text, {'year': 'When does it end?'})['year'] LIKE '%2027%' ---
+plan
+  e = ai_extract(l.text, named_struct('year', 'When does it end?')), filter: get_field(e, 'year') LIKE '%2027%', returns: [e]
+asked 3 of 5
+  'When does it end?': c0 '2027', c2 '2027', c4 '2027'
+rows 3
+  c0, {'year': '2027'}
+  c2, {'year': '2027'}
+  c4, {'year': '2027'}
+
+--- SELECT l.id, AI_EXTRACT(l.text, {'year': 'When does it end?'}) AS e FROM leases l WHERE AI_EXTRACT(l.text, {'year': 'When does it end?'})['year'] ILIKE '20_7' ---
+plan
+  e = ai_extract(l.text, named_struct('year', 'When does it end?')), filter: get_field(e, 'year') ILIKE '20_7', returns: [e]
+asked 4 of 5
+  'When does it end?': c0 '2027', c1 '2026', c2 '2027', c4 '2027'
+rows 3
+  c0, {'year': '2027'}
+  c2, {'year': '2027'}
+  c4, {'year': '2027'}

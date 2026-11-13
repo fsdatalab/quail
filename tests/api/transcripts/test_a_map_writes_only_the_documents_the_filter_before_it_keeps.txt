@@ -1,0 +1,9 @@
+--- SELECT r.id, AI.MAP(r.body, 'Summarize the review in one sentence.', 64) AS summary FROM reviews r WHERE AI_FILTER(PROMPT('Negative? {0}', r.body)) ORDER BY r.id LIMIT 1 ---
+plan
+  summary = ai_map(r.body, 'Summarize the review in one sentence.', Int64(64))
+  __quail_answer_1 = ai_filter('Negative? {0}', r.body), filter: __quail_answer_1, returns: []
+asked 5 of 5
+  'Negative? {0}': r1 FALSE, r2 TRUE, r3 TRUE
+  'Summarize the review in one sentence.': r2 'summarize r2', r3 'summarize r3'
+rows 1, in order
+  r2, 'summarize r2'

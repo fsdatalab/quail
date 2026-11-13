@@ -1,0 +1,68 @@
+--- SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.review), {'selectivity': 0.5}) AND AI_FILTER(PROMPT('q2: {0}', r.review), {'selectivity': 0.5}) AND REGEXP_LIKE(r.lang, 'e') ---
+plan
+  __quail_answer_2 = ai_filter('q2: {0}', r.review, named_struct('selectivity', Float64(0.5))), filter: __quail_answer_2, returns: []
+  __quail_answer_1 = ai_filter('q1: {0}', r.review, named_struct('selectivity', Float64(0.5))), filter: __quail_answer_1, returns: []
+asked 0 of 0
+rows 0
+
+--- SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.review), {'selectivity': 0.5}) AND AI_FILTER(PROMPT('q2: {0}', r.review), {'selectivity': 0.5}) AND REGEXP_LIKE(r.lang, 'e.') ---
+plan
+  __quail_answer_2 = ai_filter('q2: {0}', r.review, named_struct('selectivity', Float64(0.5))), filter: __quail_answer_2, returns: []
+  __quail_answer_1 = ai_filter('q1: {0}', r.review, named_struct('selectivity', Float64(0.5))), filter: __quail_answer_1, returns: []
+asked 8 of 8
+  'q1: {0}': r0 TRUE, r1 TRUE, r3 TRUE, r4 TRUE
+  'q2: {0}': r0 TRUE, r1 FALSE, r3 TRUE, r4 FALSE
+rows 2
+  r0
+  r3
+
+--- SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.review), {'selectivity': 0.5}) AND AI_FILTER(PROMPT('q2: {0}', r.review), {'selectivity': 0.5}) AND RLIKE(r.lang, 'e') ---
+plan
+  __quail_answer_2 = ai_filter('q2: {0}', r.review, named_struct('selectivity', Float64(0.5))), filter: __quail_answer_2, returns: []
+  __quail_answer_1 = ai_filter('q1: {0}', r.review, named_struct('selectivity', Float64(0.5))), filter: __quail_answer_1, returns: []
+asked 0 of 0
+rows 0
+
+--- SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.review), {'selectivity': 0.5}) AND AI_FILTER(PROMPT('q2: {0}', r.review), {'selectivity': 0.5}) AND NOT RLIKE(r.lang, 'e') ---
+plan
+  __quail_answer_2 = ai_filter('q2: {0}', r.review, named_struct('selectivity', Float64(0.5))), filter: __quail_answer_2, returns: []
+  __quail_answer_1 = ai_filter('q1: {0}', r.review, named_struct('selectivity', Float64(0.5))), filter: __quail_answer_1, returns: []
+asked 10 of 10
+  'q1: {0}': r0 TRUE, r1 TRUE, r2 FALSE, r3 TRUE, r4 TRUE, r5 FALSE
+  'q2: {0}': r0 TRUE, r1 FALSE, r3 TRUE, r4 FALSE
+rows 2
+  r0
+  r3
+
+--- SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.review), {'selectivity': 0.5}) AND AI_FILTER(PROMPT('q2: {0}', r.review), {'selectivity': 0.5}) AND REGEXP_LIKE(r.lang, r.lang || '?') ---
+plan
+  __quail_answer_2 = ai_filter('q2: {0}', r.review, named_struct('selectivity', Float64(0.5))), filter: __quail_answer_2, returns: []
+  __quail_answer_1 = ai_filter('q1: {0}', r.review, named_struct('selectivity', Float64(0.5))), filter: __quail_answer_1, returns: []
+asked 10 of 10
+  'q1: {0}': r0 TRUE, r1 TRUE, r2 FALSE, r3 TRUE, r4 TRUE, r5 FALSE
+  'q2: {0}': r0 TRUE, r1 FALSE, r3 TRUE, r4 FALSE
+rows 2
+  r0
+  r3
+
+--- SELECT r.id FROM reviews r WHERE AI.IF(PROMPT('q1: {0}', r.review)) AND AI.IF(PROMPT('q2: {0}', r.review)) AND REGEXP_CONTAINS(r.lang, 'e') ---
+plan
+  __quail_answer_2 = ai_filter('q2: {0}', r.review), filter: __quail_answer_2, returns: []
+  __quail_answer_1 = ai_filter('q1: {0}', r.review), filter: __quail_answer_1, returns: []
+asked 9 of 9
+  'q1: {0}': r0 TRUE, r1 TRUE, r3 TRUE, r4 TRUE, r5 FALSE
+  'q2: {0}': r0 TRUE, r1 FALSE, r3 TRUE, r4 FALSE
+rows 2
+  r0
+  r3
+
+--- SELECT r.id FROM reviews r WHERE AI.IF(PROMPT('q1: {0}', r.review)) AND AI.IF(PROMPT('q2: {0}', r.review)) AND REGEXP_LIKE(r.lang, 'e') ---
+plan
+  __quail_answer_2 = ai_filter('q2: {0}', r.review), filter: __quail_answer_2, returns: []
+  __quail_answer_1 = ai_filter('q1: {0}', r.review), filter: __quail_answer_1, returns: []
+asked 9 of 9
+  'q1: {0}': r0 TRUE, r1 TRUE, r3 TRUE, r4 TRUE, r5 FALSE
+  'q2: {0}': r0 TRUE, r1 FALSE, r3 TRUE, r4 FALSE
+rows 2
+  r0
+  r3

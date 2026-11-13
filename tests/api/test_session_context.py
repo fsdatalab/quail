@@ -1,4 +1,8 @@
-"""quail.SessionContext: DataFusion binds the query, Quail runs each model region."""
+"""quail.SessionContext: DataFusion binds the query, Quail runs each model region.
+
+Each transcript test's transcript, in transcripts/, shows the plan, the
+questions the model answered, and the rows (helpers/transcript.py).
+"""
 
 import threading
 
@@ -6,6 +10,7 @@ import pyarrow as pa
 import pytest
 from helpers.oracle import Oracle, finish, oracle_executor
 from helpers.sessions import CONFIG, TOKENIZER, check_table
+from helpers.transcript import Transcripts, assert_transcript
 
 import quail
 from quail.api.engine import Engine
@@ -111,16 +116,6 @@ def test_a_region_plans_and_answers_as_the_written_query(context):
         assert _same_rows(table, expected, ordered="ORDER BY" in text), name
 
 
-def test_operators_outside_a_region_run_in_datafusion(context):
-    text = ("SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) "
-            "UNION ALL SELECT a.id FROM aspects a ORDER BY id")
-    assert len(context.region_plans(text)) == 1
-    table = context.sql(text)
-    # a union's column belongs to no one table
-    assert table.column_names == ["id"]
-    assert _rows(table) == [("a0",), ("a1",), ("r0",), ("r2",), ("r3",)]
-
-
 def test_session_sql_runs_a_query_that_needs_sql_around_its_model_region(context):
     text = ("SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) "
             "UNION ALL SELECT a.id FROM aspects a ORDER BY id")
@@ -138,18 +133,6 @@ def test_session_sql_runs_a_query_that_needs_sql_around_its_model_region(context
         "WHERE AI_FILTER(PROMPT('q2: {0}', r.body)) ORDER BY id")
     assert two.num_regions == 2
     assert len(two.plan()) == 2
-
-
-def test_an_extraction_returns_and_filters_on_its_answer_positions(context):
-    fields = "c.text, {'end': 'q6: When does it end?'}"
-    text = (f"SELECT c.id, AI.EXTRACT({fields}) AS lease, "
-            f"AI.EXTRACT_SPAN({fields}) AS lease_span FROM contracts c "
-            f"WHERE AI.EXTRACT_SPAN({fields})['end']['start'] < 15")
-    expected = finish(context.session.sql(text), ORACLE).collect()
-    table = context.sql(text)
-    assert table.column_names == ["c.id", "lease", "lease_span"]
-    assert _same_rows(table, expected, ordered=False)
-    assert len(_rows(table)) == 2
 
 
 def test_every_check_query_derives_one_region_as_session_sql_compiles_it():
@@ -400,32 +383,65 @@ def test_a_top_k_over_a_join_skips_the_anchors_past_its_threshold():
     context.session.close()
 
 
-def test_a_region_that_reads_another_regions_rows_runs_after_it(context):
-    # the CTE's LIMIT runs in DataFusion between the two regions, so the
-    # second region reads the first one's rows; both run on the thread
-    # that called DataFusion, the first to its end before the second
-    text = ("WITH kept AS (SELECT r.id, r.body FROM reviews r "
-            "WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) ORDER BY r.id LIMIT 2) "
-            "SELECT r.id FROM kept r WHERE AI_FILTER(PROMPT('q2: {0}', r.body)) "
-            "ORDER BY r.id")
-    assert len(context.region_plans(text)) == 2
-    # q1 keeps r0, r2, and r3, and the LIMIT r0 and r2; the oracle answers
-    # q2 by each document's position in the second region's input, 1 and 1
-    assert _rows(context.sql(text)) == [("r0",), ("r2",)]
 
 
-def test_a_table_name_with_underscores_keeps_its_rows_in_a_region():
+def _answer(kind, prompt, rows):
+    """ORACLE's answers, by row id; 'q:' and 'ok?' pass all; a map names vendors."""
+    if prompt.startswith(("q:", "ok?")):
+        return True
+    index = int(rows[0][1:])
+    if kind == "extract":
+        return ["2027", "2030", None][index]
+    if kind == "label":
+        return LABELS[index]
+    if kind == "map":
+        return ["Acme", "Globex"][index]
+    if len(rows) == 2:
+        return (index + int(rows[1][1:])) % 2 == 0
+    if prompt.startswith("q3:"):
+        return rows[0] in ("c0", "c1")
+    return rows[0] in {"q1": ("r0", "r2", "r3"), "q2": ("r0", "r1", "r3")}.get(
+        prompt[:2], rows)
+
+
+def _transcript(tables, *queries) -> str:
+    """Transcripts of queries, each SQL or (SQL, keyword arguments)."""
+    with Transcripts(tables, _answer) as runs:
+        return "\n".join(runs.query(query[0], **query[1])
+                         if isinstance(query, tuple) else runs.query(query)
+                         for query in queries)
+
+
+def test_sql_around_a_region_runs_in_datafusion():
+    tables = {"reviews": REVIEWS, "aspects": ASPECTS, "contracts": CONTRACTS,
+              "reviews__archive": REVIEWS}
+    fields = "c.text, {'end': 'q6: When does it end?'}"
+    assert_transcript(_transcript(
+        tables,
+        # a union's column belongs to no one table
+        ("SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) "
+         "UNION ALL SELECT a.id FROM aspects a ORDER BY id",
+         {"ordered": True, "columns": True}),
+        # the CTE's LIMIT runs in DataFusion between the two regions, so the
+        # second region reads the first one's rows
+        ("WITH kept AS (SELECT r.id, r.body FROM reviews r "
+         "WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) ORDER BY r.id LIMIT 2) "
+         "SELECT r.id FROM kept r WHERE AI_FILTER(PROMPT('q2: {0}', r.body)) "
+         "ORDER BY r.id", {"ordered": True}),
+        # a plain test cuts the table's rows into a region input
+        "SELECT r.id FROM reviews__archive r WHERE r.stars > 1 "
+        "AND AI_FILTER(PROMPT('q1: {0}', r.body))",
+        # an extraction returns and filters on its answer positions
+        (f"SELECT c.id, AI.EXTRACT({fields}) AS lease, "
+         f"AI.EXTRACT_SPAN({fields}) AS lease_span FROM contracts c "
+         f"WHERE AI.EXTRACT_SPAN({fields})['end']['start'] < 15",
+         {"columns": True})))
+
+
+def test_a_table_name_with_an_at_sign_is_refused():
     session = quail.Session(CONFIG, tokenizer=TOKENIZER)
     try:
-        ORACLE.catalog = session.catalog
-        context = quail.SessionContext(session,
-                                       physical_executor=oracle_executor(ORACLE))
-        context.register("reviews__archive",
-                         quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
-        # a plain test cuts the table's rows into a region input
-        text = ("SELECT r.id FROM reviews__archive r WHERE r.stars > 1 "
-                "AND AI_FILTER(PROMPT('q1: {0}', r.body)) ORDER BY r.id")
-        assert _rows(context.sql(text)) == [("r0",), ("r2",)]
+        context = quail.SessionContext(session)
         with pytest.raises(quail.common.expressions.CompileError, match="'@'"):
             context.register("reviews@r",
                              quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
@@ -433,153 +449,71 @@ def test_a_table_name_with_underscores_keeps_its_rows_in_a_region():
         session.close()
 
 
-def _yes_context(tables):
-    """Return a session and a context whose model answers yes to everything."""
-    session = quail.Session(CONFIG, tokenizer=TOKENIZER)
-    oracle = Oracle(filters=lambda *_: True, joins=lambda *_: True)
-    oracle.catalog = session.catalog
-    context = quail.SessionContext(
-        session, physical_executor=oracle_executor(oracle))
-    for name, table in tables.items():
-        context.register(name, quail.DocumentProvider.from_table(table, id_col="id"))
-    return session, context
-
-
-def _sorted_rows(table):
-    return sorted(zip(*(column.to_pylist() for column in table.columns)))
-
-
-def test_a_join_above_a_region_of_two_ids_keeps_every_pair(monkeypatch):
+def test_an_ai_call_beside_or_inside_a_join_is_answered_once_per_row(monkeypatch):
     monkeypatch.setenv("DATAFUSION_OPTIMIZER_ENABLE_DYNAMIC_FILTER_PUSHDOWN", "true")
-    session, context = _yes_context({
+    tables = {
         "r": pa.table({"id": ["r0", "r1"], "body": ["a", "b"]}),
         "t": pa.table({"id": ["t0", "t1"], "body": ["c", "d"]}),
-        "v": pa.table({"id": ["v0", "v1"], "rid": ["r0", "r1"]}),
-    })
-    # the region returns r.id and t.id; the join's filter of r.id must
-    # not reach it reading t.id
-    rows = _sorted_rows(context.sql(
+        "v": pa.table({"id": ["v0", "v1", "v2"], "rid": ["r0", "r1", "r9"]}),
+        "vendors": pa.table({"id": ["n0"], "name": ["Acme"]}),
+        "names": pa.table({"id": ["x0"], "name": ["x"]}),
+    }
+    test = "r.id = v.rid AND AI.IF(PROMPT('q: {0}', r.body))"
+    call = "AI.MAP(r.body, 'Name the vendor.', 16)"
+    assert_transcript(_transcript(
+        tables,
+        # the region returns r.id and t.id; the join's filter of r.id must
+        # not reach it reading t.id
         "SELECT r.id, t.id, v.id FROM r CROSS JOIN t JOIN v ON v.rid = r.id "
-        "WHERE AI.IF(PROMPT('q: {0}', concat(r.body, ' ', t.body)))"))
-    session.close()
-    assert rows == [("r0", "t0", "v0"), ("r0", "t1", "v0"),
-                    ("r1", "t0", "v1"), ("r1", "t1", "v1")]
+        "WHERE AI.IF(PROMPT('q: {0}', concat(r.body, ' ', t.body)))",
+        # an AI call of one table in a join's ON runs below the join
+        f"SELECT r.id, v.id FROM r JOIN v ON {test}",
+        f"SELECT r.id, v.id FROM r LEFT JOIN v ON {test}",
+        # a join key's answer is also returned
+        f"SELECT r.id, v.id, {call} AS m FROM r JOIN vendors v ON v.name = {call}",
+        # the AI.IF's answer is a column of r, which the join must pass on
+        "SELECT r.id, AI.IF(PROMPT('q: {0}', r.body)) AS k FROM r "
+        "JOIN names v ON AI.MAP(r.body, 'Name it.', 8) <> v.name",
+        # an AI call in a correlated subquery
+        f"SELECT v.id FROM v WHERE EXISTS (SELECT 1 FROM r WHERE {test})",
+        f"SELECT v.id FROM v WHERE NOT EXISTS (SELECT 1 FROM r WHERE {test})",
+        f"SELECT v.id, (SELECT COUNT(*) FROM r WHERE {test}) AS n FROM v"))
 
 
 def test_a_join_filter_keeps_a_document_while_it_keeps_one_of_its_copies(
         monkeypatch):
     monkeypatch.setenv("DATAFUSION_OPTIMIZER_ENABLE_DYNAMIC_FILTER_PUSHDOWN", "true")
-    session, context = _yes_context({
+    tables = {
         "r": pa.table({"id": ["r0", "r1", "r2", "r3"], "stars": [1, 2, 3, 4]}),
         # d0 and d2 hold the same text, so one answer serves both
         "d": pa.table({"id": ["d0", "d1", "d2", "d3"],
                        "name": ["a", "b", "a", "d"],
                        "rid": ["r0", "r1", "r2", "r3"]}),
-    })
-    rows = _sorted_rows(context.sql(
+    }
+    assert_transcript(_transcript(
+        tables,
         "SELECT r.id, d.id FROM r JOIN d ON r.id = d.rid "
         "WHERE r.stars >= 2 AND AI.IF(PROMPT('ok? {0}', d.name))"))
-    session.close()
-    assert rows == [("r1", "d1"), ("r2", "d2"), ("r3", "d3")]
-
-
-def test_an_ai_call_of_one_table_in_a_joins_on_runs_below_the_join():
-    session, context = _yes_context({
-        "r": pa.table({"id": ["r0", "r1"], "body": ["a", "b"]}),
-        "v": pa.table({"id": ["v0", "v1"], "rid": ["r0", "r1"]}),
-    })
-    cases = {
-        "a test of one table":
-            "SELECT r.id, v.id FROM r JOIN v ON r.id = v.rid "
-            "AND AI.IF(PROMPT('q: {0}', r.body))",
-        "the same test of an outer join":
-            "SELECT r.id, v.id FROM r LEFT JOIN v ON r.id = v.rid "
-            "AND AI.IF(PROMPT('q: {0}', r.body))",
-    }
-    for name, sql in cases.items():
-        assert _sorted_rows(context.sql(sql)) == [("r0", "v0"), ("r1", "v1")], name
-    session.close()
-
-
-def test_a_join_keys_answer_is_also_returned():
-    session = quail.Session(CONFIG, tokenizer=TOKENIZER)
-    names = ["Acme", "Globex"]
-    oracle = Oracle(maps=lambda spec, document: names[document])
-    oracle.catalog = session.catalog
-    context = quail.SessionContext(
-        session, physical_executor=oracle_executor(oracle))
-    context.register("r", quail.DocumentProvider.from_table(
-        pa.table({"id": ["r0", "r1"], "body": ["a", "b"]}), id_col="id"))
-    context.register("v", quail.DocumentProvider.from_table(
-        pa.table({"id": ["v0"], "name": ["Acme"]}), id_col="id"))
-    call = "AI.MAP(r.body, 'Name the vendor.', 16)"
-    rows = _sorted_rows(context.sql(
-        f"SELECT r.id, v.id, {call} AS m FROM r JOIN v ON v.name = {call}"))
-    session.close()
-    assert rows == [("r0", "v0", "Acme")]
-
-
-def test_an_ai_filters_answer_is_returned_beside_a_join_on_another_answer():
-    session, context = _yes_context({
-        "r": pa.table({"id": ["r0", "r1"], "body": ["a", "b"]}),
-        "v": pa.table({"id": ["v0"], "name": ["x"]}),
-    })
-    # the AI.IF's answer is a column of r, which the join must pass on
-    table = context.sql(
-        "SELECT r.id, AI.IF(PROMPT('q: {0}', r.body)) AS k FROM r "
-        "JOIN v ON AI.MAP(r.body, 'Name it.', 8) <> v.name ORDER BY r.id")
-    session.close()
-    assert table.column("k").to_pylist() == [True, True]
-
-
-def test_an_ai_call_in_a_correlated_subquery_is_answered():
-    session, context = _yes_context({
-        "r": pa.table({"id": ["r0", "r1"], "body": ["a", "b"]}),
-        "v": pa.table({"id": ["v0", "v1", "v2"], "rid": ["r0", "r1", "r9"]}),
-    })
-    test = "r.id = v.rid AND AI.IF(PROMPT('q: {0}', r.body))"
-    cases = {
-        f"SELECT v.id FROM v WHERE EXISTS (SELECT 1 FROM r WHERE {test})":
-            [("v0",), ("v1",)],
-        f"SELECT v.id FROM v WHERE NOT EXISTS (SELECT 1 FROM r WHERE {test})":
-            [("v2",)],
-        f"SELECT v.id, (SELECT COUNT(*) FROM r WHERE {test}) AS n FROM v":
-            [("v0", 1), ("v1", 1), ("v2", 0)],
-    }
-    for sql, expected in cases.items():
-        assert _sorted_rows(context.sql(sql)) == expected, sql
-    session.close()
 
 
 def test_an_ai_call_of_a_null_document_is_null_and_asks_no_model():
-    session = quail.Session(CONFIG, tokenizer=TOKENIZER)
-    oracle = Oracle(labels=lambda spec, ids: "a", filters=lambda *_: True,
-                    scores=lambda *_: 0.5)
-    oracle.catalog = session.catalog
-    context = quail.SessionContext(
-        session, physical_executor=oracle_executor(oracle))
-    context.register("r", quail.DocumentProvider.from_table(
-        pa.table({"id": ["r0", "r1"], "body": ["x", None]}), id_col="id"))
-    context.register("v", quail.DocumentProvider.from_table(
-        pa.table({"id": ["v0", "v1"], "name": ["a", "b"]}), id_col="id"))
+    tables = {"r": pa.table({"id": ["r0", "r1"], "body": ["x", None]}),
+              "v": pa.table({"id": ["v0", "v1"], "name": ["a", "b"]})}
     call = "AI.CLASSIFY(PROMPT('q: {0}', r.body), ['a', 'b'])"
-    cases = {
-        f"SELECT r.id, {call} AS c FROM r": [("r0", "a"), ("r1", None)],
-        "SELECT r.id FROM r WHERE AI.IF(PROMPT('q: {0}', r.body))": [("r0",)],
-        "SELECT r.id FROM r WHERE NOT AI.IF(PROMPT('q: {0}', r.body))": [],
-        f"SELECT r.id FROM r WHERE {call} IS NULL": [("r1",)],
-        # a pair with a NULL document has no score
-        "SELECT r.id, v.id, AI.SCORE(PROMPT('q: {0} {1}', r.body, v.name)) AS s "
-        "FROM r CROSS JOIN v":
-            [("r0", "v0", 0.5), ("r0", "v1", 0.5),
-             ("r1", "v0", None), ("r1", "v1", None)],
-        # a NULL written without a type is a NULL document too
-        "SELECT AI.IF(PROMPT('q: {0}', NULL)) AS k": [(None,)],
-        # v1 has no partner; its row has no document, so no answer
-        f"SELECT v.id, {call} AS c FROM r RIGHT JOIN v ON {call} = v.name":
-            [("v0", "a"), ("v1", None)],
-    }
-    for sql, expected in cases.items():
-        assert sorted(_sorted_rows(context.sql(sql)), key=repr) == expected, sql
-    session.close()
-    assert ("r", 1) not in oracle.asked
+
+    def answer(kind, prompt, rows):
+        return {"label": "a", "score": 0.5}.get(kind, True)
+
+    with Transcripts(tables, answer) as runs:
+        assert_transcript("\n".join(runs.query(sql) for sql in (
+            f"SELECT r.id, {call} AS c FROM r",
+            "SELECT r.id FROM r WHERE AI.IF(PROMPT('q: {0}', r.body))",
+            "SELECT r.id FROM r WHERE NOT AI.IF(PROMPT('q: {0}', r.body))",
+            f"SELECT r.id FROM r WHERE {call} IS NULL",
+            # a pair with a NULL document has no score
+            "SELECT r.id, v.id, AI.SCORE(PROMPT('q: {0} {1}', r.body, v.name)) "
+            "AS s FROM r CROSS JOIN v",
+            # a NULL written without a type is a NULL document too
+            "SELECT AI.IF(PROMPT('q: {0}', NULL)) AS k",
+            # v1 has no partner; its row has no document, so no answer
+            f"SELECT v.id, {call} AS c FROM r RIGHT JOIN v ON {call} = v.name")))

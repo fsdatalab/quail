@@ -1,0 +1,26 @@
+--- SELECT r.id, p.asin FROM reviews r JOIN products p ON AI_FILTER(PROMPT('x {0} {1}', r.review, p.description)) WHERE r.stars > 4 OR p.price > 15 ---
+plan
+  __quail_answer_1 = ai_filter('x {0} {1}', r.review, p.description), filter: __quail_answer_1, returns: []
+asked 12 of 8
+  'x {0} {1}': p0+r0 TRUE, p0+r1 TRUE, p0+r2 TRUE, p0+r3 TRUE, p0+r4 TRUE, p0+r5 TRUE, p1+r0 TRUE, p1+r1 TRUE, p1+r2 TRUE, p1+r3 TRUE, p1+r4 TRUE, p1+r5 TRUE
+rows 8
+  r0, p0
+  r0, p1
+  r1, p1
+  r2, p1
+  r3, p1
+  r4, p1
+  r5, p0
+  r5, p1
+
+--- SELECT r.id, p.asin FROM reviews r JOIN items p ON AI_FILTER(PROMPT('x {0} {1}', r.review, p.description)) WHERE r.stars > p.price ---
+plan
+  __quail_answer_1 = ai_filter('x {0} {1}', r.review, p.description), filter: __quail_answer_1, returns: []
+asked 12 of 5
+  'x {0} {1}': p0+r0 TRUE, p0+r1 TRUE, p0+r2 TRUE, p0+r3 TRUE, p0+r4 TRUE, p0+r5 TRUE, p1+r0 TRUE, p1+r1 TRUE, p1+r2 TRUE, p1+r3 TRUE, p1+r4 TRUE, p1+r5 TRUE
+rows 5
+  r0, p0
+  r0, p1
+  r2, p0
+  r5, p0
+  r5, p1

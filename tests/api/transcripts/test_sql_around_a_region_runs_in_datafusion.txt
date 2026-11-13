@@ -1,0 +1,41 @@
+--- SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) UNION ALL SELECT a.id FROM aspects a ORDER BY id ---
+plan
+  __quail_answer_1 = ai_filter('q1: {0}', r.body), filter: __quail_answer_1, returns: []
+asked 4 of 4
+  'q1: {0}': r0 TRUE, r1 FALSE, r2 TRUE, r3 TRUE
+columns id string
+rows 5, in order
+  a0
+  a1
+  r0
+  r2
+  r3
+
+--- WITH kept AS (SELECT r.id, r.body FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) ORDER BY r.id LIMIT 2) SELECT r.id FROM kept r WHERE AI_FILTER(PROMPT('q2: {0}', r.body)) ORDER BY r.id ---
+plan
+  __quail_answer_2 = ai_filter('q2: {0}', r.column_1), filter: __quail_answer_2, returns: []
+  __quail_answer_1 = ai_filter('q1: {0}', r.body), filter: __quail_answer_1, returns: []
+asked 6 of 6
+  'q1: {0}': r0 TRUE, r1 FALSE, r2 TRUE, r3 TRUE
+  'q2: {0}': r0 TRUE, r2 FALSE
+rows 1, in order
+  r0
+
+--- SELECT r.id FROM reviews__archive r WHERE r.stars > 1 AND AI_FILTER(PROMPT('q1: {0}', r.body)) ---
+plan
+  __quail_answer_1 = ai_filter('q1: {0}', r.body), filter: __quail_answer_1, returns: []
+asked 3 of 3
+  'q1: {0}': r0 TRUE, r1 FALSE, r2 TRUE
+rows 2
+  r0
+  r2
+
+--- SELECT c.id, AI.EXTRACT(c.text, {'end': 'q6: When does it end?'}) AS lease, AI.EXTRACT_SPAN(c.text, {'end': 'q6: When does it end?'}) AS lease_span FROM contracts c WHERE AI.EXTRACT_SPAN(c.text, {'end': 'q6: When does it end?'})['end']['start'] < 15 ---
+plan
+  lease = ai_extract(c.text, named_struct('end', 'q6: When does it end?')), filter: get_field(lease_span, 'end', 'start') < Int32(15)
+asked 3 of 3
+  'q6: When does it end?': c0 '2027', c1 '2030', c2 NULL
+columns c.id string, lease struct<end: string>, lease_span struct<end: struct<start: int32, end: int32>>
+rows 2
+  c0, {'end': '2027'}, {'end': {'start': 14, 'end': 18}}
+  c1, {'end': '2030'}, {'end': {'start': 14, 'end': 18}}

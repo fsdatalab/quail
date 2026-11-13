@@ -1,0 +1,21 @@
+--- 
+WITH clauses AS (
+    SELECT c.id,
+           AI.EXTRACT(c.text, {'terms': 'What is the termination clause?'}) AS clause
+    FROM contracts c
+)
+SELECT x.id, x.clause,
+       AI.SCORE(PROMPT('Can the tenant terminate early? {0}', x.clause.terms))
+           AS score
+FROM clauses x
+ ---
+plan
+  score = ai_score('Can the tenant terminate early? {0}', get_field(x.column_1, 'terms'))
+  clause = ai_extract(c.text, named_struct('terms', 'What is the termination clause?')), returns: [clause]
+asked 5 of 5
+  'What is the termination clause?': 1 'Tenant may terminate early with notice', 2 NULL, 3 'Early termination is forbidden'
+  'Can the tenant terminate early? {0}': 'Early termination is forbidden' 0.1, 'Tenant may terminate early with notice' 0.9
+rows 3
+  1, {'terms': 'Tenant may terminate early with notice'}, 0.9
+  2, {'terms': None}, NULL
+  3, {'terms': 'Early termination is forbidden'}, 0.1

@@ -1,0 +1,31 @@
+--- SELECT r.id, AI.MAP(r.body, 'Summarize the review in one sentence.', 32) AS summary FROM reviews r ---
+plan
+  summary = ai_map(r.body, 'Summarize the review in one sentence.', Int64(32))
+asked 3 of 3
+  'Summarize the review in one sentence.': r1 'summarize r1', r2 'summarize r2', r3 'summarize r3'
+rows 3
+  r1, 'summarize r1'
+  r2, 'summarize r2'
+  r3, 'summarize r3'
+
+--- SELECT r.id, AI.MAP(r.body, 'Summarize the review in one sentence.') FROM reviews r ---
+plan
+  AI.MAP(r.body,'Summarize the review in one sentence.') = ai_map(r.body, 'Summarize the review in one sentence.')
+asked 3 of 3
+  'Summarize the review in one sentence.': r1 'summarize r1', r2 'summarize r2', r3 'summarize r3'
+columns r.id string, AI.MAP(r.body,Utf8("Summarize the review in one sentence.")) string
+rows 3
+  r1, 'summarize r1'
+  r2, 'summarize r2'
+  r3, 'summarize r3'
+
+--- SELECT r.id, ai_map(r.body, 'Summarize the review in one sentence.') FROM reviews r ---
+plan
+  ai_map(r.body,'Summarize the review in one sentence.') = ai_map(r.body, 'Summarize the review in one sentence.')
+asked 3 of 3
+  'Summarize the review in one sentence.': r1 'summarize r1', r2 'summarize r2', r3 'summarize r3'
+columns r.id string, ai_map(r.body,Utf8("Summarize the review in one sentence.")) string
+rows 3
+  r1, 'summarize r1'
+  r2, 'summarize r2'
+  r3, 'summarize r3'

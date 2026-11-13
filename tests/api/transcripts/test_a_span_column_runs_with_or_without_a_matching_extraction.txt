@@ -1,0 +1,23 @@
+--- SELECT c.id AS contract_id, AI.EXTRACT_SPAN(c.text, {'ends': 'Why?'}) AS lease_span FROM contracts c ---
+plan
+  lease = ai_extract(c.text, named_struct('ends', 'Why?'))
+asked 4 of 4
+  'Why?': c1 'Rent', c2 NULL, c3 'Rent', c4 NULL
+rows 4
+  c1, {'ends': {'start': 29, 'end': 33}}
+  c2, {'ends': None}
+  c3, {'ends': None}
+  c4, {'ends': None}
+
+--- SELECT c.id AS contract_id, AI.EXTRACT(c.text, {'ends': 'When?'}) AS lease, AI.EXTRACT_SPAN(c.text, {'ends': 'Why?'}) AS lease_span FROM contracts c ---
+plan
+  __quail_column_1 = ai_extract(c.text, named_struct('ends', 'Why?'))
+  lease = ai_extract(c.text, named_struct('ends', 'When?')), returns: [lease]
+asked 8 of 8
+  'When?': c1 'March 3, 2027', c2 NULL, c3 'March 3, 2027', c4 NULL
+  'Why?': c1 'Rent', c2 NULL, c3 'Rent', c4 NULL
+rows 4
+  c1, {'ends': 'March 3, 2027'}, {'ends': {'start': 29, 'end': 33}}
+  c2, {'ends': None}, {'ends': None}
+  c3, {'ends': 'March 3, 2027'}, {'ends': None}
+  c4, {'ends': None}, {'ends': None}

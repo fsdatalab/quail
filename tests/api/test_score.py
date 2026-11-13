@@ -1,21 +1,22 @@
-"""AI.SCORE parsing, planning, execution, and score semantics."""
+"""AI.SCORE parsing, planning, execution, and score semantics.
+
+The transcript test's expected text is in transcripts/: the plan's AI
+operators, the questions the model answered, and the rows
+(helpers/transcript.py).
+"""
 
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from helpers.oracle import Oracle, finish
 from helpers.planning import compile_sql, read_operators
 from helpers.sessions import TOKENIZER
+from helpers.transcript import Transcripts, assert_transcript
 
 import quail
 from quail.api.config import EngineConfig
 from quail.catalog import Catalog, DocumentProvider
-from quail.physical import (
-    AiClassify,
-    AiScore,
-    Filter,
-)
+from quail.physical import AiScore, Filter
 
 PROJECTION_SQL = (
     "SELECT d.id, "
@@ -110,48 +111,32 @@ def test_score_plan_shape_query_text_and_round_trip(catalog):
     assert expression.test.text == "{0} >= 0.5"
 
 
-def test_scores_and_labels_keep_their_types_and_prior_columns(catalog):
-    def mixed():
-        return Oracle(labels=lambda spec, ids: spec.labels[ids[0] % 2])
-
-    session = _session(catalog, model="qwen3-4b-fp8", tokenizer=TOKENIZER)
+def test_scores_and_labels_keep_their_types_and_the_columns_before_them():
     score = "AI.SCORE(PROMPT('Refund? {0}', d.body))"
     label = "AI.CLASSIFY(PROMPT('Topic {0}', d.body), ARRAY['refund','praise'])"
-    for columns in (f"{score} AS s, {label} AS topic",
-                    f"{label} AS topic, {score} AS s"):
-        for predicate, expected in (
-                ("", [(1, "refund"), (2, "praise")]),
-                (f"WHERE {score} >= 0.15", [(2, "praise")]),
-                (f"WHERE {label} IN ('praise') AND {score} >= 0.15",
-                 [(2, "praise")])):
-            query = session.sql(
-                f"SELECT d.id, {columns} FROM documents d {predicate}")
-            physical = query.plan()
-            classifications = [node for node in physical.nodes
-                               if isinstance(node, AiClassify)]
-            assert len(classifications) == 1
-            assert classifications[0].spec.labels == ("refund", "praise")
-            assert sum(type(node) is AiScore for node in physical.nodes) == 1
-            if "IN" in predicate:
-                assert any(isinstance(node, Filter)
-                           and str(node.predicate).endswith("IN ('praise')")
-                           for node in physical.nodes)
-            result = finish(query, mixed())
-            rows = result.collect()
-            assert list(zip(rows.column("d.id").to_pylist(),
-                            rows.column("topic").to_pylist())) == expected
-            assert rows.column("s").to_pylist() == pytest.approx(
-                [document / 10 for document, _ in expected])
-            assert rows.schema.field("topic").type == pa.string()
-            assert rows.schema.field("s").type == pa.float64()
-    # A pair score retains a one-document classification from its input.
-    query = session.sql(
+    queries = [f"SELECT d.id, {columns} FROM documents d {predicate}"
+               for columns in (f"{score} AS s, {label} AS topic",
+                               f"{label} AS topic, {score} AS s")
+               for predicate in ("", f"WHERE {score} >= 0.15",
+                                 f"WHERE {label} IN ('praise') AND {score} >= 0.15")]
+    # a pair score keeps a one-document classification from its input
+    queries.append(
         f"SELECT q.id, d.id, {label} AS topic, "
         "AI.SCORE(PROMPT('Relevance {0} {1}', q.text, d.body)) AS relevance "
         "FROM queries q CROSS JOIN documents d")
-    assert finish(query, mixed()).collect().column(
-        "topic").to_pylist() == ["refund", "praise", "refund", "praise"]
-    session.close()
+
+    def answer(kind, prompt, rows):
+        if kind == "label":
+            return "refund" if rows == ("d1",) else "praise"
+        return sum(int(row[1:]) for row in rows) / 10
+
+    tables = {"documents": pa.table({"id": ["d1", "d2"],
+                                     "body": ["refund please", "all good"]}),
+              "queries": pa.table({"id": ["q1", "q2"],
+                                   "text": ["refund", "shipping"]})}
+    with Transcripts(tables, answer) as runs:
+        assert_transcript("\n".join(runs.query(sql, columns=True)
+                                     for sql in queries))
 
 
 def test_a_set_attention_score_plans_a_document_longer_than_one_page(tmp_path):

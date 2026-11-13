@@ -1,0 +1,23 @@
+--- 
+WITH clauses AS (
+    SELECT c.id,
+           AI.EXTRACT(c.text, STRUCT('What is the termination clause?' AS terms))
+               AS clause
+    FROM contracts c
+),
+unused AS (
+    SELECT c.id FROM contracts c WHERE AI.IF(PROMPT('never asked: {0}', c.text))
+)
+SELECT a.id, b.id AS other
+FROM clauses a JOIN clauses b
+  ON AI.IF(PROMPT('same clause? {0} {1}', a.clause.terms, b.clause.terms))
+ ---
+plan
+  __quail_answer_1 = ai_filter('same clause? {0} {1}', get_field(a.clause, 'terms'), get_field(b.clause, 'terms')), filter: __quail_answer_1, returns: []
+  clause = ai_extract(c.text, named_struct('terms', 'What is the termination clause?')), returns: [clause]
+asked 7 of 10
+  'What is the termination clause?': 1 'Tenant may terminate early with notice', 2 NULL, 3 'Early termination is forbidden'
+  'same clause? {0} {1}': 'Early termination is forbidden'+'Early termination is forbidden' TRUE, 'Early termination is forbidden'+'Tenant may terminate early with notice' FALSE, 'Tenant may terminate early with notice'+'Early termination is forbidden' FALSE, 'Tenant may terminate early with notice'+'Tenant may terminate early with notice' TRUE
+rows 2
+  1, 1
+  3, 3

@@ -3,18 +3,17 @@
 should_stop_answers_early gives a map or extraction the region's exact
 tests of its answer alone; the executor stops an answer once one is
 decided not TRUE on the text so far, or, when nothing else reads the
-answer, once every one is decided TRUE. The oracle
-writes each answer one character a token. Each test runs a query with
-the rule on and off, checks that both return the same rows, and counts
-the characters written.
+answer, once every one is decided TRUE. The oracle writes each answer
+one character a token. The transcripts, in transcripts/, show the plan,
+each answer and where it stopped, the answer tokens written, and the
+rows (helpers/transcript.py).
 """
 
 import pyarrow as pa
-from helpers.oracle import Oracle, finish
 from helpers.sessions import CONFIG, TOKENIZER
+from helpers.transcript import Transcripts, assert_transcript
 
 import quail
-from quail.builtins import LOGICAL_RULES, PHYSICAL_RULES, built_in_registry
 from quail.execution.answer_stops import (
     AnswerStop,
     Stop,
@@ -22,82 +21,66 @@ from quail.execution.answer_stops import (
     copied_completions,
 )
 
-STOP_RULE = "should_stop_answers_early"
 REVIEWS = pa.table({
     "id": ["r0", "r1", "r2", "r3", "r4", "r5"],
     "body": ["March 3, 2020 was kind", "May 2021 rude", "March 9 kind",
              "Jan 1 rude", "March 30 kind", "Apr 2 rude"],
 })
 VERDICT = "LEFT(AI_MAP(r.body, 'Is it kind?'), 3) = 'yes'"
+VENDORS = ["Acme", "Initech Systems", "Globex", "Zeta Corporation",
+           "Acme", "Hooli"]
 
 
-def _verdict(spec, document):
-    return "yes, it is kind" if document % 2 == 0 else "no, it is not kind"
-
-
-def _run(sql, *, physical=PHYSICAL_RULES, logical=LOGICAL_RULES, **truth):
-    """Return the query's rows, sorted, and the oracle after the run."""
-    session = quail.Session(CONFIG, tokenizer=TOKENIZER, registry=built_in_registry(
-        logical_rules=logical, physical_rules=physical))
-    session.register("reviews",
-                     quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
-    oracle = Oracle(**truth)
-    try:
-        result = finish(session.sql(sql), oracle).collect()
-    finally:
-        session.close()
-    return sorted(tuple(row.values()) for row in result.to_pylist()), oracle
-
-
-OFF = tuple(name for name in PHYSICAL_RULES if name != STOP_RULE)
+def _answer(kind, prompt, rows):
+    """Judge even reviews kind, name a vendor, and extract the text's start."""
+    index = int(rows[0][1:])
+    if prompt == "Name the vendor.":
+        return VENDORS[index]
+    if kind == "map":
+        return "yes, it is kind" if index % 2 == 0 else "no, it is not kind"
+    return REVIEWS["body"][index].as_py().rsplit(" ", 1)[0]
 
 
 def test_a_map_stops_each_answer_once_its_prefix_test_is_decided():
-    sql = f"SELECT r.id FROM reviews r WHERE {VERDICT}"
-    on_rows, on = _run(sql, maps=_verdict)
-    off_rows, off = _run(sql, physical=OFF, maps=_verdict)
-    assert on_rows == off_rows == [("r0",), ("r2",), ("r4",)]
-    # a rejected answer stops at "n", an accepted one at "yes"
-    assert (on.answer_tokens, off.answer_tokens) == (3 * 1 + 3 * 3, 3 * 18 + 3 * 15)
-    assert on.stopped_early == 6
-    session = quail.Session(CONFIG, tokenizer=TOKENIZER)
-    session.register("reviews",
-                     quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
-    physical = session.sql(sql).explain()
-    session.close()
-    assert ("stops an answer once left(r.__quail_column_1, 3) = 'yes' is not TRUE on "
-            "its tokens so far, or once every one is TRUE") in physical
-
-
-def test_a_map_the_select_list_reads_writes_each_answer_it_keeps_whole():
-    sql = "SELECT r.id, AI_MAP(r.body, 'Is it kind?') AS v FROM reviews r " \
-          "WHERE LEFT(AI_MAP(r.body, 'Is it kind?'), 3) = 'yes'"
-    on_rows, on = _run(sql, maps=_verdict)
-    off_rows, off = _run(sql, physical=OFF, maps=_verdict)
-    assert on_rows == off_rows == [("r0", "yes, it is kind"), ("r2", "yes, it is kind"),
-                                   ("r4", "yes, it is kind")]
-    assert (on.answer_tokens, off.answer_tokens) == (3 * 1 + 3 * 15, 3 * 18 + 3 * 15)
+    with Transcripts({"reviews": REVIEWS}, _answer, written=True) as runs:
+        assert_transcript("\n".join(runs.query(sql) for sql in (
+            f"SELECT r.id FROM reviews r WHERE {VERDICT}",
+            # the SELECT list reads each answer the test keeps whole
+            f"SELECT r.id, AI_MAP(r.body, 'Is it kind?') AS v FROM reviews r "
+            f"WHERE {VERDICT}")))
 
 
 def test_an_extraction_stops_once_no_span_of_its_document_can_pass():
-    sql = ("SELECT r.id, AI_EXTRACT(r.body, {'w': 'When?'}) AS e FROM reviews r "
-           "WHERE LEFT(AI_EXTRACT(r.body, {'w': 'When?'})['w'], 7) = 'March 3'")
-
-    def when(spec, document):
-        return str(REVIEWS["body"][document]).rsplit(" ", 1)[0]
-
-    on_rows, on = _run(sql, answers=when)
-    off_rows, off = _run(sql, physical=OFF, answers=when)
-    assert on_rows == off_rows
-    assert [row[0] for row in on_rows] == ["r0", "r4"]
     # a span goes on only with its document's text: "M" of "May 2021
-    # rude" or "March 9 kind" cannot become "March 3", and the answers
-    # the test may keep go on, as the SELECT list reads them
-    assert on.stopped_early == 4
-    assert (on.answer_tokens, off.answer_tokens) == (
-        len("March 3, 2020 was") + 1 + 1 + 1 + len("March 30") + 1,
-        len("March 3, 2020 was") + len("May 2021") + len("March 9")
-        + len("Jan 1") + len("March 30") + len("Apr 2"))
+    # rude" or "March 9 kind" cannot become "March 3"
+    call = "AI_EXTRACT(r.body, {'w': 'When?'})"
+    with Transcripts({"reviews": REVIEWS}, _answer, written=True) as runs:
+        assert_transcript(runs.query(
+            f"SELECT r.id, {call} AS e FROM reviews r "
+            f"WHERE LEFT({call}['w'], 7) = 'March 3'"))
+
+
+def test_a_join_on_a_maps_answer_stops_each_answer_that_can_match_no_key(
+        monkeypatch):
+    monkeypatch.setenv("DATAFUSION_OPTIMIZER_ENABLE_DYNAMIC_FILTER_PUSHDOWN", "true")
+    vendors = pa.table({"id": ["v0", "v1"], "name": ["Acme", "Globex"]})
+    # the join builds on the vendors, so their names are the region's
+    # hint before the model writes an answer
+    with Transcripts({"reviews": REVIEWS, "vendors": vendors}, _answer,
+                     written=True) as runs:
+        assert_transcript(runs.query(
+            "SELECT r.id, v.id FROM vendors v JOIN reviews r "
+            "ON v.name = AI.MAP(r.body, 'Name the vendor.', 16)"))
+
+
+def test_explain_says_when_a_map_stops_an_answer():
+    session = quail.Session(CONFIG, tokenizer=TOKENIZER)
+    session.register("reviews",
+                     quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
+    physical = session.sql(f"SELECT r.id FROM reviews r WHERE {VERDICT}").explain()
+    session.close()
+    assert ("stops an answer once left(r.__quail_column_1, 3) = 'yes' is not TRUE on "
+            "its tokens so far, or once every one is TRUE") in physical
 
 
 def test_an_expression_decides_a_prefix_test_on_a_partial_answer():
@@ -164,37 +147,6 @@ def test_a_map_answer_is_decided_on_its_text_with_its_leading_space():
     for prefix, decided in ((" ", Stop.CONTINUE), (" Ye", Stop.CONTINUE),
                             ("Ye", Stop.REJECTED), (" No", Stop.REJECTED)):
         assert stop.decide(prefix) is decided, prefix
-
-
-VENDORS = ["Acme", "Initech Systems", "Globex", "Zeta Corporation",
-           "Acme", "Hooli"]
-
-
-def test_a_join_on_a_maps_answer_stops_each_answer_that_can_match_no_key(
-        monkeypatch):
-    monkeypatch.setenv("DATAFUSION_OPTIMIZER_ENABLE_DYNAMIC_FILTER_PUSHDOWN", "true")
-    from helpers.oracle import oracle_executor
-
-    session = quail.Session(CONFIG, tokenizer=TOKENIZER)
-    oracle = Oracle(maps=lambda spec, document: VENDORS[document])
-    oracle.catalog = session.catalog
-    context = quail.SessionContext(
-        session, physical_executor=oracle_executor(oracle))
-    context.register("reviews",
-                     quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
-    context.register("vendors", quail.DocumentProvider.from_table(
-        pa.table({"id": ["v0", "v1"], "name": ["Acme", "Globex"]}), id_col="id"))
-    # the join builds on the vendors, so their names are the region's
-    # hint before the model writes an answer
-    table = context.sql(
-        "SELECT r.id, v.id FROM vendors v JOIN reviews r "
-        "ON v.name = AI.MAP(r.body, 'Name the vendor.', 16)")
-    rows = sorted(zip(*(column.to_pylist() for column in table.columns)))
-    session.close()
-    assert rows == [("r0", "v0"), ("r2", "v1"), ("r4", "v0")]
-    # an answer that starts with neither name stops at its first character
-    assert oracle.stopped_early == 3
-    assert oracle.answer_tokens == len("Acme") * 2 + len("Globex") + 3
 
 
 def test_an_answer_stops_only_when_the_hint_rejects_every_completion():

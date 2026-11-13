@@ -1,0 +1,23 @@
+--- SELECT c.id, AI.EXTRACT(c.text, {'ends': 'When does the lease end?', 'rent': 'How much?'}) AS lease FROM contracts c WHERE HINT(AI.EXTRACT(c.text, {'ends': 'When does the lease end?', 'rent': 'How much?'})['ends'] IS NOT NULL, {'selectivity': 0.5}) AND HINT(AI.EXTRACT(c.text, {'ends': 'When does the lease end?', 'rent': 'How much?'})['ends'] ILIKE '%march%', {'selectivity': 0.5}) AND HINT(AI.EXTRACT_SPAN(c.text, {'ends': 'When does the lease end?', 'rent': 'How much?'})['ends']['start'] < 20, {'selectivity': 0.5}) AND HINT(LENGTH(AI.EXTRACT(c.text, {'ends': 'When does the lease end?', 'rent': 'How much?'})['rent']) < 20, {'selectivity': 0.5}) ---
+plan
+  lease = ai_extract(c.text, named_struct('ends', 'When does the lease end?', 'rent', 'How much?')), filter: hint(get_field(lease, 'ends') IS NOT NULL, named_struct('selectivity', Float64(0.5))) AND hint(get_field(lease, 'ends') ILIKE '%march%', named_struct('selectivity', Float64(0.5))) AND hint(get_field(lease_span, 'ends', 'start') < Int32(20), named_struct('selectivity', Float64(0.5))) AND hint(character_length(get_field(lease, 'rent')) < Int32(20), named_struct('selectivity', Float64(0.5))), returns: [lease]
+asked 6 of 6
+  'When does the lease end?': c1 'March 3, 2027', c2 NULL, c3 'March 3, 2027', c4 NULL
+  'How much?': c1 '$2,000', c3 NULL
+rows 1
+  c1, {'ends': 'March 3, 2027', 'rent': '$2,000'}
+
+--- SELECT c.id, AI.EXTRACT(c.text, {'ends': 'When does the lease end?'}) AS lease FROM contracts c WHERE NOT (AI.EXTRACT(c.text, {'ends': 'When does the lease end?'})['ends'] LIKE 'March%') ---
+plan
+  lease = ai_extract(c.text, named_struct('ends', 'When does the lease end?')), filter: get_field(lease, 'ends') NOT LIKE 'March%', returns: [lease]
+asked 4 of 4
+  'When does the lease end?': c1 'March 3, 2027', c2 NULL, c3 'March 3, 2027', c4 NULL
+rows 0
+
+--- SELECT c.id FROM contracts c WHERE SPLIT_PART(AI.EXTRACT(c.text, {'ends': 'When does it end?'})['ends'], ' ', 1) = 'March' ---
+plan
+  __quail_column_1 = ai_extract(c.text, named_struct('ends', 'When does it end?')), filter: split_part(get_field(__quail_column_1, 'ends'), ' ', Int64(1)) = 'March', returns: [__quail_column_1]
+asked 4 of 4
+  'When does it end?': c1 'March 3, 2027', c2 'June 1, 2030', c3 NULL, c4 NULL
+rows 1
+  c1

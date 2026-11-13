@@ -1,10 +1,16 @@
-"""AI.MAP: the operator surface, its prompt, and its plan."""
+"""AI.MAP: the operator surface, its prompt, and its plan.
+
+The transcript tests' expected text is in transcripts/: the plan's AI
+operators, the questions the model answered, and the rows
+(helpers/transcript.py).
+"""
 
 import pyarrow as pa
 import pytest
-from helpers.oracle import Oracle, finish, question_text
+from helpers.oracle import question_text
 from helpers.planning import column_tests, operators_of, placements
 from helpers.sessions import TOKENIZER
+from helpers.transcript import Transcripts, assert_transcript
 
 import quail
 from quail.api.config import EngineConfig
@@ -12,7 +18,7 @@ from quail.catalog import DocumentProvider
 from quail.common.expressions import CompileError
 from quail.physical import AiMap
 
-REVIEWS = pa.table({"id": [1, 2, 3],
+REVIEWS = pa.table({"id": ["r1", "r2", "r3"],
                     "body": ["good film", "bad film", "long dull film"]})
 SUMMARY = "Summarize the review in one sentence."
 
@@ -30,13 +36,36 @@ def _maps(plan):
     return [node for node in plan.graph.nodes if isinstance(node, AiMap)]
 
 
-def test_a_map_writes_one_answer_per_document(session):
+def _answer(kind, prompt, rows):
+    """The model's answers: a map writes its prompt's first word and the row."""
+    if kind == "filter":
+        return rows != ("r1",)
+    if kind == "label":
+        return "negative"
+    return f"{prompt.split()[0].lower()} {rows[0]}"
+
+
+def _transcript(*queries, columns=(), dialects=None) -> str:
+    """The transcripts of `queries`; those in `columns` show column types."""
+    dialects = dialects or {}
+    with Transcripts({"reviews": REVIEWS}, _answer) as runs:
+        return "\n".join(runs.query(sql, dialect=dialects.get(sql, "snowflake"),
+                                     columns=sql in columns, ordered="LIMIT" in sql)
+                         for sql in queries)
+
+
+def test_a_map_writes_one_answer_per_document():
+    unnamed = [f"SELECT r.id, {function}(r.body, '{SUMMARY}') FROM reviews r"
+               for function in ("AI.MAP", "ai_map")]
+    assert_transcript(_transcript(
+        f"SELECT r.id, AI.MAP(r.body, '{SUMMARY}', 32) AS summary FROM reviews r",
+        # an unnamed map returns each answer under its SQL name
+        *unnamed, columns=unnamed))
+
+
+def test_a_map_writes_up_to_its_answer_token_limit_after_the_document(session):
     query = session.sql(
         f"SELECT r.id, AI.MAP(r.body, '{SUMMARY}', 32) AS summary FROM reviews r")
-    rows = finish(query, Oracle()).collect().to_pylist()
-    assert rows == [{"r.id": 1, "summary": "summary 0"},
-                    {"r.id": 2, "summary": "summary 1"},
-                    {"r.id": 3, "summary": "summary 2"}]
     (node,) = _maps(query.plan())
     assert node.spec.max_answer_tokens == 32
     # the prompt is the document, then the instruction and the answer cue
@@ -50,17 +79,12 @@ def test_a_map_writes_one_answer_per_document(session):
         f"SELECT r.id, AI.MAP(r.body, '{SUMMARY}') AS summary FROM reviews r")
     (node,) = _maps(query.plan())
     assert node.spec.max_answer_tokens == 256
-    # an unnamed map returns each answer under its SQL name
-    for function in ("AI.MAP", "ai_map"):
-        query = session.sql(
-            f"SELECT r.id, {function}(r.body, '{SUMMARY}') FROM reviews r")
-        oracle = Oracle(maps=lambda _spec, document: f"summary {document}")
-        table = finish(query, oracle).collect()
-        rows = zip(table.column(0).to_pylist(), table.column(1).to_pylist())
-        assert sorted(rows) == [
-            (1, "summary 0"), (2, "summary 1"), (3, "summary 2")], function
-        assert "map" in table.column_names[1].lower(), function
-        assert not table.column_names[1].startswith("__quail_"), function
+
+
+def test_a_map_writes_only_the_documents_the_filter_before_it_keeps():
+    assert_transcript(_transcript(
+        f"SELECT r.id, AI.MAP(r.body, '{SUMMARY}', 64) AS summary FROM reviews r "
+        "WHERE AI_FILTER(PROMPT('Negative? {0}', r.body)) ORDER BY r.id LIMIT 1"))
 
 
 def test_a_map_shares_the_pipeline_of_the_filter_or_classification_before_it(
@@ -75,9 +99,6 @@ def test_a_map_shares_the_pipeline_of_the_filter_or_classification_before_it(
                     and n.type_name == "quail.ai_filter"]
     assert [member.node_id for member in plan.graph.pipelines()[
         filter_id]] == [filter_id, node.node_id]
-    oracle = Oracle(filters=lambda alias, document, position: document != 0)
-    assert finish(query, oracle).collect().to_pylist() == [
-        {"r.id": 2, "summary": "summary 1"}]
     query = session.sql(
         "SELECT r.id, AI.CLASSIFY(PROMPT('What is the tone?\\n\\n{0}', r.body), "
         f"ARRAY['positive', 'negative']) AS tone, "
@@ -117,29 +138,33 @@ def test_the_planner_may_map_only_the_documents_a_join_keeps(session):
     assert [column.above_joins for column in lifted.found.maps] == [True]
 
 
-def test_a_plain_test_keeps_only_matching_map_answers(session):
+def test_a_plain_test_keeps_only_matching_map_answers():
+    call = "AI.MAP(r.body, 'Name the topic.', 16)"
+    select = f"SELECT r.id, {call} AS topic FROM reviews r"
+    bigquery = f"{select} WHERE {call} = 'name r1'"
+    assert_transcript(_transcript(
+        bigquery,
+        f"WITH m AS ({select}) SELECT m.id, m.topic FROM m "
+        "WHERE m.topic = 'name r1'",
+        # a map only tests read is computed once
+        f"SELECT r.id FROM reviews r WHERE LENGTH({call}) > 3 "
+        f"AND {call} LIKE '% r1'", dialects={bigquery: "bq"}))
+
+
+def test_a_plain_test_of_a_map_follows_it_in_its_pipeline(session):
     call = "AI.MAP(r.body, 'Name the topic.', 16)"
     select = f"SELECT r.id, {call} AS topic FROM reviews r"
     for form, dialect, sql in (
             ("call", "bq", f"{select} WHERE {call} = 'topic 1'"),
             ("cte", "snowflake", f"WITH m AS ({select}) SELECT m.id, m.topic FROM m "
                                  "WHERE m.topic = 'topic 1'")):
-        query = session.sql(sql, dialect=dialect)
-        plan = query.plan()
+        plan = session.sql(sql, dialect=dialect).plan()
         (node,) = _maps(plan)
         (test,) = [node for node in plan.nodes if node.type_name == "quail.filter"]
         assert test.inputs[0].source.node_id == node.node_id, form
         assert [member.node_id
                 for member in plan.graph.pipelines()[node.node_id]] == [
             node.node_id, test.node_id], form
-        rows = finish(query, Oracle()).collect().to_pylist()
-        assert [list(row.values()) for row in rows] == [[2, "topic 1"]], form
-    # a map only tests read is computed once
-    query = session.sql(f"SELECT r.id FROM reviews r WHERE LENGTH({call}) > 3 "
-                        f"AND {call} LIKE '% 1'")
-    assert len(_maps(query.plan())) == 1
-    assert finish(query, Oracle(maps=lambda spec, document: f"topic {document}"))\
-        .collect().to_pylist() == [{"r.id": 2}]
 
 
 COLUMN_OPERATORS = [

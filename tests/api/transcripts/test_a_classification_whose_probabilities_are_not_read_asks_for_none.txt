@@ -1,0 +1,17 @@
+--- SELECT x.topic, COUNT(*) AS n FROM (SELECT d.id, AI.CLASSIFY(PROMPT('Which topic? {0}', d.body), ARRAY['refund', 'shipping', 'praise'], {'probabilities': true}) AS topic FROM documents d) x GROUP BY x.topic ---
+plan
+  topic = ai_classify('Which topic? {0}', d.body, make_array('refund', 'shipping', 'praise'), named_struct('probabilities', Boolean(false)))
+asked 3 of 3
+  'Which topic? {0}': d0 'praise', d1 'shipping', d2 'praise'
+rows 2
+  'praise', 2
+  'shipping', 1
+
+--- SELECT d.id FROM documents d WHERE AI.CLASSIFY(PROMPT('Which topic? {0}', d.body), ARRAY['refund', 'shipping', 'praise'], {'probabilities': true}) IN ('praise') ---
+plan
+  __quail_column_1 = ai_classify('Which topic? {0}', d.body, make_array('refund', 'shipping', 'praise'), named_struct('probabilities', Boolean(false))), filter: __quail_column_1 = 'praise'
+asked 3 of 3
+  'Which topic? {0}': d0 'praise', d1 'shipping', d2 'praise'
+rows 2
+  d0
+  d2

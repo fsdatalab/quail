@@ -1,0 +1,18 @@
+--- WITH kept AS (SELECT c.id, c.text FROM contracts c WHERE AI.IF(PROMPT('keep {0}', c.text))) SELECT k.id AS contract_id, c.text AS contract_text FROM kept k JOIN contracts c ON k.id = c.id ---
+plan
+  __quail_answer_1 = ai_filter('keep {0}', c.text), filter: __quail_answer_1, returns: []
+asked 3 of 3
+  'keep {0}': 1 TRUE, 2 TRUE, 3 TRUE
+columns contract_id int64, contract_text string
+rows 3
+  1, 'Lease ends on March 3. Tenant may terminate early with notice.'
+  2, 'No dates here. Nothing about ending.'
+  3, 'Lease ends in 2030. Early termination is forbidden.'
+
+--- WITH kept AS (SELECT c.id, c.text FROM contracts c WHERE AI.IF(PROMPT('keep {0}', c.text))) SELECT k.id AS contract_id, c.text AS contract_text FROM kept k JOIN contracts c ON k.id = c.id ---
+plan
+  __quail_answer_1 = ai_filter('keep {0}', c.text), filter: __quail_answer_1, returns: []
+asked 3 of 3
+  'keep {0}': 1 FALSE, 2 FALSE, 3 FALSE
+columns contract_id int64, contract_text string
+rows 0

@@ -1,98 +1,243 @@
-"""Column predicates: parsed in WHERE and ON, applied before any model call."""
+"""Column predicates: parsed in WHERE and ON, applied before any model call.
+
+DataFusion runs every plain test before the model region, so the model
+is asked only about the rows it passes. Each transcript test's
+transcript, in transcripts/, shows the plan, the questions the model
+answered, and the rows (helpers/transcript.py).
+"""
+
+import re
 
 import pyarrow as pa
 import pytest
 from helpers.conditions import condition
-from helpers.oracle import Oracle, oracle_executor
 from helpers.planning import operators_of, row_tests
 from helpers.sessions import CONFIG, TOKENIZER, TRUTH, _run, make_executor
+from helpers.transcript import Transcripts, assert_transcript
 
 import quail
 from quail.common.expressions import CompileError
 from quail.common.selection import selected_rows
 from quail.physical import decode_plan_value
-from quail.physical.plan import graph_from_envelope
+
+# q1 passes r0, r1, r3, and r4; q2 passes r0, r2, r3, and r5
+REVIEWS = pa.table({
+    "id": [f"r{index}" for index in range(6)],
+    "review": [f"b{index}" for index in range(6)],
+    "stars": [5, 2, 4, None, 3, 5],
+    "lang": ["en", "en", "fr", "en", "en", "de"],
+})
+PRODUCTS = pa.table({"asin": ["p0", "p1"], "description": ["d0", "d1"],
+                     "price": [10, 20], "stars": [5, 2]})
+ITEMS = pa.table({"asin": ["p0", "p1"], "description": ["d0", "d1"],
+                  "price": [3, 4]})
+PAIRS = pa.table({
+    "id": [f"r{index}" for index in range(6)],
+    "review": [f"b{index}" for index in range(6)],
+    "stars": [5, 2, 4, None, 3, 5],
+    "floor": [4, 3, 4, 1, 1, 6],
+    "lang": ["EN", "en", "Fr", "EN", "en", "DE"],
+})
+LANGS = pa.table({"code": ["EN", "FR"], "notes": ["n0", "n1"]})
+TABLES = {"reviews": REVIEWS, "products": (PRODUCTS, "asin"),
+          "items": (ITEMS, "asin"), "pairs": PAIRS, "langs": (LANGS, "code")}
+
+FILTER_SQL = (
+    "SELECT r.id FROM reviews r "
+    "WHERE AI_FILTER(PROMPT('q1: {0}', r.review), {'selectivity': 0.5}) "
+    "AND AI_FILTER(PROMPT('q2: {0}', r.review), {'selectivity': 0.5})")
+FIRST = "FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.review))"
+PAIRS_FIRST = "FROM pairs r WHERE AI_FILTER(PROMPT('q1: {0}', r.review))"
+
+
+def _answer(kind, prompt, rows):
+    """Every pair joins; q1 and q2 pass the reviews above, by their number."""
+    if not prompt.startswith("q"):
+        # a join, which the run with every pushdown off asks as a filter
+        return True
+    index = int(re.sub(r"\D", "", rows[0]))
+    return index in ((0, 1, 3, 4) if prompt.startswith("q1") else (0, 2, 3, 5))
+
+
+def _transcript(*queries) -> str:
+    """Transcripts of queries, each SQL or (SQL, keyword arguments)."""
+    with Transcripts(TABLES, _answer) as runs:
+        return "\n".join(runs.query(query[0], **query[1])
+                         if isinstance(query, tuple) else runs.query(query)
+                         for query in queries)
 
 
 @pytest.fixture()
 def session():
     session = quail.Session(CONFIG, tokenizer=TOKENIZER)
-    session.register("reviews", quail.DocumentProvider.from_table(pa.table({
-        "id": [f"r{i}" for i in range(6)],
-        "review": [f"review {i} " + "pad " * 20 for i in range(6)],
-        "stars": [5, 2, 4, None, 3, 5],
-        "lang": ["en", "en", "fr", "en", "en", "de"],
-    }), id_col="id"))
+    for name, found in TABLES.items():
+        table, id_column = found if isinstance(found, tuple) else (found, "id")
+        session.register(
+            name, quail.DocumentProvider.from_table(table, id_col=id_column))
     yield session
     session.close()
 
 
-FILTER_SQL = """
-    SELECT r.id FROM reviews r
-    WHERE AI_FILTER(PROMPT('q1: {0}', r.review), {'selectivity': 0.5})
-      AND AI_FILTER(PROMPT('q2: {0}', r.review), {'selectivity': 0.5})
-"""
+def test_column_tests_in_where_reject_rows_before_the_model_is_asked():
+    assert_transcript(_transcript(
+        f"{FILTER_SQL} AND r.stars >= 3 AND r.lang IN ('en', 'fr') "
+        "AND r.stars IS NOT NULL",
+        f"SELECT r.id, r.stars {FIRST} AND r.stars < 4 AND r.lang = 'en'",
+        # a function on a source column
+        f"SELECT r.id {FIRST} AND LENGTH(r.lang) > 2",
+        # NOT, AND, and OR of one table's columns
+        f"{FILTER_SQL} AND NOT (LOWER(r.lang) LIKE '%e%' AND r.stars < 3)",
+        f"{FILTER_SQL} AND (r.stars IS NULL OR r.lang = 'de')",
+        f"SELECT r.id {FIRST} AND NOT (r.lang = 'fr' OR r.stars IS NULL)"))
 
 
-def test_regular_predicates_select_documents_before_the_model(session):
-    seen = []
-    answer = make_executor(TRUTH)
+def test_where_and_select_take_the_same_datafusion_expressions():
+    assert_transcript(_transcript(
+        (f"SELECT r.id, REVERSE(UPPER(r.lang)) AS backwards, "
+         f"ABS(r.stars - 4) AS gap {FIRST} AND ABS(r.stars - 4) <= 1 "
+         "ORDER BY r.id", {"ordered": True}),
+        # a test of a function's value
+        f"SELECT r.id {PAIRS_FIRST} AND UPPER(r.lang) = r.lang",
+        f"SELECT r.id {PAIRS_FIRST} AND NOT (UPPER(r.lang) = r.lang)",
+        # two columns of one table; r3's null stars is rejected
+        f"SELECT r.id {PAIRS_FIRST} AND r.stars > r.floor",
+        f"SELECT r.id {PAIRS_FIRST} AND (r.stars - r.floor >= 1 OR r.lang = 'en')",
+        f"SELECT r.id {PAIRS_FIRST} AND ABS(-r.stars) <= r.floor",
+        # SELECT returns the same comparison
+        f"SELECT r.id, r.stars > r.floor AS above {PAIRS_FIRST}"))
 
-    def execute(request):
-        from quail.physical import Scan as PhysicalScan
 
-        graph = graph_from_envelope(request.plan)
-        for node in graph.nodes:
-            if isinstance(node, PhysicalScan):
-                seen.append(len(request.inputs[node.input_id].documents))
-        return answer(request)
+def test_a_regexp_matches_the_whole_value_in_snowflake_and_any_part_in_bigquery():
+    bigquery = ("SELECT r.id FROM reviews r "
+                "WHERE AI.IF(PROMPT('q1: {{0}}', r.review)) "
+                "AND AI.IF(PROMPT('q2: {{0}}', r.review)) AND {}")
+    assert_transcript(_transcript(
+        # Snowflake matches the whole value: 'e' is not 'en'
+        f"{FILTER_SQL} AND REGEXP_LIKE(r.lang, 'e')",
+        f"{FILTER_SQL} AND REGEXP_LIKE(r.lang, 'e.')",
+        f"{FILTER_SQL} AND RLIKE(r.lang, 'e')",
+        f"{FILTER_SQL} AND NOT RLIKE(r.lang, 'e')",
+        f"{FILTER_SQL} AND REGEXP_LIKE(r.lang, r.lang || '?')",
+        (bigquery.format("REGEXP_CONTAINS(r.lang, 'e')"), {"dialect": "bq"}),
+        (bigquery.format("REGEXP_LIKE(r.lang, 'e')"), {"dialect": "bq"})))
 
-    execute.oracle = answer.oracle
 
-    # the AI predicates keep r0 and r3 of all six; the regular predicates keep
-    # r0, r2, and r4. DataFusion applies them before the region, so the
-    # executor gets only those three documents
-    query = session.sql(
-        FILTER_SQL + " AND r.stars >= 3 AND r.lang IN ('en', 'fr') "
-        "AND r.stars IS NOT NULL")
-    plan = query.plan()
-    scan = next(node for node in plan.nodes if type(node).__name__ == "Scan")
+def test_a_where_test_over_two_tables_keeps_the_pairs_it_passes():
+    join = "AI_FILTER(PROMPT('x {0} {1}', r.review, p.description))"
+    assert_transcript(_transcript(
+        # r3's null stars with p1 is NULL OR TRUE, which is true
+        f"SELECT r.id, p.asin FROM reviews r JOIN products p ON {join} "
+        "WHERE r.stars > 4 OR p.price > 15",
+        f"SELECT r.id, p.asin FROM reviews r JOIN items p ON {join} "
+        "WHERE r.stars > p.price"))
+
+
+def test_an_equality_of_two_tables_in_where_pairs_their_rows_before_the_ai_join():
+    join = "AI_FILTER(PROMPT('x {0} {1}', r.review, p.description))"
+    assert_transcript(_transcript(
+        f"SELECT r.id, p.asin FROM reviews r JOIN products p ON {join} "
+        "WHERE r.stars = p.stars",
+        f"SELECT r.id, p.asin FROM reviews r, products p "
+        f"WHERE r.stars = p.stars AND {join}"))
+
+
+SQL_CALLS = (
+    "LOG10(r.stars * 20) > 1.7", "SUBSTRING(r.lang, 2, 1)",
+    "CONCAT(r.lang, '-', r.lang)",
+    "CASE WHEN r.stars > 3 THEN 'high' WHEN r.stars > 0 THEN 'low' END",
+    "CAST(r.stars AS DOUBLE)", "r.stars IN (2, 3)",
+    # an integer divided by an integer is an integer
+    "ROUND(r.stars / 2)",
+    # GREATEST skips a NULL
+    "GREATEST(r.stars, 3)",
+    "r.stars % 2", "STRPOS(r.lang, 'n')", "r.stars BETWEEN 2 AND 3",
+)
+
+
+def test_sql_functions_have_datafusions_meaning_in_every_dialect():
+    columns = ", ".join(f"{call} AS v{index}"
+                        for index, call in enumerate(SQL_CALLS))
+    sql = f"SELECT r.id, {columns} {FIRST}"
+    assert_transcript(_transcript((sql, {"dialect": "bq"}), (sql, {})))
+
+
+def test_order_by_group_by_on_and_prompt_take_expressions():
+    band = "CASE WHEN r.stars > 2 THEN 'hi' ELSE 'lo' END"
+    assert_transcript(_transcript(
+        (f"SELECT r.id {FIRST} ORDER BY ABS(r.stars - 3), r.id", {"ordered": True}),
+        (f"SELECT {band} AS band, COUNT(*) AS n, SUM(r.stars * 2) AS s {FIRST} "
+         f"GROUP BY {band} ORDER BY band", {"ordered": True}),
+        # the model reads the computed text
+        "SELECT r.id FROM reviews r "
+        "WHERE AI_FILTER(PROMPT('q1: {0}', UPPER(TRIM(r.review))))",
+        "SELECT r.id, l.code FROM reviews r "
+        "JOIN langs l ON UPPER(TRIM(r.lang)) = l.code "
+        "AND AI_FILTER(PROMPT('x {0} {1}', r.review, l.notes))"))
+
+
+def test_datafusion_runs_plain_tests_and_join_keys_outside_the_region(session):
+    query = session.sql(f"{FILTER_SQL} AND r.stars >= 3 "
+                        "AND r.lang IN ('en', 'fr') AND r.stars IS NOT NULL")
+    (scan,) = [node for node in query.plan().nodes
+               if type(node).__name__ == "Scan"]
     assert scan.num_documents == 3
-    explained = query.explain()
-    assert "stars@2 >= 3" in explained
-    result = _run(query, execute)
-    assert seen == [3]
-    assert result.to_rows() == [("r0",)]
+    assert "stars@2 >= 3" in query.explain()
+    # the region's scan holds no test of its own
+    for test in ("NOT (LOWER(r.lang) LIKE '%e%' AND r.stars < 3)",
+                 "ABS(r.stars - 4) <= 1"):
+        (scan,) = operators_of(session.sql(f"{FILTER_SQL} AND {test}")).scans
+        assert scan.predicates == (), test
+    for test in ("UPPER(r.lang) = r.lang", "r.stars > r.floor",
+                 "r.stars - r.floor >= 1 OR r.lang = 'en'"):
+        (scan,) = operators_of(session.sql(
+            f"SELECT r.id {PAIRS_FIRST} AND ({test})")).scans
+        assert scan.predicates == (), test
+    # a test of two tables runs on the region's rows; the result returns
+    # only the selected columns
+    join = "AI_FILTER(PROMPT('x {0} {1}', r.review, p.description))"
+    query = session.sql(f"SELECT r.id, p.asin FROM reviews r JOIN products p "
+                        f"ON {join} WHERE r.stars > 4 OR p.price > 15")
+    assert row_tests(query) == ["stars > 4 OR price > 15"]
+    assert _run(query, make_executor(TRUTH, lambda *_: True)).collect(
+        ).column_names == ["r.id", "p.asin"]
+    query = session.sql(f"SELECT r.id, p.asin FROM reviews r JOIN items p "
+                        f"ON {join} WHERE r.stars > p.price")
+    assert row_tests(query) == ["stars > price"]
+    # an equality of two tables in WHERE is the AI join's key
+    query = session.sql(f"SELECT r.id, p.asin FROM reviews r, products p "
+                        f"WHERE r.stars = p.stars AND {join}")
+    assert [str(test) for test in operators_of(query).joins[0].on] == [
+        "r.stars = p.stars"]
+    assert any(node.type_name == "quail.hash_join" for node in query.plan().nodes)
+    # DataFusion computes an ON key before the region
+    query = session.sql("SELECT r.id, l.code FROM reviews r "
+                        "JOIN langs l ON UPPER(TRIM(r.lang)) = l.code "
+                        "AND AI_FILTER(PROMPT('x {0} {1}', r.review, l.notes))")
+    assert "upper(btrim(lang@2)) as __quail_expr_0" in query.explain()
+
+
+def test_answer_tables_and_survivors_hold_positions_in_the_registered_table(
+        session):
+    query = session.sql(f"{FILTER_SQL} AND r.stars >= 3 "
+                        "AND r.lang IN ('en', 'fr') AND r.stars IS NOT NULL")
+    result = _run(query, make_executor(TRUTH))
     stage = next(s for s in result.report["stages"] if s["op"] == "filter")
     assert stage["evaluated"] == 3
-    # answer tables and survivors hold positions in the registered table
     answers = result.answer_tables["filters"][("r", stage["written_position"])]
     assert answers.column("r").to_pylist() == [0, 2, 4]
     assert result.survivor_indices["r"].to_pylist() == [0]
 
-    first = "WHERE AI_FILTER(PROMPT('q1: {0}', r.review))"
-    query = session.sql(f"SELECT r.id, r.stars FROM reviews r {first} "
-                        "AND r.stars < 4 AND r.lang = 'en'")
-    assert sorted(_run(query, make_executor(TRUTH)).to_rows()) == [("r1", 2), ("r4", 3)]
-    # a function on a source column reaches the scan as written
-    query = session.sql(f"SELECT r.id FROM reviews r {first} AND LENGTH(r.lang) > 2")
-    assert _run(query, make_executor(TRUTH)).to_rows() == []
 
-    # NOT, AND, and OR of one table's columns run there too.
-    # the AI predicates keep r0 (en, 5 stars) and r3 (en, no stars)
-    query = session.sql(
-        FILTER_SQL + " AND NOT (LOWER(r.lang) LIKE '%e%' AND r.stars < 3)")
-    (scan,) = operators_of(query).scans
-    assert scan.predicates == ()
-    # r3's NULL < 3 makes the OR null, so DataFusion rejects r3
-    assert _run(query, make_executor(TRUTH)).to_rows() == [("r0",)]
-    query = session.sql(FILTER_SQL + " AND (r.stars IS NULL OR r.lang = 'de')")
-    assert _run(query, make_executor(TRUTH)).to_rows() == [("r3",)]
-    query = session.sql(
-        "SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.review)) "
-        "AND NOT (r.lang = 'fr' OR r.stars IS NULL)")
-    assert _run(query, make_executor(TRUTH)).to_rows() == [
-        ("r0",), ("r1",), ("r4",)]
+def test_a_bad_expression_is_refused_with_its_reason(session):
+    with pytest.raises(CompileError, match="unknown function 'nope'"):
+        session.sql(f"SELECT r.id {FIRST} AND NOPE(r.lang) = 'x'")
+    with pytest.raises(CompileError, match="a test is true or false, got Utf8"):
+        _run(session.sql(f"SELECT r.id {PAIRS_FIRST} AND UPPER(r.lang)"),
+             make_executor(TRUTH))
+    for dialect in ("bq", "snowflake"):
+        with pytest.raises(CompileError, match="write r.stars % 2"):
+            session.sql(f"SELECT r.id, MOD(r.stars, 2) AS v {FIRST}",
+                        dialect=dialect)
 
 
 def test_a_condition_keeps_sqls_nulls_checks_its_types_and_reads_back_from_a_plan():
@@ -110,210 +255,3 @@ def test_a_condition_keeps_sqls_nulls_checks_its_types_and_reads_back_from_a_pla
     read = decode_plan_value(written.to_json())
     rows = pa.table({"stars": [5, 1, None]})
     assert read.evaluate(rows).to_pylist() == [True, False, None]
-
-
-SNOWFLAKE_REGEXPS = [
-    # Snowflake matches the whole value: 'e' is not 'en'
-    ("REGEXP_LIKE(r.lang, 'e')", []),
-    ("REGEXP_LIKE(r.lang, 'e.')", [("r0",), ("r3",)]),
-    ("RLIKE(r.lang, 'e')", []),
-    ("NOT RLIKE(r.lang, 'e')", [("r0",), ("r3",)]),
-    ("REGEXP_LIKE(r.lang, r.lang || '?')", [("r0",), ("r3",)]),
-]
-
-
-def test_a_regexp_matches_the_whole_value_in_snowflake_and_any_part_in_bigquery(
-        session):
-    # the AI predicates keep r0 and r3, both in English
-    for test, expected in SNOWFLAKE_REGEXPS:
-        query = session.sql(FILTER_SQL + f" AND {test}")
-        assert _run(query, make_executor(TRUTH)).to_rows() == expected, test
-    for test in ("REGEXP_CONTAINS(r.lang, 'e')", "REGEXP_LIKE(r.lang, 'e')"):
-        query = session.sql(f"""
-            SELECT r.id FROM reviews r
-            WHERE AI.IF(PROMPT('q1: {{0}}', r.review))
-              AND AI.IF(PROMPT('q2: {{0}}', r.review)) AND {test}
-        """, dialect="bq")
-        assert _run(query, make_executor(TRUTH)).to_rows() == [
-            ("r0",), ("r3",)], test
-
-
-def test_a_where_test_over_two_tables_runs_on_the_result_rows(session):
-    session.register("products", quail.DocumentProvider.from_table(pa.table({
-        "asin": ["p0", "p1"], "description": ["d0", "d1"],
-        "price": [10, 20]}), id_col="asin"))
-    query = session.sql("""
-        SELECT r.id, p.asin FROM reviews r
-        JOIN products p ON AI_FILTER(PROMPT('x {0} {1}', r.review, p.description))
-        WHERE r.stars > 4 OR p.price > 15
-        ORDER BY r.id, p.asin
-    """)
-    # DataFusion tests the OR on the region's rows
-    assert row_tests(query) == ["stars > 4 OR price > 15"]
-    result = _run(query, oracle_executor(Oracle(joins=lambda *_: True)))
-    # every pair with p1, and r0 and r5 (5 stars) with p0; r3's null
-    # stars with p1 is NULL OR TRUE, which is true
-    assert result.to_rows() == [
-        ("r0", "p0"), ("r0", "p1"), ("r1", "p1"), ("r2", "p1"), ("r3", "p1"),
-        ("r4", "p1"), ("r5", "p0"), ("r5", "p1")]
-    # the Project read the tested columns; the result does not return them
-    assert result.collect().column_names == ["r.id", "p.asin"]
-    session.register("items", quail.DocumentProvider.from_table(pa.table({
-        "asin": ["p0", "p1"], "description": ["d0", "d1"],
-        "price": [3, 4]}), id_col="asin"))
-    query = session.sql("""
-        SELECT r.id, p.asin FROM reviews r
-        JOIN items p ON AI_FILTER(PROMPT('x {0} {1}', r.review, p.description))
-        WHERE r.stars > p.price
-        ORDER BY r.id, p.asin
-    """)
-    assert row_tests(query) == ["stars > price"]
-    result = _run(query, oracle_executor(Oracle(joins=lambda *_: True)))
-    assert result.to_rows() == [
-        ("r0", "p0"), ("r0", "p1"), ("r2", "p0"), ("r5", "p0"), ("r5", "p1")]
-
-
-def test_where_and_select_take_the_same_datafusion_expressions(session):
-    # q1 keeps r0, r1, r3, and r4; their stars are 5, 2, None, and 3
-    query = session.sql("""
-        SELECT r.id, REVERSE(UPPER(r.lang)) AS backwards,
-               ABS(r.stars - 4) AS gap
-        FROM reviews r
-        WHERE AI_FILTER(PROMPT('q1: {0}', r.review)) AND ABS(r.stars - 4) <= 1
-        ORDER BY r.id""")
-    # DataFusion's ABS runs the WHERE test before the region
-    (scan,) = operators_of(query).scans
-    assert scan.predicates == ()
-    assert _run(query, make_executor(TRUTH)).to_rows() == [
-        ("r0", "NE", 1), ("r4", "NE", 1)]
-    with pytest.raises(CompileError, match="unknown function 'nope'"):
-        session.sql("SELECT r.id FROM reviews r WHERE NOPE(r.lang) = 'x' "
-                    "AND AI_FILTER(PROMPT('q1: {0}', r.review))")
-    session.register("pairs", quail.DocumentProvider.from_table(pa.table({
-        "id": [f"r{i}" for i in range(6)],
-        "review": [f"review {i} " + "pad " * 20 for i in range(6)],
-        "stars": [5, 2, 4, None, 3, 5],
-        "floor": [4, 3, 4, 1, 1, 6],
-        "lang": ["EN", "en", "Fr", "EN", "en", "DE"],
-    }), id_col="id"))
-    # q1 keeps r0, r1, r3, and r4
-    first = "SELECT r.id FROM pairs r WHERE AI_FILTER(PROMPT('q1: {0}', r.review))"
-    cases = {
-        # a test of a function's value
-        "UPPER(r.lang) = r.lang": ["r0", "r3"],
-        "NOT (UPPER(r.lang) = r.lang)": ["r1", "r4"],
-        # two columns of one table; r3's null stars is rejected
-        "r.stars > r.floor": ["r0", "r4"],
-        "r.stars - r.floor >= 1 OR r.lang = 'en'": ["r0", "r1", "r4"],
-        "ABS(-r.stars) <= r.floor": ["r1"],
-    }
-    for test, kept in cases.items():
-        query = session.sql(f"{first} AND ({test}) ORDER BY r.id")
-        (scan,) = operators_of(query).scans
-        # DataFusion runs every plain test before the region
-        assert scan.predicates == (), test
-        assert [row[0] for row in _run(query, make_executor(TRUTH)).to_rows()] == (
-            kept), test
-    # SELECT returns the same comparison
-    query = session.sql(
-        "SELECT r.id, r.stars > r.floor AS above FROM pairs r "
-        "WHERE AI_FILTER(PROMPT('q1: {0}', r.review)) ORDER BY r.id")
-    assert _run(query, make_executor(TRUTH)).to_rows() == [
-        ("r0", True), ("r1", False), ("r3", None), ("r4", True)]
-    with pytest.raises(CompileError, match="a test is true or false, got Utf8"):
-        _run(session.sql(f"{first} AND UPPER(r.lang)"), make_executor(TRUTH))
-
-
-def test_an_equality_of_two_tables_in_where_pairs_their_rows_before_the_ai_join(
-        session):
-    session.register("products", quail.DocumentProvider.from_table(pa.table({
-        "asin": ["p0", "p1"], "description": ["d0", "d1"],
-        "stars": [5, 2]}), id_col="asin"))
-    asked = []
-
-    def same(node, assignment):
-        asked.append((assignment["r"], assignment["p"]))
-        return True
-
-    for where in ("FROM reviews r JOIN products p ON {ai} WHERE r.stars = p.stars",
-                  "FROM reviews r, products p WHERE r.stars = p.stars AND {ai}"):
-        asked.clear()
-        query = session.sql("SELECT r.id, p.asin " + where.format(
-            ai="AI_FILTER(PROMPT('x {0} {1}', r.review, p.description))")
-            + " ORDER BY r.id")
-        # the equality is the AI join's key, as an ON equality would be
-        assert [str(condition) for condition in operators_of(query).joins[0].on] == [
-            "r.stars = p.stars"]
-        assert any(node.type_name == "quail.hash_join" for node in query.plan().nodes)
-        result = _run(query, oracle_executor(Oracle(joins=same)))
-        assert result.to_rows() == [("r0", "p0"), ("r1", "p1"), ("r5", "p0")]
-        # the model is asked only about the pairs with equal stars
-        assert sorted(asked) == [(0, 0), (1, 1), (5, 0)]
-
-
-SQL_CALLS = {
-    # DataFusion evaluates each with its SQL meaning. r0, r1, r3, and r4
-    # pass q1; their stars are 5, 2, None, and 3
-    "LOG10(r.stars * 20) > 1.7": [True, False, None, True],
-    "SUBSTRING(r.lang, 2, 1)": ["n", "n", "n", "n"],
-    "CONCAT(r.lang, '-', r.lang)": ["en-en", "en-en", "en-en", "en-en"],
-    "CASE WHEN r.stars > 3 THEN 'high' WHEN r.stars > 0 THEN 'low' END": [
-        "high", "low", None, "low"],
-    "CAST(r.stars AS DOUBLE)": [5.0, 2.0, None, 3.0],
-    "r.stars IN (2, 3)": [False, True, None, True],
-    # an integer divided by an integer is an integer
-    "ROUND(r.stars / 2)": [2, 1, None, 1],
-    # GREATEST skips a NULL
-    "GREATEST(r.stars, 3)": [5, 3, 3, 3],
-    "r.stars % 2": [1, 0, None, 1],
-    "STRPOS(r.lang, 'n')": [2, 2, 2, 2],
-    "r.stars BETWEEN 2 AND 3": [False, True, None, True],
-}
-
-
-def test_sql_functions_have_datafusions_meaning_in_every_dialect(session):
-    for dialect in ("bq", "snowflake"):
-        for expression, expected in SQL_CALLS.items():
-            query = session.sql(
-                f"SELECT r.id, {expression} AS v FROM reviews r "
-                f"WHERE AI_FILTER(PROMPT('q1: {{0}}', r.review)) ORDER BY r.id",
-                dialect=dialect)
-            values = _run(
-                query, make_executor(TRUTH)).collect().column("v").to_pylist()
-            assert values == expected, (dialect, expression)
-        with pytest.raises(CompileError, match="write r.stars % 2"):
-            session.sql("SELECT r.id, MOD(r.stars, 2) AS v FROM reviews r "
-                        "WHERE AI_FILTER(PROMPT('q1: {0}', r.review))",
-                        dialect=dialect)
-
-
-def test_order_by_group_by_on_and_prompt_take_expressions(session):
-    # q1 keeps r0, r1, r3, and r4; their stars are 5, 2, None, and 3
-    first = "FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.review))"
-    query = session.sql(f"SELECT r.id {first} ORDER BY ABS(r.stars - 3), r.id")
-    assert _run(query, make_executor(TRUTH)).to_rows() == [
-        ("r4",), ("r1",), ("r0",), ("r3",)]
-    query = session.sql(
-        f"SELECT CASE WHEN r.stars > 2 THEN 'hi' ELSE 'lo' END AS band, "
-        f"COUNT(*) AS n, SUM(r.stars * 2) AS s {first} "
-        f"GROUP BY CASE WHEN r.stars > 2 THEN 'hi' ELSE 'lo' END ORDER BY band")
-    assert _run(query, make_executor(TRUTH)).to_rows() == [
-        ("hi", 2, 16), ("lo", 2, 4)]
-    query = session.sql(
-        "SELECT r.id FROM reviews r "
-        "WHERE AI_FILTER(PROMPT('q1: {0}', LOWER(TRIM(r.review)))) ORDER BY r.id")
-    assert _run(query, make_executor(TRUTH)).to_rows() == [
-        ("r0",), ("r1",), ("r3",), ("r4",)]
-    session.register("langs", quail.DocumentProvider.from_table(pa.table({
-        "code": ["EN", "FR"], "notes": ["n0", "n1"]}), id_col="code"))
-    query = session.sql("""
-        SELECT r.id, l.code FROM reviews r
-        JOIN langs l ON UPPER(TRIM(r.lang)) = l.code
-            AND AI_FILTER(PROMPT('x {0} {1}', r.review, l.notes))
-        ORDER BY r.id""")
-    # DataFusion computes the key before the region; the region joins on it
-    explained = query.explain()
-    assert "upper(btrim(lang@2)) as __quail_expr_0" in explained
-    result = _run(query, oracle_executor(Oracle(joins=lambda *_: True)))
-    assert result.to_rows() == [("r0", "EN"), ("r1", "EN"), ("r2", "FR"),
-                                ("r3", "EN"), ("r4", "EN")]

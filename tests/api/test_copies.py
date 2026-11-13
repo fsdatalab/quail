@@ -1,110 +1,39 @@
 """Model operators over copied documents are asked once per distinct text.
 
-Each query runs with deduplication and without it; both must return the
-same rows and answers, and the deduplicated run asks only key documents.
+The transcript, in transcripts/, names a text several reviews hold by
+all of them, such as ``r0/r2/r4``, and compares the questions asked
+with those of the run without deduplication (helpers/transcript.py).
 """
 
 import pyarrow as pa
-from helpers.oracle import Oracle, finish
-from helpers.sessions import CONFIG, TOKENIZER
-
-import quail
-import quail.builtins
+from helpers.transcript import Transcripts, assert_transcript
 
 BODIES = ["noisy room", "cold room", "noisy room", "slow lift", "noisy room",
           "cold room"]
-# a copy of a review can sit in another hotel than its first
-HOTELS = ["h1", "h2", "h2", "h1", "h3", "h1"]
-# the first review of each text
-KEYS = {0, 1, 3}
-NOTES = ["noise", "cold", "noise", "lift"]
-NOTE_HOTELS = ["h1", "h2", "h2", "h3"]
-TOPIC = {"noisy room": "noise", "cold room": "cold", "slow lift": "lift"}
+REVIEWS = pa.table({
+    "id": [f"r{index}" for index in range(len(BODIES))],
+    "body": BODIES,
+    # a copy of a review can sit in another hotel than its first
+    "hotel": ["h1", "h2", "h2", "h1", "h3", "h1"],
+})
 
 
-def _session(bodies=BODIES, hotels=HOTELS):
-    session = quail.Session(CONFIG, tokenizer=TOKENIZER)
-    for name, prefix, texts, places in (("reviews", "r", bodies, hotels),
-                                        ("notes", "n", NOTES, NOTE_HOTELS)):
-        session.register(name, quail.DocumentProvider.from_table(pa.table({
-            "id": [f"{prefix}{index}" for index in range(len(texts))],
-            "body": texts, "hotel": places}), id_col="id"))
-    return session
+def _answer(kind, prompt, rows):
+    """A review is short unless slow; two reviews agree when both are of rooms."""
+    bodies = [BODIES[int(row.split("/")[0][1:])] for row in rows]
+    if len(bodies) == 1:
+        return not bodies[0].startswith("slow")
+    return all("room" in body for body in bodies)
 
 
-def _planned(query):
-    """The plan over the exact tokens; the first plan estimates lengths."""
-    query.plan()
-    return query.plan()
-
-
-def _short(session):
-    return session.sql(
-        "SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('Is {0} short?', r.body))")
-
-
-def _oracle(asked, pipelines=False, filters=None):
-    """An oracle that records each document, or pair, it is asked about."""
-    def filter_answer(alias, document, position):
-        asked.append(document)
-        return (filters or (lambda d: not BODIES[d].startswith("slow")))(document)
-
-    def join_answer(node, assignment):
-        asked.append(tuple(assignment.values()))
-        if "n" in assignment:
-            return TOPIC[BODIES[assignment["r"]]] == NOTES[assignment["n"]]
-        return all("room" in BODIES[document] for document in assignment.values())
-
-    def extract_answer(spec, document):
-        asked.append(document)
-        return BODIES[document].split()[0]
-
-    return Oracle(filters=filter_answer, joins=join_answer,
-                  answers=extract_answer, pipelines=pipelines)
-
-
-def _run(build, deduplicate, monkeypatch, session=_session, **oracle):
-    """The query's rows, its answer tables, its plan, and what it asked."""
-    asked = []
-    with monkeypatch.context() as patch:
-        if not deduplicate:
-            patch.setattr(quail.builtins, "PHYSICAL_RULES", tuple(
-                name for name in quail.builtins.PHYSICAL_RULES
-                if name != "should_deduplicate"))
-        opened = session()
-    with opened:
-        query = build(opened)
-        plan = _planned(query)
-        result = finish(query, _oracle(asked, **oracle))
-        answers = {name: sorted(map(tuple, (row.values() for row in
-                                            table.to_pylist())))
-                   for tables in result.answer_tables.values()
-                   for name, table in tables.items()}
-        return sorted(result.to_rows()), answers, plan, asked
-
-
-def _both(build, monkeypatch, **options):
-    """Run with deduplication and without; both give the same rows and answers."""
-    rows, answers, plan, asked = _run(build, True, monkeypatch, **options)
-    plain_rows, plain_answers, _, plain_asked = _run(build, False, monkeypatch,
-                                                     **options)
-    assert (rows, answers) == (plain_rows, plain_answers)
-    return rows, plan, asked, plain_asked
-
-
-def _self_join(session):
-    return session.sql(
-        "SELECT a.id, b.id FROM reviews a JOIN reviews b ON a.hotel = b.hotel "
-        "AND AI_FILTER(PROMPT('Do {0} and {1} agree?', a.body, b.body))")
-
-
-def test_a_filter_asks_once_per_text_and_a_join_once_per_pair_of_texts(monkeypatch):
-    rows, _, asked, plain = _both(_short, monkeypatch, pipelines=True)
-    # the filter returns every copy of a text it keeps
-    assert rows == [("r0",), ("r1",), ("r2",), ("r4",), ("r5",)]
-    assert (asked, plain) == ([0, 1, 3], list(range(6)))
-    _, _, asked, plain = _both(_self_join, monkeypatch)
-    # every asked review is the first of its text, on either side
-    assert {pair[0] for pair in asked} <= KEYS
-    assert {pair[1] for pair in asked} <= KEYS
-    assert len(set(asked)) < len(set(plain))
+def test_a_filter_asks_once_per_text_and_a_join_once_per_pair_of_texts():
+    short = ("SELECT r.id FROM reviews r "
+             "WHERE AI_FILTER(PROMPT('Is {0} short?', r.body))")
+    self_join = ("SELECT a.id, b.id FROM reviews a JOIN reviews b "
+                 "ON a.hotel = b.hotel "
+                 "AND AI_FILTER(PROMPT('Do {0} and {1} agree?', a.body, b.body))")
+    with Transcripts({"reviews": REVIEWS}, _answer, pipelines=True) as runs:
+        filtered = runs.query(short)
+    with Transcripts({"reviews": REVIEWS}, _answer) as runs:
+        joined = runs.query(self_join)
+    assert_transcript(filtered + "\n" + joined)

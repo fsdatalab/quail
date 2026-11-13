@@ -1,0 +1,21 @@
+--- SELECT r.id FROM reviews r WHERE LEFT(AI_MAP(r.body, 'Is it kind?'), 3) = 'yes' ---
+plan
+  __quail_column_1 = ai_map(r.body, 'Is it kind?'), filter: left(__quail_column_1, Int64(3)) = 'yes'
+asked 6 of 6
+  'Is it kind?': r0 'yes, it is kind' stopped at 'yes', r1 'no, it is not kind' stopped at 'n', r2 'yes, it is kind' stopped at 'yes', r3 'no, it is not kind' stopped at 'n', r4 'yes, it is kind' stopped at 'yes', r5 'no, it is not kind' stopped at 'n'
+wrote 12 of 99 answer tokens
+rows 3
+  r0
+  r2
+  r4
+
+--- SELECT r.id, AI_MAP(r.body, 'Is it kind?') AS v FROM reviews r WHERE LEFT(AI_MAP(r.body, 'Is it kind?'), 3) = 'yes' ---
+plan
+  v = ai_map(r.body, 'Is it kind?'), filter: left(v, Int64(3)) = 'yes'
+asked 6 of 6
+  'Is it kind?': r0 'yes, it is kind', r1 'no, it is not kind' stopped at 'n', r2 'yes, it is kind', r3 'no, it is not kind' stopped at 'n', r4 'yes, it is kind', r5 'no, it is not kind' stopped at 'n'
+wrote 48 of 99 answer tokens
+rows 3
+  r0, 'yes, it is kind'
+  r2, 'yes, it is kind'
+  r4, 'yes, it is kind'
