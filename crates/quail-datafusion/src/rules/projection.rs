@@ -1,6 +1,6 @@
-//! The projection step of [`crate::Derive`]: an `AiNode` returns
-//! only the added columns the projection above it reads, and an
-//! extraction asks only the fields the query reads.
+//! The columns and fields an `AiNode` returns, which [`crate::Derive`]'s
+//! demand pass decides: an `AiNode` returns only the added columns the
+//! plan above reads, and an extraction asks only the fields it reads.
 //!
 //! An `AiNode`'s projection `P` names the added columns it returns. A
 //! projection `Q` above the node that reads only some of them needs only
@@ -37,78 +37,22 @@
 //! from its input (`AiNode::necessary_children_exprs`), but not the
 //! columns the node adds or the fields of a struct column.
 
-use quail_planner::constants::SPAN_SUFFIX;
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::common::{DFSchema, Result, internal_err};
+use datafusion::common::{Result, internal_err};
 use datafusion::logical_expr::expr::ScalarFunction;
-use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, UserDefinedLogicalNodeCore};
+use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan};
 
-use crate::ai::{AiNode, Fetch, Semantics};
+use crate::ai::AiNode;
 use crate::derive::unfolded;
 use crate::extension::{as_node, extension_node};
 use crate::functions::function_name;
 use crate::rules::lower::quail_function;
 
-/// Make each `AiNode` under a projection return only the added columns
-/// the projection reads, and each extraction ask only the fields the
-/// query reads, as the module explains.
-pub(super) fn projections(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
-    prune_extract_fields(plan)
-}
-
-/// `plan` with each extraction asking only the fields the plan reads,
-/// as the module explains.
-fn prune_extract_fields(mut plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
-    let mut changed = false;
-    for (call, answers) in extractions(&plan)? {
-        let Some(fields) = question_fields(&call) else {
-            continue;
-        };
-        let Some(read) = read_fields(&plan, &answers)? else {
-            continue;
-        };
-        let kept: Vec<usize> = fields
-            .iter()
-            .enumerate()
-            .filter(|(_, field)| read.contains(*field))
-            .map(|(index, _)| index)
-            .collect();
-        if kept.is_empty() || kept.len() == fields.len() {
-            continue;
-        }
-        let pruned = with_fields(&call, &kept);
-        plan = replace_call(plan, &call, &pruned)?;
-        changed = true;
-    }
-    Ok(Transformed::new_transformed(plan, changed))
-}
-
-/// Each extraction call of the plan's `AiNode`s, its literals unfolded,
-/// with the answer columns of the nodes that make it.
-fn extractions(plan: &LogicalPlan) -> Result<Vec<(Expr, Vec<String>)>> {
-    let mut found: Vec<(Expr, Vec<String>)> = Vec::new();
-    plan.apply_with_subqueries(|node| {
-        if let Some(ai) = as_node::<AiNode>(node)
-            && ai.function() == "ai_extract"
-            && ai.semantics == Semantics::Rows
-        {
-            let call = unfolded(ai.call.clone());
-            match found.iter_mut().find(|(known, _)| *known == call) {
-                Some((_, answers)) => answers.push(ai.answer.clone()),
-                None => found.push((call, vec![ai.answer.clone()])),
-            }
-        }
-        Ok(TreeNodeRecursion::Continue)
-    })?;
-    Ok(found)
-}
-
 /// The field names of an unfolded extraction call's questions argument,
 /// in order; None when it is not a `named_struct` of named fields.
-fn question_fields(call: &Expr) -> Option<Vec<String>> {
+pub(crate) fn question_fields(call: &Expr) -> Option<Vec<String>> {
     let Expr::ScalarFunction(found) = call else {
         return None;
     };
@@ -129,7 +73,7 @@ fn question_fields(call: &Expr) -> Option<Vec<String>> {
 }
 
 /// An unfolded extraction call asking only the questions at `kept`.
-fn with_fields(call: &Expr, kept: &[usize]) -> Expr {
+pub(crate) fn with_fields(call: &Expr, kept: &[usize]) -> Expr {
     let Expr::ScalarFunction(found) = call else {
         unreachable!("an extraction call")
     };
@@ -143,183 +87,6 @@ fn with_fields(call: &Expr, kept: &[usize]) -> Expr {
     let mut args = found.args.clone();
     args[1] = Expr::ScalarFunction(ScalarFunction::new_udf(Arc::clone(&questions.func), pairs));
     Expr::ScalarFunction(ScalarFunction::new_udf(Arc::clone(&found.func), args))
-}
-
-/// The fields of the columns named `answers` and their spans that the
-/// plan reads; None when it reads one of them whole.
-fn read_fields(plan: &LogicalPlan, answers: &[String]) -> Result<Option<BTreeSet<String>>> {
-    let mut names: Vec<String> = answers
-        .iter()
-        .flat_map(|answer| [answer.clone(), format!("{answer}{SPAN_SUFFIX}")])
-        .collect();
-    // a projection that renames a column passes it on under the new name
-    loop {
-        let mut renamed = Vec::new();
-        plan.apply_with_subqueries(|node| {
-            if let LogicalPlan::Projection(projection) = node {
-                for expr in &projection.expr {
-                    if let Expr::Alias(alias) = expr
-                        && let Expr::Column(column) = alias.expr.as_ref()
-                        && names.contains(&column.name)
-                        && !names.contains(&alias.name)
-                        && !renamed.contains(&alias.name)
-                    {
-                        renamed.push(alias.name.clone());
-                    }
-                }
-            }
-            Ok(TreeNodeRecursion::Continue)
-        })?;
-        if renamed.is_empty() {
-            break;
-        }
-        names.extend(renamed);
-    }
-    let mut reads = Reads {
-        names: &names,
-        fields: BTreeSet::new(),
-        whole: holds_any(plan.schema(), &names),
-    };
-    plan.apply_with_subqueries(|node| {
-        reads.node(node);
-        Ok(if reads.whole {
-            TreeNodeRecursion::Stop
-        } else {
-            TreeNodeRecursion::Continue
-        })
-    })?;
-    Ok((!reads.whole).then_some(reads.fields))
-}
-
-/// Whether a schema has a column named one of `names`.
-fn holds_any(schema: &DFSchema, names: &[String]) -> bool {
-    schema
-        .fields()
-        .iter()
-        .any(|field| names.contains(field.name()))
-}
-
-/// The uses of the columns `names` that [`read_fields`] has found.
-struct Reads<'a> {
-    names: &'a [String],
-    /// The fields read by name.
-    fields: BTreeSet<String>,
-    /// Whether a use reads a column whole.
-    whole: bool,
-}
-
-impl Reads<'_> {
-    /// Note the uses of one operator.
-    fn node(&mut self, node: &LogicalPlan) {
-        match node {
-            LogicalPlan::Projection(projection) => {
-                for expr in &projection.expr {
-                    if !self.passes_on(expr) {
-                        self.expr(expr);
-                    }
-                }
-            }
-            LogicalPlan::Extension(_) => match as_node::<AiNode>(node) {
-                Some(ai) => {
-                    let exprs = ai
-                        .expressions()
-                        .into_iter()
-                        .chain(ai.filter.clone())
-                        .chain(ai.tests.iter().map(|test| test.test.clone()));
-                    for expr in exprs {
-                        self.expr(&expr);
-                    }
-                    if let Some(Fetch::PerKey { key, .. }) = &ai.fetch
-                        && key.iter().any(|name| self.names.contains(name))
-                    {
-                        self.whole = true;
-                    }
-                }
-                None => self.inputs_hold(node),
-            },
-            LogicalPlan::Filter(_)
-            | LogicalPlan::Sort(_)
-            | LogicalPlan::Limit(_)
-            | LogicalPlan::Join(_)
-            | LogicalPlan::Aggregate(_)
-            | LogicalPlan::Window(_)
-            | LogicalPlan::Repartition(_)
-            | LogicalPlan::Distinct(_)
-            | LogicalPlan::SubqueryAlias(_)
-            | LogicalPlan::TableScan(_)
-            | LogicalPlan::Values(_)
-            | LogicalPlan::EmptyRelation(_) => {
-                for expr in node.expressions() {
-                    self.expr(&expr);
-                }
-            }
-            // the columns of the rest are not followed by name
-            _ => self.inputs_hold(node),
-        }
-    }
-
-    /// Whether a SELECT list item passes a column on, as it is or renamed.
-    fn passes_on(&self, expr: &Expr) -> bool {
-        let inner = match expr {
-            Expr::Alias(alias) => alias.expr.as_ref(),
-            other => other,
-        };
-        matches!(inner, Expr::Column(column) if self.names.contains(&column.name))
-    }
-
-    /// Note an operator whose inputs' columns are all read whole.
-    fn inputs_hold(&mut self, node: &LogicalPlan) {
-        if node
-            .inputs()
-            .iter()
-            .any(|input| holds_any(input.schema(), self.names))
-        {
-            self.whole = true;
-        }
-    }
-
-    /// Note the uses in one expression.
-    fn expr(&mut self, expr: &Expr) {
-        let _ = expr.apply(|found| {
-            if let Some(field) = self.field_read(found) {
-                self.fields.insert(field);
-                return Ok(TreeNodeRecursion::Jump);
-            }
-            let subquery = match found {
-                Expr::Column(column) | Expr::OuterReferenceColumn(_, column) => {
-                    self.whole |= self.names.contains(&column.name);
-                    None
-                }
-                Expr::ScalarSubquery(subquery) => Some(&subquery.subquery),
-                Expr::InSubquery(found) => Some(&found.subquery.subquery),
-                Expr::Exists(found) => Some(&found.subquery.subquery),
-                _ => None,
-            };
-            if let Some(plan) = subquery {
-                self.whole |= holds_any(plan.schema(), self.names);
-            }
-            Ok(TreeNodeRecursion::Continue)
-        });
-    }
-
-    /// The field `expr` reads of one of the columns by name, if it is
-    /// `get_field(column, 'field', ...)`.
-    fn field_read(&self, expr: &Expr) -> Option<String> {
-        let Expr::ScalarFunction(call) = expr else {
-            return None;
-        };
-        if call.name() != "get_field" {
-            return None;
-        }
-        match call.args.as_slice() {
-            [Expr::Column(column), Expr::Literal(field, _), ..]
-                if self.names.contains(&column.name) =>
-            {
-                field.try_as_str().flatten().map(ToString::to_string)
-            }
-            _ => None,
-        }
-    }
 }
 
 /// `plan` with each AI call `old`, an unfolded call, as `new` in every

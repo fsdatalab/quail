@@ -21,9 +21,8 @@
 //!
 //! All four come from one pass down the plan ([`demand`]): each operator
 //! says what the plan above needs of its input's rows, so a need reaches
-//! a node through any operators that pass it on. One step follows it:
-//! an extraction asks only the fields the query reads
-//! ([`super::projection`]).
+//! a node through any operators that pass it on. An extraction asks only
+//! the fields of its answer the plan reads.
 
 use datafusion::common::Result;
 use datafusion::common::tree_node::Transformed;
@@ -89,17 +88,6 @@ impl Derive {
     }
 }
 
-/// A step of the rule after the demand pass: the option it derives and
-/// its rewrite.
-type Step = (
-    DeriveOption,
-    fn(LogicalPlan) -> Result<Transformed<LogicalPlan>>,
-);
-
-/// The steps after the demand pass, in the order they run. A later step
-/// reads what an earlier one set: a guard follows the filters.
-const STEPS: [Step; 1] = [(DeriveOption::Projection, super::projection::projections)];
-
 impl OptimizerRule for Derive {
     fn name(&self) -> &str {
         match self.only {
@@ -120,16 +108,6 @@ impl OptimizerRule for Derive {
             guard: wants(DeriveOption::Guard),
             projection: wants(DeriveOption::Projection),
         };
-        let done = demand::demand_pass(plan, options)?;
-        let mut changed = done.transformed;
-        let mut plan = done.data;
-        for (option, step) in STEPS {
-            if self.only.is_none_or(|only| only == option) {
-                let done = step(plan)?;
-                changed |= done.transformed;
-                plan = done.data;
-            }
-        }
-        Ok(Transformed::new_transformed(plan, changed))
+        demand::demand_pass(plan, options)
     }
 }

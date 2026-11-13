@@ -41,17 +41,21 @@ use datafusion::logical_expr::expr::Case;
 use datafusion::logical_expr::expr_rewriter::NamePreserver;
 use datafusion::logical_expr::utils::{conjunction, split_binary, split_conjunction};
 use datafusion::logical_expr::{
-    BinaryExpr, Distinct, Expr, FetchType, Filter, JoinType, LogicalPlan, Operator, SkipType, lit,
+    BinaryExpr, Distinct, EmptyRelation, Expr, FetchType, Filter, JoinType, LogicalPlan, Operator,
+    SkipType, lit,
 };
 
 use super::fetch::{at_least, distinct_key, input_key, is_count_star, stops_per_key};
 use crate::ai::{AiNode, Fetch, Semantics};
+use crate::derive::unfolded;
 use crate::extension::{as_node, extension_node, with_inputs};
 use crate::rules::distinct::{is_distinct, is_unique};
 use crate::rules::guards::reads_call_table;
 use crate::rules::or_guards::or_terms;
+use crate::rules::projection::{question_fields, replace_call, with_fields};
 use crate::rules::repeated::{through_alias, through_projection};
 use crate::rules::substring::precheck;
+use quail_planner::constants::SPAN_SUFFIX;
 
 /// Which options the pass derives.
 #[derive(Debug, Clone, Copy)]
@@ -93,6 +97,9 @@ struct Demand {
     /// their input's rows as they are: a value every row below has, every
     /// read above sees.
     carried: bool,
+    /// The columns of `reads` read only as named fields of a struct, such
+    /// as `a['who']`, with those fields.
+    fields: BTreeMap<Column, BTreeSet<String>>,
 }
 
 impl Demand {
@@ -102,6 +109,7 @@ impl Demand {
             reads: None,
             count: Count::All,
             carried: false,
+            fields: BTreeMap::new(),
         }
     }
 
@@ -114,6 +122,22 @@ impl Demand {
         (reads.get(column).cloned().into_iter())
             .chain((self.tests.iter()).filter_map(|test| read_condition(&test.expr, column)))
             .reduce(|one, two| or(&one, &two))
+    }
+
+    /// The fields of `column` read, by the tests or otherwise: None when
+    /// it is read whole, or may be.
+    fn fields_read(&self, column: &Column) -> Option<BTreeSet<String>> {
+        let reads = self.reads.as_ref()?;
+        let mut found = BTreeSet::new();
+        if reads.contains_key(column) {
+            found.extend(self.fields.get(column)?.iter().cloned());
+        }
+        for test in &self.tests {
+            if test.expr.column_refs().contains(column) {
+                found.extend(read_fields(&test.expr, column)?);
+            }
+        }
+        Some(found)
     }
 
     /// The reads with what the tests read, for an operator that does not
@@ -240,6 +264,31 @@ impl Pass {
             }
             other => other.clone(),
         };
+        // the fields of each input column that the read outputs read
+        let mut fields: BTreeMap<Column, BTreeSet<String>> = BTreeMap::new();
+        let mut whole: BTreeSet<Column> = BTreeSet::new();
+        for (index, expr) in projection.expr.iter().enumerate() {
+            let column = Column::from(projection.schema.qualified_field(index));
+            if demand.read_where(&column).is_none() {
+                continue;
+            }
+            let expr = expr.clone().unalias();
+            for input in expr.column_refs() {
+                let found = match &expr {
+                    Expr::Column(plain) if plain == input => demand.fields_read(&column),
+                    _ => read_fields(&expr, input),
+                };
+                match found {
+                    Some(found) if !whole.contains(input) => {
+                        fields.entry(input.clone()).or_default().extend(found)
+                    }
+                    _ => {
+                        whole.insert(input.clone());
+                        fields.remove(input);
+                    }
+                }
+            }
+        }
         let input = projection.input.as_ref().clone();
         let (input, taken) = self.down(
             input,
@@ -248,6 +297,7 @@ impl Pass {
                 reads: Some(reads),
                 count,
                 carried: demand.carried,
+                fields,
             },
         )?;
         Ok((
@@ -275,6 +325,9 @@ impl Pass {
                 })
                 .collect()
         });
+        let fields = (demand.fields.iter())
+            .filter_map(|(column, found)| Some((column_below(column)?, found.clone())))
+            .collect();
         let keys = |keys: &[Column]| keys.iter().map(column_below).collect::<Option<Vec<_>>>();
         let count = match &demand.count {
             Count::Distinct(found) => keys(found).map_or(Count::All, Count::Distinct),
@@ -291,6 +344,7 @@ impl Pass {
                 reads,
                 count,
                 carried: demand.carried,
+                fields,
             },
         )?;
         Ok((
@@ -317,6 +371,7 @@ impl Pass {
                 reads,
                 count: demand.count,
                 carried: demand.carried,
+                fields: demand.fields.clone(),
             },
         )?;
         let kept: Vec<Expr> = (own.iter())
@@ -361,6 +416,7 @@ impl Pass {
                 reads: demand.reads_with_tests(),
                 count,
                 carried: demand.carried,
+                fields: without_tests(&demand.fields, &demand.tests),
             },
         )?;
         // a LIMIT with no offset that a node took leaves the plan
@@ -397,6 +453,12 @@ impl Pass {
                 }
             }
         }
+        let mut fields = demand.fields.clone();
+        for expr in &sort.expr {
+            for column in expr.expr.column_refs() {
+                fields.remove(column);
+            }
+        }
         // the sort decides which rows are first
         let input = sort.input.as_ref().clone();
         let (input, mut taken) = self.down(
@@ -406,6 +468,7 @@ impl Pass {
                 reads,
                 count: Count::All,
                 carried: demand.carried,
+                fields,
             },
         )?;
         // a count taken below is the sort's, not the demand's
@@ -435,6 +498,7 @@ impl Pass {
                 reads: None,
                 count,
                 carried: false,
+                fields: BTreeMap::new(),
             },
         )?;
         // a count taken below is the DISTINCT's, not the demand's
@@ -488,6 +552,7 @@ impl Pass {
                 reads: None,
                 count,
                 carried: false,
+                fields: BTreeMap::new(),
             },
         )?;
         Ok((with_inputs(&plan, vec![input])?, Taken::default()))
@@ -551,6 +616,13 @@ impl Pass {
                 }
                 found
             });
+            let on = (join.on.iter().flat_map(|(left, right)| [left, right]))
+                .chain(join.filter.iter())
+                .flat_map(|expr| expr.column_refs())
+                .collect::<BTreeSet<_>>();
+            let fields = (without_tests(&demand.fields, &demand.tests).into_iter())
+                .filter(|(column, _)| schema.has_column(column) && !on.contains(column))
+                .collect();
             // a semi join needs one row of each key of its other side
             let count = match semi_join_keys(join, filtered) {
                 Some(keys) if self.options.fetch => Count::PerKey(keys, 1),
@@ -563,6 +635,7 @@ impl Pass {
                     reads,
                     count,
                     carried,
+                    fields,
                 },
             ));
         }
@@ -652,6 +725,7 @@ impl Pass {
             reads: demand.reads.clone(),
             count: Count::All,
             carried: demand.carried,
+            fields: demand.fields.clone(),
         };
         // where the answer is read becomes the node's guard
         if self.options.guard && !fetched {
@@ -660,6 +734,7 @@ impl Pass {
         let mut kept = None;
         if self.options.projection {
             kept = project(&mut node, &above);
+            ask_read_fields(&mut node, &above)?;
         }
         // the node's input: the tests of its input, and the reads of its
         // input's columns and of its own expressions
@@ -679,6 +754,7 @@ impl Pass {
             reads: demand.reads.clone(),
             count: Count::All,
             carried: demand.carried,
+            fields: demand.fields.clone(),
         };
         let reads = held.reads_with_tests().map(|reads| {
             let mut found: BTreeMap<Column, Expr> = (reads.iter())
@@ -719,6 +795,17 @@ impl Pass {
             }
             _ => Count::All,
         };
+        // the node's own expressions read their columns whole
+        let own: BTreeSet<Column> = ([Some(&node.call), node.guard.as_ref(), node.hint.as_ref()])
+            .into_iter()
+            .flatten()
+            .chain(node.filter.iter())
+            .chain(node.tests.iter().map(|test| &test.test))
+            .flat_map(|expr| expr.column_refs().into_iter().cloned())
+            .collect();
+        let fields = (without_tests(&held.fields, &held.tests).into_iter())
+            .filter(|(column, _)| input_schema.has_column(column) && !own.contains(column))
+            .collect();
         let (input, below) = self.down(
             input,
             Demand {
@@ -726,6 +813,7 @@ impl Pass {
                 reads,
                 count,
                 carried: demand.carried,
+                fields,
             },
         )?;
         taken.tests.extend(below.tests);
@@ -773,6 +861,115 @@ fn project(node: &mut AiNode, above: &Demand) -> Option<(String, bool)> {
     }
     node.projection = Some(Vec::new());
     Some((node.answer.clone(), !negated))
+}
+
+/// Ask an extraction only the fields the plan above and its own filter
+/// and tests read, of its answer and its spans; each field is a question
+/// of its own, so leaving one out changes no other's answer.
+fn ask_read_fields(node: &mut AiNode, above: &Demand) -> Result<()> {
+    if node.function() != "ai_extract" || node.semantics != Semantics::Rows || above.reads.is_none()
+    {
+        return Ok(());
+    }
+    let call = unfolded(node.call.clone());
+    let Some(questions) = question_fields(&call) else {
+        return Ok(());
+    };
+    let names: Vec<Column> = [node.answer.clone(), format!("{}{SPAN_SUFFIX}", node.answer)]
+        .into_iter()
+        .filter(|name| node.fields.iter().any(|field| field.name() == name))
+        .map(Column::from_name)
+        .collect();
+    let mut read = BTreeSet::new();
+    for name in &names {
+        if above.read_where(name).is_some() {
+            let Some(found) = above.fields_read(name) else {
+                return Ok(());
+            };
+            read.extend(found);
+        }
+        for expr in node
+            .filter
+            .iter()
+            .chain(node.tests.iter().map(|test| &test.test))
+        {
+            if expr.column_refs().contains(name) {
+                let Some(found) = read_fields(expr, name) else {
+                    return Ok(());
+                };
+                read.extend(found);
+            }
+        }
+    }
+    let kept: Vec<usize> = (questions.iter().enumerate())
+        .filter(|(_, question)| read.contains(*question))
+        .map(|(index, _)| index)
+        .collect();
+    if kept.is_empty() || kept.len() == questions.len() {
+        return Ok(());
+    }
+    // the call changes in this node alone: a node below with the same call
+    // asks the fields its own readers read
+    let input = Arc::clone(&node.input);
+    let alone = LogicalPlan::EmptyRelation(EmptyRelation {
+        produce_one_row: false,
+        schema: Arc::clone(input.schema()),
+    });
+    let alone = extension_node(node.with_input(alone)?.checked()?);
+    let asked = replace_call(alone, &call, &with_fields(&call, &kept))?;
+    let found = as_node::<AiNode>(&asked).expect("an AiNode");
+    *node = found.with_input(Arc::unwrap_or_clone(input))?;
+    Ok(())
+}
+
+/// `fields` without the columns the tests read, for an operator that
+/// reads them as it folds the tests into its reads.
+fn without_tests(
+    fields: &BTreeMap<Column, BTreeSet<String>>,
+    tests: &[Test],
+) -> BTreeMap<Column, BTreeSet<String>> {
+    let tested: BTreeSet<&Column> = tests
+        .iter()
+        .flat_map(|test| test.expr.column_refs())
+        .collect();
+    (fields.iter())
+        .filter(|(column, _)| !tested.contains(column))
+        .map(|(column, found)| (column.clone(), found.clone()))
+        .collect()
+}
+
+/// The fields of `column` that `expr` reads when it reads `column` only as
+/// `get_field(column, 'name')`; None when it reads more of it.
+fn read_fields(expr: &Expr, column: &Column) -> Option<BTreeSet<String>> {
+    let mut fields = BTreeSet::new();
+    let mut whole = false;
+    let _ = expr.apply(|found| {
+        if let Expr::ScalarFunction(call) = found
+            && call.name() == "get_field"
+            && matches!(call.args.first(), Some(Expr::Column(read)) if read == column)
+        {
+            let name = match call.args.get(1) {
+                Some(Expr::Literal(value, _)) => value.try_as_str().flatten(),
+                _ => None,
+            };
+            match name {
+                Some(name) => {
+                    fields.insert(name.to_string());
+                    return Ok(TreeNodeRecursion::Jump);
+                }
+                None => whole = true,
+            }
+        }
+        if matches!(found, Expr::Column(read) if read == column) {
+            whole = true;
+        }
+        Ok(if whole {
+            TreeNodeRecursion::Stop
+        } else {
+            TreeNodeRecursion::Continue
+        })
+    });
+    (!whole).then_some(fields)
 }
 
 /// `plan` with each read of a kept answer as its value, each expression
