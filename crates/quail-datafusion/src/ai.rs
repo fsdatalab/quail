@@ -349,6 +349,14 @@ impl AiNode {
             .is_some_and(|written| written.on.is_some())
     }
 
+    /// Whether a rule gave the node a filter, guard, fetch, or projection.
+    pub fn has_options(&self) -> bool {
+        self.filter.is_some()
+            || self.guard.is_some()
+            || self.fetch.is_some()
+            || self.projection.is_some()
+    }
+
     /// The added columns the node returns.
     pub fn returned_fields(&self) -> Vec<Field> {
         match &self.projection {

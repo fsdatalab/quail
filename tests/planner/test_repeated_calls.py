@@ -3,7 +3,8 @@
 AI_{f→b}(AI_{f→a}(R)) = π_{*, a→b}(AI_{f→a}(R)). The lowering gives
 calls written the same way in one SELECT list and WHERE one AiNode;
 merge_repeated_ai_calls merges an AiNode into the same call below it,
-such as an AI.IF written twice. The transcript, in transcripts/, shows
+such as an AI.IF written twice. It runs before derive, so derive gives
+the one node what every read of its answer needs. The transcript, in transcripts/, shows
 the plan, the questions the model answered, and the rows
 (helpers/transcript.py).
 """

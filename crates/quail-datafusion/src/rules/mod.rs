@@ -37,7 +37,7 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::optimizer::{ApplyOrder, Optimizer, OptimizerConfig, OptimizerRule};
 
 /// Quail's own rules, in the order they run.
-pub const QUAIL_RULES: [&str; 3] = ["derive", "place_ai_nodes", "merge_repeated_ai_calls"];
+pub const QUAIL_RULES: [&str; 3] = ["merge_repeated_ai_calls", "derive", "place_ai_nodes"];
 
 /// The rule Quail's rules run before.
 const QUAIL_RULES_BEFORE: &str = "replace_distinct_aggregate";
@@ -54,9 +54,9 @@ const EXPECTED_DEFAULT_RULES: [&str; 29] = [
     "optimize_unions",
     "unions_to_filter",
     "simplify_expressions",
+    "merge_repeated_ai_calls",
     "derive",
     "place_ai_nodes",
-    "merge_repeated_ai_calls",
     "replace_distinct_aggregate",
     "eliminate_join",
     "decorrelate_predicate_subquery",

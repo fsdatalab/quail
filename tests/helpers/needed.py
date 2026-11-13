@@ -27,7 +27,7 @@ from helpers.sessions import CONFIG, TOKENIZER
 from quail.builtins import LOGICAL_RULES, PHYSICAL_RULES, built_in_registry
 
 # Quail's logical rewrites, and the executor's ways to ask fewer rows
-QUAIL_RULES = ("derive", "place_ai_nodes", "merge_repeated_ai_calls")
+QUAIL_RULES = ("merge_repeated_ai_calls", "derive", "place_ai_nodes")
 EARLY_STOPS = ("should_stop_answers_early", "should_deduplicate",
                "should_push_down_limit")
 # the values an answer of each kind may take, besides its true one; a

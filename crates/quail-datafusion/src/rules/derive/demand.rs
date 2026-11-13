@@ -673,9 +673,14 @@ impl Pass {
             for test in &demand.tests {
                 let reads_returned = (test.expr.column_refs().iter())
                     .any(|column| column.relation.is_none() && returned.contains(&column.name));
-                if reads_returned && node.accepts_test(&test.expr) {
-                    node.filter =
-                        conjunction(node.filter.take().into_iter().chain([test.expr.clone()]));
+                // a call written twice tests the one answer twice
+                let held =
+                    (node.filter.iter().flat_map(split_conjunction)).any(|term| *term == test.expr);
+                if reads_returned && (held || node.accepts_test(&test.expr)) {
+                    if !held {
+                        node.filter =
+                            conjunction(node.filter.take().into_iter().chain([test.expr.clone()]));
+                    }
                     taken.tests.insert(test.id);
                 }
             }

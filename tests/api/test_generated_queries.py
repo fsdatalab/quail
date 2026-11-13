@@ -12,8 +12,8 @@ pytest.importorskip("_quail_native")
 
 NUM_QUERIES = 40
 # Quail's logical rewrites, and the executor's ways to ask fewer rows
-QUAIL_RULES = ("derive", "place_ai_nodes",
-               "merge_repeated_ai_calls")
+QUAIL_RULES = ("merge_repeated_ai_calls", "derive",
+               "place_ai_nodes")
 EARLY_STOPS = ("should_stop_answers_early", "should_deduplicate",
                "should_push_down_limit")
 

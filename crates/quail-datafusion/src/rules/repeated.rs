@@ -16,25 +16,19 @@
 //! derived table, the lower node's answers are added to its SELECT list
 //! where it does not return them already. For example, in `SELECT
 //! AI.CLASSIFY(d.body, ...) FROM (SELECT r.body, AI.CLASSIFY(r.body, ...)
-//! AS t FROM reviews r) d` the outer call reads `d.t`. It replaces the
-//! upper node only when:
+//! AS t FROM reviews r) d` the outer call reads `d.t`.
 //!
-//! - both nodes return rows, not a gate's;
-//! - the upper node has no fetch, and no filter across a derived table;
-//! - each term of the upper node's filter, read on the lower node's
-//!   answer, is already a term of the lower node's filter, so every row
-//!   that reaches the upper node passes it;
-//! - the lower node returns each answer column the upper node returns.
-//!
+//! The rule runs before [`crate::rules::derive`], while no node has a
+//! filter, guard, fetch, or projection, so one node stands for the call
+//! and `derive` gives it what every read of its answer needs together.
+//! It leaves a node that has one of those options, and a gate, alone.
 //! The upper node's `HINT` estimated the rows of a test the lower node
 //! already makes, and goes with it.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column, Result};
-use datafusion::logical_expr::utils::split_conjunction;
 use datafusion::logical_expr::{Expr, Filter, LogicalPlan, Projection, SubqueryAlias};
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
@@ -64,63 +58,18 @@ fn merge(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     let Some(upper) = as_node::<AiNode>(&plan) else {
         return Ok(Transformed::no(plan));
     };
-    if upper.semantics != Semantics::Rows || upper.fetch.is_some() {
+    if upper.semantics != Semantics::Rows || upper.has_options() {
         return Ok(Transformed::no(plan));
     }
-    let Some((lower, through)) = same_call_below(upper) else {
+    let Some(lower) = same_call_below(upper) else {
         return Ok(Transformed::no(plan));
     };
-    // a node across a derived table reads its columns by other names
-    if through && upper.filter.is_some() {
-        return Ok(Transformed::no(plan));
-    }
-    // each of the upper node's answer columns, by the lower node's name
-    let renamed: HashMap<&String, &String> = upper
+    let answers = &upper.fields;
+    let input = upper.input.as_ref().clone();
+    let names: Vec<String> = lower
         .fields
         .iter()
-        .map(|field| field.name())
-        .zip(lower.fields.iter().map(|field| field.name()))
-        .collect();
-    let on_lower = |expr: &Expr| -> Result<Expr> {
-        expr.clone()
-            .transform_up(|expr| match &expr {
-                Expr::Column(column) if column.relation.is_none() => {
-                    match renamed.get(&column.name) {
-                        Some(name) => Ok(Transformed::yes(Expr::Column(Column::new_unqualified(
-                            (*name).clone(),
-                        )))),
-                        None => Ok(Transformed::no(expr)),
-                    }
-                }
-                _ => Ok(Transformed::no(expr)),
-            })
-            .map(|read| read.data)
-    };
-    let lower_terms: Vec<&Expr> = lower.filter.iter().flat_map(split_conjunction).collect();
-    for term in upper.filter.iter().flat_map(split_conjunction) {
-        if !lower_terms.contains(&&on_lower(term)?) {
-            return Ok(Transformed::no(plan));
-        }
-    }
-    let returned: Vec<String> = lower
-        .returned_fields()
-        .iter()
         .map(|field| field.name().clone())
-        .collect();
-    let answers = upper.returned_fields();
-    if answers
-        .iter()
-        .any(|field| !returned.contains(renamed[field.name()]))
-    {
-        return Ok(Transformed::no(plan));
-    }
-    let input = upper.input.as_ref().clone();
-    if answers.is_empty() {
-        return Ok(Transformed::yes(input));
-    }
-    let names: Vec<String> = answers
-        .iter()
-        .map(|field| renamed[field.name()].clone())
         .collect();
     // the lower node's answers as the upper node's input names them,
     // added to each derived table's SELECT list between them
@@ -291,33 +240,20 @@ pub(crate) fn through_alias(expr: &Expr, alias: &SubqueryAlias) -> Option<Expr> 
 
 /// The first `AiNode` below `upper`, through filters, other nodes of the
 /// same rows, and the projections and aliases of derived tables, that
-/// makes `upper`'s call with its guard, each column read by the name the
-/// node's input gives it, and adds columns of the same types; and whether
-/// a projection or alias is between them.
-fn same_call_below(upper: &AiNode) -> Option<(&AiNode, bool)> {
+/// makes `upper`'s call, each column read by the name the node's input
+/// gives it, has no options, and adds columns of the same types.
+fn same_call_below(upper: &AiNode) -> Option<&AiNode> {
     let mut plan = upper.input.as_ref();
     let mut call = upper.call.clone();
-    let mut guard = upper.guard.clone();
-    let mut through = false;
     loop {
         plan = match plan {
             LogicalPlan::Filter(filter) => filter.input.as_ref(),
             LogicalPlan::Projection(projection) => {
                 call = through_projection(&call, projection)?;
-                guard = match &guard {
-                    Some(found) => Some(through_projection(found, projection)?),
-                    None => None,
-                };
-                through = true;
                 projection.input.as_ref()
             }
             LogicalPlan::SubqueryAlias(alias) => {
                 call = through_alias(&call, alias)?;
-                guard = match &guard {
-                    Some(found) => Some(through_alias(found, alias)?),
-                    None => None,
-                };
-                through = true;
                 alias.input.as_ref()
             }
             LogicalPlan::Extension(_) => {
@@ -331,144 +267,12 @@ fn same_call_below(upper: &AiNode) -> Option<(&AiNode, bool)> {
                         .iter()
                         .zip(&upper.fields)
                         .all(|(found, field)| found.data_type() == field.data_type());
-                if node.call == call && node.guard == guard && same_types {
-                    return Some((node, through));
+                if node.call == call && same_types && !node.has_options() {
+                    return Some(node);
                 }
                 node.input.as_ref()
             }
             _ => return None,
         };
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::datasource::empty::EmptyTable;
-    use datafusion::datasource::provider_as_source;
-    use datafusion::logical_expr::expr::ScalarFunction;
-    use datafusion::logical_expr::{LogicalPlanBuilder, col, lit};
-    use datafusion::optimizer::{Optimizer, OptimizerContext};
-
-    use super::*;
-    use crate::ai::Fetch;
-
-    fn reviews() -> LogicalPlan {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("body", DataType::Utf8, true),
-        ]));
-        LogicalPlanBuilder::scan(
-            "reviews",
-            provider_as_source(Arc::new(EmptyTable::new(schema))),
-            None,
-        )
-        .unwrap()
-        .build()
-        .unwrap()
-    }
-
-    fn call(function: &str, template: &str) -> Expr {
-        Expr::ScalarFunction(ScalarFunction::new_udf(
-            crate::functions::quail_functions()
-                .into_iter()
-                .find(|found| found.name() == function)
-                .unwrap(),
-            vec![lit(template), col("reviews.body")],
-        ))
-    }
-
-    /// An `AI.IF` of `template` over `input`, adding `answer`.
-    fn ai_filter(input: LogicalPlan, template: &str, answer: &str) -> AiNode {
-        let mut node = AiNode::try_new(
-            Arc::new(input),
-            call("ai_filter", template),
-            answer.into(),
-            vec![Field::new(answer, DataType::Boolean, true)],
-        )
-        .unwrap();
-        node.filter = Some(col(answer));
-        node.projection = Some(Vec::new());
-        node.checked().unwrap()
-    }
-
-    fn tone(input: LogicalPlan, answer: &str) -> AiNode {
-        AiNode::try_new(
-            Arc::new(input),
-            call("ai_classify", "Tone of {0}?"),
-            answer.into(),
-            vec![Field::new(answer, DataType::Utf8, true)],
-        )
-        .unwrap()
-    }
-
-    fn merged(plan: LogicalPlan) -> Vec<String> {
-        Optimizer::with_rules(vec![Arc::new(MergeRepeatedAiCalls)])
-            .optimize(plan, &OptimizerContext::new(), |_, _| {})
-            .unwrap()
-            .display_indent()
-            .to_string()
-            .lines()
-            .map(|line| line.trim().to_string())
-            .collect()
-    }
-
-    fn num_nodes(lines: &[String]) -> usize {
-        lines
-            .iter()
-            .filter(|line| line.starts_with("AiNode"))
-            .count()
-    }
-
-    #[test]
-    fn a_repeated_ai_filter_asks_the_model_once() {
-        let kind = extension_node(ai_filter(reviews(), "Is {0} kind?", "a"));
-        let short = extension_node(ai_filter(kind, "Is {0} short?", "b"));
-        let again = extension_node(ai_filter(short, "Is {0} kind?", "c"));
-        let lines = merged(again);
-        assert_eq!(num_nodes(&lines), 2, "{lines:?}");
-        assert!(lines[0].contains("short"), "{lines:?}");
-    }
-
-    #[test]
-    fn a_repeated_classification_reads_the_label_below_it() {
-        let first = extension_node(tone(reviews(), "a"));
-        let plan = LogicalPlanBuilder::from(extension_node(tone(first, "b")))
-            .project(vec![col("reviews.id"), col("a"), col("b")])
-            .unwrap()
-            .build()
-            .unwrap();
-        let schema = plan.schema().clone();
-        let optimized = Optimizer::with_rules(vec![Arc::new(MergeRepeatedAiCalls)])
-            .optimize(plan, &OptimizerContext::new(), |_, _| {})
-            .unwrap();
-        assert_eq!(optimized.schema(), &schema);
-        let lines: Vec<String> = optimized
-            .display_indent()
-            .to_string()
-            .lines()
-            .map(|line| line.trim().to_string())
-            .collect();
-        assert_eq!(num_nodes(&lines), 1, "{lines:?}");
-        assert!(
-            lines.iter().any(|line| line.contains("a AS b")),
-            "{lines:?}"
-        );
-    }
-
-    #[test]
-    fn a_repeated_call_with_a_new_test_or_a_fetch_is_asked_again() {
-        // the lower classification keeps every row; the upper one's test
-        // would drop rows the lower one returns
-        let first = extension_node(tone(reviews(), "a"));
-        let mut tested = tone(first, "b");
-        tested.filter = Some(col("b").eq(lit("kind")));
-        let tested = extension_node(tested.checked().unwrap());
-        assert_eq!(num_nodes(&merged(tested)), 2);
-        let first = extension_node(tone(reviews(), "a"));
-        let mut fetched = tone(first, "b");
-        fetched.fetch = Some(Fetch::Global(2));
-        let fetched = extension_node(fetched.checked().unwrap());
-        assert_eq!(num_nodes(&merged(fetched)), 2);
     }
 }
