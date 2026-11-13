@@ -788,9 +788,6 @@ class NoDocuments(EvenDocuments):
         return [False] * 14
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "with every document skipped the GPU loop has nothing to pack and "
-    "raises 'nothing buildable and nothing in flight'"))
 def test_a_region_whose_hint_drops_every_document_returns_no_rows(monkeypatch):
     with reporting(None, NoDocuments(), {"r": "reviews"}):
         result, _ = _run_recorded_region(monkeypatch, "classify")

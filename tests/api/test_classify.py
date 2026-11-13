@@ -120,9 +120,6 @@ def test_a_classification_returns_and_tests_its_labels():
         columns=(unnamed,)))
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "ConditionGate.read takes a source column at no ids, an array of the "
-    "null type, which pyarrow's take has no kernel for"))
 def test_a_test_of_a_label_and_a_column_over_no_rows_returns_no_rows(session):
     query = session.sql(
         "SELECT d.id FROM documents d WHERE d.id = 'none' "

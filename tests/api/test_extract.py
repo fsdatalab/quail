@@ -283,9 +283,6 @@ def test_an_extraction_returns_each_fields_answer_and_span():
                                   ordered=(top,)))
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "a region of no rows sends no text table, and ExtractOperator raises "
-    "'AI.EXTRACT needs the text' before it sees there is nothing to read"))
 def test_an_extraction_of_no_rows_returns_no_rows(session):
     query = session.sql(f"SELECT c.id, {LEASE_ENDS} AS lease FROM contracts c "
                         "WHERE c.id = 'none'")

@@ -5,7 +5,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, AsArray, Float32Array, Float64Array, Int32Array, RecordBatch};
+use arrow::array::{
+    Array, ArrayRef, AsArray, Float32Array, Float64Array, Int32Array, RecordBatch, new_empty_array,
+};
 use arrow::compute::{cast, concat};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::row::{RowConverter, SortField};
@@ -151,8 +153,9 @@ fn texts(document: &ScanColumn, columns: &Table) -> Result<Option<ArrayRef>, Com
         .map(|batch| built.evaluate(batch, false))
         .collect::<Result<Vec<_>, _>>()?;
     let chunks: Vec<&dyn Array> = chunks.iter().map(AsRef::as_ref).collect();
+    // a scan of no rows has no batch, and its text is no rows
     if chunks.is_empty() {
-        return Ok(None);
+        return Ok(Some(new_empty_array(&DataType::Utf8)));
     }
     concat(&chunks).map(Some).map_err(arrow_error)
 }

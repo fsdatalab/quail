@@ -81,7 +81,12 @@ impl CutNode {
             PhysicalNode::Barrier(barrier) => Role::Barrier(barrier.attributes.next_anchor.clone()),
             PhysicalNode::AiJoin(join) => Role::Keyed(join.attributes.anchor.clone()),
             _ => {
-                let mut aliases = node.document_aliases();
+                // a node of several tables' rows runs with the join whose
+                // pairs it reads, on the anchors' KV
+                let mut aliases = node.spec_aliases();
+                if aliases.len() < 2 {
+                    aliases = node.document_aliases();
+                }
                 if aliases.is_empty() {
                     aliases = node.spec_aliases();
                 }

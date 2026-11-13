@@ -183,7 +183,7 @@ class ConditionGate(SingleNodeOperator):
         if len(documents) == 1:
             # one document at a time: a slice copies nothing
             return self.columns.column(name).slice(documents[0], 1)
-        return pc.take(self.columns.column(name), pa.array(documents))
+        return pc.take(self.columns.column(name), pa.array(documents, pa.int64()))
 
     def decide(self, keys):
         """Test the documents of keys together; return the keys kept.

@@ -1197,6 +1197,9 @@ class StageExecutor:
                 self._prefilled(prefills)
                 continue
             if not groups:
+                if self.sched.done():
+                    # every document left was skipped as it was admitted
+                    continue
                 if self.outstanding:
                     self._report_next(partial=True)
                     self._answers_landed()

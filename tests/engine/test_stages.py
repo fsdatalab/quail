@@ -94,10 +94,6 @@ def test_a_query_on_two_gpus_asks_each_question_once_and_returns_the_rows_of_one
     assert two[0] == one[0] and sorted(two[3]) == sorted(one[3])
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "on two GPUs the stages run a classification of a join's pairs apart "
-    "from its join, and the executor classifies pairs only in the join's "
-    "chain, on the anchors' KV"))
 def test_a_classification_of_joined_rows_on_two_gpus_returns_the_rows_of_one(
         tmp_path):
     standin_sets(tmp_path)
