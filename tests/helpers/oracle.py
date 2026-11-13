@@ -157,6 +157,7 @@ class Oracle:
         self.groups_operators = pipelines
         self.tightens_after = frozenset(tightens_after)
         self.arena = None
+        self.last_node = None
         self.texts = {}
         self.documents = {}
         # by alias, each document's row in the registered table, which the
@@ -208,6 +209,16 @@ class Oracle:
             results[node.node_id] = context.runtimes[node.runtime_key].execute(
                 node, node_inputs, context)
         return results
+
+    def limit(self, context, node) -> int | None:
+        """The rows after which a node stops, or None for every row.
+
+        The GPU loop stops a chain once enough documents pass its last
+        operator. The oracle runs a chain one node at a time, so only
+        the last node stops; the nodes before it answer every document.
+        """
+        return (context.state.get("filter_limit")
+                if node.node_id == self.last_node else None)
 
     # ---- answering ------------------------------------------------
 
@@ -447,11 +458,7 @@ class OracleFilter(FilterOperator):
         one_by_one = ((finished_rows() is not None and sink is None)
                       or (oracle.tightens_after and (
                           sink is not None or finished_rows() is not None)))
-        # as the GPU loop does, the chain's last filter stops once enough
-        # documents pass it
-        nodes = getattr(self.region, "nodes", ())
-        limit = (self.region.context.state.get("filter_limit")
-                 if nodes and nodes[-1] is node else None)
+        limit = oracle.limit(self.region.context, node)
         num_passed = sum(1 for answer in self.answers.values() if answer[0])
         for local in documents:
             if limit is not None and num_passed >= limit:
@@ -611,7 +618,10 @@ class OracleScore(OracleOperator):
         # the scheduler asks skip as it admits each row, in order; each
         # answered row is reported as the real loop reports a chunk's
         asked, values, probabilities = [], [], []
+        limit = oracle.limit(self.region.context, node)
         for position in range(len(rows)):
+            if limit is not None and len(asked) >= limit:
+                break
             if self.skip is not None and self.skip(position):
                 continue
             asked.append(position)
@@ -664,12 +674,13 @@ class OracleDocuments(OracleOperator):
         # each document's answer is reported as it ends, as the real
         # loop reports a chunk's
         parts = []
-        for document in self.ids:
+        limit = self.oracle.limit(self.region.context, self.node)
+        for document in self.ids[:limit]:
             parts.append(self.answer([document]).outputs[port])
             self.finished = [finished_table(self.node.node_id, port,
                                             parts[-1].table())]
             self.region.send_finished(self)
-        count = len(self.ids)
+        count = len(parts)
         self.result_value = NodeResult({port: Rows.concat(parts)}, NodeMetrics(
             input_rows=count, output_rows=count, evaluated_documents=count))
 
@@ -691,6 +702,14 @@ class OracleMap(OracleDocuments):
 class OracleFeatures(OracleDocuments):
     def answer(self, ids):
         return self.oracle._sae_features(self.node, ids)
+
+
+def _last_model_node(model, graph) -> str | None:
+    """The id of the one model node no other model node reads, or None."""
+    nodes = [node for node in graph.nodes if node.type_name in model.operator_types]
+    read = {port.source.node_id for node in nodes for port in node.inputs}
+    last = [node.node_id for node in nodes if node.node_id not in read]
+    return last[0] if len(last) == 1 else None
 
 
 def _serve(model, path, description=None):
@@ -730,9 +749,10 @@ def _serve(model, path, description=None):
             if region["listening"][1]:
                 set_answer_sink(
                     lambda event: end.ask(json.dumps({"answer": [event]})))
+            graph = graph_from_envelope(payload["physical_plan"])
+            model.last_node = _last_model_node(model, graph)
             try:
-                serve_region(state, payload,
-                             graph_from_envelope(payload["physical_plan"]), end,
+                serve_region(state, payload, graph, end,
                              region["wanted"], region["hinted"])
             finally:
                 set_answer_sink(None)

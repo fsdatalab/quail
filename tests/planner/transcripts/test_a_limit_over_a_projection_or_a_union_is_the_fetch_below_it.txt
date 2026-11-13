@@ -1,8 +1,8 @@
 --- SELECT r.id, CONCAT(AI_CLASSIFY(PROMPT('tone: {0}', r.body), ['a', 'b']), '!') AS t FROM reviews r LIMIT 2 ---
 plan
   __quail_call_1 = ai_classify('tone: {0}', r.body, make_array('a', 'b')), fetch: 2
-asked 6 of 6
-  'tone: {0}': r0 'a', r1 'b', r2 'a', r3 'b', r4 'a', r5 'b'
+asked 2 of 6
+  'tone: {0}': r0 'a', r1 'b'
 rows 2
   r0, 'a!'
   r1, 'b!'

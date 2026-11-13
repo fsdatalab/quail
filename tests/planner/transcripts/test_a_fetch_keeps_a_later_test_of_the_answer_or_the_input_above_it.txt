@@ -1,8 +1,8 @@
 --- SELECT d.id FROM (SELECT r.id, AI_CLASSIFY(PROMPT('tone: {0}', r.body), ['a', 'b']) AS t FROM reviews r LIMIT 3) d WHERE d.t = 'a' ---
 plan
   t = ai_classify('tone: {0}', r.body, make_array('a', 'b')), fetch: 3
-asked 6 of 6
-  'tone: {0}': r0 'a', r1 'b', r2 'a', r3 'b', r4 'a', r5 'b'
+asked 3 of 6
+  'tone: {0}': r0 'a', r1 'b', r2 'a'
 rows 2
   r0
   r2

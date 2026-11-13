@@ -29,10 +29,15 @@ TONE = "AI_CLASSIFY(PROMPT('tone: {0}', r.body), ['a', 'b'])"
 
 
 def _answer(kind, prompt, rows):
-    """Pass rows 1, 2, 4, and 5 of each table, and label even rows 'a'."""
+    """Pass rows 1, 2, 4, and 5 of each table, and label even rows 'a'.
+
+    The 'long' question passes rows 4 and 5.
+    """
     index = int(rows[0][1:])
     if kind == "label":
         return "a" if index % 2 == 0 else "b"
+    if prompt.startswith("long"):
+        return index >= 4
     return index in (1, 2, 4, 5)
 
 
@@ -51,7 +56,10 @@ def test_a_limit_over_an_ai_filter_stops_the_model_once_enough_rows_pass():
         "SELECT kind.id FROM kind LIMIT 2",
         f"SELECT r.id FROM reviews r WHERE r.stars > 3 AND {KIND} LIMIT 2",
         f"SELECT r.id FROM reviews r WHERE HINT({KIND}, {{'selectivity': 0.5}}) "
-        "LIMIT 2"))
+        "LIMIT 2",
+        # the first rows the first filter passes do not pass the second
+        f"SELECT r.id FROM reviews r WHERE {KIND} "
+        "AND AI_FILTER(PROMPT('long: {0}', r.body)) LIMIT 1"))
 
 
 def test_a_fetch_keeps_a_later_test_of_the_answer_or_the_input_above_it():

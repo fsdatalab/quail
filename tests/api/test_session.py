@@ -88,12 +88,12 @@ def test_explain_analyze_shows_measured_rows_beside_estimates(
     assert header.split() == ["est.", "rows", "rows", "est.", "pass", "pass",
                               "est.", "time", "time", "fresh", "tokens"]
     assert re.search(
-        r"AiFilter: r\s+3\s+1\s+[\d.]+ ms\s+(?:<1|[\d.]+) ms\s+10$",
+        r"AiFilter: r\s+3\s+4\s+[\d.]+ ms\s+(?:<1|[\d.]+) ms\s+60$",
         text, re.M)
-    # Both predicates have equal estimated cost; the limit stops each after
-    # the first row that passes.
+    # Both predicates have equal estimated cost. The first passes four of six
+    # rows; the limit stops the second at its first row that passes.
     first = re.search(r"(?:1st: )?predicate ([12])  PROMPT\('DOCUMENT:\\n"
-                      r"\{0\}\\n\\nq\1:'\)\s+6\s+1\s+50%\s+100%$",
+                      r"\{0\}\\n\\nq\1:'\)\s+6\s+6\s+50%\s+66\.7%$",
                       text, re.M)
     second = re.search(r"(?:2nd: )?predicate ([12])  PROMPT\('DOCUMENT:\\n"
                        r"\{0\}\\n\\nq\1:'\)\s+3\s+1\s+50%\s+100%$",
@@ -112,7 +112,7 @@ def test_explain_analyze_shows_measured_rows_beside_estimates(
     result = _run(sess.sql(FILTER_SQL + " LIMIT 1"), make_executor(TRUTH))
     explained = result.explain()
     assert re.search(r"Limit: 1\s+1\s+1\s+<1 ms$", explained, re.M)
-    assert re.search(rf"(?:1st: )?predicate {first[1]}\s+6\s+1\s+50%\s+100%$",
+    assert re.search(rf"(?:1st: )?predicate {first[1]}\s+6\s+6\s+50%\s+66\.7%$",
                      explained, re.M)
     stages = [s for s in result.report["stages"] if s["op"] == "filter"]
     assert [s["written_position"] for s in stages] == [int(first[1]) - 1,
