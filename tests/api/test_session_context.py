@@ -533,10 +533,6 @@ def _null_document_transcript(*queries) -> str:
         return "\n".join(runs.query(sql) for sql in queries)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "GenericRunner gives the Filter after a guarded classification a chain "
-    "of its own, and a region cannot build a ConditionGate without the "
-    "operator it reads"))
 def test_a_test_of_a_null_documents_label_keeps_the_null_row():
     assert_transcript(_null_document_transcript(
         f"SELECT r.id FROM r WHERE {NULL_DOCUMENT_CALL} IS NULL"))

@@ -16,11 +16,9 @@ import pyarrow as pa
 NAMES = ["Acme", "acme", "Globex", "Hooli", "ACME corp", "Initech"]
 # what the executor raises on a region it cannot run yet; a generated
 # query that reaches one is left unchecked. Each has a test of its own,
-# marked xfail: a condition after an AI column of a table with a NULL
-# document, a hint that drops every document, an extraction of no
+# marked xfail: a hint that drops every document, an extraction of no
 # rows, and a condition on a source column of no rows.
 EXECUTOR_GAPS = (
-    "StopIteration",
     "nothing buildable and nothing in flight",
     "AI.EXTRACT needs the text of",
     "has no kernel matching input types (int64, null)",

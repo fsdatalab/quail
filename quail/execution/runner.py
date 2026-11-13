@@ -7,7 +7,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping, Protocol
 
-from quail.execution.deduplicate import deduplicate
+from quail.execution.deduplicate import MODEL_NODES, deduplicate
 from quail.execution.finished import held, report_outputs
 from quail.execution.guard import guarded, present_join_inputs, reads_null_documents
 from quail.execution.metrics import NodeMetrics, NodeResult, RunResult
@@ -107,12 +107,16 @@ class GenericRunner:
         completed = tuple(dict.fromkeys(ref.node_id for ref in (initial_outputs or ())))
         pipelines = graph.pipelines(completed) if context.run_pipeline else {}
         # a guarded node runs in a pipeline of its own, and a NULL
-        # document guards every node that asks about its table
+        # document guards every node that asks about its table; a test of
+        # their rows then runs after them, by its own runtime
         for pipeline in list(pipelines.values()):
             if len(pipeline) > 1 and any(
                     reads_null_documents(member, context) for member in pipeline):
                 for member in pipeline:
-                    pipelines[member.node_id] = (member,)
+                    if isinstance(member, MODEL_NODES):
+                        pipelines[member.node_id] = (member,)
+                    else:
+                        pipelines.pop(member.node_id, None)
         ordered = graph.topological_nodes()
         late = _without_early_stops(ordered, pipelines)
         ordered = [late.get(node.node_id, node) for node in ordered]
