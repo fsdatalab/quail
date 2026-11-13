@@ -119,9 +119,15 @@ impl Demand {
         let Some(reads) = &self.reads else {
             return Some(lit(true));
         };
-        (reads.get(column).cloned().into_iter())
-            .chain((self.tests.iter()).filter_map(|test| read_condition(&test.expr, column)))
-            .reduce(|one, two| or(&one, &two))
+        // a value is needed only in the rows that may pass the tests
+        let passing =
+            conjunction(self.tests.iter().map(|test| test.expr.clone())).unwrap_or(lit(true));
+        (reads
+            .get(column)
+            .map(|read| and(read, &passing))
+            .into_iter())
+        .chain((self.tests.iter()).filter_map(|test| read_condition(&test.expr, column)))
+        .reduce(|one, two| or(&one, &two))
     }
 
     /// The fields of `column` read, by the tests or otherwise: None when
@@ -1016,7 +1022,6 @@ fn guard(node: &mut AiNode, demand: &Demand) {
     let plain = node.semantics == Semantics::Rows
         && !node.is_predicate()
         && node.filter.is_none()
-        && node.tests.is_empty()
         && node.hint.is_none()
         && node.fetch.is_none();
     if !plain {
@@ -1032,8 +1037,11 @@ fn guard(node: &mut AiNode, demand: &Demand) {
     else {
         return;
     };
+    // a part the node cannot evaluate may be anything
+    let known = |atom: &Expr| reads_rows_values(atom, node);
+    let read = bounds(&read, &known).may_be_true;
     let kept: Vec<Expr> = (split_conjunction(&read).into_iter())
-        .filter(|term| !matches!(term, Expr::Literal(..)) && reads_call_table(term, node))
+        .filter(|term| !matches!(term, Expr::Literal(..)))
         .cloned()
         .collect();
     let guarded_already = |term: &Expr| {
@@ -1051,6 +1059,182 @@ fn guard(node: &mut AiNode, demand: &Demand) {
             None => found,
         });
     }
+}
+
+/// What a condition may and must be, where some of its parts are
+/// unknown: each is a condition of the known parts alone, never NULL.
+struct Bounds {
+    may_be_true: Expr,
+    may_be_false: Expr,
+    is_true: Expr,
+    is_false: Expr,
+}
+
+/// The bounds of `expr` when the parts `known` rejects may take any value.
+/// A part is a term other than AND, OR, NOT, and the IS TRUE family.
+fn bounds(expr: &Expr, known: &dyn Fn(&Expr) -> bool) -> Bounds {
+    let not = |expr: Expr| match expr {
+        Expr::Literal(..) if is_true(&expr) => lit(false),
+        Expr::Literal(..) if is_false(&expr) => lit(true),
+        other => Expr::Not(Box::new(other)),
+    };
+    match expr {
+        Expr::Literal(..) if is_true(expr) => Bounds {
+            may_be_true: lit(true),
+            may_be_false: lit(false),
+            is_true: lit(true),
+            is_false: lit(false),
+        },
+        Expr::Literal(..) if is_false(expr) => Bounds {
+            may_be_true: lit(false),
+            may_be_false: lit(true),
+            is_true: lit(false),
+            is_false: lit(true),
+        },
+        Expr::Alias(alias) => bounds(&alias.expr, known),
+        Expr::BinaryExpr(BinaryExpr { left, op, right })
+            if matches!(op, Operator::And | Operator::Or) =>
+        {
+            let (one, two) = (bounds(left, known), bounds(right, known));
+            if *op == Operator::And {
+                Bounds {
+                    may_be_true: and(&one.may_be_true, &two.may_be_true),
+                    may_be_false: or(&one.may_be_false, &two.may_be_false),
+                    is_true: and(&one.is_true, &two.is_true),
+                    is_false: or(&one.is_false, &two.is_false),
+                }
+            } else {
+                Bounds {
+                    may_be_true: or(&one.may_be_true, &two.may_be_true),
+                    may_be_false: and(&one.may_be_false, &two.may_be_false),
+                    is_true: or(&one.is_true, &two.is_true),
+                    is_false: and(&one.is_false, &two.is_false),
+                }
+            }
+        }
+        Expr::Not(inner) => {
+            let found = bounds(inner, known);
+            Bounds {
+                may_be_true: found.may_be_false,
+                may_be_false: found.may_be_true,
+                is_true: found.is_false,
+                is_false: found.is_true,
+            }
+        }
+        // x IS NOT TRUE is TRUE where x is FALSE or NULL
+        Expr::IsNotTrue(inner) => {
+            let found = bounds(inner, known);
+            Bounds {
+                may_be_true: not(found.is_true.clone()),
+                may_be_false: found.may_be_true.clone(),
+                is_true: not(found.may_be_true),
+                is_false: found.is_true,
+            }
+        }
+        Expr::IsNotFalse(inner) => {
+            let found = bounds(inner, known);
+            Bounds {
+                may_be_true: not(found.is_false.clone()),
+                may_be_false: found.may_be_false.clone(),
+                is_true: not(found.may_be_false),
+                is_false: found.is_false,
+            }
+        }
+        Expr::IsTrue(inner) => {
+            let found = bounds(inner, known);
+            Bounds {
+                may_be_true: found.may_be_true.clone(),
+                may_be_false: not(found.is_true.clone()),
+                is_true: found.is_true,
+                is_false: not(found.may_be_true),
+            }
+        }
+        Expr::IsFalse(inner) => {
+            let found = bounds(inner, known);
+            Bounds {
+                may_be_true: found.may_be_false.clone(),
+                may_be_false: not(found.is_false.clone()),
+                is_true: found.is_false,
+                is_false: not(found.may_be_false),
+            }
+        }
+        part if known(part) => Bounds {
+            may_be_true: part.clone().is_true(),
+            may_be_false: part.clone().is_false(),
+            is_true: part.clone().is_true(),
+            is_false: part.clone().is_false(),
+        },
+        _ => Bounds {
+            may_be_true: lit(true),
+            may_be_false: lit(true),
+            is_true: lit(false),
+            is_false: lit(false),
+        },
+    }
+}
+
+/// Whether the executor can evaluate `term` on the rows a node reads:
+/// it calls no AI function and reads columns of the one table the
+/// node's call reads, and the answers of AI operators below the node,
+/// which the rows carry.
+fn reads_rows_values(term: &Expr, node: &AiNode) -> bool {
+    if reads_call_table(term, node) {
+        return true;
+    }
+    let tables: BTreeSet<String> = (node.call.column_refs().into_iter())
+        .filter_map(|column| {
+            column
+                .relation
+                .as_ref()
+                .map(|table| table.table().to_string())
+        })
+        .collect();
+    let mut earlier = rows_answers(&node.input);
+    // classifications of the same rows run as one operator, so one cannot
+    // read another's label before it runs
+    if node.function() == "ai_classify" {
+        earlier.retain(|name| !classified(&node.input, name));
+    }
+    let input = node.input.schema();
+    tables.len() == 1
+        && !term
+            .exists(|inner| Ok(crate::is_ai_call(inner)))
+            .unwrap_or(true)
+        && term.column_refs().iter().all(|column| {
+            input.has_column(column)
+                && match &column.relation {
+                    Some(table) => tables.contains(table.table()),
+                    None => earlier.contains(&column.name),
+                }
+        })
+}
+
+/// Whether a classification below adds the column `name`.
+fn classified(plan: &LogicalPlan, name: &str) -> bool {
+    plan.exists(|below| {
+        Ok(as_node::<AiNode>(below).is_some_and(|asked| {
+            asked.function() == "ai_classify"
+                && asked.fields.iter().any(|field| field.name() == name)
+        }))
+    })
+    .unwrap_or(true)
+}
+
+/// The columns the AI operators of rows below add, which each row they
+/// return carries. A map's text and SAE features are not carried on the
+/// rows, so a guard cannot read them.
+fn rows_answers(plan: &LogicalPlan) -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    let _ = plan.apply(|below| {
+        if let Some(asked) = as_node::<AiNode>(below)
+            && asked.semantics == Semantics::Rows
+            && !matches!(asked.function(), "ai_map" | "ai_sae_features")
+        {
+            found.extend(asked.fields.iter().map(|field| field.name().clone()));
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
 }
 
 /// Guard an `AI.IF` of an OR with the OR's other terms: it is asked only

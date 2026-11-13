@@ -93,10 +93,12 @@ pub fn region_facts(found: &Operators) -> Result<Value, crate::error::CompileErr
         .filter_map(|column| column.guard.as_ref())
         .chain(filter_guards)
     {
-        // a guard may read an earlier AI filter's answer, which no
-        // table holds
+        // a guard may read an earlier AI operator's answer, which no
+        // table holds: the rows carry it
         for reference in column_references(guard) {
-            if !answers.contains(&(reference.alias.as_str(), reference.column.as_str())) {
+            let held = (schemas.get(reference.alias.as_str()))
+                .is_none_or(|columns| columns.contains(&reference.column));
+            if held && !answers.contains(&(reference.alias.as_str(), reference.column.as_str())) {
                 add(&reference.alias, &reference.column);
             }
         }

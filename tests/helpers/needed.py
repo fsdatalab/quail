@@ -30,14 +30,17 @@ from quail.builtins import LOGICAL_RULES, PHYSICAL_RULES, built_in_registry
 QUAIL_RULES = ("derive", "place_ai_nodes", "merge_repeated_ai_calls")
 EARLY_STOPS = ("should_stop_answers_early", "should_deduplicate",
                "should_push_down_limit")
-# the values an answer of each kind may take, besides its true one
+# the values an answer of each kind may take, besides its true one; a
+# model gives a document's filter, join, label, score, or map an
+# answer, so only an extraction may be NULL
 VALUES = {
-    "filter": (True, False, None),
-    "join": (True, False, None),
-    "label": ("a", "b", "c", None),
-    "score": (0.0, 0.25, 0.5, 0.75, 1.0, None),
-    "map": (*NAMES, "", "zz", None),
-    "extract": (None, "", "Acme", "acme", "Globex", "zz"),
+    "filter": (True, False),
+    "join": (True, False),
+    "label": ("a", "b", "c"),
+    "score": (0.0, 0.25, 0.5, 0.75, 1.0),
+    "map": (*NAMES, "", "zz"),
+    # the generated tests compare an answer's first letter with A, a, G, H
+    "extract": (None, "", "Acme", "acme", "Globex", "Hooli", "zz"),
 }
 
 Answer = tuple[str, str, tuple[str, ...]]
