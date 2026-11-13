@@ -38,6 +38,7 @@ use std::sync::Arc;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, Result};
 use datafusion::logical_expr::expr::Case;
+use datafusion::logical_expr::expr_rewriter::NamePreserver;
 use datafusion::logical_expr::utils::{conjunction, split_binary, split_conjunction};
 use datafusion::logical_expr::{
     BinaryExpr, Distinct, Expr, FetchType, Filter, JoinType, LogicalPlan, Operator, SkipType, lit,
@@ -58,6 +59,7 @@ pub(super) struct Options {
     pub(super) filters: bool,
     pub(super) fetch: bool,
     pub(super) guard: bool,
+    pub(super) projection: bool,
 }
 
 /// How many of the rows that pass a demand's tests are enough.
@@ -87,6 +89,10 @@ struct Demand {
     tests: Vec<Test>,
     reads: Option<BTreeMap<Column, Expr>>,
     count: Count,
+    /// Whether every read reached here through operators that return
+    /// their input's rows as they are: a value every row below has, every
+    /// read above sees.
+    carried: bool,
 }
 
 impl Demand {
@@ -95,6 +101,7 @@ impl Demand {
             tests: Vec::new(),
             reads: None,
             count: Count::All,
+            carried: false,
         }
     }
 
@@ -131,6 +138,9 @@ struct Taken {
     tests: BTreeSet<usize>,
     /// Whether a node below took the count as its fetch.
     count: bool,
+    /// Answers a node below no longer returns, with the value every row
+    /// it returns has: each operator above that reads one reads the value.
+    kept: Vec<(String, bool)>,
 }
 
 /// The state of one pass: the next test's id.
@@ -210,10 +220,12 @@ impl Pass {
         let mut reads = BTreeMap::new();
         for (index, expr) in projection.expr.iter().enumerate() {
             let column = Column::from(projection.schema.qualified_field(index));
-            let Some(read) = demand.read_where(&column) else {
-                continue;
+            // an output nothing reads is still computed, so its input
+            // columns must exist, though no row reads their values
+            let read = match demand.read_where(&column) {
+                Some(read) => weaken_through(&read, &below),
+                None => lit(false),
             };
-            let read = weaken_through(&read, &below);
             let expr = expr.clone().unalias();
             for input in expr.column_refs() {
                 if let Some(within) = read_condition(&expr, input) {
@@ -235,9 +247,13 @@ impl Pass {
                 tests,
                 reads: Some(reads),
                 count,
+                carried: demand.carried,
             },
         )?;
-        Ok((with_inputs(&plan, vec![input])?, taken))
+        Ok((
+            read_kept(with_inputs(&plan, vec![input])?, &taken.kept)?,
+            taken,
+        ))
     }
 
     fn alias(&mut self, plan: LogicalPlan, demand: Demand) -> Result<(LogicalPlan, Taken)> {
@@ -274,9 +290,13 @@ impl Pass {
                 tests,
                 reads,
                 count,
+                carried: demand.carried,
             },
         )?;
-        Ok((with_inputs(&plan, vec![input])?, taken))
+        Ok((
+            read_kept(with_inputs(&plan, vec![input])?, &taken.kept)?,
+            taken,
+        ))
     }
 
     fn filter(&mut self, plan: LogicalPlan, demand: Demand) -> Result<(LogicalPlan, Taken)> {
@@ -296,6 +316,7 @@ impl Pass {
                 tests,
                 reads,
                 count: demand.count,
+                carried: demand.carried,
             },
         )?;
         let kept: Vec<Expr> = (own.iter())
@@ -309,7 +330,7 @@ impl Pass {
             Some(predicate) => LogicalPlan::Filter(Filter::try_new(predicate, Arc::new(input))?),
             None => input,
         };
-        Ok((plan, taken))
+        Ok((read_kept(plan, &taken.kept)?, taken))
     }
 
     fn limit(&mut self, plan: LogicalPlan, demand: Demand) -> Result<(LogicalPlan, Taken)> {
@@ -339,13 +360,26 @@ impl Pass {
                 tests: Vec::new(),
                 reads: demand.reads_with_tests(),
                 count,
+                carried: demand.carried,
             },
         )?;
         // a LIMIT with no offset that a node took leaves the plan
         if taken.count && literal.is_some_and(|(skip, _)| skip == 0) {
-            return Ok((input, Taken::default()));
+            return Ok((
+                input,
+                Taken {
+                    kept: taken.kept,
+                    ..Taken::default()
+                },
+            ));
         }
-        Ok((with_inputs(&plan, vec![input])?, Taken::default()))
+        Ok((
+            with_inputs(&plan, vec![input])?,
+            Taken {
+                kept: taken.kept,
+                ..Taken::default()
+            },
+        ))
     }
 
     fn sort(&mut self, plan: LogicalPlan, demand: Demand) -> Result<(LogicalPlan, Taken)> {
@@ -371,11 +405,15 @@ impl Pass {
                 tests: demand.tests,
                 reads,
                 count: Count::All,
+                carried: demand.carried,
             },
         )?;
         // a count taken below is the sort's, not the demand's
         taken.count = false;
-        Ok((with_inputs(&plan, vec![input])?, taken))
+        Ok((
+            read_kept(with_inputs(&plan, vec![input])?, &taken.kept)?,
+            taken,
+        ))
     }
 
     fn distinct(&mut self, plan: LogicalPlan, demand: Demand) -> Result<(LogicalPlan, Taken)> {
@@ -396,6 +434,7 @@ impl Pass {
                 tests: demand.tests,
                 reads: None,
                 count,
+                carried: false,
             },
         )?;
         // a count taken below is the DISTINCT's, not the demand's
@@ -448,6 +487,7 @@ impl Pass {
                 tests: Vec::new(),
                 reads: None,
                 count,
+                carried: false,
             },
         )?;
         Ok((with_inputs(&plan, vec![input])?, Taken::default()))
@@ -464,6 +504,8 @@ impl Pass {
             JoinType::Right | JoinType::RightSemi | JoinType::RightAnti => (false, true),
             _ => (false, false),
         };
+        // an outer join's unmatched rows hold NULLs, not a kept value
+        let carried = demand.carried && join.join_type == JoinType::Inner;
         let mut sides = Vec::new();
         for (input, keeps, filtered) in [
             (
@@ -520,6 +562,7 @@ impl Pass {
                     tests,
                     reads,
                     count,
+                    carried,
                 },
             ));
         }
@@ -528,9 +571,10 @@ impl Pass {
         for (input, demand) in sides {
             let (input, below) = self.down(input, demand)?;
             taken.tests.extend(below.tests);
+            taken.kept.extend(below.kept);
             inputs.push(input);
         }
-        Ok((with_inputs(&plan, inputs)?, taken))
+        Ok((read_kept(with_inputs(&plan, inputs)?, &taken.kept)?, taken))
     }
 
     fn node(&mut self, plan: LogicalPlan, demand: Demand) -> Result<(LogicalPlan, Taken)> {
@@ -599,18 +643,23 @@ impl Pass {
         {
             input = LogicalPlan::Filter(Filter::try_new(test, Arc::new(input))?);
         }
+        // the tests the node took read its answer in its own filter
+        let above = Demand {
+            tests: (demand.tests.iter())
+                .filter(|test| !taken.tests.contains(&test.id))
+                .cloned()
+                .collect(),
+            reads: demand.reads.clone(),
+            count: Count::All,
+            carried: demand.carried,
+        };
         // where the answer is read becomes the node's guard
         if self.options.guard && !fetched {
-            // the tests the node took read its answer in its own filter
-            let above = Demand {
-                tests: (demand.tests.iter())
-                    .filter(|test| !taken.tests.contains(&test.id))
-                    .cloned()
-                    .collect(),
-                reads: demand.reads.clone(),
-                count: Count::All,
-            };
             guard(&mut node, &above);
+        }
+        let mut kept = None;
+        if self.options.projection {
+            kept = project(&mut node, &above);
         }
         // the node's input: the tests of its input, and the reads of its
         // input's columns and of its own expressions
@@ -629,6 +678,7 @@ impl Pass {
                 .collect(),
             reads: demand.reads.clone(),
             count: Count::All,
+            carried: demand.carried,
         };
         let reads = held.reads_with_tests().map(|reads| {
             let mut found: BTreeMap<Column, Expr> = (reads.iter())
@@ -675,14 +725,88 @@ impl Pass {
                 tests,
                 reads,
                 count,
+                carried: demand.carried,
             },
         )?;
         taken.tests.extend(below.tests);
         taken.count |= below.count;
         let node = node.with_input(input)?;
-        let rebuilt = extension_node(node.checked()?);
+        let rebuilt = read_kept(extension_node(node.checked()?), &below.kept)?;
+        taken.kept = below.kept;
+        taken.kept.extend(kept);
         Ok((rebuilt, taken))
     }
+}
+
+/// Return only the added columns the plan above reads, the answer always.
+/// An `AI.IF` that keeps only the rows whose answer is `b`, or only those
+/// whose answer is `NOT b`, returns no column: a read of the answer above
+/// reads the value every row it returns has, which this returns.
+fn project(node: &mut AiNode, above: &Demand) -> Option<(String, bool)> {
+    if node.semantics != Semantics::Rows || above.reads.is_none() {
+        return None;
+    }
+    let read = |name: &str| above.read_where(&Column::from_name(name)).is_some();
+    if !node.is_predicate() {
+        let returned =
+            (node.projection.clone()).unwrap_or_else(|| (0..node.fields.len()).collect());
+        let kept: Vec<usize> = (returned.iter().copied())
+            .filter(|index| *index == 0 || read(node.fields[*index].name()))
+            .collect();
+        if kept.len() < returned.len() {
+            node.projection = Some(kept);
+        }
+        return None;
+    }
+    let returns_answer = (node.returned_fields().iter()).any(|field| *field.name() == node.answer);
+    if node.function() != "ai_filter" || !returns_answer {
+        return None;
+    }
+    let filter = node.filter.as_ref()?;
+    if !read(&node.answer) {
+        node.projection = Some(Vec::new());
+        return None;
+    }
+    let negated = node.answer_term(filter)?;
+    if !above.carried {
+        return None;
+    }
+    node.projection = Some(Vec::new());
+    Some((node.answer.clone(), !negated))
+}
+
+/// `plan` with each read of a kept answer as its value, each expression
+/// keeping its name.
+fn read_kept(plan: LogicalPlan, kept: &[(String, bool)]) -> Result<LogicalPlan> {
+    if kept.is_empty() {
+        return Ok(plan);
+    }
+    let preserver = NamePreserver::new(&plan);
+    let mut changed = false;
+    let mut exprs = Vec::new();
+    for expr in plan.expressions() {
+        let saved = preserver.save(&expr);
+        let read = expr.transform_up(|found| {
+            let value = match &found {
+                // an answer's name is Quail's own, whatever qualifies it
+                Expr::Column(column) => (kept.iter())
+                    .find(|(name, _)| *name == column.name)
+                    .map(|(_, value)| *value),
+                _ => None,
+            };
+            Ok(match value {
+                Some(value) => Transformed::yes(lit(value)),
+                None => Transformed::no(found),
+            })
+        })?;
+        changed |= read.transformed;
+        exprs.push(saved.restore(read.data));
+    }
+    if !changed {
+        return Ok(plan);
+    }
+    let inputs = plan.inputs().into_iter().cloned().collect();
+    plan.with_new_exprs(exprs, inputs)
 }
 
 /// Guard a column node with where its answer is read, as far as the
@@ -858,7 +982,14 @@ fn is_true(expr: &Expr) -> bool {
     matches!(expr, Expr::Literal(value, _) if value == &datafusion::scalar::ScalarValue::Boolean(Some(true)))
 }
 
+fn is_false(expr: &Expr) -> bool {
+    matches!(expr, Expr::Literal(value, _) if value == &datafusion::scalar::ScalarValue::Boolean(Some(false)))
+}
+
 fn and(one: &Expr, two: &Expr) -> Expr {
+    if is_false(one) || is_false(two) {
+        return lit(false);
+    }
     match (is_true(one), is_true(two)) {
         (true, _) => two.clone(),
         (_, true) => one.clone(),
@@ -869,6 +1000,10 @@ fn and(one: &Expr, two: &Expr) -> Expr {
 fn or(one: &Expr, two: &Expr) -> Expr {
     if is_true(one) || is_true(two) {
         lit(true)
+    } else if is_false(two) {
+        one.clone()
+    } else if is_false(one) {
+        two.clone()
     } else if one == two {
         one.clone()
     } else {

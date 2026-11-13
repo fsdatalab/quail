@@ -19,25 +19,19 @@
 //!   reads returns no column, and a read of the answer above `σ_b` is
 //!   the constant the filter keeps.
 //!
-//! The first three come from one pass down the plan ([`demand`]): each
-//! operator says what the plan above needs of its input's rows, so a
-//! need reaches a node through any operators that pass it on. The
-//! projection steps, the guard of an `AI.IF` in an OR
-//! ([`super::or_guards`]), and the substring precheck
-//! ([`super::substring`]) follow it.
-
-use std::collections::BTreeSet;
+//! All four come from one pass down the plan ([`demand`]): each operator
+//! says what the plan above needs of its input's rows, so a need reaches
+//! a node through any operators that pass it on. One step follows it:
+//! an extraction asks only the fields the query reads
+//! ([`super::projection`]).
 
 use datafusion::common::Result;
-use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::logical_expr::expr_rewriter::NamePreserver;
-use datafusion::logical_expr::{Expr, LogicalPlan, lit};
+use datafusion::common::tree_node::Transformed;
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
 mod demand;
 mod fetch;
-use crate::ai::{AiNode, Semantics};
-use crate::extension::{as_node, extension_node};
 
 /// One kind of option [`Derive`] sets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,10 +98,7 @@ type Step = (
 
 /// The steps after the demand pass, in the order they run. A later step
 /// reads what an earlier one set: a guard follows the filters.
-const STEPS: [Step; 2] = [
-    (DeriveOption::Projection, drop_unread_answers),
-    (DeriveOption::Projection, super::projection::projections),
-];
+const STEPS: [Step; 1] = [(DeriveOption::Projection, super::projection::projections)];
 
 impl OptimizerRule for Derive {
     fn name(&self) -> &str {
@@ -127,6 +118,7 @@ impl OptimizerRule for Derive {
             filters: wants(DeriveOption::Filters),
             fetch: wants(DeriveOption::Fetch),
             guard: wants(DeriveOption::Guard),
+            projection: wants(DeriveOption::Projection),
         };
         let done = demand::demand_pass(plan, options)?;
         let mut changed = done.transformed;
@@ -140,129 +132,4 @@ impl OptimizerRule for Derive {
         }
         Ok(Transformed::new_transformed(plan, changed))
     }
-}
-
-/// `plan` with each filtering `AI.IF` node returning no column when no
-/// operator above it reads its answer; a subquery returns its own columns.
-fn drop_unread_answers(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
-    let plan = plan.transform_up(|below| below.map_subqueries(drop_unread_answers))?;
-    let (read, _) = read_kept_answers(plan.data.clone())?;
-    let mut dropped = drop_in(read.data)?;
-    dropped.transformed |= plan.transformed || read.transformed;
-    Ok(dropped)
-}
-
-/// An `AI.IF` answer and the value every row its node passes has.
-type Kept = Vec<(String, bool)>;
-
-/// `plan` with each read of an answer above the `AI.IF` node that filters
-/// on it as the value the filter keeps: TRUE above `σ_b`, FALSE above
-/// `σ_{NOT b}`. For example, `SELECT AI.IF(q) AS k ... WHERE AI.IF(q)`
-/// returns `k` as TRUE without asking again. Also the answers that hold
-/// such a value in the rows `plan` returns.
-///
-/// Only operators that return rows of their input unchanged carry a
-/// value up: an outer join's unmatched rows hold NULL instead.
-fn read_kept_answers(plan: LogicalPlan) -> Result<(Transformed<LogicalPlan>, Kept)> {
-    let mut kept = Kept::new();
-    let mut changed = false;
-    let mut inputs = Vec::new();
-    for input in plan.inputs() {
-        let (read, below) = read_kept_answers(input.clone())?;
-        changed |= read.transformed;
-        kept.extend(below);
-        inputs.push(read.data);
-    }
-    let own = as_node::<AiNode>(&plan).and_then(|node| {
-        let filters = node.function() == "ai_filter"
-            && node.semantics == Semantics::Rows
-            && !node.returned_fields().is_empty();
-        let negated = node.answer_term(node.filter.as_ref().filter(|_| filters)?)?;
-        Some((node.answer.clone(), !negated))
-    });
-    let carries = match &plan {
-        LogicalPlan::Join(join) => join.join_type == datafusion::logical_expr::JoinType::Inner,
-        LogicalPlan::Filter(_)
-        | LogicalPlan::Projection(_)
-        | LogicalPlan::SubqueryAlias(_)
-        | LogicalPlan::Sort(_)
-        | LogicalPlan::Limit(_) => true,
-        other => as_node::<AiNode>(other).is_some(),
-    };
-    let preserver = NamePreserver::new(&plan);
-    let mut exprs = Vec::new();
-    for expr in plan.expressions() {
-        let saved = preserver.save(&expr);
-        let read = expr.transform_up(|found| {
-            let value = match &found {
-                Expr::Column(column) if column.relation.is_none() => kept
-                    .iter()
-                    .find(|(name, _)| *name == column.name)
-                    .map(|(_, value)| *value),
-                _ => None,
-            };
-            Ok(match value {
-                Some(value) => Transformed::yes(lit(value)),
-                None => Transformed::no(found),
-            })
-        })?;
-        changed |= read.transformed;
-        exprs.push(saved.restore(read.data));
-    }
-    let plan = if changed {
-        plan.with_new_exprs(exprs, inputs)?
-    } else {
-        plan
-    };
-    if !carries {
-        kept.clear();
-    }
-    kept.extend(own);
-    Ok((Transformed::new_transformed(plan, changed), kept))
-}
-
-fn drop_in(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
-    let unread = |node: &AiNode, read: &BTreeSet<String>| {
-        node.function() == "ai_filter"
-            && node.semantics == Semantics::Rows
-            && node.filter.is_some()
-            && !node.returned_fields().is_empty()
-            && !read.contains(&node.answer)
-    };
-    // the plan's own columns, then the columns each operator reads, top down
-    let mut read: BTreeSet<String> = plan
-        .schema()
-        .fields()
-        .iter()
-        .map(|field| field.name().clone())
-        .collect();
-    let mut found = false;
-    plan.apply(|below| {
-        let node = as_node::<AiNode>(below);
-        found = found || node.is_some_and(|node| unread(node, &read));
-        // a node's own filter and tests read its answer before it is dropped
-        let own = node.map(|node| node.answer.as_str());
-        for expr in below.expressions() {
-            for column in expr.column_refs() {
-                if Some(column.name.as_str()) != own {
-                    read.insert(column.name.clone());
-                }
-            }
-        }
-        Ok(TreeNodeRecursion::Continue)
-    })?;
-    if !found {
-        return Ok(Transformed::no(plan));
-    }
-    plan.transform_up(|below| {
-        let dropped = match as_node::<AiNode>(&below) {
-            Some(node) if unread(node, &read) => {
-                let mut node = node.clone();
-                node.projection = Some(Vec::new());
-                extension_node(node.checked()?)
-            }
-            _ => below.recompute_schema()?,
-        };
-        Ok(Transformed::yes(dropped))
-    })
 }

@@ -44,9 +44,7 @@ use std::sync::Arc;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{DFSchema, Result, internal_err};
 use datafusion::logical_expr::expr::ScalarFunction;
-use datafusion::logical_expr::{
-    Expr, ExprSchemable, LogicalPlan, Projection, UserDefinedLogicalNodeCore,
-};
+use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, UserDefinedLogicalNodeCore};
 
 use crate::ai::{AiNode, Fetch, Semantics};
 use crate::derive::unfolded;
@@ -58,48 +56,7 @@ use crate::rules::lower::quail_function;
 /// the projection reads, and each extraction ask only the fields the
 /// query reads, as the module explains.
 pub(super) fn projections(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
-    let pushed = plan.transform_up(push_down)?;
-    let transformed = pushed.transformed;
-    let mut pruned = prune_extract_fields(pushed.data)?;
-    pruned.transformed |= transformed;
-    Ok(pruned)
-}
-
-fn push_down(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
-    let LogicalPlan::Projection(projection) = &plan else {
-        return Ok(Transformed::no(plan));
-    };
-    let Some(node) = as_node::<AiNode>(&projection.input) else {
-        return Ok(Transformed::no(plan));
-    };
-    if node.semantics != Semantics::Rows || node.is_predicate() {
-        return Ok(Transformed::no(plan));
-    }
-    let read: Vec<String> = projection
-        .expr
-        .iter()
-        .flat_map(|expr| expr.column_refs())
-        .filter(|column| column.relation.is_none())
-        .map(|column| column.name.clone())
-        .collect();
-    let returned: Vec<usize> = match &node.projection {
-        Some(positions) => positions.clone(),
-        None => (0..node.fields.len()).collect(),
-    };
-    let kept: Vec<usize> = returned
-        .iter()
-        .copied()
-        .filter(|index| *index == 0 || read.contains(node.fields[*index].name()))
-        .collect();
-    if kept.len() == returned.len() {
-        return Ok(Transformed::no(plan));
-    }
-    let mut pruned = node.clone();
-    pruned.projection = Some(kept);
-    let input = extension_node(pruned.checked()?);
-    Ok(Transformed::yes(LogicalPlan::Projection(
-        Projection::try_new(projection.expr.clone(), Arc::new(input))?,
-    )))
+    prune_extract_fields(plan)
 }
 
 /// `plan` with each extraction asking only the fields the plan reads,
@@ -489,7 +446,12 @@ mod tests {
     }
 
     fn pushed(plan: LogicalPlan) -> String {
-        projections(plan).unwrap().data.display_indent().to_string()
+        use datafusion::optimizer::{Optimizer, OptimizerContext};
+        Optimizer::with_rules(vec![Arc::new(crate::rules::derive::Derive::default())])
+            .optimize(plan, &OptimizerContext::new(), |_, _| {})
+            .unwrap()
+            .display_indent()
+            .to_string()
     }
 
     #[test]
