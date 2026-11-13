@@ -105,7 +105,9 @@ Quail source edits still require compiling and linking Quail itself.
 
 - An end-to-end test answers the model from `tests/helpers/oracle.py`:
   `Oracle` holds the planted truth, `oracle_executor` runs a request's
-  graph on it, and `finish` runs a query to its result. Do not add
+  graph on it, and `finish` runs a query to its result. The real
+  executor runs the graph; `tests/helpers/planted_model.py` is the
+  forward pass, which answers each prompt from the truth. Do not add
   another fake of the executor or the model.
 - A bug fix gets one small regression case, in the test file that
   already covers that path. Name a test as a sentence stating the
