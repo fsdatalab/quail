@@ -13,10 +13,10 @@ rows 4
 
 --- SELECT c.id, AI.EXTRACT(c.text, {'ends': 'When does the lease end?', 'rent': 'What is the rent?'}) AS lease, AI.EXTRACT_SPAN(c.text, {'ends': 'When does the lease end?', 'rent': 'What is the rent?'}) AS lease_span FROM contracts c ORDER BY c.id DESC LIMIT 1 ---
 plan
-  lease = ai_extract(c.text, named_struct('ends', 'When does the lease end?', 'rent', 'What is the rent?'))
-asked 8 of 8
-  'When does the lease end?': c1 'March 3, 2027', c2 NULL, c3 'March 3, 2027', c4 NULL
-  'What is the rent?': c1 '$2,000', c2 NULL, c3 NULL, c4 NULL
+  lease = ai_extract(c.column_1, named_struct('ends', 'When does the lease end?', 'rent', 'What is the rent?'))
+asked 2 of 8
+  'When does the lease end?': c4 NULL
+  'What is the rent?': c4 NULL
 columns c.id string, lease struct<ends: string, rent: string>, lease_span struct<ends: struct<start: int32, end: int32>, rent: struct<start: int32, end: int32>>
 rows 1, in order
   c4, {'ends': None, 'rent': None}, {'ends': None, 'rent': None}

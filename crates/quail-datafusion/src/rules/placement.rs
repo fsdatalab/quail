@@ -18,6 +18,13 @@
 //!   classification of joined rows stays above the AI join of the same
 //!   two tables.
 //!
+//! - An AI column that an `ORDER BY ... LIMIT` above it does not sort
+//!   by moves above it, so the model answers only the rows the limit
+//!   keeps: `TopK(AI(R)) ⇒ AI(TopK(R))`. For example, in `SELECT r.id,
+//!   AI.MAP(r.body, ...) FROM r ORDER BY r.id LIMIT 1` the map writes one
+//!   answer. A `LIMIT` with no `ORDER BY` is the node's fetch instead
+//!   ([`crate::rules::derive`]).
+//!
 //! Then it orders the operators on each table as Quail's executor reads
 //! them: the table's `AI.IF` and `AI.SCORE` filters in written order;
 //! each test of a label right after the classification it reads; the
@@ -30,7 +37,7 @@ use std::sync::Arc;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, Result};
 use datafusion::logical_expr::utils::split_conjunction;
-use datafusion::logical_expr::{Expr, Filter, JoinType, LogicalPlan, Projection};
+use datafusion::logical_expr::{Expr, Filter, JoinType, LogicalPlan, Projection, Sort, SortExpr};
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
 use crate::ai::{AiNode, Semantics};
@@ -51,8 +58,9 @@ impl OptimizerRule for PlaceAiNodes {
         plan: LogicalPlan,
         _config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
-        let mut plan = plan;
-        let mut changed = false;
+        let lifted = plan.transform_down(lift_above_limit)?;
+        let mut plan = lifted.data;
+        let mut changed = lifted.transformed;
         // each step moves one node one operator down; a plan has fewer
         // operators than this many steps
         for _ in 0..256 {
@@ -229,6 +237,75 @@ fn mover(node: &LogicalPlan) -> Option<Mover> {
         });
     }
     None
+}
+
+/// An `ORDER BY` with a `LIMIT`, as a limit over a sort or a sort that
+/// keeps its first rows: the sort.
+fn top_rows(plan: &LogicalPlan) -> Option<&Sort> {
+    match plan {
+        LogicalPlan::Limit(limit) => match limit.input.as_ref() {
+            LogicalPlan::Sort(sort) if sort.fetch.is_none() => Some(sort),
+            _ => None,
+        },
+        LogicalPlan::Sort(sort) if sort.fetch.is_some() => Some(sort),
+        _ => None,
+    }
+}
+
+fn sorted(expr: Vec<SortExpr>, input: LogicalPlan, fetch: Option<usize>) -> LogicalPlan {
+    LogicalPlan::Sort(Sort {
+        expr,
+        input: Arc::new(input),
+        fetch,
+    })
+}
+
+/// Move the AI column below an `ORDER BY ... LIMIT` above it, through a
+/// SELECT list between them, when the sort does not read its answer.
+fn lift_above_limit(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
+    let Some(sort) = top_rows(&plan) else {
+        return Ok(Transformed::no(plan));
+    };
+    let (projection, below) = match sort.input.as_ref() {
+        LogicalPlan::Projection(projection) => (Some(projection), projection.input.as_ref()),
+        other => (None, other),
+    };
+    let Some(node) = as_node::<AiNode>(below) else {
+        return Ok(Transformed::no(plan));
+    };
+    // a node over another shares its documents' KV with it, which rows
+    // cut off between them would not keep
+    let shares = as_node::<AiNode>(node.input.as_ref()).is_some();
+    if node.semantics != Semantics::Rows || node.has_options() || shares {
+        return Ok(Transformed::no(plan));
+    }
+    // each sort key as the node's input computes it
+    let mut keys_below = Vec::new();
+    for key in &sort.expr {
+        let expr = match projection {
+            Some(projection) => crate::rules::repeated::through_projection(&key.expr, projection),
+            None => Some(key.expr.clone()),
+        };
+        match expr {
+            Some(expr) if expr_answers(&expr).iter().all(|name| !node.is_field(name)) => {
+                keys_below.push(SortExpr::new(expr, key.asc, key.nulls_first))
+            }
+            _ => return Ok(Transformed::no(plan)),
+        }
+    }
+    let rows = node.input.as_ref().clone();
+    let kept = match &plan {
+        LogicalPlan::Limit(_) => with_input(&plan, sorted(keys_below, rows, None))?,
+        _ => sorted(keys_below, rows, sort.fetch),
+    };
+    let mut lifted = extension_node(node.with_input(kept)?);
+    if let Some(projection) = projection {
+        lifted = LogicalPlan::Projection(Projection::try_new(
+            projection.expr.clone(),
+            Arc::new(lifted),
+        )?);
+    }
+    Ok(Transformed::yes(lifted))
 }
 
 /// `node`, whose one input was `input`, over `below` instead.
