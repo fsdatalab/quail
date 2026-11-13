@@ -104,11 +104,9 @@ type Step = (
 
 /// The steps after the demand pass, in the order they run. A later step
 /// reads what an earlier one set: a guard follows the filters.
-const STEPS: [Step; 4] = [
+const STEPS: [Step; 2] = [
     (DeriveOption::Projection, drop_unread_answers),
     (DeriveOption::Projection, super::projection::projections),
-    (DeriveOption::Guard, super::or_guards::or_guards),
-    (DeriveOption::Filters, super::substring::substring_prechecks),
 ];
 
 impl OptimizerRule for Derive {

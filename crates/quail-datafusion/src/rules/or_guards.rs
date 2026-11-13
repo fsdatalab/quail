@@ -1,4 +1,5 @@
-//! A guard step of [`crate::Derive`]: an AI test in an OR is asked
+//! The guard of an AI test in an OR, which [`crate::Derive`]'s demand
+//! pass sets: the test is asked
 //! only where the rest of the OR is not TRUE.
 //!
 //! A filter `a OR b` keeps every row where `a` is TRUE, whatever `b` is.
@@ -50,22 +51,12 @@
 //! reads a guard on another call's answer as that instruction
 //! ([`OrParts`]).
 
-use std::sync::Arc;
-
-use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::common::{Column, Result};
-use datafusion::logical_expr::utils::{conjunction, disjunction, split_binary, split_conjunction};
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion::logical_expr::utils::{disjunction, split_binary, split_conjunction};
 use datafusion::logical_expr::{Expr, LogicalPlan, Operator};
 
 use crate::ai::{AiNode, Semantics};
-use crate::extension::{as_node, extension_node};
-use crate::rules::guards::reads_call_table;
-
-/// Guard the AI call that is one term of an OR with the other terms, as
-/// the module explains.
-pub(super) fn or_guards(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
-    plan.transform_up(push_down_or)
-}
+use crate::extension::as_node;
 
 /// The terms of an `AI.IF` node's filter OR other than its answer `b`,
 /// when the filter is `a ∨ b` as the module describes, and whether the
@@ -160,93 +151,6 @@ fn answers_below(plan: &LogicalPlan) -> Vec<String> {
     found
 }
 
-fn push_down_or(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
-    let Some(node) = as_node::<AiNode>(&plan) else {
-        return Ok(Transformed::no(plan));
-    };
-    let plain = node.semantics == Semantics::Rows
-        && node.function() == "ai_filter"
-        && node.guard.is_none()
-        && node.hint.is_none()
-        && node.fetch.is_none()
-        && node.returned_fields().is_empty();
-    if !plain {
-        return Ok(Transformed::no(plan));
-    }
-    let Some((rest, _)) = or_terms(node) else {
-        return Ok(Transformed::no(plan));
-    };
-    // the earlier AI.IFs of the OR, which return their answers below
-    let answers = answer_nodes(&node.input);
-    // the answer an OR's term reads, as the column or its NOT
-    let answer_of = |term: &Expr| match term {
-        Expr::Not(inner) => inner.try_as_col().cloned(),
-        other => other.try_as_col().cloned(),
-    };
-    let is_answer = |term: &Expr| {
-        answer_of(term)
-            .is_some_and(|column| column.relation.is_none() && answers.contains(&column.name))
-    };
-    let (read, plain): (Vec<Expr>, Vec<Expr>) = split_binary(&rest, Operator::Or)
-        .into_iter()
-        .cloned()
-        .partition(|term| is_answer(term));
-    if let Some(plain) = disjunction(plain.iter().cloned())
-        && !reads_call_table(&plain, node)
-    {
-        return Ok(Transformed::no(plan));
-    }
-    let mut seen = plain;
-    let input = Arc::unwrap_or_clone(Arc::clone(&node.input))
-        .transform_up(|below| {
-            let Some(asked) = as_node::<AiNode>(&below) else {
-                return Ok(Transformed::no(below));
-            };
-            let answer = Column::from_name(asked.answer.clone());
-            let Some(term) = read
-                .iter()
-                .find(|term| answer_of(term).as_ref() == Some(&answer))
-            else {
-                return Ok(Transformed::no(below));
-            };
-            let mut guarded = asked.clone();
-            guarded.guard = not_true(&seen);
-            seen.push(term.clone());
-            Ok(Transformed::yes(extension_node(guarded.checked()?)))
-        })?
-        .data;
-    let mut guarded = node.with_input(input)?;
-    guarded.guard = not_true(&seen);
-    Ok(Transformed::yes(extension_node(guarded.checked()?)))
-}
-
-/// `t1 IS NOT TRUE AND t2 IS NOT TRUE ...`, which is TRUE exactly where
-/// `t1 OR t2 ...` is not TRUE; None for no terms.
-fn not_true(terms: &[Expr]) -> Option<Expr> {
-    conjunction(terms.iter().cloned().map(Expr::is_not_true))
-}
-
-/// The answers of the `AI.IF` nodes in `plan` that return their answer
-/// and drop no row, with no guard, `HINT`, or fetch: the earlier `AI.IF`s
-/// of an OR.
-fn answer_nodes(plan: &LogicalPlan) -> Vec<String> {
-    let mut found = Vec::new();
-    let _ = plan.apply(|below| {
-        if let Some(asked) = as_node::<AiNode>(below)
-            && asked.semantics == Semantics::Rows
-            && asked.function() == "ai_filter"
-            && asked.filter.is_none()
-            && asked.guard.is_none()
-            && asked.hint.is_none()
-            && asked.fetch.is_none()
-        {
-            found.push(asked.answer.clone());
-        }
-        Ok(TreeNodeRecursion::Continue)
-    });
-    found
-}
-
 #[cfg(test)]
 mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -255,7 +159,10 @@ mod tests {
     use datafusion::logical_expr::expr::ScalarFunction;
     use datafusion::logical_expr::{LogicalPlanBuilder, col, lit};
 
+    use std::sync::Arc;
+
     use super::*;
+    use crate::extension::extension_node;
 
     /// An AI.IF of `reviews.body` answering `kind`, with `filter`, and
     /// returning `returned` of its added columns.
@@ -293,7 +200,12 @@ mod tests {
     }
 
     fn pushed(plan: LogicalPlan) -> String {
-        or_guards(plan).unwrap().data.display_indent().to_string()
+        use datafusion::optimizer::{Optimizer, OptimizerContext};
+        Optimizer::with_rules(vec![Arc::new(crate::rules::derive::Derive::default())])
+            .optimize(plan, &OptimizerContext::new(), |_, _| {})
+            .unwrap()
+            .display_indent()
+            .to_string()
     }
 
     #[test]

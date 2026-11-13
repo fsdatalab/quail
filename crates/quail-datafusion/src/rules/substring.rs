@@ -1,4 +1,4 @@
-//! A filter step of [`crate::Derive`]: an extraction whose
+//! A filter of [`crate::Derive`]'s demand pass: an extraction whose
 //! answer must contain a literal reads only the documents that contain
 //! it.
 //!
@@ -23,48 +23,31 @@
 //! node of rows with no fetch whose filter has a term `get_field(a, f)
 //! LIKE x` or `ILIKE x`, not negated, with a literal pattern.
 
-use std::sync::Arc;
-
-use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::common::{Result, ScalarValue};
+use datafusion::common::ScalarValue;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::expr::Like;
 use datafusion::logical_expr::expr_rewriter::unnormalize_col;
 use datafusion::logical_expr::utils::split_conjunction;
-use datafusion::logical_expr::{Expr, Filter, LogicalPlan};
+use datafusion::logical_expr::{Expr, LogicalPlan};
 
 use crate::ai::{AiNode, Semantics};
-use crate::extension::{as_node, extension_node};
 
 /// Test each extraction's document for the literal its answer's `LIKE`
 /// needs, as the module explains.
-pub(super) fn substring_prechecks(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
-    plan.transform_up(precheck)
-}
-
-fn precheck(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
-    let Some(node) = as_node::<AiNode>(&plan) else {
-        return Ok(Transformed::no(plan));
-    };
-    if node.function() != "ai_extract" || node.semantics != Semantics::Rows || node.fetch.is_some()
-    {
-        return Ok(Transformed::no(plan));
+/// The test of `input`'s documents that an extraction node's filter
+/// implies, as the module explains, when `input` does not test it already.
+pub(crate) fn precheck(node: &AiNode, input: &LogicalPlan) -> Option<Expr> {
+    if node.function() != "ai_extract" || node.semantics != Semantics::Rows {
+        return None;
     }
     let Expr::ScalarFunction(call) = &node.call else {
-        return Ok(Transformed::no(plan));
+        return None;
     };
-    let Some(document) = call.args.first() else {
-        return Ok(Transformed::no(plan));
-    };
-    let Some(filter) = &node.filter else {
-        return Ok(Transformed::no(plan));
-    };
-    let Some(literal) = split_conjunction(filter)
+    let document = call.args.first()?;
+    let literal = split_conjunction(node.filter.as_ref()?)
         .into_iter()
         .filter_map(|term| required_literal(term, node))
-        .max_by_key(|literal| literal.chars().count())
-    else {
-        return Ok(Transformed::no(plan));
-    };
+        .max_by_key(|literal| literal.chars().count())?;
     let test = Expr::Like(Like::new(
         false,
         Box::new(document.clone()),
@@ -75,11 +58,7 @@ fn precheck(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
         Some('\\'),
         true,
     ));
-    if tests_below(&node.input, &test) {
-        return Ok(Transformed::no(plan));
-    }
-    let input = LogicalPlan::Filter(Filter::try_new(test, Arc::clone(&node.input))?);
-    Ok(Transformed::yes(extension_node(node.with_input(input)?)))
+    (!tests_below(input, &test)).then_some(test)
 }
 
 /// The literal text every answer `term` accepts contains, when `term` is

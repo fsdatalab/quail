@@ -35,10 +35,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use datafusion::common::tree_node::Transformed;
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, Result};
 use datafusion::logical_expr::expr::Case;
-use datafusion::logical_expr::utils::{conjunction, split_conjunction};
+use datafusion::logical_expr::utils::{conjunction, split_binary, split_conjunction};
 use datafusion::logical_expr::{
     BinaryExpr, Distinct, Expr, FetchType, Filter, JoinType, LogicalPlan, Operator, SkipType, lit,
 };
@@ -48,7 +48,9 @@ use crate::ai::{AiNode, Fetch, Semantics};
 use crate::extension::{as_node, extension_node, with_inputs};
 use crate::rules::distinct::{is_distinct, is_unique};
 use crate::rules::guards::reads_call_table;
+use crate::rules::or_guards::or_terms;
 use crate::rules::repeated::{through_alias, through_projection};
+use crate::rules::substring::precheck;
 
 /// Which options the pass derives.
 #[derive(Debug, Clone, Copy)]
@@ -211,7 +213,7 @@ impl Pass {
             let Some(read) = demand.read_where(&column) else {
                 continue;
             };
-            let read = below(&read).unwrap_or(lit(true));
+            let read = weaken_through(&read, &below);
             let expr = expr.clone().unalias();
             for input in expr.column_refs() {
                 if let Some(within) = read_condition(&expr, input) {
@@ -253,7 +255,7 @@ impl Pass {
         let reads = demand.reads.as_ref().map(|reads| {
             (reads.iter())
                 .filter_map(|(column, read)| {
-                    Some((column_below(column)?, below(read).unwrap_or(lit(true))))
+                    Some((column_below(column)?, weaken_through(read, &below)))
                 })
                 .collect()
         });
@@ -494,15 +496,9 @@ impl Pass {
             let reads_with_tests = demand.reads_with_tests();
             let reads = reads_with_tests.as_ref().map(|reads| {
                 let mut found: BTreeMap<Column, Expr> = (reads.iter())
-                    .filter(|(column, read)| schema.has_column(column) && within(read))
-                    .map(|(column, read)| (column.clone(), read.clone()))
+                    .filter(|(column, _)| schema.has_column(column))
+                    .map(|(column, read)| (column.clone(), weaken(read, &within)))
                     .collect();
-                for (column, _) in reads
-                    .iter()
-                    .filter(|(column, read)| schema.has_column(column) && !within(read))
-                {
-                    found.insert(column.clone(), lit(true));
-                }
                 let on = join.on.iter().flat_map(|(left, right)| [left, right]);
                 for expr in on.chain(join.filter.iter()) {
                     for column in expr.column_refs() {
@@ -595,9 +591,26 @@ impl Pass {
             node.fetch = Some(fetch);
             taken.count = true;
         }
+        // an extraction whose answer must contain a literal reads only the
+        // documents that contain it
+        if self.options.filters
+            && node.fetch.is_none()
+            && let Some(test) = precheck(&node, &input)
+        {
+            input = LogicalPlan::Filter(Filter::try_new(test, Arc::new(input))?);
+        }
         // where the answer is read becomes the node's guard
         if self.options.guard && !fetched {
-            guard(&mut node, &demand);
+            // the tests the node took read its answer in its own filter
+            let above = Demand {
+                tests: (demand.tests.iter())
+                    .filter(|test| !taken.tests.contains(&test.id))
+                    .cloned()
+                    .collect(),
+                reads: demand.reads.clone(),
+                count: Count::All,
+            };
+            guard(&mut node, &above);
         }
         // the node's input: the tests of its input, and the reads of its
         // input's columns and of its own expressions
@@ -620,14 +633,7 @@ impl Pass {
         let reads = held.reads_with_tests().map(|reads| {
             let mut found: BTreeMap<Column, Expr> = (reads.iter())
                 .filter(|(column, _)| input_schema.has_column(column))
-                .map(|(column, read)| {
-                    let read = if reads_input_only(read) {
-                        read.clone()
-                    } else {
-                        lit(true)
-                    };
-                    (column.clone(), read)
-                })
+                .map(|(column, read)| (column.clone(), weaken(read, &reads_input_only)))
                 .collect();
             for expr in [Some(&node.call), node.guard.as_ref(), node.hint.as_ref()]
                 .into_iter()
@@ -641,11 +647,7 @@ impl Pass {
                 for column in filter.column_refs() {
                     if input_schema.has_column(column) {
                         let within = read_condition(filter, column).unwrap_or(lit(true));
-                        let within = if reads_input_only(&within) {
-                            within
-                        } else {
-                            lit(true)
-                        };
+                        let within = weaken(&within, &reads_input_only);
                         add_read(&mut found, column, within);
                     }
                 }
@@ -687,6 +689,9 @@ impl Pass {
 /// executor can evaluate it: the terms that read only the one table the
 /// call reads.
 fn guard(node: &mut AiNode, demand: &Demand) {
+    if node.function() == "ai_filter" {
+        return or_guard(node, demand);
+    }
     let plain = node.semantics == Semantics::Rows
         && !node.is_predicate()
         && node.filter.is_none()
@@ -727,6 +732,78 @@ fn guard(node: &mut AiNode, demand: &Demand) {
     }
 }
 
+/// Guard an `AI.IF` of an OR with the OR's other terms: it is asked only
+/// where none of them is TRUE, as far as the executor can tell before
+/// asking. The OR's last `AI.IF` filters on the OR, so its own filter reads
+/// its answer; each earlier one returns its answer, which the last one's
+/// filter reads. A term the guard keeps reads only the one table the call
+/// reads, or is an earlier `AI.IF`'s answer not TRUE.
+fn or_guard(node: &mut AiNode, demand: &Demand) {
+    if node.semantics != Semantics::Rows
+        || node.guard.is_some()
+        || node.hint.is_some()
+        || node.fetch.is_some()
+    {
+        return;
+    }
+    let answer = Column::from_name(node.answer.clone());
+    let read = match &node.filter {
+        // nothing above reads the last one's answer, so it returns none
+        Some(filter) if unread(node, demand) && or_terms(node).is_some() => {
+            read_condition(filter, &answer)
+        }
+        Some(_) => None,
+        None => demand.read_where(&answer),
+    };
+    let Some(read) = read else {
+        return;
+    };
+    let earlier = earlier_answers(&node.input);
+    let is_earlier = |expr: &Expr| {
+        let read = match expr {
+            Expr::Not(inner) => inner.as_ref(),
+            other => other,
+        };
+        read.try_as_col()
+            .is_some_and(|column| column.relation.is_none() && earlier.contains(&column.name))
+    };
+    let kept = (split_conjunction(&read).into_iter()).filter(|term| match term {
+        Expr::IsNotTrue(inner) if is_earlier(inner) => true,
+        Expr::Literal(..) => false,
+        other => reads_call_table(other, node),
+    });
+    node.guard = conjunction(kept.cloned());
+}
+
+/// Whether no operator above reads the node's answer: it does not
+/// return it, or the demand reads it nowhere.
+fn unread(node: &AiNode, demand: &Demand) -> bool {
+    let returned = (node.returned_fields().iter()).any(|field| *field.name() == node.answer);
+    !returned
+        || demand
+            .read_where(&Column::from_name(node.answer.clone()))
+            .is_none()
+}
+
+/// The answers of the `AI.IF` nodes below that return their answer and
+/// drop no row, as each earlier `AI.IF` of an OR does, guarded or not.
+fn earlier_answers(plan: &LogicalPlan) -> Vec<String> {
+    let mut found = Vec::new();
+    let _ = plan.apply(|below| {
+        if let Some(asked) = as_node::<AiNode>(below)
+            && asked.semantics == Semantics::Rows
+            && asked.function() == "ai_filter"
+            && asked.filter.is_none()
+            && asked.hint.is_none()
+            && asked.fetch.is_none()
+        {
+            found.push(asked.answer.clone());
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
+}
+
 /// The keys of a semi join's filtered side, when the join compares plain
 /// columns and has no other test.
 fn semi_join_keys(join: &datafusion::logical_expr::Join, filtered: bool) -> Option<Vec<Column>> {
@@ -749,6 +826,24 @@ fn keys_below(keys: &[Column], below: &dyn Fn(&Expr) -> Option<Expr>) -> Option<
             _ => None,
         })
         .collect()
+}
+
+/// The conjunction of `cond`'s terms that `keep` accepts: a weaker
+/// condition, TRUE when it accepts none.
+fn weaken(cond: &Expr, keep: &dyn Fn(&Expr) -> bool) -> Expr {
+    conjunction(
+        split_conjunction(cond)
+            .into_iter()
+            .filter(|term| keep(term))
+            .cloned(),
+    )
+    .unwrap_or(lit(true))
+}
+
+/// `cond` below an operator that renames columns: each term `below`
+/// rewrites, TRUE when it rewrites none.
+fn weaken_through(cond: &Expr, below: &dyn Fn(&Expr) -> Option<Expr>) -> Expr {
+    conjunction(split_conjunction(cond).into_iter().filter_map(below)).unwrap_or(lit(true))
 }
 
 fn add_read(reads: &mut BTreeMap<Column, Expr>, column: &Column, read: Expr) {
@@ -796,9 +891,14 @@ pub(super) fn read_condition(expr: &Expr, column: &Column) -> Option<Expr> {
         Expr::BinaryExpr(BinaryExpr { left, op, right })
             if matches!(op, Operator::And | Operator::Or) =>
         {
+            // `x OR y` is not TRUE where neither term is TRUE
             let gate = |other: &Expr| match op {
                 Operator::And => other.clone().is_not_false(),
-                _ => other.clone().is_not_true(),
+                _ => conjunction(
+                    (split_binary(other, Operator::Or).into_iter())
+                        .map(|term| term.clone().is_not_true()),
+                )
+                .unwrap_or(lit(true)),
             };
             match (reads(left), reads(right)) {
                 (true, false) => Some(and(&gate(right), &read_condition(left, column)?)),
