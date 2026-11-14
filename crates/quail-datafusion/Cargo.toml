@@ -13,6 +13,8 @@ base64 = "0.23"
 # a region's expressions cross to the executor as datafusion-proto bytes
 datafusion-proto = { version = "55.2.0", default-features = false }
 futures = "0.3"
+# the text a PDF stores, for AI.PARSE_DOCUMENT
+pdf-extract = "0.12.1"
 quail-planner.workspace = true
 serde_json = { version = "1", features = ["float_roundtrip"] }
 sqlparser = { version = "0.62.0", features = ["visitor"] }

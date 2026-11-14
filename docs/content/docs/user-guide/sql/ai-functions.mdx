@@ -14,6 +14,7 @@ a row and returns the model's answer as a SQL value.
 | [`AI.EXTRACT(input, questions)`](#aiextractinput-questions) | `AI.EXTRACT` returns each question's answer as text copied from the document. |
 | [`AI.EXTRACT_SPAN(input, questions)`](#aiextract_spaninput-questions) | `AI.EXTRACT_SPAN` returns the position of each `AI.EXTRACT` answer in the document. |
 | [`AI.MAP(input, instruction[, max_tokens])`](#aimapinput-instruction-max_tokens) | `AI.MAP` returns the text the model writes for the document. |
+| [`AI.PARSE_DOCUMENT(document)`](#aiparse_documentdocument) | `AI.PARSE_DOCUMENT` returns the text a PDF stores, for other AI functions to read. |
 | [`AI.SAE_FEATURES(prompt, options)`](#aisae_featuresprompt-options) | `AI.SAE_FEATURES` returns the model's strongest internal features for the prompt. |
 | [`HINT(condition, options)`](#hintcondition-options) | `HINT` returns `condition` and tells Quail what fraction of rows pass. |
 
@@ -178,6 +179,23 @@ FROM reviews r;
 | **input** | A text column. |
 | **instruction** | A string literal. |
 | **max_tokens** | `max_tokens` limits the tokens in an answer. It is an integer from 1 to 32768, and its default is 256. |
+
+### `AI.PARSE_DOCUMENT(document)`
+
+```sql
+SELECT f.path,
+       AI.CLASSIFY(AI.PARSE_DOCUMENT(f.pdf), ['lease', 'invoice']) AS kind
+FROM filings f
+WHERE f.year = 2025;
+```
+
+| | |
+| --- | --- |
+| **Description** | `AI.PARSE_DOCUMENT` returns the `STRING` of text a PDF stores. A form feed (`'\f'`) separates the pages, and each page's text has no whitespace at its start or end. The text is `NULL` when the PDF is `NULL` or Quail cannot read it. A scanned page stores no text, so its text is empty. |
+| **Use in SQL** | Pass the text to another AI function, or use it anywhere a `STRING` can go. Quail reads each PDF on the CPU, with no model, and only for the rows that pass the filters on other columns. |
+| **Result** | `('lease-17.pdf', 'lease')`, `('inv-0193.pdf', 'invoice')` |
+| **Alias** | `AI_PARSE_DOCUMENT` |
+| **document** | A `BINARY` column that holds each PDF's bytes. |
 
 ### `AI.SAE_FEATURES(prompt, options)`
 
