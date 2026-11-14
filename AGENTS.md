@@ -94,10 +94,8 @@ Quail source edits still require compiling and linking Quail itself.
   `cargo clippy --all-targets --locked`, and
   `cargo fmt --check` for Rust checks. Building a narrow `-p` selection
   can change Arrow's features (notably `ffi`) and rebuild DataFusion.
-  The Python module and the workspace must build one set of
-  dependencies: `tools/check_features.py` reports a dependency whose
-  features differ between them, and `crates/quail-python/Cargo.toml`
-  turns the missing features on.
+  The Python module depends on every other library crate, so
+  `uv sync` and `cargo build` compile one set of dependencies.
   Check/clippy also need metadata-only artifacts distinct from a full
   build. Embedded-Python tests and the extension may rebuild PyO3 and
   Quail for their different linking requirements.
