@@ -15,8 +15,9 @@
 //!
 //! Snowflake SQL may write `AI_PARSE_DOCUMENT(f.pdf)`.
 
+use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, StringBuilder};
 use datafusion::arrow::datatypes::DataType;
@@ -83,15 +84,37 @@ fn document_texts(documents: &ArrayRef) -> Result<ArrayRef> {
     Ok(Arc::new(texts.finish()))
 }
 
+thread_local! {
+    /// Whether this thread is reading a PDF, whose panics print nothing.
+    static PARSING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Wrap the process's panic hook once, so a panic while this thread
+/// reads a PDF prints nothing; every other panic reaches the hook as
+/// before.
+fn quiet_parse_panics() {
+    static QUIET: Once = Once::new();
+    QUIET.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !PARSING.with(Cell::get) {
+                previous(info);
+            }
+        }));
+    });
+}
+
 /// The text a PDF stores, its pages in order and each page trimmed, or
 /// None when `pdf-extract` cannot read the file.
 fn pdf_text(bytes: &[u8]) -> Option<String> {
-    // pdf-extract panics on some malformed files
+    // pdf-extract panics on some malformed files: 3 of ParseBench's 2,037
+    quiet_parse_panics();
+    PARSING.with(|parsing| parsing.set(true));
     let pages = catch_unwind(AssertUnwindSafe(|| {
         pdf_extract::extract_text_from_mem_by_pages(bytes)
-    }))
-    .ok()?
-    .ok()?;
+    }));
+    PARSING.with(|parsing| parsing.set(false));
+    let pages = pages.ok()?.ok()?;
     let pages: Vec<&str> = pages.iter().map(|page| page.trim()).collect();
     Some(pages.join(PAGE_BREAK))
 }

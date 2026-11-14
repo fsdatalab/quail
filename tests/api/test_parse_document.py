@@ -152,6 +152,17 @@ def test_a_filter_on_another_column_runs_before_the_parse(context):
     assert projection < filtered, logical
 
 
+def test_a_pdf_that_crashes_the_parser_has_null_text_and_prints_nothing(context, capfd):
+    # pdf-extract panics on a font reference to a missing object
+    broken = pdf("Lease from March 2025.").replace(b"/F1 5 0 R", b"/F1 9 0 R")
+    context.register("broken", quail.DocumentProvider.from_table(
+        pa.table({"id": ["f1"], "pdf": pa.array([broken], pa.binary())}), id_col="id"))
+    capfd.readouterr()
+    table = context.sql("SELECT AI.PARSE_DOCUMENT(b.pdf) AS text FROM broken b")
+    assert table.column("text").to_pylist() == [None]
+    assert "panicked" not in capfd.readouterr().err
+
+
 def test_a_parse_of_text_is_refused(context):
     with pytest.raises(RuntimeError, match="reads a binary column of PDFs, not Utf8"):
         context.sql("SELECT AI.PARSE_DOCUMENT(f.id) FROM files f")
