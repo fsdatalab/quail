@@ -489,7 +489,7 @@ def load(spec, device, gpu_index, gpus):
     arena = _Arena(num_layers=1, num_pages=PAGES, page_tokens=PAGE_TOKENS,
                    num_kv_heads=1, d_head=1, dtype=torch.float32, device="cpu")
     arena.attach_store(KVStore(torch, (2, 1, 1), torch.float32, STORE_BYTES,
-                               codec="raw", device="cpu"))
+                               device="cpu"))
     pipeline = fake_pipeline()
     execution = QuailModelExecution(SimpleNamespace(
         model=spec, device=device, gpu_index=gpu_index, gpus=gpus))

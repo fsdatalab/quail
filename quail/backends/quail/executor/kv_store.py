@@ -3,21 +3,18 @@
 The arena saves a document's prefix KV here when it frees the key, and
 restores it when a later operator or query admits a document with the
 same prefix tokens. A restore replaces the forward pass over the prefix
-with a copy.
+with a copy of the same bytes: the store is lossless.
 
-Host memory is pinned and grows in segments up to capacity_bytes. A
-saved prefix holds extents of token records. When a save needs room,
-the prefix with the lowest credit leaves (GreedyDual-Size): a prefix's
-credit is the forward-pass seconds it saves per byte, so a long
-document outlasts short ones, plus a clock that rises with each
-eviction, so a prefix no query reads ages out. A record is one token's
-K and V of every layer, encoded by the codec:
-
-- "raw" keeps the pool's bytes;
-- "int8" keeps one signed byte per element and one fp16 scale per head
-  vector, about half of bf16;
-- "int4" keeps four bits per element and one fp16 scale per 32
-  elements, about 28% of bf16.
+Host memory is pinned in segments up to capacity_bytes. Pinning a
+gibibyte takes a few hundred milliseconds, so a thread pins segments
+ahead of the saves, and a save that finds no pinned room is skipped: the
+prefix is saved the next time a query frees it. A saved prefix holds
+extents of token records, one record per token: its K and V of every
+layer. When the store is full and a save needs room, the prefix with
+the lowest credit leaves (GreedyDual-Size): a prefix's credit is the
+forward-pass seconds it saves per byte, so a long document outlasts
+short ones, plus a clock that rises with each eviction, so a prefix no
+query reads ages out.
 
 Saves and restores are queued and run by flush, which the loop calls
 before a forward pass writes the arena. Every copy runs on the current
@@ -27,6 +24,7 @@ CUDA stream, so a restore reads what an earlier save wrote.
 import hashlib
 import heapq
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,15 +33,17 @@ import numpy as np
 
 from quail.common.tokens import token_array
 
-CODECS = ("raw", "int8", "int4")
-# tokens one gather, encode, and copy moves; bounds the device memory a
-# flush takes beside the arena
+# tokens one gather and copy moves; bounds the device memory a flush
+# takes beside the arena
 FLUSH_TOKENS = 1024
-SEGMENT_BYTES = 1 << 30
-INT4_GROUP = 32
-# the share of the host's memory a worker's store may pin
+# one pinned allocation; small enough that pinning one stalls no pass
+SEGMENT_BYTES = 1 << 28
+# pinned bytes the pinning thread keeps free ahead of the saves
+SPARE_BYTES = 8 << 30
+# a worker's store pins at most this share of the host's memory, and at
+# most HOST_BYTES
 HOST_FRACTION = 0.5
-CODEC = "int8"
+HOST_BYTES = 64 << 30
 
 
 def host_memory_bytes() -> int:
@@ -70,14 +70,14 @@ def attach_host_store(arena, prefill_seconds=None) -> bool:
         or keep checkpoints gets none.
     """
     keys, _ = arena.layer_kv(0)
-    # the store pins no memory until its first save
     store = KVStore(
         arena.torch, (2 * len(arena.shapes), *keys.shape[1:]), arena.dtype,
-        int(HOST_FRACTION * host_memory_bytes()), codec=CODEC,
+        min(HOST_BYTES, int(HOST_FRACTION * host_memory_bytes())),
         device=arena.device, prefill_seconds=prefill_seconds)
     try:
         arena.attach_store(store)
     except ValueError:
+        store.close()
         return False
     return True
 
@@ -103,6 +103,10 @@ class _Segment:
 
     records: object
     free: list = field(default_factory=list)    # sorted (first record, count)
+
+    @property
+    def free_records(self) -> int:
+        return sum(count for _, count in self.free)
 
     def take(self, count: int):
         """Remove and return up to count records as (first record, count)."""
@@ -141,36 +145,22 @@ class KVStore:
             dimension) of one token.
         dtype: The pool's element type.
         capacity_bytes: Host bytes the store may pin.
-        codec: One of CODECS.
-        device: The pool's device; host memory is pinned for a CUDA device.
+        device: The pool's device. For a CUDA device host memory is
+            pinned, by a thread; otherwise segments are made as saves
+            need them.
         prefill_seconds: Callable(tokens) -> the seconds a forward pass
             over a prefix of that length takes; None counts tokens.
     """
 
     def __init__(self, torch, record_shape, dtype, capacity_bytes: int,
-                 codec: str = "int8", device="cuda", prefill_seconds=None):
-        if codec not in CODECS:
-            raise ValueError(f"codec must be one of {CODECS}, got {codec!r}")
+                 device="cuda", prefill_seconds=None):
         self.torch = torch
         self.record_shape = tuple(record_shape)
         self.dtype = dtype
-        self.codec = codec
         self.device = device
         self.pinned = str(device).startswith("cuda")
-        elements = int(np.prod(self.record_shape))
-        element_bytes = torch.empty(0, dtype=dtype).element_size()
-        dim = self.record_shape[-1]
-        self.group = dim if codec == "int8" else min(INT4_GROUP, dim)
-        if codec != "raw" and dim % self.group:
-            raise ValueError(f"head dimension {dim} is not a multiple of "
-                             f"{self.group}")
-        if codec == "int4" and self.group % 2:
-            raise ValueError("int4 packs elements in pairs")
-        self.record_bytes = {
-            "raw": elements * element_bytes,
-            "int8": elements + 2 * elements // self.group,
-            "int4": elements // 2 + 2 * elements // self.group,
-        }[codec]
+        self.record_bytes = (int(np.prod(self.record_shape))
+                             * torch.empty(0, dtype=dtype).element_size())
         self.segment_records = max(
             FLUSH_TOKENS, min(SEGMENT_BYTES, capacity_bytes) // self.record_bytes)
         self.max_segments = capacity_bytes // (
@@ -184,23 +174,44 @@ class KVStore:
         self._restores = []    # the same, for records to write into the pool
         self._queued = []      # _Saved whose extents the queued copies use
         self.reset_stats()
+        # the pinning thread appends to segments under the lock, and
+        # wakes when the free pinned records fall under the spare
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._closed = False
+        self._thread = None
+        if self.pinned and self.max_segments:
+            self._thread = threading.Thread(
+                target=self._pin_ahead, name="quail-kv-store", daemon=True)
+            self._thread.start()
+            self._wake.set()
+
+    def close(self) -> None:
+        """Stop the pinning thread."""
+        self._closed = True
+        self._wake.set()
+        if self._thread is not None:
+            self._thread.join()
+            self._thread = None
 
     def reset_stats(self) -> None:
         """Zero the counters a query's report reads."""
         self.saved_tokens = 0
         self.restored_tokens = 0
         self.dropped_tokens = 0
-        self.pin_seconds = 0.0     # host seconds pinning new segments
+        self.skipped_tokens = 0    # freed prefixes that found no pinned room
         self.flush_seconds = 0.0   # host seconds queueing the copies
 
     def stats(self) -> dict:
         """Return the counters since reset_stats and what the store holds."""
-        return {"codec": self.codec, "saved_tokens": self.saved_tokens,
+        return {"saved_tokens": self.saved_tokens,
                 "restored_tokens": self.restored_tokens,
                 "dropped_tokens": self.dropped_tokens,
-                "pin_seconds": self.pin_seconds,
+                "skipped_tokens": self.skipped_tokens,
                 "flush_seconds": self.flush_seconds,
                 "held_tokens": self.held_tokens, "held_bytes": self.held_bytes,
+                "pinned_bytes": len(self.segments) * self.segment_records
+                * self.record_bytes,
                 "capacity_bytes": self.max_segments * self.segment_records
                 * self.record_bytes}
 
@@ -219,35 +230,63 @@ class KVStore:
     def held_bytes(self) -> int:
         return self.held_tokens * self.record_bytes
 
+    def _new_segment(self) -> _Segment:
+        # a tensor made in inference mode could not be written outside
+        # it, where a query boundary flushes
+        with self.torch.inference_mode(False):
+            records = self.torch.empty(
+                (self.segment_records, *self.record_shape), dtype=self.dtype,
+                pin_memory=self.pinned)
+        return _Segment(records, [(0, self.segment_records)])
+
+    def _free_records(self) -> int:
+        return sum(segment.free_records for segment in self.segments)
+
+    def _pin_ahead(self) -> None:
+        """Pin segments while the free pinned records are under the spare."""
+        spare = SPARE_BYTES // self.record_bytes
+        while True:
+            self._wake.wait()
+            self._wake.clear()
+            while not self._closed and len(self.segments) < self.max_segments:
+                with self._lock:
+                    if self._free_records() >= spare:
+                        break
+                segment = self._new_segment()
+                with self._lock:
+                    self.segments.append(segment)
+            if self._closed:
+                return
+
     def _allocate(self, tokens: int):
-        """Extents for tokens records, dropping old prefixes; None if short."""
+        """Extents for tokens records, or None when no pinned room is ready.
+
+        A full store drops its lowest-credit prefixes to make room. One
+        still pinning segments drops nothing: the save is skipped.
+        """
         extents, left = [], tokens
-        while left:
-            taken = None
-            for index, segment in enumerate(self.segments):
-                taken = segment.take(left)
-                if taken is not None:
-                    break
-            if taken is None and len(self.segments) < self.max_segments:
-                index = len(self.segments)
-                # a tensor made in inference mode could not be written
-                # outside it, where a query boundary flushes
-                started = time.perf_counter()
-                with self.torch.inference_mode(False):
-                    records = self.torch.empty(
-                        (self.segment_records, self.record_bytes),
-                        dtype=self.torch.uint8, pin_memory=self.pinned)
-                self.pin_seconds += time.perf_counter() - started
-                self.segments.append(_Segment(records, [(0, self.segment_records)]))
-                taken = self.segments[index].take(left)
-            if taken is None:
-                if not self._drop_lowest():
+        with self._lock:
+            while left:
+                taken = None
+                for index, segment in enumerate(self.segments):
+                    taken = segment.take(left)
+                    if taken is not None:
+                        break
+                if (taken is None and self._thread is None
+                        and len(self.segments) < self.max_segments):
+                    index = len(self.segments)
+                    self.segments.append(self._new_segment())
+                    taken = self.segments[index].take(left)
+                if taken is None and (len(self.segments) < self.max_segments
+                                      or not self._drop_lowest()):
                     for segment, first, count in extents:
                         self.segments[segment].give(first, count)
-                    return None
-                continue
-            extents.append((index, *taken))
-            left -= taken[1]
+                    extents = None
+                    break
+                if taken is not None:
+                    extents.append((index, *taken))
+                    left -= taken[1]
+        self._wake.set()
         return extents
 
     def _credit(self, content: bytes, saved) -> None:
@@ -292,6 +331,7 @@ class KVStore:
             return
         extents = self._allocate(tokens)
         if extents is None:
+            self.skipped_tokens += tokens
             return
         saved = self.saved[content] = _Saved(tokens, extents)
         self._credit(content, saved)
@@ -335,13 +375,11 @@ class KVStore:
         restores, self._restores = self._restores, []
         for segment, first, count, rows in self._runs(saves):
             staged = pool.index_select(1, self._device_rows(rows))
-            records = self._encode(staged.permute(1, 0, 2, 3))
             self.segments[segment].records[first:first + count].copy_(
-                records, non_blocking=True)
+                staged.permute(1, 0, 2, 3).contiguous(), non_blocking=True)
         for segment, first, count, rows in self._runs(restores):
-            records = self.segments[segment].records[first:first + count].to(
+            staged = self.segments[segment].records[first:first + count].to(
                 self.device, non_blocking=True)
-            staged = self._decode(records)
             pool.index_copy_(1, self._device_rows(rows), staged.permute(1, 0, 2, 3))
 
     def _runs(self, copies):
@@ -371,42 +409,3 @@ class KVStore:
             return rows
         return rows.pin_memory().to(self.device, non_blocking=True)
 
-    def _encode(self, values):
-        """Records, as (tokens, record_bytes) bytes, of (tokens, ...) values."""
-        torch = self.torch
-        tokens = values.shape[0]
-        if self.codec == "raw":
-            return values.contiguous().view(torch.uint8).view(tokens, -1)
-        levels = 127 if self.codec == "int8" else 7
-        groups = values.float().reshape(tokens, -1, self.group)
-        # the scale is rounded to fp16 first, so decoding multiplies by
-        # the number encoding divided by
-        scales = (groups.abs().amax(-1, keepdim=True) / levels).to(torch.float16)
-        codes = (groups / scales.float().clamp_min(1e-30)).round_().clamp_(
-            -levels, levels)
-        if self.codec == "int8":
-            codes = codes.to(torch.int8).view(torch.uint8)
-        else:
-            nibbles = (codes + 8).to(torch.uint8).view(tokens, -1, 2)
-            codes = nibbles[..., 0] << 4 | nibbles[..., 1]
-        return torch.cat((codes.reshape(tokens, -1),
-                          scales.view(torch.uint8).view(tokens, -1)), dim=1)
-
-    def _decode(self, records):
-        """Values of shape (tokens, *record_shape) from their records."""
-        torch = self.torch
-        tokens = records.shape[0]
-        shape = (tokens, *self.record_shape)
-        if self.codec == "raw":
-            return records.contiguous().view(self.dtype).view(shape)
-        elements = int(np.prod(self.record_shape))
-        code_bytes = elements if self.codec == "int8" else elements // 2
-        scales = (records[:, code_bytes:].contiguous().view(torch.float16)
-                  .view(tokens, -1, 1).float())
-        packed = records[:, :code_bytes]
-        if self.codec == "int8":
-            codes = packed.contiguous().view(torch.int8).float()
-        else:
-            codes = torch.stack((packed >> 4, packed & 15), dim=-1).float() - 8
-        values = codes.view(tokens, -1, self.group) * scales
-        return values.view(shape).to(self.dtype)

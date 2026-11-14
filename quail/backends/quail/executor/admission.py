@@ -280,9 +280,9 @@ class JoinAdmission:
             settles there, as a whole-sequence pass does; a limit then
             counts the anchors that survive the last stage.
         stored: Optional callable(anchor) -> bool, asked as a fresh
-            anchor is admitted; True means reserve copies its prefix KV
-            into its pages, so it packs no prefix tokens and borrows
-            nothing.
+            anchor that borrows nothing is admitted; True means reserve
+            copies its prefix KV into its pages, so it packs no prefix
+            tokens.
 
     Each chunk fills in priority order: partner streams cut by the
     previous chunk, then anchors starting their next stage, then the
@@ -797,12 +797,14 @@ class JoinAdmission:
                     for group in self.groups[a] if group not in self._group_done):
                 hold.append(a)      # the group's anchors in flight are enough
                 continue
-            stored = (self.stored is not None and bool(self._carried[a])
-                      and self.stored(a))
-            borrow = None if stored else self.borrowing.decide(a, admitted)
+            borrow = self.borrowing.decide(a, admitted)
             if borrow == Borrowing.WAIT:
                 hold.append(a)      # its parent is still queued
                 continue
+            # a document that borrows reads its parent's pages; only one
+            # that would pack its whole prefix copies it from the store
+            stored = (borrow is None and self.stored is not None
+                      and bool(self._carried[a]) and self.stored(a))
             need = (self._page_cost[a] if borrow is None
                     else self.page_cost(self.prefix[a] - borrow[1] + self._extra))
             if blocked and need:

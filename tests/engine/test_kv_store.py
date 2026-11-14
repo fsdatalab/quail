@@ -1,6 +1,5 @@
 """Tests for the host KV store: its codecs, extents, and eviction."""
 
-import pytest
 import torch
 
 from quail.backends.quail.executor.kv_store import KVStore, content_id
@@ -13,15 +12,10 @@ def _pool(rows=256, dtype=torch.bfloat16):
     return torch.randn((TENSORS, rows, HEADS, DIM), generator=generator).to(dtype)
 
 
-def _store(codec, capacity_bytes=1 << 22, dtype=torch.bfloat16):
-    return KVStore(torch, (TENSORS, HEADS, DIM), dtype, capacity_bytes,
-                   codec=codec, device="cpu")
-
-
-def _round_trip(codec):
-    """Save 40 scattered rows, then restore them to 40 other rows."""
+def test_a_saved_prefix_restores_to_other_rows_bit_for_bit():
     pool = _pool()
-    store = _store(codec)
+    store = KVStore(torch, (TENSORS, HEADS, DIM), torch.bfloat16, 1 << 22,
+                    device="cpu")
     source = torch.arange(3, 203, 5)
     target = torch.arange(210, 250)
     store.save(b"document", source)
@@ -29,32 +23,15 @@ def _round_trip(codec):
     assert store.has(b"document", 40) and not store.has(b"document", 39)
     store.restore(b"document", target)
     store.flush(pool)
-    return pool[:, source].float(), pool[:, target].float(), store
-
-
-def test_a_raw_prefix_restores_bit_for_bit():
-    saved, restored, store = _round_trip("raw")
-    assert torch.equal(saved, restored)
+    assert torch.equal(pool[:, source], pool[:, target])
     assert store.record_bytes == TENSORS * HEADS * DIM * 2
     assert store.stats()["restored_tokens"] == 40
-
-
-@pytest.mark.parametrize("codec, levels, ratio",
-                         [("int8", 127, 0.52), ("int4", 7, 0.29)])
-def test_a_quantized_prefix_restores_within_half_a_step(codec, levels, ratio):
-    saved, restored, store = _round_trip(codec)
-    group = store.group
-    largest = saved.reshape(TENSORS, 40, -1, group).abs().amax(-1, keepdim=True)
-    error = (saved - restored).reshape(TENSORS, 40, -1, group).abs()
-    # half a step, and the bf16 rounding of the restored value
-    assert (error <= largest / levels * 0.5 + largest / 128).all()
-    assert store.record_bytes <= ratio * TENSORS * HEADS * DIM * 2
 
 
 def _full_store(pool):
     """A store of 3072 records holding a long prefix and two short ones."""
     store = KVStore(torch, (TENSORS, HEADS, DIM), torch.bfloat16,
-                    3072 * TENSORS * HEADS * DIM * 2, codec="raw", device="cpu",
+                    3072 * TENSORS * HEADS * DIM * 2, device="cpu",
                     # a pass over a prefix costs its tokens and its token pairs
                     prefill_seconds=lambda tokens: tokens + tokens * tokens / 2)
     store.save(b"long", torch.arange(2048))
@@ -91,10 +68,12 @@ def test_a_long_prefix_no_query_reads_leaves_after_short_ones_in_use():
     assert torch.equal(pool[:, 4096:4608], pool[:, :512])
 
 
-def test_a_prefix_larger_than_the_store_is_not_saved():
-    store = _store("raw", capacity_bytes=1024 * TENSORS * HEADS * DIM * 2)
+def test_a_prefix_larger_than_the_store_is_skipped():
+    store = KVStore(torch, (TENSORS, HEADS, DIM), torch.bfloat16,
+                    1024 * TENSORS * HEADS * DIM * 2, device="cpu")
     store.save(b"long", torch.arange(2000))
     assert not store.has(b"long", 2000) and store.held_tokens == 0
+    assert store.stats()["skipped_tokens"] == 2000
 
 
 def test_a_content_id_names_the_tokens_not_their_container():

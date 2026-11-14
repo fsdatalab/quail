@@ -200,6 +200,8 @@ class LoadedGpu:
     def close(self):
         """Release GPU resources held by the execution context."""
         self.execution.close()
+        if self.arena.store is not None:
+            self.arena.store.close()
 
 
 def checkpoint_arena_args(spec, device, chunk_tokens, kv_pages) -> dict:
