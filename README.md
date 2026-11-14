@@ -17,7 +17,8 @@
 
 Quail runs SQL with AI functions on your GPUs. An AI function, such as
 `AI.IF`, sends a row's text to a model and returns the model's answer.
-Apache DataFusion parses, plans, and runs the rest of the SQL.
+Quail is an [Apache DataFusion](https://datafusion.apache.org) extension:
+we use DataFusion to parse, plan, and run the rest of the SQL.
 
 [Documentation](https://fsdatalab.github.io/quail) |
 [Quickstart](https://fsdatalab.github.io/quail/docs/user-guide/quickstart) |
