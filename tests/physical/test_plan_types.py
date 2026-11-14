@@ -25,8 +25,9 @@ def _round_trip(plan, session) -> tuple[dict, dict]:
 
 
 def test_every_quail_b_plan_reads_into_the_rust_types_unchanged():
+    from helpers.check_queries import check_query_entries
+
     from quail_b.queries import queries
-    from tools.dump_check_queries import check_query_entries
 
     changed, planned = [], 0
     for entry in check_query_entries(list(queries(include_draft=True))):

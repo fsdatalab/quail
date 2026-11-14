@@ -12,8 +12,9 @@ native = pytest.importorskip("_quail_native")
 
 def quail_b_queries():
     """Yield each QUAIL-B query's id and its query, drafts included."""
+    from helpers.check_queries import check_query_entries
+
     from quail_b.queries import queries
-    from tools.dump_check_queries import check_query_entries
 
     for entry in check_query_entries(list(queries(include_draft=True))):
         with quail.Session(CONFIG, tokenizer=TOKENIZER) as session:

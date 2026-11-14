@@ -303,10 +303,10 @@ def _stand_in_answer(prompt, assignment):
 
 
 def test_every_quail_b_query_gets_an_estimate_or_names_what_it_cannot_price():
+    from helpers.check_queries import check_query_entries
     from helpers.sessions import check_table
 
     from quail_b.queries import queries
-    from tools.dump_check_queries import check_query_entries
 
     config = EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
     estimated, refused = 0, set()

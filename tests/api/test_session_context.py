@@ -136,7 +136,7 @@ def test_session_sql_runs_a_query_that_needs_sql_around_its_model_region(context
 
 
 def test_every_check_query_derives_one_region_as_session_sql_compiles_it():
-    from tools.dump_check_queries import check_query_entries
+    from helpers.check_queries import check_query_entries
 
     for entry in check_query_entries():
         session = quail.Session(CONFIG, tokenizer=TOKENIZER)

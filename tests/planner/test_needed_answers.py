@@ -3,7 +3,7 @@
 ``helpers.needed`` changes each answer of a generated query in turn; an
 answer is needed when a change alters the rows. Quail must ask every
 needed answer. The answers it asks beyond those are what its rewrites
-have yet to skip; ``tools/needed_answers.py`` reports them by query.
+have yet to skip.
 """
 
 import pytest
