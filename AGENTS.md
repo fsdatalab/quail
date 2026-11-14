@@ -28,26 +28,50 @@
 - Whatever opens a file, a process, or an engine owns it: enter it on
   an `ExitStack` or in `closing()`, and release it on the failure
   path as well as the normal one.
+- Do not add a file for a one-time check or run; the result is the
+  record. Delete a script, cell, tool, or example once no other file
+  refers to it.
+
+# Layout
+
+- `quail/` is the Python package: the `Session` API, the GPU executor,
+  the model specs, and the Modal images.
+- `crates/` is the Rust workspace:
+  - `quail-planner` plans one model region and does not use DataFusion.
+  - `quail-datafusion` is the DataFusion extension: the AI functions,
+    the optimizer rules, and model regions.
+  - `quail` is the session and the executor. It starts one Python
+    worker per GPU.
+  - `quail-server` is Quail Server, over Arrow Flight.
+  - `quail-python` is the Python module `_quail_native`.
+  - `quail-dylib` is a shared library that only test programs link.
+- `bench/` runs quail-b, `experiments/` holds GPU cells, and `docs/` is
+  the docs site.
 
 # Checks
 
-CI runs these on every pull request. Run them before pushing:
+Run the checks before pushing:
 
-    uv run ruff check quail bench calibrate tests experiments tools
-    uv run python tools/check_long_strings.py
-    uv run python tools/check_names.py
-    uv run vulture
-    uv run lint-imports
-    uv run pytest -q
+    uv run --no-sync ruff check quail bench calibrate tests experiments tools
+    uv run --no-sync python tools/check_long_strings.py
+    uv run --no-sync python tools/check_names.py
+    uv run --no-sync vulture
+    uv run --no-sync lint-imports
+    uv run --no-sync pytest -q
+    cargo fmt --check
+    cargo clippy --all-targets --locked
+    cargo test --locked
 
+- CI runs the same checks on every push to `main`. On a pull request,
+  CI runs when the pull request gets the label `run-ci` or is marked
+  ready for review; remove the label and add it again after a new push.
 - Ruff enforces line length 88, import order, naming, and Google style
   docstrings (`[tool.ruff]` in `pyproject.toml`).
-- `lint-imports` checks that each package imports only packages
+- `lint-imports` checks that each Python package imports only packages
   below it, in the order `[tool.importlinter]` in `pyproject.toml`
-  lists: `server` on top of `api`, `backends`, `execution`,
+  lists: `worker` on top of `api`, `backends`, `remote`, `execution`,
   `physical`, and so on down to `specs`. Put shared code in the lower
-  package rather than importing upward. The planner is Rust
-  (`crates/quail-planner`), so this check does not cover it.
+  package rather than importing upward.
 - `tools/check_long_strings.py` flags string literals over 200
   characters. Long content is allowed when its name identifies content
   (a name containing PROMPT, TEMPLATE, SQL, QUERY, HTML, or TEXT), kept in a
@@ -61,70 +85,50 @@ CI runs these on every pull request. Run them before pushing:
 
 ## Building
 
-Use one Rust toolchain, Cargo home, and dependency feature set. A fresh
-sandbox that compiles the Rust module, without matching build
-artifacts, needs one cold dependency build (about 20 minutes on 4
-cores). A matching cache can avoid it.
-Quail source edits still require compiling and linking Quail itself.
-
-- A developer who edits no Rust needs only uv. `tools/build.sh` looks
-  for a prebuilt wheel for the checkout's Rust sources
-  (`tools/native_key.py` prints their key) and installs its
-  `_quail_native` with no compiler. CI uploads one
-  for each change of the Rust sources on `main`
-  (`.github/workflows/publish.yml`); run that workflow on a branch to
-  upload one for the branch. The Modal image downloads the same wheel.
-  After a prebuilt install, run tools with `uv run --no-sync`: a plain
-  `uv run` compiles the module.
-- `tools/build.sh --compile` builds the module from source, as does
-  `tools/build.sh` when no prebuilt module matches. The rest of this
-  section is about that build.
-- Install rustup and uv first; Linux x86_64 also needs clang and lld.
-  Run `tools/build.sh --compile` from any shell. It prefers
-  `${CARGO_HOME:-$HOME/.cargo}/bin`, uses `rust-toolchain.toml`, prints
-  the selected compiler and paths, and runs `uv sync --frozen`.
-  Rustup downloads the pinned compiler if needed. The script does not
-  change global tool links or Cargo configuration.
-- Keep that Cargo home and `target/` between commands. Maturin must not
-  install another Rust/Cargo home: `MATURIN_NO_INSTALL_RUST` makes a
-  missing compiler fail early. Do not delete caches to fix rebuilds.
-- `uv sync` builds the editable extension with the dev profile. Cargo's
-  test profile inherits dev; `cargo test --profile dev` is unnecessary.
-  Use `cargo test --locked`,
-  `cargo clippy --all-targets --locked`, and
-  `cargo fmt --check` for Rust checks. Building a narrow `-p` selection
-  can change Arrow's features (notably `ffi`) and rebuild DataFusion.
-  The Python module depends on every other library crate, so
-  `uv sync` and `cargo build` compile one set of dependencies.
-  Check/clippy also need metadata-only artifacts distinct from a full
-  build. Embedded-Python tests and the extension may rebuild PyO3 and
-  Quail for their different linking requirements.
-- Test programs and examples link DataFusion, Arrow, and Quail from one
-  shared library, the crate `quail-dylib`, so each is a few megabytes.
-  A new test program or example names it with `use quail_dylib as _;`
-  and its package lists it under `[dev-dependencies]`. The Python
-  module does not use it: it holds its own copy and ships as one file.
-- The `quail-server` program a user installs is a Python script that
-  calls `_quail_native.serve`, so the wheel holds DataFusion once. The
-  `quail-server` crate also builds a standalone program.
-- Do not pass `--workspace` to cargo. Cargo then links the Rust
-  standard library into `quail-dylib`, and every test program fails to
-  link with "cannot satisfy dependencies so `std` only shows up once".
-  To recover, run `touch crates/quail-dylib/src/lib.rs` and build
-  again without `--workspace`.
+- **A developer who edits no Rust needs only uv.** `tools/build.sh`
+  downloads the wheel CI built for the checkout's Rust sources
+  (`tools/native_key.py` prints their key) and installs `_quail_native`
+  with no compiler. After it, run tools with `uv run --no-sync`: a
+  plain `uv run` compiles the module.
+- **A developer who edits Rust runs `tools/build.sh --compile`**, and
+  runs it again after each Rust edit. Install rustup and uv first;
+  Linux x86_64 also needs clang and lld. The first build compiles
+  DataFusion, about 20 minutes on 4 cores; later builds reuse it.
+- **Keep one Cargo home and one `target/`.** Do not delete caches to
+  fix a rebuild. If DataFusion compiles again without cause, compare
+  the compiler, the features, the rustflags, and the target directory
+  before changing a setting; `CARGO_LOG=cargo::core::compiler::fingerprint=info`
+  shows why Cargo rebuilt a crate.
+- **Do not pass `--workspace` or a narrow `-p` to cargo.** Either one
+  changes what Cargo builds. `--workspace` links the Rust standard
+  library into `quail-dylib`, and every test program then fails to
+  link with "cannot satisfy dependencies so `std` only shows up once";
+  run `touch crates/quail-dylib/src/lib.rs` and build again to recover.
+  A narrow `-p` can change a dependency's features and compile
+  DataFusion again.
+- **Test programs link DataFusion, Arrow, and Quail from `quail-dylib`**,
+  so each is a few megabytes. A new test program names the crate with
+  `use quail_dylib as _;` and lists it under `[dev-dependencies]`. An
+  example a user copies does not name it.
+- **The `quail-server` a user installs is a Python entry point** that
+  calls `_quail_native.serve`, so the wheel holds DataFusion once.
 - Cargo keeps the files of old builds in `target/`; `cargo sweep`
   (cargo-sweep) deletes them.
-- After a successful native build, run `.venv/bin/python -m pytest`
-  or `uv run --no-sync pytest` to test without an implicit build.
-  Rebuild after Rust edits. `uv run --frozen pytest` synchronizes first
-  and may rebuild the extension when its tracked source/config changes.
-- If DataFusion unexpectedly recompiles, stop changing build settings
-  and inspect the existing logs/fingerprints first. Compare compiler,
-  Cargo home, features, rustflags, and target directory. Capture
-  `CARGO_LOG=cargo::core::compiler::fingerprint=info` on the next
-  necessary build if the cause remains unclear. Do not launch extra
-  full builds merely to test caching. sccache is optional, not a
-  substitute for keeping these inputs stable.
+
+## Releases
+
+- The version is in the workspace `Cargo.toml`, on three lines: under
+  `[workspace.package]`, and on the `quail-planner` and
+  `quail-datafusion` lines below it. Change all three together.
+- `publish.yml` builds one wheel per platform. A change of the Rust
+  sources on `main` uploads the wheels to the `native-wheels` release,
+  which `tools/build.sh` and the Modal image read. A version tag also
+  publishes the wheels to PyPI and the crates `quail-planner`,
+  `quail-datafusion`, and `quail-engine` to crates.io.
+- To release, merge the version change, then run
+  `tools/release.sh <version>` on `main`. The script pushes the tag
+  `v<version>`, and `publish.yml` refuses a tag that differs from the
+  version.
 
 ## Tests
 
@@ -183,6 +187,7 @@ Quail source edits still require compiling and linking Quail itself.
   `quail_b`, pinned to a commit in `pyproject.toml`. `bench/` is
   Quail's runner for it. Change queries or labels there first, then
   move the pin here.
+- A model region is a group of AI calls that run together on the GPU.
 - The execution mechanisms are "pipelining", "token-based admission",
   "KV rewind", and "prefix sharing".
 - The attention paths are "unified" and "tree".
@@ -223,15 +228,14 @@ one. `tools/check_names.py` enforces the chosen words:
 
 # Scope
 
-- Filter and join queries on Qwen3 4B fp8, Qwen3 32B fp8,
-  DiffusionGemma 26B-A4B fp8, Decision-2.0-Kai 0.6B bf16, or the hybrid
-  models Qwen3.5 4B bf16, Qwen3.5 27B fp8, Qwen3.8 27B fp8, LFM2
-  2.6B bf16, and d1-2B bf16, on one GPU per model copy (H100 SXM,
-  L40S, or B200).
-  No tensor-parallel weight sharding.
-- `AI.MAP` writes a text answer for each row, with an optional limit
-  on answer tokens.
-  Open-ended generation, speculation, and forking are not supported.
+- The AI functions are `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`,
+  `AI.EXTRACT`, `AI.EXTRACT_SPAN`, `AI.MAP`, and `AI.SAE_FEATURES`.
+  DataFusion runs every other part of a query.
+- `AI.MAP` writes open-ended text for each row, up to a limit on answer
+  tokens. Speculation and forking are not supported.
+- The models and devices are the files in `quail/specs/data/models`
+  and `quail/specs/data/devices`. Each model copy runs on one GPU; no
+  tensor-parallel weight sharding.
 
 # What Quail builds on and learns from
 
@@ -459,32 +463,31 @@ how they release and explain changes.
 
 ## PR descriptions
 
-Write for a reviewer who has not followed the conversation. Explain
-the problem, the reasoning behind the solution, and the evidence
-needed to assess it. Describe the final change, not the history of
-implementing it.
+Write for a reviewer who has not followed the conversation, and follow
+the writing rules above. Keep the description short: a small change
+needs a few lines under each heading. Use these headings, and leave one
+out when it has nothing to say:
 
-- Start with the main change and why it is needed. Give a concrete
-  example when it helps explain the resulting behavior.
-- Use headings only when they help the reader. There are no required
-  sections or section order. A small change may need only a paragraph
-  and a sentence about testing.
-- Include design decisions, comparisons, and references only when
-  they help assess the change. Put them beside the behavior they
-  explain. Do not claim an advantage without evidence.
-- Give the source and configuration for measurements. Distinguish
-  current results from earlier runs, and estimates from measurements.
-- State what was checked and what remains uncertain. Do not imply
-  that passing tests establish more than they cover.
-- For a large change, give a short path through the relevant code
-  when it helps the reviewer.
-- Use established terminology throughout the description. Define it
-  where needed; do not add a terminology section or rename an existing
-  technique to make Quail sound different.
-- Keep the main description concise. Put long measurement tables and
-  supporting details behind links or in a collapsible section.
-- A clearer description does not make a large, mixed change small.
-  Prefer focused changes that can be reviewed and integrated promptly.
+- **Relevant links:** the issue, the pull request it supersedes, and
+  the saved runs.
+- **What:** the changes, one line each.
+- **Why:** the problem each change solves.
+- **How:** the approach, with one concrete example, and where to start
+  reading a large change.
+- **Testing:** a checklist. Check what ran, with its numbers and the
+  commit; leave unchecked what did not run, and say so.
+- **Anything else?:** known gaps and what the change leaves for later.
+
+Rules for the content:
+
+- Describe the final change, not the history of making it.
+- Give the source and configuration of each measurement, and separate
+  measurements from estimates.
+- Do not claim an advantage without evidence, and do not imply that
+  passing tests show more than they cover.
+- Put long tables behind a link to the saved run.
+- Prefer a focused change that can be reviewed and merged promptly; a
+  clear description does not make a large, mixed change small.
 
 ## Guidance for review
 
