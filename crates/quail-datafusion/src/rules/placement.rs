@@ -276,7 +276,8 @@ fn lift_above_limit(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     // a node over another shares its documents' KV with it, which rows
     // cut off between them would not keep
     let shares = as_node::<AiNode>(node.input.as_ref()).is_some();
-    if node.semantics != Semantics::Rows || node.has_options() || shares {
+    let limited_rows = node.filter.is_some() || node.fetch.is_some() || node.guard.is_some();
+    if node.semantics != Semantics::Rows || limited_rows || shares {
         return Ok(Transformed::no(plan));
     }
     // each sort key as the node's input computes it

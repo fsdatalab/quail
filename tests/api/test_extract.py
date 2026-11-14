@@ -166,7 +166,7 @@ def test_a_request_backend_decodes_and_locates_each_fields_answer_per_document()
             for step in steps] == [("ends", 4, 1.5), ("term", 4, 1.5)]
 
 
-def test_stock_vllm_extracts_every_row_and_datafusion_keeps_the_top_k(monkeypatch):
+def test_stock_vllm_extracts_the_rows_datafusions_top_k_keeps(monkeypatch):
     session = request_tests._session(
         "stock_vllm", contracts={"id": ["a", "b", "c", "d"], "text": TEXTS})
     fields = f"c.text, {{'ends': '{QUESTION}', 'term': 'How long is the term?'}}"
@@ -199,13 +199,13 @@ def test_stock_vllm_extracts_every_row_and_datafusion_keeps_the_top_k(monkeypatc
     query = session.sql(
         f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease "
         "FROM contracts c ORDER BY c.id DESC LIMIT 2")
-    # the region extracts every row; DataFusion sorts them and keeps two
+    # DataFusion sorts the contracts and keeps two; the region extracts
+    # those, reading them as the columns of DataFusion's rows
     rows = request_tests._run_stock_vllm(session, query).collect()
-    assert rows.column_names == ["c.id", "lease"]
-    leases = dict(zip(rows.column("c.id").to_pylist(),
+    assert rows.column_names == ["c.column_0", "lease"]
+    leases = dict(zip(rows.column("c.column_0").to_pylist(),
                       rows.column("lease").to_pylist(), strict=True))
-    assert len(leases) == 4
-    assert (leases["d"], leases["c"]) == ({"ends": None}, {"ends": "five years"})
+    assert leases == {"d": {"ends": None}, "c": {"ends": "five years"}}
     assert "SortExec: TopK(fetch=2)" in query.explain()
     session.close()
 
@@ -279,8 +279,12 @@ def test_an_extraction_returns_each_fields_answer_and_span():
     scored = (f"SELECT c.id, {score} AS score, {LEASE_ENDS} AS lease, "
               f"AI.EXTRACT_SPAN(c.text, {{'ends': '{QUESTION}'}}) AS lease_span "
               f"FROM contracts c WHERE {score} > 0.25")
-    assert_transcript(_transcript(both, top, scored, columns=(both, top, scored),
-                                  ordered=(top,)))
+    # the answer without its span, which the extraction then does not return
+    top_answer = (f"SELECT c.id, {LEASE_ENDS} AS lease FROM contracts c "
+                  "ORDER BY c.id LIMIT 1")
+    assert_transcript(_transcript(both, top, scored, top_answer,
+                                  columns=(both, top, scored),
+                                  ordered=(top, top_answer)))
 
 
 def test_an_extraction_of_no_rows_returns_no_rows(session):

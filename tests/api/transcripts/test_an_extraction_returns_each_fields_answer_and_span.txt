@@ -32,3 +32,11 @@ columns c.id string, score double, lease struct<ends: string>, lease_span struct
 rows 2
   c3, 0.375, {'ends': 'March 3, 2027'}, {'ends': {'start': 13, 'end': 26}}
   c4, 0.5, {'ends': None}, {'ends': None}
+
+--- SELECT c.id, AI.EXTRACT(c.text, {'ends': 'When does the lease end?'}) AS lease FROM contracts c ORDER BY c.id LIMIT 1 ---
+plan
+  lease = ai_extract(c.column_1, named_struct('ends', 'When does the lease end?')), returns: [lease]
+asked 1 of 4
+  'When does the lease end?': c1 'March 3, 2027'
+rows 1, in order
+  c1, {'ends': 'March 3, 2027'}

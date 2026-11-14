@@ -1,14 +1,16 @@
 r"""Measure what each rewrite rule saves on QUAIL-B tables, with it on and off.
 
-Each focused query uses one rule: R6 push_down_case_guards, R7
-push_down_or_guards, R4 push_down_substring_prechecks, R13
-push_down_semi_join_fetch, R14 push_down_count_threshold, R5
-push_down_projection_into_ai_nodes, R17 merge_repeated_ai_calls, and the
-physical rule should_stop_answers_early. A group of rules runs on its own
-H100: one Session with every rule on runs the group's queries, then one
-Session per rule, with that rule off, runs that rule's queries. Each
-Session first runs a warm-up query on copies of 64 reviews whose first
-line differs, so no KV it writes serves a timed query.
+Each focused query uses one rule: an option of derive (derive.guard,
+derive.filters, derive.fetch, derive.projection), merge_repeated_ai_calls,
+place_ai_nodes, or the physical rule should_stop_answers_early. The
+queries cover shapes the QUAIL-B check queries do not: a guard from a
+CASE or an OR, a call written twice, an AI column under ORDER BY ...
+LIMIT, a LIMIT over a classification, a NULL document, and an input of
+no rows. A group of rules runs on its own H100: one Session with every
+rule on runs the group's queries, then one Session per rule, with that
+rule off, runs that rule's queries. Each Session first runs a warm-up
+query on copies of 64 reviews whose first line differs, so no KV it
+writes serves a timed query.
 
     uv run modal run --detach experiments/cells/rule_savings.py::compare \
         --scale-factor 0.1 2>&1 | tee "$run_log"
@@ -45,45 +47,46 @@ ACTING = "PROMPT('Does the review praise the acting?\\n\\n{0}', r.body)"
 CANCEL = ("PROMPT('Does the customer ask to cancel, return, or exchange "
           "something?\\n\\n{0}', m.content)")
 # name -> (rule, SQL, how rows compare: "rows" whole, "nulls" (see row_keys),
-# or "ids" the first column, counting the rows whose other columns differ)
+# "ids" the first column, counting the rows whose other columns differ, or
+# "count" the number of rows, for a LIMIT that may keep any rows)
 QUERIES = {
-    "case classify": ("push_down_case_guards", (
+    "case classify": ("derive.guard", (
         "SELECT r.id, CASE WHEN LENGTH(r.body) > 2000 THEN "
         f"AI.CLASSIFY(r.body, {SENTIMENT}) END AS sentiment FROM reviews r"),
         "rows"),
-    "case map": ("push_down_case_guards", (
+    "case map": ("derive.guard", (
         "SELECT r.id, CASE WHEN LENGTH(r.body) > 2000 THEN AI.MAP(r.body, "
         "'Name the film the review is about.', 16) END AS film FROM reviews r"),
         "nulls"),
-    "case extract": ("push_down_case_guards", (
+    "case extract": ("derive.guard", (
         "SELECT c.id, CASE WHEN c.token_count < 6000 THEN AI.EXTRACT(c.text, "
         f"{{'law': '{GOVERNING_LAW}'}}) END AS e FROM contracts c"), "rows"),
-    "column or filter": ("push_down_or_guards", (
+    "column or filter": ("derive.guard", (
         f"SELECT r.id FROM reviews r WHERE LENGTH(r.body) > 1500 "
         f"OR AI.IF({ENDING})"), "rows"),
-    "filter or filter": ("push_down_or_guards", (
+    "filter or filter": ("derive.guard", (
         f"SELECT r.id FROM reviews r WHERE AI.IF({RECOMMEND}) "
         f"OR AI.IF({ACTING})"), "rows"),
-    "extract like contracts": ("push_down_substring_prechecks", (
+    "extract like contracts": ("derive.filters", (
         f"SELECT c.id, AI.EXTRACT(c.text, {{'law': '{GOVERNING_LAW}'}}) AS e "
         "FROM contracts c WHERE e.law LIKE '%Delaware%'"), "rows"),
-    "extract like reviews": ("push_down_substring_prechecks", (
+    "extract like reviews": ("derive.filters", (
         "SELECT r.id, AI.EXTRACT(r.body, {'director': 'Which director does the "
         "review name?'}) AS e FROM reviews r "
         "WHERE e.director LIKE '%Hitchcock%'"), "rows"),
-    "in subquery": ("push_down_semi_join_fetch", (
+    "in subquery": ("derive.fetch", (
         "SELECT t.id FROM support_traces t WHERE t.id IN (SELECT m.trace_id "
         f"FROM support_messages m WHERE m.role = 'user' AND AI.IF({CANCEL}))"),
         "rows"),
-    "correlated exists": ("push_down_semi_join_fetch", (
+    "correlated exists": ("derive.fetch", (
         "SELECT t.id FROM support_traces t WHERE EXISTS (SELECT 1 FROM "
         "support_messages m WHERE m.trace_id = t.id AND m.role = 'user' "
         f"AND AI.IF({CANCEL}))"), "rows"),
-    "count threshold": ("push_down_count_threshold", (
+    "count threshold": ("derive.fetch", (
         "SELECT m.trace_id FROM support_messages m WHERE m.role = 'user' "
         f"AND AI.IF({CANCEL}) GROUP BY m.trace_id HAVING COUNT(*) >= 2"),
         "rows"),
-    "one of three fields": ("push_down_projection_into_ai_nodes", (
+    "one of three fields": ("derive.projection", (
         "SELECT x.id, x.e.law AS law FROM (SELECT c.id, AI.EXTRACT(c.text, "
         f"{{'law': '{GOVERNING_LAW}', "
         "'parties': 'Who are the parties to the agreement?', "
@@ -93,6 +96,35 @@ QUERIES = {
         f"SELECT d.id, d.t, AI.CLASSIFY(d.body, {SENTIMENT}) AS u FROM "
         f"(SELECT r.id, r.body, AI.CLASSIFY(r.body, {SENTIMENT}) AS t "
         "FROM reviews r) d"), "rows"),
+    # the WHERE asks only short reviews; the test of the same call reads
+    # every review, so one operator asks each review once
+    "repeat with another guard": ("merge_repeated_ai_calls", (
+        f"SELECT r.id FROM reviews r WHERE (LENGTH(r.body) > 1500 OR "
+        f"AI.IF({ENDING})) AND AI.IF({ENDING}) IS NOT NULL"), "rows"),
+    "score selected and tested": ("merge_repeated_ai_calls", (
+        f"SELECT r.id, AI.SCORE({RECOMMEND}) AS s FROM reviews r "
+        f"WHERE AI.SCORE({RECOMMEND}) >= 0.5"), "ids"),
+    # the map is asked only where the label is negative
+    "case on a label": ("derive.guard", (
+        f"SELECT r.id, CASE WHEN AI.CLASSIFY(r.body, {SENTIMENT}) = 'negative' "
+        "THEN AI.MAP(r.body, 'Name the film the review is about.', 16) END "
+        "AS film FROM reviews r"), "nulls"),
+    "limit over classify": ("derive.fetch", (
+        f"SELECT r.id, AI.CLASSIFY(r.body, {SENTIMENT}) AS sentiment "
+        "FROM reviews r LIMIT 200"), "count"),
+    "map under order by limit": ("place_ai_nodes", (
+        "SELECT r.id, AI.MAP(r.body, 'Name the film the review is about.', 16) "
+        "AS film FROM reviews r ORDER BY r.id LIMIT 50"), "nulls"),
+    "extract under order by limit": ("place_ai_nodes", (
+        f"SELECT c.id, AI.EXTRACT(c.text, {{'law': '{GOVERNING_LAW}'}}) AS e "
+        "FROM contracts c ORDER BY c.id DESC LIMIT 5"), "rows"),
+    # a review of 2000 characters or fewer is a NULL document: no label
+    "null documents": ("derive.filters", (
+        "SELECT r.id FROM reviews r WHERE AI.CLASSIFY(CASE WHEN "
+        f"LENGTH(r.body) > 2000 THEN r.body END, {SENTIMENT}) IS NULL"), "rows"),
+    "no rows": ("place_ai_nodes", (
+        f"SELECT c.id, AI.EXTRACT(c.text, {{'law': '{GOVERNING_LAW}'}}) AS e "
+        "FROM contracts c WHERE c.token_count < 0"), "rows"),
     # the model starts each answer with a space: 2600 of 5000 begin " Yes"
     "map prefix test": ("should_stop_answers_early", (
         f"SELECT r.id FROM reviews r WHERE AI.MAP(r.body, '{RECOMMEND_MAP}', 64) "
@@ -108,11 +140,10 @@ QUERIES = {
 }
 # each group runs on its own H100
 GROUPS = {
-    "guards": ("push_down_case_guards", "push_down_or_guards"),
-    "keyed": ("push_down_semi_join_fetch", "push_down_count_threshold",
-              "merge_repeated_ai_calls"),
-    "extractions": ("push_down_substring_prechecks",
-                    "push_down_projection_into_ai_nodes"),
+    "guards": ("derive.guard",),
+    "keyed": ("derive.fetch", "merge_repeated_ai_calls"),
+    "extractions": ("derive.filters", "derive.projection"),
+    "placement": ("place_ai_nodes",),
     "answer stops": ("should_stop_answers_early",),
 }
 image = gpu_image()
@@ -120,10 +151,15 @@ image = gpu_image()
 
 def registry_without(rule: str | None):
     """Return the built-in registry with one rule left out, or every rule."""
-    from quail.builtins import LOGICAL_RULES, PHYSICAL_RULES, built_in_registry
+    from quail.builtins import (
+        LOGICAL_RULES,
+        PHYSICAL_RULES,
+        built_in_registry,
+        logical_rules_without,
+    )
 
     return built_in_registry(
-        logical_rules=[name for name in LOGICAL_RULES if name != rule],
+        logical_rules=LOGICAL_RULES if rule is None else logical_rules_without(rule),
         physical_rules=[name for name in PHYSICAL_RULES if name != rule])
 
 
@@ -134,9 +170,12 @@ def row_keys(table, compare: str) -> list[str]:
         table: The query's rows.
         compare: "rows" keys whole rows, "nulls" keys the first column and
             whether each other column is NULL, since map text may vary,
-            and "ids" keys the first column alone.
+            "ids" keys the first column alone, and "count" keys each row
+            by nothing, so only the number of rows compares.
     """
     rows = table.to_pylist()
+    if compare == "count":
+        rows = [None] * len(rows)
     if compare == "ids":
         rows = [row[table.column_names[0]] for row in rows]
     if compare == "nulls":
