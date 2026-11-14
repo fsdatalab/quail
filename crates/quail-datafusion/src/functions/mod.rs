@@ -7,6 +7,8 @@
 
 pub(crate) mod field_access;
 pub(crate) mod parse_document;
+pub(crate) mod pdf_pages;
+mod quiet;
 pub(crate) mod regexps;
 
 use std::sync::Arc;

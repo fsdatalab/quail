@@ -44,16 +44,21 @@ fn position_name(index: usize) -> String {
 }
 
 /// The DataFusion session whose functions decode and build
-/// expressions: DataFusion's own and `AI.PARSE_DOCUMENT`. Quail's
-/// executor decodes a region's expressions outside the session that
-/// planned them, so an expression that calls a host's own function does
-/// not build.
+/// expressions: DataFusion's own, `AI.PARSE_DOCUMENT`, and
+/// `AI.PDF_PAGES`. Quail's executor decodes a region's expressions
+/// outside the session that planned them, so an expression that calls
+/// a host's own function does not build.
 fn session() -> &'static SessionContext {
     static SESSION: OnceLock<SessionContext> = OnceLock::new();
     SESSION.get_or_init(|| {
         let session = SessionContext::new();
         session.register_udf(
             crate::functions::parse_document::parse_document_function()
+                .as_ref()
+                .clone(),
+        );
+        session.register_udf(
+            crate::functions::pdf_pages::pdf_pages_function()
                 .as_ref()
                 .clone(),
         );

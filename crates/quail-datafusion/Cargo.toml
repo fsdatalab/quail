@@ -15,6 +15,10 @@ datafusion-proto = { version = "55.2.0", default-features = false }
 futures = "0.3"
 # the text a PDF stores, for AI.PARSE_DOCUMENT
 pdf-extract = "0.12.1"
+# each PDF page as pixels, for AI.PDF_PAGES
+hayro = "0.9"
+# hayro already builds png, which encodes each page
+png = "0.18"
 quail-planner.workspace = true
 serde_json = { version = "1", features = ["float_roundtrip"] }
 sqlparser = { version = "0.62.0", features = ["visitor"] }

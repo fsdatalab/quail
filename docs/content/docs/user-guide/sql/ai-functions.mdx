@@ -15,6 +15,7 @@ a row and returns the model's answer as a SQL value.
 | [`AI.EXTRACT_SPAN(input, questions)`](#aiextract_spaninput-questions) | `AI.EXTRACT_SPAN` returns the position of each `AI.EXTRACT` answer in the document. |
 | [`AI.MAP(input, instruction[, max_tokens])`](#aimapinput-instruction-max_tokens) | `AI.MAP` returns the text the model writes for the document. |
 | [`AI.PARSE_DOCUMENT(document)`](#aiparse_documentdocument) | `AI.PARSE_DOCUMENT` returns the text a PDF stores, for other AI functions to read. |
+| [`AI.PDF_PAGES(pdf[, longest_edge])`](#aipdf_pagespdf-longest_edge) | `AI.PDF_PAGES` returns each page of a PDF as a PNG image. |
 | [`AI.SAE_FEATURES(prompt, options)`](#aisae_featuresprompt-options) | `AI.SAE_FEATURES` returns the model's strongest internal features for the prompt. |
 | [`HINT(condition, options)`](#hintcondition-options) | `HINT` returns `condition` and tells Quail what fraction of rows pass. |
 
@@ -196,6 +197,25 @@ WHERE f.year = 2025;
 | **Result** | `('lease-17.pdf', 'lease')`, `('inv-0193.pdf', 'invoice')` |
 | **Alias** | `AI_PARSE_DOCUMENT` |
 | **document** | A `BINARY` column that holds each PDF's bytes. |
+
+### `AI.PDF_PAGES(pdf[, longest_edge])`
+
+```sql
+SELECT p.path, p.u['page'] AS page, p.u['image'] AS image
+FROM (SELECT f.path, UNNEST(AI.PDF_PAGES(f.pdf)) AS u
+      FROM filings f
+      WHERE f.year = 2025) p;
+```
+
+| | |
+| --- | --- |
+| **Description** | `AI.PDF_PAGES` returns a list with one struct per page, in page order. `page` is the page's number, from 1, and `image` is the page as a PNG in 8-bit RGB. The list is `NULL` when the PDF is `NULL` or Quail cannot read it. An `image` is `NULL` when Quail cannot draw the page. |
+| **Image size** | The longer side of an image is `longest_edge` pixels. The other side keeps the page's shape, rounded to a multiple of 32 pixels. Quail draws the page as large as fits, in the center of the image, on white. A US Letter page is 1184 by 1536 pixels at the default. |
+| **Use in SQL** | Write `UNNEST(AI.PDF_PAGES(...)) AS u` in a subquery to return one row per page, and read a field in the outer query as `p.u['page']`. Without a subquery, read one field as `UNNEST(AI.PDF_PAGES(f.pdf))['page']`. Read one page without `UNNEST` as `array_element(AI.PDF_PAGES(f.pdf), 1)['image']`. Quail does not accept `UNNEST` or `FLATTEN` in `FROM`, or `AI.PDF_PAGES(f.pdf)[1]`. Quail draws each PDF on the CPU, with no model, and only for the rows that pass the filters on other columns. |
+| **Result** | `('lease-17.pdf', 1, <PNG>)`, `('lease-17.pdf', 2, <PNG>)`, `('inv-0193.pdf', 1, <PNG>)` |
+| **Alias** | `AI_PDF_PAGES` |
+| **pdf** | A `BINARY` column that holds each PDF's bytes. |
+| **longest_edge** | An integer literal, in pixels: a multiple of 32 from 32 to 8192. Its default is 1536. |
 
 ### `AI.SAE_FEATURES(prompt, options)`
 
