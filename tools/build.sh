@@ -88,5 +88,5 @@ echo "rustc:      $rustc_version"
 echo "CARGO_HOME: $CARGO_HOME"
 echo "target:     ${CARGO_TARGET_DIR:-$PWD/target}"
 uv sync --frozen "$@"
-cargo build --workspace --locked
+cargo build --locked
 ln -sf "$PWD/target/debug/quail-server" .venv/bin/quail-server

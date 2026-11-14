@@ -26,6 +26,10 @@
 //! let state = quail_datafusion::QuailExtension::new(executor).register(state)?;
 //! ```
 
+// links DataFusion and Quail from the shared library
+#[cfg(test)]
+use quail_dylib as _;
+
 mod executor;
 pub mod finished;
 pub mod planning;

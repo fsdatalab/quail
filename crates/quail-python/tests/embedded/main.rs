@@ -1,6 +1,9 @@
 //! The tests that embed Python, in one program: each test program links
 //! its own copy of DataFusion, about 300 MB.
 
+// links DataFusion and Quail from the shared library
+use quail_dylib as _;
+
 mod caller_routing;
 mod optional_attributes;
 mod session;

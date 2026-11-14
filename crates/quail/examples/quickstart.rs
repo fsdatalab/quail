@@ -9,6 +9,9 @@
 //! cargo run --example quickstart
 //! ```
 
+// links DataFusion and Quail from the shared library
+use quail_dylib as _;
+
 use std::sync::Arc;
 
 use datafusion::arrow::array::{RecordBatch, StringArray};

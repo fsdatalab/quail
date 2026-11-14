@@ -83,7 +83,7 @@ Quail source edits still require compiling and linking Quail itself.
   Run `tools/build.sh --compile` from any shell. It prefers
   `${CARGO_HOME:-$HOME/.cargo}/bin`, uses `rust-toolchain.toml`, prints
   the selected compiler and paths, runs `uv sync --frozen`, and
-  builds `quail-server` with `cargo build --workspace --locked`.
+  builds `quail-server` with `cargo build --locked`.
   Rustup downloads the pinned compiler if needed. The script does not
   change global tool links or Cargo configuration.
 - Keep that Cargo home and `target/` between commands. Maturin must not
@@ -91,8 +91,8 @@ Quail source edits still require compiling and linking Quail itself.
   missing compiler fail early. Do not delete caches to fix rebuilds.
 - `uv sync` builds the editable extension with the dev profile. Cargo's
   test profile inherits dev; `cargo test --profile dev` is unnecessary.
-  Use `cargo test --workspace --locked`,
-  `cargo clippy --workspace --all-targets --locked`, and
+  Use `cargo test --locked`,
+  `cargo clippy --all-targets --locked`, and
   `cargo fmt --check` for Rust checks. Building a narrow `-p` selection
   can change Arrow's features (notably `ffi`) and rebuild DataFusion.
   The Python module and the workspace must build one set of
@@ -102,10 +102,19 @@ Quail source edits still require compiling and linking Quail itself.
   Check/clippy also need metadata-only artifacts distinct from a full
   build. Embedded-Python tests and the extension may rebuild PyO3 and
   Quail for their different linking requirements.
-- Each test program and example links its own copy of DataFusion, about
-  300 MB. Add a Rust integration test as a module of the crate's one
-  test program, not as a new file directly in `tests/`. Cargo keeps the
-  files of old builds; `cargo sweep` (cargo-sweep) deletes them.
+- Test programs and examples link DataFusion, Arrow, and Quail from one
+  shared library, the crate `quail-dylib`, so each is a few megabytes.
+  A new test program or example names it with `use quail_dylib as _;`
+  and its package lists it under `[dev-dependencies]`. The Python
+  module and `quail-server` do not use it: each holds its own copy and
+  ships as one file.
+- Do not pass `--workspace` to cargo. Cargo then links the Rust
+  standard library into `quail-dylib`, and every test program fails to
+  link with "cannot satisfy dependencies so `std` only shows up once".
+  To recover, run `touch crates/quail-dylib/src/lib.rs` and build
+  again without `--workspace`.
+- Cargo keeps the files of old builds in `target/`; `cargo sweep`
+  (cargo-sweep) deletes them.
 - After a successful native build, run `.venv/bin/python -m pytest`
   or `uv run --no-sync pytest` to test without an implicit build.
   Rebuild after Rust edits. `uv run --frozen pytest` synchronizes first

@@ -4,6 +4,9 @@
 //! `tools/dump_check_queries.py` writes the file. Run with
 //! `cargo run --example bind_queries -- <file> [dialect]`.
 
+// links DataFusion and Quail from the shared library
+use quail_dylib as _;
+
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{DataType, Field, Schema};

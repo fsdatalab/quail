@@ -44,8 +44,8 @@ jobs:
       - run: tools/build.sh --compile
       - run: python3 tools/check_features.py
       - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --locked
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
       - run: uv run --no-sync ruff check quail bench calibrate tests experiments tools
       - run: uv run --no-sync python tools/check_long_strings.py
       - run: uv run --no-sync python tools/check_names.py

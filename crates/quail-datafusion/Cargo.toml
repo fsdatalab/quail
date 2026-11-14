@@ -17,4 +17,5 @@ serde_json = { version = "1", features = ["float_roundtrip"] }
 sqlparser = { version = "0.62.0", features = ["visitor"] }
 
 [dev-dependencies]
+quail-dylib = { path = "../quail-dylib" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

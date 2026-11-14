@@ -124,8 +124,8 @@ uv run python tools/check_names.py
 uv run vulture
 uv run lint-imports
 uv run --no-sync pytest -q
-cargo test --workspace --locked
-cargo clippy --workspace --all-targets --locked
+cargo test --locked
+cargo clippy --all-targets --locked
 cargo fmt --check
 ```
 

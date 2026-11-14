@@ -10,6 +10,10 @@
 //! The `quail` crate is Quail without Python: its session, executor,
 //! and GPU workers.
 
+// links DataFusion and Quail from the shared library
+#[cfg(test)]
+use quail_dylib as _;
+
 mod engine;
 pub mod native;
 pub mod pyarrow;

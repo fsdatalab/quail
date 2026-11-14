@@ -4,6 +4,18 @@ members = [
     "crates/quail-datafusion",
     "crates/quail-planner",
     "crates/quail",
+    "crates/quail-dylib",
+    "crates/quail-server",
+    "crates/quail-python",
+]
+# quail-dylib is the shared library the test programs link, and no
+# command selects it: Cargo links the Rust standard library into a
+# shared library it builds as a selected package, and a test program
+# then gets the standard library twice. Run cargo without --workspace.
+default-members = [
+    "crates/quail-datafusion",
+    "crates/quail-planner",
+    "crates/quail",
     "crates/quail-server",
     "crates/quail-python",
 ]
@@ -15,17 +27,14 @@ members = [
 # Full debug info for DataFusion's dependency tree takes many gigabytes,
 # and linking it dominates a rebuild; dependencies get none.
 #
-# Quail's crates keep their line tables in the object files
-# (split-debuginfo "off"). "unpacked" wrote a .dwo file per codegen unit,
-# and every incremental rebuild left the old ones in target/debug/deps.
-# On macOS, "off" also leaves debug info in the object files and skips
-# dsymutil, as "unpacked" did. Dependencies keep "unpacked": it is part
-# of their artifact hash, so changing it would recompile all of them,
-# and with debug = false it writes no .dwo files.
+# Quail's crates get no debug information either: it was about 40% of
+# each program's size. A panic message keeps its file and line; a
+# backtrace names functions without line numbers. Dependencies keep
+# split-debuginfo "unpacked": it is part of their artifact hash, so
+# changing it would recompile all of them.
 [profile.dev]
 opt-level = 1
-debug = "line-tables-only"
-split-debuginfo = "off"
+debug = false
 incremental = true
 
 [profile.dev.package."*"]

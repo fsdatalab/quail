@@ -1,7 +1,7 @@
 """Check that the Python module and the workspace build one set of dependencies.
 
-`uv sync` builds the package quail-python alone, and `cargo build
---workspace` builds every package. Cargo compiles a dependency again,
+`uv sync` builds the package quail-python alone, and `cargo build`
+builds every package. Cargo compiles a dependency again,
 and everything that uses it, when its features differ between the two
 builds. The script prints each such dependency and exits 1.
 """
@@ -26,7 +26,7 @@ def features(*selection: str) -> dict:
 
 def main() -> int:
     """Print the dependencies whose features differ; return 1 if any do."""
-    module, workspace = features("-p", "quail-python"), features("--workspace")
+    module, workspace = features("-p", "quail-python"), features()
     different = {package: sorted(workspace[package] - names)
                  for package, names in module.items() if names != workspace[package]}
     for package, missing in sorted(different.items()):

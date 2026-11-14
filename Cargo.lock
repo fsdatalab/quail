@@ -2675,6 +2675,7 @@ dependencies = [
  "futures",
  "memmap2",
  "quail-datafusion",
+ "quail-dylib",
  "quail-planner",
  "serde",
  "serde_json",
@@ -2690,10 +2691,18 @@ dependencies = [
  "datafusion",
  "datafusion-proto",
  "futures",
+ "quail-dylib",
  "quail-planner",
  "serde_json",
  "sqlparser",
  "tokio",
+]
+
+[[package]]
+name = "quail-dylib"
+version = "0.1.0"
+dependencies = [
+ "quail",
 ]
 
 [[package]]
@@ -2723,6 +2732,7 @@ dependencies = [
  "pyo3-build-config",
  "quail",
  "quail-datafusion",
+ "quail-dylib",
  "quail-planner",
  "serde",
  "serde_json",

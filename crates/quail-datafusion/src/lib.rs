@@ -25,6 +25,10 @@
 //!     .await?;
 //! ```
 
+// links DataFusion and Quail from the shared library
+#[cfg(test)]
+use quail_dylib as _;
+
 pub mod ai;
 pub mod derive;
 mod extension;
