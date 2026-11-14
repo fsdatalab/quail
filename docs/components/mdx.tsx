@@ -5,6 +5,7 @@ import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
 import { TypeTable } from 'fumadocs-ui/components/type-table';
 import type { MDXComponents } from 'mdx/types';
 import { ApiClass, ApiMethod } from './api-reference';
+import { DeriveFigure, PlanStagesFigure, SeveralRegionsFigure } from './planning-details';
 import { PlanningFigure } from './planning-figure';
 import { QueryOutput } from './query-output';
 import { CodeExample } from './code-example';
@@ -16,8 +17,11 @@ export function getMDXComponents(components?: MDXComponents) {
     ApiClass,
     ApiMethod,
     Callout,
+    DeriveFigure,
+    PlanStagesFigure,
     PlanningFigure,
     QueryOutput,
+    SeveralRegionsFigure,
     Step,
     Steps,
     Tab,

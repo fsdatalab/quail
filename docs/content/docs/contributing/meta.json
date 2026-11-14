@@ -1,7 +1,8 @@
 {
   "title": "Developers",
   "pages": [
-    "index"
+    "index",
+    "query-planning"
   ],
   "defaultOpen": false
 }

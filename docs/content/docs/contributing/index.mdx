@@ -97,6 +97,9 @@ The planner lives in `crates/quail-planner`. The executor lives in
 `query.explain()` prints the planned query. `result.explain()` prints the
 plan with measured row counts and times after the query finishes.
 
+[Query planning](./query-planning) follows every planning algorithm through
+one query, then shows how DataFusion connects several model regions.
+
 ## Use Quail from Rust
 
 Add the `quail-engine` crate and DataFusion 55.2, the version Quail builds

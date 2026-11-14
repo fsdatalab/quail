@@ -1,0 +1,249 @@
+---
+title: Query planning
+---
+
+Quail extends Apache DataFusion with AI operators. DataFusion plans and runs
+the relational part of a query. Quail sets options on each AI operator,
+groups AI operators into model regions, orders them by estimated GPU time,
+and runs them on the GPU.
+
+## Architecture
+
+DataFusion completes logical and physical planning before any row runs.
+Quail performs cost-based planning at run time, once per model region. The
+run-time planner waits for the region's input rows because GPU cost depends
+on the token lengths and shared prefixes of the input documents.
+
+<PlanningFigure />
+
+## Algorithms
+
+Four algorithms turn SQL into GPU work. `derive` sets safe options on each AI
+operator. `claim_model_regions` groups adjacent AI operators. The region
+planner chooses the lowest-cost physical plan. The executor runs each
+pipeline and returns finished rows to DataFusion.
+
+An AI operator runs correctly with no derived options. Each option only
+removes model work, and Quail sets an option only when the returned rows stay
+the same.
+
+Three checks protect every rewrite. Each AI operator reports every column its
+call, guard, and filter reads. Quail recomputes every operator schema after
+each optimizer rule. Generated-query tests compare each AI query with plain
+SQL over saved answers, with every option both enabled and disabled.
+
+### Algorithm 1: derive
+
+`derive` sets four options:
+
+| Option | Meaning |
+| --- | --- |
+| `filter` | A condition evaluated as the model produces an answer. |
+| `projection` | The answer columns returned to the next operator. |
+| `fetch` | The number of passing rows needed by operators above. |
+| `guard` | A condition deciding whether a row needs an answer. |
+
+```text
+lower(plan):
+  for each AI call in a filter, SELECT list, sort, aggregate, or join:
+    replace the call with an AI operator over the rows it reads
+  move a join call below one input when the call reads only one input
+  ask an AI pair once for an outer, semi, or anti join
+  restore unmatched rows by row id
+  reuse an answer only where every returned row keeps the answer unchanged
+
+derive(plan):
+  for each filter term:
+    offer the term to the operator producing every column it reads
+  for each AI operator:
+    set projection to the answer columns read above the operator
+  for each limit, DISTINCT, semi join, or COUNT threshold:
+    offer the required number of rows to the operators below
+  for each CASE or Boolean condition guarding an answer:
+    give the guard to the operator producing the answer
+
+offer(node, condition):
+  if an AI operator produces a column read by condition:
+    add condition to the operator filter
+  else if node can preserve and rewrite condition:
+    offer the rewritten condition to the child
+  else:
+    keep the condition in a DataFusion filter above node
+
+enough(node, required rows):
+  if node is an AI operator:
+    set fetch to required rows
+  else if node preserves the meaning of required rows:
+    pass required rows to the child
+  else:
+    keep the DataFusion limit above node
+```
+
+### Algorithm 2: claim model regions
+
+`claim_model_regions` runs after logical optimization and before physical
+planning. The algorithm leaves relational work with DataFusion when Quail
+cannot include the work in a model region.
+
+```text
+claim(plan):
+  remove an AI operator when no answer is read and no row is filtered
+
+  for each run of AI operators over one input, and for each AI join:
+    read a named table directly when the input is one table
+    otherwise, let DataFusion compute the input rows
+
+    try to bind the run as one model region
+    if the binder cannot run the region:
+      compute prompt arguments below the region
+      split the top operator into another region
+      move one filter or fetch back above the region
+      try to bind the smaller region again
+
+  return the answers and table columns read above each region
+  run DataFusion optimization again with each region as one operator
+```
+
+### Algorithm 3: region planner
+
+The region planner runs after DataFusion sends the input rows. The planner
+tokenizes the documents, measures their shared prefixes, and searches for the
+plan with the lowest estimated GPU time.
+
+```text
+plan_region(region, statistics):
+  bind each AI operator to its prompt, table, and output columns
+
+  for each table in the region:
+    search every order of up to 10 AI operators
+    rank larger sets greedily
+
+    for each candidate operator order:
+      estimate the rows left after each filter
+      estimate the cost with and without resident document KV
+      join consecutive operators with the same document head into one pipeline
+
+  for each AI join:
+    choose the join order and anchor with dynamic programming
+
+  for each candidate:
+    choose prefix sharing
+    choose unified or tree attention
+    choose KV retention
+
+  return the candidate with the lowest estimated GPU time
+```
+
+Resident KV contains document keys and values already on the GPU. An
+operator with resident KV adds only its question after the document tokens.
+
+### Algorithm 4: pipeline execution
+
+The executor uses the options from `derive` and the physical plan from the
+region planner. DataFusion can also send dynamic filters from joins and sorts
+while a region runs.
+
+```text
+guard_region_filters(physical plan):
+  follow each dynamic filter from its join or sort to a model region
+  map each filter column by name through the physical operators
+  accept the filter only when every column reaches the correct region column
+
+run_pipeline(operators in planned order, rows):
+  for each row, while fewer than fetch rows have passed:
+    admit the document and write its KV
+
+    for each AI operator:
+      if guard is false or the document is NULL:
+        write a NULL answer and continue
+
+      append the operator question after the resident document KV
+
+      after each answer token:
+        let DataFusion partially evaluate the operator filter
+        if the filter is false:
+          stop the answer and drop the row
+        if the filter is true and projection is empty:
+          stop the answer
+
+      rewind KV to the end of the document
+
+    emit the row with each projected answer
+```
+
+## One query through every stage
+
+The example filters reviews by year, asks whether each review mentions the
+ending, classifies the reviews passing both filters, and stops after ten
+rows:
+
+```sql
+SELECT r.id,
+       AI.CLASSIFY(r.text, ['positive', 'negative', 'mixed']) AS sentiment
+FROM reviews r
+WHERE r.year = 2024
+  AND AI.IF(PROMPT('Does the review mention the ending? {0}', r.text))
+LIMIT 10;
+```
+
+<PlanStagesFigure />
+
+DataFusion moves the year condition into the scan. `derive` gives the answer
+condition to `AI.IF` and the limit to `AI.CLASSIFY`. The original filter and
+limit can then leave the logical plan.
+
+`claim_model_regions` groups the two adjacent AI operators. DataFusion plans
+the scan and treats the model region as one physical operator. The run-time
+planner puts `AI.IF` first because its no answers remove rows before
+`AI.CLASSIFY` runs.
+
+<DeriveFigure />
+
+The fetch belongs to `AI.CLASSIFY`, the top AI operator, because the fetch
+counts rows returned by the region. `AI.IF` takes the only remaining answer
+condition, so every row reaching `AI.CLASSIFY` can count toward the fetch.
+
+## Several model regions
+
+A plain relational operator can separate AI operators into several model
+regions. The example creates one region over reviews and another region over
+movies:
+
+```sql
+SELECT m.genre,
+       AI.CLASSIFY(
+           r.text,
+           ['acting', 'plot', 'cinematography', 'other']
+       ) AS topic,
+       COUNT(*) AS reviews
+FROM reviews r
+JOIN movies m ON r.movie_id = m.id
+JOIN critics c ON r.critic_id = c.id
+WHERE AI.IF(PROMPT('Is the review negative? {0}', r.text))
+  AND AI.IF(PROMPT('Does the plot involve time travel? {0}', m.plot))
+  AND c.country = 'US'
+GROUP BY m.genre, topic;
+```
+
+<SeveralRegionsFigure />
+
+Each region gets a separate physical plan. DataFusion carries rows and
+dynamic filters between the regions.
+
+| Resource | Shared between regions? | Behavior |
+| --- | --- | --- |
+| Pipelines | No | A pipeline stays inside one region. |
+| KV and prefix sharing | No | Each region plans its own document inputs. |
+| Rows | Yes | Arrow batches pass through DataFusion operators. |
+| Dynamic filters | Yes | A completed join input can remove work from another region. |
+| Model and GPU | Yes | The same loaded model runs every region. |
+
+An AI join puts both input tables in one model region. The region planner can
+then choose the join order, the anchor, and KV reuse across both tables.
+
+## Future work
+
+Model regions do not report a row estimate to DataFusion yet. A row estimate
+would let DataFusion choose the smaller region as the build side of a plain
+hash join. The resulting dynamic filter could then flow to the larger region.
+GPU-time estimates could later improve the choice beyond row counts.
