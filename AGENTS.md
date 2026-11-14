@@ -66,24 +66,11 @@ Run every check before you push:
 
 # Build
 
-- Run `tools/build.sh` when you edit no Rust. The script downloads the
-  wheel CI built for the checkout's Rust sources, and needs only uv.
-  Run tools with `uv run --no-sync` afterwards; a plain `uv run`
-  compiles the module.
-- Run `tools/build.sh --compile` after each Rust edit. The first build
-  compiles DataFusion, about 20 minutes on 4 cores. Install rustup, and
-  clang and lld on Linux x86_64.
-- Keep one Cargo home and one `target/`. Never delete a cache to fix a
-  rebuild; `CARGO_LOG=cargo::core::compiler::fingerprint=info` shows
-  why Cargo rebuilt a crate.
-- Never pass `--workspace` or `-p` to cargo. `--workspace` breaks the
-  link of every test program ("`std` only shows up once"); run
-  `touch crates/quail-dylib/src/lib.rs` and build again to recover.
-  `-p` can compile DataFusion again.
-- Start a new Rust test program with `use quail_dylib as _;` and list
-  `quail-dylib` under `[dev-dependencies]`. The line links DataFusion
-  from one shared library. Leave the line out of an example a user
-  copies.
+- Run `tools/build.sh` when you edit no Rust, and
+  `tools/build.sh --compile` after each Rust edit.
+- Run tools with `uv run --no-sync`.
+- Never pass `--workspace` or `-p` to cargo, and never delete a cache
+  to fix a rebuild.
 
 # Release
 
