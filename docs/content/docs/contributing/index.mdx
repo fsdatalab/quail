@@ -48,21 +48,7 @@ Quail plans a query in two parts. DataFusion plans the SQL, and Quail's
 rules decide what each AI call asks the model. Quail then plans each
 *model region*: a group of AI calls running together on the GPU.
 
-<Mermaid chart={`flowchart TD
-    sql["SQL"]
-    bind["DataFusion parses and binds the SQL"]
-    lower["lower_ai_calls: each AI call becomes an AiNode"]
-    merge["merge_repeated_ai_calls: a call written twice becomes one AiNode"]
-    derive["derive: each AiNode gets its filter, fetch, guard, and returned columns"]
-    place["place_ai_nodes: each AiNode moves next to the table it reads"]
-    claim["claim_model_regions: adjacent AiNodes become one model region"]
-    plan["quail-planner: orders the region's operators by cost"]
-    run["Executor: runs the region on GPU workers"]
-    rest["DataFusion: runs scans, joins, sorts, and limits"]
-    sql --> bind --> lower --> merge --> derive --> place --> claim
-    claim --> plan --> run
-    claim --> rest
-`} />
+<PlanningFigure />
 
 | Step | Code |
 | --- | --- |

@@ -102,3 +102,51 @@ html > body[data-scroll-locked] {
   outline: 2px solid var(--color-fd-ring);
   outline-offset: -2px;
 }
+
+/* The planning figure: DataFusion's parts in one color, Quail's in another. */
+.planning-figure {
+  --df: #1f6f8b;
+  --df-soft: #e2f0f4;
+  --quail: #8a3d7c;
+  --quail-soft: #f4e6f1;
+  margin: 1.5rem 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+.dark .planning-figure {
+  --df: #6fc0d8;
+  --df-soft: #17313a;
+  --quail: #dc9bd0;
+  --quail-soft: #36203a;
+}
+.planning-figure .scroll {
+  overflow-x: auto;
+  border: 1px solid var(--color-fd-border);
+  border-radius: 6px;
+  background: var(--color-fd-card);
+}
+.planning-figure svg {
+  display: block;
+  width: 100%;
+  min-width: 640px;
+  height: auto;
+  color: var(--color-fd-muted-foreground);
+}
+.planning-figure figcaption {
+  font-size: 0.875rem;
+  color: var(--color-fd-muted-foreground);
+}
+.planning-figure .b-df { fill: var(--df-soft); stroke: var(--df); stroke-width: 1.2; }
+.planning-figure .b-q { fill: var(--quail-soft); stroke: var(--quail); stroke-width: 1.2; }
+.planning-figure .b-region { fill: none; stroke: var(--quail); stroke-width: 1.4; stroke-dasharray: 5 4; }
+.planning-figure .t { font-size: 15px; font-weight: 600; fill: var(--color-fd-foreground); }
+.planning-figure .d { font-size: 12.5px; fill: var(--color-fd-foreground); }
+.planning-figure .e { font-size: 12.5px; font-weight: 500; fill: var(--color-fd-foreground); }
+.planning-figure .r { font-size: 11px; font-weight: 600; letter-spacing: 0.05em; fill: var(--quail); }
+.planning-figure .lane-df { font-size: 12px; font-weight: 600; letter-spacing: 0.08em; fill: var(--df); }
+.planning-figure .lane-q { font-size: 12px; font-weight: 600; letter-spacing: 0.08em; fill: var(--quail); }
+.planning-figure .ph { font-size: 12.5px; font-weight: 600; letter-spacing: 0.08em; fill: var(--color-fd-foreground); }
+.planning-figure .phs { font-weight: 400; letter-spacing: 0; fill: var(--color-fd-muted-foreground); }
+.planning-figure .ln { stroke: currentColor; stroke-width: 1.4; fill: none; }
+.planning-figure .div { stroke: var(--color-fd-border); stroke-width: 1.5; stroke-dasharray: 6 5; }
