@@ -20,6 +20,9 @@ dependencies = [
     "vllm==0.29.0; sys_platform == 'linux'",
 ]
 
+[project.scripts]
+quail-server = "quail.remote.server:main"
+
 [project.urls]
 Documentation = "https://fsdatalab.github.io/quail"
 Repository = "https://github.com/fsdatalab/quail"

@@ -1,7 +1,7 @@
 name: Wheels
 
-# Builds one wheel per platform. A wheel holds the Python package, the
-# Rust module _quail_native, and the quail-server program.
+# Builds one wheel per platform. A wheel holds the Python package and
+# the Rust module _quail_native, which also runs quail-server.
 #
 # - A change of the Rust sources on main uploads the wheels to the
 #   `native-wheels` release, named by the key of the sources
@@ -49,20 +49,16 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      # PyPI accepts a Linux wheel only with a manylinux tag, so Linux
-      # builds run in the manylinux container; macOS builds on the runner
-      - if: runner.os == 'macOS'
-        run: tools/build_server.sh
       - uses: PyO3/maturin-action@v1
         with:
           command: build
           args: --release --locked --out dist
+          # PyPI accepts a Linux wheel only with a manylinux tag
           manylinux: "2_28"
           # .cargo/config.toml links Linux x86_64 builds with clang and lld
-          before-script-linux: dnf install -y clang lld && tools/build_server.sh
+          before-script-linux: dnf install -y clang lld
       - name: Upload to the native-wheels release
         run: |
-          unzip -l dist/*.whl | grep -q "data/scripts/quail-server"
           asset="quail_native-$(python3 tools/native_key.py)-${{ matrix.platform }}.whl"
           cp dist/*.whl "$asset"
           gh release view native-wheels >/dev/null 2>&1 \

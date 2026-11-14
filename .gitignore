@@ -35,4 +35,3 @@ target/
 
 # the release build puts quail-server here, and maturin installs the
 # folder's scripts with the wheel
-_quail_native.data/

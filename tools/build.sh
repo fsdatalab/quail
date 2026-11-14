@@ -5,7 +5,7 @@
 # The script first looks for a prebuilt wheel for this checkout's Rust
 # sources (tools/native_key.py), which CI uploads for the main branch.
 # With one, no Rust compiler is needed. Without one, or with --compile,
-# it builds the module and the server with the repository's pinned Rust.
+# it builds the module with the repository's pinned Rust.
 #
 # Usage: tools/build.sh [--compile] [uv sync options]
 set -euo pipefail
@@ -42,12 +42,11 @@ shutil.rmtree(site / "_quail_native", ignore_errors=True)
 with zipfile.ZipFile(sys.argv[1]) as wheel:
     wheel.extractall(site, [name for name in wheel.namelist()
                             if name.startswith("_quail_native/")])
-    server = next(name for name in wheel.namelist()
-                  if name.endswith(".data/scripts/quail-server"))
-    program = Path(sys.executable).parent / "quail-server"
-    program.unlink(missing_ok=True)
-    program.write_bytes(wheel.read(server))
-    program.chmod(0o755)
+# the program an editable install writes from [project.scripts]
+program = Path(sys.executable).parent / "quail-server"
+program.unlink(missing_ok=True)
+program.write_text(f"#!{sys.executable}\nfrom quail.remote.server import main\nmain()\n")
+program.chmod(0o755)
 (site / "quail_engine.pth").write_text(sys.argv[2])
 PY
     .venv/bin/python -c "import _quail_native, quail"
@@ -87,6 +86,4 @@ echo "compiler:   $(rustup which rustc)"
 echo "rustc:      $rustc_version"
 echo "CARGO_HOME: $CARGO_HOME"
 echo "target:     ${CARGO_TARGET_DIR:-$PWD/target}"
-uv sync --frozen "$@"
-cargo build --locked
-ln -sf "$PWD/target/debug/quail-server" .venv/bin/quail-server
+exec uv sync --frozen "$@"

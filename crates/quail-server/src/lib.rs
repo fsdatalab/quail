@@ -389,3 +389,76 @@ impl FlightService for QuailService {
         Err(Status::unimplemented("the server has no exchange"))
     }
 }
+
+/// How to call the program.
+pub const USAGE: &str = "usage: quail-server --model <model> --device <device> \
+[--gpus <n>] [--backend <backend>] [--listen <address>] [--data <directory>]";
+
+/// Serve a session over Arrow Flight until Ctrl-C or SIGTERM.
+///
+/// `arguments` are the program's, without its name: see [`USAGE`].
+///
+/// # Errors
+///
+/// An argument is wrong, the workers do not start, or the address is
+/// taken.
+pub fn run(
+    arguments: impl IntoIterator<Item = String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut options = std::collections::HashMap::new();
+    let mut arguments = arguments.into_iter();
+    while let Some(name) = arguments.next() {
+        let name = name.strip_prefix("--").ok_or(USAGE)?.to_string();
+        options.insert(name, arguments.next().ok_or(USAGE)?);
+    }
+    let mut take = |name: &str| options.remove(name);
+    let mut config =
+        quail::EngineConfig::new(take("model").ok_or(USAGE)?, take("device").ok_or(USAGE)?);
+    if let Some(gpus) = take("gpus") {
+        config.gpus = gpus.parse()?;
+    }
+    if let Some(backend) = take("backend") {
+        config.backend = backend;
+    }
+    let listen = take("listen").unwrap_or_else(|| "127.0.0.1:50051".to_string());
+    let data = take("data").unwrap_or_else(|| "quail-server-data".to_string());
+    if !options.is_empty() {
+        return Err(USAGE.into());
+    }
+    let address = listen.parse()?;
+    // a token is a secret, so it comes from the environment
+    let token = std::env::var("QUAIL_SERVER_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty());
+    // the session starts its workers before the server accepts a query
+    let session = Arc::new(Session::new(&config)?);
+    let queue = queue::Queue::open(std::path::Path::new(&data), Arc::clone(&session))?;
+    let service = QuailService::new(session, Arc::clone(&queue));
+    println!(
+        "Quail Server: {} on {}, at {listen}",
+        config.model, config.device
+    );
+    tokio::runtime::Runtime::new()?.block_on(
+        tonic::transport::Server::builder()
+            .add_service(
+                arrow_flight::flight_service_server::FlightServiceServer::with_interceptor(
+                    service,
+                    move |request| check_token(token.as_deref(), request),
+                ),
+            )
+            .serve_with_shutdown(address, stopped()),
+    )?;
+    queue.close();
+    // the session's workers stop, and their sockets go, as it drops
+    Ok(())
+}
+
+/// Resolves when the server is told to stop: Ctrl-C, or SIGTERM.
+async fn stopped() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut terminate = signal(SignalKind::terminate()).expect("a SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminate.recv() => {}
+    }
+}

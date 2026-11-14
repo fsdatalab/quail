@@ -1115,6 +1115,14 @@ fn execution_report(
     .to_string())
 }
 
+/// Run Quail Server with a command line's arguments until Ctrl-C or
+/// SIGTERM, as the `quail-server` program does.
+#[pyfunction]
+fn serve(py: Python<'_>, arguments: Vec<String>) -> PyResult<()> {
+    py.detach(|| quail_server::run(arguments))
+        .map_err(|error| PyValueError::new_err(error.to_string()))
+}
+
 /// A region's facts as JSON, as `quail_planner::facts::region_facts`
 /// reads them from its operators, given as JSON.
 #[pyfunction]
@@ -1212,6 +1220,7 @@ pub fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<cost::CostModel>()?;
     budgets::register(module)?;
     module.add_function(wrap_pyfunction!(explain_plan, module)?)?;
+    module.add_function(wrap_pyfunction!(serve, module)?)?;
     module.add_function(wrap_pyfunction!(parse_expression, module)?)?;
     module.add_function(wrap_pyfunction!(model_answers, module)?)?;
     module.add_function(wrap_pyfunction!(first_documents, module)?)?;

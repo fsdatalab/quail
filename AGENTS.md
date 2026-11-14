@@ -70,7 +70,7 @@ Quail source edits still require compiling and linking Quail itself.
 - A developer who edits no Rust needs only uv. `tools/build.sh` looks
   for a prebuilt wheel for the checkout's Rust sources
   (`tools/native_key.py` prints their key) and installs its
-  `_quail_native` and `quail-server` with no compiler. CI uploads one
+  `_quail_native` with no compiler. CI uploads one
   for each change of the Rust sources on `main`
   (`.github/workflows/publish.yml`); run that workflow on a branch to
   upload one for the branch. The Modal image downloads the same wheel.
@@ -82,8 +82,7 @@ Quail source edits still require compiling and linking Quail itself.
 - Install rustup and uv first; Linux x86_64 also needs clang and lld.
   Run `tools/build.sh --compile` from any shell. It prefers
   `${CARGO_HOME:-$HOME/.cargo}/bin`, uses `rust-toolchain.toml`, prints
-  the selected compiler and paths, runs `uv sync --frozen`, and
-  builds `quail-server` with `cargo build --locked`.
+  the selected compiler and paths, and runs `uv sync --frozen`.
   Rustup downloads the pinned compiler if needed. The script does not
   change global tool links or Cargo configuration.
 - Keep that Cargo home and `target/` between commands. Maturin must not
@@ -106,8 +105,10 @@ Quail source edits still require compiling and linking Quail itself.
   shared library, the crate `quail-dylib`, so each is a few megabytes.
   A new test program or example names it with `use quail_dylib as _;`
   and its package lists it under `[dev-dependencies]`. The Python
-  module and `quail-server` do not use it: each holds its own copy and
-  ships as one file.
+  module does not use it: it holds its own copy and ships as one file.
+- The `quail-server` program a user installs is a Python script that
+  calls `_quail_native.serve`, so the wheel holds DataFusion once. The
+  `quail-server` crate also builds a standalone program.
 - Do not pass `--workspace` to cargo. Cargo then links the Rust
   standard library into `quail-dylib`, and every test program fails to
   link with "cannot satisfy dependencies so `std` only shows up once".
