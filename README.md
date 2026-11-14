@@ -78,7 +78,7 @@ functions, and classifies only the reviews that `AI.IF` keeps.
 | `AI.CLASSIFY` | The one label the model chooses from your list |
 | `AI.EXTRACT` | Each question's answer, as text copied from the document |
 | `AI.EXTRACT_SPAN` | The position of each `AI.EXTRACT` answer in the document |
-| `AI.MAP` | The text the model writes for the document |
+| `AI.MAP` | Open-ended text: the model's answer to your instruction, up to a token limit |
 | `AI.SAE_FEATURES` | The model's strongest internal features for the prompt |
 
 The [SQL reference](https://fsdatalab.github.io/quail/docs/user-guide/sql)
