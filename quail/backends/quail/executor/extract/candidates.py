@@ -11,10 +11,15 @@ time as the writing reaches it.
 import re
 from dataclasses import dataclass
 
+import _quail_native
 import numpy as np
 
 from quail.backends.quail.executor.extract.vocabulary import Vocabulary
-from quail.physical import ExtractSpec
+
+# the source characters an ExtractSpec tokenizes in its first window and
+# in each later one, unless the plan sets them
+FIRST_WINDOW_CHARS = _quail_native.FIRST_WINDOW_CHARS
+WINDOW_CHARS = _quail_native.WINDOW_CHARS
 
 NEG = float("-inf")
 
@@ -124,8 +129,8 @@ class Stream:
     exhausted: bool = False
     windows: int = 0    # windows tokenized so far
     normalized: SqueezedText | None = None
-    first_window_chars: int = ExtractSpec.first_window_chars
-    window_chars: int = ExtractSpec.window_chars
+    first_window_chars: int = FIRST_WINDOW_CHARS
+    window_chars: int = WINDOW_CHARS
 
     def extend(self, vocabulary: Vocabulary) -> None:
         """Tokenize the next window of the document past the stream's end.
@@ -178,7 +183,7 @@ def extend_streams(streams: list, vocabulary: Vocabulary) -> None:
         window = stream.window()
         if window[0]:
             pending.append((stream, window))
-    encoded = vocabulary.tokenizer.encode_batch([window[0] for _, window in pending])
+    encoded = vocabulary.encode_batch([window[0] for _, window in pending])
     for (stream, window), tokens in zip(pending, encoded):
         stream.append_window(window, tokens)
 
@@ -289,8 +294,8 @@ def first_tokens(vocabulary: Vocabulary, lp, scan: DocumentTokens) -> FirstToken
 
 
 def make_streams(vocabulary: Vocabulary, text: str, starts: FirstTokens,
-                 first, *, first_window_chars: int = ExtractSpec.first_window_chars,
-                 window_chars: int = ExtractSpec.window_chars) -> list:
+                 first, *, first_window_chars: int = FIRST_WINDOW_CHARS,
+                 window_chars: int = WINDOW_CHARS) -> list:
     """Return a stream for each start the chosen first token begins.
 
     A stream's tokens are the text from the start as the model writes

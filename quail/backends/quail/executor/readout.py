@@ -16,8 +16,7 @@ from pathlib import Path
 import numpy as np
 
 from quail.backends.quail.executor.model_loading import answer_weights
-from quail.cost.budgets import READOUT_BLOCK_ROWS
-from quail.planner.prompt_lowering import true_false_ids
+from quail.common.budgets import READOUT_BLOCK_ROWS
 
 
 class AnswerRows:
@@ -41,12 +40,6 @@ class AnswerRows:
         self.false_cols = torch.tensor(
             [i for i, t in enumerate(self.allowed) if t in set(false_ids)],
             device="cuda")
-
-    @classmethod
-    def from_tokenizer(cls, torch, F, model, tokenizer):
-        """Rows for the TRUE and FALSE spellings the tokenizer produces."""
-        true_ids, false_ids = true_false_ids(tokenizer)
-        return cls(torch, F, model, true_ids, false_ids)
 
     def logits(self, normed):
         """Per row, the best logit of each class over its spellings."""

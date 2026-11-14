@@ -3,9 +3,11 @@
 from types import SimpleNamespace
 
 import pytest
+from helpers.oracle import question_text
+from helpers.sessions import TOKENIZER
 
 from quail.baselines.request import RequestBackend
-from quail.logical import ColumnRef
+from quail.common.expressions import ColumnRef
 from quail.specs import D1_2B_BF16, H100_SXM
 
 REVIEW = ColumnRef(alias="r", provider="reviews", column="body")
@@ -24,7 +26,14 @@ CHECKPOINT_LAYER_TYPES = (
     "sliding_attention", "conv", "full_attention", "conv")
 
 
-def test_the_vllm_baseline_refuses_d1_2b():
+def test_d1_2b_is_refused_by_the_vllm_baseline_and_refuses_map_with_a_reason():
+    import pyarrow as pa
+
+    import quail
+    from quail.api.config import EngineConfig
+    from quail.catalog import DocumentProvider
+    from quail.physical.plan import Refusal
+
     engine = SimpleNamespace(label="stock vLLM", kind="vllm")
     backend = RequestBackend(name="stock", engine=engine,
                              filter_submission="operator")
@@ -34,24 +43,32 @@ def test_the_vllm_baseline_refuses_d1_2b():
     assert not support.supported
     assert "lfm3" in support.reason
 
+    session = quail.Session(EngineConfig(model="d1-2b-bf16", device="h100-sxm"),
+                            tokenizer=TOKENIZER)
+    session.register("reviews", DocumentProvider.from_table(
+        pa.table({"id": [0, 1], "body": ["good food", "slow service"]}), id_col="id"))
+    extracted = session.sql(
+        "SELECT r.id, AI.EXTRACT(r.body, {'dish': 'Which dish?'}) AS x "
+        "FROM reviews r").plan()
+    mapped = session.sql(
+        "SELECT r.id, AI.MAP(r.body, 'Name the topic.', 8) AS topic "
+        "FROM reviews r").plan()
 
-def test_d1_2b_refuses_map_with_a_reason():
-    from quail.planner.validation import extraction_refusal
-
-    context = SimpleNamespace(model=D1_2B_BF16, tokenizer=lambda text: [1])
-
-    assert extraction_refusal(context) is None
-    assert "writes text" in extraction_refusal(context, "AI.MAP").reasons[0]
+    assert not isinstance(extracted, Refusal)
+    assert isinstance(mapped, Refusal)
+    assert "writes text" in mapped.reasons[0]
+    session.close()
 
 
-def test_a_d1_join_makes_the_longer_table_the_state(tmp_path):
+def test_a_d1_join_makes_the_longer_table_the_state_and_a_classification_follows_it(
+        tmp_path):
     import pyarrow as pa
     import pyarrow.parquet as pq
 
     import quail
+    from quail.api.config import EngineConfig
     from quail.catalog import DocumentProvider
-    from quail.physical import AiJoin
-    from quail.planner.plan import EngineConfig
+    from quail.physical import AiClassify, AiJoin
 
     body = " ".join(["word"] * 300)
     pq.write_table(pa.table({"id": list(range(40)), "body": [body] * 40}),
@@ -59,7 +76,7 @@ def test_a_d1_join_makes_the_longer_table_the_state(tmp_path):
     pq.write_table(pa.table({"id": list(range(12)), "aspect": ["acting"] * 12}),
                    tmp_path / "aspects.parquet")
     session = quail.Session(EngineConfig(model="d1-2b-bf16", device="h100-sxm"),
-                            tokenizer=str.split)
+                            tokenizer=TOKENIZER)
     for name in ("reviews", "aspects"):
         session.register(name, DocumentProvider.from_parquet(
             str(tmp_path / f"{name}.parquet"), id_col="id"))
@@ -70,23 +87,42 @@ def test_a_d1_join_makes_the_longer_table_the_state(tmp_path):
 
     (join,) = [node for node in plan.nodes if isinstance(node, AiJoin)]
     assert join.anchor == "r"
-    assert join.document_head[-2:] == ("reviews", "record:")
-    assert join.label_token_ids == (("a", ("aspects", "record:")),)
-    assert join.question_header_token_ids == ("QUESTION:",)
+    assert question_text(join.document_head).endswith("\nreviews record:\n")
+    ((alias, label),) = join.label_token_ids
+    assert (alias, question_text(label)) == ("a", "aspects record:\n")
+    assert question_text(join.question_header_token_ids) == "QUESTION:\n"
     assert not join.keep_kv
+
+    plan = session.sql(
+        "SELECT r.id, a.id, AI.CLASSIFY(PROMPT('What does DOCUMENT {0} say "
+        "about DOCUMENT {1}?', r.body, a.aspect), ARRAY['praise', 'complaint']) "
+        "AS stance FROM reviews r JOIN aspects a ON AI_FILTER(PROMPT("
+        "'Does {0} mention {1}?', r.body, a.aspect))").plan()
+
+    (join,) = [node for node in plan.nodes if isinstance(node, AiJoin)]
+    (label,) = [node for node in plan.nodes if isinstance(node, AiClassify)]
+    spec = label.spec
+    assert spec.scoring == "set_choice" and spec.aliases == ("r", "a")
+    assert [question_text(part).strip() for part in spec.join_layout] == [
+        "QUESTION:", "aspects record:"]
+    assert question_text(spec.prompt_token_parts[0]).endswith("\nreviews record:\n")
+    assert plan.graph.pipelines()[join.node_id] == (join, label)
+    # priced by its own estimate over each anchor's kept pairs, not as a
+    # pass group of one question for each pair
+    assert label.pass_group == -1
+    assert plan.estimates[label.node_id]["seconds"] == pytest.approx(
+        spec.estimated_seconds)
     session.close()
 
 
 def test_an_option_whose_code_is_two_tokens_takes_d1s_first_free_fallback():
-    from quail.logical.prompts import option_codes
-    from quail.planner.prompt_lowering import option_aliases
+    from quail.physical.lowering import option_aliases
 
     def tokenizer(text):
         return list(text) if text.isupper() else [text]
 
-    codes = option_codes([f"label {index}" for index in range(27)])
+    codes = (*(chr(ord("A") + index) for index in range(26)), "AA")
 
-    assert codes[-1] == "AA"
     assert option_aliases(codes, tokenizer)[-1] == "00"
 
 
@@ -105,48 +141,6 @@ def test_an_lfm3_checkpoint_needs_its_text_tensors_and_nothing_unknown():
         check_tensors(expected[1:], expected)
     with pytest.raises(ValueError, match="does not use"):
         check_tensors([*expected, "model.audio_tower.weight"], expected)
-
-
-def test_a_d1_classification_of_joined_rows_follows_its_join(tmp_path):
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
-    import quail
-    from quail.catalog import DocumentProvider
-    from quail.physical import AiClassify, AiJoin
-    from quail.physical.pipelines import build_pipelines
-    from quail.planner.plan import EngineConfig
-
-    body = " ".join(["word"] * 300)
-    pq.write_table(pa.table({"id": list(range(40)), "body": [body] * 40}),
-                   tmp_path / "reviews.parquet")
-    pq.write_table(pa.table({"id": list(range(12)), "aspect": ["acting"] * 12}),
-                   tmp_path / "aspects.parquet")
-    session = quail.Session(EngineConfig(model="d1-2b-bf16", device="h100-sxm"),
-                            tokenizer=str.split)
-    for name in ("reviews", "aspects"):
-        session.register(name, DocumentProvider.from_parquet(
-            str(tmp_path / f"{name}.parquet"), id_col="id"))
-
-    plan = session.sql(
-        "SELECT r.id, a.id, AI.CLASSIFY(PROMPT('What does DOCUMENT {0} say "
-        "about DOCUMENT {1}?', r.body, a.aspect), ARRAY['praise', 'complaint']) "
-        "AS stance FROM reviews r JOIN aspects a ON AI_FILTER(PROMPT("
-        "'Does {0} mention {1}?', r.body, a.aspect))").plan()
-
-    (join,) = [node for node in plan.nodes if isinstance(node, AiJoin)]
-    (label,) = [node for node in plan.nodes if isinstance(node, AiClassify)]
-    spec = label.spec
-    assert spec.scoring == "set_choice" and spec.aliases == ("r", "a")
-    assert spec.join_layout == (("QUESTION:",), ("aspects", "record:"))
-    assert spec.prompt_token_parts[0][-2:] == ("reviews", "record:")
-    assert build_pipelines(plan.graph)[join.node_id] == (join, label)
-    # priced by its own estimate over each anchor's kept pairs, not as a
-    # pass group of one question for each pair
-    assert label.pass_group == -1
-    assert plan.estimates[label.node_id]["seconds"] == pytest.approx(
-        spec.estimated_seconds)
-    session.close()
 
 
 def test_d1_2b_fp8_is_d1_2b_with_fp8_weights():

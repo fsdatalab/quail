@@ -9,7 +9,17 @@ from typing import Any, Protocol
 
 import pyarrow as pa
 
-from quail.logical import CompileError
+from quail.common.expressions import CompileError
+
+# separates a table's name from its alias in the name of a model region's
+# input that holds some of the table's rows, as in reviews@r; a registered
+# table's name has none
+INPUT_SEPARATOR = "@"
+
+
+def table_name(provider: str) -> str:
+    """Return the registered table a scanned provider reads."""
+    return provider.split(INPUT_SEPARATOR, 1)[0]
 
 
 @dataclass(frozen=True)
@@ -288,6 +298,10 @@ class Catalog:
     providers: dict[str, TableProvider] = field(default_factory=dict)
 
     def register(self, name: str, provider: TableProvider) -> None:
+        if INPUT_SEPARATOR in name:
+            raise CompileError(
+                f"table name {name!r} has {INPUT_SEPARATOR!r}, which Quail keeps "
+                "for the inputs of model regions")
         if name in self.providers:
             raise CompileError(f"provider {name!r} is already registered")
         self.providers[name] = provider

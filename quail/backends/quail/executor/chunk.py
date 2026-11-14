@@ -150,6 +150,59 @@ def _concatenate(parts):
     return np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
 
 
+_ONE = np.ones(1, dtype=np.int64)
+
+
+class _Rows:
+    """Row numbers gathered in order as runs and arrays, joined once.
+
+    A run is first, first + 1, ..., first + count - 1. Consecutive runs
+    are expanded together when the rows are joined, so a chunk of many
+    groups makes one array, not one per group.
+    """
+
+    def __init__(self):
+        # each an array, or a run as (first, count)
+        self.parts = []
+
+    def __bool__(self):
+        return bool(self.parts)
+
+    def run(self, first, count):
+        """Add the count rows that start at first."""
+        self.parts.append((first, count))
+
+    def append(self, rows):
+        """Add an array of rows."""
+        self.parts.append(rows)
+
+    def joined(self):
+        """Return every row added so far, in order, as one int64 array."""
+        arrays, firsts, counts = [], [], []
+
+        def expand():
+            if not firsts:
+                return
+            lengths = np.asarray(counts, dtype=np.int64)
+            ends = np.cumsum(lengths)
+            arrays.append(
+                np.repeat(np.asarray(firsts, dtype=np.int64) - (ends - lengths),
+                          lengths)
+                + np.arange(int(ends[-1]), dtype=np.int64))
+            firsts.clear()
+            counts.clear()
+
+        for part in self.parts:
+            if isinstance(part, tuple):
+                firsts.append(part[0])
+                counts.append(part[1])
+            else:
+                expand()
+                arrays.append(part)
+        expand()
+        return _concatenate(arrays)
+
+
 def _staged(torch, data, dtype, pinned=True):
     """Copy host data to the device.
 
@@ -267,7 +320,6 @@ class InputStaging:
         self.torch = torch
         self.buffers = {}     # name -> the buffer in use: host, device, event
         self.rings = {}       # name -> (next slot, list of buffers or None)
-        self.fixed_tokens = {}
 
     def host(self, name, count, dtype):
         torch = self.torch
@@ -297,12 +349,6 @@ class InputStaging:
         host = self.host(name, source.numel(), dtype)
         host.copy_(source.reshape(-1))
         return self.upload(name, source.numel())
-
-    def fixed(self, tokens):
-        key = id(tokens)
-        if key not in self.fixed_tokens:
-            self.fixed_tokens[key] = tokens, self.torch.as_tensor(tokens)
-        return self.fixed_tokens[key][1]
 
 
 def _staged_token_parts(torch, sequences, total, pinned=True, staging=None):
@@ -497,14 +543,15 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     canvas_sizes = []     # per group, the rows of each canvas
     canvas_seq = []       # its sequence in the unified paged call
     id_parts, num_tokens = [], 0
-    position, finals = [], []
-    cu_a = [np.zeros(1, dtype=np.int64)]
+    position, finals = _Rows(), _Rows()
+    cu_a = _Rows()
+    cu_a.run(0, 1)
     rows_per_answer = []
     multi_row = False
     # rows that read resident KV in call B: a borrowing document's
     # rows reading its parent, and a kept document's tail reading its
     # own prefix (wider than the planner's readers, which are children)
-    reader_rows = []
+    reader_rows = _Rows()
     kv_writes, layout = [], []
     row_spans = []
     # per group: (first row, end row), or under set attention (first
@@ -550,11 +597,11 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             prefix_len = len(g["prefix"])
             id_parts.append(g["prefix"])
             num_tokens += prefix_len
-            position.append(np.arange(start, start + prefix_len, dtype=np.int64))
+            position.run(start, prefix_len)
             if (paged or not n) and not stacked and not whole:
-                cu_a.append(np.array([num_tokens], dtype=np.int64))
+                cu_a.run(num_tokens, 1)
             if borrowing and not stacked:
-                reader_rows.append(np.arange(row0, num_tokens, dtype=np.int64))
+                reader_rows.run(row0, num_tokens - row0)
                 cu_q.append(cu_q[-1] + prefix_len)
                 read_keys.append(key)
                 read_used.append(start)
@@ -568,124 +615,150 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         # of the suffix's own rows
         read_all = bool(g.get("read_all_rows"))
         own = g.get("canvas")
-        group_canvas = (canvas_ids if own is None
-                        else np.asarray(own, dtype=np.int64))
-        # a two-dimensional canvas holds one canvas per suffix
-        per_suffix = group_canvas.ndim == 2
-        if per_suffix and len(group_canvas) != n:
-            raise ValueError(
-                f"group {key!r}: {len(group_canvas)} canvases for {n} suffixes")
-        width = group_canvas.shape[-1]
-        if width and not read_all and answer_row >= width:
-            raise ValueError(
-                f"group {key!r}: answer_row {answer_row} is outside its "
-                f"{width}-row canvas")
-        # every suffix's rows at once: positions restart at f for each
-        # suffix, and a canvas continues its suffix's positions
-        widths = sufs.lengths + width
-        total = int(widths.sum())
-        ends = np.cumsum(widths)
-        begins = ends - widths
-        within = np.arange(total, dtype=np.int64) - np.repeat(begins, widths)
-        if n and width:
-            # row answer_row of each canvas carries the answer
-            past = within - np.repeat(sufs.lengths, widths)
-            # suffix s reads canvas row s of a two-dimensional canvas
-            first_row = (np.repeat(np.arange(n) * width, widths) if per_suffix
-                         else 0)
-            source = np.where(
-                past >= 0, len(sufs.ids) + first_row + past,
-                np.repeat(sufs.offsets[:-1], widths) + within)
-            id_parts.append(
-                np.concatenate([sufs.ids, group_canvas.ravel()])[source])
-            first = s_row0 + begins + sufs.lengths
-            canvas_starts.append(first)
-            canvas_sizes.append(np.full(n, width, dtype=np.int64))
-            if read_all:
-                finals.append(np.repeat(first, width)
-                              + np.tile(np.arange(width, dtype=np.int64), n))
-                rows_per_answer.append(np.full(n, width, dtype=np.int64))
-                multi_row = True
-            else:
-                finals.append(first + answer_row)
-                rows_per_answer.append(np.ones(n, dtype=np.int64))
-        elif n and g.get("read_mask") is not None:
-            # the marked rows of the one suffix carry the answers
-            id_parts.append(sufs.ids)
-            mask = np.asarray(g["read_mask"], dtype=bool)
-            if n != 1 or len(mask) != total:
-                raise ValueError(
-                    f"group {key!r}: read_mask marks one suffix's rows")
-            reads = s_row0 + np.flatnonzero(mask)
-            state_reads = g.get("state_reads")
-            if state_reads is not None:
-                # a pointer read's document rows, read before its slots
-                reads = np.concatenate(
-                    [row0 + np.asarray(state_reads, dtype=np.int64), reads])
-            finals.append(reads)
-            rows_per_answer.append(np.array([len(reads)], dtype=np.int64))
-            multi_row = True
-        elif n and g.get("read_rows") is not None:
-            # the last read_rows rows of each suffix carry the answers
-            id_parts.append(sufs.ids)
-            counts = np.asarray(g["read_rows"], dtype=np.int64)
-            if len(counts) != n or (counts > sufs.lengths).any():
-                raise ValueError(
-                    f"group {key!r}: read_rows must give each suffix at most "
-                    f"its length")
-            finals.append(np.repeat(s_row0 + ends, counts)
-                          - np.repeat(counts, counts)
-                          + (np.arange(int(counts.sum()), dtype=np.int64)
-                             - np.repeat(np.cumsum(counts) - counts, counts)))
-            rows_per_answer.append(counts)
-            multi_row = True
-        elif n:
+        paths = g.get("paths")
+        # one suffix read plainly, the common group: its rows are one run
+        plain = (n == 1 and own is None and not len(canvas_ids)
+                 and paths is None and g.get("read_mask") is None
+                 and g.get("read_rows") is None)
+        if plain:
+            total = int(sufs.lengths[0])
+            width = 0
             id_parts.append(sufs.ids)
             if read_all:
-                finals.append(np.arange(s_row0, s_row0 + total, dtype=np.int64))
+                finals.run(s_row0, total)
                 rows_per_answer.append(sufs.lengths)
                 multi_row = True
             else:
-                finals.append(s_row0 + ends - 1)
-                rows_per_answer.append(np.ones(n, dtype=np.int64))
-        paths = g.get("paths")
-        if paths is not None:
-            if n != 1 or not read_all or not tree_path:
-                raise ValueError("paths pack one suffix, every row read, "
-                                 "under tree attention")
-            lengths = np.array([len(nodes) for nodes, _, _ in paths])
-            starts = np.array([start for _, start, _ in paths])
-            path_ends = s_row0 + np.cumsum(lengths)
-            path_row0 = path_ends - lengths
-            position.append(f + np.repeat(starts, lengths)
-                       + (np.arange(total, dtype=np.int64)
-                          - np.repeat(path_row0 - s_row0, lengths)))
-            cu_a.append(path_ends)
-            # a path's rows read the rows above its first node, which
-            # earlier paths hold, in call C
-            for index, (_, _, gathers) in enumerate(paths):
-                if not gathers:
-                    continue
-                keys = np.concatenate([
-                    np.arange(path_row0[c], path_row0[c] + count,
-                              dtype=np.int64) for c, count in gathers])
-                node_q.append(np.arange(path_row0[index], path_ends[index],
-                                        dtype=np.int64))
-                node_k.append(keys)
-                node_cu_q.append(node_cu_q[-1] + int(lengths[index]))
-                node_cu_k.append(node_cu_k[-1] + len(keys))
-            num_tokens += total
-        elif n:
-            position.append(f + within)
-            cu_a.append(s_row0 + ends)
+                finals.run(s_row0 + total - 1, 1)
+                rows_per_answer.append(_ONE)
+            position.run(f, total)
+            cu_a.run(s_row0 + total, 1)
             num_tokens += total
             wst = g.get("write_suffix_tokens", 0)
             if wst and paged and tree_path:
-                # the shared question preamble joins the kept KV right
-                # after the document rows: after the fresh prefix, or
-                # after a kept document's f rows
                 dest = start + prefix_len if fresh else f
                 kv_writes.append((key, s_row0, s_row0 + wst, dest))
+            if attention_mode == "unified":
+                begins = np.zeros(1, dtype=np.int64)
+                ends = np.array([total], dtype=np.int64)
+        else:
+            group_canvas = (canvas_ids if own is None
+                            else np.asarray(own, dtype=np.int64))
+            # a two-dimensional canvas holds one canvas per suffix
+            per_suffix = group_canvas.ndim == 2
+            if per_suffix and len(group_canvas) != n:
+                raise ValueError(
+                    f"group {key!r}: {len(group_canvas)} canvases for {n} suffixes")
+            width = group_canvas.shape[-1]
+            if width and not read_all and answer_row >= width:
+                raise ValueError(
+                    f"group {key!r}: answer_row {answer_row} is outside its "
+                    f"{width}-row canvas")
+            # every suffix's rows at once: positions restart at f for each
+            # suffix, and a canvas continues its suffix's positions
+            widths = sufs.lengths + width
+            total = int(widths.sum())
+            ends = np.cumsum(widths)
+            begins = ends - widths
+            within = np.arange(total, dtype=np.int64) - np.repeat(begins, widths)
+            if n and width:
+                # row answer_row of each canvas carries the answer
+                past = within - np.repeat(sufs.lengths, widths)
+                # suffix s reads canvas row s of a two-dimensional canvas
+                first_row = (np.repeat(np.arange(n) * width, widths) if per_suffix
+                             else 0)
+                source = np.where(
+                    past >= 0, len(sufs.ids) + first_row + past,
+                    np.repeat(sufs.offsets[:-1], widths) + within)
+                id_parts.append(
+                    np.concatenate([sufs.ids, group_canvas.ravel()])[source])
+                first = s_row0 + begins + sufs.lengths
+                canvas_starts.append(first)
+                canvas_sizes.append(np.full(n, width, dtype=np.int64))
+                if read_all:
+                    finals.append(np.repeat(first, width)
+                                  + np.tile(np.arange(width, dtype=np.int64), n))
+                    rows_per_answer.append(np.full(n, width, dtype=np.int64))
+                    multi_row = True
+                else:
+                    finals.append(first + answer_row)
+                    rows_per_answer.append(np.ones(n, dtype=np.int64))
+            elif n and g.get("read_mask") is not None:
+                # the marked rows of the one suffix carry the answers
+                id_parts.append(sufs.ids)
+                mask = np.asarray(g["read_mask"], dtype=bool)
+                if n != 1 or len(mask) != total:
+                    raise ValueError(
+                        f"group {key!r}: read_mask marks one suffix's rows")
+                reads = s_row0 + np.flatnonzero(mask)
+                state_reads = g.get("state_reads")
+                if state_reads is not None:
+                    # a pointer read's document rows, read before its slots
+                    reads = np.concatenate(
+                        [row0 + np.asarray(state_reads, dtype=np.int64), reads])
+                finals.append(reads)
+                rows_per_answer.append(np.array([len(reads)], dtype=np.int64))
+                multi_row = True
+            elif n and g.get("read_rows") is not None:
+                # the last read_rows rows of each suffix carry the answers
+                id_parts.append(sufs.ids)
+                counts = np.asarray(g["read_rows"], dtype=np.int64)
+                if len(counts) != n or (counts > sufs.lengths).any():
+                    raise ValueError(
+                        f"group {key!r}: read_rows must give each suffix at most "
+                        f"its length")
+                finals.append(np.repeat(s_row0 + ends, counts)
+                              - np.repeat(counts, counts)
+                              + (np.arange(int(counts.sum()), dtype=np.int64)
+                                 - np.repeat(np.cumsum(counts) - counts, counts)))
+                rows_per_answer.append(counts)
+                multi_row = True
+            elif n:
+                id_parts.append(sufs.ids)
+                if read_all:
+                    finals.append(np.arange(s_row0, s_row0 + total, dtype=np.int64))
+                    rows_per_answer.append(sufs.lengths)
+                    multi_row = True
+                else:
+                    finals.append(s_row0 + ends - 1)
+                    rows_per_answer.append(np.ones(n, dtype=np.int64))
+            if paths is not None:
+                if n != 1 or not read_all or not tree_path:
+                    raise ValueError("paths pack one suffix, every row read, "
+                                     "under tree attention")
+                lengths = np.array([len(nodes) for nodes, _, _ in paths])
+                starts = np.array([start for _, start, _ in paths])
+                path_ends = s_row0 + np.cumsum(lengths)
+                path_row0 = path_ends - lengths
+                position.append(f + np.repeat(starts, lengths)
+                           + (np.arange(total, dtype=np.int64)
+                              - np.repeat(path_row0 - s_row0, lengths)))
+                cu_a.append(path_ends)
+                # a path's rows read the rows above its first node, which
+                # earlier paths hold, in call C
+                for index, (_, _, gathers) in enumerate(paths):
+                    if not gathers:
+                        continue
+                    keys = np.concatenate([
+                        np.arange(path_row0[c], path_row0[c] + count,
+                                  dtype=np.int64) for c, count in gathers])
+                    node_q.append(np.arange(path_row0[index], path_ends[index],
+                                            dtype=np.int64))
+                    node_k.append(keys)
+                    node_cu_q.append(node_cu_q[-1] + int(lengths[index]))
+                    node_cu_k.append(node_cu_k[-1] + len(keys))
+                num_tokens += total
+            elif n:
+                position.append(f + within)
+                cu_a.append(s_row0 + ends)
+                num_tokens += total
+                wst = g.get("write_suffix_tokens", 0)
+                if wst and paged and tree_path:
+                    # the shared question preamble joins the kept KV right
+                    # after the document rows: after the fresh prefix, or
+                    # after a kept document's f rows
+                    dest = start + prefix_len if fresh else f
+                    kv_writes.append((key, s_row0, s_row0 + wst, dest))
         num_s = num_tokens - s_row0
         layout.append((key, n))
         row_spans.append((key, row0, prefix_end, num_tokens))
@@ -696,7 +769,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             # every row of the group reads the parent's pages up to
             # start; siblings packed back to back share that read
             count = num_tokens - row0
-            reader_rows.append(np.arange(row0, num_tokens, dtype=np.int64))
+            reader_rows.run(row0, count)
             read_key = g["read_key"]
             if read_keys and read_keys[-1] == read_key \
                     and read_used[-1] == start:
@@ -708,7 +781,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 read_used.append(start)
                 max_q = max(max_q, count)
         elif num_s and f and paged and tree_path and not whole:
-            reader_rows.append(np.arange(s_row0, num_tokens, dtype=np.int64))
+            reader_rows.run(s_row0, num_s)
             cu_q.append(cu_q[-1] + num_s)
             read_keys.append(key)
             read_used.append(f)
@@ -747,7 +820,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         rows_per_answer.append(np.ones(count, dtype=np.int64))
         cu_a.append(num_tokens + decode_offsets[1:])
         num_tokens += count
-    cu_a = np.concatenate(cu_a)
+    cu_a = cu_a.joined()
 
     t = _tick(timing, "pack_py", t)
     reads = None
@@ -766,7 +839,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 decode.page_table[decode_offsets[:-1]])
             table = stage("read_table", flat, torch.int32).view(*flat.shape)
         t = _tick(timing, "pack_blocktable", t)
-        rows = np.concatenate(reader_rows)
+        rows = reader_rows.joined()
         # row -> its index in call B's output, -1 for rows that read
         # nothing resident; the fused merge kernel's map
         source = np.full(num_tokens, -1, dtype=np.int32)
@@ -916,9 +989,9 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     # launch per layer (kv_row_scatter)
     kv_src = kv_dst = None
     if kv_writes or tree_decode:
-        src, dst_parts = [], []
+        src, dst_parts = _Rows(), []
         for key, r0, r1, dest in kv_writes:
-            src.append(np.arange(r0, r1, dtype=np.int64))
+            src.run(r0, r1 - r0)
             rows = arena.capacity_rows(key)[dest:dest + (r1 - r0)]
             if rows.numel() != r1 - r0:
                 raise AssertionError("KV write exceeds reserved rows")
@@ -927,7 +1000,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             src.append(np.arange(decode_row0, decode_row0 + len(decode),
                                  dtype=np.int64))
             dst_parts.append(np.asarray(decode.write_rows, dtype=np.int64))
-        kv_src = _staged(torch, np.concatenate(src), torch.int64, pinned)
+        kv_src = _staged(torch, src.joined(), torch.int64, pinned)
         kv_dst = _staged(torch, np.concatenate(dst_parts), torch.int64,
                          pinned)
     t = _tick(timing, "pack_kv", t)
@@ -999,8 +1072,8 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     out = Chunk(
         input_ids=_staged_token_parts(
             torch, id_parts, num_tokens, pinned, staging),
-        positions=stage("positions", _concatenate(position), torch.int64),
-        final_indices=stage("finals", _concatenate(finals), torch.int64),
+        positions=stage("positions", position.joined(), torch.int64),
+        final_indices=stage("finals", finals.joined(), torch.int64),
         meta=meta, attention_mode=attention_mode, tokens=num_tokens,
         layout=layout, row_spans=tuple(row_spans),
         temporary_keys=tuple(temporary_keys),

@@ -1,8 +1,9 @@
 """CPU checks that every QUAIL-B query builds and plans on Quail."""
 
 
-from helpers.fakes import letter_tokens
+from helpers.planning import operators_of
 from helpers.quailb_data import standin_sets
+from helpers.sessions import TOKENIZER
 
 import quail
 from bench.quailb import (
@@ -10,8 +11,8 @@ from bench.quailb import (
     queries,
     register_tables,
 )
-from quail.logical import Aggregate
-from quail.planner.plan import EngineConfig, Refusal
+from quail.api.config import EngineConfig
+from quail.physical.plan import Refusal
 from quail_b.queries import QUERY_ORDER
 
 
@@ -42,55 +43,33 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
     }
     assert set(QUERY_ORDER) == (
         expected | classify | extract | relational) - {"PRIV-1", "PRIV-2"}
-    for backend in ("quail", "stock_vllm", "pipelined_vllm", "pipelined_sglang"):
+    for backend in ("quail", "stock_vllm", "pipelined_vllm"):
         with quail.Session(
             EngineConfig(gpus=1, model="qwen3-4b-fp8", backend=backend,
                          device="h100-sxm"),
-            tokenizer=letter_tokens,
+            tokenizer=TOKENIZER,
         ) as sess:
             register_tables(sess, tmp_path)
             qdefs = queries(sess)
-            # every backend lists every query; SGLang refuses the
-            # classification and extraction queries at plan time, since
-            # its engine returns no decoded answer text.
+            # every backend lists every query
             assert set(qdefs) == expected | classify | extract | relational, (
                 backend)
             for qid, (_, build) in qdefs.items():
                 case = f"{backend} {qid}"
                 query = build()
-                operators = query.logical.operators()
+                found = operators_of(query)
                 selectivities = [
-                    predicate.selectivity for sequence in operators.filters.values()
-                    for predicate in sequence]
-                selectivities += [join.selectivity for join in operators.joins]
+                    predicate.selectivity
+                    for _, predicates in found.filters for predicate in predicates]
+                selectivities += [join.selectivity for join in found.joins]
                 assert all((s is None) == qid.startswith("PRIV-")
                            for s in selectivities), case
                 plan = query.plan()
-                root = query.logical.result
-                sorts = bool(root.order or root.distinct or root.offset
-                             or isinstance(root.input, Aggregate))
-                assert sorts <= (qid in relational), case
-                if backend != "quail" and sorts:
-                    # a request backend sorts returned rows on the
-                    # coordinator, but runs no GROUP BY or window
-                    if isinstance(root.input, Aggregate):
-                        assert isinstance(plan, Refusal), case
-                        assert plan.constraint == "sort_needs_quail_backend", case
-                        continue
-                    if isinstance(plan, Refusal):
-                        # refused for its AI functions, not its sort
-                        assert plan.constraint != "sort_needs_quail_backend", case
-                    else:
-                        assert any(node.type_name == "quail.sort"
-                                   for node in plan.graph.nodes), case
-                    continue
-                if backend == "pipelined_sglang" and qid in classify:
-                    assert isinstance(plan, Refusal), case
-                    assert plan.constraint == "classify_needs_quail_backend", case
-                    continue
-                if backend == "pipelined_sglang" and qid in extract:
-                    assert isinstance(plan, Refusal), case
-                    assert plan.constraint == "extract_needs_quail_backend", case
+                if backend != "quail" and qid in relational and isinstance(
+                        plan, Refusal):
+                    # refused for its AI functions; DataFusion runs the
+                    # relational operators above the region on any backend
+                    assert plan.constraint != "sort_needs_quail_backend", case
                     continue
                 assert not isinstance(plan, Refusal), f"{case} refused: {plan}"
                 assert plan.settings["order_rule"] == "by_cost", case
@@ -108,3 +87,8 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
     assert _submission_to_answer_s(
         "pipelined_vllm", report, frontend_s=1.0, answer_prepare_s=0.75
     ) == 11.25
+    # DataFusion's time around the model region counts for every backend
+    report["datafusion_s"] = 0.5
+    assert _submission_to_answer_s(
+        "quail", report, frontend_s=1.0, answer_prepare_s=0.75
+    ) == 15.0

@@ -1,4 +1,4 @@
-"""The Filter runtime: documents on the GPU executor, result rows on the coordinator."""
+"""The Filter runtime: a condition on documents, on the GPU executor."""
 
 from __future__ import annotations
 
@@ -6,67 +6,30 @@ import numpy as np
 import pyarrow as pa
 from pyarrow import compute as pc
 
-from quail.catalog.pairs import columns_key
+from quail.common.expressions import accepts
+from quail.common.pairs import columns_key
 from quail.execution.metrics import NodeMetrics, NodeResult
-from quail.execution.result import QueryResult, answer_table, filter_answer_table
+from quail.execution.result import answer_table, filter_answer_table
 from quail.execution.rows import Rows
-from quail.execution.runtimes.relational import row_batches
 from quail.physical import Filter
 
 
 class FilterRuntime:
     """Keep the rows that pass the predicate.
 
-    A filter with aliases reads a score, label, or answer table and also
-    returns its answers; one without reads result rows.
+    It reads a score, label, or answer table and also returns its answers.
     """
 
     def execute(self, node, inputs, context) -> NodeResult:
         if not isinstance(node, Filter):
             raise TypeError(type(node).__name__)
         values = [inputs[port.name] for port in node.inputs]
-        if not node.aliases:
-            if len(values) != 1:
-                raise ValueError("a Filter on result rows needs one input")
-            return filter_result_rows(node, values[0])
         rows, others = values[0], values[1:]
         if all(name in rows.column_names for name in node.tested_columns):
             return filter_scores(node, rows)
         sources = context.sources.get(columns_key(node.aliases[0]))
         return filter_scores(node, rows, tested_table(
             node, rows, lambda name, ids: _read(name, ids, node, others, sources)))
-
-
-class ResultColumns:
-    """Read result row columns by name, including fields of struct columns.
-
-    The Project packs each extraction's answers into a struct column,
-    so ``lease.ends`` is the field ``ends`` of the column ``lease`` when
-    no column has that name.
-    """
-
-    def __init__(self, batch: pa.RecordBatch):
-        self.batch = batch
-
-    def column(self, name: str):
-        if name in self.batch.schema.names:
-            return self.batch.column(name)
-        struct, _, field = name.rpartition(".")
-        if struct in self.batch.schema.names:
-            return pc.struct_field(self.batch.column(struct), field)
-        raise KeyError(f"the result rows have no column {name!r}")
-
-
-def filter_result_rows(node, value) -> NodeResult:
-    """Keep the result rows whose predicate holds, one batch at a time."""
-    num_rows, batches = 0, []
-    for batch in row_batches(value):
-        num_rows += batch.num_rows
-        kept = node.predicate.accepts(ResultColumns(batch), qualified=True)
-        batches.append(batch.filter(kept).select(list(node.columns)))
-    table = pa.Table.from_batches(batches)
-    return NodeResult({"rows": QueryResult.from_table(table)}, NodeMetrics(
-        input_rows=num_rows, output_rows=table.num_rows))
 
 
 def _filter_answer_table(node: Filter, rows: Rows, answers) -> pa.Table:
@@ -115,7 +78,7 @@ def filter_scores(node, rows: Rows, tested: pa.Table | None = None) -> NodeResul
         tested: The columns the predicate reads, one row per row of
             rows, when the rows lack some of them.
     """
-    answers = node.predicate.accepts(rows if tested is None else tested)
+    answers = accepts(node.predicate, rows if tested is None else tested)
     filtered = rows.filter(answers)
     if len(node.aliases) == 1:
         answer_name = f"filter_answers:{node.aliases[0]}"
@@ -132,8 +95,7 @@ def filter_scores(node, rows: Rows, tested: pa.Table | None = None) -> NodeResul
                 "anchor": left,
                 "partners": right,
                 "semantics": "full",
-                "comparison": node.predicate.comparison,
-                "threshold": node.predicate.value,
+                "predicate": str(node.predicate),
             },
         )
     outputs = {node.rows_port: filtered, answer_name: answer_relation}

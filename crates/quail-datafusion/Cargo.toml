@@ -1,0 +1,22 @@
+[package]
+name = "quail-datafusion"
+version.workspace = true
+edition = "2024"
+license = "MIT"
+description = "Quail's AI functions and model region planning as a DataFusion extension"
+repository = "https://github.com/fsdatalab/quail"
+
+[dependencies]
+async-trait = "0.1"
+datafusion = { version = "55.2.0", default-features = false, features = ["sql", "nested_expressions", "string_expressions", "unicode_expressions", "math_expressions", "regex_expressions"] }
+base64 = "0.23"
+# a region's expressions cross to the executor as datafusion-proto bytes
+datafusion-proto = { version = "55.2.0", default-features = false }
+futures = "0.3"
+quail-planner.workspace = true
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sqlparser = { version = "0.62.0", features = ["visitor"] }
+
+[dev-dependencies]
+quail-dylib = { path = "../quail-dylib" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

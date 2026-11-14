@@ -20,7 +20,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from quail.cost.budgets import CHECKPOINT_PASS_QUESTIONS
+from quail.common.budgets import CHECKPOINT_PASS_QUESTIONS
 
 
 @dataclass

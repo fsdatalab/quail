@@ -1,38 +1,82 @@
-name: Publish to PyPI
+name: Wheels
 
+# Builds one wheel per platform. A wheel holds the Python package and
+# the Rust module _quail_native, which also runs quail-server.
+#
+# - A change of the Rust sources on main uploads the wheels to the
+#   `native-wheels` release, named by the key of the sources
+#   (tools/native_key.py). tools/build.sh and the Modal image download
+#   the module from there, so nobody else compiles it.
+# - A version tag also publishes the wheels to PyPI and the Rust crates
+#   to crates.io.
+# - A manual run uploads the wheels for any branch: Actions tab, or
+#   `gh workflow run publish.yml --ref <branch>`.
+#
+# PyPI trusts the file by name; keep the name publish.yml.
 on:
   push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".cargo/**"
     tags:
+      # the version in Cargo.toml after a v, such as v0.2.0 or v0.2.0-rc.1
       - "v[0-9]+.[0-9]+.[0-9]+"
-      - "v[0-9]+.[0-9]+.[0-9]+rc[0-9]+"
-      - "v[0-9]+.[0-9]+.[0-9]+[ab][0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+  workflow_dispatch:
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  # _quail_native is built for Python's stable ABI (abi3), so one wheel
+  # per platform serves every supported Python version
+  wheels:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux-x86_64
+          - runner: ubuntu-24.04-arm
+            platform: linux-aarch64
+          - runner: macos-14
+            platform: macos-arm64
+    runs-on: ${{ matrix.runner }}
     permissions:
-      contents: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Check the tag is the version in Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: test "$GITHUB_REF_NAME" = "v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)"
+      - uses: PyO3/maturin-action@v1
         with:
-          persist-credentials: false
-      - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+          command: build
+          args: --release --locked --out dist
+          # PyPI accepts a Linux wheel only with a manylinux tag
+          manylinux: "2_28"
+          # .cargo/config.toml links Linux x86_64 builds with clang and lld
+          before-script-linux: dnf install -y clang lld
+      - name: Upload to the native-wheels release
+        run: |
+          asset="quail_native-$(python3 tools/native_key.py)-${{ matrix.platform }}.whl"
+          cp dist/*.whl "$asset"
+          gh release view native-wheels >/dev/null 2>&1 \
+            || gh release create native-wheels --prerelease \
+                 --title "Prebuilt wheels" --notes "tools/build.sh downloads these." \
+            || true
+          gh release upload native-wheels "$asset" --clobber
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          version: "0.12.13"
-          enable-cache: false
-          python-version: "3.12"
-      - name: Build
-        run: uv build --no-sources
-      - name: Upload release files
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: dist
+          name: dist-${{ matrix.platform }}
           path: dist/
 
   publish:
-    needs: build
+    needs: wheels
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -40,17 +84,30 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
         with:
           enable-cache: false
           version: "0.12.13"
-      - name: Download release files
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          name: dist
+          pattern: dist-*
+          merge-multiple: true
           path: dist/
-      - name: Generate attestations
-        uses: astral-sh/attest-action@f589a42a7efb6fe400b4f400de60b4bc90390027
-      - name: Publish
-        run: uv publish
+      # the source package, for a platform with no wheel
+      - run: uv build --sdist
+      - uses: astral-sh/attest-action@f589a42a7efb6fe400b4f400de60b4bc90390027
+      - run: uv publish
+
+  # quail-engine is the crate a Rust user adds; crates.io needs the two
+  # crates it depends on as well, in dependency order
+  crates:
+    needs: wheels
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - run: sudo apt-get update && sudo apt-get install -y clang lld
+      - run: cargo publish --locked -p quail-planner -p quail-datafusion -p quail-engine
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

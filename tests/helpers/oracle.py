@@ -1,46 +1,46 @@
-"""One fake model for the end-to-end tests: it answers from planted truth.
+"""The planted truth of the end-to-end tests, and workers that answer from it.
 
-The oracle stands in for the GPU. It answers every model operator
-from the truth it was given and builds each result with the
-production builders (filter_result, score_rows, extraction_rows, and
-the join answer record the executor writes), so a test never spells
-a port name or a result shape.
+An ``Oracle`` holds what the model would say: each filter's and join's
+answer, each label, score, written answer, copied text, and feature
+list. ``OracleWorkers`` stand for the GPUs' workers: each runs its
+regions with the production executor on a fake model whose forward
+pass answers from the oracle (helpers/planted_model.py). Nothing here
+decides which rows an operator reads or returns.
 """
 
 from __future__ import annotations
 
+import copy
+import json
+import threading
+import time
+import traceback
+
+import _quail_native
 import numpy as np
 import pyarrow as pa
 
-from quail.backends.base import GpuContext
-from quail.backends.quail.executor.operators.filter import filter_result
-from quail.backends.quail.executor.operators.sae_features import (
-    FEATURE_LIST,
-)
-from quail.backends.quail.reranker import (
-    RerankerBatch,
-    RerankerModelExecution,
-    score_rows,
-)
-from quail.execution.metrics import NodeMetrics, NodeResult
-from quail.execution.result import true_answer_rows
-from quail.execution.rows import Rows, extraction_rows
-from quail.execution.spans import locate_span
-from quail.physical import (
-    AiClassify,
-    AiExtract,
-    AiFilter,
-    AiJoin,
-    AiMap,
-    AiSaeFeatures,
-    AiScore,
-    ClassifySpec,
-)
-from quail.specs import H100_SXM, QWEN3_4B_FP8
+from helpers.planted_model import PlantedModel, load
+from quail.execution.finished import region_hint
+from quail.physical import AiExtract, AiJoin, AiMap
+from quail.physical.plan import graph_from_envelope
+from quail.progress import set_answer_sink
+
+# the most seconds an operator above a region may take to tighten the
+# region's hint after receiving a row; a slower one fails the test
+HINT_WAIT_SECONDS = 30.0
+
+
+def question_text(token_ids) -> str:
+    """Return the text of a question's token ids in the tests' tokenizer."""
+    from helpers.sessions import encoder
+
+    found = encoder().decode([int(token) for token in token_ids])
+    return found.decode() if isinstance(found, bytes) else found
 
 
 class Oracle:
-    """A model execution whose answers come from planted truth.
+    """The planted truth a fake model answers from, and what it was asked.
 
     Args:
         filters: alias -> {question key: a bit per document}, where the
@@ -48,8 +48,8 @@ class Oracle:
             or a callable (alias, document, written_position) -> bool.
         joins: {(anchor, *partners): rule(anchor_id, *partner_ids)}; or
             a callable (node, assignment) -> bool over alias -> id.
-        labels: A callable (spec, ids) -> the label of one row or None,
-            a sequence indexed by the first id, or None.
+        labels: A callable (spec, ids) -> the label of one row, or a
+            sequence indexed by the first id.
         scores: A callable (spec, ids) -> the score of one row.
         answers: A callable (spec, document) -> the extracted text or
             None; or a sequence indexed by document for every question.
@@ -58,24 +58,24 @@ class Oracle:
         features: A callable (spec, document) -> a feature list of
             {"feature", "strength"} mappings; None plants one feature
             per document, its id modulo 7 at strength id + 1.
-        probabilities: Whether a classification reports label
-            probabilities when its spec asks for them.
-        retain: How many of a keep_kv filter's survivors the oracle
-            retains in the arena, as the executor would.
-        join_metrics: Metrics every join stage reports beside its rows.
-        streams: Whether a score call reports each row as it is scored.
-        pipelines: Whether the executor groups operators into pipelines,
-            as the GPU executor does; the oracle then runs a pipeline's
-            nodes in order.
+        truth: A callable (kind, question, texts) -> the answer of any
+            operator, from the question's text and the text of each
+            document it reads; kind is "filter", "join", "label",
+            "score", "map", or "extract". It replaces the arguments
+            above, and reads each input by position.
+        join_metrics: The GPU seconds, peak GPU bytes, and extension
+            counters each worker reports for a join, in place of what a
+            CPU run measures.
+        chunk_tokens: The forward pass size, in place of the plan's.
+        tightens_after: Source rows of the first alias; after the
+            region reports one of them, the worker waits until the
+            region's hint tightens, so a test decides when the operator
+            above the region tightens its test.
     """
 
-    # the oracle runs one node at a time; a pipeline falls back to that
-    execute_pipeline = None
-
     def __init__(self, filters=None, joins=None, labels=None, scores=None,
-                 answers=None, features=None, maps=None, *,
-                 probabilities=False, retain=0, join_metrics=None,
-                 streams=False, pipelines=False):
+                 answers=None, features=None, maps=None, *, truth=None,
+                 join_metrics=None, chunk_tokens=None, tightens_after=()):
         self.filters = filters or {}
         self.joins = joins or {}
         self.labels = labels
@@ -83,277 +83,355 @@ class Oracle:
         self.answers = answers
         self.features = features
         self.maps = maps or (lambda spec, document: f"{spec.name} {document}")
-        self.probabilities = probabilities
-        self.retain = retain
+        self.truth = truth
+        if truth is not None:
+            self.scores = lambda spec, ids: truth(
+                "score", spec.query_template, self._texts(spec.aliases, ids))
+            self.maps = lambda spec, document: truth(
+                "map", spec.query_template,
+                self._texts(spec.aliases[:1], [document]))
+            self.answers = lambda spec, document: truth(
+                "extract", question_text(spec.prompt_token_parts[1]),
+                self._texts(spec.aliases[:1], [document]))
         self.join_metrics = join_metrics
-        self.streams_answers = streams
-        self.arena = None
+        self.chunk_tokens = chunk_tokens
+        self.tightens_after = frozenset(tightens_after)
         self.texts = {}
         self.documents = {}
-        self.calls = []       # (spec name, rows) of every score or label call
-        if pipelines:
-            self.execute_pipeline = self._execute_pipeline
+        # by alias, each document's row in the registered table, which the
+        # planted truth uses, for an input that holds some of a table's rows
+        self.source_rows = {}
+        # (spec name, rows) of every score or classification a region ran
+        self.calls = []
+        self.asked = []       # (alias, document) of every filter answer
+        # tokens of map and extraction answers written, and the answers
+        # stopped before their end
+        self.answer_tokens = 0
+        self.stopped_early = 0
 
-    # ---- the executor's model execution interface ----------------
+    def _source(self, alias, document) -> int:
+        """The registered table's row of an input's document position."""
+        rows = None if self.truth is not None else self.source_rows.get(alias)
+        return int(document) if rows is None else rows[int(document)]
 
-    def _execute_pipeline(self, nodes, inputs, context) -> dict:
-        """Run a pipeline's nodes in order, each reading the one before it."""
-        results = {}
-        for node in nodes:
-            node_inputs = dict(inputs[node.node_id])
-            for port in node.inputs:
-                if port.source.node_id in results:
-                    node_inputs[port.name] = results[
-                        port.source.node_id].outputs[port.source.port]
-            results[node.node_id] = context.runtimes[node.runtime_key].execute(
-                node, node_inputs, context)
-        return results
+    def _texts(self, aliases, ids) -> tuple:
+        """The text of each input's document, an empty string for NULL."""
+        found = []
+        for alias, document in zip(aliases, ids):
+            text = self.texts[alias][int(document)]
+            text = text.as_py() if hasattr(text, "as_py") else text
+            found.append("" if text is None else str(text))
+        return tuple(found)
 
-    def execute(self, node, inputs) -> NodeResult:
-        if isinstance(node, AiFilter):
-            return self._filter(node, inputs)
-        if isinstance(node, AiJoin):
-            return self.execute_predicates((node,), inputs)[node.node_id]
-        if isinstance(node, AiExtract):
-            return self._extract(node, inputs)
-        if isinstance(node, AiSaeFeatures):
-            return self._sae_features(node, inputs)
-        if isinstance(node, AiMap):
-            return self._map(node, inputs)
-        if isinstance(node, AiClassify) and node.spec.partner is not None:
-            return self._classify_joined(node, inputs)
-        if isinstance(node, (AiScore, AiClassify)):
-            return self._reranker().execute(node, inputs.get("score_inputs", inputs))
-        raise TypeError(f"the oracle has no answers for {node.type_name}")
-
-    def execute_predicates(self, nodes, inputs) -> dict:
-        """Answer a group of join stages, each over the survivors of the last."""
-        anchor_ids = list(inputs["anchor_ids"])
-        lists_for = inputs.get("anchor_partners")
-        survivors = set(range(len(anchor_ids)))
-        results = {}
-        for index, node in enumerate(nodes):
-            partners = inputs["partner_indices"][node.written_position]
-            members = {} if lists_for and node.pairs_from else None
-            rows = {}
-            for local in sorted(survivors):
-                mine = (range(len(partners)) if members is None
-                        else list(lists_for(anchor_ids[local], index)))
-                if members is not None:
-                    members[local] = mine
-                rows[local] = [
-                    self._join_answer(node, anchor_ids[local], partners[member])
-                    for member in mine]
-            if inputs.get("anchor_done") is not None:
-                for local, row in rows.items():
-                    inputs["anchor_done"](local, row)
-            passing = {local for local, row in rows.items() if any(row)}
-            survivors = (survivors - passing if node.semantics == "anti"
-                         else passing)
-            kept = [anchor_ids[local] for local in sorted(survivors)]
-            answer = {
-                "rows": rows, "anchor_index": anchor_ids,
-                "partner_index": partners, "anchor_partners": members,
-                "anchor": node.anchor, "partners": list(node.partners),
-                "semantics": node.semantics, "selectivity": node.selectivity,
-                "written_position": node.written_position,
-            }
-            metrics = self.join_metrics or NodeMetrics()
-            results[node.node_id] = NodeResult(
-                {f"rows:{node.anchor}": Rows({node.anchor: kept}),
-                 f"join_answers:{node.written_position}": answer},
-                NodeMetrics(
-                    input_rows=len(anchor_ids), output_rows=len(kept),
-                    evaluated_document_pairs=sum(len(row) for row in rows.values()),
-                    gpu_s=metrics.gpu_s, peak_gpu_bytes=metrics.peak_gpu_bytes,
-                    extension={**metrics.extension, "answers": [rows]}))
-        return results
-
-    # ---- the reranker interface, for scores and labels -------------
-
-    def score(self, spec, rows, documents, on_answers=None) -> RerankerBatch:
-        rows = np.asarray(rows).reshape(-1, len(spec.aliases))
-        self.calls.append((spec.name, rows.tolist()))
-        ids = [tuple(int(value) for value in row) for row in rows]
-        if isinstance(spec, ClassifySpec):
-            values = np.asarray([self._label(spec, row) for row in ids], dtype=object)
-            probabilities = None
-            if self.probabilities and spec.probabilities:
-                probabilities = np.asarray([
-                    [np.nan] * len(spec.labels) if value is None
-                    else [0.8 if label == value else 0.1 for label in spec.labels]
-                    for value in values])
-            return RerankerBatch(values, fresh_tokens=len(rows), cached_tokens=0,
-                                 suffix_tokens=3 * len(rows),
-                                 probabilities=probabilities)
-        scores = [self.scores(spec, row) for row in ids]
-        if on_answers is not None:
-            for position, value in enumerate(scores):
-                on_answers(np.array([position]), [value])
-        return RerankerBatch(scores, fresh_tokens=len(rows), cached_tokens=0)
-
-    # ---- answering ------------------------------------------------
-
-    def _filter(self, node, inputs) -> NodeResult:
-        document_ids = list(inputs["document_ids"])
-        groups = inputs.get("stop_groups")
-        stopped = set()
-        answers = {}
-        for local, document in enumerate(document_ids):
-            # the scheduler skips a stop key group once one of it survived
-            if groups is not None and groups[local] in stopped:
-                continue
-            answers[local] = [self._filter_answer(node, document)]
-            if groups is not None and answers[local][0]:
-                stopped.add(groups[local])
-        if inputs.get("document_done") is not None:
-            # the real loop reports a chunk's finished documents by position
-            inputs["document_done"]([
-                (local, 0, bool(row[0])) for local, row in answers.items()])
-        if node.keep_kv and self.arena is not None:
-            kept = [document for local, document in enumerate(document_ids)
-                    if answers[local][0]]
-            for document in kept[:self.retain]:
-                self.arena.retain((node.alias, document), 16)
-        return filter_result(node, answers, 10 * len(answers), document_ids)
+    def _sources(self, aliases, ids) -> tuple:
+        return tuple(self._source(alias, document)
+                     for alias, document in zip(aliases, ids))
 
     def _filter_answer(self, node, document) -> bool:
+        """The planted answer of a filter's question about a document."""
+        self.asked.append((node.alias, int(document)))
+        document = self._source(node.alias, document)
+        if self.truth is not None:
+            return bool(self.truth(
+                "filter", question_text(node.question_token_ids),
+                self._texts([node.alias], [document])))
         if callable(self.filters):
             return bool(self.filters(node.alias, document, node.written_position))
         truth = self.filters[node.alias]
-        question = node.question_token_ids
+        question = question_text(node.question_token_ids)
         for key, bits in truth.items():
-            if any(token.startswith(key) for token in question):
+            if key in question:
                 return bool(bits[document])
-        raise KeyError(f"no filter truth for {node.alias!r} matches {question[:5]}")
+        raise KeyError(f"no filter truth for {node.alias!r} matches {question[:40]!r}")
 
     def _join_answer(self, node, anchor_id, partner_ids) -> bool:
+        """The planted answer of a join about an anchor and its partners."""
+        aliases = (node.anchor, *node.partners)
+        ids = self._sources(aliases, (anchor_id, *partner_ids))
+        if self.truth is not None:
+            return bool(self.truth("join", question_text(node.frame_token_ids),
+                                   self._texts(aliases, ids)))
         if callable(self.joins):
-            assignment = dict(zip((node.anchor, *node.partners),
-                                  (anchor_id, *partner_ids)))
-            return bool(self.joins(node, assignment))
-        rule = self.joins[(node.anchor, *node.partners)]
-        return bool(rule(anchor_id, *partner_ids))
+            return bool(self.joins(node, dict(zip(aliases, ids))))
+        return bool(self.joins[aliases](*ids))
 
-    def _label(self, spec, ids):
+    def label(self, spec, ids):
+        """The planted label of a row, or None."""
+        ids = self._sources(spec.aliases, ids)
+        if self.truth is not None:
+            return self.truth("label", spec.query_template,
+                              self._texts(spec.aliases, ids))
         if callable(self.labels):
             return self.labels(spec, ids)
         return None if self.labels is None else self.labels[ids[0]]
 
-    def _classify_joined(self, node, inputs) -> NodeResult:
-        """Label the pairs a join kept; a pair without a label has no row."""
-        (answers,) = inputs["score_inputs"].values()
-        spec = node.spec
-        pairs = []
-        if isinstance(answers, pa.Table):
-            # the join's answers over every pair, as a table
-            kept = true_answer_rows(answers)
-            pairs = list(zip(*(kept.column(alias).to_pylist()
-                               for alias in spec.aliases)))
-        else:
-            for local, row in answers["rows"].items():
-                anchor = answers["anchor_index"][local]
-                members = (answers["anchor_partners"] or {}).get(local)
-                for position, bit in enumerate(row):
-                    if not bit:
-                        continue
-                    member = position if members is None else members[position]
-                    (partner,) = answers["partner_index"][member]
-                    pairs.append((int(anchor), int(partner)))
-        labels = {pair: self._label(spec, pair) for pair in pairs}
-        labeled = [pair for pair in pairs if labels[pair] is not None]
-        rows = np.asarray(labeled, dtype=np.int32).reshape(-1, 2)
-        return NodeResult(
-            {node.rows_port: score_rows(rows, spec.aliases, spec.name,
-                                        [labels[pair] for pair in labeled],
-                                        pa.string())},
-            NodeMetrics(input_rows=len(pairs), output_rows=len(labeled)))
+    def score(self, spec, ids) -> float:
+        """The planted score of a row."""
+        return float(self.scores(spec, self._sources(spec.aliases, ids)))
 
-    def _extract(self, node, inputs) -> NodeResult:
-        spec = node.spec
-        ids = [int(document) for document in inputs["document_ids"]]
-        texts = self.texts.get(spec.alias)
-        found = [self._answer(spec, document) for document in ids]
-        spans = [None if text is None or texts is None
-                 else locate_span(str(texts[document]), text)
-                 for document, text in zip(ids, found)]
-        return NodeResult(
-            {node.rows_port: extraction_rows(
-                spec.alias, spec.name, spec.span_name, ids, found, spans)},
-            NodeMetrics(input_rows=len(ids), output_rows=len(ids),
-                        evaluated_documents=len(ids)))
+    def written(self, spec, document) -> str:
+        """The planted answer a map writes about a document."""
+        return self.maps(spec, self._source(spec.aliases[0], document))
 
-    def _sae_features(self, node, inputs) -> NodeResult:
-        spec = node.spec
-        ids = [int(document) for document in inputs["document_ids"]]
-        values = [self._feature_list(spec, document) for document in ids]
-        rows = np.asarray(ids, dtype=np.int32).reshape(-1, 1)
-        return NodeResult(
-            {node.rows_port: score_rows(rows, spec.aliases, spec.name,
-                                        values, FEATURE_LIST)},
-            NodeMetrics(input_rows=len(ids), output_rows=len(ids),
-                        evaluated_documents=len(ids)))
-
-    def _map(self, node, inputs) -> NodeResult:
-        spec = node.spec
-        ids = [int(document) for document in inputs["document_ids"]]
-        rows = np.asarray(ids, dtype=np.int32).reshape(-1, 1)
-        return NodeResult(
-            {node.rows_port: score_rows(
-                rows, spec.aliases, spec.name,
-                [self.maps(spec, document) for document in ids], pa.string())},
-            NodeMetrics(input_rows=len(ids), output_rows=len(ids),
-                        evaluated_documents=len(ids)))
-
-    def _feature_list(self, spec, document) -> list:
-        if callable(self.features):
-            return self.features(spec, document)
-        return [{"feature": document % 7, "strength": float(document + 1)}]
-
-    def _answer(self, spec, document):
+    def extracted(self, spec, document):
+        """The planted text an extraction copies from a document, or None."""
+        document = self._source(spec.alias, document)
         if callable(self.answers):
             return self.answers(spec, document)
         return None if self.answers is None else self.answers[document]
 
-    def _reranker(self) -> RerankerModelExecution:
-        return RerankerModelExecution(GpuContext(
-            gpu_index=0, gpus=1, model=QWEN3_4B_FP8, device=H100_SXM,
-            query_settings={"reranker": self, "documents": self.documents}))
+    def _written(self, node, text, found) -> None:
+        """Take what the executor wrote of a map's or extraction's planted answer.
+
+        A region calls this once it has run, per answer in the order
+        the model was asked; a test that reads the written answers
+        replaces it.
+
+        Args:
+            node: The AiMap or AiExtract.
+            text: The planted answer.
+            found: The answer the region returned.
+        """
+
+    def feature_list(self, spec, document) -> list:
+        """The planted features of a document."""
+        document = self._source(spec.aliases[0], document)
+        if callable(self.features):
+            return self.features(spec, document)
+        return [{"feature": document % 7, "strength": float(document + 1)}]
 
 
-def oracle_executor(oracle: Oracle, **report):
-    """Return a physical executor that runs each request's graph on the oracle.
+class OracleEnd:
+    """A worker's connection that records what the region wrote and reported.
+
+    Args:
+        end: The ``_quail_native.WorkerEnd``.
+        oracle: The Oracle.
+    """
+
+    def __init__(self, end, oracle):
+        self.end = end
+        self.oracle = oracle
+        self.waited = set()     # the rows of tightens_after already waited for
+        self.model = None       # the running region's PlantedModel
+
+    def __getattr__(self, name):
+        return getattr(self.end, name)
+
+    def begin(self, model) -> None:
+        """Start a region that runs on the model."""
+        self.model, self.waited = model, set()
+
+    def finished(self, table) -> None:
+        """Send finished rows; after a row in tightens_after, wait for the hint.
+
+        Raises:
+            AssertionError: The hint did not tighten within
+                HINT_WAIT_SECONDS.
+        """
+        oracle, hint = self.oracle, region_hint()
+        metadata = table.schema.metadata
+        rows = set()
+        # a model node's rows port completes its rows; a join reports
+        # its answers before it
+        if (hint is not None and metadata[b"quail.port"].startswith(b"rows")
+                and metadata[b"quail.node"].decode() in self.model.asking):
+            alias = next(name for name in table.column_names
+                         if name in oracle.documents)
+            rows = {oracle._source(alias, document)
+                    for document in table.column(alias).to_pylist()}
+        rows = (rows & oracle.tightens_after) - self.waited
+        self.waited |= rows
+        before = hint.generation() if rows else None
+        self.end.finished(table)
+        deadline = time.monotonic() + HINT_WAIT_SECONDS
+        while rows and hint.generation() == before:
+            if time.monotonic() > deadline:
+                raise AssertionError(f"the hint did not tighten after {sorted(rows)}")
+            time.sleep(0.001)
+
+    def ran(self, report, tables) -> None:
+        """Send what the region ran, with the oracle's join metrics.
+
+        The oracle counts the answer tokens the region's maps and
+        extractions wrote, and takes each written answer.
+        """
+        oracle, report = self.oracle, json.loads(report)
+        planted = oracle.join_metrics
+        for node_id, metrics in report["metrics"].items():
+            extension = metrics.get("extension") or {}
+            oracle.answer_tokens += extension.get("answer_tokens", 0)
+            oracle.stopped_early += extension.get("answers_stopped_early", 0)
+            if planted is not None and isinstance(
+                    self.model.asking.get(node_id), AiJoin):
+                metrics.update(
+                    gpu_s=planted.gpu_s, peak_gpu_bytes=planted.peak_gpu_bytes,
+                    extension={**extension, **planted.extension})
+        written = {}
+        for table in tables:
+            node = self.model.asking.get(table.schema.metadata[b"quail.node"].decode())
+            if isinstance(node, (AiMap, AiExtract)):
+                spec = node.spec
+                written[node.node_id] = dict(zip(
+                    table.column(spec.aliases[0]).to_pylist(),
+                    table.column(spec.name).to_pylist()))
+        for node, document, text in self.model.writes:
+            oracle._written(node, text, written.get(node.node_id, {}).get(document))
+        self.end.ran(json.dumps(report), tables)
+
+
+def _serve(oracle, path, description=None, gpu_index=0, gpus=1):
+    """Serve each region as a GPU worker does, on a model that answers from truth.
+
+    Args:
+        oracle: The oracle this worker's model answers from.
+        path: The socket Quail listens at for this worker.
+        description: What the worker answers a describe with, as
+            ``engine_description`` returns it.
+        gpu_index: Which of the run's GPUs this worker stands for.
+        gpus: How many GPUs the run has.
+    """
+    from helpers.fakes import fake_readout
+    from quail.backends.quail.graph import payload_tables, serve_region
+    from quail.builtins import built_in_registry
+
+    registry = built_in_registry()
+    end = OracleEnd(_quail_native.WorkerEnd(path), oracle)
+    gpu = None
+    while (message := end.next()) is not None:
+        try:
+            if message[0] == "describe":
+                end.described(json.dumps(description))
+                continue
+            if message[0] == "boot":
+                end.booted(json.dumps({"boot_s": 0.5, "kind": "warm"}))
+                continue
+            region = json.loads(message[1])
+            payload = {**region["query"], **payload_tables(message[2])}
+            plan = payload["physical_plan"]
+            # the oracle answers about the region's documents
+            oracle.documents = payload["documents"]
+            oracle.texts = {alias: payload["texts"].get(alias)
+                            for alias in payload["documents"]}
+            oracle.source_rows = {alias: rows.to_pylist() for alias, rows
+                                  in payload["source_rows"].items()}
+            graph = graph_from_envelope(plan)
+            device = registry.device(plan["device"])
+            if gpu is None:
+                gpu = load(registry.model(plan["model"]), device, gpu_index, gpus)
+            model = PlantedModel(oracle, graph, gpu, payload)
+            end.begin(model)
+            gpu.pipeline.forward_chunk = model.forward_chunk
+            chunk_tokens = oracle.chunk_tokens or payload["chunk_tokens"]
+            gpu.execution.bind_query(
+                torch=gpu.torch, answer_rows=object(), chunk_tokens=chunk_tokens,
+                async_answers=fake_readout(
+                    submit=lambda rows: (rows[:, model.yes] > rows[:, model.no]
+                                         ).tolist()),
+                async_scores=fake_readout(
+                    dtype=np.float32,
+                    submit=lambda rows: rows[:, model.yes].numpy()))
+            state = {
+                "gpu": gpu, "documents": payload["documents"],
+                "texts": payload["texts"], "columns": payload["columns"],
+                "runtimes": registry.runtimes, "device": device,
+                "chunk_tokens": chunk_tokens,
+                "gpu_timing": payload.get("gpu_timing", False)}
+            # as the GPU worker does, send each answer to a listener
+            if region["listening"][1]:
+                set_answer_sink(
+                    lambda event: end.ask(json.dumps({"answer": [event]})))
+            try:
+                serve_region(state, payload, graph, end,
+                             region["wanted"], region["hinted"])
+            finally:
+                set_answer_sink(None)
+        except Exception:
+            end.fail(traceback.format_exc())
+    if gpu is not None:
+        gpu.idle.append(gpu)
+
+
+class OracleWorkers:
+    """Workers that answer from an oracle, in place of the GPUs' workers.
+
+    A query run with ``physical_executor=OracleWorkers(...)`` runs as on
+    GPUs: Rust sends each worker the region and its tables, and each
+    worker is a thread that runs the region on a model answering from
+    the oracle. A plan on several GPUs gives each a copy of the oracle;
+    the copies share the lists of what was asked.
 
     Args:
         oracle: The oracle answering the model operators.
-        **report: Report fields the response carries, such as wall_s.
+        **report: Report fields the run carries, such as wall_s.
     """
-    def execute(request):
-        from helpers.fakes import graph_state
-        from quail.backends.quail.graph import execute_single_graph
-        from quail.builtins import built_in_registry
+
+    def __init__(self, oracle: Oracle, **report):
+        self.oracle = oracle
+        self.report = {"wall_s": 1.0, "boot_s": 0.5, "fresh_tokens": 1234,
+                       **report}
+        self._workers = None
+
+    def start_workers(self, gpus: int) -> dict:
+        """Start a worker per GPU; returns them with a boot record."""
+        oracle = self.oracle
+        models = [oracle] if gpus == 1 else [
+            copy.copy(oracle) for _ in range(gpus)]
+        self._workers = workers = _quail_native.Workers(gpus)
+        for index, (model, path) in enumerate(
+                zip(models, workers.paths, strict=True)):
+            threading.Thread(target=_serve, args=(model, str(path), None, index, gpus),
+                             daemon=True).start()
+        workers.connect()
+        return {"workers": workers, "boot": {"boot_s": 0.5, "kind": "warm"}}
+
+    def close(self) -> None:
+        """Stop the workers."""
+        workers, self._workers = self._workers, None
+        if workers is not None:
+            workers.close()
+
+    def __call__(self, request):
+        """Run a request's graph on the oracle, as a physical executor.
+
+        A test that wraps the executor in a callable of its own runs a
+        request this way.
+        """
+        from helpers.fakes import run_on_workers
         from quail.execution.types import PhysicalResponse
-        from quail.physical import Scan, decode_graph
+        from quail.physical import Scan
+        from quail.specs import DEVICES
 
-        graph = decode_graph(request.plan["graph"], built_in_registry().codecs)
-        scans = [node for node in graph.nodes if isinstance(node, Scan)]
-        oracle.documents = {node.alias: request.inputs[node.input_id].documents
-                            for node in scans}
-        oracle.texts = {node.alias: request.inputs[node.input_id].texts
-                        for node in scans}
-        state = graph_state(oracle, oracle.documents)
-        state["texts"] = oracle.texts
-        oracle.arena = state["gpu"].arena
-        if getattr(request, "relations", None):
-            state["columns"] = request.column_tables()
-        result = execute_single_graph(state, {
-            "filter_limit": None,
-            "deduplicate": request.plan["settings"].get("deduplicate", {})}, graph)
-        outputs = result.pop("_outputs")
-        return PhysicalResponse(outputs, {
-            **result, "wall_s": 1.0, "boot_s": 0.5, "fresh_tokens": 1234, **report})
+        scans = [node for node in graph_from_envelope(request.plan).nodes
+                 if isinstance(node, Scan)]
+        booted = self.start_workers(request.gpus)
+        try:
+            payload = {
+                "physical_plan": request.plan, **request.plan["settings"],
+                "documents": {node.alias: request.inputs[node.input_id].documents
+                              for node in scans},
+                "columns": request.column_tables(),
+                "texts": {node.alias: request.inputs[node.input_id].texts
+                          for node in scans
+                          if request.inputs[node.input_id].texts is not None},
+                "source_rows": {alias: pa.table({"row": rows})
+                                for alias, rows in request.source_rows.items()}}
+            result = run_on_workers(
+                booted["workers"], payload, graph_from_envelope(request.plan),
+                DEVICES[request.plan["device"]])
+        finally:
+            self.close()
+        return PhysicalResponse(result.pop("_outputs"), {**result, **self.report})
 
-    return execute
+
+def oracle_executor(oracle: Oracle, **report) -> OracleWorkers:
+    """Return workers that answer each request from the oracle.
+
+    Args:
+        oracle: The oracle answering the model operators.
+        **report: Report fields the run carries, such as wall_s.
+    """
+    return OracleWorkers(oracle, **report)
 
 
 def finish(query, oracle: Oracle, **report):

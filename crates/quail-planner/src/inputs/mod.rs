@@ -1,0 +1,17 @@
+//! Quail's tokenized document columns.
+//!
+//! A query's documents are a table column's texts. Planning reads their
+//! token counts and the prefixes they share; the executor reads their
+//! tokens. This crate tokenizes a column into an in-memory token store, which
+//! Python's executor reads over the same buffers, and computes those
+//! statistics.
+
+pub mod prefix;
+pub mod store;
+pub mod tokenizer;
+
+pub use prefix::{PrefixIndex, PrefixTree, ReaderGroup, first_documents, last_tokens};
+pub use store::{
+    COUNT_COLUMN, Documents, OFFSET_COLUMN, TOKEN_COLUMN, TokenStore, TokenStoreWriter,
+};
+pub use tokenizer::{Encoded, HfTokenizer, token_lists};

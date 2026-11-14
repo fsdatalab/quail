@@ -1,141 +1,203 @@
 ---
-title: Overview
+title: Developer guide
 ---
 
-Here we explain how to report a bug or submit a change to Quail.
+The developer guide is for people who want to work on Quail. The guide
+explains how to set up the repository, how Quail works with DataFusion, and
+how Quail plans a query. The guide then lists the checks to run before you
+submit a change.
 
-## Report a bug
+## Set up Quail from source
 
-If you find a bug, please
-[open an issue](https://github.com/fsdatalab/quail/issues).
-Include:
-
-- A minimal example that reproduces the bug.
-- The expected behavior and what happened.
-- The Quail version or commit. For an inference error, include the model,
-  device, and backend configuration.
-
-## Prepare the repository
-
-Quail requires Python 3.12. Clone the repository and install the development
-dependencies:
+Install [uv](https://docs.astral.sh/uv/). Quail uses Python 3.12.
 
 ```bash
 git clone https://github.com/fsdatalab/quail.git
 cd quail
-uv sync --frozen
+tools/build.sh
 ```
 
-The development dependencies include
-[quail-b](https://github.com/fsdatalab/quail-bench).
-You need access to that repository to install them.
-
-## Make a change
-
-For a new feature or a substantial change, open an issue to discuss the
-approach before implementation.
-Include the tests and documentation needed to check and use your change.
-
-| Path | Contents |
-| --- | --- |
-| `quail/api/` | `Session`, `Query`, and running a query in this process. |
-| `quail/frontend/` | SQL parsing. |
-| `quail/catalog/` | Table providers and the tokenized inputs of a session. |
-| `quail/logical/`, `quail/physical/` | Logical and physical plan definitions. |
-| `quail/planner/`, `quail/cost/`, `quail/specs/` | Planning rules, cost estimates, and model and device specifications. |
-| `quail/execution/` | The runner and the CPU operators. |
-| `quail/backends/` | The Quail inference engine. |
-| `quail/baselines/` | The stock vLLM and SGLang backends the benchmark compares against. |
-| `quail/remote/`, `quail/server/` | The client and server of Quail Server. |
-| `quail/deploy/` | The Modal images. |
-| `bench/` | The QUAIL-B runner, outside the wheel. |
-| `tests/`, `experiments/` | CPU tests and Modal GPU scripts. |
-| `docs/`, `demos/` | Documentation and examples. |
-
-Each package imports only the packages below it in the list in
-`pyproject.toml` under `[tool.importlinter]`; `uv run lint-imports`
-checks that.
-
-`quail/planner/` has one subpackage per planning stage. The table runs
-from top to bottom, and `lint-imports` holds the planner to this order
-too:
-
-| Path | Contents |
-| --- | --- |
-| `pricing.py` | Helpers that price a logical plan through the same search as the query planner. |
-| `rules/` | `logical.py` changes query trees. `physical.py` changes executable graphs. |
-| `graph/` | `GraphBuilder`, which turns the planner's decisions into a physical graph, plus shards, retention, and result operators. |
-| `sol/` | The speed-of-light estimate and its plan search. |
-| `search/` | `operator_order.py` assembles the chosen filter order, join order, and anchors. `filter_order.py` and `join_order.py` implement the searches. |
-| `operators/` | One module per AI operator (`filter`, `join`, `score`, `classify`, `extract`) with its statistics, cost, spec, and `emit_*` functions that add its plan nodes. |
-| `statistics/` | Table length summaries and `pool_split`, the KV pool split every operator reads. |
-| `optimize.py` | Candidate generation, refinement, and final selection. |
-| `optimizer/` | `context.py` holds planning inputs. `candidates.py` defines candidate plans and the backend planner interface. `tree_rewrites.py` and `graph_refinement.py` apply the two rule interfaces in `rules.py`. |
-| `validation.py`, `prompt_lowering.py`, `plan.py` | Refusals, prompt tokenization, and `PhysicalPlan`. |
-
-To add an AI operator, add a module under `operators/` and call its
-`emit_*` function from `GraphBuilder` in `graph/builder.py`.
-
-For module names, follow the [Google Python naming guidance](https://google.github.io/styleguide/pyguide.html#316-naming).
-Use descriptive `snake_case` names and avoid unfamiliar abbreviations.
-Keep related classes and functions together. Choose the name from the
-module's responsibility, such as `model_loading.py` or `admission.py`.
-
-The Quail backend separates its entry point from lowering and execution:
-
-| Path under `quail/backends/quail/` | Responsibility |
-| --- | --- |
-| `backend.py` | Implement the backend interface and report supported configurations. |
-| `lowering.py` | Lower one candidate and bind its runtime prompts. |
-| `executor/runtime.py` | Bind loaded model and query state, then dispatch execution. |
-| `executor/model_loading.py` | Resolve model files and load weights. |
-| `executor/admission.py` | Admit requests within token and KV budgets. |
-
-See [Architecture](/docs/architecture) for the query execution flow.
-See [Extending Quail](/docs/extending) for the extension interfaces.
-
-## Check the change
-
-### Code checks
-
-Run these commands from the repository root:
+`tools/build.sh` installs three things into `.venv`: the Python package from
+your checkout, the Rust module `_quail_native`, and the `quail-server`
+program. Run a program or the server from the checkout with
+`uv run --no-sync`:
 
 ```bash
-uv run ruff check quail bench tests experiments tools
+uv run --no-sync python my_program.py
+uv run --no-sync quail-server --model qwen3-4b-fp8 --device h100-sxm
+```
+
+The build script downloads prebuilt Rust parts when CI has built them for the
+same Rust sources. Python changes do not need a Rust compiler when the
+prebuilt parts are available.
+
+Rust changes need a local Rust build. Install [rustup](https://rustup.rs),
+clang, and lld, then run:
+
+```bash
+tools/build.sh --compile
+```
+
+The first build takes about 20 minutes on 4 cores because it compiles
+DataFusion. Later builds reuse the compiled dependencies. Run the command
+again after each Rust change.
+
+## Understand how Quail works with DataFusion
+
+DataFusion parses the SQL and runs the relational operators, including scans,
+plain filters, joins, aggregates, sorts, and limits. Quail adds the AI
+functions and runs the model.
+
+Quail extends a DataFusion session in four steps:
+
+1. Quail registers SQL functions such as `AI.IF` and `AI.MAP`.
+2. DataFusion turns the SQL into a logical plan. A logical plan lists the
+   query operations without choosing how to run them.
+3. Quail's optimizer rules represent each AI call as an `AiNode`. An `AiNode`
+   is a logical-plan node for one AI call. The rules place each node among the
+   DataFusion operators.
+4. Quail groups related AI calls into a model region. A model region contains
+   the part of the query Quail plans and runs.
+
+DataFusion runs the operators below a model region and sends their rows to
+Quail as Arrow batches. Quail runs the model and returns finished rows.
+DataFusion then runs the remaining operators.
+
+<PlanningFigure />
+
+The DataFusion integration lives in `crates/quail-datafusion`:
+
+| Code | Purpose |
+| --- | --- |
+| `functions` | Register the AI functions. |
+| `ai` | Represent one AI call as an `AiNode`. |
+| `rules` | Place and simplify the AI calls. |
+| `region` | Create and run model regions. |
+| `derive` | Read a model region from its DataFusion plan. |
+
+## Understand Quail's query planner
+
+Quail's query planner chooses how each model region runs on the GPU. The
+planner orders the AI operators and chooses the rows each operator evaluates.
+The operator order determines which prompts can share prefixes and KV. KV
+stores the model's keys and values for prompt tokens already processed. The
+planner then orders the model requests and assigns GPU memory to KV.
+
+The planner lives in `crates/quail-planner`. The executor lives in
+`crates/quail` and `quail/backends/quail`.
+
+| Code | Purpose |
+| --- | --- |
+| `operators`, `expressions`, `facts` | Describe the model region. |
+| `inputs` | Tokenize the document columns and measure shared prefixes. |
+| `cost` | Estimate time and memory for the model and GPU. |
+| `search`, `optimize`, `pricing` | Choose the operator and join order. |
+| `physical` | Describe the plan the executor runs. |
+
+`query.explain()` prints the planned query. `result.explain()` prints the
+plan with measured row counts and times after the query finishes.
+
+[Planner overview](./query-planning) follows every planning algorithm through
+one query, then shows how DataFusion connects several model regions.
+
+## Use Quail from Rust
+
+Add the `quail-engine` crate and DataFusion 55.2, the version Quail builds
+against. The crate's library is named `quail`:
+
+```toml
+[dependencies]
+datafusion = "55.2.0"
+quail-engine = { git = "https://github.com/fsdatalab/quail" }
+```
+
+Quail starts one Python process per GPU to run the model. Install the Python
+package in the environment named by `VIRTUAL_ENV`:
+
+```bash
+pip install quail-engine
+```
+
+`quail::Session` runs SQL with AI functions:
+
+```rust
+let config = quail::EngineConfig::new("qwen3-4b-fp8", "h100-sxm");
+let session = quail::Session::new(&config)?;
+session.register_table("reviews", reviews)?;
+let rows = session.sql(
+    "SELECT r.id FROM reviews r \
+     WHERE AI.IF(PROMPT('Does the reviewer ask for a refund? {0}', r.body))",
+)?;
+```
+
+[`quickstart.rs`](https://github.com/fsdatalab/quail/blob/main/crates/quail/examples/quickstart.rs)
+is the complete program.
+
+### Add Quail to your own DataFusion session
+
+A Rust program with its own DataFusion functions and rules can add Quail with
+`quail::extension::QuailExtension`.
+
+`QuailExtension::register` adds the AI functions, Quail's optimizer rules,
+and Quail's query planner to your `SessionState`:
+
+```rust
+let host = SessionStateBuilder::new()
+    .with_default_features()
+    .with_optimizer_rule(Arc::new(MyRule))
+    .build();
+let state = QuailExtension::new(runner).register(host)?;
+let context = SessionContext::new_with_state(state);
+```
+
+The `runner` runs the model. Use
+`Arc::new(quail::Executor::open(&config)?)` to run it on your GPUs.
+
+Call `register_rules` when you need to keep your own query planner. Your
+planner must call `quail::extension::claim_model_regions` on the optimized
+plan and add `QuailExtension::extension_planner()` to its extension planners.
+
+[`host_session.rs`](https://github.com/fsdatalab/quail/blob/main/crates/quail-datafusion/examples/host_session.rs)
+is a complete program. Run it with:
+
+```bash
+cargo run --example host_session
+```
+
+## Check a change
+
+Run the Python checks:
+
+```bash
+uv run ruff check quail bench calibrate tests experiments tools
 uv run python tools/check_long_strings.py
+uv run python tools/check_names.py
 uv run vulture
 uv run lint-imports
-uv run pytest -q
+uv run --no-sync pytest -q
 ```
 
-All four checks must pass before pushing. These checks do not require a GPU.
-
-For changes to model execution, run the relevant GPU tests.
-The script
-[`experiments/run_gpu_tests.py`](https://github.com/fsdatalab/quail/blob/main/experiments/run_gpu_tests.py)
-runs these tests on Modal.
-For performance changes, use the [benchmark guide](/docs/contributing/benchmark).
-
-### Documentation checks
-
-Install the documentation dependencies and start the site:
+Run the Rust checks after a successful native build:
 
 ```bash
-pnpm --dir docs install --frozen-lockfile
-pnpm --dir docs dev
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked
+cargo fmt --check
 ```
 
-Open [the local site](http://localhost:3000/quail).
-Check the changed pages, then run:
-
-```bash
-pnpm --dir docs types:check
-pnpm --dir docs build
-```
+[`AGENTS.md`](https://github.com/fsdatalab/quail/blob/main/AGENTS.md)
+holds the rules for writing, names, tests, and GPU runs.
 
 ## Submit a pull request
 
-Describe the problem, what your change does, and why.
-List the checks you ran and their results.
-For a performance change, include the configurations, measurements, and
-saved result paths. State any remaining limitations.
+Explain the problem and how the change fixes it. List the checks you ran and
+their results. State any unverified behavior.
+
+## Report a bug
+
+[Open an issue](https://github.com/fsdatalab/quail/issues) and include:
+
+- a minimal example reproducing the bug;
+- the behavior you expected and the behavior you saw;
+- the Quail version or commit;
+- the `EngineConfig` for an error in an AI call.

@@ -2,8 +2,9 @@
 
 import re
 
+import numpy as np
+
 from quail.backends.quail.executor.extract.vocabulary import Vocabulary
-from quail.backends.quail.executor.tokenizer import ModelTokenizer
 from quail.physical import ExtractSpec
 
 NEG = float("-inf")
@@ -21,9 +22,8 @@ NONE_HELD = "None of the parties may assign this Agreement."
 class FakeTokenizer:
     """Words, numbers, and punctuation as tokens, spaced like a byte-level BPE.
 
-    A token after a space starts with "Ġ", a line break is "Ċ", and the
-    offsets of a token include its leading space, as a Hugging Face
-    fast tokenizer reports them.
+    It has Tokenizer's methods. A token after a space is spelled with
+    "Ġ" and a line break "Ċ", as a byte-level BPE spells them.
     """
 
     PIECES = re.compile(r"\n| ?[A-Za-z]+|[0-9]| ?[^\sA-Za-z0-9]| ")
@@ -38,7 +38,7 @@ class FakeTokenizer:
                     self.tokens.append(piece)
         self.ids = {token: index for index, token in enumerate(self.tokens)}
         self.eos_token_id = self.ids["<|im_end|>"]
-        self.unk_token_id = None
+        self.stop_ids = [self.eos_token_id]
 
     def __len__(self):
         return len(self.tokens)
@@ -53,33 +53,34 @@ class FakeTokenizer:
         if at != len(text):
             raise ValueError(f"cannot tokenize {text[at:]!r}")
 
-    def __call__(self, text, return_offsets_mapping=True, add_special_tokens=False):
-        if isinstance(text, list):
-            each = [self(one) for one in text]
-            return {"input_ids": [e["input_ids"] for e in each],
-                    "offset_mapping": [e["offset_mapping"] for e in each]}
-        ids, offsets = [], []
-        for piece, span in self._pieces(text):
-            ids.append(self.ids[piece])
-            offsets.append(span)
-        return {"input_ids": ids, "offset_mapping": offsets}
+    def __call__(self, text):
+        return [self.ids[piece] for piece, _ in self._pieces(text)]
 
-    def encode(self, text, add_special_tokens=False):
-        return self(text)["input_ids"]
+    def encode_packed(self, texts):
+        ids, ranges, boundaries = [], [], [0]
+        for text in texts:
+            for piece, span in self._pieces(text):
+                ids.append(self.ids[piece])
+                ranges.extend(span)
+            boundaries.append(len(ids))
+        return tuple(np.asarray(values, dtype="<i8").tobytes()
+                     for values in (ids, ranges, boundaries))
 
-    def convert_ids_to_tokens(self, ids):
-        return [self.spelled(index) for index in ids]
+    def token_bytes(self):
+        return [token.encode() for token in self.tokens]
+
+    def token_texts(self):
+        return [self.spelled(index) for index in range(len(self.tokens))]
+
+    def decode_batch(self, tokens):
+        return ["".join(self.tokens[int(t)] for t in ids if int(t) != self.eos_token_id)
+                for ids in tokens]
 
     def spelled(self, index):
         token = self.tokens[index]
         if token == "\n":
             return "Ċ"
         return "Ġ" + token[1:] if token.startswith(" ") else token
-
-    def convert_tokens_to_ids(self, token):
-        text = ("\n" if token == "Ċ" else " " + token[1:]
-                if token.startswith("Ġ") else token)
-        return self.ids.get(text, -1)
 
 
 RANKED = "The lease ends on March 3. The rent is due."
@@ -94,7 +95,7 @@ def make_vocabulary(*extra):
                                *(squeezed(text)[0] for text in (LEASE, TERM,
                                                                 NOTHING)),
                                *extra])
-    return Vocabulary(ModelTokenizer(tokenizer))
+    return Vocabulary(tokenizer)
 
 
 def make_spec(*extra):
@@ -102,8 +103,8 @@ def make_spec(*extra):
     return ExtractSpec(
         name="ends", aliases=("c",), query_template="{0}",
         arguments=(("c", "text"),), expected_rows=3, estimated_seconds=0.0,
-        prompt_token_parts=(tuple(tables.tokenizer.encode_ids(HEAD)),
-                            tuple(tables.tokenizer.encode_ids(TAIL))),
+        prompt_token_parts=(tuple(tables.tokenizer(HEAD)),
+                            tuple(tables.tokenizer(TAIL))),
         question=QUESTION, draft_tokens=16, draft_policy="fixed"), tables
 
 

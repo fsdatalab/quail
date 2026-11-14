@@ -72,6 +72,7 @@ def estimate_sol(query_id: str, scale_factor: float, collection_id: str,
     """
     import quail
     from bench.quailb import answer_oracle, build_query
+    from quail.physical import decode_plan_value
     from quail_b.benchmark import load_benchmark
 
     suite = load_benchmark([query_id], scale_factor=scale_factor,
@@ -85,10 +86,11 @@ def estimate_sol(query_id: str, scale_factor: float, collection_id: str,
             session.register(name, quail.DocumentProvider.from_table(
                 table, id_col="id"))
         query = build_query(session, spec)
-        operators = query.logical.operators()
-        saved_by_prompt = {node.call.prompt: saved[node.name]
-                           for node in (*operators.maps, *operators.extracts)
-                           if node.name in saved}
+        operators = json.loads(query.operators)
+        columns = (*operators["maps"], *operators["extracts"])
+        saved_by_prompt = {
+            decode_plan_value(json.dumps(column["call"]["prompt"])): saved[name]
+            for column in columns if (name := column["name"]) in saved}
         reference = answer_oracle(suite.ground_truth, suite.tables,
                                   session.model.turn)
         from_run = set()

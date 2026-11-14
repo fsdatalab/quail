@@ -227,7 +227,7 @@ class CopyConstraint:
         self.changed = np.zeros(len(self.characters), dtype=bool)
         self.position_rows_device = self.tensor(self.position_rows.copy())
         self.characters_device = self.tensor(self.characters)
-        self.is_stop = self.tensor(vocabulary.tokenizer.is_stop)
+        self.is_stop = self.tensor(vocabulary.is_stop)
         self.stop_ids = self.tensor(vocabulary.tokenizer.stop_ids)
 
     def _prepare_fillers(self, documents, tokens):
@@ -433,7 +433,7 @@ class CopyConstraint:
             documents, self.window_ends[positions], sizes)
         self.window_started[positions] = True
         self.window_ends[positions] = cuts
-        tokens, offsets, boundaries = self.vocabulary.tokenizer.encode_packed(text)
+        tokens, offsets, boundaries = self.vocabulary.encode_packed(text)
         counts = np.diff(boundaries)
         owner = np.repeat(np.arange(len(positions)), counts)
         columns = (np.arange(len(tokens)) - np.repeat(boundaries[:-1], counts)
@@ -742,13 +742,7 @@ class CopyConstraint:
                 spans.append(None)
                 continue
             position, option = divmod(source, STREAM_STRIDE)
-            start = int(self.characters[position])
-            index = max(0, length - 1 - max(0, self.filler_lengths[option]))
-            end = int(
-                self.position_ends[position]
-                if index == 0
-                else self.ends[self.position_rows[position], index]
-            )
+            start, end = self._span(position, option, length)
             text = self.documents.documents[document].text
             while start < end and text[start].isspace():
                 start += 1
@@ -757,3 +751,51 @@ class CopyConstraint:
             values.append(text[start:end])
             spans.append((start, end))
         return values, spans
+
+    def _span(self, position, option, length):
+        """Return the characters an answer of length tokens covers, unstripped."""
+        start = int(self.characters[position])
+        index = max(0, length - 1 - max(0, self.filler_lengths[option]))
+        end = int(
+            self.position_ends[position]
+            if index == 0
+            else self.ends[self.position_rows[position], index]
+        )
+        return start, end
+
+    def live_spans(self, document, mask, first_token, length):
+        """Return the span each live position's answer covers so far.
+
+        Args:
+            document: The answer's document index.
+            mask: The answer's packed live positions.
+            first_token: The answer's first token, which picks each
+                position's option.
+            length: The answer's tokens so far.
+
+        Returns:
+            Each live position's (start, end) characters, unstripped, or
+            None when no position is live or one's span is not known.
+        """
+        _, positions = self.live_positions(np.array([document]), mask[None])
+        if not len(positions):
+            return None
+        lookup = (self.key_anchors[self.position_keys[positions]]
+                  * len(self.vocabulary.vocab) + first_token)
+        found = np.minimum(np.searchsorted(self.option_lookup, lookup),
+                           len(self.option_lookup) - 1)
+        if not (self.option_lookup[found] == lookup).all():
+            return None
+        spans = []
+        for position, option in zip(positions.tolist(),
+                                    self.option_order[found].tolist()):
+            filler = self.filler_lengths[option]
+            index = length - 1 - max(0, filler)
+            row = self.position_rows[position]
+            if length > 1 and filler < 0:
+                return None
+            if index > 0 and (row < 0 or index >= self.ends.shape[1]
+                              or self.ends[row, index] < 0):
+                return None
+            spans.append(self._span(position, option, length))
+        return spans

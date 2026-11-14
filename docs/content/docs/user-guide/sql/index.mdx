@@ -2,37 +2,117 @@
 title: SQL reference
 ---
 
-AI-SQL extends standard SQL with functions that call a language model
-during query execution. You can filter rows, join tables, score documents,
-assign labels, and extract answers using natural language instructions.
+Use the SQL reference to look up AI function arguments and supported SQL
+syntax.
 
 <Cards>
   <Card title="AI functions" href="/docs/user-guide/sql/ai-functions"
-        description="Filter and join documents, score answers, classify rows, and extract text." />
-  <Card title="SQL functions" href="/docs/user-guide/sql/sql-functions"
-        description="Text functions, conditions, aggregates, windows, and query clauses." />
+        description="Arguments, return values, and options for each AI function." />
+  <Card title="SQL with AI functions" href="/docs/user-guide/sql/sql-functions"
+        description="How DataFusion SQL affects AI calls and model work." />
 </Cards>
 
-## Write a query
+## Simple queries
 
-For example, suppose you registered a `reviews` table with columns `id`
-and `body`. This query returns IDs of reviews that discuss the movie's
-ending:
+The examples read `reviews(id, body, stars, category)` and
+`aspects(id, name, category)`.
+
+### Read columns
+
+`SELECT` returns stored columns without calling the model:
+
+```sql
+SELECT r.id, r.stars
+FROM reviews r
+LIMIT 10;
+```
+
+### Filter rows with the model
+
+`AI.IF` in `WHERE` keeps reviews the model considers positive:
 
 ```sql
 SELECT r.id
 FROM reviews r
-WHERE AI.IF(PROMPT('Does this review discuss the ending of the movie?\n\n{0}', r.body))
+WHERE AI.IF(PROMPT('Is the review positive? {0}', r.body));
 ```
 
-The model reads each review and returns TRUE or FALSE. Quail keeps
-the rows where the answer is TRUE.
+### Return an AI answer
 
-Quail supports Snowflake and BigQuery syntax:
+`AI.CLASSIFY` in `SELECT` adds one sentiment label to each row:
 
-```python
-session.sql(text, dialect="snowflake")  # AI_FILTER syntax
-session.sql(text, dialect="bq")         # AI.IF syntax
+```sql
+SELECT r.id,
+       AI.CLASSIFY(r.body, ['positive', 'negative', 'mixed']) AS sentiment
+FROM reviews r;
 ```
 
-The query above uses the BigQuery dialect (`dialect="bq"`).
+## More involved queries
+
+### Filter, score, sort, and limit
+
+The ordinary filter removes reviews below four stars before `AI.SCORE`
+reads the remaining reviews. `ORDER BY` then returns the ten reviews with
+the highest refund scores:
+
+```sql
+SELECT r.id,
+       AI.SCORE(PROMPT('Does the reviewer request a refund? {0}', r.body))
+           AS refund_score
+FROM reviews r
+WHERE r.stars >= 4
+ORDER BY refund_score DESC NULLS LAST
+LIMIT 10;
+```
+
+### Join rows with stored and AI conditions
+
+The category comparison limits the candidate pairs. `AI.IF` then keeps
+each pair the model considers related:
+
+```sql
+SELECT r.id, a.name
+FROM reviews r
+JOIN aspects a
+  ON r.category = a.category
+ AND AI.IF(PROMPT('Does the review discuss the aspect? {0} {1}',
+                  r.body, a.name));
+```
+
+### Aggregate answers
+
+`GROUP BY` counts the rows for each label returned by `AI.CLASSIFY`:
+
+```sql
+SELECT AI.CLASSIFY(r.body, ['positive', 'negative', 'mixed']) AS sentiment,
+       COUNT(*) AS reviews
+FROM reviews r
+GROUP BY sentiment
+ORDER BY reviews DESC;
+```
+
+### Use one AI answer in another AI function
+
+The common table expression (CTE) gives each summary a column name. The
+outer query classifies each summary:
+
+```sql
+WITH summaries AS (
+    SELECT r.id,
+           AI.MAP(r.body, 'Summarize the review.', 32) AS summary
+    FROM reviews r
+)
+SELECT s.id,
+       AI.CLASSIFY(s.summary, ['praise', 'complaint', 'mixed']) AS kind
+FROM summaries s;
+```
+
+## SQL dialects
+
+`session.sql()` parses Snowflake syntax by default. Pass `dialect="bq"`
+to parse BigQuery syntax. The dialect changes ordinary SQL syntax and the
+syntax for AI function options.
+
+[DataFusion's SQL reference](https://datafusion.apache.org/user-guide/sql/index.html)
+documents ordinary SQL syntax. The Quail pages document the AI functions
+and their use with ordinary SQL.

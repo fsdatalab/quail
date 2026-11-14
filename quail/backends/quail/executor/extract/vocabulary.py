@@ -7,8 +7,9 @@ matched against a row's likeliest tokens by word.
 """
 
 import numpy as np
+import pyarrow as pa
 
-from quail.backends.quail.executor.tokenizer import ModelTokenizer
+from quail.common.tokens import Tokenizer, TokenView
 
 
 def same_word(token) -> str:
@@ -50,9 +51,12 @@ class Vocabulary:
         tokenizer: The model's tokenizer.
     """
 
-    def __init__(self, tokenizer: ModelTokenizer):
+    def __init__(self, tokenizer: Tokenizer):
         self.tokenizer = tokenizer
         self.vocab = tokenizer.token_texts()
+        # the tokens that end an answer
+        self.is_stop = np.zeros(len(self.vocab), dtype=bool)
+        self.is_stop[list(tokenizer.stop_ids)] = True
         # a document token may be written without its leading space
         # or in another case after the opening quote: every
         # vocabulary token with the same text up to those can start it
@@ -104,5 +108,43 @@ class Vocabulary:
             cached = self._fillers[token] = [None] * len(text)
         found = cached[length]
         if found is None:
-            found = cached[length] = self.tokenizer.encode_ids(text[length:])
+            found = cached[length] = self.tokenizer(text[length:])
         return found
+
+    def encode_packed(self, texts):
+        """Return flat token ids, character ranges, and text boundaries.
+
+        The ranges are (tokens, 2); text i's tokens are boundaries[i] up
+        to boundaries[i + 1].
+        """
+        texts = pa.array(texts, type=pa.large_string()).to_pylist()
+        ids, ranges, boundaries = self.tokenizer.encode_packed(texts)
+        return (np.frombuffer(ids, dtype="<i8"),
+                np.frombuffer(ranges, dtype="<i8").reshape(-1, 2),
+                np.frombuffer(boundaries, dtype="<i8"))
+
+    def encode_batch(self, texts) -> list:
+        """Return (token ids, character ranges) of each text, encoded together."""
+        if not len(texts):
+            return []
+        ids, ranges, boundaries = self.encode_packed(texts)
+        return [(ids[start:end], ranges[start:end])
+                for start, end in zip(boundaries[:-1], boundaries[1:])]
+
+    def document_batch(self, texts, stored) -> list[TokenView]:
+        """Return document token views with source character ranges.
+
+        Stored views with ranges are reused; the rest are encoded together
+        with the tokenizer continuations use.
+        """
+        missing = [index for index, tokens in enumerate(stored)
+                   if not isinstance(tokens, TokenView)
+                   or tokens.character_offsets is None]
+        result = list(stored)
+        encoded = self.encode_batch([texts[index] for index in missing])
+        for index, (ids, offsets) in zip(missing, encoded):
+            bounds = np.asarray(offsets, dtype=np.int64).reshape(-1)
+            result[index] = TokenView(
+                pa.array(ids, type=pa.int32()),
+                pa.FixedSizeListArray.from_arrays(pa.array(bounds), 2))
+        return result

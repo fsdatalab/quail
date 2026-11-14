@@ -2,39 +2,49 @@
 
 from __future__ import annotations
 
-import time
+import json
 
-import pyarrow as pa
+import _quail_native
 
 from quail.backends.quail.executor.memory import memory_report
-from quail.backends.quail.executor.operators import execution_parts
 from quail.backends.quail.retention import apply_retention
-from quail.catalog.pairs import columns_key
-from quail.execution.metrics import NodeResult, scalar_node_metrics
+from quail.common.pairs import columns_key
+from quail.common.tokens import documents_from_table
+from quail.execution.metrics import NodeResult
 from quail.execution.runner import (
     ExecutionContext,
-    GenericRunner,
     compute_subgraph,
 )
-from quail.execution.runtimes import ModelNodeRuntime
-from quail.execution.types import export_physical_outputs
+from quail.execution.stages import (
+    answer_hint,
+    payload_first_rows,
+    ran_message,
+    serve_stages,
+)
 from quail.physical import (
     AiClassify,
     AiExtract,
     AiFilter,
-    AiInference,
     AiJoin,
     AiMap,
     AiSaeFeatures,
     AiScore,
     PhysicalGraph,
-    Scan,
+    PortRef,
 )
+
+
+class RegionRuntime:
+    """Run one model node as a chain of its own in the model execution."""
+
+    def execute(self, node, inputs, context) -> NodeResult:
+        return context.model_execution.execute_pipeline(
+            (node,), {node.node_id: inputs}, context)[node.node_id]
 
 
 def quail_runtimes() -> dict:
     """Return runtimes for the Quail backend's physical nodes."""
-    model_runtime = ModelNodeRuntime()
+    model_runtime = RegionRuntime()
     return {
         AiFilter.runtime_key: model_runtime,
         AiJoin.runtime_key: model_runtime,
@@ -44,32 +54,6 @@ def quail_runtimes() -> dict:
         AiSaeFeatures.runtime_key: model_runtime,
         AiMap.runtime_key: model_runtime,
     }
-
-
-def prepare_model_inputs(node, inputs, context: ExecutionContext,
-                         upstream=None, nodes=None):
-    """Convert graph input ports into backend scheduler inputs.
-
-    Args:
-        node: Physical operator to execute.
-        inputs: Port values supplied by preceding operators.
-        context: Execution context containing document tokens and settings.
-        nodes: Join predicates sharing one scheduler run.
-        upstream: Optional preceding pipeline state for a join, containing its
-            documents, document IDs, operator parts, and selected pairs.
-
-    Returns:
-        A scheduler input mapping for filters, joins, and scores. Other
-        operators receive the original input mapping.
-    """
-    implementation = execution_parts().get(node.type_name)
-    prepared = (None if implementation is None
-                else implementation.model_inputs(
-                    node, inputs, context, upstream, nodes))
-    if prepared is None:
-        return inputs
-    return {**prepared,
-            "gpu_timing": context.state.get("gpu_timing", False)}
 
 
 def record_model_result(node, result: NodeResult,
@@ -124,10 +108,11 @@ def execution_context(state, payload, graph: PhysicalGraph) -> ExecutionContext:
         runtimes=state["runtimes"],
         model_execution=execution,
         sources=sources,
-        model_inputs=prepare_model_inputs,
         model_result=record_model_result,
         state=runtime_state,
-        run_pipeline=execution.execute_pipeline,
+        # an execution that runs node by node leaves the runner's chains out
+        run_pipeline=(execution.execute_pipeline if execution.groups_operators
+                      else None),
         deduplicate=payload.get("deduplicate", {}),
     )
 
@@ -147,96 +132,97 @@ def execution_measurements(context: ExecutionContext) -> dict:
     }
 
 
-def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
-    """Execute one Quail model graph on one GPU executor."""
-    context = execution_context(state, payload, graph)
-    torch = state["gpu"].torch
-    arena = state["gpu"].arena
-    started = time.perf_counter()
-    with torch.inference_mode():
-        result = GenericRunner().run(compute_subgraph(graph), context)
-    torch.cuda.synchronize()
-    wall = time.perf_counter() - started
-    arena.write_trace_files()
-    for key in arena.resident_keys():
-        arena.free_key(key)
-    report = graph_report(graph, result, wall, state["device"],
-                          gpu_timing=state.get("gpu_timing", False))
-    measurements = execution_measurements(context)
-    report.update(kv_manager=measurements["kv_manager"], **measurements["memory"])
-    return report
+# the tables of a runtime payload, each a mapping from alias
+_PAYLOAD_TABLES = ("documents", "texts", "columns", "source_rows")
 
 
-def graph_report(graph, result, wall, device, *, gpus=1, gpu_timing=False):
-    """Collect graph outputs, execution metrics, and GPU cost."""
-    filters, joins = model_answers(graph, result)
-    report = {
-        "filters": filters,
-        "joins": joins,
-        "_outputs": export_physical_outputs(compute_subgraph(graph), result),
-        "wall_s": round(wall, 2),
-        "fresh_tokens": result.metrics.fresh_tokens,
-        "cached_tokens": result.metrics.cached_tokens,
-        "evaluated_documents": result.metrics.evaluated_documents,
-        "evaluated_document_pairs": result.metrics.evaluated_document_pairs,
-        "usd_per_query": (
-            None if device.usd_per_hour is None
-            else wall / 3600 * gpus * device.usd_per_hour
-        ),
-        "backend_metrics": {"inferences": [
-            dict(value.metrics.extension)
-            for node_id, value in result.nodes.items()
-            if isinstance(graph.node(node_id), AiInference)
-        ]},
-        "node_metrics": scalar_node_metrics(result.nodes),
-        "executed_join_plan": executed_join_plan(graph),
-    }
-    report.update(throughput(graph, result.metrics, wall))
-    if gpu_timing:
-        report["gpu_s"] = round(result.metrics.gpu_s, 3)
-        report["chunks"] = result.metrics.chunks
-    return report
+def payload_tables(tables: dict) -> dict:
+    """Return the documents, texts, and columns of ``region_tables``' tables."""
+    payload = {name: {} for name in _PAYLOAD_TABLES}
+    for name, table in tables.items():
+        kind, alias = name.split(":", 1)
+        payload[kind][alias] = (
+            documents_from_table(table) if kind == "documents"
+            else table.column("text") if kind == "texts"
+            else table.column("row") if kind == "source_rows" else table)
+    return payload
 
 
-def throughput(graph, metrics, seconds: float) -> dict:
-    """Return the run's throughput under one key.
+def serve_region(state, payload, graph: PhysicalGraph, end, wanted,
+                 hinted: dict | None = None) -> None:
+    """Serve a begun region's stages on one GPU, then say what the GPU ran.
 
-    A run that evaluated document pairs reports evaluated pairs per
-    second. Any other run reports input document rows, summed over
-    every scan and counted before filters, per second.
+    Args:
+        state: The GPU executor's state for the query.
+        payload: The query's runtime payload.
+        graph: The region's graph.
+        end: The worker's ``WorkerEnd``, which has read the region.
+        wanted: The (node, port) pairs the region's FinishedRows reads.
+        hinted: Each scan alias's table name, for the tables the
+            region's hint holds rows of.
     """
-    seconds = max(seconds, 1e-9)
-    if metrics.evaluated_document_pairs:
-        return {
-            "document_pairs_per_second":
-                metrics.evaluated_document_pairs / seconds,
-        }
-    documents = sum(
-        node.num_documents for node in graph.nodes if isinstance(node, Scan)
-    )
-    return {"documents_per_second": documents / seconds}
+    context = execution_context(state, payload, graph)
+    torch, arena = state["gpu"].torch, state["gpu"].arena
+    try:
+        with torch.inference_mode():
+            results = serve_stages(
+                end, context, compute_subgraph(graph), payload["stages"],
+                wanted, hinted, payload_first_rows(payload) if hinted else None)
+        torch.cuda.synchronize()
+        # the region is timed until its end, so the files fall inside it
+        arena.write_trace_files()
+    finally:
+        for key in arena.resident_keys():
+            arena.free_key(key)
+    end.ran(*ran_message(results, execution_measurements(context)))
 
 
-def model_answers(graph, result) -> tuple[dict, list]:
-    """Collect predicate answers in execution order."""
-    filters, joins = {}, []
-    for node in graph.topological_nodes():
-        if isinstance(node, AiFilter):
-            filters.setdefault(node.alias, []).append(
-                result.nodes[node.node_id].outputs[f"filter_answers:{node.alias}"])
-        elif isinstance(node, AiJoin):
-            joins.append(result.nodes[node.node_id].outputs[
-                f"join_answers:{node.written_position}"])
-    return {alias: pa.concat_tables(tables) for alias, tables in filters.items()}, joins
+def answer_region(hint, sinks, question: str):
+    """Answer a worker's question from the region's hint and listeners.
+
+    Args:
+        hint: The region's ``InputHint``, or None.
+        sinks: The progress sink and the answer sink, each or None.
+        question: The question, as JSON.
+
+    Returns:
+        The answer as JSON text, or a table for a table's kept rows.
+    """
+    found = json.loads(question)
+    if "hint" in found:
+        return answer_hint(hint, found)
+    for sink, name in zip(sinks, ("progress", "answer"), strict=True):
+        if name in found and sink is not None:
+            sink(*found[name])
+    return "null"
 
 
-def executed_join_plan(graph) -> list[dict]:
-    """Describe the join nodes executed from the saved graph."""
-    from quail.physical import Barrier
+def region_report(graph: PhysicalGraph, ran: list, wall: float, device, *,
+                  gpus: int, gpu_timing: bool = False) -> dict:
+    """Report a region's run from what each worker ran.
 
-    return [
-        {"type": node.type_name, "id": node.node_id,
-         **node.explain_fields()}
-        for node in graph.topological_nodes()
-        if isinstance(node, (AiJoin, Barrier))
-    ]
+    Rust merges the workers' outputs and metrics
+    (``quail::report::region_report``).
+
+    Args:
+        graph: The region's graph.
+        ran: Per worker, what it ran as ``ran_message`` wrote it.
+        wall: Seconds the region took.
+        device: The GPUs' device spec.
+        gpus: How many GPUs.
+        gpu_timing: Whether to report GPU seconds and chunks.
+
+    Returns:
+        The report, with the run's output tables under "_outputs".
+    """
+    text, tables = _quail_native.region_report(
+        graph.to_json(), ran, wall, device.usd_per_hour, gpus, gpu_timing)
+    report = json.loads(text)
+    outputs = {}
+    for table in tables:
+        metadata = dict(table.schema.metadata)
+        ref = PortRef(metadata.pop(b"quail.node").decode(),
+                      metadata.pop(b"quail.port").decode())
+        outputs[ref] = table.replace_schema_metadata(metadata or None)
+    report["_outputs"] = outputs
+    return report

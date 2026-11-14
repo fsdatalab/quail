@@ -5,19 +5,24 @@ import pickle
 import pyarrow as pa
 import pytest
 
-from quail.catalog.tokens import (
+from quail.common.tokens import (
     ArrowTokenDocuments,
-    TokenLengths,
     TokenStore,
     concat_tokens,
     decode_token_documents,
     prefix_tree,
 )
-from quail.planner.graph.shards import contiguous_shards
-from quail.planner.statistics.tables import AliasStats, summarize_alias
 
 
-def test_token_views_store_concatenations_and_shared_prefixes(tmp_path, monkeypatch):
+def _store(documents):
+    """A TokenStore of token id lists, as Rust's planner hands one over."""
+    return TokenStore(pa.table({
+        "__quail_token_ids": pa.array(documents, pa.large_list(pa.int32())),
+        "__quail_token_count": pa.array(map(len, documents), pa.int64()),
+    }))
+
+
+def test_token_views_store_concatenations_and_shared_prefixes(monkeypatch):
     tokens = pa.chunked_array([
         pa.array([[1, 2, 3], [], [4, 5]], type=pa.large_list(pa.int32()))
     ])
@@ -37,56 +42,19 @@ def test_token_views_store_concatenations_and_shared_prefixes(tmp_path, monkeypa
     assert list(combined) == [1, 2, 1, 2, 3, 20]
     assert combined.token_parts[1] is first
 
-    schema = pa.schema({"id": pa.string(), "body": pa.string()})
-    batches = [
-        pa.record_batch([["a", "b"], ["one two", "three"]], schema=schema),
-        pa.record_batch([["c"], ["four five six"]], schema=schema),
-    ]
-    path = tmp_path / "tokens.arrow"
-    store = TokenStore.write(str(path), batches, document_column="body",
-                             tokenizer=str.split, token_type=pa.string())
-    assert path.exists()
-    assert list(store.lengths) == [2, 1, 3]
-    assert [list(store[index]) for index in range(len(store))] == [
-        ["one", "two"], ["three"], ["four", "five", "six"]]
-    assert store._reader.schema.names == [
-        "__quail_token_ids", "__quail_token_count"]
+    store = _store([[1, 2, 3], [4, 5], [1, 2, 9]])
+    assert list(store.lengths) == [3, 2, 3]
+    tree = prefix_tree(store, 1)
+    assert (tree.order, tree.parent, tree.shared) == (
+        [0, 2, 1], [None, None, 0], [0, 0, 2])
     with monkeypatch.context() as patch:
-        patch.setattr(type(store.lengths), "__getitem__",
-                      lambda *_: pytest.fail("statistics read an Arrow scalar"))
-        memo = {}
-        summary = summarize_alias(store.lengths, 3, memo=memo)
-        assert summary == AliasStats(3, 6, 14, 3, 3, ((1, 1), (2, 1)))
-        assert summary.variance == pytest.approx(2 / 3)
-        assert contiguous_shards(store.lengths, 1, total=summary.total) == (
-            ((0, 3),), [6])
-        assert contiguous_shards(store.lengths, 2) == (((0, 2), (2, 3)), [3, 3])
-        assert summarize_alias(store.lengths, 3, memo=memo) is summary
-        assert summarize_alias(store.lengths, memo=memo).short_counts == ()
-        assert summarize_alias(TokenLengths([4]), 3, memo=memo) == AliasStats(
-            1, 4, 16, 4, 3)
-    assert summarize_alias(TokenLengths(pa.array([], pa.int32())), 3) == AliasStats(
-        0, 0, 0, 0, 3)
-    assert summarize_alias(TokenLengths([])).variance == 0
-    assert summarize_alias(TokenLengths([100_000_000, 100_000_001])).variance == 0.25
-    assert summarize_alias(
-        TokenLengths(pa.array([100_000], pa.int32()))).squared == 10_000_000_000
-    index = store.prefix_index
-    with monkeypatch.context() as patch:
-        patch.setattr("quail.catalog.tokens._token_array",
-                      lambda *_: pytest.fail("prefix preparation ran twice"))
-        assert prefix_tree(store, 1) is index.tree(1)
-        assert prefix_tree(store, 16) is index.tree(16)
-    store.close()
+        patch.setattr("_quail_native.PrefixIndex",
+                      lambda *_: pytest.fail("the documents were sorted twice"))
+        assert prefix_tree(store, 1) is tree
+        assert prefix_tree(store, 2).shared == [0, 0, 2]
 
-    schema = pa.schema({"body": pa.string()})
-    store = TokenStore.write(
-        str(path), [pa.record_batch([["word " * 1000] * 10], schema=schema)],
-        document_column="body", tokenizer=str.split, token_type=pa.string())
-    assert store.prefix_index is not index
-    assert prefix_tree(store, 16).shared_tokens == 9 * 992
-    encoded = pickle.dumps(store.select(range(10)))
-    restored = pickle.loads(encoded)
-    assert len(encoded) < 1000
+    long = _store([list(range(1000))] * 10)
+    assert prefix_tree(long, 16).shared_tokens == 9 * (999 // 16 * 16)
+    restored = pickle.loads(pickle.dumps(long))
     assert len(restored) == 10
-    assert len(restored[0]) == 1000
+    assert list(restored[9]) == list(range(1000))

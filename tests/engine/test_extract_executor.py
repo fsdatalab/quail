@@ -1,13 +1,15 @@
 """Shared AI.EXTRACT execution on a scripted model."""
 
+import json
 from collections import Counter
-from dataclasses import replace
 from types import SimpleNamespace
 
+import _quail_native
 import numpy as np
 import pyarrow as pa
 import pytest
 import torch as tensor_torch
+from helpers.conditions import condition as sql_condition
 from helpers.extract_fakes import (
     LEASE,
     NOTHING,
@@ -18,47 +20,52 @@ from helpers.extract_fakes import (
     make_spec as make_extract_spec,
 )
 from helpers.extract_reference import AnswerState, Decoder
-from helpers.fakes import fake_pipeline, fake_readout
+from helpers.fakes import fake_pipeline, fake_readout, run_graph, run_on_threads
 from helpers.kv_checker import Setup, make_arena
+from test_kv_reads import named
 from test_map_decode import cpu_staging, events_torch
 
 from quail.backends.quail import QuailModelExecution
-from quail.backends.quail.distributed import (
-    execute_distributed_graph,
-)
 from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.extract.candidates import Stream
 from quail.backends.quail.executor.extract.vocabulary import same_word
-from quail.backends.quail.executor.operators.extract import (
-    ExtractPart,
-    execute_extractions,
-)
+from quail.backends.quail.executor.operators import operator_types
+from quail.backends.quail.executor.operators.extract import ExtractOperator
+from quail.backends.quail.executor.region import RegionExecution
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
-from quail.backends.quail.graph import execute_single_graph
-from quail.backends.quail.worker import ChildState, _child_execute
+from quail.backends.quail.worker import _execution_state
 from quail.builtins import built_in_registry
-from quail.logical import And, ColumnRef, GetField, Not, Or, RegularPredicate
 from quail.physical import (
     AiExtract,
     AiFilter,
     PhysicalGraph,
     PortRef,
     Scan,
-    plan_envelope,
+    input_ports,
 )
-from quail.physical.base import input_ports
 from quail.specs import DEVICES, MODELS, QWEN3_4B_FP8
+
+
+def execute_extractions(state, nodes, inputs) -> dict:
+    """Run extraction nodes alone over the documents, as a region runs them."""
+    region = RegionExecution(
+        SimpleNamespace(query=state, operator_types=operator_types()),
+        SimpleNamespace(sources={}, state={
+            "documents": inputs["documents"], "texts": inputs["texts"],
+            "gpu_timing": inputs.get("gpu_timing", False)}))
+    return region.run(nodes, {node.node_id: {"input:0": inputs["document_ids"]}
+                              for node in nodes})
 
 
 def make_spec(*texts):
     spec, vocabulary = make_extract_spec(*texts)
-    return replace(spec, top_tokens=4), vocabulary
+    return spec.replace(top_tokens=4), vocabulary
 
 
 @pytest.fixture(autouse=True)
 def packed_scripted_inputs(monkeypatch):
     cpu_staging(monkeypatch)
-    monkeypatch.setattr("quail.backends.quail.executor.parts.input_staging",
+    monkeypatch.setattr("quail.backends.quail.executor.region.input_staging",
                         lambda state: None)
     pack = chunk_mod.pack_chunk
 
@@ -71,16 +78,11 @@ def packed_scripted_inputs(monkeypatch):
     monkeypatch.setattr(chunk_mod, "pack_chunk", capture)
 
 
-@pytest.mark.parametrize(("scores", "stop", "chosen", "done"), [
-    ([-1, -1, -9, -10], -8, 1, False),
-    ([-2, -1, -9, -0.5], -8, None, True),
-])
-def test_continuation_arrays_handle_duplicates_ties_and_stops(
+def check_continuation_arrays_handle_duplicates_ties_and_stops(
         scores, stop, chosen, done):
     tokens = [33, 1, 1]
-    vocabulary = SimpleNamespace(
-        vocab=range(64), tokenizer=SimpleNamespace(is_stop=np.zeros(64, dtype=bool)))
-    vocabulary.tokenizer.is_stop[62] = True
+    vocabulary = SimpleNamespace(vocab=range(64), is_stop=np.zeros(64, dtype=bool))
+    vocabulary.is_stop[62] = True
     decoder = Decoder(vocabulary, 4, 9, 1, make_spec()[0])
     text = "abcdefghij"
     streams = [Stream(at, [0, token], [at + 1, at + 2], text, exhausted=True)
@@ -97,38 +99,48 @@ def test_continuation_arrays_handle_duplicates_ties_and_stops(
             index for index, token in enumerate(tokens) if token == chosen]
 
 
-def test_writing_that_begins_outside_the_document_answers_none(monkeypatch):
+def test_continuation_arrays_handle_duplicates_ties_and_stops():
+    for scores, stop, chosen, done in [
+        ([-1, -1, -9, -10], -8, 1, False),
+        ([-2, -1, -9, -0.5], -8, None, True),
+    ]:
+        named(
+            f"scores={scores} stop={stop} chosen={chosen} done={done}",
+            check_continuation_arrays_handle_duplicates_ties_and_stops,
+            scores=scores, stop=stop, chosen=chosen, done=done)
+
+
+def test_an_answer_outside_the_document_is_none_and_a_rejected_draft_is_replaced(
+        monkeypatch):
     # at the cue the model prefers a word that begins no position: its
     # answer is not in the document, and neither extraction answers
-    state, model, run, _ = _setup(monkeypatch)
-    tables = model.tables
-    stray = tables.tokenizer.encode_ids(" five")[0]
-    cue_row = model._cue_row
+    with monkeypatch.context() as patch:
+        state, model, run, _ = _setup(patch)
+        tables = model.tables
+        stray = tables.tokenizer(" five")[0]
+        cue_row = model._cue_row
 
-    def straying(key):
-        if key[1] != 0:
-            return cue_row(key)
-        march = tables.tokenizer.encode_ids("March")[0]
-        return model._cue({stray: -0.05, march: -0.5}, -6.0)
+        def straying(key):
+            if key[1] != 0:
+                return cue_row(key)
+            march = tables.tokenizer("March")[0]
+            return model._cue({stray: -0.05, march: -0.5}, -6.0)
 
-    model._cue_row = straying
-    result, stages = run()
+        model._cue_row = straying
+        result, stages = run()
     assert result.outputs["rows:c"].column("ends").to_pylist() == [
         None, "five years", None]
     assert stages.documents[0].answers[0].none_wins
 
-
-@pytest.mark.parametrize("recurrent", [False])
-def test_a_rejected_draft_is_replaced_by_the_next_round(monkeypatch, recurrent):
     # "five" starts two positions; the draft follows the first, "five
     # days", and the model chooses " years" instead: the round ends
     # there, and the next round feeds " years" in the draft's place
     text = "five days or five years"
-    asked, model = _extract_spec(monkeypatch, text, "five years", recurrent=recurrent)
+    asked, model = _extract_spec(monkeypatch, text, "five years")
     assert asked.answer == "five years" and asked.span == (13, 23)
-    assert asked.written == model.tables.tokenizer.encode_ids(" five years")
+    assert asked.written == model.tables.tokenizer(" five years")
     assert asked.steps >= 2
-    assert any(model.tables.tokenizer.encode_ids(" days")[0] in suffix
+    assert any(model.tables.tokenizer(" days")[0] in suffix
                for _, suffix, _, _, _ in model.packed)
 
 
@@ -151,7 +163,7 @@ class ScriptedModel:
         self.filter_truth = {}      # key -> a filter question's answer
         self.reads = Counter()      # key -> times its prefix was packed
         self.width = 1 + 2 * k
-        self.cue_token = tables.tokenizer.encode_ids(TAIL)[-1]
+        self.cue_token = tables.tokenizer(TAIL)[-1]
         self.kv = {}                # key -> tokens appended after the prefix
         self.prefix_len = {}        # key -> the prefix's tokens
         self.packed = []
@@ -172,13 +184,13 @@ class ScriptedModel:
     def _cue(self, lps, stop_lp):
         """A row: the stop, then the top tokens."""
         for token, value in lps.items():
-            if self.tables.tokenizer.is_stop[token]:
+            if self.tables.is_stop[token]:
                 stop_lp = np.logaddexp(stop_lp, value)
         return self._top(lps, [stop_lp])
 
     def _gold_ids(self, key):
         gold = self.gold[key]
-        return self.tables.tokenizer.encode_ids(gold) if gold else []
+        return self.tables.tokenizer(gold) if gold else []
 
     def forward_chunk(self, chunk):
         specs = list(chunk.specs)
@@ -304,7 +316,7 @@ def _extract_spec(monkeypatch, text, gold, spec=None, vocabulary=None, recurrent
     state.loaded_model.vocabulary = vocabulary
     state.loaded_model.tokenizer = vocabulary.tokenizer
     seen = []
-    original = ExtractPart.__init__
+    original = ExtractOperator.__init__
 
     def initialize(self, *args, **kwargs):
         original(self, *args, **kwargs)
@@ -313,18 +325,21 @@ def _extract_spec(monkeypatch, text, gold, spec=None, vocabulary=None, recurrent
             model.gold[document.key] = gold
         seen.append(self)
 
-    monkeypatch.setattr(ExtractPart, "__init__", initialize)
+    monkeypatch.setattr(ExtractOperator, "__init__", initialize)
     node = AiExtract(node_id="extract", backend_name="quail", model=QWEN3_4B_FP8.name,
                      spec=spec)
     execute_extractions(state, [node], {
         "document_ids": [0],
-        "documents": {"c": [vocabulary.tokenizer.encode_ids(text)]},
+        "documents": {"c": [vocabulary.tokenizer(text)]},
         "texts": {"c": [text]}})
     return _snapshot(seen[-1]).documents[0].answers[0], model
 
 
 DOCS = [LEASE, TERM, NOTHING]
 GOLD = ["March 3, 2027", "five years", None]
+SPAN = pa.struct([("start", pa.int32()), ("end", pa.int32())])
+# the answer columns the conditions on extractions read
+ANSWERS = {"ends": pa.string(), "starts": pa.string(), "starts_span": SPAN}
 
 
 def _setup(monkeypatch, documents=None, token_documents=None,
@@ -332,16 +347,16 @@ def _setup(monkeypatch, documents=None, token_documents=None,
            policy="fixed", recurrent=False):
     """A state, its scripted model, and a node builder for one spec name."""
     spec, tables = make_spec()
-    spec = replace(spec, draft_policy=policy, round_cost_per_token=0.05)
+    spec = spec.replace(draft_policy=policy, round_cost_per_token=0.05)
     documents = DOCS if documents is None else documents
     model = ScriptedModel(tables, {}, {}, 4)
     state = _state(model, recurrent=recurrent)
     state.loaded_model.vocabulary = tables
     state.loaded_model.tokenizer = tables.tokenizer
-    tokens = {"c": ([tables.tokenizer.encode_ids(text) for text in documents]
+    tokens = {"c": ([tables.tokenizer(text) for text in documents]
                     if token_documents is None else token_documents)}
     stages_seen = {}
-    original = ExtractPart.__init__
+    original = ExtractOperator.__init__
 
     def init(self, *args, **kwargs):
         original(self, *args, **kwargs)
@@ -350,12 +365,12 @@ def _setup(monkeypatch, documents=None, token_documents=None,
             model.gold[document.key] = GOLD[documents.index(document.text)]
         stages_seen["stages"] = self
 
-    monkeypatch.setattr(ExtractPart, "__init__", init)
+    monkeypatch.setattr(ExtractOperator, "__init__", init)
 
     def node(name):
         return AiExtract(node_id=f"ai-extract:{name}", backend_name="quail",
-                         model="qwen3-4b-fp8", spec=replace(
-                             spec, name=name, share_prefixes=share_prefixes))
+                         model="qwen3-4b-fp8", spec=spec.replace(
+                             name=name, share_prefixes=share_prefixes))
 
     inputs = {"document_ids": (list(range(len(documents))) if document_ids is None
                                else document_ids), "documents": tokens,
@@ -363,7 +378,7 @@ def _setup(monkeypatch, documents=None, token_documents=None,
 
     def run(name="ends", keep_kv=False):
         result = execute_extractions(
-            state, [replace(node(name), keep_kv=keep_kv)], inputs)[node(name).node_id]
+            state, [node(name).replace(keep_kv=keep_kv)], inputs)[node(name).node_id]
         return result, _snapshot(stages_seen["stages"])
 
     def run_pipeline(*names):
@@ -374,7 +389,8 @@ def _setup(monkeypatch, documents=None, token_documents=None,
     return state, model, run, run_pipeline
 
 
-def test_extraction_borrows_prefix_pages_and_keeps_decode_kv(monkeypatch):
+def test_extraction_borrows_prefix_pages_and_grows_answers_without_headroom_admission(
+        monkeypatch):
     documents = [LEASE, LEASE, NOTHING]
     _, _, plain, _ = _setup(monkeypatch, documents=documents)
     unshared, _ = plain()
@@ -392,13 +408,7 @@ def test_extraction_borrows_prefix_pages_and_keeps_decode_kv(monkeypatch):
         assert model.reads[document.key] <= 1
         assert all(entry[2] > 0 for entry in rounds)
 
-
-def test_extraction_answers_grow_on_demand_without_headroom_admission(monkeypatch):
     from quail.backends.quail.executor import answer_admission
-
-    documents = [LEASE, LEASE, NOTHING]
-    _, _, reference, _ = _setup(monkeypatch, documents=documents)
-    expected, _ = reference()
 
     def refuse(*args, **kwargs):
         raise AssertionError("extraction answers need no headroom admission")
@@ -406,7 +416,7 @@ def test_extraction_answers_grow_on_demand_without_headroom_admission(monkeypatc
     monkeypatch.setattr(answer_admission, "HeadroomAdmission", refuse)
     _, _, run, _ = _setup(monkeypatch, documents=documents)
     result, _ = run()
-    assert result.outputs["rows:c"].table().equals(expected.outputs["rows:c"].table())
+    assert result.outputs["rows:c"].table().equals(unshared.outputs["rows:c"].table())
 
 
 @pytest.mark.parametrize("gpu_timing,recurrent", [(True, True)])
@@ -446,23 +456,22 @@ def test_a_pipeline_of_extractions_reads_each_document_once(
 
 
 @pytest.mark.parametrize("gpus", [2])
-def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, gpus):
-    import pickle
-
+def test_extractions_on_several_gpus_keep_spans_and_free_kv(monkeypatch, gpus):
     state, model, _, run_pipeline = _setup(monkeypatch, share_prefixes=True)
     expected, _ = run_pipeline("ends", "starts")
     spec, tables = make_spec()
-    nodes = [Scan(node_id="input:c", alias="c", input_id="c")]
+    nodes = [Scan(node_id="input:c", alias="c", input_id="c",
+                  num_documents=len(DOCS))]
     for name in ("ends", "starts"):
         previous = nodes[-1]
         nodes.append(AiExtract(
             node_id=f"ai-extract:{name}", backend_name="quail", model="qwen3-4b-fp8",
             inputs=input_ports((PortRef(previous.node_id, "rows:c"),)),
-            spec=replace(spec, name=name, share_prefixes=True),
+            spec=spec.replace(name=name, share_prefixes=True),
             keep_kv=name == "starts"))
     graph = PhysicalGraph(tuple(nodes), PortRef(nodes[-1].node_id, "rows:c"))
     registry = built_in_registry()
-    children = []
+    gpu_states = []
     for _ in range(gpus):
         local = _state(model)
         torch, arena = local.torch, local.loaded_model.arena
@@ -476,43 +485,29 @@ def test_distributed_extraction_preserves_spans_order_and_kv(monkeypatch, gpus):
         execution.bind_query(torch=torch, answer_rows=object(),
                              chunk_tokens=state.chunk_tokens,
                              async_answers=fake_readout())
-        children.append(ChildState(gpu_index=0, registry=registry, gpu=SimpleNamespace(
+        gpu_states.append(SimpleNamespace(
             execution=execution, torch=torch, arena=arena, pipeline=pipeline,
-            spec=MODELS["qwen3-4b-fp8"])))
+            spec=MODELS["qwen3-4b-fp8"]))
     payload = {
         "model": "qwen3-4b-fp8", "chunk_tokens": state.chunk_tokens,
         "true_ids": [1], "false_ids": [2],
-        "documents": {"c": tables.tokenizer.document_batch(DOCS, [None] * len(DOCS))},
+        "documents": {"c": tables.document_batch(DOCS, [None] * len(DOCS))},
         "texts": {"c": pa.array(DOCS)},
-        "physical_plan": plan_envelope(
-            backend="quail", model="qwen3-4b-fp8", device="h100-sxm",
-            gpus=gpus, graph=graph, codecs=registry.codecs),
+        "physical_plan": {
+            "backend": "quail", "model": "qwen3-4b-fp8", "device": "h100-sxm",
+            "gpus": gpus, "settings": {}, "graph": json.loads(graph.to_json())},
+        "stages": json.loads(_quail_native.region_stages(graph.to_json(), gpus)),
     }
-    rounds = []
-
-    def round_fn(kind, subs):
-        assert kind == "execute"
-        subs = pickle.loads(pickle.dumps(subs))
-        rounds.append(subs)
-        return [_child_execute(child, sub) for child, sub in zip(children, subs)]
-
-    result = execute_distributed_graph(
-        payload, graph, gpus, round_fn, DEVICES["h100-sxm"], registry.runtimes,
-        registry)
-    assert len(rounds) == 1
-    # every worker ran the whole pipeline over its own documents
-    shards = [sub["inputs"]["ai-extract:ends"]["input:0"].ids["c"].to_pylist()
-              for sub in rounds[0]]
-    assert sorted(document for shard in shards for document in shard) == [0, 1, 2]
-    assert all(sub["pipeline"] and sub["final"] for sub in rounds[0])
+    states = [_execution_state(gpu, payload, registry) for gpu in gpu_states]
+    result = run_on_threads(states, payload, graph, DEVICES["h100-sxm"])
     for node in nodes[1:]:
-        actual = result["_outputs"][PortRef(node.node_id, "rows:c")]
+        actual = result["_outputs"][PortRef(node.node_id, "rows:c")].sort_by("c")
         assert actual.equals(expected[node.node_id].outputs["rows:c"].table())
     assert result["fresh_tokens"] == sum(
         item.metrics.fresh_tokens for item in expected.values())
     assert result["evaluated_documents"] == 2 * len(DOCS)
     assert result["backend_metrics"]["inferences"][0]["none"] == 1
-    assert all(not child.gpu.arena.accounting.owned for child in children)
+    assert all(not gpu.arena.accounting.owned for gpu in gpu_states)
 
 
 def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
@@ -528,7 +523,7 @@ def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
         model.documents[("c", index)] = text
         model.gold[("c", index)] = GOLD[index]
         model.filter_truth[("c", index)] = index != 2
-    question = tables.tokenizer.encode_ids(" question")
+    question = tables.tokenizer(" question")
     graph = PhysicalGraph(
         (
             Scan(node_id="input:c", alias="c", input_id="c"),
@@ -557,7 +552,7 @@ def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
                 inputs=input_ports((PortRef("ai-extract:ends", "rows:c"),)),
                 backend_name="quail",
                 model="qwen3-4b-fp8",
-                spec=replace(plain, name="starts"),
+                spec=plain.replace(name="starts"),
             ),
         ),
         PortRef("ai-extract:starts", "rows:c"),
@@ -581,9 +576,9 @@ def test_an_extraction_after_a_filter_asks_the_filtered_documents_once(
              "runtimes": built_in_registry().runtimes,
              "device": DEVICES["h100-sxm"],
              "chunk_tokens": 400,
-             "documents": {"c": [tables.tokenizer.encode_ids(text) for text in DOCS]},
+             "documents": {"c": [tables.tokenizer(text) for text in DOCS]},
              "texts": {"c": list(DOCS)}, "gpu_timing": True}
-    report = execute_single_graph(
+    report = run_graph(
         state, {"filter_limit": None, "retention": {}}, graph)
     table = report["_outputs"][PortRef("ai-extract:ends", "rows:c")].to_pydict()
     assert table["c"] == [0, 1]
@@ -610,7 +605,6 @@ def test_a_filter_on_answers_drops_documents_before_the_next_question(
     # passed, over the KV the first question left; the dropped
     # document is packed once and its KV freed
     from quail.physical import Filter
-    from quail.physical.pipelines import build_pipelines
 
     spec, tables = make_spec()
     model = ScriptedModel(tables, {}, {}, 4)
@@ -624,29 +618,25 @@ def test_a_filter_on_answers_drops_documents_before_the_next_question(
                   backend_name="quail", model="qwen3-4b-fp8", spec=spec),
         Filter(node_id="filter:c:0",
                inputs=input_ports((PortRef("ai-extract:ends", "rows:c"),)),
-               predicate=Not(RegularPredicate(
-                   ColumnRef("c", "contracts", "ends"), "like", "five%")),
+               predicate=sql_condition(
+                   "NOT (ends LIKE 'five%')", ANSWERS, "c", "contracts"),
                aliases=("c",), written_position=0),
         AiExtract(node_id="ai-extract:starts",
                   inputs=input_ports((PortRef("filter:c:0", "rows:c"),)),
                   backend_name="quail", model="qwen3-4b-fp8",
-                  spec=replace(spec, name="starts")),
+                  spec=spec.replace(name="starts")),
         Filter(node_id="filter:c:1",
                # a condition on two extractions reads each as the
                # document settles: starts from the part before it, ends
                # by document ID from the port that still carries it
                inputs=input_ports((PortRef("ai-extract:starts", "rows:c"),
                                    PortRef("filter:c:0", "rows:c"))),
-               predicate=Or((
-                   RegularPredicate(ColumnRef("c", "contracts", "starts"), "is null"),
-                   And((RegularPredicate(ColumnRef("c", "contracts", "ends"),
-                                         "like", "March%"),
-                        RegularPredicate(
-                            GetField(ColumnRef("c", "contracts", "starts_span"),
-                                     "start"), "<", 40))))),
+               predicate=sql_condition(
+                   "starts IS NULL OR (ends LIKE 'March%' AND starts_span.start < 40)",
+                   ANSWERS, "c", "contracts"),
                aliases=("c",), written_position=1),
     ), PortRef("filter:c:1", "rows:c"))
-    assert [member.node_id for member in build_pipelines(graph)["ai-extract:ends"]
+    assert [member.node_id for member in graph.pipelines()["ai-extract:ends"]
             ] == ["ai-extract:ends", "filter:c:0", "ai-extract:starts", "filter:c:1"]
     local = _state(model)
     torch, arena = local.torch, local.loaded_model.arena
@@ -663,9 +653,9 @@ def test_a_filter_on_answers_drops_documents_before_the_next_question(
                                     execution=execution, spec=MODELS["qwen3-4b-fp8"]),
              "runtimes": built_in_registry().runtimes,
              "device": DEVICES["h100-sxm"], "chunk_tokens": 400,
-             "documents": {"c": [tables.tokenizer.encode_ids(text) for text in DOCS]},
+             "documents": {"c": [tables.tokenizer(text) for text in DOCS]},
              "texts": {"c": list(DOCS)}}
-    report = execute_single_graph(
+    report = run_graph(
         state, {"filter_limit": None, "retention": {}}, graph)
     outputs = report["_outputs"]
     first = outputs[PortRef("ai-extract:ends", "rows:c")].to_pydict()
@@ -691,7 +681,6 @@ def test_a_filter_after_an_extraction_rewinds_the_kv_past_the_answer(
     # the filter's question follows the document in KV, in place of
     # the answer the extraction wrote; the document is packed once
     from quail.physical import Filter
-    from quail.physical.pipelines import build_pipelines
 
     spec, tables = make_spec()
     head = list(spec.prompt_token_parts[0])
@@ -700,7 +689,7 @@ def test_a_filter_after_an_extraction_rewinds_the_kv_past_the_answer(
         model.documents[("c", index)] = text
         model.gold[("c", index)] = GOLD[index]
         model.filter_truth[("c", index)] = index != 1
-    question = tables.tokenizer.encode_ids(" question")
+    question = tables.tokenizer(" question")
     graph = PhysicalGraph(
         (
             Scan(node_id="input:c", alias="c", input_id="c"),
@@ -714,9 +703,8 @@ def test_a_filter_after_an_extraction_rewinds_the_kv_past_the_answer(
             Filter(
                 node_id="filter:c:1",
                 inputs=input_ports((PortRef("ai-extract:ends", "rows:c"),)),
-                predicate=RegularPredicate(
-                    ColumnRef("c", "contracts", "ends"), "is not null"
-                ),
+                predicate=sql_condition(
+                    "ends IS NOT NULL", ANSWERS, "c", "contracts"),
                 aliases=("c",),
                 written_position=1,
             ),
@@ -736,7 +724,7 @@ def test_a_filter_after_an_extraction_rewinds_the_kv_past_the_answer(
         ),
         PortRef("ai_filter:c", "rows:c"),
     )
-    assert [member.node_id for member in build_pipelines(graph)["ai-extract:ends"]
+    assert [member.node_id for member in graph.pipelines()["ai-extract:ends"]
             ] == ["ai-extract:ends", "filter:c:1", "ai_filter:c"]
     local = _state(model)
     torch, arena = local.torch, local.loaded_model.arena
@@ -756,9 +744,9 @@ def test_a_filter_after_an_extraction_rewinds_the_kv_past_the_answer(
                                     execution=execution, spec=MODELS["qwen3-4b-fp8"]),
              "runtimes": built_in_registry().runtimes,
              "device": DEVICES["h100-sxm"], "chunk_tokens": 400,
-             "documents": {"c": [tables.tokenizer.encode_ids(text) for text in DOCS]},
+             "documents": {"c": [tables.tokenizer(text) for text in DOCS]},
              "texts": {"c": list(DOCS)}}
-    report = execute_single_graph(
+    report = run_graph(
         state, {"filter_limit": None, "retention": {}}, graph)
     outputs = report["_outputs"]
     assert outputs[PortRef("ai-extract:ends", "rows:c")].to_pydict()["ends"] == [
@@ -802,8 +790,8 @@ def test_a_limit_ends_the_pipeline_once_enough_documents_pass(monkeypatch, limit
                   backend_name="quail", model="qwen3-4b-fp8", spec=spec),
         Filter(node_id="filter:c:0",
                inputs=input_ports((PortRef("ai-extract:ends", "rows:c"),)),
-               predicate=RegularPredicate(
-                   ColumnRef("c", "contracts", "ends"), "is not null"),
+               predicate=sql_condition(
+                   "ends IS NOT NULL", ANSWERS, "c", "contracts"),
                aliases=("c",), written_position=0),
     ), PortRef("filter:c:0", "rows:c"))
     local = _state(model)
@@ -815,7 +803,7 @@ def test_a_limit_ends_the_pipeline_once_enough_documents_pass(monkeypatch, limit
     execution.loaded_model.vocabulary = tables
     execution.loaded_model.tokenizer = tables.tokenizer
     execution.loaded_model.input_staging = None
-    documents = [tables.tokenizer.encode_ids(text) for text in texts]
+    documents = [tables.tokenizer(text) for text in texts]
     # a chunk holds about one document and its question
     chunk = max(len(document) for document in documents) + len(
         spec.prompt_token_parts[0]) + len(spec.prompt_token_parts[1]) + 8
@@ -826,7 +814,7 @@ def test_a_limit_ends_the_pipeline_once_enough_documents_pass(monkeypatch, limit
              "runtimes": built_in_registry().runtimes,
              "device": DEVICES["h100-sxm"], "chunk_tokens": chunk,
              "documents": {"c": documents}, "texts": {"c": list(texts)}}
-    report = execute_single_graph(
+    report = run_graph(
         state, {"filter_limit": limit, "retention": {}}, graph)
     outputs = report["_outputs"]
     kept = outputs[PortRef("filter:c:0", "rows:c")].to_pydict()

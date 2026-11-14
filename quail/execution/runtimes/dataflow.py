@@ -1,42 +1,16 @@
-"""Runtimes for the dataflow nodes: exchange, barrier, recombine, and join."""
+"""Runtimes for the dataflow nodes: barrier and join."""
 
 from __future__ import annotations
 
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from quail.catalog.pairs import columns_key, pair_table
+from quail.common.pairs import columns_key, pair_table
 from quail.execution.ids import document_ids
 from quail.execution.metrics import NodeMetrics, NodeResult
-from quail.execution.result import (
-    IndexRelation,
-    build_result_declaration,
-    joined_survivors,
-    true_answer_rows,
-)
-from quail.execution.rows import Rows, as_table
-from quail.logical.expressions import (
-    column_references,
-    evaluate_expression,
-)
-from quail.physical import (
-    Barrier,
-    Exchange,
-    HashJoin,
-    Recombine,
-    ValueType,
-)
-
-
-class ExchangeRuntime:
-    """Pass anchor ids through; several GPUs route them to their KV."""
-
-    def execute(self, node, inputs, context) -> NodeResult:
-        if not isinstance(node, Exchange):
-            raise TypeError(type(node).__name__)
-        if len(inputs) != 1:
-            raise ValueError("Exchange takes one survivor input")
-        return NodeResult({f"rows:{node.anchor}": next(iter(inputs.values()))})
+from quail.execution.result import joined_survivors, true_answer_rows
+from quail.execution.rows import Rows
+from quail.physical import Barrier, HashJoin, ValueType
 
 
 class BarrierRuntime:
@@ -65,46 +39,11 @@ class BarrierRuntime:
 
 def relation_values(columns, expression):
     """Return one key column's values from the alias's value table."""
-    for ref in column_references(expression):
+    for ref in expression.references:
         if columns is None or ref.column not in columns.column_names:
             raise KeyError(f"column {ref.alias}.{ref.column} is not among the "
                            f"request's relations")
-    return evaluate_expression(expression, columns)
-
-
-class RecombineRuntime:
-    """Run the configured exact answer relation join."""
-
-    def execute(self, node, inputs, context) -> NodeResult:
-        if not isinstance(node, Recombine):
-            raise TypeError(type(node).__name__)
-        if context.recombine is None:
-            answer_tables = []
-            survivors = {}
-            for input_port in node.inputs:
-                value = as_table(inputs[input_port.name])
-                if not isinstance(value, pa.Table):
-                    raise TypeError(
-                        "Recombine inputs must be Arrow tables"
-                    )
-                if input_port.value_type is ValueType.JOIN_ANSWERS:
-                    answer_tables.append(true_answer_rows(value))
-                elif input_port.value_type is ValueType.ROWS:
-                    alias = input_port.source.port.split(":", 1)[1]
-                    survivors[alias] = value.column(alias).combine_chunks()
-                else:
-                    raise TypeError(
-                        f"Recombine cannot read {input_port.value_type.value}"
-                    )
-            declaration, schema = build_result_declaration(
-                answer_tables,
-                survivors,
-                node.alias_order[0],
-            )
-            value = IndexRelation(declaration, schema)
-        else:
-            value = context.recombine(node, inputs)
-        return NodeResult({"tuples": value})
+    return expression.evaluate(columns)
 
 
 class ModelNodeRuntime:
@@ -113,8 +52,6 @@ class ModelNodeRuntime:
     def execute(self, node, inputs, context) -> NodeResult:
         if context.model_execution is None:
             raise RuntimeError("model node has no model execution object")
-        if context.model_inputs is not None:
-            inputs = context.model_inputs(node, inputs, context)
         result = context.model_execution.execute(node, inputs)
         if not isinstance(result, NodeResult):
             raise TypeError("model execution must return NodeResult")

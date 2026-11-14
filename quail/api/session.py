@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
-from quail.api.query import Query, QueryLike
+import os
+
+import _quail_native
+
+from quail.api.compile import SQLDialect
+from quail.api.config import EngineConfig, resolve_model
+from quail.api.query import QueryLike
 from quail.builtins import built_in_registry
-from quail.catalog import Catalog, InputStore, TableProvider
-from quail.catalog.tokens import GigatokenEncoder
+from quail.catalog import Catalog, TableProvider
+from quail.common.tokens import Tokenizer
 from quail.extensions import ExtensionRegistry
-from quail.frontend.prompts import PromptBinder
-from quail.frontend.sql import SQLDialect, compile_sql
-from quail.planner.plan import EngineConfig, Refusal, RefusalError, resolve_model
+from quail.physical.plan import Refusal, RefusalError
 from quail.specs.files import resolve_model_path
 
 
@@ -17,13 +21,14 @@ class Session:
     """Register tables and run queries, here or on Quail Server.
 
     Without ``endpoint`` every query runs in this process. With one,
-    ``register`` describes each table for the server, ``sql`` returns
-    a query that ``submit()`` sends there, and ``get_run`` reattaches
-    to an accepted query by id. The query API is the same either way.
+    such as ``grpc://127.0.0.1:8642``, ``register`` uploads each table
+    to the server over Arrow Flight, ``sql`` returns a query that
+    ``submit()`` sends there, and ``get_run`` reattaches to a submitted
+    query by id. The query API is the same either way.
     """
 
     def __init__(self, config: EngineConfig, *,
-                 tokenizer=None,
+                 tokenizer: str | os.PathLike | None = None,
                  registry: ExtensionRegistry | None = None,
                  endpoint: str | None = None):
         self.registry = registry or built_in_registry()
@@ -54,42 +59,29 @@ class Session:
                 unit="configurations",
             ))
         self.catalog = Catalog()
-        self._tokenizer = tokenizer      # injectable for tests
-        self.inputs = InputStore(
-            self.catalog, tokenizer=lambda: self.tokenizer,
-            tokenizer_name="configured tokenizer" if tokenizer else "Gigatoken")
+        self._tokenizer_directory = tokenizer
+        self._tokenizer = None
         self._remote = None
         if endpoint is not None:
             from quail.remote.client import RemoteConnection
 
-            self._remote = RemoteConnection(endpoint, self.registry.codecs)
-        elif tokenizer is None:
+            self._remote = RemoteConnection(endpoint)
+        else:
             _ = self.tokenizer
-            self.inputs.warm_tokenizer()
 
     @property
     def endpoint(self) -> str | None:
         """The Quail Server this session submits to, or None."""
         return None if self._remote is None else self._remote.client.endpoint
 
-    @property
-    def session_id(self) -> str | None:
-        """The id sent with every submission of a remote session, or None.
-
-        The server saves it on each record, so ``GET /v1/queries``
-        with ``session_id`` lists what this session submitted.
-        """
-        return None if self._remote is None else self._remote.session_id
-
     def close(self):
         """Wait for background tokenization and remove temporary token files.
 
-        Closing a remote session removes its staged uploads only; the
-        server keeps every accepted query and the inputs it needs.
+        Closing a remote session closes its connection only; the
+        server keeps its tables and every submitted query.
         """
         if self._remote is not None:
             self._remote.close()
-        self.inputs.close()
 
     def __enter__(self):
         return self
@@ -100,11 +92,7 @@ class Session:
     def register(self, name: str, provider: TableProvider) -> None:
         """Register a table under ``name``.
 
-        On a remote session the provider must be one the server can
-        read: an in-memory table, a Parquet, IPC, or Arrow dataset
-        (uploaded as a snapshot), or a Hugging Face dataset (pinned to a
-        revision). Any other provider raises TypeError here rather than
-        running locally.
+        A remote session uploads the provider's rows to the server.
         """
         self.catalog.register(name, provider)
         if self._remote is not None:
@@ -119,26 +107,28 @@ class Session:
         """Compile SQL locally or prepare it for remote submission.
 
         Returns:
-            A local ``Query`` when the session has no endpoint. A remote
-            session returns ``RemoteQuery`` and the server compiles the SQL.
+            A ``Query`` that this process plans and runs, or a
+            ``RemoteQuery`` the server compiles when the session has an
+            endpoint.
+
+        Raises:
+            ValueError: ``order`` is given on a remote session; the
+                server chooses each query's order.
         """
         if self._remote is not None:
             from quail.remote.client import RemoteQuery
 
-            return RemoteQuery(self, text, order=order,
-                               dialect=SQLDialect(dialect).value)
-        logical = compile_sql(
-            text, self.catalog, dialect=dialect,
-            prompts=PromptBinder(model=self.model),
-        )
-        return Query(self, logical, order=order)
+            if order is not None:
+                raise ValueError("a remote session does not take order")
+            return RemoteQuery(self, text, dialect=SQLDialect(dialect).value)
+        from quail.api.query import Query
+
+        query = Query(self, text, SQLDialect(dialect).value, order=order)
+        query.bound_whole()     # a statement that does not bind fails here
+        return query
 
     def get_run(self, query_id: str):
-        """Reattach to a query the server already accepted.
-
-        Returns a QueryRun; it never resubmits or starts another
-        execution.
-        """
+        """Return the run of a query the server already has, by its id."""
         if self._remote is None:
             raise RuntimeError(
                 "get_run() needs a Session with an endpoint; a local "
@@ -146,14 +136,36 @@ class Session:
         return self._remote.run(query_id)
 
     @property
-    def tokenizer(self):
-        """Return Gigatoken's encoder, loading it when first used.
+    def tokenizer_file(self) -> str:
+        """Return the path of the model's ``tokenizer.json``."""
+        from pathlib import Path
 
-        The encoder's ``decode`` attribute returns a token id list's text
-        as bytes; the planner uses it to find the word each label token
-        starts.
+        directory = self._tokenizer_directory or resolve_model_path(
+            self.model.hf_name, self.model.revision, include_weights=False)
+        return str(Path(directory) / "tokenizer.json")
+
+    @property
+    def planner(self):
+        """Return the Rust planner of this session's regions, made when first used.
+
+        It tokenizes with the session's ``tokenizer.json`` and keeps the
+        token stores of the tables its queries read whole.
+        """
+        if getattr(self, "_planner", None) is None:
+            self._planner = _quail_native.NativePlanner(self.tokenizer_file)
+        return self._planner
+
+    @property
+    def tokenizer(self):
+        """Return the model's tokenizer, loading it when first used.
+
+        It reads the ``tokenizer.json`` in the directory the session was
+        given, or else the model's. The encoder's ``decode`` attribute
+        returns a token id list's text as bytes; the planner uses it to
+        find the word each label token starts.
         """
         if self._tokenizer is None:
-            self._tokenizer = GigatokenEncoder(resolve_model_path(
-                self.model.hf_name, self.model.revision, include_weights=False))
+            directory = self._tokenizer_directory or resolve_model_path(
+                self.model.hf_name, self.model.revision, include_weights=False)
+            self._tokenizer = Tokenizer(directory)
         return self._tokenizer

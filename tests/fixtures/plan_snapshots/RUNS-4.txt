@@ -1,30 +1,34 @@
+DataFusion:
+SortPreservingMergeExec: [test_steps@1 DESC NULLS LAST, trace_id@0 ASC NULLS LAST], fetch=50
+  ProjectionExec: expr=[trace_id@0 as trace_id, count(Int64(1))@1 as test_steps]
+    SortExec: TopK(fetch=50), expr=[count(Int64(1))@1 DESC NULLS LAST, trace_id@0 ASC NULLS LAST], preserve_partitioning=[true]
+      FilterExec: count(Int64(1))@1 >= 3
+        AggregateExec: mode=FinalPartitioned, gby=[trace_id@0 as trace_id], aggr=[count(Int64(1))]
+          RepartitionExec: partitioning=Hash([trace_id@0], 4), input_partitions=4
+            AggregateExec: mode=Partial, gby=[trace_id@0 as trace_id], aggr=[count(Int64(1))]
+              RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+                ModelRegionExec: calls=[ai_filter], tables=[issue_messages@m]
+                  CoalescePartitionsExec
+                    FilterExec: role@1 = assistant, projection=[trace_id@0, content@2, id@3]
+                      DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
+
+model region:
 logical:
-  Limit: 50
-    Sort: test_steps DESC NULLS LAST, m.trace_id ASC NULLS LAST
-      Aggregate: group by m.trace_id; test_steps = count(*); having test_steps >= 3
-        Project: m.trace_id
-          SemanticFilter
-            PROMPT("DOCUMENT:\n{0}\n\nJudge strictly from the agent step above whether it runs the project's tests or a reproduction script.\n\nInstruction: answer TRUE if the step runs tests or a reproduction script, FALSE otherwise.", m.content) (selectivity=29.5%)
-            Scan issue_messages as m [content, trace_id, role] where m.role = 'assistant'
+  Projection: m.trace_id
+    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Judge strictly from the agent step above whether it runs the project's tests or a reproduction script.\n\n{0}\n\nInstruction: answer TRUE if the step runs tests or a reproduction script, FALSE otherwise."), m.content), named_struct(Utf8("selectivity"), Float64(0.2946534217550425))), filter: __quail_answer_1, returns: []
+      SubqueryAlias: m
+        TableScan: issue_messages@m
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
-  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
+  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                                        est. rows   est. pass   est. time
-  Sort: test_steps DESC NULLS LAST, m.trace_id ASC NULLS LAST
-    fetch=50
-    Aggregate: m.trace_id, test_steps
-      group by m.trace_id
-      test_steps = count(*)
-      having test_steps >= 3
-      Project: m.trace_id                                                   0.295
-        AiFilter: m                                                         0.295                 1.54 ms
-          KV rewind=on
-          predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')           1       29.5%
-          Scan issue_messages as m                                              1
-            tokens=144, mean_document_tokens=24
-            where m.role = 'assistant'
+                                                                  est. rows   est. pass   est. time
+  AiFilter: m                                                             0                   <1 ms
+    KV: not stored
+    predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')           0       29.5%
+    Scan issue_messages as m                                              0
+      tokens=0, mean_document_tokens=0
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

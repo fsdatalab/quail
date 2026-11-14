@@ -1,19 +1,16 @@
 """Run a query in the current process."""
 
 import atexit
+import json
 import os
 import time
 
 from quail.backends import BackendExecutionContext
+from quail.execution.finished import first_rows, reporting
+from quail.execution.result import QueryResult
 from quail.execution.types import PhysicalRequest, PhysicalResponse
-from quail.logical import WithCTE
-from quail.physical import (
-    ExecutionLocation,
-    Scan,
-    check_plan_envelope,
-    decode_graph,
-)
-from quail.planner.plan import Refusal, RefusalError
+from quail.physical import ExecutionLocation, Scan
+from quail.physical.plan import Refusal, RefusalError, graph_from_envelope
 
 
 class _BackendState:
@@ -68,9 +65,8 @@ def _validate_physical_request(request, registry):
     if not isinstance(request, PhysicalRequest):
         raise TypeError("execution requires a PhysicalRequest")
     envelope = request.plan
-    check_plan_envelope(envelope)
+    graph = graph_from_envelope(envelope)
     backend = registry.backend(envelope["backend"])
-    graph = decode_graph(envelope["graph"], registry.codecs)
     graph.validate(runtime_keys=set(registry.runtimes))
     graph.validate_backend(envelope["backend"])
     needed_inputs = {
@@ -102,32 +98,209 @@ def _execute_physical(request, registry):
     return response
 
 
-def execute_query(query, physical_executor=None, plan=None,
-                  on_backend_ready=None, on_execution_ready=None):
+def execute_query(query, physical_executor=None, on_backend_ready=None,
+                  on_execution_ready=None, on_rows=None, hint=None):
     """Execute one query in its session's process.
 
     Args:
         query: The Query to run.
         physical_executor: Optional callable(PhysicalRequest) that
             returns the PhysicalResponse, for tests without a GPU.
-        plan: An edited PhysicalPlan to run instead of the planner's.
         on_backend_ready: Optional callback after model preparation.
         on_execution_ready: Optional callback after backend preparation and
             immediately before query execution.
+        on_rows: Optional callable(pyarrow Table) handed a model region's
+            rows as they finish, each row once.
+        hint: Optional ``InputHint`` the region may skip the rows of the
+            tables it reads by.
     """
-    if isinstance(query.logical.root, WithCTE):
-        from quail.api.stages import execute_stages
+    from quail.api.query import Query
 
-        if plan is not None:
-            raise RuntimeError("edited query stage plans are not supported")
-        return execute_stages(query, physical_executor, on_backend_ready,
-                              on_execution_ready)
+    if isinstance(query, Query):
+        return _execute_in_datafusion(query, physical_executor,
+                                      on_backend_ready, on_execution_ready)
+    return _execute_region(query, physical_executor,
+                           on_backend_ready, on_execution_ready, on_rows, hint)
+
+
+def _execute_in_datafusion(query, physical_executor, on_backend_ready,
+                           on_execution_ready):
+    """Run a query's SQL in DataFusion, which calls back for each model region.
+
+    The result holds DataFusion's rows. A query of one model region also
+    carries that region's plan, metrics, and answers, and, when the region
+    is the whole query, the region's own rows, which keep Quail's added
+    columns such as a label's probabilities. A query of several model
+    regions retains each executed result in ``region_results``, keyed by its
+    query-local logical ID, and reports each report under ``regions``.
+    """
+    from quail.api.context import SessionContext
+
+    whole = query.bound_whole()
+    results, region_tables, region_s = [], [], []
+    region_results = {}
+    started = time.perf_counter()
+    from quail.api.query import backend_refusal
+
+    session = query.session
+    # Rust runs the regions of Quail's own backend on GPU workers
+    # itself. A request backend, and a callable that stands in for one,
+    # go through the Python engine.
+    workers_of = getattr(physical_executor, "start_workers", None)
+    rust_runs = (
+        query.num_regions > 0
+        and session.config.backend == "quail" and backend_refusal(session) is None
+        and (physical_executor is None or workers_of is not None))
+    if rust_runs:
+        def ready():
+            for called in (on_backend_ready, on_execution_ready):
+                if called is not None:
+                    called()
+
+        table, context, startup_s = _run_in_rust(
+            query, physical_executor, ready, results, region_tables,
+            region_s, region_results)
+        # starting the workers is model startup, not query time
+        return _query_result(query, context, table, whole, started + startup_s,
+                             results, region_tables, region_s, region_results)
+
+    def run_query(region, on_rows=None, hint=None):
+        if region.region_id is None or region.region_id in region_results:
+            raise RuntimeError("model region has a missing or duplicate logical ID")
+        region_started = time.perf_counter()
+        result = _execute_region(region, physical_executor,
+                                 on_backend_ready, on_execution_ready, on_rows, hint)
+        region_s.append(time.perf_counter() - region_started)
+        results.append(result)
+        region_results[region.region_id] = result
+        table = result.collect()
+        region_tables.append(table)
+        return table
+
+    context = SessionContext(query.session, order=query.order, run_query=run_query)
+    table = context.sql(query.text, query.dialect)
+    return _query_result(query, context, table, whole, started, results,
+                         region_tables, region_s, region_results)
+
+
+def _run_in_rust(query, source, ready, results, region_tables, region_s,
+                 region_results):
+    """Run a query whose model regions Rust runs on GPU workers.
+
+    Each region's QueryResult is built from what Rust kept of its run.
+
+    Args:
+        query: The Query.
+        source: None for the GPUs' workers, or a test's stand-in:
+            ``start_workers(gpus)`` returns workers under "workers",
+            ``report`` holds report fields to set, and ``close()`` stops
+            the workers.
+        ready: Callable() called once the workers have the model loaded
+            for a region.
+        results: Filled with each region's QueryResult, in run order.
+        region_tables: Filled with each region's rows.
+        region_s: Filled with each region's seconds.
+        region_results: Filled with each region's result by region id.
+
+    Returns:
+        The query's rows, the SessionContext that ran it, and the
+        seconds it took to start the workers.
+    """
+    from quail.api.context import SessionContext
+    from quail.api.region_inputs import region_query
+
+    session = query.session
+    config, registry = session.config, session.registry
+    backend = registry.backend(config.backend)
+    # the GPU check imports torch, which is startup as well
+    startup_started = time.perf_counter()
+    if source is None:
+        problem = gpu_problem()
+        if problem is not None:
+            raise RuntimeError(
+                f"cannot run the model on this machine: {problem}. "
+                "Run your Session on a machine with a CUDA GPU "
+                "and the backend installed.")
+    if source is None:
+        workers = backend.workers(config)
+    else:
+        workers = source.start_workers(config.gpus)["workers"]
+    # loading the tokenizer into the planner is startup as well
+    _ = session.planner
+    startup_s = time.perf_counter() - startup_started
+    try:
+        context = SessionContext(session, order=query.order, workers=workers)
+        context.when_ready(ready)
+        table = context.sql(query.text, query.dialect)
+        regions = context.take_regions()
+    finally:
+        if source is not None:
+            source.close()
+    for planned, scans, inputs, relation, ran, boots, seconds, total_s in regions:
+        found = json.loads(planned)
+        region = region_query(
+            session, found["operators"], logical=found.get("logical", ""),
+            order=query.order, tables=inputs, keep_order=True,
+            region_id=found.get("region_id"))
+        region.adopt_plan(found, scans)
+        report = backend.report_region(
+            region.plan(), ran, [json.loads(boot) for boot in boots], seconds,
+            registry.device(config.device))
+        if source is not None:
+            report.update(source.report)
+        response = PhysicalResponse(report.pop("_outputs"), report)
+        result = region.finish(response, seconds, relation=relation)
+        result.report.update(
+            planning_s=round(region.planning_s, 4),
+            input_ready_s=round(region.planning_s, 4),
+            physical_prepare_s=0.0, model_wall_s=result.report["wall_s"],
+            finish_s=0.0, worker_total_s=round(total_s, 4))
+        results.append(result)
+        region_tables.append(result.collect())
+        # the boot is the region's time, not DataFusion's
+        region_s.append(total_s)
+        region_results[region.region_id] = result
+    return table, context, startup_s
+
+
+def _query_result(query, context, table, whole, started, results, region_tables,
+                  region_s, region_results):
+    """Return a query's result from its rows and its regions' results."""
+    if len(results) != 1:
+        result = QueryResult.from_table(table, report={
+            "regions": [region_results[key].report for key in sorted(region_results)]
+        } if results else None)
+        result.region_results = region_results
+        return result
+    (region,) = results
+    # the time outside the region: building the context, planning the
+    # SQL, gathering the region's rows, and the operators around it
+    region.report["datafusion_s"] = round(
+        time.perf_counter() - started - region_s[0], 4)
+    result = QueryResult.from_table(region_tables[0] if whole else table,
+                                    report=region.report)
+    result.plan = region.plan
+    result.physical_plan = region.physical_plan
+    result.region_id = region.region_id
+    result.region_results = region_results
+    result.node_metrics = region.node_metrics
+    result.answer_tables = region.answer_tables
+    result.survivor_indices = region.survivor_indices
+    result.true_join_tables = region.true_join_tables
+    result.region_rows = region_tables[0].num_rows
+    if not whole:
+        result.datafusion_plan = context.explain(query.text, query.dialect)
+    return result
+
+
+def _execute_region(query, physical_executor, on_backend_ready,
+                    on_execution_ready, on_rows=None, hint=None):
+    """Execute one model region's Query in its session's process.
+
+    With ``on_rows``, the region's rows go to it as they finish, each
+    row once, and the result holds them all as well.
+    """
     total_started = time.perf_counter()
-    if plan is not None:
-        if isinstance(plan, Refusal) or not hasattr(plan, "graph"):
-            raise TypeError("plan must be a PhysicalPlan")
-        query.plan()            # tokenization and pair tables first
-        query._plan = plan
     plan = query.plan()
     if isinstance(plan, Refusal):
         raise RefusalError(plan)
@@ -151,16 +324,24 @@ def execute_query(query, physical_executor=None, plan=None,
         _prepare_backend(plan, query.session.registry)
     if has_compute and on_backend_ready is not None:
         on_backend_ready()
-    query.wait_for_tokens()
     physical_prepare_started = time.perf_counter()
     request = query._prepare_physical() if has_compute else None
     physical_prepare_s = time.perf_counter() - physical_prepare_started
     if on_execution_ready is not None:
         on_execution_ready()
     started = time.perf_counter()
+    finished = query.finished_rows(on_rows)
     if has_compute:
-        response = (physical_executor(request) if physical_executor is not None
-                    else _execute_physical(request, query.session.registry))
+        tables = {scan["alias"]: scan["provider"] for scan in query.facts()["scans"]}
+        first = {}
+        if hint is not None:
+            first = first_rows(request.column_tables(),
+                               plan.settings.get("deduplicate", {}))
+        # with no one taking rows as they finish, they are built at the end
+        with reporting(None if on_rows is None else finished, hint, tables,
+                       first):
+            response = (physical_executor(request) if physical_executor is not None
+                        else _execute_physical(request, query.session.registry))
     else:
         response = PhysicalResponse(
             {}, {"wall_s": 0.0, "fresh_tokens": 0, "cached_tokens": 0})
@@ -168,17 +349,17 @@ def execute_query(query, physical_executor=None, plan=None,
         raise TypeError("a physical executor must return PhysicalResponse")
     coordinator_wall_s = time.perf_counter() - started
     finish_started = time.perf_counter()
-    result = query.finish(response, coordinator_wall_s)
+    result = query.finish(response, coordinator_wall_s, finished)
     finish_s = time.perf_counter() - finish_started
     model_wall_s = result.report["wall_s"]
     result.report.update(
         planning_s=round(query.planning_s, 4),
-        input_ready_s=round(query.input_ready_s, 4),
+        # the planner tokenizes the inputs, so they are ready once planned
+        input_ready_s=round(query.planning_s, 4),
         physical_prepare_s=round(physical_prepare_s, 4),
         model_wall_s=model_wall_s,
         finish_s=round(finish_s, 4),
     )
-    result.report["token_wait_s"] = round(query.token_wait_s, 4)
     result.report["worker_total_s"] = round(
         time.perf_counter() - total_started, 4)
     return result
@@ -190,7 +371,7 @@ def _prepare_backend(plan, registry) -> None:
     prepare = getattr(backend, "prepare_request", None)
     if prepare is None:
         return
-    envelope = plan.to_envelope(registry.codecs)
+    envelope = plan.to_envelope()
     prepare(BackendExecutionContext(
         request=PhysicalRequest(envelope, {}),
         graph=plan.graph,

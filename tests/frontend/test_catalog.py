@@ -8,7 +8,7 @@ import pytest
 from datasets import Dataset
 
 from quail.catalog import DocumentProvider, ScanRequest
-from quail.logical import CompileError
+from quail.common.expressions import CompileError
 
 
 def test_table_provider_scans_and_validation(monkeypatch):

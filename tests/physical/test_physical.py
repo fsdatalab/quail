@@ -1,10 +1,9 @@
 """Physical planning and runtime extension test."""
 
 import copy
+import json
 import sys
 import types
-from dataclasses import dataclass, replace
-from typing import ClassVar
 
 import pyarrow as pa
 import pytest
@@ -12,29 +11,22 @@ import pytest
 import quail
 from quail.api.execute import _execute_physical
 from quail.builtins import built_in_registry
-from quail.catalog import DocumentProvider
+from quail.common.expressions import ColumnRef
 from quail.execution.metrics import NodeResult
 from quail.execution.runtimes import BarrierRuntime
 from quail.execution.types import PhysicalRequest, PhysicalResponse, document_input
-from quail.logical import ColumnRef
 from quail.physical import (
     Barrier,
-    ExecutionLocation,
+    ExtensionNode,
     InputPort,
     OutputPort,
     PhysicalGraph,
-    PhysicalNode,
     PortRef,
-    Project,
     Scan,
     ValueType,
-    decode_graph,
-    encode_graph,
-    plan_envelope,
+    decode_plan_value,
 )
-from quail.planner.optimizer.candidates import PhysicalCandidate, SupportResult
-from quail.planner.optimizer.rules import PhysicalRule
-from quail.planner.plan import EngineConfig, PhysicalPlan
+from quail.physical.plan import PhysicalPlan, graph_from_envelope
 
 
 @pytest.mark.parametrize("shape", ["cycle"])
@@ -42,7 +34,7 @@ def test_barrier_survivors_are_the_ids_of_a_complete_join(shape):
     """A survivor needs a partner in every join at once, whatever the relation order."""
     import itertools
 
-    from quail.physical.base import input_ports
+    from quail.physical import input_ports
 
     if shape == "disconnected":
         edges = [("a", "b", [(1, 0)]), ("c", "d", [(0, 1)])]
@@ -76,10 +68,9 @@ def test_barrier_survivors_are_the_ids_of_a_complete_join(shape):
 def test_hash_join_keeps_ids_apart_from_a_key_column_named_like_its_alias(aliases):
     from types import SimpleNamespace
 
-    from quail.catalog.pairs import columns_key
+    from quail.common.pairs import columns_key
     from quail.execution.runtimes.dataflow import HashJoinRuntime
-    from quail.physical import HashJoin
-    from quail.physical.base import input_ports
+    from quail.physical import HashJoin, input_ports
 
     left, right = aliases
     node = HashJoin(
@@ -95,19 +86,8 @@ def test_hash_join_keeps_ids_apart_from_a_key_column_named_like_its_alias(aliase
     assert result.outputs["pairs:0"].to_pydict() == {left: [1, 2], right: [2, 0]}
 
 
-@dataclass(frozen=True)
-class FirstDocuments(PhysicalNode):
-    alias: str = ""
-    count: int = 1
+FIRST_DOCUMENTS = "test.first_documents"
 
-    type_name: ClassVar[str] = "test.first_documents"
-    runtime_key: ClassVar[str] = type_name
-    location: ClassVar[ExecutionLocation] = ExecutionLocation.COORDINATOR
-
-    @property
-    def outputs(self):
-        return (OutputPort(f"rows:{self.alias}", ValueType.ROWS,
-                           schema=(self.alias,)),)
 
 class FirstDocumentsRuntime:
     def execute(self, node, inputs, context):
@@ -115,105 +95,45 @@ class FirstDocumentsRuntime:
         return NodeResult({f"rows:{node.alias}": documents[:node.count]})
 
 
-def local_plan(context, *, count, estimate, source):
+def local_plan(*, num_documents, count):
     def ids_from(node_id):
         return (InputPort("input:0", ValueType.ROWS,
                           PortRef(node_id, "rows:d"), schema=("d",)),)
 
     scan = Scan(node_id="input:d", alias="d", input_id="d",
-                num_documents=len(context.document_tokens["d"]))
-    filtered = FirstDocuments(
-        node_id="filter:d", inputs=ids_from("input:d"), alias="d", count=count)
-    project = Project(
-        node_id="project", inputs=ids_from("filter:d"), columns=("d.id",))
-    plan = PhysicalPlan(
-        model=context.model.name, device=context.device.name,
-        gpus=context.gpus, backend="local_filter",
-        estimated_seconds=estimate, nodes=(scan, filtered, project),
-        settings={"planner_source": source})
-    return PhysicalCandidate(plan.graph, plan, estimate)
+                num_documents=num_documents)
+    filtered = ExtensionNode(
+        FIRST_DOCUMENTS, "filter:d", inputs=ids_from("input:d"),
+        outputs=(OutputPort("rows:d", ValueType.ROWS, schema=("d",)),),
+        alias="d", count=count)
+    return PhysicalPlan(model="qwen3-4b-fp8", device="h100-sxm", gpus=1,
+                        nodes=(scan, filtered))
 
 
-class LocalFilterBackend:
-    name = "local_filter"
-
-    def __init__(self):
-        self.called = False
-
-    def supports(self, model, device, gpus):
-        return SupportResult.accept()
-
-    def plan(self, region, context):
-        self.called = True
-        return (local_plan(context, count=1, estimate=0.0, source="backend"),)
-
-
-class PreferredPlanner:
-    name = "preferred"
-
-    def __init__(self):
-        self.called = False
-
-    def plan(self, region, context):
-        self.called = True
-        return (local_plan(
-            context, count=2, estimate=-1.0, source="preferred planner"),)
-
-
-class KeepFirstDocument(PhysicalRule):
-    name = "keep_first_document"
-
-    def rewrite(self, graph, context):
-        return PhysicalGraph(
-            tuple(replace(node, count=1) if isinstance(node, FirstDocuments)
-                  else node for node in graph.nodes),
-            graph.root)
-
-
-def test_physical_extensions_plan_validate_and_execute(monkeypatch):
+def test_an_extension_node_encodes_validates_and_runs(monkeypatch):
     registry = quail.ExtensionRegistry.with_built_ins()
-    backend = LocalFilterBackend()
-    planner = PreferredPlanner()
-    registry.register_backend(backend)
-    registry.register_physical_planner(planner)
-    registry.register_physical_rule(KeepFirstDocument())
-    registry.register_node(FirstDocuments, runtime=FirstDocumentsRuntime())
-    session = quail.Session(
-        EngineConfig(gpus=1, model="qwen3-4b-fp8", backend="local_filter",
-                     device="h100-sxm"),
-        tokenizer=str.split,
-        registry=registry,
-    )
-    session.register("documents", DocumentProvider.from_table(
-        pa.table({"id": ["a", "b"], "body": ["one", "two"]}),
-        id_col="id", identity="local-filter-docs"))
-    query = session.sql(
-        "SELECT d.id FROM documents d WHERE AI_FILTER(PROMPT('ok {0}', d.body))")
-    plan = query.plan()
-    envelope = plan.to_envelope(registry.codecs)
+    registry.register_runtime(FirstDocumentsRuntime(), key=FIRST_DOCUMENTS)
+    plan = local_plan(num_documents=2, count=1)
+    envelope = plan.to_envelope()
+    assert graph_from_envelope(envelope) == plan.graph
+    plan.graph.validate(runtime_keys=set(registry.runtimes))
+    result = FirstDocumentsRuntime().execute(
+        plan.nodes[1], {"input:0": ["a", "b"]}, None)
+    assert result.outputs == {"rows:d": ["a"]}
+    assert "test.first_documents" in plan.graph.to_json()
 
-    assert backend.called
-    assert planner.called
-    assert plan.settings["planner_source"] == "preferred planner"
-    # the registered extension rule rewrote the planner's node
-    firsts = [node for node in plan.nodes if isinstance(node, FirstDocuments)]
-    assert firsts and all(node.count == 1 for node in firsts)
-    assert decode_graph(envelope["graph"], registry.codecs) == plan.graph
-
-    registry = built_in_registry()
     scan = Scan(node_id="input:d", alias="d", input_id="d", num_documents=1,
-                shard_ranges=((0, 1),), shard_token_loads=(1,))
-    plan = PhysicalGraph((scan,), PortRef("input:d", "rows:d"))
-    encoded = encode_graph(plan, registry.codecs)
+                total_tokens=1)
+    encoded = json.loads(PhysicalGraph((scan,), PortRef("input:d", "rows:d")).to_json())
     missing = copy.deepcopy(encoded)
-    del missing["nodes"][0]["attributes"]["shard_ranges"]
-    with pytest.raises(ValueError, match="missing fields"):
-        decode_graph(missing, registry.codecs)
+    del missing["nodes"][0]["attributes"]["total_tokens"]
+    with pytest.raises(ValueError, match="missing field"):
+        PhysicalGraph.from_json(json.dumps(missing))
 
     extra = copy.deepcopy(encoded)
-    extra["nodes"][0]["unused"] = True
-    with pytest.raises(ValueError, match="unknown fields"):
-        decode_graph(extra, registry.codecs)
+    extra["nodes"][0]["attributes"]["unused"] = True
+    with pytest.raises(ValueError, match="unknown field"):
+        PhysicalGraph.from_json(json.dumps(extra))
 
     class ExampleBackend:
         name = "test.example"
@@ -230,13 +150,18 @@ def test_physical_extensions_plan_validate_and_execute(monkeypatch):
     monkeypatch.setitem(sys.modules, module.__name__, module)
     registry = built_in_registry()
     scan = Scan(node_id="input:d", alias="d", input_id="d", num_documents=2)
-    graph = PhysicalGraph((scan,), PortRef("input:d", "rows:d"))
+    plan = PhysicalPlan(model="qwen3-4b-fp8", device="h100-sxm", gpus=1,
+                        backend=ExampleBackend.name, nodes=(scan,))
     request = PhysicalRequest(
-        plan_envelope(backend=ExampleBackend.name, model="qwen3-4b-fp8",
-                      device="h100-sxm", gpus=1, graph=graph,
-                      codecs=registry.codecs),
-        {"d": document_input(pa.array([[1], [2]]))},
-    )
+        plan.to_envelope(), {"d": document_input(pa.array([[1], [2]]))})
     registry.load_extension(module)
     response = _execute_physical(request, registry)
     assert response.metrics == {"backend": "test.example", "nodes": ["input:d"]}
+
+
+def test_a_plan_saved_before_the_expressions_moved_still_decodes():
+    column = ColumnRef("r", "reviews", "stars")
+    saved = json.loads(column.to_json())
+    saved["type"] = saved["type"].replace(
+        "quail.common.expressions", "quail.logical.expressions")
+    assert decode_plan_value(json.dumps(saved)) == column

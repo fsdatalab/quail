@@ -1,25 +1,22 @@
-"""The SQL front end: dialects, plan shapes, and named errors."""
+"""The SQL front end: dialects, the operators a query derives, and named errors."""
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from helpers.oracle import question_text
+from helpers.planning import compile_sql, placements, read_operators
+from helpers.sessions import CONFIG, TOKENIZER
 
+import quail
+from quail.api.compile import SQLDialect
 from quail.catalog import Catalog, DocumentProvider
-from quail.frontend.sql import SQLDialect, compile_sql
-from quail.logical import (
-    ColumnRef,
-    CompileError,
-    Join,
-    Project,
-    Scan,
-    SemanticFilter,
-    SemanticJoin,
-    join_conditions,
-    join_outer_input,
-)
-from quail.planner.optimizer.context import PlanningContext
-from quail.planner.optimizer.tree_rewrites import logical_alternatives
-from quail.planner.rules import built_in_rules
+from quail.common.expressions import ColumnRef, CompileError
+from quail.physical import AiFilter, AiJoin
+
+
+def compile_operators(*args, **options):
+    """Compile SQL and read its region's operators."""
+    return read_operators(compile_sql(*args, **options))
 
 
 @pytest.fixture()
@@ -51,7 +48,7 @@ THREE_WAY_TEMPLATE = ("Review {0} praises the thread in {1} and the "
 THREE_WAY_ON = """
     SELECT a.id, b.id, p.asin
     FROM reviews a
-    JOIN threads b
+    CROSS JOIN threads b
     JOIN products p
       ON AI_FILTER(PROMPT('%s', a.review, b.thread, p.description),
                    {'selectivity': 0.02, 'anchor': 'b'})
@@ -66,31 +63,29 @@ THREE_WAY_WHERE = """
 
 
 def test_sql_dialects_and_join_spellings_produce_the_same_plan(catalog):
-    plan = compile_sql(FILTER_JOIN_SQL, catalog)
-    root = plan.root
-    assert isinstance(root, Project)
-    assert [(c.alias, c.column) for c in root.columns] == \
+    found = compile_operators(FILTER_JOIN_SQL, catalog)
+    assert [(c.alias, c.column) for c in found.projection.columns] == \
         [("r", "id"), ("p", "asin")]
-    join = root.input
-    assert isinstance(join, SemanticJoin)
+    (join,) = found.joins
     assert (join.semantics, join.selectivity, join.anchor) == ("full", 0.05, None)
     # no ON equality means every pair is a candidate
-    pairs = join.input
-    assert isinstance(pairs, Join) and pairs.on == ()
-    filt = pairs.left
-    assert isinstance(filt, SemanticFilter)
-    assert filt.predicates[0].selectivity == 0.3
-    assert (filt.input.provider, str(filt.input.column)) == ("reviews", "r.review")
-    assert (pairs.right.provider, str(pairs.right.column)) == \
+    assert join.on == ()
+    assert join.outer_aliases == ("r",)
+    ((alias, (predicate,)),) = found.filters
+    assert (alias, predicate.selectivity) == ("r", 0.3)
+    assert found.filters_before_joins == (("r", (True,)),)
+    scans = {scan.alias: scan for scan in found.scans}
+    assert (scans["r"].provider, str(scans["r"].column)) == ("reviews", "r.review")
+    assert (scans["p"].provider, str(scans["p"].column)) == \
         ("products", "p.description")
     # the join template is the per-tuple question and is never canonicalized
-    assert join.prompt.template == "Review {0} discusses product {1}"
+    assert join.predicate.prompt.template == "Review {0} discusses product {1}"
 
-    star = compile_sql(
+    star = compile_operators(
         "SELECT * FROM reviews r WHERE "
         "AI_FILTER(PROMPT('neg: {0}', r.review))", catalog)
-    assert [(c.alias, c.column) for c in star.root.columns] == \
-        [("r", "id"), ("r", "review")]
+    assert [(c.alias, c.column) for c in star.projection.columns] == [
+        ("r", "id"), ("r", "review")]
 
     snowflake = compile_sql(
         "SELECT r.id FROM reviews r WHERE "
@@ -105,17 +100,13 @@ def test_sql_dialects_and_join_spellings_produce_the_same_plan(catalog):
 
     # one prompt, three placeholders, all three documents in the same
     # model call - never a sequence of pairwise stages
-    on_plan = compile_sql(THREE_WAY_ON, catalog)
-    join = on_plan.root.input
-    assert isinstance(join, SemanticJoin)
+    on_found = compile_operators(THREE_WAY_ON, catalog)
+    (join,) = on_found.joins
     assert (join.anchor, join.selectivity) == ("b", 0.02)
-    outer_pairs = join.input
-    assert isinstance(outer_pairs, Join) and outer_pairs.on == ()
-    assert isinstance(outer_pairs.left, Join)
-    assert isinstance(outer_pairs.left.left, Scan)
-    assert isinstance(join_outer_input(join), Scan)
-    assert [r.alias for r in join.prompt.args] == ["a", "b", "p"]
-    assert on_plan == compile_sql(THREE_WAY_WHERE, catalog)
+    assert join.on == ()
+    assert join.outer_aliases == ("a",)
+    assert [r.alias for r in join.predicate.prompt.args] == ["a", "b", "p"]
+    assert compile_sql(THREE_WAY_ON, catalog) == compile_sql(THREE_WAY_WHERE, catalog)
 
 
 TWO_ONS = """
@@ -150,14 +141,12 @@ PAIR_JOIN_SQL = """
 
 def test_join_predicates_semantics_and_equality_pruning(catalog):
     # a sequence: each multi-table AI_FILTER is its own pairwise join
-    plan = compile_sql(TWO_ONS, catalog)
-    outer = plan.root.input
-    inner = join_outer_input(outer)
-    assert isinstance(outer, SemanticJoin) and isinstance(inner, SemanticJoin)
-    assert [r.alias for r in inner.prompt.args] == ["a", "b"]
-    assert [r.alias for r in outer.prompt.args] == ["b", "p"]
+    inner, outer = compile_operators(TWO_ONS, catalog).joins
+    assert [r.alias for r in inner.predicate.prompt.args] == ["a", "b"]
+    assert [r.alias for r in outer.predicate.prompt.args] == ["b", "p"]
     assert inner.selectivity == 0.5 and outer.selectivity == 0.2
-    assert plan == compile_sql(TWO_WHERE, catalog)
+    assert (inner.outer_aliases, outer.outer_aliases) == (("a",), ("a", "b"))
+    assert compile_sql(TWO_ONS, catalog) == compile_sql(TWO_WHERE, catalog)
 
     sql = """
         SELECT t.id FROM threads t
@@ -167,53 +156,41 @@ def test_join_predicates_semantics_and_equality_pruning(catalog):
                                                  t.thread,
                                                  s.description)))
     """
-    plan = compile_sql(sql, catalog)
-    join = plan.root.input
-    assert isinstance(join, SemanticJoin)
+    found = compile_operators(sql, catalog)
+    (join,) = found.joins
     # the gate applies to the outer table, so it always anchors there
     assert (join.semantics, join.anchor) == ("anti", "t")
-    outer = join_outer_input(join)
-    assert isinstance(outer, SemanticFilter)
-    assert outer.predicates[0].prompt.template.endswith("good:")
+    assert join.outer_aliases == ("t",)
+    ((alias, (predicate,)),) = found.filters
+    assert alias == "t" and predicate.prompt.template.endswith("good:")
     exists_sql = sql.replace("NOT EXISTS", "EXISTS")
-    assert compile_sql(exists_sql, catalog).root.input.semantics == "exists"
+    assert compile_operators(exists_sql, catalog).joins[0].semantics == "exists"
     anchored_sql = exists_sql.replace(
         "s.description)))", "s.description), {'anchor': 's'}))")
     with pytest.raises(CompileError, match="outer table"):
-        compile_sql(anchored_sql, catalog)
+        compile_operators(anchored_sql, catalog)
 
     # two predicates over the same two tables: a pair must answer TRUE
     # to both, and only the first carries the joined table into the tree
-    plan = compile_sql(
+    inner, outer = compile_operators(
         "SELECT r.id FROM reviews r JOIN products p ON AI_FILTER("
         "PROMPT('x {0} {1}', r.review, p.description)) "
         "WHERE AI_FILTER(PROMPT('y {0} {1}', r.review, p.description))",
-        catalog)
-    outer = plan.root.input
-    inner = outer.input
-    assert isinstance(outer, SemanticJoin) and isinstance(inner, SemanticJoin)
-    assert isinstance(inner.input, Join)
-    assert [r.alias for r in inner.prompt.args] == ["r", "p"]
-    assert [r.alias for r in outer.prompt.args] == ["r", "p"]
+        catalog).joins
+    assert [r.alias for r in inner.predicate.prompt.args] == ["r", "p"]
+    assert [r.alias for r in outer.predicate.prompt.args] == ["r", "p"]
+    assert (inner.outer_aliases, outer.outer_aliases) == (("r",), ("r", "p"))
 
     # an ON equality prunes the pairs before the AI predicate sees them
-    plan = compile_sql(PAIR_JOIN_SQL, catalog)
-    join = plan.root.input
-    assert isinstance(join, SemanticJoin)
-    pairs = join.input
-    assert isinstance(pairs, Join)
-    assert [str(condition) for condition in pairs.on] == ["r.id = p.asin"]
-    assert join_conditions(join) == pairs.on
-    assert pairs.on[0].left == ColumnRef("r", "reviews", "id")
-    assert pairs.on[0].right == ColumnRef("p", "products", "asin")
+    (join,) = compile_operators(PAIR_JOIN_SQL, catalog).joins
+    assert [str(condition) for condition in join.on] == ["r.id = p.asin"]
+    assert join.on[0].left == ColumnRef("r", "reviews", "id")
+    assert join.on[0].right == ColumnRef("p", "products", "asin")
     # the equality columns are loaded as values for the pair table
-    candidate, = logical_alternatives(
-        plan, built_in_rules(), PlanningContext(catalog=catalog))
-    optimized, _ = candidate.plan, candidate.rules
-    scans = {node.alias: node for node in optimized.walk()
-             if isinstance(node, Scan)}
+    candidate, = placements(compile_sql(PAIR_JOIN_SQL, catalog))
+    scans = {scan.alias: scan for scan in candidate.found.scans}
     assert "id" in scans["r"].columns and "asin" in scans["p"].columns
-    where_plan = compile_sql("""
+    written_in_where = compile_sql("""
         SELECT r.id, p.asin FROM reviews r
         JOIN products p ON r.id = p.asin
         WHERE AI_FILTER(PROMPT('Review {0} discusses product {1}',
@@ -221,31 +198,38 @@ def test_join_predicates_semantics_and_equality_pruning(catalog):
                         {'selectivity': 0.05})
           AND AI_FILTER(PROMPT('This review is negative: {0}', r.review))
     """, catalog)
-    assert where_plan == plan
+    assert written_in_where == compile_sql(PAIR_JOIN_SQL, catalog)
 
 
-def test_the_frontend_binds_parts_as_written_and_the_rule_places_them(catalog):
-    from quail.frontend.sql import bind_relation
-    from quail.logical import And, Filter, ModelCall, RegularPredicate
-    from quail.logical.naive import Hint
-
+def test_each_part_of_a_where_or_on_clause_goes_to_the_operator_that_tests_it(
+        catalog):
     sql = FILTER_JOIN_SQL + " AND r.id <> 'z'"
-    relation = bind_relation(sql, catalog)
-    # one Filter over the join holds every part, the ON predicate first
-    assert isinstance(relation, Filter) and isinstance(relation.input, Join)
-    assert [scan.alias for scan in relation.input.children()] == ["r", "p"]
-    parts = relation.condition.operands
-    assert isinstance(relation.condition, And) and len(parts) == 3
-    assert isinstance(parts[0], Hint) and parts[0].selectivity == 0.05
-    assert isinstance(parts[0].condition, ModelCall)
-    assert parts[0].condition.aliases() == ("r", "p")
-    assert isinstance(parts[2], RegularPredicate)
-    # the rule puts the column test in the Scan, the one-table AI.IF in a
-    # SemanticFilter, and the two-table AI.IF in a SemanticJoin
-    plan = compile_sql(sql, catalog)
-    scans = {node.alias: node for node in plan.walk() if isinstance(node, Scan)}
-    assert [str(p) for p in scans["r"].predicates] == ["r.id <> 'z'"]
-    (gate,) = [node for node in plan.walk() if isinstance(node, SemanticFilter)]
-    assert [p.selectivity for p in gate.predicates] == [0.3]
-    (join,) = [node for node in plan.walk() if isinstance(node, SemanticJoin)]
+    # DataFusion runs the column test before the region, the one-table
+    # AI.IF is an AI filter, and the two-table AI.IF an AI join
+    found = compile_operators(sql, catalog)
+    scans = {scan.alias: scan for scan in found.scans}
+    assert scans["r"].predicates == ()
+    ((_, predicates),) = found.filters
+    assert [p.selectivity for p in predicates] == [0.3]
+    (join,) = found.joins
     assert join.selectivity == 0.05
+    # a join with two AI predicates in its ON plans both
+    with quail.Session(CONFIG, tokenizer=TOKENIZER) as session:
+        for name, provider in catalog.providers.items():
+            session.register(name, provider)
+        query = session.sql("""
+            SELECT r.id FROM reviews r JOIN products p
+            ON AI_FILTER(PROMPT('x {0} {1}', r.review, p.description))
+            AND AI_FILTER(PROMPT('y {0} {1}', r.review, p.description))
+        """)
+        questions = []
+        for region in query.regions():
+            for node in region.plan().nodes:
+                if isinstance(node, AiFilter):
+                    questions.append(question_text(node.question_token_ids))
+                elif isinstance(node, AiJoin):
+                    questions.append(question_text([
+                        *node.frame_token_ids, *node.tail_token_ids]))
+        assert len(questions) == 2
+        assert any("x" in question.split() for question in questions)
+        assert any("y" in question.split() for question in questions)

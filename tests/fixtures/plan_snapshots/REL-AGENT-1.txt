@@ -1,21 +1,27 @@
+DataFusion:
+CooperativeExec
+  ModelRegionExec: calls=[ai_filter], tables=[agent_traces@t]
+    CoalescePartitionsExec
+      FilterExec: turn_index@2 >= 10 AND token_count@3 <= 6000, projection=[id@0, trace@1]
+        DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
+
+model region:
 logical:
-  Project: t.id
-    SemanticFilter
-      PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the agent trace above whether the agent recovered after pursuing an approach that did not work. Recovery means the agent recognized or moved past the unsuccessful approach and then made useful progress with a different or corrected approach.\n\nInstruction: answer TRUE if the trace shows the agent recovering after an unsuccessful approach, FALSE otherwise.', t.trace) (selectivity=32.2%)
-      Scan agent_traces as t [trace, id, turn_index, token_count] where t.turn_index >= 10 and t.token_count <= 6000
+  Projection: t.id
+    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Judge strictly from the agent trace above whether the agent recovered after pursuing an approach that did not work. Recovery means the agent recognized or moved past the unsuccessful approach and then made useful progress with a different or corrected approach.\n\n{0}\n\nInstruction: answer TRUE if the trace shows the agent recovering after an unsuccessful approach, FALSE otherwise."), t.trace), named_struct(Utf8("selectivity"), Float64(0.3216704288939052))), filter: __quail_answer_1, returns: []
+      SubqueryAlias: t
+        TableScan: agent_traces@t
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
-  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
+  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                                    est. rows   est. pass   est. time
-  Project: t.id                                                         0.322
-    AiFilter: t                                                         0.322                 2.74 ms
-      KV: not stored
-      predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')           1       32.2%
-      Scan agent_traces as t                                                1
-        tokens=78, mean_document_tokens=13
-        where t.turn_index >= 10 and t.token_count <= 6000
+                                                                  est. rows   est. pass   est. time
+  AiFilter: t                                                             0                   <1 ms
+    KV: not stored
+    predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')           0       32.2%
+    Scan agent_traces as t                                                0
+      tokens=0, mean_document_tokens=0
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

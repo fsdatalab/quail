@@ -36,16 +36,18 @@ jobs:
           git config --global
           url."https://x-access-token:${{ secrets.QUAILB_TOKEN }}@github.com/".insteadOf
           "https://github.com/"
-      - run: uv sync --frozen
-      - name: Lint (ruff)
-        run: uv run --frozen ruff check quail bench calibrate tests experiments tools
-      - name: Long string literals
-        run: uv run --frozen python tools/check_long_strings.py
-      - name: Names (check_names)
-        run: uv run --frozen python tools/check_names.py
-      - name: Dead code (vulture)
-        run: uv run --frozen vulture
-      - name: Import direction (import-linter)
-        run: uv run --frozen lint-imports
-      - name: Tests
-        run: uv run --frozen pytest -q
+      - uses: Swatinem/rust-cache@v2
+      # .cargo/config.toml links Linux builds with clang and lld
+      - run: sudo apt-get update && sudo apt-get install -y clang lld
+      # builds _quail_native and quail-server with the Rust that
+      # rust-toolchain.toml pins; cargo test reuses the dependencies
+      - run: tools/build.sh --compile
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      - run: uv run --no-sync ruff check quail bench calibrate tests experiments tools
+      - run: uv run --no-sync python tools/check_long_strings.py
+      - run: uv run --no-sync python tools/check_names.py
+      - run: uv run --no-sync vulture
+      - run: uv run --no-sync lint-imports
+      - run: uv run --no-sync pytest -q

@@ -7,7 +7,7 @@ import pytest
 from quail.backends.quail.executor.pages import PageArena
 
 
-def test_allocation_retention_rewind_and_pinning():
+def test_pages_are_allocated_retained_rewound_pinned_and_borrowed_until_freed():
     a = PageArena(num_pages=10, page_tokens=16)
     pages = a.alloc("d0", 40)      # 3 pages
     assert len(pages) == 3
@@ -79,8 +79,7 @@ def test_allocation_retention_rewind_and_pinning():
 
     assert a.pop_retained_victim() is None
 
-
-def test_borrowed_pages_are_shared_until_the_last_holder_frees_them():
+    # borrowed pages are shared until the last holder frees them
     a = PageArena(num_pages=10, page_tokens=16)
     parent = a.alloc("p", 40)                 # pages for 40 tokens: 3
     child = a.alloc("c", 50, borrowed=a.shared_pages("p", 32))  # borrows 2, owns 2

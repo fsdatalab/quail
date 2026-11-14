@@ -1,20 +1,19 @@
 logical:
-  Project: d.id
-    SemanticFilter
-      PROMPT("DOCUMENT:\n{0}\n\nJudge strictly from the excerpt above whether it argues that the cited case's reasoning does not apply here.\n\nInstruction: answer TRUE if the excerpt argues the cited case's reasoning does not apply here, FALSE otherwise.", d.destination_context) (selectivity=2.8%)
-      Scan citation_contexts as d [destination_context, id]
+  Projection: d.id
+    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Judge strictly from the excerpt above whether it argues that the cited case's reasoning does not apply here.\n\n{0}\n\nInstruction: answer TRUE if the excerpt argues the cited case's reasoning does not apply here, FALSE otherwise."), d.destination_context), named_struct(Utf8("selectivity"), Float64(0.028))), filter: __quail_answer_1, returns: []
+      SubqueryAlias: d
+        TableScan: citation_contexts projection=[id, destination_context]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
-  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
+  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                                    est. rows   est. pass   est. time
-  Project: d.id                                                         0.168
-    AiFilter: d                                                         0.168                  9.8 ms
-      KV rewind=on
-      predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')           6        2.8%
-      Scan citation_contexts as d                                           6
-        tokens=108, mean_document_tokens=18
+                                                                  est. rows   est. pass   est. time
+  AiFilter: d                                                         0.168                 9.17 ms
+    KV: not stored
+    predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')           6        2.8%
+    Scan citation_contexts as d                                           6
+      tokens=96, mean_document_tokens=16
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

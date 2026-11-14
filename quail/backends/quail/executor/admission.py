@@ -2,12 +2,13 @@
 
 JoinAdmission serves joins, filter sequences, and classifications.
 It prioritizes unfinished requests, then documents entering their next
-stage, then new documents. Suffix requests are never split across chunks.
+stage, then the chunked prefills of documents too long for one forward
+pass, then new documents. Suffix requests are never split across chunks.
 Tensor construction is handled by chunk.py.
 """
 
 from bisect import bisect_right
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass
 
 import numpy as np
@@ -24,6 +25,21 @@ class OwnRequests(list):
     def __init__(self, lengths):
         super().__init__(range(len(lengths)))
         self.lengths = np.asarray(lengths, dtype=np.int64)
+
+
+class OversizedDocumentError(ValueError):
+    """A document too large for the whole arena, or, unpaged, for one forward pass.
+
+    Attributes:
+        anchor: The document's anchor index.
+        reason: What it exceeds.
+    """
+
+    def __init__(self, anchor: int, reason: str):
+        super().__init__(f"document {anchor}: {reason}")
+        self.anchor = anchor
+        self.reason = reason
+
 
 def pages_for(tokens: int, page_tokens: int) -> int:
     """Pages needed for `tokens` rows (suffix KV is never paged)."""
@@ -70,11 +86,23 @@ class Borrowing:
     def __init__(self, n, tree=None, can_borrow=None):
         self.tree_parent = [None] * n if tree is None else list(tree.parent)
         self.tree_shared = [0] * n if tree is None else list(tree.shared)
+        self.tree = tree
         self.can_borrow = can_borrow
         self.admitted = set()
         self.skipped = set()       # documents that never run a chunk
+        # documents whose prefix is still being written by a chunked
+        # prefill: a borrower waits until every page of it is written
+        self.prefilling = set()
         self.chosen = {}           # admitted borrower -> (parent, shared)
         self.borrowed_tokens = 0   # prefix tokens read from a parent
+
+    @property
+    def order(self):
+        """Document positions in admission order, or None for position order.
+
+        A tree that shares nothing leaves the documents in position order.
+        """
+        return None if self.tree is None else self.tree.order
 
     def detach(self, document):
         """The document's KV is already resident, so it borrows nothing."""
@@ -98,7 +126,7 @@ class Borrowing:
         parent = self.tree_parent[document]
         if parent is None or parent in self.skipped:
             return None
-        if parent not in self.admitted:
+        if parent not in self.admitted or parent in self.prefilling:
             return self.WAIT
         if self.can_borrow is not None and not self.can_borrow(
                 document, parent, parent in chunk):
@@ -149,6 +177,13 @@ class AdmissionReport:
 
     settlements: tuple[Settlement, ...] = ()
     transitions: tuple[tuple[int, int, bool], ...] = ()
+
+
+def _stop_counts(group) -> Counter:
+    """An anchor's copies in each stop key group; empty for None."""
+    if group is None:
+        return Counter()
+    return Counter(group if isinstance(group, tuple) else (group,))
 
 
 class JoinAdmission:
@@ -202,12 +237,23 @@ class JoinAdmission:
             stage, or None. Under a limit, anchors are admitted only
             while the ones in flight are expected to fall short of it;
             None admits every anchor that fits.
-        stop_groups: Per anchor, its stop key group, or None. At most
-            stop_width anchors of a group are admitted at a time, and
-            once one survives the last stage the group's queued anchors
-            are skipped: they never run and take_skipped() lists them.
+        stop_groups: Per anchor, its stop key group, or None. An anchor
+            that stands for copies in several groups gives a tuple with
+            one group per copy, so a group may repeat; an anchor whose
+            entry is None has no stop key and is never held or skipped
+            for one. An anchor is
+            admitted while one of its groups has fewer than stop_width
+            anchors in flight. A surviving anchor counts once for each
+            of its copies in a group; once a group has num_key_survivors
+            survivors, a queued anchor whose groups are all done is
+            skipped: it never runs and take_skipped() lists it.
         stop_width: Anchors of one group in flight at once; the caller
             widens it when the groups are too few to fill a chunk.
+        num_key_survivors: How many anchors of a stop key group must
+            survive before its queued anchors are skipped.
+        skip: Optional callable(anchor) -> bool asked each time a fresh
+            anchor would be admitted; True skips it: it never runs and
+            take_skipped() lists it.
         extra_tokens: Rows past the prefix an anchor's pages must
             cover, when more than its largest frame: a stage whose
             one suffix is written into the anchor's own pages.
@@ -224,10 +270,25 @@ class JoinAdmission:
         dependencies: Dependent anchor -> (parent anchor, start stage). A
             dependent waits for its parent's launch at that stage, runs only
             that stage, and is excluded from limits and survival estimates.
+        chunked_prefill: Whether a fresh anchor whose prefix and first
+            request exceed the chunk budget writes its prefix over
+            several passes (see take_prefills); otherwise it raises
+            OversizedDocumentError.
+        start_stages: Per anchor, the stage it starts at, or None to
+            start every anchor at the first stage.
+        one_stage: Whether each anchor asks only its start stage and
+            settles there, as a whole-sequence pass does; a limit then
+            counts the anchors that survive the last stage.
 
     Each chunk fills in priority order: partner streams cut by the
-    previous chunk, then anchors starting their next stage, then
-    fresh anchors whose pages fit the free list. Requests skipped for token
+    previous chunk, then anchors starting their next stage, then the
+    next pieces of chunked prefills, then fresh anchors whose pages
+    fit the free list. A fresh anchor too long for one pass is
+    admitted like any other, its pages reserved whole, and writes its
+    prefix in pieces that fill the room left in each pass, as vLLM's
+    chunked prefill does; its first request runs in the pass after the
+    last piece, as a resident anchor's would, and its borrowers wait
+    for that pass. Requests skipped for token
     space take priority in the next chunk. Pages are granted in queue order.
     An anchor advances to its next stage once its whole stream is launched
     and one partner has answered TRUE; the remaining answers fill in
@@ -244,7 +305,8 @@ class JoinAdmission:
                  tree=None, can_borrow=None, advance=None,
                  frame_writes=None, limit=None, survival=None, extra_tokens=None,
                  stop_groups=None, stop_width=1, reserve=None, dependencies=None,
-                 gated=()):
+                 gated=(), num_key_survivors=1, skip=None,
+                 chunked_prefill=False, start_stages=None, one_stage=False):
         k = len(stage_suffixes)
         self.answer_dtypes = (list(answer_dtype) if isinstance(answer_dtype, list)
                               else [answer_dtype] * k)
@@ -259,16 +321,20 @@ class JoinAdmission:
         for anchor, (parent, stage) in self.dependencies.items():
             self.dependents.setdefault((parent, stage), []).append(anchor)
         self.advance = advance
+        self.skip = skip
         self.limit = limit
         self.survival = survival
         self.survivors = 0
         n = len(prefix_tokens)
-        self.groups = None if stop_groups is None else list(stop_groups)
+        self.groups = None if stop_groups is None else [
+            _stop_counts(group) for group in stop_groups]
         if self.groups is not None and len(self.groups) != n:
             raise ValueError("stop_groups must match prefix_tokens")
         self._group_width = max(1, int(stop_width))
         self._group_busy = {}       # group -> its anchors admitted, unsettled
-        self._group_done = set()    # groups with a survivor
+        self._group_done = set()    # groups with num_key_survivors survivors
+        self._group_survivors = {}  # group -> its anchors that survived
+        self._num_key_survivors = max(1, int(num_key_survivors))
         self._group_members = {}    # group -> its anchors still queued
         self._skipped = []          # queued anchors a done group skipped
         self._dead = 0              # skipped anchors still in the pending deque
@@ -330,11 +396,16 @@ class JoinAdmission:
         self._next = []            # next partner index at the stage
         self._true = []
         self._settled = []         # events for anchors that never ran
-        self.oversized = []        # anchors too long for a chunk or the arena
         self.in_flight = 0         # launched groups not yet reported
         self.blocked_pages = 0
         self.reserve = reserve
         self.answers = [dict() for _ in range(k)]
+        self.chunked_prefill = chunked_prefill
+        self.one_stage = one_stage
+        self._starts = []          # per anchor: the stage it starts at
+        self._prefill = {}         # anchor -> its next prefix token to write
+        self._prefilled = []       # anchors whose last piece is in this pass
+        self.prefills = []         # this pass's pieces: (anchor, start, end)
         resident = dict(resident or {})
         anchor_partners = dict(anchor_partners or {})
         # A deferred parent cannot free its pages before a dependent runs.
@@ -343,12 +414,14 @@ class JoinAdmission:
             pages = self.page_cost(prefix_tokens[a] - self.borrowing.tree_shared[a]
                                    + self._extra)
             self._dependent_pages[parent] = max(self._dependent_pages[parent], pages)
+        starts = [0] * n if start_stages is None else list(start_stages)
         for a, prefix in enumerate(prefix_tokens):
-            self._register(prefix, resident.get(a), anchor_partners.get(a))
+            self._register(prefix, resident.get(a), anchor_partners.get(a),
+                           starts[a])
         # resident anchors first: they cost no prefix tokens and few
         # or no pages, so they never wait behind a page-blocked anchor
         n = len(self.prefix)
-        fresh_order = range(n) if tree is None else tree.order
+        fresh_order = self.borrowing.order or range(n)
         self.pending.extend(a for a in range(n)
                             if a in resident and self._stage[a] == -1)
         self.pending.extend(a for a in fresh_order
@@ -358,8 +431,8 @@ class JoinAdmission:
             self.borrowing.detach(a)
         if self.groups is not None:
             for a in self.pending:
-                self._group_members.setdefault(self.groups[a], set()).add(a)
-
+                for group in self.groups[a]:
+                    self._group_members.setdefault(group, set()).add(a)
 
     def num_partners(self, a, j):
         """Return the number of partner requests anchor a streams at stage j.
@@ -442,11 +515,12 @@ class JoinAdmission:
         lst = self._lists[a][j]
         return range(start, end) if lst is None else lst[start:end]
 
-    def _register(self, prefix, resident_pages, partners):
+    def _register(self, prefix, resident_pages, partners, start=0):
         """Record one anchor's costs; returns its index."""
         a = len(self.prefix)
         k = len(self.stages)
-        j = self.dependencies.get(a, (None, 0))[1]
+        self._starts.append(start)
+        j = self.dependencies.get(a, (None, start))[1]
         lazy = None
         if partners is None:
             lists = [None] * k
@@ -477,22 +551,22 @@ class JoinAdmission:
         need = self.page_cost(prefix + self._extra)
         shared = self.borrowing.tree_shared[a] if a in self.dependencies else 0
         fresh = prefix - shared
-        reserve = self._dependent_pages[a] if a < len(self._dependent_pages) else 0
-        oversized = False
+        reserve = self._dependent_pages[a]
         if resident_pages is not None:
             need = max(0, need - resident_pages)
         elif self.page_cost(fresh + self._extra) + reserve > self.arena_pages:
-            oversized = True
+            raise OversizedDocumentError(a, (
+                f"its {fresh}-token prefix needs "
+                f"{self.page_cost(fresh + self._extra) + reserve} KV pages, "
+                f"more than the {self.arena_pages} pages of the whole arena"))
         cum = self._cum[j] if lists[j] is None else cums[j]
-        if not oversized and resident_pages is None and len(cum) > 1:
+        if resident_pages is None and len(cum) > 1 and not self.chunked_prefill:
             first = self.frame_rows[j] + int(cum[1] - cum[0])
-            oversized = fresh + first > self.chunk_budget
-        if oversized:
-            # a document that cannot fit one chunk or the arena is
-            # skipped: it settles unanswered, like one with nothing to ask
-            self.oversized.append(a)
-            need = 0
-            lists[j], cums[j] = self._partner_list(a, j, [])
+            if fresh + first > self.chunk_budget:
+                raise OversizedDocumentError(a, (
+                    f"its {fresh}-token prefix and {first}-token first request "
+                    f"exceed the {self.chunk_budget}-token forward pass, and an "
+                    f"unpaged run does not split a prefix across passes"))
         carried = 0 if resident_pages is not None else prefix
         self.prefix.append(prefix)
         self._lists.append(lists)
@@ -531,13 +605,46 @@ class JoinAdmission:
             self._page_reserve = max(self._page_reserve, largest)
         self._first.append(first)
         # the fewest tokens any fresh anchor can pack: a borrower
-        # packs only the tokens past its shared prefix
-        tree_shared = self.borrowing.tree_shared
-        shared = tree_shared[a] if a < len(tree_shared) else 0
-        self._min_fresh = min(self._min_fresh, max(0, carried - shared) + first)
+        # packs only the tokens past its shared prefix, and an anchor
+        # too long for one pass starts its chunked prefill in any room
+        least = max(0, carried - self.borrowing.tree_shared[a]) + first
+        if self.chunked_prefill and least > self.chunk_budget:
+            least = 1
+        self._min_fresh = min(self._min_fresh, least)
         if not need:
             self._zero_cost += 1
         return a
+
+    def take_prefills(self):
+        """Remove and return this pass's chunked prefill pieces.
+
+        Returns:
+            (anchor, start, end) per piece: the anchor's prefix tokens
+            start to end, written into its pages after the tokens
+            before start.
+        """
+        prefills, self.prefills = self.prefills, []
+        return prefills
+
+    def _continue_prefills(self, room):
+        """Add the next piece of each chunked prefill; returns the room left."""
+        for a in list(self._prefill):
+            if not room:
+                break
+            room = self._prefill_piece(a, room)
+        return room
+
+    def _prefill_piece(self, a, room):
+        """Add the anchor's next prefill piece within room; returns the room left."""
+        start = self._prefill[a]
+        end = min(self.prefix[a], start + room)
+        self.prefills.append((a, start, end))
+        if end == self.prefix[a]:
+            del self._prefill[a]
+            self._prefilled.append(a)
+        else:
+            self._prefill[a] = end
+        return room - (end - start)
 
     def _suffix(self, a, j, i):
         cum = self._cum_of(a, j)
@@ -604,6 +711,12 @@ class JoinAdmission:
         is buildable.
         """
         self.blocked_pages = 0
+        # a prefix whose last piece ran in an earlier pass is written:
+        # its first request runs now, and its borrowers may read it
+        for a in self._prefilled:
+            self.borrowing.prefilling.discard(a)
+            self.ready.append(a)
+        self._prefilled = []
         limited = self.limit_reached()
         if limited and not self.dependencies:
             return []
@@ -632,6 +745,8 @@ class JoinAdmission:
             room -= tokens
             if self._launch(a, j, end):
                 continued.append(a)
+        if not limited:
+            room = self._continue_prefills(room)
         # 2) fresh anchors: pages in queue order, chunk room may skip
         held = []
         blocked = False
@@ -666,10 +781,14 @@ class JoinAdmission:
                 if self._stage[a] == _DONE:
                     self._dead -= 1     # skipped by its group's survivor
                     continue
-                j = 0
+                if self.skip is not None and self.skip(a):
+                    self._skip_queued(a)
+                    continue
+                j = self._starts[a]
             hold = held_waiting if dependency is not None else held
-            if self.groups is not None and self._group_busy.get(
-                    self.groups[a], 0) >= self._group_width:
+            if self.groups is not None and self.groups[a] and not any(
+                    self._group_busy.get(group, 0) < self._group_width
+                    for group in self.groups[a] if group not in self._group_done):
                 hold.append(a)      # the group's anchors in flight are enough
                 continue
             borrow = self.borrowing.decide(a, admitted)
@@ -695,23 +814,28 @@ class JoinAdmission:
                 continue
             carried = (self._carried[a] if borrow is None
                        else self.prefix[a] - borrow[1])
-            if carried + self._first[a] > room:
+            long = self.chunked_prefill and carried + self._first[a] > self.chunk_budget
+            if long and not room:
+                hold.append(a)
+                continue
+            if carried + self._first[a] > room and not long:
                 hold.append(a)      # chunk room only; retry next chunk
                 continue
-            end, tokens, pages = self._take(
-                a, j, 0, room - carried, free_pages - need)
-            if end == 0:
-                hold.append(a)
-                self.blocked_pages = (
-                    need + self._suffix_page_cost(a, j, 0) - free_pages)
-                break
+            if long:
+                end = tokens = pages = 0
+            else:
+                end, tokens, pages = self._take(
+                    a, j, 0, room - carried, free_pages - need)
+                if end == 0:
+                    hold.append(a)
+                    self.blocked_pages = (
+                        need + self._suffix_page_cost(a, j, 0) - free_pages)
+                    break
             if self.reserve is not None and not self.reserve(
                     a, borrow, self.chunk_budget - room):
                 hold.append(a)
                 break
             temporary_pages += pages
-            groups.append((a, j, 0, end, carried > 0))
-            room -= carried + tokens
             free_pages -= need + pages
             if not self._page_cost[a]:
                 self._zero_cost -= 1
@@ -719,10 +843,18 @@ class JoinAdmission:
             admitted.add(a)
             expected_rows += int(dependency is None)
             if self.groups is not None:
-                group = self.groups[a]
-                self._group_busy[group] = self._group_busy.get(group, 0) + 1
-                self._group_members[group].discard(a)
+                for group in self.groups[a]:
+                    self._group_busy[group] = self._group_busy.get(group, 0) + 1
+                    self._group_members.get(group, set()).discard(a)
             self.borrowing.record(a, borrow)
+            if long:
+                # its prefix goes in pieces; its first request follows
+                self._prefill[a] = self.prefix[a] - carried
+                self.borrowing.prefilling.add(a)
+                room = self._prefill_piece(a, room)
+                continue
+            groups.append((a, j, 0, end, carried > 0))
+            room -= carried + tokens
             if self._launch(a, j, end):
                 continued.append(a)
         self.pending.extendleft(reversed(held))
@@ -732,6 +864,10 @@ class JoinAdmission:
         return groups
 
     # ---- gating --------------------------------------------------------
+
+    def stage_of(self, a) -> int:
+        """The stage the document is at, or a negative number once it is done."""
+        return self._stage[a]
 
     def report(self, a, j, start, end, bits):
         """Record a group's answers and update document progress.
@@ -772,7 +908,8 @@ class JoinAdmission:
         settlements = []
         transitions = []
         dependent = a in self.dependencies
-        if not dependent and j == self._stage[a] and j + 1 < k:
+        last = dependent or self.one_stage or j == k - 1
+        if not last and j == self._stage[a]:
             if self._true[a][j] and self._next[a] == num_partners:
                 # the whole stream is launched, so every later chunk
                 # is behind it on the stream and the next stage's
@@ -788,7 +925,7 @@ class JoinAdmission:
                 self._stage[a] = _DONE
                 transitions.append((a, j, False))
                 settlements.append(Settlement("dropped", a, False))
-        if (dependent or j == k - 1) and complete:
+        if last and complete:
             self._stage[a] = _DONE
             self._count_survivor(self.dependencies[a][0] if dependent else a)
             survived = bool(self._true[a][j])
@@ -848,22 +985,43 @@ class JoinAdmission:
                 self._settled.append(Settlement("dropped", dependent, False))
         if self.groups is None:
             return
-        group = self.groups[a]
-        busy = self._group_busy.get(group, 0) - 1
-        if busy > 0:
-            self._group_busy[group] = busy
-        else:
-            self._group_busy.pop(group, None)
-        if not survived or group in self._group_done:
-            return
-        self._group_done.add(group)
-        skipped = sorted(self._group_members.pop(group, ()))
+        finished = []
+        for group, copies in self.groups[a].items():
+            busy = self._group_busy.get(group, 0) - 1
+            if busy > 0:
+                self._group_busy[group] = busy
+            else:
+                self._group_busy.pop(group, None)
+            if not survived or group in self._group_done:
+                continue
+            survivors = self._group_survivors.get(group, 0) + copies
+            self._group_survivors[group] = survivors
+            if survivors >= self._num_key_survivors:
+                self._group_done.add(group)
+                finished.append(group)
+        candidates = set()
+        for group in finished:
+            candidates.update(self._group_members.pop(group, ()))
+        skipped = sorted(b for b in candidates
+                         if all(group in self._group_done for group in self.groups[b]))
         for b in skipped:
+            for group in self.groups[b]:
+                self._group_members.get(group, set()).discard(b)
             self._stage[b] = _DONE
             if not self._page_cost[b]:
                 self._zero_cost -= 1
         self._dead += len(skipped)
         self._skipped.extend(skipped)
+
+    def _skip_queued(self, a):
+        """Skip a fresh anchor taken off the queue: it never runs."""
+        self._stage[a] = _DONE
+        if not self._page_cost[a]:
+            self._zero_cost -= 1
+        if self.groups is not None:
+            for group in self.groups[a]:
+                self._group_members.get(group, set()).discard(a)
+        self._skipped.append(a)
 
     def take_skipped(self):
         """Remove and return the queued anchors a done group skipped."""
@@ -903,6 +1061,11 @@ class JoinAdmission:
         """
         out = [a for a in self.ready if self._stage[a] != _DONE]
         out.extend(a for a in self.pending if self._stage[a] != -1)
+        # a document part way through its prefill, or just through it
+        out.extend((*self._prefill, *self._prefilled))
+        self._prefill.clear()
+        self._prefilled = []
+        self.prefills = []
         for a in out:
             self._stage[a] = _DONE
         for a in self.waiting:
@@ -921,5 +1084,6 @@ class JoinAdmission:
             return (not self.in_flight and not self._settled
                     and all(self._stage[a] == _DONE for a in self.waiting))
         return len(self.pending) == self._dead and not self.ready \
+            and not self._prefill and not self._prefilled \
             and not self.in_flight and not self._settled \
             and all(self._stage[a] == _DONE for a in self.waiting)

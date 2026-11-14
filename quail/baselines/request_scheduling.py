@@ -1,4 +1,4 @@
-"""Request scheduling shared by the vLLM and SGLang backends.
+"""Request scheduling for the vLLM backends.
 
 Filter sequences advance on individual request completions under a shared
 KV admission calculation. The fields of an extraction, and the maps of a

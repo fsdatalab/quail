@@ -2,126 +2,97 @@
 title: Metrics
 ---
 
-Quail records execution time, row counts, and token counts for each query.
-The report includes totals for the query and measurements for individual
-operators in its plan.
+Use `result.report` to read the time, model work, memory, and GPU cost of
+one finished run. Use `result.explain()` to compare measurements for each
+query operation.
 
-## Read a query report
+The examples continue the H100 run from
+[Query results and plans](/docs/user-guide/results).
 
-Call `query.run()` to execute a query. The returned `QueryResult` has a
-`report` containing the measurements from that run.
-
-For example, imagine a `reviews` table registered on `session`, with
-review IDs in `id` and review text in `body`. Run a filter and read its
-execution time and token count:
+## Print a summary
 
 ```python
-query = session.sql("""
-    SELECT r.id
-    FROM reviews r
-    WHERE AI.IF(PROMPT('Does this review discuss the ending? {0}', r.body))
-""", dialect="bq")
-
-result = query.run()
 report = result.report
-print("Query time in seconds:", report["wall_s"])
-print("Model startup time in seconds:", report["boot_s"])
-print("Tokens computed:", report["fresh_tokens"])
+print(f"AI execution: {report['wall_s']:.2f} s")
+print(f"Model startup: {report['boot_s']:.1f} s")
+print(f"Fresh tokens: {report['fresh_tokens']}")
+print(f"Cached tokens: {report['cached_tokens']}")
+print(f"Peak GPU memory: {report['peak_gib']:.2f} GiB")
+print(f"GPU cost: ${report['usd_per_query']:.6f}")
 ```
 
-To compare measurements with the plan's estimates, use
-[`result.explain()`](/docs/user-guide/results#measure-the-plan).
-
-## Query totals
-
-### Execution time
-
-| Field | Meaning |
-| --- | --- |
-| `wall_s` | Query execution time in seconds. Excludes model startup and result collection. |
-| `boot_s` | Model startup time in seconds, including loading weights and preparing GPU kernels. |
-| `worker_total_s` | Time in seconds from calling `run()` until it returns. Includes planning, input preparation, model startup, and preparing the result. Excludes result collection. |
-| `boot_kind` | `"cold"` when the model or kernels needed preparation; `"warm"` when they were already ready. |
-
-To inspect startup time, read `report["boot"]`.
-It includes `load_model_s` for loading weights, `arena_s` for allocating
-KV memory, and `warm_kernels_s` for preparing kernels. Each is in seconds.
-
-### Token counts
-
-A *fresh token* is a token position computed by the model rather than
-read from saved KV. Computing the same position again counts again.
-
-| Field | Meaning |
-| --- | --- |
-| `fresh_tokens` | Total token positions computed by the model. |
-| `cached_tokens` | Total token positions read from KV, when available. |
-
-`fresh_tokens` counts model computation. It does not count every token
-in every prompt when the model reuses KV.
-
-## Operator metrics
-
-`report["node_metrics"]` contains measurements for each physical operator.
-The keys are the operator IDs shown by `explain(verbose=True)`.
-For example, `"ai_filter:r"` identifies a model filter on table alias `r`.
-
-```python
-for operator_id, metrics in report["node_metrics"].items():
-    print(operator_id, metrics["input_rows"], metrics["output_rows"])
+```text title="Output"
+AI execution: 0.02 s
+Model startup: 28.5 s
+Fresh tokens: 100
+Cached tokens: 0
+Peak GPU memory: 52.97 GiB
+GPU cost: $0.000020
 ```
 
-| Field | Meaning |
-| --- | --- |
-| `wall_s` | Operator time in seconds. |
-| `input_rows` | Rows or pairs received by the operator. |
-| `output_rows` | Rows or pairs returned by the operator. |
-| `evaluated_documents` | Documents evaluated by a model filter, score, or classification operator. |
-| `evaluated_document_pairs` | Document pairs evaluated by a model join or classification operator. |
-| `fresh_tokens`, `cached_tokens` | Token counts for the operator, with the same definitions as the query totals. |
+The values depend on the query, model, GPU, and warm state. A warm state
+means the model and kernels are already prepared.
 
-The available measurements depend on the operator.
-Use the query's `wall_s` for total execution time rather than adding
-operator times.
-
-## Filter and join predicates
-
-`report["stages"]` records measurements for individual filter and join
-predicates. A *predicate* is a condition that keeps or removes rows.
-A query with several `AI.IF` conditions can have several stage records
-for one model filter operator.
-
-*Selectivity* is the fraction of documents or pairs that pass a predicate.
-Compare the estimated and measured fractions to see whether a predicate
-kept more input than expected.
+## Time
 
 | Field | Meaning |
 | --- | --- |
-| `op` | `"filter"` or `"join"`. |
-| `written_position` | Predicate position in the query, starting at zero. `explain()` displays positions starting at one. |
-| `provided_selectivity` | Selectivity supplied in the query, or `None` if omitted. |
-| `observed_selectivity` | Measured fraction of documents or pairs that passed. |
-| `evaluated` | Documents evaluated by a filter predicate. |
-| `tuples` | Document pairs evaluated by a join predicate. |
-| `alias` | Table alias for a filter. |
-| `anchor`, `partners` | Table aliases for a join. |
+| `wall_s` | Time spent running the AI operations. The value excludes model startup. |
+| `boot_s` | Time spent loading the model and preparing GPU execution. |
+| `boot_kind` | Startup state: `"cold"` when Quail prepares the model or kernels, or `"warm"` when preparation is already complete. |
+| `worker_total_s` | Total worker time, including startup and result preparation. |
+| `datafusion_s` | Time spent planning SQL and running DataFusion operators outside the AI work. |
 
-Use `written_position` to match a record to its condition in the query.
-The execution order can differ from the written order.
-Score and classification measurements are in `node_metrics`.
+Use `wall_s` to compare query execution. Report `boot_s` separately when
+startup matters.
 
-## GPU cost
+## Tokens and rows
 
-Compute GPU cost from query time, GPU count, and the hourly price per GPU.
-For an H100 query, use Quail's configured H100 price:
+| Field | Meaning |
+| --- | --- |
+| `fresh_tokens` | Token positions computed by the model. A position computed twice counts twice. |
+| `cached_tokens` | Token positions read from KV, the cached attention state. |
+| `evaluated_documents` | Documents read by AI operations. |
+| `evaluated_document_pairs` | Document pairs read by AI joins. |
+| `documents_per_second` | Evaluated documents divided by AI execution time. |
 
-```python
-from quail.specs import H100_USD_PER_HOUR
+Fresh and cached tokens measure different work. Do not add them to estimate
+the original input length because repeated computation can count one token
+position more than once.
 
-gpus = query.session.config.gpus
-cost_usd = (report["wall_s"] / 3600) * gpus * H100_USD_PER_HOUR
-print("GPU cost in dollars:", cost_usd)
-```
+## Memory and cost
 
-The calculation excludes model startup and result collection.
-Use the hourly price for your device when running on another GPU type.
+| Field | Meaning |
+| --- | --- |
+| `peak_gib` | Highest GPU memory use during the run, in gibibytes. |
+| `usd_per_query` | GPU cost for AI execution, excluding startup and DataFusion work. |
+
+Quail calculates `usd_per_query` from `wall_s`, the number of GPUs, and the
+hourly price in the device configuration. A rental bill can be higher
+because the process also uses the GPU during startup and idle time.
+
+## Operation metrics
+
+`report["node_metrics"]` maps each operation ID to its measurements.
+`result.explain()` presents the main fields in the measured plan, so start
+with the plan before reading the dictionary.
+
+| Field | Meaning |
+| --- | --- |
+| `wall_s` | Time spent in the operation. |
+| `input_rows` | Rows or pairs received by the operation. |
+| `output_rows` | Rows or pairs returned by the operation. |
+| `evaluated_documents` | Documents read by the model. |
+| `evaluated_document_pairs` | Document pairs read by the model. |
+| `fresh_tokens` | Token positions computed by the model. |
+| `cached_tokens` | Token positions read from KV. |
+
+Each operation reports only the fields it measures. Operation times can
+overlap, so their sum is not the query time.
+
+## Queries with several AI regions
+
+An AI region is a group of AI functions Quail runs together. A query with
+one region stores the fields directly in `result.report`. A query with
+several regions stores one report per region in `result.report["regions"]`.
+A query without an AI function has no AI region report.

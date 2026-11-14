@@ -1,4 +1,4 @@
-"""AI.MAP branches through the shared document scheduler.
+"""AI.MAP branches in a region's GPU loop.
 
 The document runs the first map after the earlier stages keep it.
 Dependent anchors run the other maps at the same stage, borrowing the
@@ -6,17 +6,15 @@ document's whole pages. Each branch decodes one row per pass. The
 document's stage is reported only after every branch's answer ends.
 """
 
+from dataclasses import replace
 from itertools import groupby
 
 import numpy as np
 import pyarrow as pa
 
-from quail.backends.quail.executor.parts import (
-    ColumnPart,
-    ExecutionPart,
-    document_inputs,
-    execute_alone,
-    execution_prefix_tree,
+from quail.backends.quail.executor.model_operator import (
+    ColumnOperator,
+    ModelOperator,
     gpu_seconds,
     join_prior_rows,
     operator_label,
@@ -24,7 +22,8 @@ from quail.backends.quail.executor.parts import (
     stage_spans,
 )
 from quail.backends.quail.executor.stages import Stage, StageRequests
-from quail.catalog.tokens import DocumentKeys, DocumentPrefixes, PrefixTree
+from quail.common.tokens import DocumentPrefixes, PrefixTree
+from quail.execution.finished import finished_rows, finished_table
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.rows import Rows
 
@@ -45,63 +44,41 @@ class NoAnswers:
         return [0] * handle
 
 
-def execute_maps(state, nodes, inputs) -> dict:
-    """Run a pipeline of maps alone as branches, one per document and map.
-
-    The first node is charged the documents' tokens and the wall time.
-
-    Args:
-        state: The loaded model and current query state.
-        nodes: The AiMap nodes, in pipeline order.
-        inputs: The documents' ids and the tokenized documents by alias.
-
-    Returns:
-        Node id -> NodeResult with the node's answer table.
-    """
-    ids = np.asarray(inputs["document_ids"], dtype=np.int64)
-    (alias,) = nodes[0].spec.aliases
-
-    def build():
-        prefixes = DocumentPrefixes(nodes[0].document_head,
-                                    inputs["documents"][alias], ids)
-        tree = execution_prefix_tree(nodes[0], prefixes, state.loaded_model.arena)
-        return MapPart(state, nodes, ids, 0), prefixes, DocumentKeys(alias, ids), tree
-
-    return execute_alone(state, nodes, inputs, build, label="map")
-
-
-class MapPart(ColumnPart, ExecutionPart):
-    """One pipeline's consecutive maps, decoded as branches at one stage."""
+class MapOperator(ColumnOperator, ModelOperator):
+    """A chain's consecutive maps, decoded as branches at one stage."""
 
     combine = True
     attention = "unified"
-    execute_group = staticmethod(execute_maps)
-
-    @staticmethod
-    def model_inputs(node, inputs, context, sequence=None, nodes=None):
-        return {**document_inputs(node, inputs, context, sequence, nodes),
-                "limit": context.state.get("filter_limit"),
-                "gpu_timing": context.state.get("gpu_timing", False)}
+    # the word naming the operator's nodes in a progress label
+    word = "map"
 
     @classmethod
-    def prepare(cls, state, nodes, ids, parts, inputs, context):
-        priors, prior_tables = prior_inputs(nodes[0], parts,
-                                            inputs[nodes[0].node_id])
-        first = sum(len(part.answer_limits) for part in parts)
-        return cls(state, nodes, ids, first, priors, prior_tables)
+    def build(cls, region, nodes, chain):
+        """Build the maps; maps alone return their answers without input columns."""
+        priors, prior_tables = ((), ()) if region.one_family else prior_inputs(
+            nodes[0], chain, region.node_inputs(nodes[0]))
+        first = sum(len(operator.answer_limits) for operator in chain)
+        return cls(region.query, nodes, region.document_ids(), first, priors,
+                   prior_tables)
+
+    @classmethod
+    def alone(cls, region, operators, table, settings):
+        nodes = [node for operator in operators for node in operator.nodes]
+        return replace(settings, label=operator_label(cls.word, nodes))
 
     def __init__(self, state, nodes, ids, first, priors=(), prior_tables=()):
         self.state = state
         self.nodes = list(nodes)
         self.node = self.nodes[0]
         self.ids = np.asarray(ids, dtype=np.int64)
-        self.first = first          # the pipeline's index of the first map
+        self.first = first          # the chain's index of the first map
         self.priors = priors
         self.prior_tables = prior_tables
         self._decoder = None
         self.asked = [np.zeros(len(self.ids), dtype=bool) for _ in self.nodes]
         self.slots = np.arange(len(self.ids), dtype=np.int64)[None, :]
         self._results = {}
+        self.finished = []      # (map, document) answers ended since the last take
         tails = []
         for node in self.nodes:
             head, tail = node.spec.prompt_token_parts
@@ -161,7 +138,7 @@ class MapPart(ColumnPart, ExecutionPart):
 
     @property
     def decoder(self):
-        """The pipeline's MapDecoder, which writes the part's answers."""
+        """The region's MapDecoder, which writes the operator's answers."""
         return self._decoder
 
     @decoder.setter
@@ -191,7 +168,34 @@ class MapPart(ColumnPart, ExecutionPart):
     def expected_answer_tokens(self) -> tuple:
         return tuple(node.spec.expected_answer_tokens for node in self.nodes)
 
-    def finish(self, every) -> int:
+    def settle(self, document, survived, row):
+        """Record that a branch's answer ended: one map's answer for a document."""
+        q, position = self.branch_of.get(document, (None, None))
+        if q is not None and self.asked[q][position]:
+            self.finished.append((q, position))
+
+    def take_finished(self):
+        """Return each map's rows whose answers ended since the last call."""
+        finished, self.finished = self.finished, []
+        if not finished or finished_rows() is None:
+            return []
+        tables = []
+        for q in sorted({q for q, _ in finished}):
+            node = self.nodes[q]
+            positions = sorted(position for found, position in finished if found == q)
+            tables.append(finished_table(node.node_id, node.rows_port,
+                                         self.answer_rows(q, positions).table()))
+        return tables
+
+    def answer_rows(self, q, positions):
+        """The Rows of map q's answers over documents, by position."""
+        spec = self.nodes[q].spec
+        (values,) = self.column_values(q, positions)
+        (alias,) = spec.aliases
+        return Rows({alias: self.ids[positions].astype(np.int32)},
+                    pa.table({spec.name: values}))
+
+    def read_answers(self, every) -> int:
         """Return the tokens the maps fed: their tails and their decode rows."""
         tails = sum(int(asked.sum()) * len(node.spec.prompt_token_parts[1])
                     for asked, node in zip(self.asked, self.nodes))
@@ -202,9 +206,12 @@ class MapPart(ColumnPart, ExecutionPart):
     def column_values(self, index, positions) -> tuple:
         tokens = self.decoder.answers(self.first + index, self._slots(index, positions))
         tokenizer = self.state.loaded_model.tokenizer
-        return (pa.array(tokenizer.decode_batch(tokens), pa.string()),)
+        # an answer is the model's text without the whitespace around it:
+        # the first token of a turn starts with a space
+        texts = [text.strip() for text in tokenizer.decode_batch(tokens)]
+        return (pa.array(texts, pa.string()),)
 
-    def complete(self, fresh, spans, stats, offset):
+    def close(self, fresh, spans, stats, offset) -> dict:
         """Build each map's answer table and attribute its GPU work."""
         own = [int(asked.sum()) * len(node.spec.prompt_token_parts[1]) + fed
                for asked, node, fed in zip(self.asked, self.nodes, self.fed)]
@@ -212,11 +219,8 @@ class MapPart(ColumnPart, ExecutionPart):
             spec = node.spec
             asked = np.flatnonzero(self.asked[q])
             tokens = self.decoder.answers(self.first + q, self._slots(q, asked))
-            (values,) = self.column_values(q, asked)
-            (alias,) = spec.aliases
-            rows = Rows({alias: self.ids[asked].astype(np.int32)},
-                        pa.table({spec.name: values}))
-            rows = join_prior_rows(rows, alias, self.priors, self.prior_tables)
+            rows = join_prior_rows(self.answer_rows(q, asked), spec.aliases[0],
+                                   self.priors, self.prior_tables)
             selected = stage_spans(spans, offset, offset + 1)
             fresh_tokens = fresh - sum(own[1:]) if q == 0 else own[q]
             tail = len(spec.prompt_token_parts[1])
@@ -233,6 +237,8 @@ class MapPart(ColumnPart, ExecutionPart):
                         "input_rows": len(asked),
                         "answer_tokens": int(sum(map(len, tokens))),
                         "decode_rows": self.fed[q],
+                        "answers_stopped_early": int(
+                            self.decoder.stopped_early[self.first + q]),
                         "suffix_tokens": tail,
                         "borrowed_prefix_tokens": (
                             stats.get("borrowed_tokens", 0) if q == 0 else 0),
@@ -244,7 +250,7 @@ class MapPart(ColumnPart, ExecutionPart):
                         "recomputed_tokens": (stats.get("recomputed_tokens", 0)
                                               if q == 0 else 0),
                         **(admission_metrics(stats) if q == 0 else {})}))
-        self.result_value = self._results[self.nodes[0].node_id]
+        return self._results
 
     def results(self) -> dict:
         return self._results
@@ -280,49 +286,66 @@ def admission_metrics(stats) -> dict:
     return metrics
 
 
-class AnswerBranches(MapPart):
+class AnswerBranches(MapOperator):
     """Adjacent map and extraction fields sharing one branching stage."""
 
-    def __init__(self, parts):
-        self.parts = parts
-        first = parts[0]
-        super().__init__(first.state, [node for part in parts for node in part.nodes],
+    def __init__(self, operators):
+        self.operators = operators
+        first = operators[0]
+        super().__init__(first.state,
+                         [node for operator in operators for node in operator.nodes],
                          first.ids, first.first)
-        self.asked = [asked for part in parts for asked in part.asked]
+        self.asked = [asked for operator in operators for asked in operator.asked]
+
+    def settle(self, document, survived, row):
+        """Record a branch's ended answer in the operator whose map it is."""
+        q, position = self.branch_of.get(document, (None, None))
+        if q is None or not self.asked[q][position]:
+            return
+        for operator in self.operators:
+            start = operator.first - self.first
+            if start <= q < start + len(operator.nodes):
+                operator.finished.append((q - start, position))
+
+    def take_finished(self):
+        return [table for operator in self.operators
+                for table in operator.take_finished()]
 
     def branch_inputs(self, prefixes, keys, tree, page_tokens, stage):
         result = super().branch_inputs(prefixes, keys, tree, page_tokens, stage)
-        for part in self.parts:
-            start = part.first - self.first
-            part.slots = self.slots[start:start + len(part.nodes)]
+        for operator in self.operators:
+            start = operator.first - self.first
+            operator.slots = self.slots[start:start + len(operator.nodes)]
         return result
 
     def bind_decoder(self, decoder):
         super().bind_decoder(decoder)
-        for part in self.parts:
-            part.bind_decoder(decoder)
+        for operator in self.operators:
+            operator.bind_decoder(decoder)
 
-    def finish(self, every):
-        self.own = [part.finish(every) for part in self.parts]
+    def read_answers(self, every):
+        self.own = [operator.read_answers(every) for operator in self.operators]
         return sum(self.own)
 
-    def complete(self, fresh, spans, stats, offset):
-        for index, part in enumerate(self.parts):
+    def close(self, fresh, spans, stats, offset) -> dict:
+        for index, operator in enumerate(self.operators):
             tokens = fresh - sum(self.own[1:]) if index == 0 else self.own[index]
             share = tokens / max(1, fresh)
             selected = [({j: n * share for j, n in rows.items()}, total, start, end)
                         for rows, total, start, end in spans]
-            part.complete(tokens, selected, stats if index == 0 else {}, offset)
+            operator.close(tokens, selected, stats if index == 0 else {}, offset)
+        return self.results()
 
     def results(self):
-        return {key: value for part in self.parts
-                for key, value in part.results().items()}
+        return {key: value for operator in self.operators
+                for key, value in operator.results().items()}
 
 
-def branch_parts(parts):
-    """Coalesce adjacent answer parts without crossing dependent conditions."""
+def branch_operators(operators):
+    """Coalesce adjacent answer operators without crossing dependent conditions."""
     combined = []
-    for answers, group in groupby(parts, lambda part: isinstance(part, MapPart)):
+    for answers, group in groupby(operators,
+                                  lambda operator: isinstance(operator, MapOperator)):
         members = list(group)
         combined.extend([AnswerBranches(members)] if answers and len(members) > 1
                         else members)

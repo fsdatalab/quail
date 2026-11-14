@@ -3,15 +3,15 @@
 
 import pyarrow as pa
 import pytest
-from helpers.sessions import CONFIG, _run, fake_tok, make_executor
+from helpers.planning import operators_of
+from helpers.sessions import CONFIG, TOKENIZER, _run, encoder, make_executor
 
 import quail
-from quail.logical import Scan
 
 
 @pytest.fixture
 def session():
-    with quail.Session(CONFIG, tokenizer=fake_tok) as session:
+    with quail.Session(CONFIG, tokenizer=TOKENIZER) as session:
         session.register("docs", quail.DocumentProvider.from_table(pa.table({
             "id": ["d0", "d1", "d2"],
             "details": [{"body": "one", "url": "u1", "kind": "a"},
@@ -29,13 +29,16 @@ def session():
 def test_a_prompt_reads_a_struct_field_as_the_document(session):
     query = session.sql(
         "SELECT r.id FROM docs r WHERE AI_FILTER(PROMPT('q: {0}', r.details.body))")
-    scan = next(node for node in query.logical.walk() if isinstance(node, Scan))
+    (scan,) = operators_of(query).scans
     assert str(scan.column) == "r.details.body"
     result = _run(query, make_executor({"r": {"q:": [1, 0, 1]}}))
     assert result.to_rows() == [("d0",), ("d2",)]
     # the field's text was tokenized, not the struct's
-    assert list(session.inputs.token_lengths("docs", scan.column)) == [1, 2, 3]
-    assert "details.body" in query.explain()
+    bodies = ("one", "two words", "three words here")
+    assert list(query.token_inputs()["r"].lengths) == [
+        len(encoder()(text)) for text in bodies]
+    # DataFusion's plan of the region reads the field
+    assert 'get_field(r.details, Utf8("body"))' in query.explain()
 
 
 FILTERED = "FROM docs r WHERE AI_FILTER(PROMPT('q: {0}', r.details.body))"
@@ -54,5 +57,10 @@ def test_select_order_and_group_take_expressions(session):
         "GROUP BY r.details.kind ORDER BY r.details.kind")
     assert _run(grouped, executor).to_rows() == [("a", 2), ("b", 1)]
     distinct = session.sql(
-        f"SELECT DISTINCT r.details.kind {FILTERED} ORDER BY r.details.kind")
+        f"SELECT DISTINCT r.details.kind {FILTERED} ORDER BY 1")
     assert _run(distinct, executor).to_rows() == [("a",), ("b",)]
+    # a struct field is named by its path, and an alias as written
+    rows = _run(session.sql(
+        f'SELECT r.details.body, r.details.kind AS "a[b]" {FILTERED} ORDER BY 1'),
+        executor)
+    assert rows.columns == ["r.details.body", "a[b]"]

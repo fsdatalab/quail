@@ -330,9 +330,9 @@ def requested_input_tokens(
     """
     from gigatoken import Tokenizer
 
-    from quail.logical.prompts import bind_join_prompt, bind_prompt
-    from quail.planner.prompt_lowering import lower_prompt
-    from quail.specs.diffusion_gemma_26b import DIFFUSION_GEMMA_26B_FP8
+    from quail.api.prompts import bind_join_prompt, bind_prompt
+    from quail.physical.lowering import lower_prompt
+    from quail.specs import DIFFUSION_GEMMA_26B_FP8
 
     class Ref:
         def __init__(self, alias):

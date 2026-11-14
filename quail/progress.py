@@ -1,10 +1,30 @@
-"""Progress messages for the long steps of a query, on the "quail" logger."""
+"""Progress messages for the long steps of a query, on the "quail" logger.
+
+On a terminal a query shows its steps: one line for each, and for a
+running count one bar that updates in place with the count, the rate,
+and the time left. Details, such as how many forward passes a step
+took, are left out there. Anywhere else, such as a log file or a Modal
+log, every message is one plain line, details included, and a count
+logs a line at each tenth of its total.
+"""
 
 import contextlib
 import logging
 import os
 import sys
 import time
+
+from rich.console import Console
+from rich.markup import escape
+from rich.progress import (
+    BarColumn,
+    ProgressColumn,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+)
+from rich.progress import Progress as Bar
+from rich.text import Text
 
 _GPU_INDEX = None
 # names the run in every line's prefix, such as a benchmark's query
@@ -26,27 +46,78 @@ class _GpuFilter(logging.Filter):
         return True
 
 
-class _StdoutHandler(logging.StreamHandler):
-    """Write to the sys.stdout of the moment, so output capture sees it."""
+_CONSOLES: dict = {}
 
-    @property
-    def stream(self):
-        return sys.stdout
 
-    @stream.setter
-    def stream(self, value):
-        pass
+def console() -> Console:
+    """Return the console of the sys.stdout of the moment, so output capture sees it."""
+    found = _CONSOLES.get(id(sys.stdout))
+    if found is None or found.file is not sys.stdout:
+        _CONSOLES.clear()
+        found = _CONSOLES[id(sys.stdout)] = Console(file=sys.stdout, highlight=False)
+    return found
+
+
+class _ConsoleHandler(logging.Handler):
+    """Write each message to `console()`: a step on a terminal, else a plain line."""
+
+    def emit(self, record):
+        found = console()
+        # a record of a child logger skips this logger's filter; format()
+        # adds a logged exception's traceback
+        tag, text = getattr(record, "gpu", ""), self.format(record)
+        if not found.is_terminal:
+            stamp = time.strftime("%m-%d %H:%M:%S", time.localtime(record.created))
+            # a log file keeps one unwrapped line per message
+            print(f"{record.levelname} {stamp} [quail]{tag} {text}",
+                  file=found.file, flush=True)
+        elif not getattr(record, "detail", False):
+            done = getattr(record, "done", False)
+            mark = "[green]✓[/green]" if done else "[dim]·[/dim]"
+            found.print(f"  {mark} [dim]{escape(tag)}[/dim]{escape(text.strip())}",
+                        soft_wrap=True)
+
+
+class _CountColumn(ProgressColumn):
+    """A count beside its total, with thousands separators: 743 of 1,772 documents."""
+
+    def render(self, task):
+        return Text(f"{int(task.completed):,} of {int(task.total):,} "
+                    f"{task.fields['unit']}")
+
+
+class _RateColumn(ProgressColumn):
+    """The rate the count is moving at, from its recent updates: 16 documents/s."""
+
+    def render(self, task):
+        if task.speed is None:
+            return Text("")
+        return Text(f"{task.speed:,.0f} {task.fields['unit']}/s", style="bold")
+
+
+def _clock(seconds: float) -> str:
+    """Write a duration as minutes and seconds, with hours when it has them: 1:04."""
+    minutes, seconds = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+class _TimeColumn(ProgressColumn):
+    """The time a count has run and the time it has left: 0:46 elapsed, 1:04 left."""
+
+    def render(self, task):
+        text = f"{_clock(task.elapsed or 0)} elapsed"
+        if task.time_remaining is not None:
+            text += f", {_clock(task.time_remaining)} left"
+        return Text(text, style="dim")
 
 
 logger = logging.getLogger("quail")
 if not logger.handlers:
     # INFO lines reach stdout unless the program configures the logger itself
-    _handler = _StdoutHandler()
-    _handler.setFormatter(logging.Formatter(
-        "%(levelname)s %(asctime)s [quail]%(gpu)s %(message)s",
-        datefmt="%m-%d %H:%M:%S",
-    ))
-    logger.addHandler(_handler)
+    logger.addHandler(_ConsoleHandler())
     logger.addFilter(_GpuFilter())
     logger.setLevel(logging.INFO)
     logger.propagate = False
@@ -97,10 +168,26 @@ def answer_sink():
     return _ANSWER_SINK
 
 
-def say(message: str) -> None:
-    """Log one progress message at INFO, unless inside quiet()."""
+def progress_sink():
+    """Return the progress sink, or None when nobody is listening."""
+    return _SINK
+
+
+def say(message: str, *, done: bool = False) -> None:
+    """Log one progress message at INFO, unless inside quiet().
+
+    Args:
+        message: The step, such as "model ready".
+        done: Whether the message reports a finished step.
+    """
     if not _QUIET:
-        logger.info(message)
+        logger.info(message, extra={"done": done})
+
+
+def detail(message: str) -> None:
+    """Log a detail of the step before it, which a terminal leaves out."""
+    if not _QUIET:
+        logger.info(message, extra={"detail": True})
 
 
 @contextlib.contextmanager
@@ -115,7 +202,12 @@ def quiet():
 
 
 class Progress:
-    """Report a running count, logging at most once every `every` seconds."""
+    """Report a running count: a bar on a terminal, lines anywhere else.
+
+    The progress sink hears the count at most once every `every` seconds.
+    A line is logged no more often than that, and for a count with a
+    total only when another tenth of it is done.
+    """
 
     def __init__(self, label: str, total: int | None = None,
                  unit: str = "documents", every: float = 5.0, *, emit=say):
@@ -127,20 +219,44 @@ class Progress:
         self.done = 0
         self.started = time.perf_counter()
         self._last = self.started
+        self._logged = 0
+        self._bar = self._task = None
+        if emit is say and not _QUIET and total and console().is_terminal:
+            self._bar = Bar(
+                TextColumn(" "), SpinnerColumn(), TextColumn("{task.description}"),
+                BarColumn(complete_style="green", finished_style="green"),
+                _CountColumn(), TaskProgressColumn("{task.percentage:>3.0f}%"),
+                _RateColumn(), _TimeColumn(), console=console(), transient=True)
+            self._task = self._bar.add_task(label, total=total, unit=unit)
+            self._bar.start()
 
     def update(self, done: int) -> None:
-        """Record the count and log a line when enough time has passed."""
+        """Record the count; move the bar, or log a line when one is due."""
+        if self._bar is not None:
+            self._bar.advance(self._task, done - self.done)
         self.done = done
         now = time.perf_counter()
-        if now - self._last >= self.every:
-            self._last = now
+        if now - self._last < self.every:
+            return
+        self._last = now
+        self._report()
+        # a tenth of the total since the last line, or any change without one
+        step = (self.total or 0) / 10
+        if self._bar is None and done - self._logged >= step:
+            self._logged = done
             self.emit(self._line(self.label, now))
-            self._report()
 
     def finish(self, label: str, extra: str = "") -> None:
         """Log the final line under a past tense label."""
+        if self._bar is not None:
+            self._bar.stop()
+            self._bar = None
         line = self._line(label, time.perf_counter())
-        self.emit(f"{line}, {extra}" if extra else line)
+        line = f"{line}, {extra}" if extra else line
+        if self.emit is say:
+            say(line, done=True)
+        else:
+            self.emit(line)
         self._report()
 
     def _report(self) -> None:

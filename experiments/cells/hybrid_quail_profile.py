@@ -64,14 +64,15 @@ def profile(model: str, backend: str = "triton") -> dict:
     from quail.backends.quail.executor.models import build_pipeline
     from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
     from quail.backends.quail.worker import checkpoint_arena_args
-    from quail.cost import budgets
-    from quail.planner.prompt_lowering import true_false_ids
+    from quail.common import budgets
+    from quail.common.tokens import model_answers
     from quail.specs import H100_SXM, MODELS
 
     spec = MODELS[model]
     tokenizer = AutoTokenizer.from_pretrained(
         spec.hf_name, revision=spec.revision or None)
-    true_ids, false_ids = true_false_ids(tokenizer)
+    true_ids, false_ids, _ = model_answers(spec, lambda text: tokenizer(
+        text, add_special_tokens=False)["input_ids"])
     budget = budgets.chunk_budget(spec, H100_SXM)
     loaded = load_model(spec.hf_name, spec.revision or None,
                         answer_token_ids=true_ids | false_ids,

@@ -1,32 +1,30 @@
 logical:
-  Project: c.id, e.id
-    SemanticJoin (full)
-      PROMPT('Does the Wikipedia passage in DOCUMENT {1} support the claim in DOCUMENT {0}?', c.claim, e.text) (selectivity=0.217%)
-      Join
-        cross
-        SemanticFilter
-          PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the claim above whether it asserts something about a person, rather than an organization, place, or event.\n\nInstruction: answer TRUE if the claim asserts something about a person, FALSE otherwise.', c.claim) (selectivity=59.2%)
-          Scan claims as c [claim, id]
-        Scan evidence as e [text, id]
+  Projection: c.id, e.id
+    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Does the Wikipedia passage in DOCUMENT {1} support the claim in DOCUMENT {0}?"), c.claim, e.text), named_struct(Utf8("selectivity"), Float64(0.002167247386759582))), filter: __quail_answer_1, returns: []
+      Cross Join:
+        AiNode: __quail_answer_2 = ai_filter(prompt(Utf8("Judge strictly from the claim above whether it asserts something about a person, rather than an organization, place, or event.\n\n{0}\n\nInstruction: answer TRUE if the claim asserts something about a person, FALSE otherwise."), c.claim), named_struct(Utf8("selectivity"), Float64(0.592))), filter: __quail_answer_2, returns: []
+          SubqueryAlias: c
+            TableScan: claims projection=[id, claim]
+        SubqueryAlias: e
+          TableScan: evidence projection=[id, text]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
-  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
+  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                                                             est. rows   est. pass   est. time
-  Project: c.id, e.id
-    AiJoin: anchor=c                                                                                                   10.8 ms
-      KV: anchor=from filters, retain after join=no
-      join 1 full (c, e)  PROMPT('Does the Wikipedia passage in DO…')                             21.3      0.217%
-      AiFilter: c                                                                                  3.6                 11.8 ms
-        KV rewind=on
-        expected recompute at the join if the sequence's KV is released: 0 tokens, 0.000 s
-        predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')                                  6       59.2%
-        Scan claims as c                                                                             6
-          tokens=42, mean_document_tokens=7
-      Scan evidence as e                                                                             6
-        tokens=114, mean_document_tokens=19
+                                                                                           est. rows   est. pass   est. time
+  AiJoin: anchor=c                                                                                                   9.77 ms
+    KV: anchor=from filters, retain after join=no
+    join 1 full (c, e)  PROMPT('Does the Wikipedia passage in DO…')                             21.3      0.217%
+    AiFilter: c                                                                                  3.6                 8.94 ms
+      KV rewind=on
+      expected recompute at the join if the sequence's KV is released: 0 tokens, 0.000 s
+      predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')                                  6       59.2%
+      Scan claims as c                                                                             6
+        tokens=42, mean_document_tokens=7
+    Scan evidence as e                                                                             6
+      tokens=102, mean_document_tokens=17
   Pipeline on c: ai_filter:c -> ai_join:c (each document runs every operator with its KV resident)
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

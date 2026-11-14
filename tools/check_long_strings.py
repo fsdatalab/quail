@@ -12,7 +12,9 @@ clearly content rather than code:
 - it lives in a prompts module or folder: any part of the file path
   contains "prompt" (experiments/prompts/x.py);
 - it looks like HTML (starts with "<" and ends with ">") or SQL (starts
-  with SELECT, WITH, INSERT, CREATE, or UPDATE).
+  with SELECT, WITH, INSERT, CREATE, or UPDATE);
+- it is the expected transcript of a test: the second argument of an
+  ``assert_transcript`` call.
 
 Docstrings are exempt. An f-string counts only its literal text.
 
@@ -81,6 +83,13 @@ def _content_ids(tree):
     return ids
 
 
+def _transcript_ids(tree):
+    """Ids of the expected transcripts of assert_transcript calls."""
+    return {id(node.args[1]) for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and len(node.args) == 2
+            and getattr(node.func, "id", None) == "assert_transcript"}
+
+
 def _looks_like_content(text):
     stripped = text.strip()
     if stripped.startswith("<") and stripped.endswith(">"):
@@ -93,7 +102,7 @@ def long_strings(path, limit):
     if any("prompt" in part.lower() for part in path.parts):
         return
     tree = ast.parse(path.read_text(), filename=str(path))
-    exempt = _docstring_ids(tree) | _content_ids(tree)
+    exempt = _docstring_ids(tree) | _content_ids(tree) | _transcript_ids(tree)
     for node in ast.walk(tree):
         if id(node) in exempt:
             continue

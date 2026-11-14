@@ -3,20 +3,21 @@
 from __future__ import annotations
 
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping, Protocol
 
-from quail.execution.deduplicate import deduplicate
+from quail.execution.deduplicate import MODEL_NODES, deduplicate
+from quail.execution.finished import held, report_outputs
+from quail.execution.guard import guarded, present_join_inputs, reads_null_documents
 from quail.execution.metrics import NodeMetrics, NodeResult, RunResult
 from quail.physical import (
+    AiFilter,
     ExecutionLocation,
     PhysicalGraph,
     PhysicalNode,
     PortRef,
-    Project,
-    Recombine,
 )
-from quail.physical.pipelines import build_pipelines
 
 
 class NodeRuntime(Protocol):
@@ -47,19 +48,12 @@ class ExecutionContext:
     runtimes: Mapping[str, NodeRuntime]
     model_execution: Any = None
     sources: Mapping[str, Any] = field(default_factory=dict)
-    project: Callable[[Project, Any], Any] | None = None
-    recombine: Callable[[Recombine, Mapping[str, Any]], Any] | None = None
-    model_inputs: Callable[
-        [PhysicalNode, Mapping[str, Any], "ExecutionContext"],
-        Mapping[str, Any],
-    ] | None = None
     model_result: Callable[
         [PhysicalNode, NodeResult, "ExecutionContext"], None,
     ] | None = None
     state: dict[str, Any] = field(default_factory=dict)
     observers: tuple[ExecutionObserver, ...] = ()
     functions: Mapping[str, Callable[..., Any]] = field(default_factory=dict)
-    gpus: int = 1
     run_pipeline: Callable[..., Mapping[str, "NodeResult"]] | None = None
     # alias -> the row columns its documents are grouped by beside their
     # tokens; empty leaves every model operator asking per row
@@ -108,11 +102,28 @@ class GenericRunner:
             node_results[node.node_id] = result
             for observer in context.observers:
                 observer.after_node(node, result)
+            report_outputs(node, result)
 
         completed = tuple(dict.fromkeys(ref.node_id for ref in (initial_outputs or ())))
-        pipelines = (build_pipelines(graph, completed)
-                     if context.run_pipeline else {})
-        for node in graph.topological_nodes():
+        pipelines = graph.pipelines(completed) if context.run_pipeline else {}
+        # a guarded node runs in a pipeline of its own, and a NULL
+        # document guards every node that asks about its table; a test of
+        # their rows then runs after them, by its own runtime
+        for pipeline in list(pipelines.values()):
+            if len(pipeline) > 1 and any(
+                    reads_null_documents(member, context) for member in pipeline):
+                for member in pipeline:
+                    if isinstance(member, MODEL_NODES):
+                        pipelines[member.node_id] = (member,)
+                    else:
+                        pipelines.pop(member.node_id, None)
+        ordered = graph.topological_nodes()
+        late = _without_early_stops(ordered, pipelines)
+        ordered = [late.get(node.node_id, node) for node in ordered]
+        pipelines = {
+            node_id: tuple(late.get(member.node_id, member) for member in pipeline)
+            for node_id, pipeline in pipelines.items()}
+        for node in ordered:
             pipeline = pipelines.get(node.node_id)
             if pipeline is not None:
                 if node is not pipeline[-1]:
@@ -125,14 +136,25 @@ class GenericRunner:
                         for port in member.inputs
                         if port.source.node_id not in inside}
                     for member in pipeline}
+                for member in pipeline:
+                    inputs[member.node_id] = present_join_inputs(
+                        member, inputs[member.node_id], context)
+                # a guarded node runs in a pipeline of its own
+                guard = guarded(node, inputs[node.node_id], context)
+                if guard is not None:
+                    inputs[node.node_id] = guard.inputs(inputs[node.node_id])
                 deduplicated = deduplicate(graph, pipeline, inputs, context)
                 started = time.perf_counter()
-                results = context.run_pipeline(
-                    pipeline,
-                    inputs if deduplicated is None else deduplicated.inputs,
-                    context)
+                with _renumbered(guard, deduplicated):
+                    results = context.run_pipeline(
+                        pipeline,
+                        inputs if deduplicated is None else deduplicated.inputs,
+                        context)
                 if deduplicated is not None:
                     results = deduplicated.expanded(results)
+                if guard is not None:
+                    results = {**results,
+                               node.node_id: guard.expanded(results[node.node_id])}
                 # a pipeline's wall is charged once, to its first member
                 for index, member in enumerate(pipeline):
                     record(member, results[member.node_id],
@@ -160,17 +182,24 @@ class GenericRunner:
                     ]
                     for input_port in node.inputs
                 }
+                inputs = present_join_inputs(node, inputs, context)
+                guard = guarded(node, inputs, context)
+                if guard is not None:
+                    inputs = guard.inputs(inputs)
                 deduplicated = deduplicate(
                     graph, (node,), {node.node_id: inputs}, context)
                 started = time.perf_counter()
-                result = context.runtimes[node.runtime_key].execute(
-                    node,
-                    inputs if deduplicated is None
-                    else deduplicated.inputs[node.node_id],
-                    context)
+                with _renumbered(guard, deduplicated):
+                    result = context.runtimes[node.runtime_key].execute(
+                        node,
+                        inputs if deduplicated is None
+                        else deduplicated.inputs[node.node_id],
+                        context)
                 if deduplicated is not None:
                     result = deduplicated.expanded(
                         {node.node_id: result})[node.node_id]
+                if guard is not None:
+                    result = guard.expanded(result)
                 record(node, result, started)
                 continue
             record(node, result)
@@ -180,6 +209,34 @@ class GenericRunner:
         for node in graph.topological_nodes():
             metrics = metrics + node_results[node.node_id].metrics
         return RunResult(values[root], node_results, metrics)
+
+
+def _without_early_stops(ordered, pipelines) -> dict:
+    """Return node id -> a filter without its stop key, where it would stop too soon.
+
+    A key stops once a document passes the last filter that carries the
+    key. A filter before it stops the key at the same point only when
+    the two run in one pipeline, which counts the documents that pass
+    its last filter.
+    """
+    last = {node.alias: node.node_id for node in ordered
+            if isinstance(node, AiFilter) and node.stop_key}
+    return {
+        node.node_id: node.replace(stop_key=())
+        for node in ordered
+        if isinstance(node, AiFilter) and node.stop_key
+        and last[node.alias] != node.node_id
+        and last[node.alias] not in {
+            member.node_id for member in pipelines.get(node.node_id, ())}}
+
+
+def _renumbered(guard, deduplicated):
+    """Hold back operators' reports while a node runs over renumbered rows.
+
+    A guard or deduplication renumbers the rows an operator reports, so
+    its rows go once its result is expanded.
+    """
+    return held() if guard is not None or deduplicated is not None else nullcontext()
 
 
 def compute_subgraph(graph: PhysicalGraph) -> PhysicalGraph:

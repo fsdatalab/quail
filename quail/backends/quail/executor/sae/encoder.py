@@ -6,7 +6,7 @@ from quail.backends.quail.executor.readout import _HostReadout
 
 # bytes of fp32 pre-activation one encode block materializes: it lives
 # in the device memory the arena leaves unclaimed (POOL_FRACTION in
-# quail.cost.budgets), and fewer, larger blocks mean fewer launches
+# quail.common.budgets), and fewer, larger blocks mean fewer launches
 ENCODE_BLOCK_BYTES = 256 * 2**20
 
 

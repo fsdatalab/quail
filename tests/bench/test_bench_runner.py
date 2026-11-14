@@ -2,8 +2,9 @@
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pytest
-from helpers.oracle import Oracle, oracle_executor
+from helpers.oracle import Oracle, finish, oracle_executor, question_text
+from helpers.planning import operators_of
+from helpers.sessions import CONFIG, TOKENIZER, encoder
 
 import quail
 from bench.quailb import (
@@ -15,19 +16,19 @@ from bench.quailb import (
     run_output,
 )
 from bench.substrait import sql_string
+from quail.api.config import EngineConfig
 from quail.api.execute import execute_query
-from quail.baselines.nodes import RequestExecution
-from quail.builtins import built_in_registry
 from quail.catalog import DocumentProvider
 from quail.execution.metrics import NodeMetrics, NodeResult, RunResult
 from quail.execution.result import answer_table
 from quail.execution.types import PhysicalResponse, export_physical_outputs
-from quail.physical import decode_graph
-from quail.planner.plan import EngineConfig, Refusal
+from quail.physical import RequestExecution
+from quail.physical.plan import Refusal, graph_from_envelope
 from quail_b.labels import GroundTruthCollection, PredicateLabels
 from quail_b.minimum import DocumentTokens, token_metrics
 from quail_b.prompts import DISCUSS_ASPECT, F1
 from quail_b.queries import get_query
+from quail_b.rendering import ANSWER_CUE
 from quail_b.scoring import evaluate
 
 # IMDB-3 is F1 on the reviews, then the DISCUSS_ASPECT join with the aspects
@@ -62,7 +63,7 @@ def _truth():
 
 
 def _token_ids(text):
-    return [byte + 1 for byte in text.encode("utf-8")]
+    return encoder()(text)
 
 
 def _config(backend):
@@ -73,8 +74,7 @@ def _config(backend):
 def _session(tmp_path, backend="quail"):
     for name, table in CORPUS.items():
         pq.write_table(table, tmp_path / f"{name}.parquet")
-    tokenizer = str.split if backend == "quail" else _token_ids
-    sess = quail.Session(_config(backend), tokenizer=tokenizer)
+    sess = quail.Session(_config(backend), tokenizer=TOKENIZER)
     for name in CORPUS:
         sess.register(name, DocumentProvider.from_parquet(
             str(tmp_path / f"{name}.parquet"), id_col="id"))
@@ -100,7 +100,7 @@ _REPORT = {"wall_s": 2.0, "boot_s": 3.0, "boot_kind": "cold", "boot": {},
 def _execute(query, nodes, **metrics):
     """Run a query on a request backend whose node results nodes() plants."""
     def execute(request):
-        graph = decode_graph(request.plan["graph"], built_in_registry().codecs)
+        graph = graph_from_envelope(request.plan)
         outputs = export_physical_outputs(
             graph, RunResult(None, nodes(graph, request), NodeMetrics()))
         return PhysicalResponse(outputs, {**_REPORT, **metrics})
@@ -159,40 +159,42 @@ TRACES = pa.table({
 
 def test_relational_plans_build_and_run(tmp_path):
     pq.write_table(TRACES, tmp_path / "agent_traces.parquet")
-    with quail.Session(_config("quail"), tokenizer=str.split) as sess:
+    with quail.Session(_config("quail"), tokenizer=TOKENIZER) as sess:
         sess.register("agent_traces", DocumentProvider.from_parquet(
             str(tmp_path / "agent_traces.parquet"), id_col="id"))
-        logical = build_query(sess, get_query("REL-AGENT-6")).logical
-        root = logical.root
-        assert root.input.keys == ("t.trajectory_id",)
-        assert [str(a) for a in root.input.aggregates] == [
-            "fixes = count(*)", "first_fix = min(t.turn_index)",
-            "longest = max(t.token_count)"]
-        assert [str(t) for t in root.input.having] == ["fixes >= 2"]
-        assert [str(key) for key in root.order] == [
-            "first_fix ASC NULLS LAST", "t.trajectory_id ASC NULLS LAST"]
-        assert (root.limit, root.offset) == (50, 0)
-        scan = next(node for node in logical.walk()
-                    if type(node).__name__ == "Scan")
-        tested = build_query(sess, get_query("REL-AGENT-1")).logical
-        scan = next(node for node in tested.walk()
-                    if type(node).__name__ == "Scan")
-        assert [str(p) for p in scan.predicates] == [
-            "t.turn_index >= 10", "t.token_count <= 6000"]
-        paged = build_query(sess, get_query("REL-AGENT-2")).logical.root
-        assert (paged.limit, paged.offset) == (10, 10)
-        top = build_query(sess, get_query("REL-AGENT-4")).logical.root
-        assert [column.name for column in top.input.columns
+        # DataFusion groups, filters, sorts, and limits the AI filter's rows
+        grouped = build_query(sess, get_query("REL-AGENT-6"))
+        assert not grouped.whole
+        explained = grouped.explain()
+        assert "gby=[trajectory_id@0 as trajectory_id]" in explained
+        assert "FilterExec: count(Int64(1))@1 >= 2" in explained
+        assert "fetch=50" in explained
+        assert operators_of(grouped).scans
+        # the plain tests run in DataFusion, before the model reads a row
+        tested = build_query(sess, get_query("REL-AGENT-1"))
+        (scan,) = operators_of(tested).scans
+        assert scan.predicates == ()
+        explained = tested.explain()
+        assert "turn_index@2 >= 10" in explained
+        assert "token_count@3 <= 6000" in explained
+        # DataFusion sorts, skips, and limits the region's rows
+        paged = build_query(sess, get_query("REL-AGENT-2"))
+        assert operators_of(paged).fetch is None
+        explained = paged.explain()
+        assert "GlobalLimitExec: skip=10, fetch=10" in explained
+        assert "SortExec: TopK(fetch=20)" in explained
+        top = build_query(sess, get_query("REL-AGENT-4"))
+        assert [column.name for column in operators_of(top).projection.columns
                 if hasattr(column, "name")] == ["recovered_score"]
-        assert top.order[0].name == "recovered_score" and top.limit == 20
+        assert "TopK(fetch=20), expr=[recovered_score@1 DESC" in top.explain()
         # an aggregate with no measures is a DISTINCT, which the filter
         # stops per trajectory
         query = build_query(sess, get_query("REL-AGENT-3"))
-        distinct = query.logical.root
-        assert distinct.distinct and [
-            column.column for column in distinct.input.columns
-        ] == ["trajectory_id"]
-        assert "stop per key: trajectory_id" in query.explain()
+        assert [column.column for column in operators_of(query).projection.columns
+                ] == ["trajectory_id"]
+        explained = query.explain()
+        assert "gby=[trajectory_id@0 as trajectory_id], aggr=[]" in explained
+        assert "stop per key: trajectory_id" in explained
 
         # the fixes: s0, s1 (A), s2, s4 (B), s5 (C): A and B twice
         oracle = Oracle(filters=lambda alias, document, position: document != 3)
@@ -216,45 +218,54 @@ CONTRACTS = pa.table({
 })
 
 
-@pytest.mark.parametrize("query_id", [
-    "IMDB-22", "IMDB-20", "IMDB-21", "IMDB-24", "IMDB-25", "CUAD-19", "CUAD-20"])
-def test_a_map_query_reports_every_answer_and_its_pieces(tmp_path, query_id):
-    spec = get_query(query_id)
+MAP_QUERIES = [
+    "IMDB-22", "IMDB-20", "IMDB-21", "IMDB-24", "IMDB-25", "CUAD-19", "CUAD-20"]
+
+
+def test_a_map_query_reports_every_answer_and_its_pieces(tmp_path):
     corpus = {"reviews": CORPUS["reviews"], "contracts": CONTRACTS}
     oracle = Oracle(filters=lambda alias, document, position: document != 1,
                     labels=lambda spec, ids: "negative")
+    index = {"r0": 0, "r1": 1, "ct0": 0, "ct1": 1, "ct2": 2}
     with _session(tmp_path) as sess:
         sess.register("contracts", DocumentProvider.from_table(
             CONTRACTS, id_col="id"))
-        query = build_query(sess, spec)
-        result = execute_query(query, physical_executor=oracle_executor(
-            oracle, **_REPORT, store=None))
-        output = run_output(result, spec.info, corpus)
-        pieces = prompt_pieces(query, spec.info, {})
         turn = sess.model.turn
-    (relation,) = spec.info.relations
-    alias = relation.alias
-    filtered = bool(spec.info.filters)
-    read = (["r0"] if relation.table == "reviews" else ["ct0", "ct2"]) \
-        if filtered else corpus[relation.table].column("id").to_pylist()
-    if query_id == "IMDB-25":
-        read = []   # every review is labeled negative; only mixed ones are mapped
-    assert sorted(output.map_answers) == [m.id for m in spec.info.maps]
-    for operator in spec.info.maps:
-        answers = output.map_answers[operator.id].to_pydict()
-        assert answers[alias] == read
-        index = {"r0": 0, "r1": 1, "ct0": 0, "ct1": 1, "ct2": 2}
-        assert answers["answer"] == [f"{operator.output} {index[i]}" for i in read]
-        assert output.rows.column(operator.output).to_pylist() == answers["answer"]
-    # every map shows the document under the shared preamble, so a
-    # filter or classification before it in the pipeline leaves its KV
-    assert pieces["preamble"] == (turn[0] + quail.SHARED_PRE).split()
-    assert [piece["id"] for piece in pieces["maps"]] == [
-        m.id for m in spec.info.maps]
-    assert all(piece["tail"][-1] == "ANSWER:" for piece in pieces["maps"])
+        for query_id in MAP_QUERIES:
+            spec = get_query(query_id)
+            query = build_query(sess, spec)
+            result = execute_query(query, physical_executor=oracle_executor(
+                oracle, **_REPORT, store=None))
+            output = run_output(result, spec.info, corpus)
+            pieces = prompt_pieces(query, spec.info, {})
+            (relation,) = spec.info.relations
+            alias = relation.alias
+            filtered = bool(spec.info.filters)
+            read = (["r0"] if relation.table == "reviews" else ["ct0", "ct2"]) \
+                if filtered else corpus[relation.table].column("id").to_pylist()
+            if query_id == "IMDB-25":
+                # every review is labeled negative; only mixed ones are mapped
+                read = []
+            assert sorted(output.map_answers) == [
+                m.id for m in spec.info.maps], query_id
+            for operator in spec.info.maps:
+                answers = output.map_answers[operator.id].to_pydict()
+                assert answers[alias] == read, query_id
+                assert answers["answer"] == [
+                    f"{operator.output} {index[i]}" for i in read], query_id
+                assert output.rows.column(operator.output).to_pylist() == (
+                    answers["answer"]), query_id
+            # every map shows the document under the shared preamble, so a
+            # filter or classification before it in the pipeline leaves its KV
+            assert pieces["preamble"] == _token_ids(
+                turn[0] + quail.SHARED_PRE), query_id
+            assert [piece["id"] for piece in pieces["maps"]] == [
+                m.id for m in spec.info.maps], query_id
+            assert all(question_text(piece["tail"]).endswith(ANSWER_CUE.strip())
+                       for piece in pieces["maps"]), query_id
 
 
-def test_stock_vllm_reports_an_extraction_and_its_pieces(tmp_path):
+def test_stock_vllm_reports_extractions_and_maps_with_their_pieces(tmp_path):
     spec = get_query("CUAD-1")
     span_type = pa.struct([("start", pa.int64()), ("end", pa.int64())])
 
@@ -289,11 +300,9 @@ def test_stock_vllm_reports_an_extraction_and_its_pieces(tmp_path):
     assert [item["id"] for item in pieces["extracts"]] == ["extract-1"]
     assert pieces["extracts"][0]["tail"][-1] == _token_ids(":")[-1]
 
-
-def test_stock_vllm_reports_maps_and_their_pieces(tmp_path):
     spec = get_query("CUAD-18")
 
-    def nodes(graph, request):
+    def map_nodes(graph, request):
         model = next(
             node for node in graph.nodes if isinstance(node, RequestExecution))
         return {model.node_id: NodeResult({
@@ -309,7 +318,7 @@ def test_stock_vllm_reports_maps_and_their_pieces(tmp_path):
         sess.register("contracts", DocumentProvider.from_table(
             CONTRACTS, id_col="id"))
         query = build_query(sess, spec)
-        result = _execute(query, nodes, cached_tokens=0)
+        result = _execute(query, map_nodes, cached_tokens=0)
         output = run_output(result, spec.info, {"contracts": CONTRACTS})
         pieces = prompt_pieces(query, spec.info, {})
     for operator in spec.info.maps:
@@ -371,8 +380,26 @@ def test_sec_queries_read_their_own_directory_as_engines_see_the_filings(tmp_pat
         "id": ["0001"], "text": ["cafe\u0301 agreement"],
         "filing_date": ["2024-01-02"], "filing_month": ["2024-01"]}),
         tmp_path / "sec_filings.parquet")
-    with quail.Session(_config("quail"), tokenizer=str.split) as sess:
+    with quail.Session(_config("quail"), tokenizer=TOKENIZER) as sess:
         register_tables(sess, tmp_path)
         query = sess.sql("SELECT f.id FROM sec_filings f WHERE f.text_chars = 14 "
                          "AND AI_FILTER(PROMPT('Is {0} a contract?', f.text))")
         assert not isinstance(query.plan(), Refusal)
+
+
+def test_a_map_answers_prefix_test_keeps_its_rows_and_reports_no_filter():
+    calls = pa.table({
+        "id": ["s0", "s1", "s2"], "transcript": ["a b", "c d", "e f"]})
+    written = ["price: too high", "none", "timing: next quarter"]
+    spec = get_query("SALES-6")
+    with quail.Session(CONFIG, tokenizer=TOKENIZER) as session:
+        session.register("sales_calls", DocumentProvider.from_table(
+            calls, id_col="id"))
+        query = build_query(session, spec)
+        result = finish(query, Oracle(maps=lambda spec, document: written[document]))
+        output = run_output(result, spec.info, {"sales_calls": calls})
+        pieces = prompt_pieces(query, spec.info, {})
+    assert output.rows.to_pylist() == [{"c": "s0", "objection": "price: too high"}]
+    # the test is no AI filter, so it has no answers or prompt of its own
+    assert not output.filter_answers and not pieces["filters"]
+    assert [item["id"] for item in pieces["maps"]] == ["map-1"]

@@ -9,7 +9,7 @@ architecture with bf16 weights and run through this file too.
 
 from quail.backends.quail.executor.attention import Engine
 from quail.backends.quail.executor.models.base import ModelPipeline
-from quail.cost.budgets import tree_attention_allowed
+from quail.common.budgets import tree_attention_allowed
 
 
 class Qwen3Pipeline(ModelPipeline):

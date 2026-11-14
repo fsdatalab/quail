@@ -22,17 +22,26 @@ export default async function Page(props: PageProps<'/docs/[[...slug]]'>) {
   const markdownUrl = getPageMarkdownUrl(page).url;
 
   return (
-    <DocsPage toc={page.data.toc} full={page.data.full}>
-      <DocsTitle>{page.data.title}</DocsTitle>
-      <DocsDescription className="mb-0">{page.data.description}</DocsDescription>
-      <div className="flex flex-row gap-2 items-center border-b pb-6">
-        <MarkdownCopyButton markdownUrl={markdownUrl} />
-        <ViewOptionsPopover
-          markdownUrl={markdownUrl}
-          githubUrl={`https://github.com/${gitConfig.user}/${gitConfig.repo}/blob/${gitConfig.branch}/content/docs/${page.path}`}
-        />
-      </div>
-      <DocsBody>
+    <DocsPage
+      toc={page.data.toc}
+      full={page.data.full}
+      breadcrumb={{ className: 'quail-breadcrumb' }}
+      footer={{ className: 'quail-page-footer' }}
+    >
+      <header className="quail-page-header">
+        <div className="quail-title-row">
+          <DocsTitle>{page.data.title}</DocsTitle>
+          <div className="quail-page-actions">
+            <MarkdownCopyButton markdownUrl={markdownUrl} />
+            <ViewOptionsPopover
+              markdownUrl={markdownUrl}
+              githubUrl={`https://github.com/${gitConfig.user}/${gitConfig.repo}/blob/${gitConfig.branch}/docs/content/docs/${page.path}`}
+            />
+          </div>
+        </div>
+        <DocsDescription>{page.data.description}</DocsDescription>
+      </header>
+      <DocsBody className="quail-prose">
         <MDX
           components={getMDXComponents({
             // this allows you to link to other pages with relative file paths

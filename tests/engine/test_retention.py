@@ -4,7 +4,7 @@ from helpers.fakes import bare_arena
 
 from quail.backends.quail.executor.arena import KVArena
 from quail.backends.quail.retention import apply_retention
-from quail.cost.retention import RetentionPolicy
+from quail.common.retention import RetentionPolicy
 from quail.progress import set_answer_sink
 
 

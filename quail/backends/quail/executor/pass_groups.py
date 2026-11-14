@@ -3,9 +3,8 @@
 A pass group (PackSetPasses) is the operators whose questions share a
 pass over each document: AI filters (yes/no), scores (yes/no, read as
 a probability), classifications (option codes), and extractions
-(pointer reads). run_pass_group asks them all
-in one pass per document and decodes the answers for every document
-at once.
+(pointer reads). A PassGroup asks them all in one pass per document,
+in one GPU loop, and decodes the answers for every document at once.
 """
 
 from dataclasses import dataclass, field, replace
@@ -13,11 +12,10 @@ from dataclasses import dataclass, field, replace
 import numpy as np
 
 from quail.backends.quail.executor.model_loading import full_output_head
-from quail.backends.quail.executor.parts import gpu_seconds, input_staging
 from quail.backends.quail.executor.readout import AsyncPassReadout
-from quail.backends.quail.executor.set_passes import group_passes
-from quail.backends.quail.executor.stages import Stage, run_stages
-from quail.catalog.document_ends import ends_for, joined_state
+from quail.backends.quail.executor.set_passes import Passes, group_passes, run_passes
+from quail.backends.quail.executor.stages import Stage
+from quail.common.document_ends import ends_for, joined_state
 from quail.physical import AiFilter, ClassifySpec, ExtractSpec, ScoreSpec
 
 
@@ -176,96 +174,140 @@ def _decode(values, places, code_width, width, temperature):
     return out
 
 
-def run_pass_group(state, questions, prefixes, *, limit=None, stop_groups=None,
-                   label="pass group") -> GroupAnswers:
-    """Ask every question of a pass group of each document.
+class PassGroup:
+    """A pass group's stages in a set-attention run, and its answers.
 
     Each document's pass reads its prompt head and document, the state
     tail, then the questions, each after the first opened by its header.
     The planner sized the group to fit one chunk; a document longer than
-    it planned for splits the group into more passes.
+    it planned for splits the group into more passes, one stage each.
 
     Args:
         state: The query's execution state.
         questions: The group's SetQuestions, in plan order.
-        prefixes: Per document, its prompt head and document tokens.
-        limit: Stop admitting documents once this many passed every
-            yes/no question; None asks every document.
-        stop_groups: Per document, its stop key group, or None.
+        prefixes: Per document the run may ask, its prompt head and
+            document tokens; the longest state sizes the passes.
         label: The progress label.
 
     Raises:
         ValueError: The questions differ in prompt head or state tail.
     """
-    first = questions[0]
-    if any(q.head != first.head or q.state_tail != first.state_tail
-           for q in questions):
-        raise ValueError("the questions of one pass group share their prompt "
-                         "head and state tail")
-    ends = dict(first.ends) if first.ends else None
-    states = [joined_state(prefix, first.state_tail, ends) for prefix in prefixes]
-    head = len(first.head)
-    reads_any = any(q.kind == "read" for q in questions)
-    # a read's document rows: the first row, which stands for nothing,
-    # then each document row the state kept
-    state_rows = ([np.r_[0, np.arange(head, min(len(prefix), len(kept)))]
-                   for prefix, kept in zip(prefixes, states)] if reads_any else None)
-    rows = state.answer_rows
-    yes = [rows.allowed[i] for i in rows.true_cols.tolist()]
-    no = [rows.allowed[i] for i in rows.false_cols.tolist()]
-    targets = sorted({token for q in questions if q.kind != "read"
-                      for token in (yes + no if q.kind in ("yes_no", "score")
-                                    else [t for ids in q.spellings for t in ids])})
-    model_spec = state.loaded_model.model_spec
-    torch = state.torch
-    head_weights = full_output_head(state.loaded_model.model)
-    answers = [None] * len(questions)
-    suffix_tokens = [0] * len(questions)
-    group = GroupAnswers(np.zeros(0, dtype=np.int64), answers, suffix_tokens)
-    passes = group_passes(states, [q.tokens for q in questions], first.header,
-                          model_spec.set_size, state.chunk_tokens)
-    if len(passes) > 1:
-        # every pass of a split group asks every document, so their
-        # answers line up
-        limit, stop_groups = None, None
-    for members, suffix, shape in passes:
-        kinds, places, code_width, reads = _layout(questions, members, yes, no,
-                                                   targets)
-        yes_no = [(place[1], place[2], place[3]) for place in places
-                  if place[0] == "yes_no"]
-        width = len(targets)
 
-        def decide(_, row, yes_no=yes_no, width=width):
-            values = np.asarray(row[0]).reshape(-1)
-            return all(values[slot * width + np.asarray(y)].max()
-                       > values[slot * width + np.asarray(n)].max()
-                       for slot, y, n in yes_no)
+    def __init__(self, state, questions, prefixes, label="pass group"):
+        first = questions[0]
+        if any(q.head != first.head or q.state_tail != first.state_tail
+               for q in questions):
+            raise ValueError("the questions of one pass group share their prompt "
+                             "head and state tail")
+        self.state = state
+        self.label = label
+        self.questions = questions
+        self.ends = dict(first.ends) if first.ends else None
+        self.reads_any = any(q.kind == "read" for q in questions)
+        self.reads = []         # per pass asked, the state rows a read scores
+        rows = state.answer_rows
+        yes = [rows.allowed[i] for i in rows.true_cols.tolist()]
+        no = [rows.allowed[i] for i in rows.false_cols.tolist()]
+        targets = sorted({token for q in questions if q.kind != "read"
+                          for token in (yes + no if q.kind in ("yes_no", "score")
+                                        else [t for ids in q.spellings for t in ids])})
+        self.width = len(targets)
+        model_spec = state.loaded_model.model_spec
+        self.temperature = model_spec.answer_temperature
+        torch = state.torch
+        head_weights = full_output_head(state.loaded_model.model)
+        longest = max((len(self.state_of(prefix)) for prefix in prefixes), default=0)
+        self.passes = []
+        self.stages = []
+        for members, suffix, shape in group_passes(
+                longest, [q.tokens for q in questions], first.header,
+                model_spec.set_size, state.chunk_tokens):
+            kinds, places, code_width, reads = _layout(questions, members, yes, no,
+                                                       targets)
+            yes_no = [(place[1], place[2], place[3]) for place in places
+                      if place[0] == "yes_no"]
 
-        stage = Stage(
-            suffixes=[suffix],
-            readout=AsyncPassReadout(torch, torch.nn.functional, head_weights,
-                                     targets, kinds, model_spec.read_span_tokens),
-            questions=(shape,),
-            question_slots=tuple(questions[member].slots for member in members),
-            state_reads=(None if not reads else (lambda anchor: state_rows[anchor])),
-            decide=decide, label=label)
-        found, spans, tokens = run_stages(
-            torch, state.loaded_model.arena, state.loaded_model.pipeline, [stage],
-            states, state.chunk_tokens, staging=input_staging(state),
-            gpu_timing=state.gpu_timing, paged=False, label=label,
-            limit=limit, stop_groups=stop_groups)
-        positions = np.fromiter(sorted(found[0]), dtype=np.int64,
-                                count=len(found[0]))
-        values = (np.stack([np.asarray(found[0][int(p)][0], dtype=np.float64)
-                            .reshape(-1) for p in positions])
-                  if len(positions) else np.zeros((0, code_width + 3 * reads)))
-        for member, answer, length in zip(members, _decode(
-                values, places, code_width, width, model_spec.answer_temperature),
-                shape):
-            answers[member] = answer
-            suffix_tokens[member] = length * len(positions)
-        group.positions = positions
-        group.tokens += tokens
-        group.gpu_s += gpu_seconds(spans)
-        group.chunks += len(spans)
-    return group
+            def decide(_, row, yes_no=yes_no, width=self.width):
+                values = np.asarray(row[0]).reshape(-1)
+                return all(values[slot * width + np.asarray(y)].max()
+                           > values[slot * width + np.asarray(n)].max()
+                           for slot, y, n in yes_no)
+
+            self.passes.append((members, places, code_width, reads, shape))
+            self.stages.append(Stage(
+                suffixes=[suffix],
+                readout=AsyncPassReadout(torch, torch.nn.functional, head_weights,
+                                         targets, kinds, model_spec.read_span_tokens),
+                questions=(shape,),
+                question_slots=tuple(questions[member].slots for member in members),
+                state_reads=self.reads.__getitem__ if reads else None,
+                decide=decide, label=label))
+
+    def state_of(self, prefix):
+        """A document's state: its prefix, joined with the state tail."""
+        return joined_state(prefix, self.questions[0].state_tail, self.ends)
+
+    def ask(self, prefixes, stop_groups=None, limit=None,
+            num_key_survivors=1) -> GroupAnswers:
+        """Ask every question of the group of each document, in one GPU loop.
+
+        Args:
+            prefixes: Per document, its prompt head and document tokens.
+            stop_groups: Per document, its stop key group, or None. The
+                groups apply to a group of one pass only, so the answers
+                of split passes line up.
+            limit: Stop once this many documents passed every yes/no
+                question, or None.
+            num_key_survivors: How many documents of a stop key group
+                must pass before the rest of the group is skipped.
+        """
+        states = [self.state_of(prefix) for prefix in prefixes]
+        head = len(self.questions[0].head)
+        # a read's document rows: the first row, which stands for nothing,
+        # then each document row the state kept
+        reads = ([np.r_[0, np.arange(head, min(len(prefix), len(kept)))]
+                  for prefix, kept in zip(prefixes, states)]
+                 if self.reads_any else [])
+        passes = Passes(stop_groups=(None if stop_groups is None
+                                     or len(self.passes) > 1 else list(stop_groups)))
+        self.reads[:] = []
+        for stage, (*_, shape) in enumerate(self.passes):
+            passes.stages += [stage] * len(states)
+            passes.states += states
+            passes.suffix_tokens += [sum(shape)] * len(states)
+            passes.owners += range(len(states))
+            self.reads += reads
+        return self.answers(run_passes(self.state, self.stages, passes,
+                                       label=self.label, limit=limit,
+                                       num_key_survivors=num_key_survivors),
+                            len(states))
+
+    def answers(self, passes, count) -> GroupAnswers:
+        """Decode the group's answers from its answered passes.
+
+        Args:
+            passes: The group's answered Passes, pass by pass, each over
+                every document in order.
+            count: The documents asked.
+        """
+        questions = self.questions
+        answers = [None] * len(questions)
+        suffix_tokens = [0] * len(questions)
+        group = GroupAnswers(np.zeros(0, dtype=np.int64), answers, suffix_tokens,
+                             tokens=passes.tokens, gpu_s=passes.gpu_s,
+                             chunks=passes.chunks)
+        for index, (members, places, code_width, reads, shape) in enumerate(
+                self.passes):
+            found = passes.values[index * count:(index + 1) * count]
+            positions = np.asarray([position for position, value in enumerate(found)
+                                    if value is not None], dtype=np.int64)
+            values = (np.stack([np.asarray(found[p], dtype=np.float64).reshape(-1)
+                                for p in positions])
+                      if len(positions) else np.zeros((0, code_width + 3 * reads)))
+            for member, answer, length in zip(members, _decode(
+                    values, places, code_width, self.width, self.temperature),
+                    shape):
+                answers[member] = answer
+                suffix_tokens[member] = length * len(positions)
+            group.positions = positions
+        return group

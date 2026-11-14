@@ -1,19 +1,18 @@
 logical:
-  Project: m.id, organ_class
-    SemanticClassify: organ_class
-      PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the reaction above which MedDRA system organ class it belongs to.', m.term) labels=['cardiac disorders', 'vascular disorders', 'nervous system disorders', 'psychiatric disorders', 'eye disorders', 'ear and labyrinth disorders', 'respiratory, thoracic and mediastinal disorders', 'gastrointestinal disorders', 'hepatobiliary disorders', 'renal and urinary disorders', 'skin and subcutaneous tissue disorders', 'musculoskeletal and connective tissue disorders', 'blood and lymphatic system disorders', 'immune system disorders', 'endocrine disorders', 'metabolism and nutrition disorders', 'infections and infestations', 'neoplasms benign, malignant and unspecified', 'injury, poisoning and procedural complications', 'investigations', 'general disorders and administration site conditions', 'reproductive system and breast disorders', 'pregnancy, puerperium and perinatal conditions', 'congenital, familial and genetic disorders', 'surgical and medical procedures', 'social circumstances']
-      Scan terms as m [term, id]
+  Projection: m.id, organ_class
+    AiNode: organ_class = ai_classify(prompt(Utf8("Judge strictly from the reaction above which MedDRA system organ class it belongs to.\n\n{0}"), m.term), make_array(Utf8("cardiac disorders"), Utf8("vascular disorders"), Utf8("nervous system disorders"), Utf8("psychiatric disorders"), Utf8("eye disorders"), Utf8("ear and labyrinth disorders"), Utf8("respiratory, thoracic and mediastinal disorders"), Utf8("gastrointestinal disorders"), Utf8("hepatobiliary disorders"), Utf8("renal and urinary disorders"), Utf8("skin and subcutaneous tissue disorders"), Utf8("musculoskeletal and connective tissue disorders"), Utf8("blood and lymphatic system disorders"), Utf8("immune system disorders"), Utf8("endocrine disorders"), Utf8("metabolism and nutrition disorders"), Utf8("infections and infestations"), Utf8("neoplasms benign, malignant and unspecified"), Utf8("injury, poisoning and procedural complications"), Utf8("investigations"), Utf8("general disorders and administration site conditions"), Utf8("reproductive system and breast disorders"), Utf8("pregnancy, puerperium and perinatal conditions"), Utf8("congenital, familial and genetic disorders"), Utf8("surgical and medical procedures"), Utf8("social circumstances")))
+      SubqueryAlias: m
+        TableScan: terms projection=[id, term]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
-  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
+  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                      est. rows   est. time
-  Project: m.id, organ_class
-    AiClassify: organ_class over m                                  35.2 ms
-      rule=trie_decode, labels=26, label tokens=801
-      Scan terms as m                                         6
-        tokens=60, mean_document_tokens=10
+                                                    est. rows   est. time
+  AiClassify: organ_class over m                                  27.5 ms
+    rule=trie_decode, labels=26, label tokens=662
+    Scan terms as m                                         6
+      tokens=60, mean_document_tokens=10
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

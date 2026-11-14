@@ -1,6 +1,6 @@
 """Tests for the adaptive draft-length policy."""
 
-from quail.cost.draft_policy import DraftPolicy
+from helpers.draft_policy import DraftPolicy
 
 
 def test_draft_length_grows_with_the_kv_read_and_shrinks_with_live_positions():
@@ -18,10 +18,10 @@ def test_draft_length_grows_with_the_kv_read_and_shrinks_with_live_positions():
     assert policy.draft_length(0, 1, num_streams=100) == 0
 
 
-def test_fit_drafts_keeps_the_largest_gains_in_the_room():
+def test_fit_drafts_keeps_the_largest_gains_in_the_room_and_gains_match_the_policy():
     import numpy as np
 
-    from quail.cost.draft_policy import fit_drafts
+    from quail.common.draft_policy import draft_gains, fit_drafts
 
     gains = np.array([[0.9, 0.8, 0.1, 0.1],
                       [0.5, 0.5, 0.5, 0.0],
@@ -35,12 +35,6 @@ def test_fit_drafts_keeps_the_largest_gains_in_the_room():
     # gains of 1 / j shrink drafts evenly, as fixed drafts are
     even = np.tile(1.0 / np.arange(1, 9), (3, 1))
     assert fit_drafts(even, np.array([8, 8, 2]), 10).tolist() == [4, 4, 2]
-
-
-def test_draft_gains_match_the_policy_costs():
-    import numpy as np
-
-    from quail.cost.draft_policy import draft_gains
 
     policy = DraftPolicy(cap=8, max_answer_tokens=10, expected_answer_tokens=4)
     gains = draft_gains(8, 10, policy.curve(), [0, 5], [1, 3],

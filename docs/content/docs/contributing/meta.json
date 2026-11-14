@@ -1,8 +1,8 @@
 {
-  "title": "Contributing",
+  "title": "Developers",
   "pages": [
     "index",
-    "benchmark"
+    "query-planning"
   ],
   "defaultOpen": false
 }

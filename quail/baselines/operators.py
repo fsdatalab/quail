@@ -7,7 +7,7 @@ import time
 import numpy as np
 import pyarrow as pa
 
-from quail.catalog.pairs import (
+from quail.common.pairs import (
     allowed_members,
     members_by_partner,
     pair_partner,
@@ -335,7 +335,7 @@ def answer_documents(client, extracts, maps, bodies, texts, body_texts=None, *,
     wall_s = time.perf_counter() - started
     extracted = [read_extractions(own, texts, wall_s)
                  for own in per_spec[:len(extracts)]]
-    mapped = [{"answers": [output.outputs[0].text for output in own],
+    mapped = [{"answers": [output.outputs[0].text.strip() for output in own],
                "wall_s": wall_s, "requests": len(own), "doc_cap": None,
                **_generation_counts(own)}
               for own in per_spec[len(extracts):]]
@@ -391,7 +391,7 @@ def map_documents(client, specs, bodies, body_texts=None, *,
     else:
         raise ValueError(f"unknown map submission {submission!r}")
     wall_s = time.perf_counter() - started
-    return [{"answers": [output.outputs[0].text for output in own],
+    return [{"answers": [output.outputs[0].text.strip() for output in own],
              "wall_s": wall_s, "requests": len(own), "doc_cap": document_cap,
              **_generation_counts(own)}
             for own in per_spec]

@@ -115,11 +115,12 @@ def smoke(device: str, run_dir: str) -> dict:
     import torch
 
     import quail
+    from quail.api.config import EngineConfig
     from quail.backends.quail.executor.attention import (
         deep_gemm_supported,
         flash_attention_version,
     )
-    from quail.planner.plan import EngineConfig, Refusal
+    from quail.physical.plan import Refusal
 
     capability = tuple(torch.cuda.get_device_capability(0))
     tmp = tempfile.mkdtemp()

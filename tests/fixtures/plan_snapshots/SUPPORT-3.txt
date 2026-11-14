@@ -1,36 +1,40 @@
+DataFusion:
+CooperativeExec
+  ModelRegionExec: calls=[ai_classify, ai_filter], tables=[support_messages, support_messages@u]
+    CoalescePartitionsExec
+      FilterExec: role@1 = user, projection=[id@0, content@2, prev_assistant_id@3]
+        DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
+
+model region:
 logical:
-  Project: u.id, a.id, disagreement
-    SemanticClassify: disagreement
-      PROMPT("Judge strictly from the customer's reply in DOCUMENT {0} to the agent message in DOCUMENT {1} what the disagreement is about.", u.content, a.content) labels=['policy refusal', 'misunderstood request', 'wrong details', 'repeated question', 'changed mind', 'other']
-      SemanticJoin (full)
-        PROMPT("Does the customer's reply in DOCUMENT {1} disagree with, correct, or push back on what the agent said in DOCUMENT {0}? Answer TRUE if the reply objects to the agent's statement, rejects its proposal, or says the agent got something wrong, FALSE otherwise.", a.content, u.content) (selectivity=5.26%)
-        Join
-          on a.id = u.prev_assistant_id
-          Scan support_messages as a [content, id]
-          Scan support_messages as u [content, id, prev_assistant_id, role] where u.role = 'user'
+  Projection: u.id, a.id, disagreement
+    AiNode: disagreement = ai_classify(prompt(Utf8("Judge strictly from the customer's reply in DOCUMENT {0} to the agent message in DOCUMENT {1} what the disagreement is about."), u.content, a.content), make_array(struct(Utf8("policy refusal"), Utf8("the agent declined the request citing policy and the customer objects")), struct(Utf8("misunderstood request"), Utf8("the agent acted on or proposed something other than what was asked")), struct(Utf8("wrong details"), Utf8("the agent stated wrong order, booking, price, or account details")), struct(Utf8("repeated question"), Utf8("the agent asked for information or confirmation the customer already gave")), struct(Utf8("changed mind"), Utf8("the customer withdraws or changes their own earlier request")), struct(Utf8("other"), Utf8("none of the above"))))
+      AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Does the customer's reply in DOCUMENT {1} disagree with, correct, or push back on what the agent said in DOCUMENT {0}? Answer TRUE if the reply objects to the agent's statement, rejects its proposal, or says the agent got something wrong, FALSE otherwise."), a.content, u.content), named_struct(Utf8("selectivity"), Float64(0.052648790058862))), filter: __quail_answer_1, returns: []
+        Inner Join: a.id = u.prev_assistant_id
+          SubqueryAlias: a
+            TableScan: support_messages projection=[id, content]
+          SubqueryAlias: u
+            TableScan: support_messages@u
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
-  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
+  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
                                                                                                       est. rows   est. pass   est. time
-  Project: u.id, a.id, disagreement
-    AiJoin: anchor=u [3]                                                                                                         1.1 ms
+  AiClassify: disagreement over a                                                                                                 <1 ms
+    rule=letters, labels=6, label tokens=6
+    AiJoin: anchor=a                                                                                                              <1 ms
       KV: anchor=not resident, retain after join=no
-      join 1 full (u, a) over pairs from hash_join:a-u  PROMPT("Does the customer's reply in DOC…")         0.2       5.26%
-      Scan support_messages as u [2]                                                                          1
-        tokens=156, mean_document_tokens=26
-        where u.role = 'user'
+      join 1 full (a, u) over pairs from hash_join:a-u  PROMPT("Does the customer's reply in DOC…")           0       5.26%
       Scan support_messages as a [1]                                                                          6
-        tokens=156, mean_document_tokens=26
+        tokens=144, mean_document_tokens=24
+      Scan support_messages as u [2]                                                                          0
+        tokens=0, mean_document_tokens=0
       HashJoin: a.id = u.prev_assistant_id
-        pairs kept: 0.02778 of the cross product
+        pairs kept: 0 of the cross product
         Reuse [1]
         Reuse [2]
-    AiClassify: disagreement over u                                                                                               <1 ms
-      rule=letters, labels=6, label tokens=6
-      Reuse [3]
-  Pipeline on u: ai_join:u -> ai-classify:0 (each document runs every operator with its KV resident)
+  Pipeline on a: ai_join:a -> ai-classify:0 (each document runs every operator with its KV resident)
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

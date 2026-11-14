@@ -3,16 +3,17 @@
 import numpy as np
 import pytest
 from helpers.fakes import cpu_staging, plain_arena
+from helpers.rust_cost import classify_estimate, cost_model
+from test_kv_reads import named
 
 from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.chunk import Suffixes
-from quail.cost.classify import estimate
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 
 torch = pytest.importorskip("torch")
 
 
-def test_pack_chunk_rows_for_many_suffixes(monkeypatch):
+def test_pack_chunk_rows_for_many_suffixes_and_copy_drafts(monkeypatch):
     cpu_staging(monkeypatch)
     arena = plain_arena()
     key = ("d", 0)
@@ -48,6 +49,12 @@ def test_pack_chunk_rows_for_many_suffixes(monkeypatch):
     assert reads["cu_q"].tolist() == [0, 6]
     assert reads["used"].tolist() == [4]
     assert reads["source"].tolist() == [0, 1, 2, 3, 4, 5]
+
+    for mode, shared in [("tree", True), ("unified", False)]:
+        named(
+            f"copy drafts mode={mode} shared={shared}",
+            check_copy_drafts_pack_as_causal_sequences_without_combining_slots,
+            monkeypatch=monkeypatch, mode=mode, shared=shared)
 
 
 @pytest.mark.parametrize("mode", ["tree"])
@@ -85,14 +92,13 @@ def test_decode_cost_matches_packed_retained_kv(monkeypatch, mode, shared, run):
         labels = ([(10,)] if first else
                   [(10, *range(11, 10 + run), 1), (10, *range(11, 10 + run), 2),
                    (20, *range(21, 20 + run), 1), (20, *range(21, 20 + run), 2)])
-        cost = estimate(
-            "trie_decode", 1, 0, 2, labels, lengths=(32,),
+        cost = classify_estimate(
+            cost_model(), "trie_decode", 1, 0, 2, labels, lengths=(32,),
             shared=(shared,), chunk=100,
-            model=QWEN3_4B_FP8, device=H100_SXM)
-        assert cost.work.tokens == fresh_tokens
-        assert cost.work.kv_read == retained_reads
-@pytest.mark.parametrize("mode,shared", [("tree", True), ("unified", False)])
-def test_copy_drafts_pack_as_causal_sequences_without_combining_slots(
+            model=QWEN3_4B_FP8.name, device=H100_SXM.name)
+        assert cost.work["tokens"] == fresh_tokens
+        assert cost.work["kv_read"] == retained_reads
+def check_copy_drafts_pack_as_causal_sequences_without_combining_slots(
         monkeypatch, mode, shared):
     cpu_staging(monkeypatch)
     arena = plain_arena()
@@ -138,5 +144,3 @@ def test_copy_drafts_pack_as_causal_sequences_without_combining_slots(
     for key in reversed(keys):
         arena.free_key(key)
     assert not arena.accounting.owned
-
-

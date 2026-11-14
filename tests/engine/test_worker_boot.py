@@ -1,6 +1,7 @@
 """Booting a GPU for a query, reusing it, and releasing it for another model."""
 
 import contextlib
+import gc
 import sys
 import types
 import weakref
@@ -8,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from quail.backends.base import GpuContext
 from quail.backends.quail import worker
 from quail.backends.quail.executor.chunk import InputStaging
 from quail.backends.quail.executor.memory import memory_report
@@ -58,11 +60,62 @@ ENVELOPE = {
     "gpus": 1,
     "settings": {"chunk_tokens": 8192, "true_ids": [1], "false_ids": [2]},
 }
-PAYLOAD = {"physical_plan": ENVELOPE, "model": "qwen3-4b-fp8", "gpus": 1,
-           "documents": {}, **ENVELOPE["settings"]}
+SETUP = {"model": "qwen3-4b-fp8", "device": "h100-sxm", "backend": "quail",
+         "gpus": 1, "model_path": None, "extensions": [],
+         **ENVELOPE["settings"]}
 
 
-def test_arena_resize_releases_pieces_that_write_kv(booted, monkeypatch):
+def test_a_worker_reuses_its_model_and_an_arena_resize_releases_pieces_that_write_kv(
+        booted, monkeypatch):
+    state = worker.WorkerState(0, registry=built_in_registry())
+
+    assert worker._boot_worker(state, SETUP)["kind"] == "cold"
+    gpu = state.gpu
+    assert memory_report(gpu)["memory_bytes"] == {
+        "weights": 8 * 2**30, "kv": 0, "state": 0,
+        "other": 12 * 2**30, "peak": 20 * 2**30}
+
+    execution = gpu.execution
+    loaded = execution.loaded_model
+    loaded.label_readout = object()
+    readout = loaded.label_readout
+    staging = loaded.input_staging = InputStaging(gpu.torch)
+    buffers = staging.buffers
+    buffers["tokens"] = object()
+    query = execution.query
+    query.async_scores = SimpleNamespace(rows=query.answer_rows)
+    query.gpu_timing = True
+    old_query = weakref.ref(query)
+    del query
+
+    assert worker._boot_worker(state, SETUP)["kind"] == "warm"
+    assert old_query() is None
+    assert execution.query.loaded_model is loaded
+    assert execution.query.async_answers is gpu.async_ans
+    assert execution.query.async_scores is None
+    assert execution.query.gpu_timing is False
+    assert loaded.label_readout is readout
+    assert loaded.input_staging is staging
+    assert staging.buffers is buffers and "tokens" in buffers
+    assert state.gpu is gpu
+    resized = []
+    gpu.arena = SimpleNamespace(
+        k=[], v=[], gdn_state=None, conv_state=None,
+        resize=lambda *pages, **kw: resized.append((pages, kw)))
+    gpu.bind_query([1], [2], 4096, arena_pages=(8, 2))
+    assert resized == [((8, 2), {"free_resident": True})]
+    execution.bind_loaded_model(model=object(), arena=gpu.arena,
+                                pipeline=gpu.pipeline)
+    assert execution.loaded_model is not loaded
+    assert execution.loaded_model.label_readout is None
+    assert execution.loaded_model.input_staging is None
+    with pytest.raises(RuntimeError, match="no bound query"):
+        execution.query
+    replacement = weakref.ref(execution.loaded_model)
+    execution.close()
+    assert replacement() is None
+
+    # an arena resize releases the pieces that write KV
     calls = []
     gpu = LoadedGpu.__new__(LoadedGpu)
     gpu.torch = sys.modules["torch"]
@@ -86,114 +139,37 @@ def test_arena_resize_releases_pieces_that_write_kv(booted, monkeypatch):
     assert calls == ["synchronize", "invalidate", "resize"]
 
 
-def test_prepared_boot_is_handed_to_the_query_and_used_once(
-        booted, monkeypatch):
-    registry = built_in_registry()
-    backend = registry.backend("quail")
-    runtime_state = {}
-    boots = []
-    real_boot_for_query = worker._boot_for_query
-
-    def counting_boot(*args, **kwargs):
-        boots.append(1)
-        return real_boot_for_query(*args, **kwargs)
-
-    monkeypatch.setattr(worker, "_boot_for_query", counting_boot)
-    monkeypatch.setattr(worker, "execute_single",
-                        lambda gpu, *a, **k: {
-                            "_outputs": {}, "wall_s": 1.0,
-                            **memory_report(gpu)})
-
-    worker.prepare_quail_request(SimpleNamespace(
-        gpus=1, registry=registry, runtime_state=runtime_state,
-        request=SimpleNamespace(plan=ENVELOPE),
-    ))
-
-    gpu = runtime_state["gpu"]
-    assert gpu.prepared_boot["kind"] == "cold"
-    assert len(boots) == 1
-
-    response = worker.execute_quail_payload(
-        PAYLOAD, registry, object(), backend, runtime_state)
-
-    assert response.metrics["boot_kind"] == "cold"
-    assert response.metrics["memory_bytes"] == {
-        "weights": 8 * 2**30, "kv": 0, "state": 0,
-        "other": 12 * 2**30, "peak": 20 * 2**30}
-    assert gpu.prepared_boot is None
-    assert len(boots) == 1
-
-    execution = gpu.execution
-    loaded = execution.loaded_model
-    loaded.label_readout = object()
-    readout = loaded.label_readout
-    staging = loaded.input_staging = InputStaging(gpu.torch)
-    buffers = staging.buffers
-    buffers["tokens"] = object()
-    staging.fixed_tokens[1] = object()
-    query = execution.query
-    query.async_scores = SimpleNamespace(rows=query.answer_rows)
-    query.gpu_timing = True
-    old_query = weakref.ref(query)
-    reranker = execution._reranker_execution({"d": [[1]]})
-    old_reranker = weakref.ref(reranker)
-    del query, reranker
-
-    second = worker.execute_quail_payload(
-        PAYLOAD, registry, object(), backend, runtime_state)
-
-    assert second.metrics["boot_kind"] == "warm"
-    assert old_query() is None and old_reranker() is None
-    assert execution.query.loaded_model is loaded
-    assert execution.query.async_answers is gpu.async_ans
-    assert execution.query.async_scores is None
-    assert execution.query.gpu_timing is False
-    assert loaded.label_readout is readout
-    assert loaded.input_staging is staging
-    assert staging.buffers is buffers and "tokens" in buffers
-    assert not staging.fixed_tokens
-    assert len(boots) == 2
-    assert runtime_state["gpu"] is gpu
-    resized = []
-    gpu.arena = SimpleNamespace(
-        k=[], v=[], gdn_state=None, conv_state=None,
-        resize=lambda *pages, **kw: resized.append((pages, kw)))
-    gpu.bind_query([1], [2], 4096, arena_pages=(8, 2))
-    assert resized == [((8, 2), {"free_resident": True})]
-    execution.bind_loaded_model(model=object(), arena=gpu.arena,
-                                pipeline=gpu.pipeline)
-    assert execution.loaded_model is not loaded
-    assert execution.loaded_model.label_readout is None
-    assert execution.loaded_model.input_staging is None
-    with pytest.raises(RuntimeError, match="no bound query"):
-        execution.query
-    replacement = weakref.ref(execution.loaded_model)
-    execution.close()
-    assert replacement() is None
-
-
-def test_a_failed_boot_releases_the_gpu_and_the_next_boot_loads_again(
+def test_a_failed_boot_releases_the_gpu_and_a_cold_boot_stays_out_of_collections(
         booted, monkeypatch):
     calls = []
     monkeypatch.setattr(worker, "release_models",
                         lambda state: calls.append(("release", sorted(state))))
     registry = built_in_registry()
     backend = registry.backend("quail")
-    context = worker._single_gpu_context(registry, ENVELOPE)
-    state = {}
+    context = GpuContext(
+        gpu_index=0, gpus=1, model=registry.model(ENVELOPE["model"]),
+        device=registry.device(ENVELOPE["device"]), query_settings={})
 
     def fail(*args, **kwargs):
         raise RuntimeError("warm failed")
 
     monkeypatch.setattr(worker.LoadedGpu, "warm", fail)
     with pytest.raises(RuntimeError, match="warm failed"):
-        worker._boot_for_query(state, backend, context, 100, [1], [2])
+        worker._boot_gpu(None, backend, context, 100, [1], [2])
     assert calls == [("release", ["gpu"])]
-    assert state == {}
 
     monkeypatch.setattr(worker.LoadedGpu, "warm", lambda self: (0.0, None))
-    gpu, boot = worker._boot_for_query(state, backend, context, 100, [1], [2])
-    assert state == {"gpu": gpu} and boot["kind"] == "cold"
-    again, boot = worker._boot_for_query(state, backend, context, 100, [1], [2])
+    gpu, boot = worker._boot_gpu(None, backend, context, 100, [1], [2])
+    assert boot["kind"] == "cold"
+    again, boot = worker._boot_gpu(gpu, backend, context, 100, [1], [2])
     assert again is gpu and boot["kind"] == "warm"
     assert calls == [("release", ["gpu"])]
+
+    # a cold boot leaves the loaded objects out of later collections
+    gc.unfreeze()
+    try:
+        gpu, _ = worker._boot_gpu(None, backend, context, 100, [1], [2])
+        # a full collection inside a query skips the loaded model's objects
+        assert not any(found is gpu for found in gc.get_objects())
+    finally:
+        gc.unfreeze()

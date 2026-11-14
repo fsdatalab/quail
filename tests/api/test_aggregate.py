@@ -1,24 +1,17 @@
-"""GROUP BY, aggregates, and HAVING: the Aggregate node, its runtime, the plan."""
+"""GROUP BY, aggregates, and HAVING run in DataFusion on a model region's rows."""
 
 
 import pyarrow as pa
 import pytest
-from helpers.sessions import CONFIG, _run, fake_tok, make_executor
+from helpers.sessions import CONFIG, TOKENIZER, _run, make_executor
 
 import quail
-from quail.execution.runtimes.relational import aggregate_table
-from quail.logical import CompileError
-from quail.physical import Aggregate
-from quail.physical.base import input_ports
-
-
-def _node(**fields):
-    return Aggregate(node_id="aggregate", inputs=input_ports(()), **fields)
+from quail.common.expressions import CompileError
 
 
 @pytest.fixture()
 def session():
-    session = quail.Session(CONFIG, tokenizer=fake_tok)
+    session = quail.Session(CONFIG, tokenizer=TOKENIZER)
     session.register("reviews", quail.DocumentProvider.from_table(pa.table({
         "id": [f"r{i}" for i in range(6)],
         "review": [f"review {i} " + "pad " * 20 for i in range(6)],
@@ -44,7 +37,10 @@ def test_group_by_runs_on_the_result(session):
     assert result.columns == ["r.lang", "n", "mean", "total"]
     assert result.to_rows() == [("en", 3, 10 / 3, 10), ("de", 1, 5.0, 5),
                                 ("fr", 1, 4.0, 4)]
-    assert "Aggregate: r.lang, n, mean, total" in result.explain()
+    # DataFusion groups the rows the model region returns
+    explained = result.explain()
+    assert "AggregateExec: mode=FinalPartitioned, gby=[lang@0 as lang]" in explained
+    assert explained.index("ModelRegion") < explained.index("model region:")
 
     whole = _run(session.sql("""
         SELECT COUNT(*) AS n, MAX(r.stars) AS top FROM reviews r
@@ -60,21 +56,12 @@ def test_group_by_runs_on_the_result(session):
     """)
     assert _run(having, make_executor(TRUTH)).to_rows() == [("en", 10)]
 
-    for sql, fragment in (
-        ("SELECT r.lang, COUNT(*) FROM reviews r WHERE AI_FILTER("
-         "PROMPT('q: {0}', r.review)) GROUP BY r.lang", "AS name"),
-        ("SELECT r.lang, COUNT(*) AS n FROM reviews r WHERE AI_FILTER("
-         "PROMPT('q: {0}', r.review))", "not in GROUP BY"),
-    ):
-        with pytest.raises(CompileError, match=fragment):
-            session.sql(sql)
-
-
-@pytest.mark.parametrize("grouped", [True])
-@pytest.mark.parametrize("dtype,values", [(pa.int64(), [2**63 - 1, 1])])
-def test_an_integer_sum_raises_instead_of_wrapping(dtype, values, grouped):
-    table = pa.table({"group": ["a"] * len(values), "value": pa.array(values, dtype)})
-    node = _node(keys=("group",) if grouped else (),
-                 aggregates=(("total", "sum", "value"),), columns=("total",))
-    with pytest.raises(pa.ArrowInvalid):
-        aggregate_table(table, node)
+    # DataFusion names an aggregate the query leaves unnamed
+    unnamed = _run(session.sql(
+        "SELECT r.lang, COUNT(*) FROM reviews r WHERE AI_FILTER("
+        "PROMPT('q: {0}', r.review)) GROUP BY r.lang ORDER BY r.lang"),
+        make_executor(TRUTH))
+    assert unnamed.columns == ["r.lang", "count(*)"]
+    with pytest.raises(CompileError, match="not in GROUP BY"):
+        session.sql("SELECT r.lang, COUNT(*) AS n FROM reviews r WHERE AI_FILTER("
+                    "PROMPT('q: {0}', r.review))")

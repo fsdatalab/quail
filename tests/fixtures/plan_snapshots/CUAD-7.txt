@@ -1,28 +1,23 @@
 logical:
-  Project: c.id, contract.audit_rights
-    contract = struct(contract.audit_rights)
-    SemanticExtract: contract.audit_rights, contract.audit_rights_span
-      question='Does a party have the right to\xa0 audit the books, records, or physical locations of the counterparty to ensure compliance with the contract?'
-      SemanticFilter
-        PROMPT('DOCUMENT:\n{0}\n\nDoes a party have the right to\xa0 audit the books, records, or physical locations of the counterparty to ensure compliance with the contract?', c.text) (selectivity=36.5%)
-        Scan contracts as c [text, id]
+  Projection: c.id, contract
+    AiNode: contract = ai_extract(c.text, named_struct(Utf8("audit_rights"), Utf8("Does a party have the right to  audit the books, records, or physical locations of the counterparty to ensure compliance with the contract?"))), returns: [contract]
+      AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("{0}\n\nDoes a party have the right to  audit the books, records, or physical locations of the counterparty to ensure compliance with the contract?"), c.text), named_struct(Utf8("selectivity"), Float64(0.36525612472160357))), filter: __quail_answer_1, returns: []
+        SubqueryAlias: c
+          TableScan: contracts projection=[id, text]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
-  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
+  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                                                                                                                                                          est. rows   est. pass   est. time
-  Project: c.id, contract, contract_span
-    contract = struct(contract.audit_rights)
-    contract_span = struct(contract.audit_rights_span)
-    AiExtract: contract.audit_rights over c                                                                                                                                                                         4.79 ms
-      question='Does a party have the right to\xa0 audit the books, records, or physical locations of the counterparty to ensure compliance with the contract?', up to 64 answer tokens
-      AiFilter: c                                                                                                                                                                               2.2                 9.87 ms
-        KV rewind=on
-        predicate 1  PROMPT('DOCUMENT:\n{0}\n\nDoes a party have…')                                                                                                                               6       36.5%
-        Scan contracts as c                                                                                                                                                                       6
-          tokens=96, mean_document_tokens=16
+                                                                                                                                                                                        est. rows   est. pass   est. time
+  AiExtract: contract.audit_rights over c                                                                                                                                                                         3.57 ms
+    question='Does a party have the right to\xa0 audit the books, records, or physical locations of the counterparty to ensure compliance with the contract?', up to 64 answer tokens
+    AiFilter: c                                                                                                                                                                               2.2                 7.63 ms
+      KV rewind=on
+      predicate 1  PROMPT('DOCUMENT:\n{0}\n\nDoes a party have…')                                                                                                                               6       36.5%
+      Scan contracts as c                                                                                                                                                                       6
+        tokens=78, mean_document_tokens=13
   Pipeline on c: ai_filter:c -> ai-extract:0 (each document runs every operator with its KV resident)
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

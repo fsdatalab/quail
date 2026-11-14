@@ -4,42 +4,43 @@
 @import 'katex/dist/katex.min.css';
 
 @theme {
-  /* CMU light — Carnegie Red accent on a warm white ground */
-  --color-fd-background: hsl(0, 0%, 100%);
-  --color-fd-foreground: hsl(0, 3%, 16%);
-  --color-fd-muted: hsl(0, 0%, 96%);
-  --color-fd-muted-foreground: hsl(0, 0%, 40%);
+  --text-docs-body: 0.9375rem;
+  --text-docs-body--line-height: 1.6;
+  --color-fd-background: #fffdfd;
+  --color-fd-foreground: #252525;
+  --color-fd-muted: #fdf5f6;
+  --color-fd-muted-foreground: #626262;
   --color-fd-popover: hsl(0, 0%, 100%);
   --color-fd-popover-foreground: hsl(0, 3%, 16%);
-  --color-fd-card: hsl(0, 0%, 99%);
+  --color-fd-card: #ffffff;
   --color-fd-card-foreground: hsl(0, 3%, 16%);
-  --color-fd-border: hsl(0, 0%, 88%);
-  --color-fd-primary: hsl(350, 82%, 42%);
+  --color-fd-border: #e0e0e0;
+  --color-fd-primary: #c41230;
   --color-fd-primary-foreground: hsl(0, 0%, 100%);
-  --color-fd-secondary: hsl(0, 0%, 95%);
+  --color-fd-secondary: #fdf5f6;
   --color-fd-secondary-foreground: hsl(0, 3%, 16%);
-  --color-fd-accent: hsl(0, 0%, 93%);
+  --color-fd-accent: #fdf0f2;
   --color-fd-accent-foreground: hsl(0, 3%, 16%);
   --color-fd-ring: hsl(350, 82%, 42%);
 }
 
 .dark {
-  --color-fd-background: hsl(0, 3%, 10%);
-  --color-fd-foreground: hsl(0, 0%, 93%);
-  --color-fd-muted: hsl(0, 2%, 15%);
-  --color-fd-muted-foreground: hsl(0, 0%, 60%);
-  --color-fd-popover: hsl(0, 2%, 13%);
+  --color-fd-background: #182c4b;
+  --color-fd-foreground: #edf1f7;
+  --color-fd-muted: #203c60;
+  --color-fd-muted-foreground: #b0c5df;
+  --color-fd-popover: #182c4b;
   --color-fd-popover-foreground: hsl(0, 0%, 93%);
-  --color-fd-card: hsla(0, 2%, 18%, 0.5);
+  --color-fd-card: #1b3455;
   --color-fd-card-foreground: hsl(0, 0%, 93%);
-  --color-fd-border: hsla(0, 0%, 50%, 0.2);
-  --color-fd-primary: hsl(350, 80%, 62%);
+  --color-fd-border: #355275;
+  --color-fd-primary: #ef3a47;
   --color-fd-primary-foreground: hsl(0, 0%, 100%);
-  --color-fd-secondary: hsl(0, 2%, 20%);
+  --color-fd-secondary: #244467;
   --color-fd-secondary-foreground: hsl(0, 0%, 90%);
-  --color-fd-accent: hsl(0, 2%, 20%);
+  --color-fd-accent: #2a4d75;
   --color-fd-accent-foreground: hsl(0, 0%, 90%);
-  --color-fd-ring: hsl(350, 80%, 62%);
+  --color-fd-ring: #ef3a47;
 }
 
 html {
@@ -60,6 +61,283 @@ pre,
   font-family: var(--font-quail-mono), monospace;
 }
 
+figure.shiki {
+  margin-block: 1.5rem;
+  background: color-mix(in srgb, var(--color-fd-muted) 65%, var(--color-fd-background));
+  border-color: var(--color-fd-border);
+  border-radius: 0.625rem;
+  box-shadow: none;
+}
+
+figure.shiki > div:has(> figcaption) {
+  height: 2.5rem;
+  background: var(--color-fd-muted);
+  color: var(--color-fd-muted-foreground);
+}
+
+figure.shiki figcaption {
+  font-family: var(--font-quail-sans), sans-serif;
+  font-size: 0.8125rem;
+  font-weight: 500;
+}
+
+figure.shiki > .fd-scroll-container {
+  padding-block: 1.125rem;
+  font-size: 0.875rem;
+  line-height: 1.75;
+}
+
+figure.shiki pre,
+figure.shiki code {
+  font-family: var(--font-quail-mono), monospace;
+  font-variant-ligatures: none;
+}
+
+.dark figure.shiki {
+  background: #10223c;
+}
+
+.quail-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.quail-brand-name {
+  color: var(--color-fd-primary);
+  font-family: var(--font-quail-serif), Georgia, serif;
+  font-size: 1.625rem;
+  font-weight: 600;
+  letter-spacing: -0.06em;
+}
+
+.quail-brand-label {
+  padding-left: 0.75rem;
+  border-left: 1px solid var(--color-fd-border);
+  color: var(--color-fd-muted-foreground);
+  font-size: 0.8125rem;
+  font-weight: 400;
+}
+
+#nd-sidebar {
+  background: color-mix(in srgb, var(--color-fd-primary) 3%, var(--color-fd-background));
+  color: var(--color-fd-foreground);
+}
+
+.dark #nd-sidebar {
+  background: #132640;
+}
+
+#nd-sidebar > div:first-child {
+  gap: 1.5rem;
+  padding: 1.75rem 1.25rem 1.25rem;
+}
+
+#nd-sidebar [data-active] {
+  border-radius: 0.375rem;
+  padding-block: 0.5rem;
+  font-size: 0.8125rem;
+}
+
+#nd-sidebar [data-active='true'] {
+  background: color-mix(in srgb, var(--color-fd-primary) 6%, transparent);
+  color: var(--color-fd-primary);
+  font-weight: 500;
+}
+
+#nd-page {
+  max-width: 50rem;
+  gap: 0;
+  padding-bottom: 4rem;
+}
+
+.quail-breadcrumb {
+  margin-bottom: 1.25rem;
+  color: var(--color-fd-muted-foreground);
+  font-size: 0.75rem;
+}
+
+.quail-page-header {
+  margin-bottom: 2rem;
+}
+
+.quail-theme-switch {
+  background: transparent;
+}
+
+.quail-title-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.quail-title-row h1 {
+  font-size: 2rem;
+  line-height: 1.25;
+  letter-spacing: -0.035em;
+}
+
+.quail-page-header > p {
+  margin: 1rem 0 0;
+}
+
+.quail-page-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.quail-page-actions button {
+  min-height: 2rem;
+  padding-inline: 0.5rem;
+  border-color: transparent;
+  border-radius: 0.375rem;
+  background: transparent;
+  color: var(--color-fd-muted-foreground);
+  font-size: 0.75rem;
+  box-shadow: none;
+}
+
+.quail-page-actions button:hover {
+  background: var(--color-fd-muted);
+  color: var(--color-fd-foreground);
+}
+
+.quail-page-header > p,
+.quail-prose,
+.quail-prose :where(p, li, th, td, summary, [role='tabpanel'], .prose-no-margin) {
+  font-size: var(--text-docs-body);
+  line-height: var(--text-docs-body--line-height);
+}
+
+.quail-prose p {
+  margin-block: 1rem;
+}
+
+.quail-prose > :first-child {
+  margin-top: 0;
+}
+
+.quail-prose h2 {
+  color: var(--color-fd-foreground);
+  margin-top: 3rem;
+  margin-bottom: 1.125rem;
+  font-size: 1.5rem;
+  line-height: 1.4;
+  letter-spacing: -0.025em;
+}
+
+.quail-prose h3 {
+  margin-top: 2rem;
+  margin-bottom: 0.75rem;
+  font-family: var(--font-quail-sans), sans-serif;
+  font-size: 1.0625rem;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.quail-code-tabs {
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.quail-code-tabs > [role='tablist'] {
+  padding-inline: 0;
+  border-bottom: 1px solid var(--color-fd-border);
+}
+
+.quail-code-tabs > [role='tabpanel'] {
+  padding: 1rem 0 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.quail-code-tabs [role='tabpanel'] > :first-child {
+  margin-top: 0;
+}
+
+.quail-code-tabs [role='tabpanel'] > :last-child {
+  margin-bottom: 0;
+}
+
+.quail-code-tabs [role='tabpanel'] > figure.shiki:only-child {
+  margin: 0;
+  border: 1px solid var(--color-fd-border);
+  border-radius: 0.625rem;
+}
+
+.quail-prose a:not([data-card]) {
+  color: var(--color-fd-primary);
+  text-decoration-color: color-mix(in srgb, var(--color-fd-primary) 30%, transparent);
+  text-underline-offset: 0.2em;
+}
+
+.quail-prose a:not([data-card]):hover {
+  text-decoration-color: currentColor;
+}
+
+.quail-prose :not(pre) > code {
+  padding: 0.125em 0.35em;
+  border: 1px solid var(--color-fd-border);
+  border-radius: 0.3rem;
+  background: var(--color-fd-muted);
+  font-size: inherit;
+  box-shadow: none;
+}
+
+.quail-prose a[data-card='true'] {
+  padding: 1.25rem;
+  border-radius: 0.625rem;
+  background: var(--color-fd-background);
+  text-decoration: none;
+}
+
+.quail-prose a[data-card='true']:hover {
+  border-color: color-mix(in srgb, var(--color-fd-primary) 45%, var(--color-fd-border));
+  background: color-mix(in srgb, var(--color-fd-primary) 2%, var(--color-fd-background));
+}
+
+.quail-prose a[data-card='true'] h3 {
+  margin: 0 0 0.5rem;
+  font-family: var(--font-quail-sans), sans-serif;
+  font-size: var(--text-docs-body);
+}
+
+.quail-page-footer {
+  margin-top: 3.5rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--color-fd-border);
+}
+
+.quail-page-footer a {
+  border-radius: 0.625rem;
+  box-shadow: none;
+}
+
+#nd-toc h3 {
+  font-family: var(--font-quail-sans), sans-serif;
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+
+#nd-toc {
+  font-size: 0.75rem;
+}
+
+@media (max-width: 767px) {
+  #nd-page {
+    padding: 2rem 1.5rem 3rem;
+  }
+
+  .quail-page-actions {
+    gap: 0;
+  }
+}
+
 details {
   margin: 1rem 0;
   padding: 0.75rem 1rem;
@@ -71,7 +349,6 @@ details {
 details > summary {
   cursor: pointer;
   font-weight: 500;
-  font-size: 0.9rem;
 }
 
 details[open] > summary {
@@ -101,4 +378,249 @@ html > body[data-scroll-locked] {
 .function-index tbody tr:focus-within {
   outline: 2px solid var(--color-fd-ring);
   outline-offset: -2px;
+}
+
+/* The planning figure: DataFusion's parts in one color, Quail's in another. */
+.planning-figure {
+  --df: #1f6f8b;
+  --df-soft: #e2f0f4;
+  --quail: #8a3d7c;
+  --quail-soft: #f4e6f1;
+  margin: 1.5rem 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+.dark .planning-figure {
+  --df: #6fc0d8;
+  --df-soft: #17313a;
+  --quail: #dc9bd0;
+  --quail-soft: #36203a;
+}
+.planning-figure .scroll {
+  overflow-x: auto;
+  border: 1px solid var(--color-fd-border);
+  border-radius: 6px;
+  background: var(--color-fd-card);
+}
+.planning-figure svg {
+  display: block;
+  width: 100%;
+  min-width: 640px;
+  height: auto;
+  color: var(--color-fd-muted-foreground);
+}
+.planning-figure figcaption {
+  font-size: 0.875rem;
+  color: var(--color-fd-muted-foreground);
+}
+.planning-figure .b-df { fill: var(--df-soft); stroke: var(--df); stroke-width: 1.2; }
+.planning-figure .b-q { fill: var(--quail-soft); stroke: var(--quail); stroke-width: 1.2; }
+.planning-figure .b-region { fill: none; stroke: var(--quail); stroke-width: 1.4; stroke-dasharray: 5 4; }
+.planning-figure .t { font-size: 15px; font-weight: 600; fill: var(--color-fd-foreground); }
+.planning-figure .d { font-size: 12.5px; fill: var(--color-fd-foreground); }
+.planning-figure .e { font-size: 12.5px; font-weight: 500; fill: var(--color-fd-foreground); }
+.planning-figure .r { font-size: 11px; font-weight: 600; letter-spacing: 0.05em; fill: var(--quail); }
+.planning-figure .lane-df { font-size: 12px; font-weight: 600; letter-spacing: 0.08em; fill: var(--df); }
+.planning-figure .lane-q { font-size: 12px; font-weight: 600; letter-spacing: 0.08em; fill: var(--quail); }
+.planning-figure .ph { font-size: 12.5px; font-weight: 600; letter-spacing: 0.08em; fill: var(--color-fd-foreground); }
+.planning-figure .phs { font-weight: 400; letter-spacing: 0; fill: var(--color-fd-muted-foreground); }
+.planning-figure .ln { stroke: currentColor; stroke-width: 1.4; fill: none; }
+.planning-figure .div { stroke: var(--color-fd-border); stroke-width: 1.5; stroke-dasharray: 6 5; }
+
+.planning-detail {
+  --df: #1f6f8b;
+  --df-soft: #e2f0f4;
+  --quail: #8a3d7c;
+  --quail-soft: #f4e6f1;
+  margin: 1.5rem 0 2rem;
+}
+
+.planner-algorithm {
+  margin: 1rem 0 2rem;
+  overflow-x: auto;
+  border-left: 2px solid var(--color-fd-primary);
+  background: color-mix(in srgb, var(--color-fd-muted) 45%, transparent);
+  padding: 0.9rem 1rem;
+  color: var(--color-fd-foreground);
+  font-family: var(--font-quail-mono), monospace;
+  font-size: 0.78rem;
+  font-variant-ligatures: none;
+  line-height: 1.65;
+  white-space: pre;
+}
+
+.planner-algorithm code {
+  font: inherit;
+}
+
+.dark .planning-detail {
+  --df: #6fc0d8;
+  --df-soft: #17313a;
+  --quail: #dc9bd0;
+  --quail-soft: #36203a;
+}
+
+.planning-detail figcaption {
+  margin-top: 0.7rem;
+  color: var(--color-fd-muted-foreground);
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+
+.planning-stage-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.8rem;
+}
+
+.planning-stage-grid > section,
+.planning-table-scroll {
+  border: 1px solid var(--color-fd-border);
+  border-radius: 0.5rem;
+  background: var(--color-fd-card);
+}
+
+.planning-stage-grid > section {
+  padding: 0.9rem;
+}
+
+.planning-stage-grid h3 {
+  margin: 0 0 0.8rem;
+  color: var(--color-fd-muted-foreground);
+  font-size: 0.75rem;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.planning-stage-grid section > p {
+  margin: 0.8rem 0 0;
+  color: var(--color-fd-muted-foreground);
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
+.planning-node {
+  border: 1px solid;
+  border-radius: 0.35rem;
+  padding: 0.5rem 0.65rem;
+  text-align: center;
+  font-size: 0.82rem;
+  line-height: 1.35;
+}
+
+.planning-node.datafusion {
+  border-color: var(--df);
+  background: var(--df-soft);
+}
+
+.planning-node.quail {
+  border-color: var(--quail);
+  background: var(--quail-soft);
+}
+
+.planning-node small,
+.planning-region small {
+  display: block;
+  margin-top: 0.2rem;
+  color: var(--color-fd-muted-foreground);
+  font-size: 0.72rem;
+}
+
+.planning-arrow {
+  height: 1.2rem;
+  color: var(--color-fd-muted-foreground);
+  text-align: center;
+  font-size: 1rem;
+  line-height: 1.2rem;
+}
+
+.planning-region {
+  min-width: 0;
+  border: 1.5px dashed var(--quail);
+  border-radius: 0.45rem;
+  padding: 0.65rem;
+  color: var(--quail);
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.planning-region.solid {
+  border-style: solid;
+  background: color-mix(in srgb, var(--quail-soft) 45%, transparent);
+}
+
+.planning-region .planning-node {
+  color: var(--color-fd-foreground);
+  letter-spacing: normal;
+  text-transform: none;
+}
+
+.planning-pipeline {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr auto 1fr;
+  align-items: center;
+  gap: 0.35rem;
+  margin: 0.55rem 0;
+}
+
+.planning-stage-grid .planning-pipeline {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.planning-stage-grid .planning-pipeline > span {
+  transform: rotate(-90deg);
+  text-align: center;
+}
+
+.planning-table-scroll {
+  overflow-x: auto;
+}
+
+.derive-table {
+  width: 100%;
+  min-width: 720px;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+}
+
+.derive-table th,
+.derive-table td {
+  border-bottom: 1px solid var(--color-fd-border);
+  padding: 0.7rem 0.8rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.derive-table th {
+  color: var(--color-fd-muted-foreground);
+  font-size: 0.7rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.derive-table td:last-child {
+  color: var(--quail);
+  font-family: var(--font-mono);
+}
+
+.derive-table tr:last-child td {
+  border-bottom: 0;
+}
+
+@media (max-width: 720px) {
+  .planning-stage-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .planning-pipeline {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .planning-pipeline > span {
+    transform: rotate(90deg);
+    text-align: center;
+  }
 }

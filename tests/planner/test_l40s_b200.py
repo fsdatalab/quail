@@ -2,11 +2,12 @@
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-from helpers.fakes import letter_tokens
+from helpers.sessions import TOKENIZER
 
 import quail
 from bench.quailb import queries, register_tables
-from quail.planner.plan import EngineConfig, Refusal
+from quail.api.config import EngineConfig
+from quail.physical.plan import Refusal
 
 
 def _standin_filter_and_join(tmp_path):
@@ -36,7 +37,7 @@ def test_filter_and_join_plan_on_l40s_and_b200(tmp_path):
     for device in ("l40s", "b200"):
         with quail.Session(
             EngineConfig(model="qwen3-4b-fp8", device=device),
-            tokenizer=letter_tokens,
+            tokenizer=TOKENIZER,
         ) as sess:
             register_tables(sess, tmp_path)
             listed = queries(sess)

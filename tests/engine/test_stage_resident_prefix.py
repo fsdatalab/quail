@@ -4,8 +4,9 @@ import pytest
 from helpers.fakes import cpu_staging
 from helpers.kv_checker import Run, Setup, chain, passthrough
 
-from quail.backends.quail.executor.stages import Stage, StageRequests, run_stages
-from quail.catalog.tokens import prefix_tree
+from quail.backends.quail.executor.stage_executor import StageExecutor
+from quail.backends.quail.executor.stages import Stage, StageRequests
+from quail.common.tokens import prefix_tree
 
 
 @pytest.mark.parametrize("path", ["tree"])
@@ -35,10 +36,10 @@ def test_borrowed_prefix_and_accepted_decode_tokens_survive_rounds(path, monkeyp
               readout=passthrough()),
     ]
     stats = {}
-    output, _, tokens = run_stages(
+    output, _, tokens = StageExecutor(
         run.torch, run.arena, run.pipeline, stages, documents, setup.budget,
         attention_mode=path, prefix_tree=prefix_tree(documents, setup.page_tokens),
-        stats=stats)
+        stats=stats).run()
     assert stats["borrowed_tokens"] == 16
     assert tokens == sum(map(len, documents)) - 16 + len(documents) * (
         3 + 3 + 2 + 3 + 1

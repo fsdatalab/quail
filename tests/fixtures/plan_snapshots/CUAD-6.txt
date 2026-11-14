@@ -1,25 +1,24 @@
 logical:
-  Project: c.id
-    SemanticFilter
-      PROMPT('DOCUMENT:\n{0}\n\nIs there a restriction on the ability of a party to compete with the counterparty or operate in a certain geography or business or technology sector?', c.text) (selectivity=20%)
-      PROMPT('DOCUMENT:\n{0}\n\nIs there an exclusive dealing\xa0 commitment with the counterparty? This includes a commitment to procure all “requirements” from one party of certain technology, goods, or services or a prohibition on licensing or selling technology, goods or services to third parties, or a prohibition on\xa0 collaborating or working with other parties), whether during the contract or\xa0 after the contract ends (or both).', c.text) (selectivity=32.1%)
-      Scan contracts as c [text, id]
+  Projection: c.id
+    AiNode: __quail_answer_2 = ai_filter(prompt(Utf8("{0}\n\nIs there an exclusive dealing  commitment with the counterparty? This includes a commitment to procure all “requirements” from one party of certain technology, goods, or services or a prohibition on licensing or selling technology, goods or services to third parties, or a prohibition on  collaborating or working with other parties), whether during the contract or  after the contract ends (or both)."), c.text), named_struct(Utf8("selectivity"), Float64(0.3207126948775056))), filter: __quail_answer_2, returns: []
+      AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("{0}\n\nIs there a restriction on the ability of a party to compete with the counterparty or operate in a certain geography or business or technology sector?"), c.text), named_struct(Utf8("selectivity"), Float64(0.20044543429844097))), filter: __quail_answer_1, returns: []
+        SubqueryAlias: c
+          TableScan: contracts projection=[id, text]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
-  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
+  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                                      est. rows   est. pass   est. time
-  Project: c.id                                                           0.386
-    AiFilter: c                                                           0.386                 2.93 ms
+                                                                    est. rows   est. pass   est. time
+  AiFilter: c                                                           0.386                 2.13 ms
+    KV rewind=on
+    predicate 2  PROMPT('DOCUMENT:\n{0}\n\nIs there an exclu…')           1.2       32.1%
+    AiFilter: c                                                           1.2                 7.75 ms
       KV rewind=on
-      predicate 2  PROMPT('DOCUMENT:\n{0}\n\nIs there an exclu…')           1.2       32.1%
-      AiFilter: c                                                           1.2                 10.1 ms
-        KV rewind=on
-        predicate 1  PROMPT('DOCUMENT:\n{0}\n\nIs there a restri…')           6         20%
-        Scan contracts as c                                                   6
-          tokens=96, mean_document_tokens=16
+      predicate 1  PROMPT('DOCUMENT:\n{0}\n\nIs there a restri…')           6         20%
+      Scan contracts as c                                                   6
+        tokens=78, mean_document_tokens=13
   Pipeline on c: ai_filter:c -> ai_filter:c:1 (each document runs every operator with its KV resident)
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

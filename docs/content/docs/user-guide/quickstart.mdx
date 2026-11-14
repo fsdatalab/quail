@@ -2,115 +2,202 @@
 title: Quickstart
 ---
 
-## Install
+Filter the 100,000 reviews in the
+[Stanford IMDB dataset](https://huggingface.co/datasets/stanfordnlp/imdb).
+The query keeps reviews that mention a positive aspect of the movie.
 
-Install [quail-engine from PyPI](https://pypi.org/project/quail-engine/).
-Install the `quail-engine` package. In Python, import `quail`.
+The quickstart runs the examples from a Quail source checkout:
 
 ```bash
+git clone https://github.com/fsdatalab/quail.git
+cd quail
+```
+
+## Install
+
+Quail needs Python 3.12 and a
+[supported CUDA GPU](/docs/user-guide/models).
+
+<Tabs items={['Python', 'Rust']} groupId="quickstart-language" className="quail-code-tabs">
+<Tab value="python" id="install-python">
+
+Create a Python environment and install Quail:
+
+```bash
+uv venv --python 3.12
+source .venv/bin/activate
 uv pip install quail-engine
 ```
 
-Quail requires Python 3.12 and a CUDA GPU (local or on
-[Modal](/docs/user-guide/models#no-local-gpu-use-modal)).
+</Tab>
+<Tab value="rust" id="install-rust">
+
+The Rust crate runs a Python process for the model. The build script
+compiles the Rust crate and installs the Python package into `.venv`.
+
+Install rustup, clang, and lld as described in the
+[build instructions](/docs/contributing), then run:
+
+```bash
+tools/build.sh --compile
+source .venv/bin/activate
+```
+
+</Tab>
+</Tabs>
+
+## Download the reviews
+
+A helper script downloads all three dataset splits and writes
+`reviews.arrow`. Run the command from the repository root:
+
+```bash
+python crates/quail/examples/download_reviews.py
+```
 
 ## Run an AI filter
 
-This example filters the 100,000 movie reviews in the
-[Stanford IMDB dataset](https://huggingface.co/datasets/stanfordnlp/imdb)
-on an H100 SXM, keeping reviews that mention a positive aspect of the
-movie.
+`AI.IF` asks whether each review mentions a positive aspect. The
+function keeps a row when the model answers yes.
 
-```python
-import pyarrow as pa, pyarrow.dataset as ds
+Both programs register the Arrow table as `reviews`, run the same SQL,
+and print the matching IDs.
+
+<Tabs items={['Python', 'Rust']} groupId="quickstart-language" className="quail-code-tabs">
+<Tab value="python" id="run-python">
+
+```python title="crates/quail/examples/imdb_filter.py"
+import sys
+
+import pyarrow as pa
 import quail
-from datasets import concatenate_datasets, load_dataset
 
-imdb = load_dataset("stanfordnlp/imdb")
-all_reviews = concatenate_datasets([imdb["train"], imdb["test"], imdb["unsupervised"]])
-reviews = ds.dataset(pa.table({
-    "id": pa.array(f"review-{i}" for i in range(len(all_reviews))),
-    "body": all_reviews.data.table.column("text"),
-}))
+path = sys.argv[1] if len(sys.argv) > 1 else "reviews.arrow"
+with pa.memory_map(path, "r") as source:
+    reviews = pa.ipc.open_file(source).read_all()
+
+sql = """
+SELECT r.id
+FROM reviews r
+WHERE AI.IF(PROMPT(
+    'Does this review mention a positive aspect of the movie? {0}',
+    r.body
+))
+"""
 
 config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
+provider = quail.DocumentProvider.from_table(reviews, id_col="id")
+
 with quail.Session(config=config) as session:
-    session.register("reviews", quail.DocumentProvider.from_dataset(reviews, id_col="id"))
-    result = session.sql("""
-        SELECT r.id
-        FROM reviews r
-        WHERE AI.IF(PROMPT(
-            'Does this review mention a positive aspect of the movie?\n\n{0}',
-            r.body))
-    """, dialect="bq").run()
-    table = result.collect()
-    print(table)
+    session.register("reviews", provider)
+    table = session.sql(sql, dialect="bq").collect()
+
+print(f"Matching reviews: {table.num_rows}")
+print(table.slice(0, 10).to_pandas().to_markdown(index=False))
 ```
 
-`session.register()` makes the dataset available under a SQL name.
-`AI.IF` evaluates the prompt on each review. The model returns
-TRUE or FALSE, and Quail returns the rows where the answer is TRUE.
-
-The output is a PyArrow table with the matching rows:
-
-```
-pyarrow.Table
-r.id: string
-----
-r.id: [["review-0","review-3","review-7",...]]
+```bash
+python crates/quail/examples/imdb_filter.py reviews.arrow
 ```
 
-## See the plan and measured cost
-
-Call `explain(analyze=True)` to run the query and print the plan
-together with measured time, token counts, and GPU cost:
-
-```python
-with quail.Session(config=config) as session:
-    session.register("reviews", quail.DocumentProvider.from_dataset(reviews, id_col="id"))
-    query = session.sql("""
-        SELECT r.id
-        FROM reviews r
-        WHERE AI.IF(PROMPT(
-            'Does this review mention a positive aspect of the movie?\n\n{0}',
-            r.body))
-    """, dialect="bq")
-    print(query.explain(analyze=True))
+```text title="Output"
+Matching reviews: 81143
+| r.id      |
+|:----------|
+| review-0  |
+| review-2  |
+| review-3  |
+| review-8  |
+| review-9  |
+| review-10 |
+| review-11 |
+| review-12 |
+| review-13 |
+| review-14 |
 ```
 
-The output shows the logical and physical plan, followed by the
-measured totals:
+</Tab>
+<Tab value="rust" id="run-rust">
 
+```rust title="crates/quail/examples/imdb_filter.rs"
+use std::fs::File;
+use std::sync::Arc;
+
+use datafusion::arrow::ipc::reader::FileReader;
+use datafusion::arrow::util::pretty::print_batches;
+use datafusion::common::Result;
+use datafusion::datasource::MemTable;
+use quail::{EngineConfig, Session};
+
+const SQL: &str = r#"
+SELECT r.id
+FROM reviews r
+WHERE AI.IF(PROMPT(
+    'Does this review mention a positive aspect of the movie? {0}',
+    r.body
+))
+"#;
+
+fn main() -> Result<()> {
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "reviews.arrow".to_string());
+    let reader = FileReader::try_new(File::open(path)?, None)?;
+    let schema = reader.schema();
+    let batches = reader.collect::<std::result::Result<Vec<_>, _>>()?;
+    let reviews = MemTable::try_new(schema, vec![batches])?;
+
+    let config = EngineConfig::new("qwen3-4b-fp8", "h100-sxm");
+    let session = Session::new(&config)?;
+    session.register_table("reviews", Arc::new(reviews))?;
+    let (_, batches) = session.sql_in_dialect(SQL, Some("BigQuery"))?;
+
+    let num_reviews: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+    println!("Matching reviews: {num_reviews}");
+    if let Some(batch) = batches.first() {
+        print_batches(&[batch.slice(0, batch.num_rows().min(10))])?;
+    }
+    Ok(())
+}
 ```
-run:
-  query time   52.3 s (model startup excluded)
-  startup      14.1 s (cold)
-  throughput   34,600 documents/second over 100,000 input documents
-  tokens       8,123,456 fresh
-  GPU cost     $0.0574 per query (1 GPU at $3.9492/hour, startup excluded)
+
+```bash
+cargo run -p quail-engine --example imdb_filter -- reviews.arrow
 ```
 
-The GPU cost line is the query runtime in hours multiplied by the
-number of GPUs and the
-[Modal H100 hourly price](https://modal.com/pricing) (\$3.9492/hour).
-Startup is excluded from both query time and cost. A 100K-document
-filter on Qwen3 4B typically costs a few cents per query.
+```text title="Output"
+Matching reviews: 81143
++--------------+
+| r.id         |
++--------------+
+| review-28005 |
+| review-28007 |
+| review-28008 |
+| review-28011 |
+| review-28012 |
+| review-28017 |
+| review-28019 |
+| review-28020 |
+| review-28028 |
+| review-28029 |
++--------------+
+```
 
-## Write more queries
+</Tab>
+</Tabs>
 
-See the [SQL reference](/docs/user-guide/sql) for joins, scores,
-classification, extraction, and the other functions you can use in
-`session.sql()`.
+## Continue
 
-## Running on Modal
+- [Results and plans](/docs/user-guide/results) shows estimated and measured
+  query plans.
+- [Metrics](/docs/user-guide/metrics) explains query time, token counts, and
+  GPU cost.
+- [SQL reference](/docs/user-guide/sql) lists the other AI functions.
+- [Running queries](/docs/user-guide/sessions) covers table registration and
+  session reuse.
 
-If you do not have a local GPU, you can run queries on Modal.
-See [No local GPU? Use Modal](/docs/user-guide/models#no-local-gpu-use-modal)
-for how to set up the function, volumes, and caches.
+## Run on Modal
 
-Modal bills per second of GPU time. An H100 costs \$3.9492/hour.
-A single AI filter over 100K documents on Qwen3 4B takes roughly
-a minute of GPU time, so one query costs about \$0.05 to \$0.07.
-Model startup adds 10 to 30 seconds on a cold start; subsequent
-queries on a warm function skip that. Use `explain(analyze=True)`
-to see the exact cost of any query.
+Use the complete
+[Modal example](/docs/user-guide/models#no-local-gpu-use-modal) when you
+have no local GPU.

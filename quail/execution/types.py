@@ -10,8 +10,8 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from quail.catalog.pairs import COLUMNS_PREFIX
-from quail.catalog.tokens import decode_token_documents
+from quail.common.pairs import COLUMNS_PREFIX
+from quail.common.tokens import decode_token_documents
 from quail.execution.result import answer_table
 from quail.execution.rows import Rows, rows_of
 from quail.physical import (
@@ -52,12 +52,16 @@ class PhysicalRequest:
     """A physical plan, its token input bindings, and its relations.
 
     relations holds one value table per alias a HashJoin or an apply()
-    function reads, keyed ``columns:<alias>``; see quail.catalog.pairs.
+    function reads, keyed ``columns:<alias>``; see quail.common.pairs.
+    source_rows holds, by alias, the row in the registered table of each
+    document of a scan that reads some of the table's rows, found by the
+    table's id column.
     """
 
     plan: Mapping[str, Any]
     inputs: Mapping[str, TokenizedInput]
     relations: Mapping[str, pa.Table] = field(default_factory=dict)
+    source_rows: Mapping[str, pa.Array] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for input_id, value in self.inputs.items():
@@ -149,7 +153,8 @@ def _join_answers_table(value: Mapping[str, Any]) -> pa.Table:
     return answer_table(columns, answers, "join_answers", metadata)
 
 
-def _output_table(node, port: OutputPort, value: Any) -> pa.Table:
+def output_table(node, port: OutputPort, value: Any) -> pa.Table:
+    """Return one output port's value as its Arrow relation."""
     if isinstance(value, Rows):
         return value.table()
     if isinstance(value, pa.Table):
@@ -172,7 +177,7 @@ def export_physical_outputs(graph: PhysicalGraph, run_result) -> dict:
         result = run_result.nodes[node.node_id]
         ports = {port.name: port for port in node.outputs}
         for name, value in result.outputs.items():
-            outputs[PortRef(node.node_id, name)] = _output_table(
+            outputs[PortRef(node.node_id, name)] = output_table(
                 node, ports[name], value
             )
     return outputs

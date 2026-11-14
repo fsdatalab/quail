@@ -1,13 +1,12 @@
 [project]
 name = "quail-engine"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Quail: a declarative query engine for AI.IF and AI_JOIN"
 readme = "README.md"
 license = "MIT"
 # The Modal image and tested vLLM build use Python 3.12
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "sqlglot==30.17.0",
     "transformers==5.15.0",
     "huggingface-hub==1.28.0",
     "pyarrow==25.0.1",
@@ -15,20 +14,14 @@ dependencies = [
     "numpy==2.5.2; sys_platform == 'emscripten' or sys_platform == 'win32'",
     "gigatoken==0.10.0",
     "datasets==5.0.1",
+    # progress bars on a terminal and aligned log lines elsewhere
+    "rich==15.0.0",
     # same version as the Modal image; vLLM has Linux wheels only
     "vllm==0.29.0; sys_platform == 'linux'",
 ]
 
-[project.optional-dependencies]
-# Quail Server (quail-server), the optional query server; the client
-# side of a remote Session needs only the standard library
-server = [
-    "starlette==1.6.0",
-    "uvicorn==0.52.4",
-]
-
 [project.scripts]
-quail-server = "quail.server.__main__:main"
+quail-server = "quail.remote.server:main"
 
 [project.urls]
 Documentation = "https://fsdatalab.github.io/quail"
@@ -56,34 +49,63 @@ dev = [
 ]
 
 [tool.uv.sources]
-quail-b = { git = "https://github.com/fsdatalab/quail-bench.git", rev = "9d56aa9" }
+quail-b = { git = "https://github.com/fsdatalab/quail-bench.git", rev = "cf07b18" }
 
+# One wheel holds the quail package and _quail_native, the planner's
+# Rust module, built from the crates/ workspace
 [build-system]
-requires = ["hatchling==1.32.0"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.10,<2"]
+build-backend = "maturin"
 
-[tool.hatch.build.targets.wheel]
-packages = ["quail"]
-
-[tool.hatch.build.targets.sdist]
-include = [
-    "LICENSE",
-    "README.md",
-    "pyproject.toml",
-    "quail",
-]
-exclude = [
-    "demos",
-    "docs",
-]
+[tool.maturin]
+manifest-path = "crates/quail-python/Cargo.toml"
+module-name = "_quail_native"
+python-packages = ["quail"]
+include = ["LICENSE", "README.md"]
+exclude = ["demos/**", "docs/**"]
+# Wheels (`uv build`) use the release profile. `uv sync` installs the
+# project editable, which builds the dev profile instead: dependencies are
+# optimized and cached once, and an edit recompiles only Quail's crates,
+# incrementally (see [profile.dev] in Cargo.toml).
+profile = "release"
+editable-profile = "dev"
+# pyo3 rebuilds whenever the Python path it is built against changes; the
+# base interpreter's path stays the same across uv's build environments
+use-base-python = true
 
 [tool.uv]
 # uv's Python builds include the C headers Triton needs at startup
 python-preference = "only-managed"
+# Require the installed Rust toolchain instead of letting maturin create
+# another CARGO_HOME and invalidate dependency reuse (see AGENTS.md).
+extra-build-variables = { quail-engine = { MATURIN_NO_INSTALL_RUST = "1" } }
+# uv rebuilds the project, and its Rust module, when any of these change
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "Cargo.lock" },
+    { file = "crates/**/*.rs" },
+    { file = "crates/**/Cargo.toml" },
+    { file = ".cargo/config.toml" },
+    { file = "rust-toolchain.toml" },
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["tests"]
+
+# Rust plans every query, so the executor reads no catalog.
+# Code both use lives in quail.common.
+[[tool.importlinter.contracts]]
+name = "The executor imports no catalog code"
+type = "forbidden"
+source_modules = ["quail.backends", "quail.execution"]
+forbidden_modules = [
+    "quail.catalog",
+]
+allow_indirect_imports = false
+# QueryResult.explain() prints the logical plan beside the executed one
+ignore_imports = ["quail.execution.result -> quail.explain"]
 
 [tool.ruff]
 line-length = 88
@@ -110,12 +132,14 @@ known-first-party = ["quail", "quail_b", "bench", "calibrate", "experiments"]
 # ExtensionRegistry.with_built_ins() build the built in registry.
 [tool.importlinter]
 root_package = "quail"
+# imports under TYPE_CHECKING carry no run-time dependency
+exclude_type_checking_imports = true
 
 [[tool.importlinter.contracts]]
 name = "Packages import downward only"
 type = "layers"
 layers = [
-    "quail.server",
+    "quail.worker",
     "quail.api",
     "quail.builtins",
     "quail.baselines",
@@ -124,31 +148,12 @@ layers = [
     "quail.remote",
     "quail.execution",
     "quail.explain",
-    "quail.planner",
     "quail.physical",
-    "quail.frontend",
     "quail.catalog",
-    "quail.logical",
-    "quail.cost",
+    "quail.common",
     "quail.specs | quail.labels | quail.progress | quail.deploy",
 ]
 ignore_imports = ["quail.extensions -> quail.builtins"]
-
-[[tool.importlinter.contracts]]
-name = "Planner stages import downward only"
-type = "layers"
-layers = [
-    "quail.planner.pricing",
-    "quail.planner.rules",
-    "quail.planner.graph | quail.planner.sol",
-    "quail.planner.search",
-    "quail.planner.operators",
-    "quail.planner.statistics",
-    "quail.planner.optimize",
-    "quail.planner.optimizer",
-    "quail.planner.validation | quail.planner.prompt_lowering",
-    "quail.planner.plan",
-]
 
 [tool.vulture]
 paths = ["quail", "bench", "calibrate"]

@@ -1,27 +1,23 @@
 logical:
-  Project: t.id, progress, test_result
-    SemanticClassify: test_result
-      PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the agent trace above what the most recent test or reproduction run showed.', t.trace) labels=['bug fixed, tests pass', 'bug still occurs', 'bug fixed, other tests fail', 'run errored']
-      Filter: t.progress IN ('changed the code, not checked', 'changed the code, check passes', 'changed the code, check fails') (selectivity=36.1%)
-        SemanticClassify: progress
-          PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the agent trace above how far the agent has gotten so far.', t.trace) labels=['has not located the relevant code', 'located the relevant code', 'changed the code, not checked', 'changed the code, check passes', 'changed the code, check fails']
-          Scan agent_traces as t [trace, id]
+  Projection: t.id, progress, test_result
+    AiNode: test_result = ai_classify(prompt(Utf8("Judge strictly from the agent trace above what the most recent test or reproduction run showed.\n\n{0}"), t.trace), make_array(struct(Utf8("bug fixed, tests pass"), Utf8("the reported bug no longer occurs and other tests pass")), struct(Utf8("bug still occurs"), Utf8("the reported bug still happens")), struct(Utf8("bug fixed, other tests fail"), Utf8("the reported bug no longer occurs but other tests fail")), struct(Utf8("run errored"), Utf8("the run crashed or errored before testing anything"))))
+      AiNode: progress = ai_classify(prompt(Utf8("Judge strictly from the agent trace above how far the agent has gotten so far.\n\n{0}"), t.trace), make_array(struct(Utf8("has not located the relevant code"), Utf8("has not yet found the code that causes the issue")), struct(Utf8("located the relevant code"), Utf8("found the code that causes the issue but has not changed it")), struct(Utf8("changed the code, not checked"), Utf8("edited the code but has not run a test or reproduction since")), struct(Utf8("changed the code, check passes"), Utf8("edited the code and the latest test or reproduction run succeeds")), struct(Utf8("changed the code, check fails"), Utf8("edited the code and the latest test or reproduction run still fails")))), filter: hint(progress = Utf8("changed the code, not checked") OR progress = Utf8("changed the code, check passes") OR progress = Utf8("changed the code, check fails"), named_struct(Utf8("selectivity"), Float64(0.3606094808126411)))
+        SubqueryAlias: t
+          TableScan: agent_traces projection=[id, trace]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
-  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
+  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                                                                                                   est. rows   est. time
-  Project: t.id, progress, test_result
-    AiClassify: test_result over t                                                                                                               5.43 ms
-      rule=trie_decode, labels=4, label tokens=75
-      Filter: t.progress IN ('changed the code, not checked', 'changed the code, check passes', 'changed the code, check fails')
-        AiClassify: progress over t [1]                                                                                                            23 ms
-          rule=trie_decode, labels=5, label tokens=146
-          Scan agent_traces as t                                                                                                           6
-            tokens=78, mean_document_tokens=13
-    Reuse [1]
+                                                                                                                                 est. rows   est. time
+  AiClassify: test_result over t                                                                                                               3.87 ms
+    rule=trie_decode, labels=4, label tokens=55
+    Filter: t.progress IN ('changed the code, not checked', 'changed the code, check passes', 'changed the code, check fails')
+      AiClassify: progress over t                                                                                                              16.2 ms
+        rule=trie_decode, labels=5, label tokens=106
+        Scan agent_traces as t                                                                                                           6
+          tokens=66, mean_document_tokens=11
   Pipeline on t: ai-classify:0 -> filter:t:0 -> ai-classify:1 (each document runs every operator with its KV resident)
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

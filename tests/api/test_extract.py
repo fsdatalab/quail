@@ -1,67 +1,33 @@
-"""AI.EXTRACT: the operator surface, its prompt, and its plan."""
+"""AI.EXTRACT: the operator surface, its prompt, and its plan.
 
-from dataclasses import replace
+Each transcript test holds its expected transcript: the plan's AI
+operators, the questions the model answered, and the rows
+(helpers/transcript.py).
+"""
+
 from types import SimpleNamespace
 
 import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 from helpers import baselines as request_tests
-from helpers.fakes import letter_tokens
-from helpers.oracle import Oracle, finish, oracle_executor
+from helpers.oracle import Oracle, finish, question_text
+from helpers.planning import column_tests, operators_of
+from helpers.sessions import TOKENIZER
+from helpers.transcript import Transcripts, assert_transcript
 
 import quail
-from quail.baselines.nodes import RequestExecution, RequestExtractSpec
+from quail.api.config import EngineConfig
 from quail.catalog import DocumentProvider
-from quail.logical import (
-    CompileError,
-)
 from quail.physical import (
     AiExtract,
     Filter,
-    decode_graph,
-    encode_graph,
+    RequestExecution,
+    RequestExtractSpec,
 )
-from quail.physical.pipelines import build_pipelines, resident_inputs
-from quail.planner.plan import EngineConfig, Refusal
+from quail.physical.plan import Refusal
 
 QUESTION = "When does the lease end?"
 LEASE = "Lease ends on March 3, 2027.\nRent is $2,000."
-
-@pytest.fixture()
-def session(tmp_path):
-    path = tmp_path / "contracts.parquet"
-    pq.write_table(pa.table({
-        "id": [1, 2], "text": [LEASE, "No dates here."],
-    }), path)
-    value = quail.Session(
-        EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
-        tokenizer=letter_tokens)
-    value.register("contracts",
-                   DocumentProvider.from_parquet(str(path), id_col="id"))
-    yield value
-    value.close()
-
-
-@pytest.mark.parametrize("filtered", [True])
-def test_score_and_extract_return_both_columns(session, monkeypatch, filtered):
-    oracle = Oracle(answers=lambda spec, document: (
-        "March 3, 2027" if document == 0 else None))
-    query = session.sql(
-        "SELECT c.id, AI.SCORE(PROMPT('Is this a lease? {0}', c.text)) AS score, "
-        f"AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease FROM contracts c "
-        + ("WHERE AI.SCORE(PROMPT('Is this a lease? {0}', c.text)) > 0.15"
-           if filtered else ""))
-    result = finish(query, oracle)
-    rows = result.collect()
-    assert rows.column("score").type == pa.float64()
-    expected = [
-        {"c.id": 1, "score": 0.1, "lease": {"ends": "March 3, 2027"},
-         "lease_span": {"ends": {"start": 14, "end": 27}}},
-        {"c.id": 2, "score": 0.2, "lease": {"ends": None},
-         "lease_span": {"ends": None}},
-    ]
-    assert rows.to_pylist() == (expected[1:] if filtered else expected)
 
 
 class _PhraseClient(request_tests._Client):
@@ -80,8 +46,7 @@ class _PhraseClient(request_tests._Client):
         outputs = []
         for prompt in prompts:
             ids = prompt["prompt_token_ids"]
-            spelled = bytes(token - 1 for token in ids if 1 <= token <= 256)
-            text = spelled.decode("utf-8", errors="ignore")
+            text = question_text(ids)
             if "March" in text:
                 answer, tokens = "March 3, 2027", [1, 2, 3, 4]
             elif "five" in text:
@@ -109,11 +74,27 @@ class _TextPhraseClient(_PhraseClient):
              for prompt in prompts], sampling_params, use_tqdm)
 
 
+class _FieldsClient(_PhraseClient):
+    """Runs the fields of each document together, as the vLLM client does."""
+
+    def __init__(self):
+        super().__init__()
+        self.runs = []
+
+    def run_extract_fields(self, sampling_params, body_ids, tail_ids, *,
+                           answer_tokens, body_texts=None, tail_texts=None):
+        self.runs.append((tail_ids, answer_tokens))
+        return {"wall": 1.5, "outputs": [
+            self.generate([{"prompt_token_ids": body + tail}
+                           for body in body_ids], sampling_params)
+            for tail in tail_ids]}
+
+
 TEXTS = [LEASE, "No dates here.", "Term: five years\nmore text",
          "the absent one"]
 
 
-def test_request_backend_decodes_and_locates_one_answer_per_document():
+def test_a_request_backend_decodes_and_locates_each_fields_answer_per_document():
     limit = 7
     documents = {"c": [request_tests._tokens(text) for text in TEXTS]}
     specs = (
@@ -153,8 +134,8 @@ def test_request_backend_decodes_and_locates_one_answer_per_document():
     # an engine that takes text gets the preamble, the document, and
     # the tail's text, tokenized by the engine itself
     texted = _TextPhraseClient()
-    node = replace(node, preamble_text="DOCUMENT:\n",
-                   extracts=(replace(specs[0], tail_text="\nQ?\nPhrase:"),))
+    node = node.replace(preamble_text="DOCUMENT:\n",
+                   extracts=(specs[0].replace(tail_text="\nQ?\nPhrase:"),))
     result = request_tests._execution(
         documents, client=texted, document_texts={"c": TEXTS}).execute(node, {})
     assert texted.prompts == ["DOCUMENT:\n" + text + "\nQ?\nPhrase:"
@@ -162,25 +143,7 @@ def test_request_backend_decodes_and_locates_one_answer_per_document():
     assert result.outputs["extract_answers:ends"].to_pydict()["ends"] == [
         "March 3, 2027", None, "five years", None]
 
-
-class _FieldsClient(_PhraseClient):
-    """Runs the fields of each document together, as the vLLM client does."""
-
-    def __init__(self):
-        super().__init__()
-        self.runs = []
-
-    def run_extract_fields(self, sampling_params, body_ids, tail_ids, *,
-                           answer_tokens, body_texts=None, tail_texts=None):
-        self.runs.append((tail_ids, answer_tokens))
-        return {"wall": 1.5, "outputs": [
-            self.generate([{"prompt_token_ids": body + tail}
-                           for body in body_ids], sampling_params)
-            for tail in tail_ids]}
-
-
-def test_request_backend_runs_the_fields_of_a_document_together():
-    documents = {"c": [request_tests._tokens(text) for text in TEXTS]}
+    # pipelined submission runs the fields of a document together
     specs = tuple(
         RequestExtractSpec(alias="c", output=output, question=QUESTION,
                            tail_token_ids=(tail,), max_answer_tokens=limit)
@@ -203,12 +166,13 @@ def test_request_backend_runs_the_fields_of_a_document_together():
             for step in steps] == [("ends", 4, 1.5), ("term", 4, 1.5)]
 
 
-def test_stock_vllm_plans_and_runs_an_extraction(monkeypatch):
+def test_stock_vllm_extracts_the_rows_datafusions_top_k_keeps(monkeypatch):
     session = request_tests._session(
         "stock_vllm", contracts={"id": ["a", "b", "c", "d"], "text": TEXTS})
+    fields = f"c.text, {{'ends': '{QUESTION}', 'term': 'How long is the term?'}}"
     query = session.sql(
-        f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}', "
-        f"'term': 'How long is the term?'}}) AS lease FROM contracts c")
+        f"SELECT c.id, AI.EXTRACT({fields}) AS lease, "
+        f"AI.EXTRACT_SPAN({fields}) AS lease_span FROM contracts c")
     boot = {"client": _PhraseClient(), "sampling_params": object(),
             "capacity": request_tests.CAPACITY}
     monkeypatch.setattr(
@@ -232,181 +196,389 @@ def test_stock_vllm_plans_and_runs_an_extraction(monkeypatch):
     steps = result.report["backend_metrics"]["steps"]
     assert [(step["kind"], step["requests"]) for step in steps] == [
         ("extract", 4), ("extract", 4)]
-    session.close()
-
-
-def test_stock_vllm_sorts_and_limits_extracted_rows(monkeypatch):
-    session = request_tests._session(
-        "stock_vllm", contracts={"id": ["a", "b", "c", "d"], "text": TEXTS})
     query = session.sql(
         f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease "
         "FROM contracts c ORDER BY c.id DESC LIMIT 2")
-    boot = {"client": _PhraseClient(), "sampling_params": object(),
-            "capacity": request_tests.CAPACITY}
-    monkeypatch.setattr(
-        "quail.baselines.vllm.VLLMEngine.boot",
-        lambda self, spec, allowed_ids, *, device, resources: (
-            boot, {"kind": "cold", "boot_s": 0.1}))
+    # DataFusion sorts the contracts and keeps two; the region extracts
+    # those, reading them as the columns of DataFusion's rows
     rows = request_tests._run_stock_vllm(session, query).collect()
-    assert rows.column_names == ["c.id", "lease", "lease_span"]
-    assert rows.column("c.id").to_pylist() == ["d", "c"]
-    assert rows.column("lease").to_pylist() == [{"ends": None},
-                                                {"ends": "five years"}]
+    assert rows.column_names == ["c.column_0", "lease"]
+    leases = dict(zip(rows.column("c.column_0").to_pylist(),
+                      rows.column("lease").to_pylist(), strict=True))
+    assert leases == {"d": {"ends": None}, "c": {"ends": "five years"}}
+    assert "SortExec: TopK(fetch=2)" in query.explain()
     session.close()
 
 
-STRUCT_SQL = ("SELECT c.id, AI.EXTRACT(c.text, {'ends': '" + QUESTION
-              + "', 'rent': 'What is the rent?'}) AS lease FROM contracts c")
+CONTRACTS = pa.table({
+    "id": ["c1", "c2", "c3", "c4"],
+    "text": [LEASE, "No dates here.", "Deed ends on March 3, 2027.",
+             "A deed with no date."]})
+LEASE_ENDS = f"AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}})"
+FIELDS = f"c.text, {{'ends': '{QUESTION}', 'rent': 'How much?'}}"
+SELECT_LEASE = f"SELECT c.id, AI.EXTRACT({FIELDS}) AS lease FROM contracts c WHERE "
+ENDS = f"AI.EXTRACT({FIELDS})['ends']"
+START = f"AI.EXTRACT_SPAN({FIELDS})['ends']['start']"
 
 
-def _struct_answers():
-    answers = {"lease.ends": ["March 3, 2027", None],
-               "lease.rent": ["$2,000", None]}
-    return Oracle(answers=lambda spec, document: answers[spec.name][document])
+@pytest.fixture()
+def session():
+    value = quail.Session(
+        EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
+        tokenizer=TOKENIZER)
+    value.register("contracts",
+                   DocumentProvider.from_table(CONTRACTS, id_col="id"))
+    yield value
+    value.close()
 
 
-@pytest.mark.parametrize("suffix", ["", " ORDER BY c.id DESC LIMIT 1"])
-def test_extract_returns_answer_and_span_structs(
-        session, monkeypatch, suffix):
-    result = finish(session.sql(STRUCT_SQL + suffix), _struct_answers())
-    rows = result.collect()
-    assert rows.column_names == ["c.id", "lease", "lease_span"]
-    span = pa.struct([("start", pa.int32()), ("end", pa.int32())])
-    assert rows.schema.field("lease").type == pa.struct(
-        [("ends", pa.string()), ("rent", pa.string())])
-    assert rows.schema.field("lease_span").type == pa.struct(
-        [("ends", span), ("rent", span)])
-    expected = [
-        {"c.id": 1, "lease": {"ends": "March 3, 2027", "rent": "$2,000"},
-         "lease_span": {"ends": {"start": 14, "end": 27},
-                        "rent": {"start": 37, "end": 43}}},
-        {"c.id": 2, "lease": {"ends": None, "rent": None},
-         "lease_span": {"ends": None, "rent": None}},
-    ]
-    assert rows.to_pylist() == (expected[1:] if "DESC" in suffix else expected)
+def _answer(kind, prompt, rows):
+    """The model's answers.
+
+    The lease ends on March 3, 2027 in c1 and c3, whose rent is $2,000 in
+    c1; asked when it ends, c2 says June 1, 2030, which its text does
+    not hold, so the executor returns no answer. c1 and c2 are leases;
+    c1 gives "Rent" as the reason. The score of c<i> is i / 8, which
+    a float32, as the executor reads a score, holds exactly.
+    """
+    (row,) = rows
+    if kind == "label":
+        return "lease" if row in ("c1", "c2") else "deed"
+    if kind == "score":
+        return int(row[1:]) / 8
+    if prompt in (QUESTION, "When?"):
+        return "March 3, 2027" if row in ("c1", "c3") else None
+    if prompt in ("How much?", "What is the rent?"):
+        return "$2,000" if row == "c1" else None
+    if prompt == "When does it end?":
+        return {"c1": "March 3, 2027", "c2": "June 1, 2030"}.get(row)
+    if prompt == "Why?":
+        return "Rent" if row == "c1" else None
+    raise AssertionError(prompt)
 
 
-def _answers_executor(answers):
-    """A physical executor whose extractions answer answers[document]."""
-    return oracle_executor(Oracle(answers=answers), fresh_tokens=12)
+def _transcript(*queries, columns=(), ordered=()) -> str:
+    """The transcripts of `queries`.
+
+    Those in `columns` show column types, and those in `ordered` their
+    rows in order.
+    """
+    with Transcripts({"contracts": CONTRACTS}, _answer) as runs:
+        return "\n".join(runs.query(sql, columns=sql in columns,
+                                     ordered=sql in ordered)
+                         for sql in queries)
 
 
-def test_filters_on_answers_keep_the_documents_whose_answer_passes(session):
-    from quail.api.execute import execute_query
-    from quail.logical import Filter as LogicalFilter
+def test_an_extraction_returns_each_fields_answer_and_span():
+    fields = f"c.text, {{'ends': '{QUESTION}', 'rent': 'What is the rent?'}}"
+    both = (f"SELECT c.id, AI.EXTRACT({fields}) AS lease, "
+            f"AI.EXTRACT_SPAN({fields}) AS lease_span FROM contracts c")
+    top = f"{both} ORDER BY c.id DESC LIMIT 1"
+    score = "AI.SCORE(PROMPT('Is this a lease? {0}', c.text))"
+    # a score beside the extraction, and a test on it, keep both columns
+    scored = (f"SELECT c.id, {score} AS score, {LEASE_ENDS} AS lease, "
+              f"AI.EXTRACT_SPAN(c.text, {{'ends': '{QUESTION}'}}) AS lease_span "
+              f"FROM contracts c WHERE {score} > 0.25")
+    # the answer without its span, which the extraction then does not return
+    top_answer = (f"SELECT c.id, {LEASE_ENDS} AS lease FROM contracts c "
+                  "ORDER BY c.id LIMIT 1")
+    assert_transcript(_transcript(both, top, scored, top_answer,
+                                  columns=(both, top, scored),
+                                  ordered=(top, top_answer)), """\
+--- SELECT c.id, AI.EXTRACT(c.text, {'ends': 'When does the lease end?', 'rent': 'What
+    is the rent?'}) AS lease, AI.EXTRACT_SPAN(c.text, {'ends': 'When does the lease
+    end?', 'rent': 'What is the rent?'}) AS lease_span FROM contracts c ---
+plan
+  lease = ai_extract(c.text, named_struct('ends', 'When does the lease end?', 'rent',
+      'What is the rent?'))
+asked 8 of 8
+  'When does the lease end?': c1 'March 3, 2027', c2 NULL, c3 'March 3, 2027', c4 NULL
+  'What is the rent?': c1 '$2,000', c2 NULL, c3 NULL, c4 NULL
+columns c.id string, lease struct<ends: string, rent: string>, lease_span struct<ends:
+    struct<start: int32, end: int32>, rent: struct<start: int32, end: int32>>
+rows 4
+  c1, {'ends': 'March 3, 2027', 'rent': '$2,000'}, {'ends': {'start': 14, 'end': 27},
+      'rent': {'start': 37, 'end': 43}}
+  c2, {'ends': None, 'rent': None}, {'ends': None, 'rent': None}
+  c3, {'ends': 'March 3, 2027', 'rent': None}, {'ends': {'start': 13, 'end': 26},
+      'rent': None}
+  c4, {'ends': None, 'rent': None}, {'ends': None, 'rent': None}
 
+--- SELECT c.id, AI.EXTRACT(c.text, {'ends': 'When does the lease end?', 'rent': 'What
+    is the rent?'}) AS lease, AI.EXTRACT_SPAN(c.text, {'ends': 'When does the lease
+    end?', 'rent': 'What is the rent?'}) AS lease_span FROM contracts c ORDER BY c.id
+    DESC LIMIT 1 ---
+plan
+  lease = ai_extract(c.column_1, named_struct('ends', 'When does the lease end?',
+      'rent', 'What is the rent?'))
+asked 2 of 8
+  'When does the lease end?': c4 NULL
+  'What is the rent?': c4 NULL
+columns c.id string, lease struct<ends: string, rent: string>, lease_span struct<ends:
+    struct<start: int32, end: int32>, rent: struct<start: int32, end: int32>>
+rows 1, in order
+  c4, {'ends': None, 'rent': None}, {'ends': None, 'rent': None}
+
+--- SELECT c.id, AI.SCORE(PROMPT('Is this a lease? {0}', c.text)) AS score,
+    AI.EXTRACT(c.text, {'ends': 'When does the lease end?'}) AS lease,
+    AI.EXTRACT_SPAN(c.text, {'ends': 'When does the lease end?'}) AS lease_span FROM
+    contracts c WHERE AI.SCORE(PROMPT('Is this a lease? {0}', c.text)) > 0.25 ---
+plan
+  lease = ai_extract(c.text, named_struct('ends', 'When does the lease end?'))
+  score = ai_score('Is this a lease? {0}', c.text), filter: score > Float64(0.25)
+asked 6 of 6
+  'Is this a lease? {0}': c1 0.125, c2 0.25, c3 0.375, c4 0.5
+  'When does the lease end?': c3 'March 3, 2027', c4 NULL
+columns c.id string, score double, lease struct<ends: string>, lease_span struct<ends:
+    struct<start: int32, end: int32>>
+rows 2
+  c3, 0.375, {'ends': 'March 3, 2027'}, {'ends': {'start': 13, 'end': 26}}
+  c4, 0.5, {'ends': None}, {'ends': None}
+
+--- SELECT c.id, AI.EXTRACT(c.text, {'ends': 'When does the lease end?'}) AS lease FROM
+    contracts c ORDER BY c.id LIMIT 1 ---
+plan
+  lease = ai_extract(c.column_1, named_struct('ends', 'When does the lease end?')),
+      returns: [lease]
+asked 1 of 4
+  'When does the lease end?': c1 'March 3, 2027'
+rows 1, in order
+  c1, {'ends': 'March 3, 2027'}
+""")
+
+
+def test_an_extraction_of_no_rows_returns_no_rows(session):
+    query = session.sql(f"SELECT c.id, {LEASE_ENDS} AS lease FROM contracts c "
+                        "WHERE c.id = 'none'")
+    assert finish(query, Oracle()).collect().num_rows == 0
+
+
+def test_a_span_column_runs_with_or_without_a_matching_extraction():
+    assert_transcript(_transcript(*(
+        f"SELECT c.id AS contract_id, {other}"
+        "AI.EXTRACT_SPAN(c.text, {'ends': 'Why?'}) AS lease_span FROM contracts c"
+        for other in ("", "AI.EXTRACT(c.text, {'ends': 'When?'}) AS lease, "))), """\
+--- SELECT c.id AS contract_id, AI.EXTRACT_SPAN(c.text, {'ends': 'Why?'}) AS lease_span
+    FROM contracts c ---
+plan
+  lease = ai_extract(c.text, named_struct('ends', 'Why?'))
+asked 4 of 4
+  'Why?': c1 'Rent', c2 NULL, c3 NULL, c4 NULL
+rows 4
+  c1, {'ends': {'start': 29, 'end': 33}}
+  c2, {'ends': None}
+  c3, {'ends': None}
+  c4, {'ends': None}
+
+--- SELECT c.id AS contract_id, AI.EXTRACT(c.text, {'ends': 'When?'}) AS lease,
+    AI.EXTRACT_SPAN(c.text, {'ends': 'Why?'}) AS lease_span FROM contracts c ---
+plan
+  __quail_column_1 = ai_extract(c.text, named_struct('ends', 'Why?'))
+  lease = ai_extract(c.text, named_struct('ends', 'When?')), returns: [lease]
+asked 8 of 8
+  'When?': c1 'March 3, 2027', c2 NULL, c3 'March 3, 2027', c4 NULL
+  'Why?': c1 'Rent', c2 NULL, c3 NULL, c4 NULL
+rows 4
+  c1, {'ends': 'March 3, 2027'}, {'ends': {'start': 29, 'end': 33}}
+  c2, {'ends': None}, {'ends': None}
+  c3, {'ends': 'March 3, 2027'}, {'ends': None}
+  c4, {'ends': None}, {'ends': None}
+""")
+
+
+def test_tests_of_answers_keep_the_documents_whose_answers_pass():
+    lease, span = f"AI.EXTRACT({FIELDS})", f"AI.EXTRACT_SPAN({FIELDS})"
     tests = " AND ".join(f"HINT({test}, {{'selectivity': 0.5}})" for test in (
-        "lease.ends IS NOT NULL", "lease.ends ILIKE '%march%'",
-        "lease_span.ends.start < 20", "LENGTH(lease.rent) < 20"))
-    query = session.sql(
-        f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}', "
-        f"'rent': 'How much?'}}) AS lease FROM contracts c WHERE {tests}")
-    # each test follows its field's extraction; the span and length
-    # tests use the same Filter node
-    kinds = [type(node).__name__ for node in query.logical.walk()]
-    assert kinds == ["Scan", "SemanticExtract", "Filter", "Filter", "Filter",
-                     "SemanticExtract", "Filter", "Project"]
-    tests = [node for node in query.logical.walk()
-             if isinstance(node, LogicalFilter)]
-    assert [str(node.condition) for node in tests] == [
-        "c.lease.ends IS NOT NULL", "c.lease.ends ilike '%march%'",
-        "c.lease.ends_span.start < 20", "length(c.lease.rent) < 20"]
-    assert [node.selectivity for node in tests] == [0.5, 0.5, 0.5, 0.5]
-    operators = query.logical.operators()
-    assert [(test.name, test.position)
-            for test in operators.column_filters["c"]] == [
-        ("lease.ends", 0), ("lease.ends", 1), ("lease.ends", 2),
-        ("lease.rent", 3)]
+        f"{lease}['ends'] IS NOT NULL", f"{lease}['ends'] ILIKE '%march%'",
+        f"{span}['ends']['start'] < 20", f"LENGTH({lease}['rent']) < 20"))
+    assert_transcript(_transcript(
+        # the second field is asked only of the documents the tests of the
+        # first keep
+        SELECT_LEASE + tests,
+        # a negated text test drops the null answer as SQL does
+        f"SELECT c.id, {LEASE_ENDS} AS lease FROM contracts c "
+        f"WHERE NOT ({LEASE_ENDS}['ends'] LIKE 'March%')",
+        # SPLIT_PART is DataFusion's; Arrow compute has no such function
+        "SELECT c.id FROM contracts c WHERE SPLIT_PART(AI.EXTRACT(c.text, "
+        "{'ends': 'When does it end?'})['ends'], ' ', 1) = 'March'"), """\
+--- SELECT c.id, AI.EXTRACT(c.text, {'ends': 'When does the lease end?', 'rent': 'How
+    much?'}) AS lease FROM contracts c WHERE HINT(AI.EXTRACT(c.text, {'ends': 'When does
+    the lease end?', 'rent': 'How much?'})['ends'] IS NOT NULL, {'selectivity': 0.5})
+    AND HINT(AI.EXTRACT(c.text, {'ends': 'When does the lease end?', 'rent': 'How
+    much?'})['ends'] ILIKE '%march%', {'selectivity': 0.5}) AND
+    HINT(AI.EXTRACT_SPAN(c.text, {'ends': 'When does the lease end?', 'rent': 'How
+    much?'})['ends']['start'] < 20, {'selectivity': 0.5}) AND
+    HINT(LENGTH(AI.EXTRACT(c.text, {'ends': 'When does the lease end?', 'rent': 'How
+    much?'})['rent']) < 20, {'selectivity': 0.5}) ---
+plan
+  lease = ai_extract(c.text, named_struct('ends', 'When does the lease end?', 'rent',
+      'How much?')), filter: hint(get_field(lease, 'ends') IS NOT NULL,
+      named_struct('selectivity', Float64(0.5))) AND hint(get_field(lease, 'ends') ILIKE
+      '%march%', named_struct('selectivity', Float64(0.5))) AND
+      hint(get_field(lease_span, 'ends', 'start') < Int32(20),
+      named_struct('selectivity', Float64(0.5))) AND
+      hint(character_length(get_field(lease, 'rent')) < Int32(20),
+      named_struct('selectivity', Float64(0.5))), returns: [lease]
+asked 6 of 6
+  'When does the lease end?': c1 'March 3, 2027', c2 NULL, c3 'March 3, 2027', c4 NULL
+  'How much?': c1 '$2,000', c3 NULL
+rows 1
+  c1, {'ends': 'March 3, 2027', 'rent': '$2,000'}
+
+--- SELECT c.id, AI.EXTRACT(c.text, {'ends': 'When does the lease end?'}) AS lease FROM
+    contracts c WHERE NOT (AI.EXTRACT(c.text, {'ends': 'When does the lease
+    end?'})['ends'] LIKE 'March%') ---
+plan
+  lease = ai_extract(c.text, named_struct('ends', 'When does the lease end?')), filter:
+      get_field(lease, 'ends') NOT LIKE 'March%', returns: [lease]
+asked 4 of 4
+  'When does the lease end?': c1 'March 3, 2027', c2 NULL, c3 'March 3, 2027', c4 NULL
+rows 0
+
+--- SELECT c.id FROM contracts c WHERE SPLIT_PART(AI.EXTRACT(c.text, {'ends': 'When does
+    it end?'})['ends'], ' ', 1) = 'March' ---
+plan
+  __quail_column_1 = ai_extract(c.text, named_struct('ends', 'When does it end?')),
+      filter: split_part(get_field(__quail_column_1, 'ends'), ' ', Int64(1)) = 'March',
+      returns: [__quail_column_1]
+asked 4 of 4
+  'When does it end?': c1 'March 3, 2027', c2 'June 1, 2030', c3 NULL, c4 NULL
+rows 1
+  c1
+""")
+
+
+def test_not_and_or_of_answers_labels_and_columns_keep_the_rows_sql_would():
+    kind = "AI.CLASSIFY(c.text, ['lease', 'deed'])"
+    rent = f"AI.EXTRACT({FIELDS})['rent']"
+    assert_transcript(_transcript(
+        # one extraction's answer and span
+        SELECT_LEASE + f"NOT ({ENDS} IS NULL OR {START} < 0)",
+        SELECT_LEASE + f"{ENDS} IS NULL OR {START} >= 0",
+        # an answer and a source column
+        SELECT_LEASE + f"NOT ({ENDS} IS NULL AND c.id = 'c2')",
+        # two extractions
+        SELECT_LEASE + f"{ENDS} = 'x' OR {rent} IS NOT NULL",
+        # a label and an extracted answer
+        f"SELECT c.id AS contract_id, {kind} AS kind, {LEASE_ENDS} AS lease "
+        f"FROM contracts c WHERE {kind} = 'lease' "
+        f"OR {LEASE_ENDS}['ends'] IS NULL"), """\
+--- SELECT c.id, AI.EXTRACT(c.text, {'ends': 'When does the lease end?', 'rent': 'How
+    much?'}) AS lease FROM contracts c WHERE NOT (AI.EXTRACT(c.text, {'ends': 'When does
+    the lease end?', 'rent': 'How much?'})['ends'] IS NULL OR AI.EXTRACT_SPAN(c.text,
+    {'ends': 'When does the lease end?', 'rent': 'How much?'})['ends']['start'] < 0) ---
+plan
+  lease = ai_extract(c.text, named_struct('ends', 'When does the lease end?', 'rent',
+      'How much?')), filter: get_field(lease, 'ends') IS NOT NULL AND
+      get_field(lease_span, 'ends', 'start') >= Int32(0), returns: [lease]
+asked 6 of 6
+  'When does the lease end?': c1 'March 3, 2027', c2 NULL, c3 'March 3, 2027', c4 NULL
+  'How much?': c1 '$2,000', c3 NULL
+rows 2
+  c1, {'ends': 'March 3, 2027', 'rent': '$2,000'}
+  c3, {'ends': 'March 3, 2027', 'rent': None}
+
+--- SELECT c.id, AI.EXTRACT(c.text, {'ends': 'When does the lease end?', 'rent': 'How
+    much?'}) AS lease FROM contracts c WHERE AI.EXTRACT(c.text, {'ends': 'When does the
+    lease end?', 'rent': 'How much?'})['ends'] IS NULL OR AI.EXTRACT_SPAN(c.text,
+    {'ends': 'When does the lease end?', 'rent': 'How much?'})['ends']['start'] >= 0 ---
+plan
+  lease = ai_extract(c.text, named_struct('ends', 'When does the lease end?', 'rent',
+      'How much?')), filter: get_field(lease, 'ends') IS NULL OR get_field(lease_span,
+      'ends', 'start') >= Int32(0), returns: [lease]
+asked 8 of 8
+  'When does the lease end?': c1 'March 3, 2027', c2 NULL, c3 'March 3, 2027', c4 NULL
+  'How much?': c1 '$2,000', c2 NULL, c3 NULL, c4 NULL
+rows 4
+  c1, {'ends': 'March 3, 2027', 'rent': '$2,000'}
+  c2, {'ends': None, 'rent': None}
+  c3, {'ends': 'March 3, 2027', 'rent': None}
+  c4, {'ends': None, 'rent': None}
+
+--- SELECT c.id, AI.EXTRACT(c.text, {'ends': 'When does the lease end?', 'rent': 'How
+    much?'}) AS lease FROM contracts c WHERE NOT (AI.EXTRACT(c.text, {'ends': 'When does
+    the lease end?', 'rent': 'How much?'})['ends'] IS NULL AND c.id = 'c2') ---
+plan
+  lease = ai_extract(c.text, named_struct('ends', 'When does the lease end?', 'rent',
+      'How much?')), filter: get_field(lease, 'ends') IS NOT NULL OR c.id != 'c2',
+      returns: [lease]
+asked 7 of 7
+  'When does the lease end?': c1 'March 3, 2027', c2 NULL, c3 'March 3, 2027', c4 NULL
+  'How much?': c1 '$2,000', c3 NULL, c4 NULL
+rows 3
+  c1, {'ends': 'March 3, 2027', 'rent': '$2,000'}
+  c3, {'ends': 'March 3, 2027', 'rent': None}
+  c4, {'ends': None, 'rent': None}
+
+--- SELECT c.id, AI.EXTRACT(c.text, {'ends': 'When does the lease end?', 'rent': 'How
+    much?'}) AS lease FROM contracts c WHERE AI.EXTRACT(c.text, {'ends': 'When does the
+    lease end?', 'rent': 'How much?'})['ends'] = 'x' OR AI.EXTRACT(c.text, {'ends':
+    'When does the lease end?', 'rent': 'How much?'})['rent'] IS NOT NULL ---
+plan
+  lease = ai_extract(c.text, named_struct('ends', 'When does the lease end?', 'rent',
+      'How much?')), filter: get_field(lease, 'ends') = 'x' OR get_field(lease, 'rent')
+      IS NOT NULL, returns: [lease]
+asked 8 of 8
+  'How much?': c1 '$2,000', c2 NULL, c3 NULL, c4 NULL
+  'When does the lease end?': c1 'March 3, 2027', c2 NULL, c3 'March 3, 2027', c4 NULL
+rows 1
+  c1, {'ends': 'March 3, 2027', 'rent': '$2,000'}
+
+--- SELECT c.id AS contract_id, AI.CLASSIFY(c.text, ['lease', 'deed']) AS kind,
+    AI.EXTRACT(c.text, {'ends': 'When does the lease end?'}) AS lease FROM contracts c
+    WHERE AI.CLASSIFY(c.text, ['lease', 'deed']) = 'lease' OR AI.EXTRACT(c.text,
+    {'ends': 'When does the lease end?'})['ends'] IS NULL ---
+plan
+  lease = ai_extract(c.text, named_struct('ends', 'When does the lease end?')), returns:
+      [lease]
+  kind = ai_classify(c.text, make_array('lease', 'deed'))
+asked 8 of 8
+  '?': c1 'lease', c2 'lease', c3 'deed', c4 'deed'
+  'When does the lease end?': c1 'March 3, 2027', c2 NULL, c3 'March 3, 2027', c4 NULL
+rows 3
+  c1, 'lease', {'ends': 'March 3, 2027'}
+  c2, 'lease', {'ends': None}
+  c4, 'deed', {'ends': None}
+""")
+
+
+def test_tests_of_answers_follow_the_extraction_they_read(session):
+    lease, span = f"AI.EXTRACT({FIELDS})", f"AI.EXTRACT_SPAN({FIELDS})"
+    tests = " AND ".join(f"HINT({test}, {{'selectivity': 0.5}})" for test in (
+        f"{lease}['ends'] IS NOT NULL", f"{lease}['ends'] ILIKE '%march%'",
+        f"{span}['ends']['start'] < 20", f"LENGTH({lease}['rent']) < 20"))
+    query = session.sql(SELECT_LEASE + tests)
+    found = operators_of(query)
+    assert [column.name for column in found.extracts] == ["lease.ends", "lease.rent"]
+    tests = column_tests(found)
+    assert [test.selectivity for test in tests] == [0.5, 0.5, 0.5, 0.5]
+    # the first three tests read the first field, the last the second
+    assert [test.name for test in tests] == ["lease.ends"] * 3 + ["lease.rent"]
     plan = query.plan()
     assert not isinstance(plan, Refusal)
     extracts = [n for n in plan.nodes if isinstance(n, AiExtract)]
     filters = [n for n in plan.nodes if isinstance(n, Filter)]
     assert [str(node.predicate) for node in filters] == [
         "c.lease.ends IS NOT NULL", "c.lease.ends ilike '%march%'",
-        "c.lease.ends_span.start < 20", "length(c.lease.rent) < 20"]
+        "c.lease.ends_span.start < 20", "character_length(c.lease.rent) < 20"]
     assert filters[0].inputs[0].source.node_id == extracts[0].node_id
     assert extracts[1].inputs[0].source.node_id == filters[2].node_id
     # the three tests on the first field thin the second extraction,
     # which runs in the same pipeline over the resident KV
-    assert extracts[1].spec.expected_rows == pytest.approx(2 * 0.5 ** 3)
+    assert extracts[1].spec.expected_rows == pytest.approx(
+        CONTRACTS.num_rows * 0.5 ** 3)
     assert extracts[1].spec.estimated_seconds < extracts[0].spec.estimated_seconds
-    pipelines = build_pipelines(plan.graph)
+    pipelines = plan.graph.pipelines()
     assert [member.node_id for member in pipelines[extracts[0].node_id]] == [
         extracts[0].node_id, filters[0].node_id, filters[1].node_id,
         filters[2].node_id, extracts[1].node_id, filters[3].node_id]
     # the second extraction reads the KV the first left resident
-    residents = resident_inputs(plan.graph, pipelines)
+    residents = plan.graph.resident_inputs()
     assert extracts[1].node_id in residents and extracts[0].node_id not in residents
-    codecs = session.registry.codecs
-    assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
     assert "Filter: c.lease.ends ilike '%march%'" in query.explain()
-
-    # one document answers; its answer passes the tests
-    result = execute_query(query, physical_executor=_answers_executor(
-        {0: "March 3, 2027", 1: None}))
-    rows = result.collect()
-    assert rows.column("c.id").to_pylist() == [1]
-    assert rows.column("lease").to_pylist() == [
-        {"ends": "March 3, 2027", "rent": "March 3, 2027"}]
-    answers = result.answer_tables["extracts"]["lease.ends"]
-    assert answers.column("lease.ends").to_pylist() == ["March 3, 2027", None]
-    # the second question was asked of the survivor only
-    assert result.answer_tables["extracts"]["lease.rent"].num_rows == 1
-    passed = result.answer_tables["filters"]
-    assert passed[("c", 0)].column("answer").to_pylist() == [True, False]
-    assert passed[("c", 2)].column("answer").to_pylist() == [True]
-    # a negated text test drops the null answer as SQL does
-    negated = session.sql(
-        f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease "
-        "FROM contracts c WHERE NOT (lease.ends LIKE 'March%')")
-    assert str(negated.logical.root.input.condition) == (
-        "NOT (c.lease.ends like 'March%')")
-    result = execute_query(negated, physical_executor=_answers_executor(
-        {0: "March 3, 2027", 1: None}))
-    assert result.collect().num_rows == 0
-
-
-def test_not_and_or_of_answers_run_after_one_extraction_or_on_result_rows(session):
-    from quail.api.execute import execute_query
-    from quail.logical import Filter as LogicalFilter
-
-    head = (f"SELECT c.id, AI.EXTRACT(c.text, {{'ends': '{QUESTION}', "
-            f"'rent': 'How much?'}}) AS lease FROM contracts c WHERE ")
-
-    def placed(query):
-        return [(type(node.input).__name__, str(node.condition))
-                for node in query.logical.walk() if isinstance(node, LogicalFilter)]
-
-    def kept(query):
-        result = execute_query(query, physical_executor=_answers_executor(
-            {0: "March 3, 2027", 1: None}))
-        return result.collect().column("c.id").to_pylist()
-
-    # one extraction's answer and span: the Filter follows the extraction
-    one = session.sql(head + "NOT (lease.ends IS NULL OR lease_span.ends.start < 0)")
-    assert placed(one) == [
-        ("SemanticExtract", "c.lease.ends IS NOT NULL"),
-        ("Filter", "NOT (c.lease.ends_span.start < 0)")]
-    one = session.sql(head + "lease.ends IS NULL OR lease_span.ends.start >= 0")
-    assert placed(one) == [
-        ("SemanticExtract", "c.lease.ends IS NULL OR c.lease.ends_span.start >= 0")]
-    assert kept(one) == [1, 2]
-    # an answer and a source column, or two extractions: after the last
-    # extraction read, each other column read by document ID
-    mixed = session.sql(head + "NOT (lease.ends IS NULL AND c.id = 2)")
-    assert placed(mixed) == [
-        ("SemanticExtract", "c.lease.ends IS NOT NULL OR NOT (c.id = 2)")]
-    assert kept(mixed) == [1]
-    fields = session.sql(head + "lease.ends = 'x' OR lease.rent IS NOT NULL")
-    assert placed(fields) == [
-        ("SemanticExtract", "c.lease.ends = 'x' OR c.lease.rent IS NOT NULL")]
-    (test,) = [node for node in fields.plan().nodes if isinstance(node, Filter)]
+    # a test of two extractions reads both
+    (test,) = [node for node in session.sql(
+        SELECT_LEASE + f"{ENDS} = 'x' OR AI.EXTRACT({FIELDS})['rent'] IS NOT NULL"
+    ).plan().nodes if isinstance(node, Filter)]
     assert [port.source.node_id for port in test.inputs] == [
         "ai-extract:1", "ai-extract:0"]
-    assert kept(fields) == [1]
-    # a label and an answer in one condition are refused
-    with pytest.raises(CompileError, match="tests a label and another"):
-        session.sql(
-            "SELECT c.id, AI.CLASSIFY(c.text, ['lease', 'deed']) AS kind, "
-            f"AI.EXTRACT(c.text, {{'ends': '{QUESTION}'}}) AS lease "
-            "FROM contracts c WHERE kind = 'lease' OR lease.ends IS NULL")

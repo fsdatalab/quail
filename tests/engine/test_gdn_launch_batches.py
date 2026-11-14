@@ -15,7 +15,7 @@ from experiments.hybrid import (  # noqa: E402
 
 
 def test_launches_cap_the_sequences_and_match_one_pass(monkeypatch):
-    from quail.cost.budgets import CHECKPOINT_PASS_QUESTIONS
+    from quail.common.budgets import CHECKPOINT_PASS_QUESTIONS
 
     assert 2 * gdn.SEQUENCES_PER_LAUNCH <= CHECKPOINT_PASS_QUESTIONS
     key_heads, value_heads, key_dim, value_dim = 2, 4, 8, 8

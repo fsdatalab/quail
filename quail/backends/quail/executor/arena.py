@@ -16,7 +16,7 @@ the same methods:
   retention_cap_pages, retained_keys, retained_pages,
   retained_prefix_tokens
 - residency: is_resident, resident_keys, owned_pages, capacity_rows,
-  pages_needed, page_cost, held_cost, page_tokens, num_pages, free_pages
+  pages_needed, page_cost, page_tokens, num_pages, free_pages
 - the sliding window: has_sliding, origin, sliding_start, trim_window,
   owned_sliding_pages, capacity_rows_sliding, num_sliding_pages, resize
 - attention inputs: layer_kv, paged_kv, block_table, block_table_rows
@@ -435,14 +435,6 @@ class KVArena:
             capacity_s = len(self.sliding.table_pages(key)) * self.page_tokens
             self._sliding_rows[key] = self._page_rows(self.sliding, key, capacity_s)
 
-    def slots_held(self, keys) -> int:
-        """Checkpoint slots the given keys hold: main, extension, and share."""
-        keys = set(keys)
-        held = self.accounting
-        return (sum(1 for key in held.slots if key in keys)
-                + sum(1 for key in held.ext_slots if key in keys)
-                + sum(1 for point in held.share_slots if point[0] in keys))
-
     def pin(self, key):
         self.accounting.pin(key)
 
@@ -766,14 +758,6 @@ class KVArena:
         origin = 0 if base_tokens is None else self.origin(base_tokens)
         pages_s = self.sliding.pages_needed(max(0, tokens - origin))
         return max(pages, self._as_every_token_pages(pages_s))
-
-    def held_cost(self, key) -> int:
-        """Pages a resident key holds, in every-token pages."""
-        pages = len(self.accounting.owned[key])
-        if self.sliding is None:
-            return pages
-        return max(pages, self._as_every_token_pages(
-            len(self.sliding.owned[key])))
 
     def growth_cost(self, key, capacity_tokens: int) -> int:
         """Pages a resident key needs to grow to capacity, in every-token pages.

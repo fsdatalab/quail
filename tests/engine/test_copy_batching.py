@@ -1,13 +1,12 @@
 """Extraction head work and tensor dispatches are batched across fields."""
 
 from collections import Counter
-from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
-import pytest
 import torch
 from helpers.extract_fakes import make_spec
+from test_kv_reads import named
 from test_map_decode import events_torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
@@ -32,7 +31,7 @@ def copy_batch(num_fields, num_documents=4, document_tokens=24, draft_tokens=2,
     """Build independent fields over repeated document spans with a small head."""
     text = text or "five" + " years" * (document_tokens - 1)
     spec, vocabulary = make_spec(text)
-    spec = replace(spec, top_tokens=4, draft_tokens=draft_tokens,
+    spec = spec.replace(top_tokens=4, draft_tokens=draft_tokens,
                    max_answer_tokens=answer_limit, first_window_chars=8,
                    window_chars=16)
     state = SimpleNamespace(loaded_model=SimpleNamespace(arena=SimpleNamespace()))
@@ -53,7 +52,7 @@ def copy_batch(num_fields, num_documents=4, document_tokens=24, draft_tokens=2,
     for slot in range(slots.size, num_slots):
         decoder.start(slot, num_fields, 0, [0, 1, 2])
     hidden = torch.full((num_slots, size), -10.0)
-    hidden[:, vocabulary.tokenizer.encode_ids("five")[0]] = 1
+    hidden[:, vocabulary.tokenizer("five")[0]] = 1
     decoder.submit(hidden, np.arange(num_slots), np.arange(num_slots), None)
     decoder.harvest(wait=True, prepare=prepare)
     return decoder, vocabulary
@@ -66,7 +65,7 @@ def continuation(decoder, vocabulary):
                             input_ids=torch.empty(len(rows), dtype=torch.int64))
     decoder.feed(chunk)
     hidden = torch.full((len(rows), len(vocabulary.vocab)), -10.0)
-    hidden[:, vocabulary.tokenizer.encode_ids(" years")[0]] = 1
+    hidden[:, vocabulary.tokenizer(" years")[0]] = 1
     decoder.submit(hidden, [], [], rows)
     decoder.harvest(wait=True)
     return len(rows)
@@ -78,7 +77,7 @@ def test_maps_keep_argmax_tie_order_in_a_shared_projection():
     decoder.feed(SimpleNamespace(
         decode_rows=rows, tokens=len(rows), meta={},
         input_ids=torch.empty(len(rows), dtype=torch.int64)))
-    tokens = [vocabulary.tokenizer.encode_ids(word)[0] for word in ("five", " years")]
+    tokens = [vocabulary.tokenizer(word)[0] for word in ("five", " years")]
     hidden = torch.full((len(rows), len(vocabulary.vocab)), -10.0)
     hidden[:, tokens] = 1
     with Dispatches() as dispatches:
@@ -152,11 +151,11 @@ def verifier_inputs(decoder, vocabulary, mixed=False):
         valid = indices <= 40 + documents % 9
         documents, indices = documents[valid], indices[valid]
     hidden = torch.full((len(documents), len(vocabulary.vocab)), -10.0)
-    hidden[:, vocabulary.tokenizer.encode_ids(" years")[0]] = 1
+    hidden[:, vocabulary.tokenizer(" years")[0]] = 1
     if mixed:
         rejects = ((documents % 4 == 0) & (indices == 20)
                    | (documents % 4 == 1) & (indices == 40))
-        hidden[rejects, vocabulary.tokenizer.encode_ids(" days")[0]] = 2
+        hidden[rejects, vocabulary.tokenizer(" days")[0]] = 2
         stops = (documents % 4 == 2) & (indices == 1 + documents % 43)
         hidden[stops, vocabulary.tokenizer.stop_ids[0]] = 2
     group = decoder.copy_groups[0]
@@ -164,11 +163,7 @@ def verifier_inputs(decoder, vocabulary, mixed=False):
     return group, projected[group.key], documents, indices
 
 
-@pytest.mark.parametrize("trace,num_fields,workspace_bytes", [
-    (False, 1, 64 * 2**20),
-    (True, 41, 128000),
-])
-def test_long_draft_choices_and_state_match_sequential_verification(
+def check_long_draft_choices_and_state_match_sequential_verification(
     monkeypatch, tmp_path, trace, num_fields, workspace_bytes
 ):
     if trace:
@@ -205,3 +200,17 @@ def test_long_draft_choices_and_state_match_sequential_verification(
     assert (group.widths >= group.alive.sum(dim=1).numpy()).all()
     assert (actual[:, 0] == -2).any()
     assert (actual[:, 0] >= 0).any()
+
+
+def test_long_draft_choices_and_state_match_sequential_verification(
+        monkeypatch, tmp_path):
+    for trace, num_fields, workspace_bytes in [
+        (False, 1, 64 * 2**20),
+        (True, 41, 128000),
+    ]:
+        named(
+            f"trace={trace} num_fields={num_fields} "
+            f"workspace_bytes={workspace_bytes}",
+            check_long_draft_choices_and_state_match_sequential_verification,
+            monkeypatch=monkeypatch, tmp_path=tmp_path, trace=trace,
+            num_fields=num_fields, workspace_bytes=workspace_bytes)

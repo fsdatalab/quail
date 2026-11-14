@@ -4,7 +4,8 @@ import pytest
 from helpers.fakes import cpu_staging
 from helpers.kv_checker import Run, Setup, answer, chain, passthrough
 
-from quail.backends.quail.executor.stages import Stage, run_stages
+from quail.backends.quail.executor.stage_executor import StageExecutor
+from quail.backends.quail.executor.stages import Stage
 
 DOCS = [[1, 2, 3, 4], [5, 6, 7], [8, 9, 10, 11, 12]]
 FIRST, SECOND = [70, 71], [72, 73, 74, 75]     # two questions' frames
@@ -48,9 +49,9 @@ def test_each_question_reads_its_frame_right_after_the_document(path, monkeypatc
     stages = (_question(FIRST, seen, 0, passthrough())
               + _question(SECOND, seen, 2, passthrough())
               + _question(SECOND, seen, 4, passthrough()))
-    out, _, tokens = run_stages(
+    out, _, tokens = StageExecutor(
         run.torch, run.arena, run.pipeline, stages, DOCS, setup.budget,
-        anchor_keys=[("d", d) for d in range(len(DOCS))], attention_mode=path)
+        anchor_keys=[("d", d) for d in range(len(DOCS))], attention_mode=path).run()
     # the checking model fails any row that reads KV no request wrote
     for d, rows in want.items():
         assert [out[j][d] for j in range(6)] == rows, f"document {d}"

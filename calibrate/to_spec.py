@@ -1,4 +1,8 @@
-"""Print GEMM MAMF fields from one device's validated calibration summaries."""
+"""Print GEMM MAMF fields from one device's validated calibration summaries.
+
+The fields print as TOML lines for the device's file in
+``quail/specs/data/devices``.
+"""
 
 from __future__ import annotations
 
@@ -43,7 +47,7 @@ def spec_text(summaries: list[dict]) -> str:
             if not math.isfinite(rate) or rate <= 0 or not mamf.get("mhz", 0) > 0:
                 raise ValueError("summary has a missing or invalid MAMF")
             rates[precision] = max(rates.get(precision, 0), rate * 1e12)
-    return "\n".join(f"mamf_{precision}_flops={rates[precision]:.6g},"
+    return "\n".join(f"mamf_{precision}_flops = {rates[precision]:.6g}"
                      for precision in DTYPES if precision in rates)
 
 

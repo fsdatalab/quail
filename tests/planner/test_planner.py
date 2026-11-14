@@ -1,45 +1,25 @@
 """Planner ordering, anchor selection, sharding, break-evens, and refusals."""
 
-import itertools
+import json
 from dataclasses import replace
 
+import _quail_native
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from helpers.planning import _optimize, _plan, node_kinds
+from helpers.planning import _plan, compile_sql, node_kinds, read_operators
 
 from quail.catalog import Catalog, DocumentProvider
-from quail.catalog.tokens import TokenLengths
-from quail.cost.filters import filter_cost
-from quail.cost.joins import PricedJoin
-from quail.cost.sol import speed_of_light
-from quail.cost.work import ask, scan, stream
-from quail.explain import explain
-from quail.frontend.sql import compile_sql
-from quail.logical import ModelCall, SemanticJoin
+from quail.explain import explain as explain_plan
+from quail.extensions import LogicalRule, PhysicalRule
 from quail.physical import (
     AiFilter,
     AiJoin,
     Barrier,
-    Project,
-    Scan,
 )
-from quail.physical.codec import encode_fields
-from quail.planner.operators.filter import prepare_filter_costs
-from quail.planner.plan import Refusal
-from quail.planner.rules import (
-    ShouldEliminateDistinct,
-    ShouldPushDownLimit,
-    ShouldRetainKv,
-)
-from quail.planner.search.filter_order import order_filters_indexed
-from quail.planner.statistics.tables import AliasStats, summarize_alias
-from quail.specs import H100_SXM, QWEN3_4B_FP8, QWEN3_32B_FP8
+from quail.physical.plan import Refusal
+from quail.specs import QWEN3_4B_FP8, QWEN3_32B_FP8
 
-
-def order_filters(predicates, rule, **kwargs):
-    costs = prepare_filter_costs(predicates, lower=lambda prompt: prompt, **kwargs)
-    return [predicates[i] for i in order_filters_indexed(costs, rule)]
 
 def filter_sequence(plan, alias=None):
     return next(n for n in plan.nodes if isinstance(n, AiFilter)
@@ -47,13 +27,8 @@ def filter_sequence(plan, alias=None):
 
 
 def join_stages(plan):
-    return [encode_fields(node, exclude=("node_id", "inputs"))
+    return [json.loads(node.to_json())["attributes"]
             for node in plan.nodes if isinstance(node, AiJoin)]
-
-
-def _sink_source(plan):
-    sink = next(node for node in plan.nodes if isinstance(node, Project))
-    return sink.inputs[0].source
 
 
 def _parquet(path, columns):
@@ -81,6 +56,11 @@ def _cell(text, title):
     raise AssertionError(f"no row starts with {title!r}")
 
 
+def explain(operators, plan, **options):
+    """Return the explain text of a region's operators and physical plan."""
+    return explain_plan("", operators, plan, **options)
+
+
 def _five_filter_plan(catalog, sels):
     filters = " AND ".join(
         f"AI_FILTER(PROMPT('flag {j} of: {{0}}', r.review)"
@@ -90,109 +70,54 @@ def _five_filter_plan(catalog, sels):
 
 
 def test_gpu_copies_and_memory_refusals(catalog):
-    from quail.planner.graph.shards import contiguous_shards
-
-    assert contiguous_shards([2, 2, 2], 2) == (((0, 1), (1, 3)), [2, 4])
-    assert contiguous_shards([1, 0, 9], 2) == (((0, 1), (1, 3)), [1, 9])
-    assert contiguous_shards([0, 2, 0, 4], 3) == (
-        ((0, 2), (2, 4), (4, 4)), [2, 4, 0])
-    assert contiguous_shards([], 2) == (((0, 0), (0, 0)), [0, 0])
-    logical = _five_filter_plan(catalog, (0.5,))
+    operators = _five_filter_plan(catalog, (0.5,))
     for model in (QWEN3_4B_FP8, QWEN3_32B_FP8):
         for gpus in (1, 2, 4, 8):
-            plan = _plan(logical, {"r": [100] * 8}, model=model, gpus=gpus)
+            plan = _plan(operators, {"r": [100] * 8}, model=model, gpus=gpus)
             assert plan.model == model.name
             assert plan.gpus == gpus
-            scan_node = next(node for node in plan.nodes if isinstance(node, Scan))
-            assert len(scan_node.shards) == gpus
 
     big = replace(QWEN3_4B_FP8, w_mem_bytes=150e9)
-    logical = _five_filter_plan(catalog, (0.9,))
+    operators = _five_filter_plan(catalog, (0.9,))
     for gpus in (1, 8):
-        result = _plan(logical, {"r": [100] * 10}, model=big, gpus=gpus)
+        result = _plan(operators, {"r": [100] * 10}, model=big, gpus=gpus)
         assert isinstance(result, Refusal)
         assert result.constraint == "weights_need_more_cards"
         assert result.needed > result.available
 
     # a document too long for one pass is skipped at execution, not refused
-    assert not isinstance(_plan(logical, {"r": [150_000]}), Refusal)
+    assert not isinstance(_plan(operators, {"r": [150_000]}), Refusal)
 
 
 def test_filter_ordering_and_kv_writes(catalog):
     # the B3 shape: a 0.2-selectivity filter written third among five
     sels = (0.9, 0.9, 0.2, 0.9, 0.9)
-    logical = _five_filter_plan(catalog, sels)
+    operators = _five_filter_plan(catalog, sels)
     tokens = {"r": [400] * 100}
 
-    by_cost = _plan(logical, tokens)
+    by_cost = _plan(operators, tokens)
     sequence = filter_sequence(by_cost)
     assert by_cost.settings["order_rule"] == "by_cost"
     assert sequence.selectivity == 0.2
     second = by_cost.graph.nodes_by_type(AiFilter.type_name)[1]
     assert second.expected_rows == pytest.approx(20.0)
-    # the physical planner chooses the order; the logical plan keeps
-    # the predicates as written
-    optimized, _ = _optimize(logical, tokens)
+    # the physical planner chooses the order; the operators keep the
+    # predicates as written
     assert sequence.written_position == 2
-    assert "predicate 3" in explain(optimized, by_cost)
+    assert "predicate 3" in explain(operators, by_cost)
 
-    as_written = _plan(logical, tokens, order="as_written")
+    as_written = _plan(operators, tokens, order="as_written")
     assert [node.selectivity
             for node in as_written.graph.nodes_by_type(AiFilter.type_name)] \
         == list(sels)
 
-    class Predicate:
-        def __init__(self, tail, selectivity):
-            self.prompt = type("Prompt", (), {
-                "tail_tokens": tail, "preamble_tokens": 0})()
-            self.expression = ModelCall(self.prompt)
-            self.selectivity = selectivity
-
-    first, second = Predicate(10, 0.5), Predicate(10, 0.5)
-    kwargs = dict(mean_tokens=400, model=QWEN3_4B_FP8,
-                  device=H100_SXM, chunk_tokens=110_376)
-    assert order_filters([first, second], "by_cost", **kwargs) == \
-        [first, second]
-    never_kills = Predicate(1, 1.0)
-    assert order_filters([never_kills, first], "by_cost", **kwargs) == \
-        [first, never_kills]
-
-    predicates = [Predicate(12, 0.8), Predicate(50, 0.1), Predicate(8, 1.0),
-                  Predicate(25, 0.0)]
-    ask_costs = [filter_cost(predicate.prompt.tail_tokens, first=False, **kwargs)
-                 for predicate in predicates]
-    scan_costs = [filter_cost(predicate.prompt.tail_tokens, first=True, **kwargs)
-                  for predicate in predicates]
-
-    candidates = []
-    for first in range(len(predicates)):
-        def score(index):
-            rejected = 1.0 - predicates[index].selectivity
-            return ask_costs[index] / rejected if rejected else float("inf")
-
-        remaining = sorted(
-            (index for index in range(len(predicates)) if index != first),
-            key=score)
-        order = [first, *remaining]
-        expected = 0.0
-        expected_rows = 1.0
-        for position, index in enumerate(order):
-            expected += expected_rows * (scan_costs[index] if position == 0
-                                else ask_costs[index])
-            expected_rows *= predicates[index].selectivity
-        candidates.append((expected, order))
-
-    expected_order = min(candidates)[1]
-    actual = order_filters(predicates, "by_cost", **kwargs)
-    assert actual == [predicates[index] for index in expected_order]
-
-    logical = compile_sql(
+    operators = compile_sql(
         "SELECT r.id FROM reviews r "
         f"WHERE AI_FILTER(PROMPT('{'long ' * 100}{{0}}', r.review), "
         "{'selectivity': 0.1}) "
         f"AND AI_FILTER(PROMPT('{'short ' * 10}{{0}}', r.review), "
         "{'selectivity': 0.5})", catalog)
-    plan = _plan(logical, {"r": [400] * 100})
+    plan = _plan(operators, {"r": [400] * 100})
     assert [node.written_position
             for node in plan.graph.nodes_by_type(AiFilter.type_name)] == [1, 0]
 
@@ -207,12 +132,12 @@ def test_filter_ordering_and_kv_writes(catalog):
     sequence = filter_sequence(plan)
     assert sequence.arena_writes is True
 
-    logical = compile_sql(
+    operators = compile_sql(
         "SELECT r.id FROM reviews r "
         "WHERE AI_FILTER(PROMPT('a: {0}', r.review)) "
         "AND AI_FILTER(PROMPT('b: {0}', r.review), {'selectivity': 0.5})",
         catalog)
-    plan = _plan(logical, {"r": [100] * 10})
+    plan = _plan(operators, {"r": [100] * 10})
     assert plan.settings["order_rule"] == "by_cost"
     assert "selectivity 0.2" in plan.settings["order_source"]
 
@@ -225,102 +150,40 @@ ROW_ESTIMATES = [
 
 def test_explain_row_estimates_limits_and_verbose_fields(catalog):
     for sels, expected in ROW_ESTIMATES:
-        logical = _five_filter_plan(catalog, sels)
-        plan = _plan(logical, {"r": [400] * 100})
-        text = explain(logical, plan)
+        operators = _five_filter_plan(catalog, sels)
+        plan = _plan(operators, {"r": [400] * 100})
+        text = explain(operators, plan)
         physical = text.split("physical:", 1)[1]
-        assert _cell(physical, "Project: r.id") == [expected], sels
         assert _cell(physical, "AiFilter: r")[0] == expected, sels
         assert _cell(physical, "AiFilter: r")[-1] in ("ms", "s"), sels
         assert _cell(physical, "Scan reviews as r") == ["100"], sels
         assert "tokens=40,000" in physical, sels
         assert "node_id=" not in text and "arena_writes" not in text, sels
         assert "KV=bf16, chunk budget=" in text and "KV rewind=on" in text, sels
+        prompts = json.loads(_quail_native.region_facts(operators))["prompts"]
         for stage in plan.graph.nodes_by_type(AiFilter.type_name):
-            predicate = logical.root.input.predicates[stage.written_position]
+            prompt = prompts["filters"]["r"][stage.written_position]
             assert (f"predicate {stage.written_position + 1}  "
-                    f"PROMPT({predicate.prompt.template!r})") in physical, sels
-        verbose = explain(logical, plan, verbose=True)
+                    f"PROMPT({prompt['template']!r})") in physical, sels
+        verbose = explain(operators, plan, verbose=True)
         assert "node_id=ai_filter:r" in verbose, sels
         assert "admission_tokens=" in verbose and "expected_rows=" in verbose, sels
 
-    logical = _five_filter_plan(catalog, (0.25,))
-    logical = replace(logical, root=replace(logical.result, limit=10))
-    plan = _plan(logical, {"r": [400] * 100})
-    physical = explain(logical, plan).split("physical:", 1)[1]
+    operators = _five_filter_plan(catalog, (0.25,))
+    operators = _quail_native.limited_operators(operators, 10)
+    plan = _plan(operators, {"r": [400] * 100})
+    physical = explain(operators, plan).split("physical:", 1)[1]
     assert _cell(physical, "Limit: 10") == ["10"]
-    assert _cell(physical, "Project: r.id") == ["25"]
     assert "KV: not stored" in physical
 
-    rules = (ShouldEliminateDistinct(), ShouldPushDownLimit(), ShouldRetainKv())
-    assert "rules" not in explain(logical, plan, rules=rules)
-    text = explain(logical, plan, verbose=True, rules=rules)
-    assert "  logical: should_eliminate_distinct" in text
+    rules = (LogicalRule("derive"),
+             PhysicalRule("should_push_down_limit"), PhysicalRule("should_retain_kv"))
+    assert "rules" not in explain(operators, plan, rules=rules)
+    text = explain(operators, plan, verbose=True, rules=rules)
+    assert "  logical: derive" in text
     assert "  physical: should_push_down_limit, should_retain_kv" in text
     assert ("refine each graph in order: should_push_down_limit, "
             "should_retain_kv") in text
-
-
-def mask_pairs(prefix, suffix, window):
-    """Count allowed keys for every new query position."""
-    return sum(1 for q in range(prefix, prefix + suffix) for k in range(q + 1)
-               if not window or q - k < window)
-
-
-def test_work_matches_attention_masks_and_component_costs():
-    from quail.cost.dense_decoder_cost import (
-        dense_decoder_components,
-        dense_params,
-    )
-    from quail.specs import DIFFUSION_GEMMA_26B_FP8
-
-    for window, prefix, suffix in ((0, 2, 4), (1, 9, 3), (4, 0, 3),
-                                  (4, 2, 4), (4, 4, 1), (4, 9, 3)):
-        first = scan(prefix, suffix, window=window)
-        continuation = ask(prefix, suffix, window=window)
-        assert first.pairs == mask_pairs(0, prefix + suffix, 0)
-        assert continuation.pairs == mask_pairs(prefix, suffix, 0)
-        assert first.sliding_pairs == (
-            mask_pairs(0, prefix + suffix, window) if window else 0)
-        assert continuation.sliding_pairs == (
-            mask_pairs(prefix, suffix, window) if window else 0)
-        assert continuation.sliding_kv_read == (
-            min(prefix, window - 1) if window else 0)
-        branches = stream(prefix, [suffix, suffix + 1], window=window)
-        assert branches.sliding_pairs == (
-            sum(mask_pairs(prefix, s, window) for s in (suffix, suffix + 1))
-            if window else 0)
-        assert branches.sliding_kv_read == continuation.sliding_kv_read
-
-    work = ask(400, 50) * 1000
-    result = speed_of_light(work, QWEN3_4B_FP8, H100_SXM, 110_376)
-    assert result.bound_by == "mixed"
-    assert [c.name for c in result.components] == [
-        "attn_proj", "mlp", "attention"]
-    assert result.seconds == pytest.approx(sum(
-        max(c.compute_seconds, c.memory_seconds)
-        for c in result.components))
-    assert result.component("mlp") is result.components[1]
-    assert result.seconds > max(result.compute, result.memory)
-    dense_bytes = sum(
-        c.bytes_moved for c in result.components if c.name != "attention")
-    assert dense_bytes == dense_params(QWEN3_4B_FP8) * result.passes
-    larger_resident_copy = replace(QWEN3_4B_FP8, w_mem_bytes=150e9)
-    assert speed_of_light(
-        work, larger_resident_copy, H100_SXM, 110_376).seconds \
-        == pytest.approx(result.seconds)
-
-    model = DIFFUSION_GEMMA_26B_FP8
-    work = ask(4096, 16, window=model.sliding_window)
-    attention = dense_decoder_components(work, model, 1)[2]
-    assert attention.flops == 4 * 16 * (
-        5 * 512 * work.pairs + 25 * 256 * work.sliding_pairs)
-    assert attention.bytes_moved == (
-        5 * 2 * 2 * 512 * 2 * (16 + 4096)
-        + 25 * 2 * 8 * 256 * 2 * (16 + 1023))
-    assert work + work == work * 2
-    assert not work.dominates(replace(work, sliding_pairs=work.sliding_pairs - 1))
-    assert not work.dominates(replace(work, sliding_kv_read=1022))
 
 
 def _join_sequence(catalog, sels=(0.1, 0.1), anchors=(None, None)):
@@ -339,13 +202,13 @@ def _join_sequence(catalog, sels=(0.1, 0.1), anchors=(None, None)):
 
 
 def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
-    logical = compile_sql("""
-        SELECT r.id FROM reviews r JOIN products p JOIN threads t
+    operators = compile_sql("""
+        SELECT r.id FROM reviews r CROSS JOIN products p JOIN threads t
         ON AI_FILTER(PROMPT('m {0} {1} {2}', r.review, p.description, t.thread),
                      {'selectivity': 0.02})
     """, catalog)
     tokens = {"r": [3000] * 20, "p": [100] * 30, "t": [50] * 40}
-    plan = _plan(logical, tokens)
+    plan = _plan(operators, tokens)
     stage = join_stages(plan)[0]
     assert stage["expected_rows"] == 20 * 30 * 40
     assert stage["anchor"] == "r"
@@ -359,12 +222,11 @@ def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
     assert [s["anchor"] for s in stages] == ["r", "p"]
     assert [s["written_position"] for s in stages] == [0, 1]
     # the physical planner chooses the stage order and anchors; the
-    # logical plan keeps the joins as written
-    optimized, _ = _optimize(_join_sequence(catalog), tokens, order="as_written")
-    joins = [node for node in optimized.walk() if isinstance(node, SemanticJoin)]
-    assert [join.anchor for join in joins] == [None, None]
+    # operators keep the joins as written
+    written = _join_sequence(catalog)
+    assert [join.anchor for join in read_operators(written).joins] == [None, None]
     assert [(s["exec_index"], s["anchor"]) for s in stages] == [(0, "r"), (1, "p")]
-    text = explain(optimized, plan)
+    text = explain(written, plan)
     assert "AiJoin: anchor=r" in text and "AiJoin: anchor=p" in text
     assert stages[0]["partners"] == stages[1]["partners"] == ["t"]
     assert stages[0]["expected_rows"] == 10 * 8
@@ -397,7 +259,7 @@ def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
     assert join_stages(same)[0]["anchor"] == "r"
 
     # by_cost runs the cheap .01 exists gate before the .9 full join
-    logical = compile_sql("""
+    operators = compile_sql("""
         SELECT r.id FROM reviews r
         JOIN products p ON AI_FILTER(PROMPT('m {0} {1}', r.review, p.description),
                                      {'selectivity': 0.9})
@@ -406,138 +268,17 @@ def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
                                       {'selectivity': 0.01}))
     """, catalog)
     tokens = {"r": [400] * 100, "p": [100] * 100, "t": [100] * 100}
-    plan = _plan(logical, tokens)
+    plan = _plan(operators, tokens)
     assert [(s["written_position"], s["exec_index"], s["anchor"])
             for s in join_stages(plan)] == [(1, 0, "r"), (0, 1, "r")]
 
-    as_written = _plan(logical, tokens, order="as_written")
+    as_written = _plan(operators, tokens, order="as_written")
     assert join_stages(as_written)[0]["selectivity"] == 0.9
 
-    assert _sink_source(plan).node_id == "recombine"
+    assert not [node for node in plan.nodes if node.type_name == "quail.recombine"]
     groups = plan.graph.nodes_by_type(AiJoin.type_name)
     assert len(groups) == 2
     assert [group.anchor for group in groups] == ["r", "r"]
     assert groups[0].keep_kv is True
     assert groups[1].keep_kv is False
     assert groups[1].anchor_resident == "kept"
-
-
-
-
-def _join_search_spec(position, aliases, anchor):
-    return PricedJoin(
-        written_position=position, aliases=tuple(aliases), anchor=anchor,
-        anchor_free=False, semantics="full", selectivity=None,
-        frame_tokens={alias: 5 for alias in aliases},
-        label_tokens={alias: 4 for alias in aliases}, tail_tokens=6)
-
-
-
-
-def test_join_search_matches_enumeration_and_tracks_residency():
-    from quail.planner.search.join_order import (
-        anchor_fits,
-        search_joins,
-        walk,
-    )
-
-    specs = [PricedJoin(written_position=index, aliases=aliases, anchor=aliases[0],
-                        anchor_free=True, semantics="full",
-                        selectivity=selectivity,
-                        frame_tokens={alias: 8 for alias in aliases},
-                        label_tokens={alias: 4 for alias in aliases},
-                        tail_tokens=2)
-             for index, (aliases, selectivity) in enumerate([
-                 (("a", "b"), 0.01), (("b", "c"), 0.1),
-             ])]
-    lengths = {alias: summarize_alias(TokenLengths(tokens)) for alias, tokens in [
-        ("a", [800] * 20), ("b", [100] * 30), ("c", [400] * 10),
-    ]}
-    filtered = {"a", "c"}
-    expected_rows = {"a": 10.0, "b": 6.0, "c": 8.0}
-    result = search_joins(specs, expected_rows, lengths, filtered, 5, 8192,
-                          QWEN3_4B_FP8, H100_SXM)
-    costs = []
-    for order in itertools.permutations(specs):
-        for anchors in itertools.product(*(spec.aliases for spec in order)):
-            work, records = walk(list(zip(order, anchors)), expected_rows, lengths,
-                                 filtered, 5, QWEN3_4B_FP8, H100_SXM)
-            seen = set()
-            for record in records:
-                if record.anchor in seen:
-                    assert record.resident != "filter"
-                seen.add(record.anchor)
-            costs.append(speed_of_light(work, QWEN3_4B_FP8, H100_SXM, 8192).seconds)
-    assert speed_of_light(
-        result.work, QWEN3_4B_FP8, H100_SXM, 8192).seconds == min(costs)
-
-    specs = [
-        _join_search_spec(0, ("a", "b"), "a"),
-        _join_search_spec(1, ("b", "c"), "b"),
-        _join_search_spec(2, ("a", "c"), "a"),
-    ]
-    expected_rows = {"a": 3.0, "b": 3.0, "c": 2.0}
-    lengths = {"a": TokenLengths([90, 100, 110]), "b": TokenLengths([400] * 3),
-               "c": TokenLengths([50] * 2)}
-    assert anchor_fits(specs[0], "a", lengths, 10, 100_000)
-    assert not anchor_fits(specs[0], "a", lengths, 10, 500)
-    current = search_joins(
-        specs, expected_rows, lengths, {"a"}, 10, 100_000,
-        QWEN3_4B_FP8, H100_SXM, fixed_order=True)
-    # a's filter computed its prefixes: its first anchor use pays no
-    # prefix, and neither does its later use (kept after group 0)
-    assert current.steps[0].resident == "filter"
-    assert current.steps[0].resident_documents == 3
-    assert current.steps[1].resident == "none"
-    assert current.steps[2].resident == "kept"
-    assert current.steps[2].resident_documents == 3
-
-    specs = [
-        _join_search_spec(0, ("a", "b"), "b"),
-        _join_search_spec(2, ("c", "d"), "c"),
-    ]
-    expected_rows = {alias: 2.0 for alias in "abcd"}
-    lengths = {alias: TokenLengths([100, 120]) for alias in "abcd"}
-
-    assert search_joins(specs, expected_rows, lengths, {}, 10, 100_000,
-                        QWEN3_4B_FP8, H100_SXM) is None
-    found = search_joins(specs, expected_rows, lengths, {}, 10, 100_000,
-                         QWEN3_4B_FP8, H100_SXM, already_joined={"b", "c"})
-    assert found is not None
-    assert {position for position, _ in found.seq} == {0, 2}
-
-    million = AliasStats(count=1_000_000, total=100_000_000,
-                         squared=10_000_000_000, maximum=100)
-    stats = {alias: million for alias in "abcd"}
-    expected_rows = {alias: 1_000_000.0 for alias in "abcd"}
-    specs = [
-        _join_search_spec(0, ("a", "b"), "a"),
-        _join_search_spec(1, ("b", "c"), "b"),
-        _join_search_spec(2, ("c", "d"), "c"),
-    ]
-    found = search_joins(specs, expected_rows, stats, {}, 10, 100_000,
-                         QWEN3_4B_FP8, H100_SXM)
-    assert found is not None
-    assert len(found.seq) == 3
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

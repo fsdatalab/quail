@@ -1,29 +1,25 @@
 """End-to-end Session tests with a fake executor."""
 
 import re
-import sys
-from types import SimpleNamespace
 
-import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from helpers.sessions import CONFIG, TRUTH, _run, fake_tok, make_executor
+from helpers.sessions import CONFIG, TOKENIZER, TRUTH, _run, make_executor
 
 import quail
 from quail.api import execute as execution
+from quail.api.config import EngineConfig
 from quail.execution.result import (
     QueryResult,
     build_result_declaration,
-    count_rows,
     document_index_table,
 )
-from quail.planner.plan import EngineConfig
 
 
 @pytest.fixture()
 def sess(tmp_path):
-    s = quail.Session(CONFIG, tokenizer=fake_tok)
+    s = quail.Session(CONFIG, tokenizer=TOKENIZER)
     pq.write_table(pa.table({
         "id": [f"r{i}" for i in range(6)],
         "review": [f"review {i} " + "pad " * 20 for i in range(6)],
@@ -34,7 +30,10 @@ def sess(tmp_path):
     s.close()
 
 
-def test_session_requires_model_and_device_and_loads_gigatoken(monkeypatch):
+def test_session_requires_model_and_device_and_loads_the_models_tokenizer(
+        monkeypatch):
+    from helpers.sessions import TOKENIZER
+
     with pytest.raises(TypeError, match="'model' and 'device'"):
         EngineConfig()
     with pytest.raises(TypeError, match="'device'"):
@@ -45,30 +44,17 @@ def test_session_requires_model_and_device_and_loads_gigatoken(monkeypatch):
 
     sources = []
 
-    class Tokenizer:
-        def __init__(self, source):
-            sources.append(source)
+    def resolve(name, revision, **kwargs):
+        sources.append(f"{name}@{revision}")
+        return TOKENIZER
 
-        def encode(self, text):
-            assert text in ("", "hello")
-            return np.array([1, 2], dtype=np.uint32)[:len(text)]
-
-        def decode(self, ids):
-            return b"hello"[:len(ids)]
-
-    monkeypatch.setitem(sys.modules, "gigatoken", SimpleNamespace(Tokenizer=Tokenizer))
-    monkeypatch.setattr("quail.api.session.resolve_model_path",
-                        lambda name, revision, **kwargs: f"{name}@{revision}")
+    monkeypatch.setattr("quail.api.session.resolve_model_path", resolve)
     with quail.Session(CONFIG) as session:
-        token_ids = session.tokenizer("hello")
-        piece = session.tokenizer.decode([1])
-        # the session loads one encoder for the caller and warms one on
-        # the tokenization thread; the thread keeps its own instance
-        session.inputs.warm_tokenizer().result()
-    assert sources == ["Qwen/Qwen3-4B-FP8@" + session.model.revision] * 2
-    assert token_ids == [1, 2]
-    assert all(type(token_id) is int for token_id in token_ids)
-    assert piece == b"h"
+        token_ids = session.tokenizer("hello world")
+        text = session.tokenizer.decode(token_ids)
+    assert sources == ["Qwen/Qwen3-4B-FP8@" + session.model.revision]
+    assert token_ids and all(type(token_id) is int for token_id in token_ids)
+    assert text == b"hello world"
 
 
 FILTER_SQL = """
@@ -91,8 +77,7 @@ def test_explain_analyze_shows_measured_rows_beside_estimates(
     # Query.run binds execute_query at import, so patch it there
     monkeypatch.setattr(
         "quail.api.query.execute_query",
-        lambda q, physical_executor=executor, plan=None: original(
-            q, physical_executor=physical_executor, plan=plan))
+        lambda q, physical_executor=None: original(q, physical_executor=executor))
     planned = query.explain()
     text = query.explain(analyze=True)
 
@@ -102,18 +87,20 @@ def test_explain_analyze_shows_measured_rows_beside_estimates(
     assert header.split() == ["est.", "rows", "rows", "est.", "pass", "pass",
                               "est.", "time", "time", "fresh", "tokens"]
     assert re.search(
-        r"AiFilter: r\s+3\s+4\s+[\d.]+ ms\s+(?:<1|[\d.]+) ms\s+60$",
+        r"AiFilter: r\s+3\s+4\s+[\d.]+ ms\s+(?:<1|[\d.]+) ms\s+[\d,]+$",
         text, re.M)
-    # Both predicates have equal estimated cost and pass four of six rows.
+    # Both predicates have equal estimated cost. The limit ends the run
+    # before the first reads its sixth row; four of its five pass. The
+    # second reads three of them in the pass that reaches the limit, and
+    # two pass.
     first = re.search(r"(?:1st: )?predicate ([12])  PROMPT\('DOCUMENT:\\n"
-                      r"\{0\}\\n\\nq\1:'\)\s+6\s+6\s+50%\s+66\.7%$",
+                      r"\{0\}\\n\\nq\1:'\)\s+6\s+5\s+50%\s+80%$",
                       text, re.M)
     second = re.search(r"(?:2nd: )?predicate ([12])  PROMPT\('DOCUMENT:\\n"
-                       r"\{0\}\\n\\nq\1:'\)\s+3\s+4\s+50%\s+50%$",
+                       r"\{0\}\\n\\nq\1:'\)\s+3\s+3\s+50%\s+66\.7%$",
                        text, re.M)
     assert first and second and first[1] != second[1]
-    assert re.search(r"Scan reviews as r\s+6\s+6\s+<1 ms$", text, re.M)
-    assert re.search(r"Project: r\.id\s+1\.5\s+2\s+<1 ms$", text, re.M)
+    assert re.search(r"Scan reviews as r\s+6\s+6\s+\S+ ms$", text, re.M)
     assert re.search(r"Limit: 1\s+1\s+1\s+<1 ms$", text, re.M)
     assert "run:" in text
     assert "query time   1 s (model startup excluded)" in text
@@ -126,7 +113,7 @@ def test_explain_analyze_shows_measured_rows_beside_estimates(
     result = _run(sess.sql(FILTER_SQL + " LIMIT 1"), make_executor(TRUTH))
     explained = result.explain()
     assert re.search(r"Limit: 1\s+1\s+1\s+<1 ms$", explained, re.M)
-    assert re.search(rf"(?:1st: )?predicate {first[1]}\s+6\s+6\s+50%\s+66\.7%$",
+    assert re.search(rf"(?:1st: )?predicate {first[1]}\s+6\s+5\s+50%\s+80%$",
                      explained, re.M)
     stages = [s for s in result.report["stages"] if s["op"] == "filter"]
     assert [s["written_position"] for s in stages] == [int(first[1]) - 1,
@@ -157,7 +144,7 @@ def test_query_rows_observers_saved_reports_and_streamed_results(sess):
 
     registry = quail.ExtensionRegistry.with_built_ins().register_observer(
         NodeTypes)
-    session = quail.Session(CONFIG, tokenizer=fake_tok, registry=registry)
+    session = quail.Session(CONFIG, tokenizer=TOKENIZER, registry=registry)
     session.register("reviews", quail.DocumentProvider.from_table(
         pa.table({"id": ["r0", "r1"], "review": ["first", "second"]}), id_col="id"))
     result = _run(session.sql(
@@ -165,7 +152,7 @@ def test_query_rows_observers_saved_reports_and_streamed_results(sess):
         "AI_FILTER(PROMPT('q: {0}', r.review)) LIMIT 1"
     ), make_executor({"r": {"q:": [1, 0]}}))
     assert result.observer(NodeTypes)["types"] == [
-        "quail.scan", "quail.ai_filter", "quail.project", "quail.limit"]
+        "quail.scan", "quail.ai_filter"]
     assert result.observer(NodeTypes) is result.observer("test.node_types")
     with pytest.raises(KeyError):
         result.observer("example.missing")
@@ -173,7 +160,7 @@ def test_query_rows_observers_saved_reports_and_streamed_results(sess):
     # saved reports can be loaded separately from their result tables
     restored = QueryResult.from_table(result.collect(), report=dict(result.report))
     assert restored.plan is None
-    restored.attach_executed_plan(registry.codecs)
+    restored.attach_executed_plan()
     assert [node.node_id for node in restored.plan.topological_nodes()] == [
         node.node_id for node in result.plan.topological_nodes()]
     assert restored.node_metrics == result.node_metrics
@@ -185,8 +172,8 @@ def test_query_rows_observers_saved_reports_and_streamed_results(sess):
         node_id: {**metrics, "borrowed_prefix_tokens": 3}
         for node_id, metrics in report["node_metrics"].items()}
     counted = QueryResult.from_table(result.collect(), report=report)
-    counted.attach_executed_plan(registry.codecs)
-    assert all(metrics.extension == {"borrowed_prefix_tokens": 3}
+    counted.attach_executed_plan()
+    assert all(metrics.extension["borrowed_prefix_tokens"] == 3
                for metrics in counted.node_metrics.values())
     assert {node_id: metrics.wall_s
             for node_id, metrics in counted.node_metrics.items()} == {
@@ -202,19 +189,12 @@ def test_query_rows_observers_saved_reports_and_streamed_results(sess):
     survivors = {alias: pa.array(rows, type=pa.int32()) for alias, rows in
                  {"r1": [0, 1], "r2": [0, 1], "a1": [0], "a2": [0, 1]}.items()}
     declaration, _ = build_result_declaration(true_join_tables, survivors, "r1")
-    assert count_rows(declaration) == 6
+    assert declaration.to_table().num_rows == 6
 
     relation = document_index_table({"r": list(range(5))}, "filter_survivors")
     assert relation.schema.metadata[b"quail.kind"] == b"filter_survivors"
-    survivors = {"r": pa.array(range(5), type=pa.int32())}
-    declaration, index_schema = build_result_declaration([], survivors, "r")
-    schema = pa.schema([pa.field("r.id", pa.string(), nullable=False)],
-                       metadata={b"quail.kind": b"query_result"})
-    result = QueryResult(
-        columns=["r.id"], declaration=declaration,
-        document_index_schema=index_schema, output_schema=schema,
-        projection=[("r", pa.array([f"r{i}" for i in range(5)]))],
-        report={}, survivor_indices=survivors, true_join_tables={})
+    result = QueryResult.from_table(
+        pa.table({"r.id": [f"r{i}" for i in range(5)]}))
 
     reader = result.execute_stream(batch_rows=2)
     batches = list(reader)
@@ -227,10 +207,10 @@ def test_query_rows_observers_saved_reports_and_streamed_results(sess):
     assert not hasattr(result, "rows")
 
 
-def test_order_by_offset_and_distinct_run_on_the_result():
+def test_order_by_offset_and_distinct_run_in_datafusion_on_the_regions_rows():
     registry = quail.ExtensionRegistry.with_built_ins().register_observer(
         NodeTypes)
-    session = quail.Session(CONFIG, tokenizer=fake_tok, registry=registry)
+    session = quail.Session(CONFIG, tokenizer=TOKENIZER, registry=registry)
     session.register("reviews", quail.DocumentProvider.from_table(
         pa.table({"id": [f"r{i}" for i in range(6)],
                   "review": [f"review {i} " + "pad " * 20 for i in range(6)],
@@ -242,9 +222,8 @@ def test_order_by_offset_and_distinct_run_on_the_result():
     assert result.to_rows() == [("r3",)]
     assert result.count() == 1
     assert result.observer(NodeTypes)["types"] == [
-        "quail.scan", "quail.ai_filter", "quail.ai_filter",
-        "quail.project", "quail.sort"]
-    assert "Sort: r.stars DESC NULLS FIRST" in result.explain()
+        "quail.scan", "quail.ai_filter", "quail.ai_filter"]
+    assert "SortExec: TopK(fetch=1), expr=[stars@1 DESC]" in result.explain()
 
     result = _run(session.sql(
         "SELECT r.id, r.stars FROM reviews r WHERE AI_FILTER(PROMPT("

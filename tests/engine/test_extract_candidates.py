@@ -1,8 +1,8 @@
 """The extraction's candidates: word keys, first tokens, and streams."""
 
 import numpy as np
-import pytest
 from helpers.extract_fakes import RANKED, make_vocabulary, squeezed
+from test_kv_reads import named
 
 from quail.backends.quail.executor.extract.candidates import (
     DocumentTokens,
@@ -17,11 +17,11 @@ from quail.backends.quail.executor.extract.candidates import (
 def test_first_tokens_follow_the_models_spelling():
     tables = make_vocabulary()
     text = RANKED
-    ids, offsets = tables.tokenizer.encode(text)
+    ids, offsets = tables.encode_batch([text])[0]
     scan = DocumentTokens.from_tokens(tables, ids, offsets, 1)
-    the = tables.tokenizer.encode_ids("The")[0]
-    march = tables.tokenizer.encode_ids("March")[0]
-    space_march = tables.tokenizer.encode_ids(" March")[0]
+    the = tables.tokenizer("The")[0]
+    march = tables.tokenizer("March")[0]
+    space_march = tables.tokenizer(" March")[0]
     lp = {the: -0.5, march: -1.0, space_march: -3.0}
     starts = first_tokens(tables, _scores(tables, lp), scan)
     by_char = {scan.starts[i - 1]: value for i, value in starts.items(tables)}
@@ -38,7 +38,7 @@ def test_first_tokens_follow_the_models_spelling():
     # a stream holds its first token until the writing reaches it
     assert streams[1].stream == [the]
     streams[1].extend(tables)
-    assert streams[1].stream[:3] == tables.tokenizer.encode_ids("The rent is")
+    assert streams[1].stream[:3] == tables.tokenizer("The rent is")
     # a start's offset includes its token's leading space
     assert text[streams[1].char:streams[1].ends[2]] == " The rent is"
     (march_stream,) = make_streams(tables, text, starts, march)
@@ -47,36 +47,31 @@ def test_first_tokens_follow_the_models_spelling():
     assert text[march_stream.char:march_stream.ends[3]] == " March 3."
 
 
-@pytest.mark.parametrize("first_window,window", [(9, 19)])
-def test_stream_batches_preserve_tokens_and_offsets_across_windows(
-        monkeypatch, first_window, window):
+def test_windows_preserve_tokens_offsets_unicode_and_whitespace_runs(monkeypatch):
+    first_window, window = 9, 19
     texts = [" ".join(["word"] * 300), "word   \n word  ", "word"]
     tables = make_vocabulary(*texts)
     streams = []
     expected = []
-    word = tables.tokenizer.encode_ids("word")[0]
+    word = tables.tokenizer("word")[0]
     for text in texts:
-        ids, offsets = tables.tokenizer.encode(text)
+        ids, offsets = tables.encode_batch([text])[0]
         scan = DocumentTokens.from_tokens(tables, ids, offsets)
         starts = first_tokens(tables, _scores(tables, {word: -0.5}), scan)
         streams.append(make_streams(tables, text, starts, word,
                                     first_window_chars=first_window,
                                     window_chars=window)[0])
         rest, ends = squeezed(text)
-        ids, offsets = tables.tokenizer.encode(rest)
-        expected.append((ids, [ends[b - 1] for _, b in offsets]))
+        ids, offsets = tables.encode_batch([rest])[0]
+        expected.append(([int(t) for t in ids], [int(ends[b - 1]) for _, b in offsets]))
     batches = []
-    encode_batch = tables.tokenizer.encode_batch
+    encode_batch = tables.encode_batch
 
     def recorded(texts):
         batches.append(tuple(texts))
         return encode_batch(texts)
 
-    def scalar(text):
-        raise AssertionError("stream windows must be tokenized together")
-
-    monkeypatch.setattr(tables.tokenizer, "encode_batch", recorded)
-    monkeypatch.setattr(tables.tokenizer, "encode", scalar)
+    monkeypatch.setattr(tables, "encode_batch", recorded)
     ensure_tokens(streams, 80, tables)
     assert len(batches[0]) == 2
     largest_window = max(len(text) for batch in batches for text in batch)
@@ -84,11 +79,18 @@ def test_stream_batches_preserve_tokens_and_offsets_across_windows(
     assert not streams[0].exhausted
     assert streams[1].exhausted and streams[2].exhausted
     ensure_tokens(streams, 10_000, tables)
-    assert [(stream.stream, stream.ends) for stream in streams] == expected
+    assert [([int(t) for t in stream.stream], [int(e) for e in stream.ends])
+            for stream in streams] == expected
     assert all(stream.exhausted for stream in streams)
     before = list(batches)
     ensure_tokens(streams, 10_000, tables)
     assert batches == before
+
+    for size in [1, 2, 8, 16]:
+        named(
+            f"packed windows of size {size}",
+            check_packed_windows_preserve_unicode_and_partial_whitespace_runs,
+            size=size)
 
 
 def _scores(vocabulary, pairs):
@@ -96,8 +98,7 @@ def _scores(vocabulary, pairs):
     for token, score in pairs.items():
         values[token] = score
     return values
-@pytest.mark.parametrize("size", [1, 2, 8, 16])
-def test_packed_windows_preserve_unicode_and_partial_whitespace_runs(size):
+def check_packed_windows_preserve_unicode_and_partial_whitespace_runs(size):
     texts = ["", "  café\n\n\n東京 🙂 word\t end  ", "a b", "\n\t "]
     packed = TextWindows(texts)
     documents = np.repeat(np.arange(len(texts)), [len(text) + 1 for text in texts])
@@ -110,5 +111,3 @@ def test_packed_windows_preserve_unicode_and_partial_whitespace_runs(size):
         actual = np.minimum(packed.ends[left[row]:left[row] + len(text)]
                             - packed.offsets[document], cuts[row])
         np.testing.assert_array_equal(actual, ends)
-
-

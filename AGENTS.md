@@ -1,22 +1,17 @@
 # Writing
 
-Write like two engineers talking at a whiteboard.
-
-- Lead with the answer, then the reasoning. Short sentences, one idea
-  each.
-- Use bullet points for anything longer than a few sentences.
-- Use everyday words. Define an unavoidable technical term once, in
-  one sentence, then use it the same way every time.
-- No analogies, metaphors, or dramatic shorthand. Say "the run is on
-  Modal", not "the flight is in the air"; say "saved", "finished",
-  "running", not "banked", "landed", "armed", "healthy".
-- Give an example with "For example," and all of its context: "For
-  example, imagine a table where each row is an agent trace…".
-- Give numbers, and say what each is compared with: "52.3 s, compared
-  with 47 s for the unavoidable work alone".
-- Do not start a sentence with a number.
-- When something failed or is uncertain, say so, and say what would
-  settle it.
+- Have a model of the user or person who asked the question. Start with
+  what they want to know or do, and build on what they already know.
+- Put the main subject and verb of every sentence at the beginning of
+  the sentence. Use tenses consistent with your model of the person who
+  asked the question.
+- Don't use demonstrative pronouns (this, these, that, those).
+- Make each sentence lead into the next sentence.
+- Use only words and phrases found in the dictionary or common
+  technical terms (simplified technical English). Define new or
+  ambiguous terms inline when you first introduce them.
+- Be as concise as possible.
+- Use as much of the person's original wording as possible.
 - Call the KV cache "KV".
 - Say "run" or "configuration" for the runs of an experiment, never
   "arm".
@@ -49,26 +44,128 @@ CI runs these on every pull request. Run them before pushing:
   docstrings (`[tool.ruff]` in `pyproject.toml`).
 - `lint-imports` checks that each package imports only packages
   below it, in the order `[tool.importlinter]` in `pyproject.toml`
-  lists: `api` on top of `execution`, `planner`, `physical`,
-  `logical`, and so on down to `specs`. Put shared code in the lower
-  package rather than importing upward.
+  lists: `server` on top of `api`, `backends`, `execution`,
+  `physical`, and so on down to `specs`. Put shared code in the lower
+  package rather than importing upward. The planner is Rust
+  (`crates/quail-planner`), so this check does not cover it.
 - `tools/check_long_strings.py` flags string literals over 200
   characters. Long content is allowed when its name identifies content
   (a name containing PROMPT, TEMPLATE, SQL, QUERY, HTML, or TEXT), kept in a
-  prompts module or folder, or plainly HTML or SQL. Docstrings are
-  exempt. Shorten long messages and log lines.
+  prompts module or folder, or plainly HTML or SQL. Docstrings and
+  expected transcripts are exempt. Shorten long messages and log lines.
 - `tools/check_names.py` reports two names for one concept or one
   name for two: duplicate function bodies, a parameter passed on
   under another keyword, identifiers that differ by a synonym, and a
   variable whose name describes a type it does not hold. `--inventory`
   lists what the code defines, for finding such names by hand.
 
+## Building
+
+Use one Rust toolchain, Cargo home, and dependency feature set. A fresh
+sandbox that compiles the Rust module, without matching build
+artifacts, needs one cold dependency build (about 20 minutes on 4
+cores). A matching cache can avoid it.
+Quail source edits still require compiling and linking Quail itself.
+
+- A developer who edits no Rust needs only uv. `tools/build.sh` looks
+  for a prebuilt wheel for the checkout's Rust sources
+  (`tools/native_key.py` prints their key) and installs its
+  `_quail_native` with no compiler. CI uploads one
+  for each change of the Rust sources on `main`
+  (`.github/workflows/publish.yml`); run that workflow on a branch to
+  upload one for the branch. The Modal image downloads the same wheel.
+  After a prebuilt install, run tools with `uv run --no-sync`: a plain
+  `uv run` compiles the module.
+- `tools/build.sh --compile` builds the module from source, as does
+  `tools/build.sh` when no prebuilt module matches. The rest of this
+  section is about that build.
+- Install rustup and uv first; Linux x86_64 also needs clang and lld.
+  Run `tools/build.sh --compile` from any shell. It prefers
+  `${CARGO_HOME:-$HOME/.cargo}/bin`, uses `rust-toolchain.toml`, prints
+  the selected compiler and paths, and runs `uv sync --frozen`.
+  Rustup downloads the pinned compiler if needed. The script does not
+  change global tool links or Cargo configuration.
+- Keep that Cargo home and `target/` between commands. Maturin must not
+  install another Rust/Cargo home: `MATURIN_NO_INSTALL_RUST` makes a
+  missing compiler fail early. Do not delete caches to fix rebuilds.
+- `uv sync` builds the editable extension with the dev profile. Cargo's
+  test profile inherits dev; `cargo test --profile dev` is unnecessary.
+  Use `cargo test --locked`,
+  `cargo clippy --all-targets --locked`, and
+  `cargo fmt --check` for Rust checks. Building a narrow `-p` selection
+  can change Arrow's features (notably `ffi`) and rebuild DataFusion.
+  The Python module depends on every other library crate, so
+  `uv sync` and `cargo build` compile one set of dependencies.
+  Check/clippy also need metadata-only artifacts distinct from a full
+  build. Embedded-Python tests and the extension may rebuild PyO3 and
+  Quail for their different linking requirements.
+- Test programs and examples link DataFusion, Arrow, and Quail from one
+  shared library, the crate `quail-dylib`, so each is a few megabytes.
+  A new test program or example names it with `use quail_dylib as _;`
+  and its package lists it under `[dev-dependencies]`. The Python
+  module does not use it: it holds its own copy and ships as one file.
+- The `quail-server` program a user installs is a Python script that
+  calls `_quail_native.serve`, so the wheel holds DataFusion once. The
+  `quail-server` crate also builds a standalone program.
+- Do not pass `--workspace` to cargo. Cargo then links the Rust
+  standard library into `quail-dylib`, and every test program fails to
+  link with "cannot satisfy dependencies so `std` only shows up once".
+  To recover, run `touch crates/quail-dylib/src/lib.rs` and build
+  again without `--workspace`.
+- Cargo keeps the files of old builds in `target/`; `cargo sweep`
+  (cargo-sweep) deletes them.
+- After a successful native build, run `.venv/bin/python -m pytest`
+  or `uv run --no-sync pytest` to test without an implicit build.
+  Rebuild after Rust edits. `uv run --frozen pytest` synchronizes first
+  and may rebuild the extension when its tracked source/config changes.
+- If DataFusion unexpectedly recompiles, stop changing build settings
+  and inspect the existing logs/fingerprints first. Compare compiler,
+  Cargo home, features, rustflags, and target directory. Capture
+  `CARGO_LOG=cargo::core::compiler::fingerprint=info` on the next
+  necessary build if the cause remains unclear. Do not launch extra
+  full builds merely to test caching. sccache is optional, not a
+  substitute for keeping these inputs stable.
+
 ## Tests
 
 - An end-to-end test answers the model from `tests/helpers/oracle.py`:
   `Oracle` holds the planted truth, `oracle_executor` runs a request's
-  graph on it, and `finish` runs a query to its result. Do not add
+  graph on it, and `finish` runs a query to its result. The real
+  executor runs the graph; `tests/helpers/planted_model.py` is the
+  forward pass, which answers each prompt from the truth. Do not add
   another fake of the executor or the model.
+- A test of a query is a transcript test. The test runs the query and
+  compares a transcript, the text of what Quail did, with the expected
+  transcript written in the test:
+
+      def test_an_or_asks_only_where_the_column_is_not_true():
+          assert_transcript(_transcript(
+              f"SELECT r.id FROM reviews r WHERE r.long OR {KIND}"), """\
+      --- SELECT r.id FROM reviews r WHERE r.long OR AI_FILTER(...) ---
+      plan
+        __quail_answer_1 = ai_filter('kind: {0}', r.body), guard: r.long IS NOT TRUE
+      asked 3 of 6
+        'kind: {0}': r1 FALSE, r2 TRUE, r4 TRUE
+      rows 5
+        r0
+        ...
+      """)
+
+  - A transcript shows the plan's AI operators, each question the model
+    answered, and the rows returned. "asked 3 of 6" compares Quail with
+    the same query run with every pushdown off; the two runs must
+    return the same rows.
+  - Write a new test with `""` as the expected transcript. Run
+    `QUAIL_UPDATE_TRANSCRIPTS=1 uv run --no-sync pytest <file>` to write
+    the transcript into the test, then read the diff before you commit.
+  - `tests/helpers/transcript.py` builds the transcript;
+    `tests/planner/test_guards.py` is a worked example.
+  - Andrew Lamb describes the method in
+    [Transcript Testing](https://andrew.nerdnetworks.org/blog/2026/11/13/transcript-testing/);
+    [DataFusion's transcript tests](https://github.com/apache/datafusion/pull/26897)
+    are his example.
+  - Assert directly, without a transcript, on what a transcript does
+    not show: explain text, costs, error messages, and reports.
 - A bug fix gets one small regression case, in the test file that
   already covers that path. Name a test as a sentence stating the
   behavior, such as `test_a_failed_boot_releases_the_gpu`.
@@ -78,7 +175,9 @@ CI runs these on every pull request. Run them before pushing:
 # Names
 
 - The project is Quail (QUery-Aware Inference Layer); the package is
-  `quail`.
+  `quail`. On PyPI and crates.io the name is `quail-engine`; the Rust
+  library is `quail`, and it re-exports `quail-datafusion` as
+  `quail::extension` and `quail-planner` as `quail::planner`.
 - quail-b, the benchmark, lives in
   https://github.com/fsdatalab/quail-bench and is installed here as
   `quail_b`, pinned to a commit in `pyproject.toml`. `bench/` is
@@ -130,7 +229,8 @@ one. `tools/check_names.py` enforces the chosen words:
   2.6B bf16, and d1-2B bf16, on one GPU per model copy (H100 SXM,
   L40S, or B200).
   No tensor-parallel weight sharding.
-- `AI.MAP` is on the roadmap.
+- `AI.MAP` writes a text answer for each row, with an optional limit
+  on answer tokens.
   Open-ended generation, speculation, and forking are not supported.
 
 # What Quail builds on and learns from
@@ -147,14 +247,16 @@ Built on:
 - **DeepGEMM**: the FP8 matrix multiplies.
 - **Triton**: Quail's fused kernels (RMSNorm plus quantize, QK-norm
   plus RoPE, SiLU plus quantize, the attention merge).
-- **Apache Arrow and Acero**: tables, streams, and the relational
-  operators in query plans.
+- **Apache DataFusion** (with sqlparser): SQL parsing and binding,
+  logical optimization, and every relational operator: scans, plain
+  filters, plain joins, aggregates, sorts, and limits. Quail adds the
+  AI operators and runs only those.
+- **Apache Arrow**: tables, and the streams that carry rows between
+  DataFusion and Quail.
 - **Substrait**: the plan format quail-b queries are written in.
-- **sqlglot**: SQL parsing.
 - **Hugging Face** (`transformers`, `huggingface_hub`, `datasets`):
   tokenizers, checkpoints, and benchmark data.
 - **Modal**: every GPU run and the result volumes.
-- **SGLang**: a second baseline.
 
 Learned from. Treat these as whole projects to study, not single
 features: their APIs, their code layout, their tests, their docs, and
@@ -168,9 +270,11 @@ how they release and explain changes.
     (Quail Server and the remote `Session`).
   - `EXPLAIN` and the Spark UI, for showing a plan and what it cost
     (`explain()`, `explain(analyze=True)`).
-- **Apache DataFusion**: an Arrow-native query engine built to be
-  extended, with clear extension points (Quail's extension registry,
-  custom operators, and rules) and docs for each.
+- **Apache DataFusion**: also the model for how to extend an engine:
+  clear extension points (Quail's extension registry, custom
+  operators, and rules) and docs for each. Projects built on it, such
+  as Comet, InfluxDB 3, and Lance, show how an extension marks the
+  part of a plan it runs and leaves the rest to the host.
 - **DuckDB**: an engine that is easy to embed and whose docs answer a
   question in one short page with a runnable example.
 - **Apache Arrow**: columnar data and Arrow Flight for moving results
@@ -189,7 +293,7 @@ how they release and explain changes.
 - Do not create Modal app names. Attach GPU cells to
   `quail-milestone1` and the worker to `quail-engine`; caches and warm
   state belong to those apps.
-- To check a change, run these 15 queries at scale factor 0.1, with
+- To check a change, run these 18 queries at scale factor 0.1, with
   Quail alone. Do not run the full suite; it is slow. Together they
   cover each AI operator alone, chained with the others, and followed
   by relational operators:
@@ -208,6 +312,9 @@ how they release and explain changes.
   - `SALES-5`: a relational filter, a score, then top 25.
   - `IMDB-24`: a filter, then three maps over the same rows.
   - `CUAD-20`: three extracts and a map.
+  - `SALES-6`: a map whose answer a prefix test can stop early.
+  - `SALES-7`: a relational filter, then the same map and test.
+  - `SALES-8`: the same map with no test, the cost with no early stop.
 
   `bench.quailb_parallel` runs each query family on its own H100, so
   this set uses five H100s: IMDB, FEV, AGENT, CUAD, and SALES. If a
@@ -217,17 +324,17 @@ how they release and explain changes.
 
       queries=IMDB-1,IMDB-2,IMDB-4,FEV-9,IMDB-11,AGENT-5,IMDB-15
       queries=$queries,CUAD-1,CUAD-4,CUAD-10,CUAD-15,CUAD-11,SALES-5
-      queries=$queries,IMDB-24,CUAD-20
+      queries=$queries,IMDB-24,CUAD-20,SALES-6,SALES-7,SALES-8
       uv run modal run --detach -m bench.quailb_parallel \
         --model qwen3-4b-fp8 --scale-factor 0.1 --query "$queries" \
-        --no-include-baselines --no-include-sglang \
+        --no-include-baselines \
         2>&1 | tee "$run_log"
 
   Run more queries, or a larger scale factor, only when the change
   targets them or the user asks.
-- Do not run stock vLLM, pipelined vLLM, or SGLang by default.
+- Do not run stock vLLM or pipelined vLLM by default.
   `bench.quailb_parallel` runs them unless told not to, so pass
-  `--no-include-baselines --no-include-sglang`. Run a baseline only
+  `--no-include-baselines`. Run a baseline only
   for an experiment whose point is to compare Quail with it, or when
   the user asks. Reuse saved baseline results when the queries, scale
   factor, and model have not changed.

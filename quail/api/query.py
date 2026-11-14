@@ -2,47 +2,77 @@
 
 from __future__ import annotations
 
-import time
-from contextlib import closing
-from dataclasses import replace
+import json
+import warnings
+from dataclasses import asdict, replace
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
+import _quail_native
 import pyarrow as pa
 
 from quail.api.execute import execute_query
-from quail.catalog import inputs
-from quail.catalog.pairs import FIRST_DOCUMENT, columns_key, estimate_pair_fraction
-from quail.catalog.providers import ScanRequest
-from quail.catalog.selection import selected_rows
-from quail.catalog.tokens import TokenLengths
-from quail.execution.metrics import NodeMetrics, scalar_node_metrics
-from quail.execution.projection import projection_for
-from quail.execution.reporting import collect_answers, execution_report
+from quail.api.region_inputs import input_scans
+from quail.common.expressions import CompileError, SimilarCallWarning
+from quail.common.pairs import columns_key
+from quail.common.tokens import ScanInput, TokenStore
+from quail.execution.finished import finished_table
+from quail.execution.metrics import NodeMetrics, NodeResult, scalar_node_metrics
 from quail.execution.result import QueryResult
-from quail.execution.runner import ExecutionContext, GenericRunner
+from quail.execution.rows import as_table
+from quail.execution.runner import compute_subgraph
 from quail.execution.types import PhysicalRequest, document_input
 from quail.explain import explain
-from quail.logical import (
-    LogicalPlan,
-    WithCTE,
-    join_conditions,
-    oriented_join_conditions,
-)
-from quail.logical.expressions import (
-    column_references,
-    evaluate_expression,
-    source_columns,
-)
-from quail.physical import Scan, encode_graph
-from quail.planner import plan_query, refine_plan
-from quail.planner.optimizer.context import PlanningContext
-from quail.planner.optimizer.tree_rewrites import logical_alternatives
-from quail.planner.plan import Refusal, RefusalError
-from quail.planner.search.statistics import filter_stop_keys
-from quail.planner.stages import relational_plan
+from quail.physical import Limit, Scan, decode_plan_value
+from quail.physical.plan import Refusal, RefusalError, plan_from_json
+
+# the start of Rust's message for a document that is an expression
 
 if TYPE_CHECKING:
     from quail.api.session import Session
+
+
+def backend_refusal(session) -> Refusal | None:
+    """Return why the session's backend cannot run its configuration, or None."""
+    config = session.config
+    if config.canvas_draws < 1:
+        return Refusal(
+            reasons=(f"canvas_draws must be at least 1, got {config.canvas_draws}",),
+            constraint="canvas_draws", needed=1, available=config.canvas_draws,
+            unit="draws")
+    try:
+        backend = session.registry.backend(config.backend)
+    except ValueError as error:
+        return Refusal(reasons=(str(error),), constraint="unknown_backend",
+                       needed=1, available=0, unit="backends")
+    support = backend.supports(session.model, session.device, config.gpus)
+    if not support.supported:
+        return Refusal(
+            reasons=(support.reason or "unsupported backend configuration",),
+            constraint="unsupported_backend_configuration", needed=1,
+            available=0, unit="configurations")
+    return None
+
+
+def planning_settings(session, order: str | None) -> dict:
+    """The configuration Rust plans a region for.
+
+    Args:
+        session: The session whose model, device, and backend plan it.
+        order: The stage order rule, 'by_cost' or 'as_written', or None.
+    """
+    config = session.config
+    backend = session.registry.backend(config.backend)
+    return {
+        "model": asdict(session.model),
+        "device": asdict(session.device),
+        "gpus": config.gpus, "canvas_draws": config.canvas_draws,
+        "gpu_timing": config.gpu_timing,
+        "attention": config.attention, "order": order,
+        "backend": config.backend,
+        "physical_rules": [rule.name for rule in
+                           session.registry.physical_rules.values()],
+        "request": getattr(backend, "request_settings", None),
+    }
 
 
 @runtime_checkable
@@ -70,241 +100,305 @@ class QueryLike(Protocol):
 
 
 class Query:
-    """A compiled query that plans and executes in the current process."""
+    """A SQL query that DataFusion plans and runs, with Quail running its model regions.
 
-    def __init__(self, session: "Session", logical: LogicalPlan,
-                 order: str | None = None, *, catalog=None, inputs=None):
+    Rust's session parses and binds the SQL, plans each model region in
+    Rust, and runs every operator outside the regions; the Python
+    executor runs each planned region. A query of one model region also
+    offers that region's ``RegionQuery`` attributes, such as ``facts()``.
+
+    Args:
+        session: The session whose tables and model the query uses.
+        text: The SQL statement.
+        dialect: "snowflake" or "bq".
+        order: The stage order rule each region is planned with.
+    """
+
+    def __init__(self, session: "Session", text: str, dialect: str = "snowflake",
+                 order: str | None = None):
         self.session = session
+        self.text = text
+        self.dialect = dialect
+        self.order = order
+        self._regions = None
+        self._whole = None
+        self._bound = None
+
+    def _native(self, run_query=None, physical_executor=None):
+        from quail.api.context import SessionContext
+
+        return SessionContext(self.session, physical_executor, order=self.order,
+                              run_query=run_query)._native
+
+    def _dialect(self) -> str:
+        from quail.api.compile import DATAFUSION_DIALECTS
+
+        return DATAFUSION_DIALECTS[self.dialect]
+
+    def bound_whole(self) -> bool:
+        """Bind the SQL and return whether one model region is the whole query.
+
+        Raises:
+            CompileError: The SQL does not bind.
+        """
+        if self._whole is None:
+            native = self._native()
+            model = self.session.model
+            try:
+                bound, self._whole = native.region_plans(
+                    self.text, tuple(model.turn), model.prompt_layout, self._dialect())
+            except RuntimeError as error:
+                from quail.api.compile import compile_message
+
+                raise CompileError(compile_message(error, self.text)) from None
+            for region, message, unsupported in bound:
+                # DataFusion runs the operators of a shape Quail does not read
+                if message is not None and not unsupported:
+                    raise CompileError(message)
+                for warning in json.loads(region).get("warnings", []) if region else []:
+                    warnings.warn(warning, SimilarCallWarning, stacklevel=3)
+            self._bound = bound
+        return self._whole
+
+    @property
+    def whole(self) -> bool:
+        """Whether the query is one model region, with no SQL around it."""
+        return self.bound_whole()
+
+    @property
+    def num_regions(self) -> int:
+        """The model regions DataFusion hands Quail, before any is planned."""
+        self.bound_whole()
+        return len(self._bound)
+
+    def _bound_region(self) -> dict:
+        """The one model region as derived, before planning."""
+        self.bound_whole()
+        if len(self._bound) != 1:
+            raise AttributeError(
+                f"the query has {len(self._bound)} model regions; use regions()")
+        ((found, message, _),) = self._bound
+        if message is not None:
+            region = self._region()
+            return {"operators": region.operators, "logical": region.logical}
+        return json.loads(found)
+
+    @property
+    def logical(self) -> str:
+        """DataFusion's plan of the one model region, before planning."""
+        return self._bound_region()["logical"]
+
+    @property
+    def operators(self) -> str:
+        """The one model region's operators as JSON, before planning."""
+        return self._bound_region()["operators"]
+
+    def regions(self) -> list["RegionQuery"]:
+        """Plan each model region once and return them, in plan order.
+
+        Raises:
+            CompileError: The SQL does not bind.
+        """
+        if self._regions is None:
+            from quail.api.region_inputs import region_query
+
+            self.bound_whole()
+            try:
+                found = self._native().plans(self.text, self._dialect())
+            except RuntimeError as error:
+                from quail.api.compile import compile_message
+
+                raise CompileError(compile_message(error, self.text)) from None
+            regions = []
+            for payload, planned in found:
+                found = json.loads(payload)
+                region = region_query(self.session, found["operators"],
+                                      logical=found["logical"], order=self.order,
+                                      region_id=found["region_id"])
+                if planned is not None:
+                    text, scans = planned
+                    region.adopt_plan(json.loads(text), scans)
+                regions.append(region)
+            self._regions = regions
+        return self._regions
+
+    def _region(self) -> "RegionQuery":
+        regions = self.regions()
+        if len(regions) != 1:
+            raise AttributeError(
+                f"the query has {len(regions)} model regions; use regions()")
+        return regions[0]
+
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return getattr(self._region(), name)
+
+    def plan(self):
+        """Return the physical plan, or Refusal, of the query's model region.
+
+        A query with several model regions returns each one's, in a tuple.
+        """
+        plans = tuple(region.plan() for region in self.regions())
+        return plans[0] if len(plans) == 1 else plans
+
+    def explain(self, *, verbose: bool = False, analyze: bool = False) -> str:
+        """Return DataFusion's plan around the regions, then each region's plan.
+
+        Args:
+            verbose: Include runtime settings and internal node fields.
+            analyze: Run the query first, like EXPLAIN ANALYZE, and show
+                each node's measured rows, time, and tokens beside the
+                planner's estimates. Regions SQL did not read are labeled
+                not executed and show estimates only.
+        """
+        regions = self.regions()
+        result = self.run() if analyze else None
+        if result is not None:
+            unexpected = (set(result.region_results)
+                          - {region.region_id for region in regions})
+            if unexpected:
+                raise RuntimeError(
+                    f"executed model regions do not match the query: {unexpected}")
+        texts = []
+        for region in regions:
+            executed = (result.region_results.get(region.region_id)
+                        if result is not None else None)
+            text = region._explain(executed, verbose)
+            if result is not None and executed is None:
+                # LIMIT and other SQL operators need not read every model region.
+                text = "not executed (estimated plan):\n" + text
+            texts.append(text)
+        if len(regions) == 1 and self._whole and not regions[0].has_inputs():
+            return texts[0]
+        around = (result.datafusion_plan if result is not None
+                  and result.datafusion_plan is not None
+                  else self._native().explain(self.text, self._dialect()))
+        if len(texts) == 1:
+            return f"DataFusion:\n{around}\n\nmodel region:\n{texts[0]}"
+        return "\n\n".join([around, *(f"model region {index + 1}:\n{text}"
+                                       for index, text in enumerate(texts))])
+
+    def run(self, *, physical_executor=None) -> QueryResult:
+        """Execute the query in the current process.
+
+        Args:
+            physical_executor: Optional callable(PhysicalRequest) that
+                returns the PhysicalResponse, for tests without a GPU.
+        """
+        return execute_query(self, physical_executor=physical_executor)
+
+    def submit(self, **_options):
+        """Submitting needs Quail Server; local queries use run()."""
+        raise RuntimeError(
+            "submit() needs a Session with an endpoint; this session runs "
+            "queries in the current process, so call run() or collect()")
+
+    def execute_stream(self, batch_rows: int = 65_536,
+                       limit: int | None = None) -> pa.RecordBatchReader:
+        """Execute the query and stream Arrow record batches."""
+        return self.run().execute_stream(batch_rows=batch_rows, limit=limit)
+
+    def collect(self, limit: int | None = None,
+                batch_rows: int = 65_536) -> pa.Table:
+        """Execute the query and collect one Arrow table."""
+        return self.run().collect(limit=limit, batch_rows=batch_rows)
+
+
+class RegionQuery:
+    """One model region of a query: its plan, and its run in this process."""
+
+    def __init__(self, session: "Session", operators: str,
+                 order: str | None = None, *, logical: str = "", catalog=None,
+                 region_id: int | None = None):
+        self.session = session
+        self.region_id = region_id
         self.catalog = session.catalog if catalog is None else catalog
-        self.inputs = session.inputs if inputs is None else inputs
+        # the region's operators, as Rust's JSON: as derived, then as the
+        # planner chose them
+        self.operators = operators
+        self._operators_input = operators
+        # DataFusion's plan of the region, one operator per line
         self.logical = logical
-        self._logical_input = logical
+        self._facts = {}
         self.order = order
         self._plan = None
-        self._searched_plan = None
         self._document_tokens = None
         self._token_inputs = None
-        self._token_futures = {}
-        self._token_finished_at = {}
-        self._estimated = ()
-        self._planning_started_at = None
-        self._planning_finished_at = None
-        self._replanning_s = 0.0
-        self._scan_selectivities = {}
-        self._pair_selectivities = {}
-        self.token_wait_s = 0.0
+        # seconds Rust took to tokenize the inputs and plan the region
+        self._planning_s = 0.0
+        # each filtered input's rows' positions in its registered table
+        self.source_rows = {}
+
+    def facts(self, operators: str | None = None) -> dict:
+        """Return what Rust reads from the region's operators, once per value.
+
+        Args:
+            operators: Operators as JSON; the query's chosen operators
+                when omitted.
+
+        Returns:
+            The operators' scans, value columns, stop keys, join
+            equalities, and whether they ask the model; see
+            ``region_facts`` in Rust.
+        """
+        operators = self.operators if operators is None else operators
+        if operators not in self._facts:
+            self._facts[operators] = json.loads(_quail_native.region_facts(operators))
+        return self._facts[operators]
 
     def token_inputs(self) -> dict:
-        """Return the token store of every scanned alias.
-
-        Plans first, then waits for any background tokenization, so
-        planning and the speed of light estimate share these stores.
-        """
+        """Return the token store of every scanned alias, as Rust planned with it."""
         self.plan()
-        self.wait_for_tokens()
         return self._token_inputs
 
     def plan(self):
-        """Plan the query once and return its physical plan or refusal.
-
-        Document lengths are exact for a tokenized column. For any other
-        column they are estimated from a sample while a background thread
-        tokenizes it. The tree rewrites and the physical planner both read
-        these lengths.
+        """Return the physical plan Rust made for the region, or its refusal.
 
         Returns:
             The physical plan, or a Refusal when no backend can run it.
         """
         if self._plan is not None:
             return self._plan
-        if isinstance(self.logical.root, WithCTE):
-            from quail.api.stages import plan_stages
+        # Rust plans every region a backend accepts as the query runs
+        refusal = backend_refusal(self.session)
+        if refusal is None:
+            raise RuntimeError("a model region is planned by Rust's session")
+        self._plan = refusal
+        return refusal
 
-            self._plan = plan_stages(self)
-            return self._plan
-        if not self.logical.operators().prompts:
-            (scan,) = self.logical.operators().scans
-            num_documents = self.catalog.get(scan.provider).statistics().num_rows
-            if self.inputs.pending(scan.provider):
-                num_documents = len(self.inputs.estimate_lengths(
-                    scan.provider, scan.column))
-            self._plan = relational_plan(
-                self.logical, self.session.config, num_documents or 0)
-            return self._plan
-        if self._plan is None:
-            self._planning_started_at = time.perf_counter()
-            config = self.session.config
-            operators = self.logical.operators()
-            self._document_tokens = {}
-            self._token_inputs = {}
-            estimated = []
-            for s in operators.scans:
-                exact = self.inputs.token_lengths(s.provider, s.column)
-                if exact is not None:
-                    self._document_tokens[s.alias] = exact
-                    continue
-                self._document_tokens[s.alias] = self.inputs.estimate_lengths(
-                    s.provider, s.column)
-                estimated.append(s.alias)
-            self._estimated = tuple(estimated)
-            # the planner estimates what the regular predicates and the join
-            # equalities keep from samples; the executor applies them
-            scan_fractions = self._scan_fractions(operators.scans)
-            pair_fractions = self._pair_fractions(
-                operators.scans, operators.joins)
-            self._scan_selectivities = scan_fractions
-            self._pair_selectivities = pair_fractions
-            context = PlanningContext(
-                catalog=self.catalog, engine_config=config,
-                model=self.session.model, device=self.session.device,
-                gpus=config.gpus, document_tokens=self._document_tokens,
-                backend=config.backend, order=self.order,
-                canvas_draws=config.canvas_draws,
-                attention=config.attention,
-                tokenizer=self.session.tokenizer,
-                pair_fractions=pair_fractions,
-                scan_fractions=scan_fractions)
-            candidates = logical_alternatives(
-                self._logical_input,
-                tuple(self.session.registry.logical_rules.values()),
-                context)
-            self.logical = candidates[0].plan
-            scans = {}
-            offset_aliases = set()
-            # an alias some plan scans without predicates reads every row
-            whole_aliases = set()
-            for candidate in candidates:
-                operators = candidate.plan.operators()
-                offset_aliases.update(alias for extract in operators.extracts
-                                      for alias in extract.call.aliases())
-                whole_aliases.update(scan.alias for scan in operators.scans
-                                     if not scan.predicates)
-                for scan in operators.scans:
-                    previous = scans.get(scan.alias, scan)
-                    scans[scan.alias] = replace(scan, columns=tuple(dict.fromkeys(
-                        (*previous.columns, *scan.columns))))
-            backend = self.session.registry.backend(config.backend)
-            # an extension backend may leave the capability flags unset
-            reads_text = getattr(backend, "reads_document_text", False)
-            locates_answers = getattr(backend, "locates_answers_in_text", False)
-            for s in scans.values():
-                if self.inputs.pending(s.provider):
-                    continue
-                columns = s.columns
-                # the extraction computes the offsets of the rows the
-                # predicates keep; computing them for every row of a
-                # large table costs far more than tokenizing it
-                with_offsets = (locates_answers and s.alias in offset_aliases
-                                and s.alias in whole_aliases)
-                if reads_text:
-                    columns = tuple(dict.fromkeys(
-                        (*columns, *source_columns(s.column))))
-                if s.alias not in self._estimated:
-                    self._token_inputs[s.alias] = self.inputs.tokenize(
-                        s.provider, s.column, columns, with_offsets=with_offsets)
-                    continue
-                future = self.inputs.tokenize_async(
-                    s.provider, s.column, columns, with_offsets=with_offsets)
+    def adopt_plan(self, found: dict, scans: dict):
+        """Take the plan Rust made, and its scans' tokens and columns as the inputs.
 
-                def record_finished(_future, alias=s.alias):
-                    self._token_finished_at[alias] = time.perf_counter()
+        Args:
+            found: A planned or refused region, read from the JSON Rust
+                planned it as.
+            scans: By alias, (the token store, the value columns) of each
+                scan, as pyarrow Tables over Rust's buffers.
 
-                future.add_done_callback(record_finished)
-                self._token_futures[s.alias] = future
-            self._plan = plan_query(
-                self._logical_input, model=self.session.model,
-                device=self.session.device,
-                document_tokens=self._document_tokens,
-                gpus=config.gpus,
-                order=self.order,
-                canvas_draws=config.canvas_draws,
-                attention=config.attention,
-                backend=config.backend,
-                registry=self.session.registry,
-                tokenizer=self.session.tokenizer,
-                pair_fractions=pair_fractions,
-                scan_fractions=scan_fractions,
-                memo=context.memo, catalog=self.catalog,
-                engine_config=config, logical_candidates=candidates)
-            if not isinstance(self._plan, Refusal):
-                self.logical = self._plan.logical_plan
-            extra = {}
-            if config.gpu_timing:
-                extra["gpu_timing"] = True
-            if extra and not isinstance(self._plan, Refusal):
-                self._plan = replace(self._plan, settings={
-                    **self._plan.settings, **extra})
-            self._planning_finished_at = time.perf_counter()
-            self._searched_plan = self._plan
-        return self._plan
+        Returns:
+            The physical plan, or the Refusal.
+        """
+        self._planning_s = found.pop("planning_s", 0.0)
+        self._token_inputs, self._document_tokens = {}, {}
+        for alias, (tokens, columns) in scans.items():
+            store = TokenStore(tokens)
+            self._token_inputs[alias] = ScanInput(store, columns)
+            self._document_tokens[alias] = store.lengths
+        plan = plan_from_json(found)
+        if isinstance(plan, Refusal):
+            self._plan = plan
+            return plan
+        self.operators = plan.operators
+        if self.session.config.gpu_timing:
+            plan = replace(plan, settings={**plan.settings, "gpu_timing": True})
+        self._plan = plan
+        return plan
 
     @property
     def planning_s(self) -> float:
-        """Return wall time spent planning this query."""
-        if self._planning_started_at is None:
-            return 0.0
-        finished = self._planning_finished_at or time.perf_counter()
-        return finished - self._planning_started_at + self._replanning_s
-
-    @property
-    def input_ready_s(self) -> float:
-        """Return planning and tokenization time, excluding backend startup."""
-        if self._planning_started_at is None:
-            return 0.0
-        finished = [
-            self._planning_finished_at or time.perf_counter(),
-            *self._token_finished_at.values(),
-        ]
-        return max(finished) - self._planning_started_at + self._replanning_s
-
-    def _pair_fractions(self, scans, joins) -> dict:
-        """Estimated pairs over the cross product, per join with conditions."""
-        providers = {scan.alias: scan.provider for scan in scans}
-        samples = {}
-
-        def keys(expressions):
-            out = []
-            for expression in expressions:
-                refs = column_references(expression)
-                for ref in refs:
-                    if (ref.alias, ref.column) not in samples:
-                        samples[(ref.alias, ref.column)] = (
-                            self.inputs.sample_columns(
-                                providers[ref.alias], [ref.column])[ref.column])
-                out.append(evaluate_expression(expression, pa.table({
-                    ref.column: samples[(ref.alias, ref.column)] for ref in refs})))
-            return out
-
-        fractions = {}
-        for position, join in enumerate(joins):
-            oriented = oriented_join_conditions(join)
-            if oriented is None:
-                continue
-            _, _, conditions = oriented
-            fractions[position] = estimate_pair_fraction(
-                keys([left for left, _ in conditions]),
-                keys([right for _, right in conditions]))
-        return fractions
-
-    def _scan_fractions(self, scans) -> dict:
-        """Estimated fraction of each tested scan's documents its tests keep."""
-        fractions = {}
-        for scan in scans:
-            if not scan.predicates:
-                continue
-            columns = pa.table(self.inputs.sample_columns(
-                scan.provider,
-                list(dict.fromkeys(reference.column
-                                   for predicate in scan.predicates
-                                   for test in predicate.tests()
-                                   for reference in column_references(
-                                       test.expression)))))
-            sampled = columns.num_rows
-            kept = len(selected_rows(columns, scan.predicates))
-            # a sample that keeps nothing, or everything, says little
-            # about the rest, so the estimate stays off 0 and 1
-            fractions[scan.alias] = (kept + 1) / (sampled + 2)
-        return fractions
+        """Return the seconds Rust took to tokenize the inputs and plan the region."""
+        return self._planning_s
 
     def explain(self, *, verbose: bool = False,
                 analyze: bool = False) -> str:
@@ -326,12 +420,14 @@ class Query:
             result: The QueryResult of running the plan, or None.
             verbose: Include runtime settings and internal node fields.
         """
-        # plan() first: it replaces self.logical with the optimized tree
-        physical = self.plan()
+        # A downstream region may have been inspected with empty placeholder
+        # inputs. ANALYZE must use the plan chosen for its actual input rows.
+        physical = (result.physical_plan if result is not None
+                    and result.physical_plan is not None else self.plan())
         if result is not None:
-            physical = self._plan
             # the root relation is lazy, so its row count is taken here
-            rows = result.count()
+            rows = (result.region_rows if result.region_rows is not None
+                    else result.count())
             root = physical.graph.root.node_id
             result.node_metrics[root] = replace(
                 result.node_metrics.get(root, NodeMetrics()),
@@ -339,235 +435,230 @@ class Query:
             result.report.setdefault("node_metrics", {}).setdefault(
                 root, {})["output_rows"] = rows
         registry = self.session.registry
-        text = explain(self.logical, physical, verbose=verbose,
-                       result=result,
+        operators = physical.operators if not isinstance(physical, Refusal) else None
+        text = explain(self.logical, operators or self.operators, physical,
+                       verbose=verbose, result=result,
                        rules=tuple(registry.rules.values()),
                        usd_per_hour=(
                            self.session.device.usd_per_hour or None))
-        if self._estimated:
-            text += ("\n\n  note: token counts for "
-                     + ", ".join(repr(a) for a in self._estimated)
-                     + f" are estimated from a {inputs.ESTIMATE_SAMPLE} document "
-                     "sample")
         return text
 
-    def wait_for_tokens(self) -> None:
-        """Block until every background tokenization has finished.
+    def has_inputs(self) -> bool:
+        """Whether the region reads a table the session did not register."""
+        return bool(input_scans(self.facts(self._operators_input),
+                                self.session.catalog))
 
-        A plan made on estimated lengths is searched again with exact inputs,
-        so prefix sharing can change which logical alternative wins.
-        """
-        if not self.logical.operators().prompts:
-            self._prepare_relational()
-            return
-        started = time.perf_counter()
-        refine = bool(self._token_futures)
-        for alias, future in list(self._token_futures.items()):
-            self._token_inputs[alias] = future.result()
-            self._document_tokens[alias] = self._token_inputs[alias].lengths
-            self._token_finished_at.setdefault(alias, time.perf_counter())
-            del self._token_futures[alias]
-        self.token_wait_s += time.perf_counter() - started
-        if refine and self._plan is not None:
-            started = time.perf_counter()
-            options = dict(
-                model=self.session.model,
-                device=self.session.device, document_tokens=self._document_tokens,
-                gpus=self.session.config.gpus, order=self.order,
-                canvas_draws=self.session.config.canvas_draws,
-                attention=self.session.config.attention,
-                backend=self.session.config.backend,
-                registry=self.session.registry,
-                tokenizer=self.session.tokenizer,
-                pair_fractions=self._pair_selectivities)
-            if self._plan is self._searched_plan:
-                self._plan = plan_query(
-                    self._logical_input, scan_fractions=self._scan_selectivities,
-                    catalog=self.catalog, engine_config=self.session.config,
-                    **options)
-                if not isinstance(self._plan, Refusal):
-                    self.logical = self._plan.logical_plan
-            else:
-                # Explicit physical edits must survive exact tokenization.
-                self._plan = refine_plan(self._plan, **options)
-            if self.session.config.gpu_timing and not isinstance(self._plan, Refusal):
-                self._plan = replace(self._plan, settings={
-                    **self._plan.settings, "gpu_timing": True})
-            self._replanning_s += time.perf_counter() - started
-            self._estimated = ()
-
-    def _prepare_relational(self):
-        """Read a relational stage's value columns without tokenizing them."""
-        if self._token_inputs is not None:
-            return
-        (scan,) = self.logical.operators().scans
-        provider = self.catalog.get(scan.provider)
-        expressions = (*self.logical.projection.columns,
-                       *(key.expression for key in self.logical.result.order),
-                       *(test.expression for predicate in scan.predicates
-                         for test in predicate.tests()))
-        columns = tuple(dict.fromkeys(
-            column for expression in expressions
-            for column in source_columns(expression)))
-        with closing(provider.scan(ScanRequest(columns=columns))) as reader:
-            table = reader.read_all()
-        self._token_inputs = {scan.alias: table}
-        self._document_tokens = {scan.alias: TokenLengths([0] * table.num_rows)}
-        self._plan = relational_plan(self.logical, self.session.config, table.num_rows)
-
-    def run(self, plan=None) -> QueryResult:
-        """Execute the query in the current process.
-
-        Args:
-            plan: An edited PhysicalPlan from plan().insert(),
-                remove(), or move(); the planner's own plan when
-                omitted.
-        """
-        return execute_query(self, plan=plan)
-
-    def submit(self, **_options):
-        """Submitting needs Quail Server; local queries use run()."""
-        raise RuntimeError(
-            "submit() needs a Session with an endpoint; this session runs "
-            "queries in the current process, so call run() or collect()")
-
-    def execute_stream(self, batch_rows: int = 65_536,
-                       limit: int | None = None) -> pa.RecordBatchReader:
-        """Execute the query and stream Arrow record batches."""
-        return self.run().execute_stream(
-            batch_rows=batch_rows, limit=limit)
-
-    def collect(self, limit: int | None = None,
-                batch_rows: int = 65_536) -> pa.Table:
-        """Execute the query and explicitly collect one Arrow table."""
-        return self.run().collect(
-            limit=limit, batch_rows=batch_rows)
+    def run(self) -> QueryResult:
+        """Execute the query in the current process."""
+        return execute_query(self)
 
     def _prepare_physical(self):
         """Bind the query's tokenized inputs to its physical plan."""
         self.plan()
-        self.wait_for_tokens()
         plan = self.plan()
         if isinstance(plan, Refusal):
             raise RefusalError(plan)
         plan.graph.validate(runtime_keys=set(self.session.registry.runtimes))
         plan.graph.validate_backend(plan.backend)
+        envelope = plan.to_envelope()
+        # Rust builds what the workers read: each document's text, and
+        # the value columns with each table's first documents
+        tables = dict(_quail_native.request_tables(
+            json.dumps(envelope), self.operators, self.scan_tables()))
         inputs = {}
-        logical_scans = {
-            scan.alias: scan for scan in self.logical.operators().scans
-        }
         for node in plan.nodes:
             if not isinstance(node, Scan):
                 continue
-            store = self._token_inputs[node.alias]
-            logical_scan = logical_scans[node.alias]
+            texts = tables.get(f"texts:{node.alias}")
             inputs[node.input_id] = document_input(
-                store.tokens,
-                (
-                    evaluate_expression(logical_scan.column, store)
-                    if set(source_columns(logical_scan.column))
-                    <= set(store.projected_columns)
-                    else None
-                ),
-            )
-        envelope = plan.to_envelope(self.session.registry.codecs)
-        return PhysicalRequest(envelope, inputs, self._column_tables())
+                self._token_inputs[node.alias].tokens,
+                None if texts is None else texts.column("text"))
+        relations = {columns_key(name.split(":", 1)[1]): table
+                     for name, table in tables.items()
+                     if name.startswith("columns:")}
+        return PhysicalRequest(envelope, inputs, relations,
+                               self._alias_source_rows())
 
-    def _column_tables(self) -> dict:
-        """One value table per alias whose columns the executor reads.
+    def scan_tables(self) -> dict:
+        """Each scan's token store and the columns of its rows, by alias."""
+        return {alias: (store.tokens.table, store.columns)
+                for alias, store in self._token_inputs.items()}
 
-        A scan's regular predicates, a HashJoin, an apply(), and a stop key
-        read values; the tables carry the columns they name. A table the
-        plan deduplicates also carries FIRST_DOCUMENT, computed from the
-        tokens and the row columns the deduplicate setting lists for it.
+    def _alias_source_rows(self) -> dict:
+        """Each filtered input's rows in its registered table, by scan alias."""
+        return {scan["alias"]: self.source_rows[scan["provider"]]
+                for scan in self.facts()["scans"]
+                if scan["provider"] in self.source_rows}
+
+    def finished_rows(self, on_rows=None):
+        """Return the FinishedRows that builds the region's rows from its run.
+
+        Args:
+            on_rows: Optional callable(pyarrow Table) handed each batch
+                of rows as it is built, each row once.
         """
-        needed = {}
-        operators = self.logical.operators()
-        for join in operators.joins:
-            for condition in join_conditions(join):
-                for ref in column_references(condition.left) + column_references(
-                        condition.right):
-                    needed.setdefault(ref.alias, {})[ref.column] = None
-        for scan in operators.scans:
-            for predicate in scan.predicates:
-                for test in predicate.tests():
-                    for reference in column_references(test.expression):
-                        needed.setdefault(scan.alias, {})[reference.column] = None
-        # a Filter on labels or answers reads the source columns it tests
-        # by document ID
-        providers = {scan.alias: scan.provider for scan in operators.scans}
-        for alias, filters in operators.column_filters.items():
-            columns = self.catalog.get(providers[alias]).columns
-            for reference in (reference for each in filters
-                              for found in each.condition.tests()
-                              for reference in column_references(found.expression)):
-                if reference.alias == alias and reference.column in columns:
-                    needed.setdefault(alias, {})[reference.column] = None
-        for alias, key in filter_stop_keys(self.logical).items():
-            for column in key:
-                needed.setdefault(alias, {})[column] = None
-        deduplicated = self.plan().settings.get("deduplicate", {})
-        for alias in deduplicated:
-            needed.setdefault(alias, {})
-        tables = {}
-        for alias, columns in needed.items():
-            store = self._token_inputs[alias]
-            values = {name: store.column(name) for name in columns}
-            if alias in deduplicated:
-                values[FIRST_DOCUMENT] = store.tokens.first_documents_with(
-                    [store.column(column) for column in deduplicated[alias]])
-            tables[columns_key(alias)] = pa.table(values)
-        return tables
+        request = self._answer_request(self.plan(), returned=True)
+        return _quail_native.FinishedRows(json.dumps(request), self._source_values,
+                                          on_rows)
 
-    def finish(self, response, coordinator_wall: float = 0.0) -> QueryResult:
-        """Finish the physical graph and attach execution details."""
+    def finish(self, response, coordinator_wall: float = 0.0,
+               finished=None, relation: pa.Table | None = None) -> QueryResult:
+        """Return the region's result: its rows and the run's report.
+
+        Args:
+            response: The run's PhysicalResponse.
+            coordinator_wall: Seconds the run took, as the caller saw it.
+            finished: The FinishedRows the run reported to, or None for
+                a new one. Every returned output is reported to it, so it
+                builds each row the run's operators did not report.
+            relation: The region's rows, when the run built them.
+        """
         plan = self.plan()
         out = response.metrics
-        report = execution_report(
-            plan, out, self.inputs.notes, coordinator_wall)
-        sources = {
-            node.input_id: range(node.num_documents)
-            for node in plan.nodes
-            if isinstance(node, Scan)
-        }
-        sources.update(self._column_tables())
-        observers = self.session.registry.new_observers()
-        run = GenericRunner().run(
-            plan.graph,
-            ExecutionContext(
-                runtimes=self.session.registry.runtimes,
-                sources=sources,
-                project=projection_for(
-                    self.logical, self._token_inputs, self._document_tokens),
-                observers=observers,
-            ),
-            initial_outputs=response.outputs,
-            initial_metrics={
-                node_id: NodeMetrics.from_scalars(metrics)
-                for node_id, metrics in out.get("node_metrics", {}).items()
-            },
-        )
-        if not isinstance(run.value, QueryResult):
-            raise TypeError("physical graph root must return QueryResult")
-        result = run.value
+        report = json.loads(_quail_native.execution_report(
+            plan.backend, plan.estimated_seconds, plan.settings.get("order_rule"),
+            json.dumps(out, default=str), coordinator_wall))
+        tables = _output_tables(response.outputs)
+        if relation is None:
+            relation = self._built_rows(tables, finished)
+        result = QueryResult.from_table(relation, report=report)
         result.plan = plan.graph
+        result.physical_plan = plan
+        result.region_id = self.region_id
+        report["region_id"] = self.region_id
+        measured = dict(out.get("node_metrics", {}))
+        for node in plan.nodes:
+            if isinstance(node, Limit):
+                # Rust keeps the region's first rows as it builds them
+                measured[node.node_id] = scalar_node_metrics({node.node_id: NodeResult(
+                    {}, NodeMetrics(output_rows=relation.num_rows))})[node.node_id]
         result.node_metrics = {
-            node_id: node_result.metrics
-            for node_id, node_result in run.nodes.items()
-        }
+            node_id: NodeMetrics.from_scalars(metrics)
+            for node_id, metrics in measured.items()}
         # Saved reports need the graph and metrics without Python objects.
-        report["executed_plan"] = encode_graph(
-            plan.graph, self.session.registry.codecs)
-        report["node_metrics"] = scalar_node_metrics(run.nodes)
+        report["executed_plan"] = json.loads(plan.graph.to_json())
+        report["node_metrics"] = {
+            node_id: dict(metrics) for node_id, metrics in measured.items()}
+        observers = self.session.registry.new_observers()
+        _observe(plan.graph, response.outputs, result.node_metrics, observers)
         observer_reports = {
             observer.name: dict(observer.report())
             for observer in observers
         }
         if observer_reports:
             report["observers"] = observer_reports
-        result.report = report
-
-        (result.answer_tables, result.survivor_indices,
-         result.true_join_tables, report["stages"]) = collect_answers(
-             self.logical, plan, response.outputs, self._document_tokens)
+        self._collect_answers(result, plan, tables)
         return result
+
+    def _built_rows(self, tables: dict, finished=None) -> pa.Table:
+        """Build the region's rows from a run's output tables."""
+        if finished is None:
+            finished = self.finished_rows()
+        for node in self.plan().graph.topological_nodes():
+            for output in node.outputs:
+                table = tables.get((node.node_id, output.name))
+                if table is not None and finished.wants(node.node_id, output.name):
+                    finished.report(finished_table(node.node_id, output.name, table))
+        finished.finish()
+        return finished.rows()
+
+    def _source_values(self, name: str, expression: str) -> pa.Table:
+        """Return a source column's values for each document of its table.
+
+        Args:
+            name: The column's name in the region's rows.
+            expression: The column's source expression, as Rust's JSON.
+        """
+        source = decode_plan_value(expression)
+        alias = source.references[0].alias
+        store = self._token_inputs[alias]
+        loaded = (store.column_names if isinstance(store, pa.Table)
+                  else store.projected_columns)
+        for ref in source.references:
+            if ref.column not in loaded:
+                raise CompileError(
+                    f"the column {name!r} was not loaded by the scan of {alias!r}")
+        return pa.table({name: source.evaluate(store)})
+
+    def _answer_request(self, plan, returned: bool = False) -> dict:
+        """Return what Rust reads besides the output relations.
+
+        The operators, every output port, and each scan's documents.
+
+        Args:
+            plan: The physical plan.
+            returned: List only the ports of the nodes the run returns:
+                the model nodes and the inputs they read.
+        """
+        nodes = plan.graph.topological_nodes()
+        if returned:
+            try:
+                kept = {node.node_id for node in compute_subgraph(plan.graph).nodes}
+            except ValueError:
+                kept = set()
+            nodes = [node for node in nodes if node.node_id in kept]
+        ports = [
+            {"node_type": node.type_name, "node": node.node_id,
+             "port": output.name, "value_type": output.value_type.value,
+             "answer": None if output.answer is None else {
+                 "kind": output.answer.kind, "name": output.answer.name,
+                 "columns": list(output.answer.columns)}}
+            for node in nodes for output in node.outputs]
+        source_rows = {alias: rows.to_pylist()
+                       for alias, rows in self._alias_source_rows().items()}
+        return {
+            "operators": self.operators, "ports": ports,
+            "num_documents": {alias: len(tokens)
+                              for alias, tokens in self._document_tokens.items()},
+            "source_rows": source_rows}
+
+    def _collect_answers(self, result, plan, tables) -> None:
+        """Attach the answers, survivors, and stages Rust reads from outputs.
+
+        Each model operator's answers, the surviving documents, and each
+        predicate's measured selectivity; documents are numbered by their
+        row in the registered table.
+
+        Args:
+            result: The QueryResult to attach them to.
+            plan: The executed physical plan.
+            tables: Each output relation, by (node id, port).
+        """
+        answers, survivors, true_joins, stages = _quail_native.collect_answers(
+            json.dumps(self._answer_request(plan)), tables)
+        result.answer_tables = {kind: {} for kind in (
+            "filters", "joins", "classifies", "scores", "extracts", "features",
+            "maps")}
+        for kind, key, table in answers:
+            key = tuple(key) if isinstance(key, list) else key
+            result.answer_tables[kind][key] = table
+        result.survivor_indices = {alias: table.column(0).combine_chunks()
+                                   for alias, table in survivors}
+        result.true_join_tables = dict(true_joins)
+        result.report["stages"] = json.loads(stages)
+
+
+def _output_tables(outputs) -> dict:
+    """Return each output relation that is an Arrow table, by (node id, port)."""
+    tables = {}
+    for ref, value in outputs.items():
+        table = as_table(value)
+        if isinstance(table, pa.Table):
+            tables[(ref.node_id, ref.port)] = table
+    return tables
+
+
+def _observe(graph, outputs, metrics, observers) -> None:
+    """Show each observer every node whose outputs the run returned."""
+    if not observers:
+        return
+    values = {(ref.node_id, ref.port): value for ref, value in outputs.items()}
+    for node in graph.topological_nodes():
+        found = {output.name: values[(node.node_id, output.name)]
+                 for output in node.outputs
+                 if (node.node_id, output.name) in values}
+        if not found or len(found) != len(node.outputs):
+            continue
+        result = NodeResult(found, metrics.get(node.node_id, NodeMetrics()))
+        for observer in observers:
+            observer.after_node(node, result)

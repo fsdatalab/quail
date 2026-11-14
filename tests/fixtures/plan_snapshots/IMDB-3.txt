@@ -1,32 +1,30 @@
 logical:
-  Project: r.id, a.id
-    SemanticJoin (full)
-      PROMPT('Does the review in DOCUMENT {0} discuss the movie aspect in DOCUMENT {1}?', r.body, a.aspect) (selectivity=29.5%)
-      Join
-        cross
-        SemanticFilter
-          PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the review above whether it mentions at least one positive aspect of the movie.\n\nInstruction: answer TRUE if the review mentions at least one positive aspect of the movie, FALSE otherwise.', r.body) (selectivity=80.1%)
-          Scan reviews as r [body, id]
-        Scan aspects as a [aspect, id]
+  Projection: r.id, a.id
+    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Does the review in DOCUMENT {0} discuss the movie aspect in DOCUMENT {1}?"), r.body, a.aspect), named_struct(Utf8("selectivity"), Float64(0.2947166666666667))), filter: __quail_answer_1, returns: []
+      Cross Join:
+        AiNode: __quail_answer_2 = ai_filter(prompt(Utf8("Judge strictly from the review above whether it mentions at least one positive aspect of the movie.\n\n{0}\n\nInstruction: answer TRUE if the review mentions at least one positive aspect of the movie, FALSE otherwise."), r.body), named_struct(Utf8("selectivity"), Float64(0.8008))), filter: __quail_answer_2, returns: []
+          SubqueryAlias: r
+            TableScan: reviews projection=[id, body]
+        SubqueryAlias: a
+          TableScan: aspects projection=[id, aspect]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
-  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
+  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                                                             est. rows   est. pass   est. time
-  Project: r.id, a.id
-    AiJoin: anchor=r                                                                                                   47.5 ms
-      KV: anchor=from filters, retain after join=no
-      join 1 full (r, a)  PROMPT('Does the review in DOCUMENT {0} …')                            115.3       29.5%
-      AiFilter: r                                                                                  9.6                 23.4 ms
-        KV rewind=on
-        expected recompute at the join if the sequence's KV is released: 0 tokens, 0.000 s
-        predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')                                 12       80.1%
-        Scan reviews as r                                                                           12
-          tokens=158, mean_document_tokens=13.2
-      Scan aspects as a                                                                             12
-        tokens=164, mean_document_tokens=13.7
+                                                                                           est. rows   est. pass   est. time
+  AiJoin: anchor=r                                                                                                   43.7 ms
+    KV: anchor=from filters, retain after join=no
+    join 1 full (r, a)  PROMPT('Does the review in DOCUMENT {0} …')                            115.3       29.5%
+    AiFilter: r                                                                                  9.6                 17.5 ms
+      KV rewind=on
+      expected recompute at the join if the sequence's KV is released: 0 tokens, 0.000 s
+      predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')                                 12       80.1%
+      Scan reviews as r                                                                           12
+        tokens=134, mean_document_tokens=11.2
+    Scan aspects as a                                                                             12
+      tokens=135, mean_document_tokens=11.2
   Pipeline on r: ai_filter:r -> ai_join:r (each document runs every operator with its KV resident)
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

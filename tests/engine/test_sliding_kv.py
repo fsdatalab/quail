@@ -28,7 +28,8 @@ def cpu_arena(pages=64, sliding_pages=16):
     )
 
 
-def test_window_origin_and_trim():
+def test_a_window_trims_its_origin_and_pack_chunk_reads_both_pools_and_borrowed_pages(
+        monkeypatch):
     arena = cpu_arena()
     assert arena.has_sliding
     assert arena.origin(20) == 0
@@ -61,8 +62,7 @@ def test_window_origin_and_trim():
     arena.free_key(key)
     assert arena.free_pages == 64
 
-
-def test_pack_chunk_builds_both_pools_and_reads_borrowed_pages(monkeypatch):
+    # pack_chunk builds both pools and reads borrowed pages
     cpu_staging(monkeypatch)
     arena = cpu_arena(pages=64, sliding_pages=32)
     key = ("d", 0)

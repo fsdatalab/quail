@@ -1,31 +1,30 @@
 """Quail: a declarative query engine for AI_FILTER and AI_JOIN."""
 
-from quail.api import Query, RefusalError, Session
+import _quail_native
+
+from quail.api import Query, RefusalError, Session, SessionContext
+from quail.api.compile import SQLDialect
+from quail.api.config import EngineConfig
+from quail.api.prompts import bind_join_prompt, bind_prompt
+from quail.api.sol import SpeedOfLightEstimate, speed_of_light_estimate
 from quail.catalog import DocumentProvider, ScanRequest, TableProvider
+from quail.common.expressions import ColumnRef
 from quail.execution.result import QueryResult
 from quail.extensions import ExtensionRegistry
-from quail.frontend.sql import SQLDialect
-from quail.logical import (
-    SHARED_PRE,
-    ColumnRef,
-    bind_join_prompt,
-    bind_prompt,
-    render_join_prompt_text,
-)
-from quail.physical import NodeCodec, PhysicalGraph, PhysicalNode
-from quail.planner.plan import EngineConfig
-from quail.planner.prompt_lowering import lower_prompt, true_false_ids
-from quail.planner.sol.estimate import SpeedOfLightEstimate, speed_of_light_estimate
-from quail.remote.client import QueryRun
-from quail.remote.records import QueryFailedError, QueryStatus
+from quail.physical import ExtensionNode, PhysicalGraph, PhysicalNode
+from quail.physical.lowering import lower_prompt
+from quail.remote.client import QueryFailedError, QueryRun, QueryStatus
+
+# the label before each document in a prompt
+SHARED_PRE = _quail_native.SHARED_PRE
 
 __all__ = [
     "SHARED_PRE",
     "ColumnRef",
     "DocumentProvider",
     "EngineConfig",
+    "ExtensionNode",
     "ExtensionRegistry",
-    "NodeCodec",
     "PhysicalGraph",
     "PhysicalNode",
     "Query",
@@ -36,13 +35,12 @@ __all__ = [
     "RefusalError",
     "ScanRequest",
     "Session",
+    "SessionContext",
     "SpeedOfLightEstimate",
     "SQLDialect",
     "TableProvider",
     "bind_join_prompt",
     "bind_prompt",
     "lower_prompt",
-    "render_join_prompt_text",
     "speed_of_light_estimate",
-    "true_false_ids",
 ]

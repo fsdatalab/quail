@@ -8,17 +8,14 @@ import sys
 from types import ModuleType, SimpleNamespace
 
 import numpy as np
-import pytest
 from helpers.fakes import bare_arena, fake_pipeline, fake_torch
 
 from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.arena import KVArena, PageArena
 from quail.backends.quail.executor.chunk import Suffixes
 from quail.backends.quail.executor.gdn import plan_phases
-from quail.backends.quail.executor.stages import (
-    Stage,
-    run_stages,
-)
+from quail.backends.quail.executor.stage_executor import StageExecutor
+from quail.backends.quail.executor.stages import Stage
 
 
 class _Rows(dict):
@@ -96,11 +93,11 @@ def _run(arena, keys, stages, budget, monkeypatch, prefix_tree=None,
         if arena.is_resident(keys[anchor]):
             arena.retain(keys[anchor], lengths[anchor])
 
-    return run_stages(
+    return StageExecutor(
         fake_torch(), arena, pipeline, stages,
         prefixes or [[1] * 64 for _ in keys],
         budget, anchor_keys=keys, on_settled=settled,
-        attention_mode="unified", prefix_tree=prefix_tree)
+        attention_mode="unified", prefix_tree=prefix_tree).run()
 
 
 def _stages(count=2, frame=(7, 7), question=3):
@@ -118,15 +115,6 @@ def _retained_run(slots, retained, documents, stages, monkeypatch):
         arena.retain(key, 64)
     _run(arena, keys, stages, 72 * 12, monkeypatch)
     return arena
-
-
-@pytest.mark.parametrize("retained,stage_count", [(39, 2)],
-                         ids=["nearly-full-multistage"])
-def test_retained_documents_do_not_exhaust_the_checkpoint_slots(
-        retained, stage_count, monkeypatch):
-    arena = _retained_run(40, retained, 160, _stages(stage_count),
-                          monkeypatch)
-    assert arena.accounting.free_slots
 
 
 def _tree_run(slots, parents, children, monkeypatch, stages=1, frame=(),
@@ -160,11 +148,12 @@ def _tree_run(slots, parents, children, monkeypatch, stages=1, frame=(),
     return arena
 
 
-@pytest.mark.parametrize("slots,children,stages,frame", [
-    (10, 6, 2, (7, 7)),
-], ids=["multistage-frame"])
-def test_parents_with_many_share_lengths_run_in_a_small_pool(
-        slots, children, stages, frame, monkeypatch):
+def test_retained_documents_and_many_share_lengths_run_in_a_small_slot_pool(
+        monkeypatch):
+    # 39 retained documents nearly fill 40 checkpoint slots
+    arena = _retained_run(40, 39, 160, _stages(2), monkeypatch)
+    assert arena.accounting.free_slots
+
     # a pool too small for every share point keeps the ones that save
     # the most, and the other borrowers compute their whole prefix
-    _tree_run(slots, 6, children, monkeypatch, stages=stages, frame=frame)
+    _tree_run(10, 6, 6, monkeypatch, stages=2, frame=(7, 7))

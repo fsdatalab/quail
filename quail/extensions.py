@@ -4,23 +4,45 @@ from __future__ import annotations
 
 import importlib
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from types import MappingProxyType, ModuleType
-from typing import TYPE_CHECKING, Any
-
-from quail.physical import NodeCodec, PhysicalNode
-from quail.planner.optimizer.rules import LogicalRule, PhysicalRule
+from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
     from quail.backends.base import ModelBackend
     from quail.execution.runner import ExecutionObserver, NodeRuntime
-    from quail.planner.optimizer.candidates import PhysicalPlanner
     from quail.specs import DeviceSpec, ModelSpec
 
 
+@dataclass(frozen=True)
+class LogicalRule:
+    """A logical optimizer rule that DataFusion runs over a query's plan.
+
+    The name is the rule's ``OptimizerRule::name()``: one of Quail's
+    rules or DataFusion's default rules, listed in
+    ``quail_datafusion::logical_rule``. A registry lists the rules a
+    session applies, by name, in the order they apply.
+    """
+
+    name: str
+    kind: ClassVar[str] = "logical"
+
+
+@dataclass(frozen=True)
+class PhysicalRule:
+    """A physical rule of the Rust planner, which rewrites a physical graph.
+
+    The rules are in ``crates/quail-planner/src/physical_rules.rs``.
+    """
+
+    name: str
+    kind: ClassVar[str] = "physical"
+
+
 _KINDS = {
-    "logical_rule", "physical_planner", "physical_rule",
+    "logical_rule", "physical_rule",
     "backend",
-    "model", "device", "codec", "runtime", "observer",
+    "model", "device", "runtime", "observer",
 }
 
 
@@ -51,10 +73,6 @@ class ExtensionRegistry:
         return self._values("logical_rule")
 
     @property
-    def physical_planners(self) -> Mapping[str, PhysicalPlanner]:
-        return self._values("physical_planner")
-
-    @property
     def physical_rules(self) -> Mapping[str, PhysicalRule]:
         return self._values("physical_rule")
 
@@ -78,10 +96,6 @@ class ExtensionRegistry:
     @property
     def devices(self) -> Mapping[str, DeviceSpec]:
         return self._values("device")
-
-    @property
-    def codecs(self) -> Mapping[str, NodeCodec]:
-        return self._values("codec")
 
     @property
     def runtimes(self) -> Mapping[str, NodeRuntime]:
@@ -113,34 +127,6 @@ class ExtensionRegistry:
     def register_device(self, device: DeviceSpec) -> ExtensionRegistry:
         return self._add("device", device.name, device)
 
-    def register_node(
-        self,
-        node_type: type[PhysicalNode],
-        *,
-        runtime: NodeRuntime,
-        codec: NodeCodec | None = None,
-    ) -> ExtensionRegistry:
-        """Register a physical node's codec and runtime together.
-
-        Args:
-            node_type: Physical node class with a type_name and runtime_key.
-            runtime: Implementation that executes the node.
-            codec: Node codec. Defaults to NodeCodec(node_type).
-        """
-        if not isinstance(node_type, type) or not issubclass(node_type, PhysicalNode):
-            raise TypeError("register_node needs a PhysicalNode class")
-        codec = NodeCodec(node_type) if codec is None else codec
-        if codec.node_type is not node_type:
-            raise ValueError("the codec must describe the registered node class")
-        self._check_name("codec", codec.type_name)
-        self._check_name("runtime", node_type.runtime_key)
-        self._registrations["codec", codec.type_name] = codec
-        self._registrations["runtime", node_type.runtime_key] = runtime
-        return self
-
-    def register_codec(self, codec: NodeCodec) -> ExtensionRegistry:
-        return self._add("codec", codec.type_name, codec)
-
     def register_runtime(
         self, runtime: NodeRuntime, *, key: str | None = None,
     ) -> ExtensionRegistry:
@@ -161,7 +147,9 @@ class ExtensionRegistry:
 
     def _register_rule(self, rule, name, *, kind, rule_type):
         if not isinstance(rule, rule_type):
-            raise TypeError(f"{kind} needs a {rule_type.__name__} subclass")
+            raise TypeError(
+                f"{kind} needs a {rule_type.__name__}: Quail's rules are "
+                f"written in Rust and registered by name")
         name = rule.name if name is None else name
         self._check_name(kind, name)
         if name in self.rules:
@@ -171,21 +159,14 @@ class ExtensionRegistry:
     def register_logical_rule(
         self, rule: LogicalRule, *, name: str | None = None,
     ) -> ExtensionRegistry:
-        """Register a rule that simplifies or proposes query trees."""
+        """Register a logical rule of the Rust planner by name."""
         return self._register_rule(
             rule, name, kind="logical_rule", rule_type=LogicalRule)
-
-    def register_physical_planner(
-        self, planner: PhysicalPlanner, *, name: str | None = None,
-    ) -> ExtensionRegistry:
-        return self._add(
-            "physical_planner", planner.name if name is None else name, planner,
-        )
 
     def register_physical_rule(
         self, rule: PhysicalRule, *, name: str | None = None,
     ) -> ExtensionRegistry:
-        """Register an executable graph rule in dependency order."""
+        """Register a physical rule of the Rust planner by name, in apply order."""
         return self._register_rule(
             rule, name, kind="physical_rule", rule_type=PhysicalRule)
 

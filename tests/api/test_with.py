@@ -1,16 +1,17 @@
-"""WITH: common table expressions whose results later AI operators read."""
+"""WITH: common table expressions whose results later AI operators read.
 
+Each transcript test's transcript shows the plan, the
+questions the model answered, and the rows (helpers/transcript.py). A
+question about an extracted text names the text.
+"""
 
 import pyarrow as pa
-import pytest
-from helpers.oracle import Oracle, oracle_executor
+from helpers.sessions import TOKENIZER
+from helpers.transcript import Transcripts, assert_transcript
 
 import quail
-from quail.api import execute as execution
-from quail.api.query import Query
+from quail.api.config import EngineConfig
 from quail.catalog import DocumentProvider
-from quail.physical import QueryStage, decode_graph, encode_graph
-from quail.planner.plan import EngineConfig, PhysicalPlan
 
 CONTRACTS = pa.table({
     "id": [1, 2, 3],
@@ -19,8 +20,8 @@ CONTRACTS = pa.table({
              "Lease ends in 2030. Early termination is forbidden."],
 })
 # the planted termination clause of each contract; the second has none
-CLAUSES = {0: "Tenant may terminate early with notice", 1: None,
-           2: "Early termination is forbidden"}
+CLAUSES = {"1": "Tenant may terminate early with notice", "2": None,
+           "3": "Early termination is forbidden"}
 
 EXTRACT_THEN_SCORE = """
 WITH clauses AS (
@@ -33,132 +34,201 @@ SELECT x.id, x.clause,
            AS score
 FROM clauses x
 """
+READ_TWICE = """
+WITH clauses AS (
+    SELECT c.id,
+           AI.EXTRACT(c.text, STRUCT('What is the termination clause?' AS terms))
+               AS clause
+    FROM contracts c
+),
+unused AS (
+    SELECT c.id FROM contracts c WHERE AI.IF(PROMPT('never asked: {0}', c.text))
+)
+SELECT a.id, b.id AS other
+FROM clauses a JOIN clauses b
+  ON AI.IF(PROMPT('same clause? {0} {1}', a.clause.terms, b.clause.terms))
+"""
+LIMITED = """
+WITH first AS (
+    SELECT c.id FROM contracts c WHERE AI.IF(PROMPT('keep {0}', c.text))
+    ORDER BY c.id LIMIT 2)
+SELECT f.id AS result_id FROM first f WHERE f.id > 0
+"""
+KEPT_ON_THE_RIGHT = """
+WITH kept AS (
+    SELECT c.id, c.text FROM contracts c WHERE AI.IF(PROMPT('keep {0}', c.text)))
+SELECT a.id, b.id AS other FROM contracts a JOIN kept b
+ON AI.IF(PROMPT('same? {0} {1}', a.text, b.text))
+"""
 
 
-def words(text):
-    return text.split()
+def _answer(kind, prompt, rows):
+    """The model's answers: planted clauses, and tests of them and of contracts."""
+    if kind == "extract":
+        return CLAUSES[rows[0]]
+    if kind == "score":
+        # scores a float32 holds exactly, as the executor reads them
+        return 0.875 if "Tenant may" in rows[0] else 0.125
+    if kind == "label":
+        return "lease" if rows[0] in ("1", "3") else "note"
+    if len(rows) == 2:
+        # a join: a pair of the same text matches
+        return rows[0] == rows[1]
+    return rows[0] != "2"
 
 
-@pytest.fixture()
-def session():
+def _transcript(*queries, answer=_answer) -> str:
+    """Transcripts of queries, each SQL or (SQL, keyword arguments)."""
+    with Transcripts({"contracts": CONTRACTS}, answer) as runs:
+        return "\n".join(runs.query(query[0], **query[1])
+                         if isinstance(query, tuple) else runs.query(query)
+                         for query in queries)
+
+
+def test_an_extraction_in_a_cte_is_scored_by_its_extracted_text():
+    # a NULL clause has a NULL score: the model is not asked about it
+    assert_transcript(_transcript(EXTRACT_THEN_SCORE), """\
+---  WITH clauses AS (     SELECT c.id,            AI.EXTRACT(c.text, {'terms': 'What is
+    the termination clause?'}) AS clause     FROM contracts c ) SELECT x.id, x.clause,
+    AI.SCORE(PROMPT('Can the tenant terminate early? {0}', x.clause.terms))
+    AS score FROM clauses x  ---
+plan
+  score = ai_score('Can the tenant terminate early? {0}', get_field(x.column_1,
+      'terms'))
+  clause = ai_extract(c.text, named_struct('terms', 'What is the termination clause?')),
+      returns: [clause]
+asked 5 of 5
+  'What is the termination clause?': 1 'Tenant may terminate early with notice', 2 NULL,
+      3 'Early termination is forbidden'
+  'Can the tenant terminate early? {0}': 'Early termination is forbidden' 0.125, 'Tenant
+      may terminate early with notice' 0.875
+rows 3
+  1, {'terms': 'Tenant may terminate early with notice'}, 0.875
+  2, {'terms': None}, NULL
+  3, {'terms': 'Early termination is forbidden'}, 0.125
+""")
+
+
+def test_a_cte_runs_once_however_many_times_it_is_read():
+    # the extraction once, though the join reads it twice; the CTE nothing
+    # reads never runs, and the contract with no clause matches nothing
+    assert_transcript(_transcript((READ_TWICE, {"dialect": "bq"})), """\
+---  WITH clauses AS (     SELECT c.id,            AI.EXTRACT(c.text, STRUCT('What is
+    the termination clause?' AS terms))                AS clause     FROM contracts c ),
+    unused AS (     SELECT c.id FROM contracts c WHERE AI.IF(PROMPT('never asked: {0}',
+    c.text)) ) SELECT a.id, b.id AS other FROM clauses a JOIN clauses b   ON
+    AI.IF(PROMPT('same clause? {0} {1}', a.clause.terms, b.clause.terms))  ---
+plan
+  __quail_answer_1 = ai_filter('same clause? {0} {1}', get_field(a.clause, 'terms'),
+      get_field(b.clause, 'terms')), filter: __quail_answer_1, returns: []
+  clause = ai_extract(c.text, named_struct('terms', 'What is the termination clause?')),
+      returns: [clause]
+asked 7 of 10
+  'What is the termination clause?': 1 'Tenant may terminate early with notice', 2 NULL,
+      3 'Early termination is forbidden'
+  'same clause? {0} {1}': 'Early termination is forbidden'+'Early termination is
+      forbidden' TRUE, 'Early termination is forbidden'+'Tenant may terminate early with
+      notice' FALSE, 'Tenant may terminate early with notice'+'Early termination is
+      forbidden' FALSE, 'Tenant may terminate early with notice'+'Tenant may terminate
+      early with notice' TRUE
+rows 2
+  1, 1
+  3, 3
+""")
+
+
+def test_a_cte_that_filters_or_classifies_returns_the_rows_its_reader_selects():
+    assert_transcript(_transcript(
+        (LIMITED, {"dialect": "bq"}),
+        # a filtered CTE on the right of a join keeps its filter
+        (KEPT_ON_THE_RIGHT, {"dialect": "bq"}),
+        # DataFusion names the reader's columns
+        ("WITH k AS (SELECT c.id, AI.CLASSIFY(c.text, ['lease', 'note']) AS kind "
+         "FROM contracts c) SELECT k.id, k.kind FROM k WHERE k.kind = 'lease'",
+         {"columns": True})), """\
+---  WITH first AS (     SELECT c.id FROM contracts c WHERE AI.IF(PROMPT('keep {0}',
+    c.text))     ORDER BY c.id LIMIT 2) SELECT f.id AS result_id FROM first f WHERE f.id
+    > 0  ---
+plan
+  __quail_answer_1 = ai_filter('keep {0}', c.text), filter: __quail_answer_1, returns:
+      []
+asked 3 of 3
+  'keep {0}': 1 TRUE, 2 FALSE, 3 TRUE
+rows 2
+  1
+  3
+
+---  WITH kept AS (     SELECT c.id, c.text FROM contracts c WHERE AI.IF(PROMPT('keep
+    {0}', c.text))) SELECT a.id, b.id AS other FROM contracts a JOIN kept b ON
+    AI.IF(PROMPT('same? {0} {1}', a.text, b.text))  ---
+plan
+  __quail_answer_2 = ai_filter('same? {0} {1}', a.text, b.text), filter:
+      __quail_answer_2, returns: []
+  __quail_answer_1 = ai_filter('keep {0}', c.text), filter: __quail_answer_1, returns:
+      []
+asked 9 of 9
+  'keep {0}': 1 TRUE, 2 FALSE, 3 TRUE
+  'same? {0} {1}': 1+1 TRUE, 1+2 FALSE, 1+3 FALSE, 3+1 FALSE, 3+2 FALSE, 3+3 TRUE
+rows 2
+  1, 1
+  3, 3
+
+--- WITH k AS (SELECT c.id, AI.CLASSIFY(c.text, ['lease', 'note']) AS kind FROM
+    contracts c) SELECT k.id, k.kind FROM k WHERE k.kind = 'lease' ---
+plan
+  kind = ai_classify(c.text, make_array('lease', 'note')), filter: kind = 'lease'
+asked 3 of 3
+  '?': 1 'lease', 2 'note', 3 'lease'
+columns k.id int64, k.kind string
+rows 2
+  1, 'lease'
+  3, 'lease'
+""")
+
+
+def test_a_cte_join_can_reuse_an_alias_from_the_ctes_scope():
+    sql = ("WITH kept AS (SELECT c.id, c.text FROM contracts c "
+           "WHERE AI.IF(PROMPT('keep {0}', c.text))) "
+           "SELECT k.id AS contract_id, c.text AS contract_text "
+           "FROM kept k JOIN contracts c ON k.id = c.id")
+    query = (sql, {"columns": True})
+    assert_transcript(_transcript(query, answer=lambda *_: True)
+                      + "\n" + _transcript(query, answer=lambda *_: False), """\
+--- WITH kept AS (SELECT c.id, c.text FROM contracts c WHERE AI.IF(PROMPT('keep {0}',
+    c.text))) SELECT k.id AS contract_id, c.text AS contract_text FROM kept k JOIN
+    contracts c ON k.id = c.id ---
+plan
+  __quail_answer_1 = ai_filter('keep {0}', c.text), filter: __quail_answer_1, returns:
+      []
+asked 3 of 3
+  'keep {0}': 1 TRUE, 2 TRUE, 3 TRUE
+columns contract_id int64, contract_text string
+rows 3
+  1, 'Lease ends on March 3. Tenant may terminate early with notice.'
+  2, 'No dates here. Nothing about ending.'
+  3, 'Lease ends in 2030. Early termination is forbidden.'
+
+--- WITH kept AS (SELECT c.id, c.text FROM contracts c WHERE AI.IF(PROMPT('keep {0}',
+    c.text))) SELECT k.id AS contract_id, c.text AS contract_text FROM kept k JOIN
+    contracts c ON k.id = c.id ---
+plan
+  __quail_answer_1 = ai_filter('keep {0}', c.text), filter: __quail_answer_1, returns:
+      []
+asked 3 of 3
+  'keep {0}': 1 FALSE, 2 FALSE, 3 FALSE
+columns contract_id int64, contract_text string
+rows 0
+""")
+
+
+def test_a_cte_is_a_model_region_of_its_own_when_an_ai_operator_reads_it():
     with quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
-                       tokenizer=words) as value:
-        value.register("contracts",
-                       DocumentProvider.from_table(CONTRACTS, id_col="id"))
-        yield value
-
-
-class Recorder:
-    """Run requests on an oracle and keep the documents each stage saw."""
-
-    def __init__(self, oracle):
-        self.execute = oracle_executor(oracle)
-        self.requests = []
-        self.documents = {}   # alias -> each document's tokens, per request
-
-    def __call__(self, request):
-        self.requests.append(request)
-        for key, value in request.inputs.items():
-            self.documents.setdefault(key, []).append(
-                [list(document) for document in value.documents])
-        return self.execute(request)
-
-
-def run(query, oracle):
-    recorder = Recorder(oracle)
-    result = execution.execute_query(query, physical_executor=recorder)
-    return result, recorder
-
-
-def test_extraction_then_score_sends_the_extracted_text_to_the_scorer(session):
-    query = session.sql(EXTRACT_THEN_SCORE)
-    assert isinstance(query, Query)
-    plan = query.plan()
-    assert isinstance(plan, PhysicalPlan)
-    assert all(isinstance(node, QueryStage) for node in plan.nodes)
-    envelope = plan.to_envelope(session.registry.codecs)
-    decoded = decode_graph(envelope["graph"], session.registry.codecs)
-    assert encode_graph(decoded, session.registry.codecs) == envelope["graph"]
-    oracle = Oracle(answers=lambda spec, document: CLAUSES[document],
-                    scores=lambda spec, ids: 0.9 if ids[0] == 0 else 0.1)
-    result, recorder = run(query, oracle)
-    rows = result.collect()
-    assert rows.column("x.id").to_pylist() == [1, 2, 3]
-    assert rows.column("x.clause").to_pylist() == [
-        {"terms": clause} for clause in CLAUSES.values()]
-    assert rows.column("score").to_pylist() == [0.9, 0.1, 0.1]
-    # the scorer read the extracted clauses, not the contracts; a null
-    # answer reaches it as empty text
-    (scored,) = recorder.documents["x"]
-    assert scored == [words(CLAUSES[0]), [], words(CLAUSES[2])]
-    assert len(recorder.requests) == 2
-    # every stage counts in the totals; each CTE keeps its own report
-    assert result.report["wall_s"] == 2.0
-    assert result.report["fresh_tokens"] == 2 * 1234
-    assert result.report["ctes"]["clauses"]["wall_s"] == 1.0
-    assert result.report["ctes"]["clauses"]["node_metrics"]["ai-extract:0"][
-        "evaluated_documents"] == 3
-    assert result.plan == query.plan().graph
-    assert "AiExtract" in result.explain()
-    assert "quail.ai_score" in result.explain()
-
-
-def test_a_cte_runs_once_however_many_times_it_is_read(session):
-    query = session.sql("""
-        WITH clauses AS (
-            SELECT c.id,
-                   AI.EXTRACT(c.text, {'terms': 'What is the termination clause?'})
-                       AS clause
-            FROM contracts c
-        ),
-        unused AS (
-            SELECT c.id FROM contracts c
-            WHERE AI.IF(PROMPT('never asked: {0}', c.text))
-        )
-        SELECT a.id, b.id AS other
-        FROM clauses a JOIN clauses b
-          ON AI.IF(PROMPT('same clause? {0} {1}', a.clause.terms, b.clause.terms))
-    """, dialect="bq")
-    # a CTE nothing reads is left out
-    assert [name for name, _ in query.logical.stages() if name] == ["clauses"]
-    oracle = Oracle(answers=lambda spec, document: CLAUSES[document],
-                    joins=lambda node, assignment: (
-                        assignment["a"] == assignment["b"]))
-    result, recorder = run(query, oracle)
-    assert len(recorder.requests) == 2
-    rows = result.collect()
-    assert rows.column("a.id").to_pylist() == [1, 2, 3]
-    assert rows.column("other").to_pylist() == [1, 2, 3]
-    # both aliases read the one result table
-    assert recorder.documents["a"] == recorder.documents["b"]
-
-
-@pytest.mark.parametrize("sql", [
-    """WITH first AS (
-           SELECT c.id FROM contracts c WHERE AI.IF(PROMPT('keep {0}', c.text))
-           ORDER BY c.id LIMIT 2)
-       SELECT f.id AS result_id FROM first f WHERE f.id > 0""",
-])
-def test_relational_stages_before_and_after_ai_return_the_selected_rows(session, sql):
-    result, recorder = run(session.sql(sql, dialect="bq"),
-                           Oracle(filters=lambda *args: True,
-                                  joins=lambda node, assignment:
-                                  len(set(assignment.values())) == 1))
-    assert result.collect().column("result_id").to_pylist() == [1, 2]
-    assert "Project" in result.explain()
-    assert len(recorder.requests) == 1
-
-
-def test_a_filtered_cte_on_the_right_of_a_join_keeps_its_filter(session):
-    query = session.sql("""
-        WITH kept AS (
-            SELECT c.id, c.text FROM contracts c
-            WHERE AI.IF(PROMPT('keep {0}', c.text)))
-        SELECT a.id, b.id AS other FROM contracts a JOIN kept b
-        ON AI.IF(PROMPT('same? {0} {1}', a.text, b.text))
-    """, dialect="bq")
-    result, recorder = run(query, Oracle(
-        filters=lambda alias, document, position: document != 1,
-        joins=lambda node, assignment: len(set(assignment.values())) == 1))
-    assert result.collect().to_pydict() == {"a.id": [1, 3], "other": [1, 3]}
-    assert len(recorder.requests) == 1
+                       tokenizer=TOKENIZER) as session:
+        session.register("contracts",
+                         DocumentProvider.from_table(CONTRACTS, id_col="id"))
+        regions = {sql: session.sql(sql, dialect="bq").num_regions
+                   for sql in (READ_TWICE, LIMITED, KEPT_ON_THE_RIGHT)}
+        regions[EXTRACT_THEN_SCORE] = session.sql(EXTRACT_THEN_SCORE).num_regions
+    # the CTE nothing reads has no region
+    assert regions == {EXTRACT_THEN_SCORE: 2, READ_TWICE: 2, LIMITED: 1,
+                       KEPT_ON_THE_RIGHT: 1}

@@ -66,23 +66,17 @@ def _device():
 
 
 def _prompt_ids():
-    from gigatoken import Tokenizer
-
-    from quail.logical import bind_prompt
-    from quail.planner.prompt_lowering import (
-        lower_prompt,
-        render_filter_prompt_ids,
-    )
+    from quail.api.prompts import bind_prompt
+    from quail.common.tokens import Tokenizer
+    from quail.physical.lowering import lower_prompt
     from quail.specs import MODELS
+    from quail.specs.files import resolve_model_path
 
     spec = MODELS[MODEL]
-    tokenizer = Tokenizer(spec.hf_name).as_hf()
-
-    def ids(text):
-        return tokenizer(text, add_special_tokens=False)["input_ids"]
+    ids = Tokenizer(resolve_model_path(spec.hf_name, spec.revision))
 
     prompt = lower_prompt(bind_prompt(QUESTION, ("body",), turn=spec.turn), ids)
-    return [render_filter_prompt_ids(prompt, ids(review))
+    return [[*prompt.preamble_token_ids, *ids(review), *prompt.tail_token_ids]
             for review in REVIEWS]
 
 
@@ -213,17 +207,17 @@ def quail(prompts, stock_layers):
 
 
 def test_answers_agree_with_stock_vllm(stock_layers, quail):
-    from gigatoken import Tokenizer
-
-    from quail.planner.prompt_lowering import true_false_ids
+    from quail.common.tokens import Tokenizer, model_answers
     from quail.specs import MODELS
+    from quail.specs.files import resolve_model_path
 
     quail_layers, model = quail
     stock_rows = [rows[-1] for rows in stock_layers]
     rows = [rows[-1] for rows in quail_layers]
     spec = MODELS[MODEL]
-    true_ids, false_ids = true_false_ids(
-        Tokenizer(spec.hf_name).as_hf())
+    true_ids, false_ids, _ = model_answers(
+        spec, Tokenizer(resolve_model_path(spec.hf_name, spec.revision)))
+    true_ids, false_ids = sorted(true_ids), sorted(false_ids)
     columns = list(model.quail_answer_token_ids)
     weights = model.quail_answer_weights.float().cpu()
     norm = model.model.norm

@@ -3,9 +3,6 @@
   "pages": [
     "index",
     "user-guide",
-    "demos",
-    "architecture",
-    "extending",
     "contributing"
   ]
 }

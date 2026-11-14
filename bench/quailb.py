@@ -13,6 +13,7 @@ no Modal or volume is involved:
 """
 
 import argparse
+import json
 import os
 import time
 from dataclasses import asdict
@@ -27,13 +28,19 @@ import quail
 import quail_b as benchmark
 from bench import substrait
 from bench.results import write_json
-from quail.baselines.nodes import RequestExecution
+from quail.api.prompts import bind_classify_prompt, bind_extract_prompt
 from quail.execution.result import answer_values
-from quail.logical.expressions import SPAN_SUFFIX
-from quail.logical.prompts import bind_classify_prompt, bind_extract_prompt
-from quail.physical import AiClassify, AiExtract, AiMap, AiSaeFeatures, AiScore
-from quail.planner.plan import Refusal
-from quail.planner.prompt_lowering import lower_prompt
+from quail.physical import (
+    AiClassify,
+    AiExtract,
+    AiMap,
+    AiSaeFeatures,
+    AiScore,
+    RequestExecution,
+    decode_plan_value,
+)
+from quail.physical.lowering import lower_prompt
+from quail.physical.plan import Refusal
 from quail.progress import say
 from quail.specs import DEVICES, MODELS
 from quail_b.queries import (
@@ -47,7 +54,7 @@ from quail_b.queries import (
 )
 from quail_b.queries import queries as query_specs
 from quail_b.scoring import RunOutput, reference_answer
-from quail_b.substrait import Filter, InList, PlanInfo
+from quail_b.substrait import Filter, InList, PlanInfo, StartsWith
 
 # the fixed planner inputs, by prompt, and by prompt and accepted
 # labels for an IN-list filter; a predicate without an estimate here gets
@@ -183,6 +190,39 @@ def answer_oracle(ground_truth, tables):
     return answer
 
 
+def answer_name(output: str, relations, outputs, aliases: dict) -> str:
+    """Return the name Quail gave an operator's answer column.
+
+    An answer the query returns under its output name keeps that name.
+    One the query only tests, sorts by, or aggregates has no name in its
+    SQL, so Quail names its column itself, and it is the one unnamed
+    answer over the operator's relations.
+
+    Args:
+        output: The operator's output name in the benchmark's plan.
+        relations: The aliases the operator reads.
+        outputs: The output names of the plan's operators of this kind.
+        aliases: Each answer column Quail computed -> the aliases it reads.
+
+    Raises:
+        KeyError: No one answer column is the operator's.
+    """
+    if output in aliases:
+        return output
+    unnamed = [name for name, read in aliases.items()
+               if name not in outputs and set(relations) <= set(read)]
+    if len(unnamed) != 1:
+        raise KeyError(f"no one answer column for {output}: {unnamed}")
+    return unnamed[0]
+
+
+def label_name(info: PlanInfo, operator, aliases: dict) -> str:
+    """Return the name Quail gave a classification's column."""
+    return answer_name(
+        operator.output, operator.relations,
+        {found.output for found in info.classifies}, aliases)
+
+
 def run_output(result, info: PlanInfo, tables) -> RunOutput:
     """Translate a Quail result's row indices into benchmark ids by operator."""
     ids = {relation.alias: pa.array(_ids(tables[relation.table]), pa.string())
@@ -194,20 +234,24 @@ def run_output(result, info: PlanInfo, tables) -> RunOutput:
     filter_answers = {}
     for (alias, position), table in result.answer_tables["filters"].items():
         operator = _alias_filters(info, alias)[position]
-        if isinstance(operator, InList):
-            # QUAIL-B scores an IN-list filter from the classification's labels
+        if isinstance(operator, (InList, StartsWith)):
+            # QUAIL-B scores an IN-list filter from the classification's
+            # labels, and a map answer has no reference
             continue
         filter_answers[operator.id] = pa.table({
             alias: id_column(alias, table.column(alias)),
             "answer": answer_values(table),
         })
     classify_answers = {}
+    labels = result.answer_tables["classifies"]
     for operator in info.classifies:
-        table = result.answer_tables["classifies"][operator.output]
+        name = label_name(info, operator, {
+            found: table.column_names for found, table in labels.items()})
+        table = labels[name]
         classify_answers[operator.id] = pa.table({
             **{alias: id_column(alias, table.column(alias))
                for alias in operator.relations},
-            "label": table.column(operator.output),
+            "label": table.column(name),
         })
     join_answers = {}
     for position, table in result.answer_tables["joins"].items():
@@ -222,8 +266,13 @@ def run_output(result, info: PlanInfo, tables) -> RunOutput:
         """Return operator ID -> its answer table, the ids and one column."""
         tables = {}
         for operator in operators:
+            found = result.answer_tables[kind]
             name = operator.output if name_of is None else name_of(operator)
-            table = result.answer_tables[kind][name]
+            name = answer_name(
+                name, (operator.relation,),
+                {other.output for other in operators},
+                {key: table.column_names for key, table in found.items()})
+            table = found[name]
             values = table.column(name)
             tables[operator.id] = pa.table({
                 operator.relation: id_column(
@@ -239,15 +288,11 @@ def run_output(result, info: PlanInfo, tables) -> RunOutput:
         "extracts", info.extracts, "answer", pa.string(),
         name_of=lambda operator: _extract_name(info, operator))
     # quail-b checks that a plan selects ids, labels, scores, answer
-    # structs, and measures; an answer struct brings its span struct,
-    # which the benchmark does not take
+    # structs, and measures
     names = list(info.columns)
     started = time.perf_counter()
     table = result.collect()
     collection_s = time.perf_counter() - started
-    spans = [f"{struct.name}{SPAN_SUFFIX}" for struct in info.structs]
-    table = table.drop_columns([name for name in table.column_names
-                              if name in spans])
     return RunOutput(
         filter_answers, join_answers, table.rename_columns(names),
         result.report["wall_s"], dict(result.report, collection_s=collection_s),
@@ -259,9 +304,9 @@ def run_output(result, info: PlanInfo, tables) -> RunOutput:
 
 
 def _alias_filters(info: PlanInfo, alias: str) -> list:
-    """Return an alias's AI filters and IN-list filters, in written order."""
+    """Return an alias's AI filters and answer tests, in written order."""
     return [operator for operator in info.operators
-            if isinstance(operator, (Filter, InList))
+            if isinstance(operator, (Filter, InList, StartsWith))
             and operator.relation == alias]
 
 
@@ -288,51 +333,56 @@ def prompt_pieces(query, info: PlanInfo, anchors) -> dict | None:
         info: The query's plan reading, for the operator ids.
         anchors: Written join position -> the anchor alias.
     """
-    operators = query.logical.operators()
-    filters, joins = operators.filters, operators.joins
+    prompts = query.facts()["prompts"]
+    filters = {alias: [decode_plan_value(json.dumps(prompt)) for prompt in written]
+               for alias, written in prompts["filters"].items()}
+    joins = [decode_plan_value(json.dumps(prompt)) for prompt in prompts["joins"]]
+    classifies = {name: (decode_plan_value(json.dumps(found["prompt"])),
+                         found["aliases"])
+                  for name, found in prompts["classifies"].items()}
 
     def lower(prompt):
         return lower_prompt(prompt, query.session.tokenizer)
 
+    every = [*(prompt for written in filters.values() for prompt in written),
+             *(prompt for prompt, _ in classifies.values()), *joins]
     preamble = next((list(lower(prompt).preamble_token_ids)
-                     for prompt in operators.prompts
-                     if lower(prompt).preamble_token_ids), [])
+                     for prompt in every if lower(prompt).preamble_token_ids), [])
     pieces = {"tokenizer": query.session.model.hf_name, "preamble": preamble,
               "filters": [], "joins": [], "classifies": [], "scores": [],
               "extracts": [], "features": [], "maps": []}
-    for alias, predicates in filters.items():
+    for alias, written_prompts in filters.items():
         written = _alias_filters(info, alias)
-        for position, predicate in enumerate(predicates):
-            if isinstance(written[position], InList):
+        for position, prompt in enumerate(written_prompts):
+            if isinstance(written[position], (InList, StartsWith)):
                 continue
             pieces["filters"].append({
                 "id": written[position].id,
-                "tail": list(lower(predicate.prompt).tail_token_ids)})
-    for position, join in enumerate(joins):
+                "tail": list(lower(prompt).tail_token_ids)})
+    for position, prompt in enumerate(joins):
         anchor = anchors[position]
         pieces["joins"].append({
             "id": info.joins[position].id, "anchor": anchor,
-            **_pair_pieces(lower(join.prompt), anchor)})
-    if info.classifies:
-        labels = operators.labels
-        calls = {labels.names[call]: call for call, _ in labels.calls}
-        for operator in info.classifies:
-            call = calls[operator.output]
-            if operator.partner is None:
-                piece = {"tail": list(lower(call.prompt).tail_token_ids)}
-            else:
-                # the anchor is the call's first document
-                anchor = call.aliases()[0]
-                piece = {"anchor": anchor,
-                         **_pair_pieces(lower(call.prompt), anchor)}
-            pieces["classifies"].append({"id": operator.id, **piece})
+            **_pair_pieces(lower(prompt), anchor)})
+    for operator in info.classifies:
+        prompt, aliases = classifies[label_name(info, operator, {
+            name: read for name, (_, read) in classifies.items()})]
+        if operator.partner is None:
+            piece = {"tail": list(lower(prompt).tail_token_ids)}
+        else:
+            # the anchor is the call's first document
+            anchor = aliases[0]
+            piece = {"anchor": anchor, **_pair_pieces(lower(prompt), anchor)}
+        pieces["classifies"].append({"id": operator.id, **piece})
     # the planner lays a score out as the AI.IF prompt of its document,
     # so its head is the preamble and its tail follows the document
+    scored = {node.spec.name: node for node in query.plan().nodes
+              if isinstance(node, AiScore) and not isinstance(node, AiClassify)}
     for operator in info.scores:
-        node = next(node for node in query.plan().nodes
-                    if isinstance(node, AiScore)
-                    and not isinstance(node, AiClassify)
-                    and node.spec.name == operator.output)
+        node = scored[answer_name(
+            operator.output, (operator.relation,),
+            {found.output for found in info.scores},
+            {name: (operator.relation,) for name in scored})]
         head, tail = node.spec.prompt_token_parts
         if not pieces["preamble"]:
             pieces["preamble"] = list(head)
@@ -407,6 +457,8 @@ def _submission_to_answer_s(
         report["model_wall_s"]
         + report["finish_s"]
         + answer_prepare_s
+        # DataFusion's planning and operators around the model region
+        + report.get("datafusion_s", 0.0)
     )
     if backend == "quail":
         runtime_s += (
@@ -603,7 +655,7 @@ def main():
     args = parser.parse_args()
     run_suite(
         [value.strip() for value in args.only.split(",")] if args.only else None,
-        scale_factor=args.scale_factor,
+        scale_factor=args.sf,
         config=quail.EngineConfig(
             gpus=args.gpus,
             model=args.model,

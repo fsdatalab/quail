@@ -1,32 +1,29 @@
+DataFusion:
+SortExec: TopK(fetch=20), expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]
+  CooperativeExec
+    ModelRegionExec: hint=[DynamicFilter [ empty ]], calls=[ai_extract, ai_filter], tables=[contracts]
+
+model region:
 logical:
-  Limit: 20
-    Sort: c.id ASC NULLS LAST
-      Project: c.id, contract.expiration_date
-        contract = struct(contract.expiration_date)
-        SemanticExtract: contract.expiration_date, contract.expiration_date_span
-          question="On what date will the contract's initial term expire?"
-          SemanticFilter
-            PROMPT('DOCUMENT:\n{0}\n\nCan a party terminate this\xa0 contract without cause (solely by giving a notice and allowing a waiting\xa0 period to expire)?', c.text) (selectivity=32.7%)
-            Scan contracts as c [text, id]
+  Projection: c.id, contract
+    AiNode: contract = ai_extract(c.text, named_struct(Utf8("expiration_date"), Utf8("On what date will the contract's initial term expire?"))), returns: [contract]
+      AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("{0}\n\nCan a party terminate this  contract without cause (solely by giving a notice and allowing a waiting  period to expire)?"), c.text), named_struct(Utf8("selectivity"), Float64(0.3273942093541203))), filter: __quail_answer_1, returns: []
+        SubqueryAlias: c
+          TableScan: contracts projection=[id, text]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
-  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
+  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                                                                   est. rows   est. pass   est. time
-  Sort: c.id ASC NULLS LAST
-    fetch=20
-    Project: c.id, contract, contract_span
-      contract = struct(contract.expiration_date)
-      contract_span = struct(contract.expiration_date_span)
-      AiExtract: contract.expiration_date over c                                                                             3.48 ms
-        question="On what date will the contract's initial term expire?", up to 64 answer tokens
-        AiFilter: c                                                                                        2                 9.36 ms
-          KV rewind=on
-          predicate 1  PROMPT('DOCUMENT:\n{0}\n\nCan a party termi…')                                      6       32.7%
-          Scan contracts as c                                                                              6
-            tokens=96, mean_document_tokens=16
+                                                                                               est. rows   est. pass   est. time
+  AiExtract: contract.expiration_date over c                                                                             2.66 ms
+    question="On what date will the contract's initial term expire?", up to 64 answer tokens
+    AiFilter: c                                                                                        2                 7.41 ms
+      KV rewind=on
+      predicate 1  PROMPT('DOCUMENT:\n{0}\n\nCan a party termi…')                                      6       32.7%
+      Scan contracts as c                                                                              6
+        tokens=78, mean_document_tokens=13
   Pipeline on c: ai_filter:c -> ai-extract:0 (each document runs every operator with its KV resident)
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

@@ -1,0 +1,65 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/quail-datafusion",
+    "crates/quail-planner",
+    "crates/quail",
+    "crates/quail-dylib",
+    "crates/quail-server",
+    "crates/quail-python",
+]
+# quail-dylib is the shared library the test programs link, and no
+# command selects it: Cargo links the Rust standard library into a
+# shared library it builds as a selected package, and a test program
+# then gets the standard library twice. Run cargo without --workspace.
+default-members = [
+    "crates/quail-datafusion",
+    "crates/quail-planner",
+    "crates/quail",
+    "crates/quail-server",
+    "crates/quail-python",
+]
+
+# The one version of Quail: every crate inherits it, and the Python
+# package reads it from crates/quail-python (pyproject.toml, dynamic).
+# A release tag must equal it, with a leading v; publish.yml checks.
+[workspace.package]
+version = "0.1.0"
+
+# a published crate names the version of each Quail crate it depends on
+[workspace.dependencies]
+quail-planner = { version = "0.1.0", path = "crates/quail-planner" }
+quail-datafusion = { version = "0.1.0", path = "crates/quail-datafusion" }
+
+# The dev profile is the one to edit and rebuild with: `uv sync`, maturin,
+# `cargo test`. Dependencies (DataFusion, Arrow, ...) are compiled once at
+# opt-level 3 and stay cached in target/, so the planner runs at close to
+# release speed; Quail's own crates rebuild incrementally at opt-level 1.
+# Full debug info for DataFusion's dependency tree takes many gigabytes,
+# and linking it dominates a rebuild; dependencies get none.
+#
+# Quail's crates get no debug information either: it was about 40% of
+# each program's size. A panic message keeps its file and line; a
+# backtrace names functions without line numbers. Dependencies keep
+# split-debuginfo "unpacked": it is part of their artifact hash, so
+# changing it would recompile all of them.
+[profile.dev]
+opt-level = 1
+debug = false
+incremental = true
+
+[profile.dev.package."*"]
+opt-level = 3
+debug = false
+split-debuginfo = "unpacked"
+
+# Rebuilding the Python module after an edit recompiles only Quail's
+# crates: incrementally, in many codegen units. Dependencies, compiled
+# once, keep the default units.
+[profile.release]
+incremental = true
+codegen-units = 64
+
+[profile.release.package."*"]
+codegen-units = 16
+incremental = false

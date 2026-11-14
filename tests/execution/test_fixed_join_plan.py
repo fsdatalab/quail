@@ -1,26 +1,19 @@
 """Fixed join execution, filter retention, and answer reconstruction."""
 
 import pyarrow as pa
-from helpers.fakes import graph_state, letter_tokens
-from helpers.oracle import Oracle
+from helpers.oracle import Oracle, oracle_executor
+from helpers.sessions import TOKENIZER
 
 import quail
 from bench import quailb
+from quail.api.config import EngineConfig
 from quail.api.execute import execute_query
-from quail.backends.quail.graph import execute_single_graph
 from quail.execution.metrics import NodeMetrics
-from quail.execution.types import PhysicalResponse
 from quail.physical import (
-    AiFilter,
     AiJoin,
-    Barrier,
     PortRef,
-    Scan,
-    decode_graph,
-    encode_graph,
 )
-from quail.physical.pipelines import build_pipelines
-from quail.planner.plan import EngineConfig
+from quail.physical.plan import graph_from_envelope
 from quail_b import prompts
 from quail_b.queries import FILTER_SELECTIVITY_ESTIMATES
 
@@ -31,7 +24,7 @@ def _session(gpus=1, backend="quail"):
     session = quail.Session(
         EngineConfig(gpus=gpus, model="qwen3-4b-fp8", backend=backend,
                      device="h100-sxm"),
-        tokenizer=letter_tokens)
+        tokenizer=TOKENIZER)
     register_fever(session)
     return session
 
@@ -74,81 +67,50 @@ def _fever_join(node, assignment):
     return (claim, evidence) in passing
 
 
-def fever_oracle(capacity, empty):
+def fever_oracle(empty=False):
     """The oracle answering FEVER: c0 and c1 pass every filter unless empty."""
     return Oracle(
         filters=lambda alias, document, position: document < 2 and not empty,
-        joins=_fever_join, labels=_fever_label, retain=capacity,
+        joins=_fever_join, labels=_fever_label,
         join_metrics=NodeMetrics(gpu_s=0.02, peak_gpu_bytes=128, extension={
             "pack_s": 0.125, "borrowed_prefix_tokens": 16}))
 
 
-def fever_executor(session, monkeypatch, gpus, check=None, capacity=1,
-                   empty=False):
-    """Return a physical executor that runs the FEVER fakes on one or two GPUs."""
-    from quail.backends.quail import worker
-    from quail.backends.quail.distributed import execute_distributed_graph
-    from quail.specs import H100_SXM
-
-    def child(documents):
-        model = fever_oracle(capacity=1, empty=False)
-        state = graph_state(model, documents)
-        model.arena = state["gpu"].arena
-        return worker.ChildState(
-            gpu_index=0, gpu=state["gpu"], registry=session.registry)
-
+def fever_executor(check=None, empty=False):
+    """Return a physical executor that answers FEVER on the request's GPUs."""
     def execute(request):
-        graph = decode_graph(request.plan["graph"], session.registry.codecs)
-        documents = {node.alias: request.inputs[node.input_id].documents
-                for node in graph.nodes if isinstance(node, Scan)}
-        extra = check(request, graph) if check else {}
-        if gpus == 1:
-            model = fever_oracle(capacity, empty)
-            state = graph_state(model, documents)
-            model.arena = state["gpu"].arena
-            state.update(extra)
-            report = execute_single_graph(state, request.plan["settings"], graph)
-            assert not state["gpu"].arena.accounting.owned
-            return PhysicalResponse(report.pop("_outputs"), report)
-        children = [child(documents), child(documents)]
-
-        def round_fn(kind, subs):
-            assert kind == "execute"
-            return [worker._child_execute(state, sub)
-                    for state, sub in zip(children, subs)]
-
-        report = execute_distributed_graph(
-            {**request.plan["settings"], "model": "qwen3-4b-fp8",
-             "documents": documents, **extra, "physical_plan": request.plan},
-            graph, 2, round_fn, H100_SXM, session.registry.runtimes,
-            session.registry,
-        )
-        assert all(not child.gpu.arena.accounting.owned for child in children)
-        for node in graph.nodes:
-            if isinstance(node, AiJoin):
-                metrics = report["node_metrics"][node.node_id]
+        graph = graph_from_envelope(request.plan)
+        if check:
+            check(request, graph)
+        response = oracle_executor(fever_oracle(empty))(request)
+        if request.gpus > 1:
+            # each GPU measured the planted join metrics: times and
+            # counts add up, and the peak is the largest
+            for node in graph.nodes_by_type(AiJoin.type_name):
+                metrics = response.metrics["node_metrics"][node.node_id]
                 assert metrics["pack_s"] == 0.25
                 assert metrics["borrowed_prefix_tokens"] == 32
                 assert metrics["gpu_s"] == 0.04
                 assert metrics["peak_gpu_bytes"] == 128
-        return PhysicalResponse(report.pop("_outputs"), report)
+        return response
 
     return execute
 
 
+# GPUs, whether no document passes a filter, and the filters' estimate
 FEV9_RUNS = [
-    (1, 10, False, 0.001), (1, 1, False, 1.0), (1, 0, False, 0.5),
-    (1, 0, True, 1.0), (2, 1, False, None),
+    (1, False, 0.001), (1, False, 1.0), (1, False, 0.5), (1, True, 1.0),
+    (2, False, None),
 ]
 
 
-def test_fev9_executes_bound_and_edited_join_nodes_without_the_optimizer(
+def test_fev9_executes_bound_join_nodes_without_the_optimizer(
         monkeypatch):
     def unexpected_search(*args, **kwargs):
-        raise AssertionError("execution called the join optimizer")
+        raise AssertionError("execution planned the query again")
 
-    for gpus, capacity, empty, estimate in FEV9_RUNS:
-        case = f"gpus={gpus} capacity={capacity} empty={empty}"
+    for gpus, empty, estimate in FEV9_RUNS:
+        case = f"gpus={gpus} empty={empty} estimate={estimate}"
         with monkeypatch.context() as patch:
             if estimate is not None:
                 patch.setitem(FILTER_SELECTIVITY_ESTIMATES, prompts.F11, estimate)
@@ -156,50 +118,20 @@ def test_fev9_executes_bound_and_edited_join_nodes_without_the_optimizer(
 
             def check(request, graph):
                 assert len(graph.nodes_by_type(AiJoin.type_name)) == 3
-                patch.setattr("quail.planner.search.join_order.search_joins",
+                patch.setattr("quail.api.query.plan_from_json",
                               unexpected_search)
                 return {}
 
             with _session(gpus=gpus) as session:
                 query = quailb.queries(session)["FEV-9"][1]()
-                execute = fever_executor(
-                    session, patch, gpus, check, capacity, empty)
+                execute = fever_executor(check, empty)
                 result = execute_query(query, physical_executor=execute).collect()
         assert result.to_pylist() == ([] if empty else FEV9_ROWS), case
 
-    with _session() as session:
-        query = quailb.queries(session)["FEV-9"][1]()
-        plan = query.plan()
-        join = next(node for node in plan.nodes if isinstance(node, AiJoin))
-        sequence = next(node for node in plan.nodes
-                     if isinstance(node, AiFilter) and node.alias == join.anchor)
-        assert not sequence.keep_kv
-        edited = plan.insert(
-            Barrier(node_id=f"barrier:{sequence.alias}", next_anchor=sequence.alias,
-                    aliases=(sequence.alias,)),
-            between=(sequence.node_id, join.node_id))
-        # cut off from its join by the barrier, the sequence retains KV
-        assert edited.graph.node(sequence.node_id).keep_kv
-        assert edited != plan
 
-        seen = []
-
-        def check(request, graph):
-            seen.append([node.node_id for node in graph.nodes])
-            return {}
-
-        execute = fever_executor(session, monkeypatch, 1, check, capacity=10)
-        rows = execute_query(query, physical_executor=execute).collect()
-        edited_result = execute_query(
-            quailb.queries(session)["FEV-9"][1](), physical_executor=execute,
-            plan=edited)
-        assert f"barrier:{sequence.alias}" in seen[1]
-        assert f"barrier:{sequence.alias}" not in seen[0]
-        assert edited_result.collect().to_pylist() == rows.to_pylist() == FEV9_ROWS
-
-
-TOPIC_SQL = ("AI.CLASSIFY(PROMPT('What is {0} about?', c.claim), "
-             "['science', 'sport']) AS topic")
+TOPIC_CALL = ("AI.CLASSIFY(PROMPT('What is {0} about?', c.claim), "
+              "['science', 'sport'])")
+TOPIC_SQL = f"{TOPIC_CALL} AS topic"
 PLAUSIBLE_SQL = ("AI_FILTER(PROMPT('Is {0} plausible?', c.claim), "
                  "{'selectivity': 0.9})")
 
@@ -211,11 +143,11 @@ def test_classification_runs_beside_filters_and_joins(monkeypatch):
                             f"WHERE {PLAUSIBLE_SQL}")
         plan = query.plan()
         assert [type(node).__name__ for node in plan.nodes] == [
-            "Scan", "AiFilter", "AiClassify", "Project"]
+            "Scan", "AiFilter", "AiClassify"]
         classify = plan.nodes[2]
         assert classify.inputs[0].source == PortRef(plan.nodes[1].node_id,
                                                     "rows:c")
-        execute = fever_executor(session, monkeypatch, 1, capacity=10)
+        execute = fever_executor()
         rows = execute_query(query, physical_executor=execute).collect()
         assert rows.to_pylist() == [{"c.id": "c0", "topic": "science"},
                                     {"c.id": "c1", "topic": "sport"}]
@@ -228,7 +160,7 @@ def test_classification_runs_beside_filters_and_joins(monkeypatch):
               ON AI_FILTER(PROMPT('Does {{1}} support {{0}}?', c.claim, e.text),
                            {{'selectivity': 0.5}})
             WHERE {PLAUSIBLE_SQL}
-              AND HINT(topic IN ('science'), {{'selectivity': 0.5}})
+              AND HINT({TOPIC_CALL} IN ('science'), {{'selectivity': 0.5}})
         """)
         plan = query.plan()
         # the label test rejects half the claims and the filter a tenth,
@@ -236,21 +168,16 @@ def test_classification_runs_beside_filters_and_joins(monkeypatch):
         # filter on its label, and the sequence run as one pipeline,
         # and the join joins it only when it anchors on the claims
         assert [type(node).__name__ for node in plan.nodes] == [
-            "Scan", "Scan", "AiClassify", "Filter", "AiFilter", "AiJoin",
-            "Project"]
-        test, ask, join, project = plan.nodes[3:7]
+            "Scan", "Scan", "AiClassify", "Filter", "AiFilter", "AiJoin"]
+        test, ask, join = plan.nodes[3:6]
         members = tuple(
-            member.node_id for member in build_pipelines(plan.graph)["ai-classify:0"])
+            member.node_id for member in plan.graph.pipelines()["ai-classify:0"])
         assert members == (("ai-classify:0", test.node_id, ask.node_id)
                            + ((join.node_id,) if join.anchor == "c" else ()))
         (claims_port,) = [port.source for port in join.inputs
                           if port.source.port == "rows:c"]
         assert claims_port == PortRef(ask.node_id, "rows:c")
-        assert [port.source.port for port in project.inputs] == [
-            "join_answers:0", "rows:c"]
-        codecs = session.registry.codecs
-        assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
-        execute = fever_executor(session, monkeypatch, 1, capacity=10)
+        execute = fever_executor()
         result = execute_query(query, physical_executor=execute)
         assert result.collect().to_pylist() == [
             {"c.id": "c0", "e.id": "e0", "topic": "science"}]

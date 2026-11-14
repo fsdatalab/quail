@@ -1,29 +1,31 @@
+DataFusion:
+SortPreservingMergeExec: [first_fix@2 ASC NULLS LAST, trajectory_id@0 ASC NULLS LAST], fetch=50
+  ProjectionExec: expr=[trajectory_id@0 as trajectory_id, count(Int64(1))@1 as fixes, min(t.turn_index)@2 as first_fix, max(t.token_count)@3 as longest]
+    SortExec: TopK(fetch=50), expr=[min(t.turn_index)@2 ASC NULLS LAST, trajectory_id@0 ASC NULLS LAST], preserve_partitioning=[true]
+      FilterExec: count(Int64(1))@1 >= 2
+        AggregateExec: mode=FinalPartitioned, gby=[trajectory_id@0 as trajectory_id], aggr=[count(Int64(1)), min(t.turn_index), max(t.token_count)]
+          RepartitionExec: partitioning=Hash([trajectory_id@0], 4), input_partitions=4
+            AggregateExec: mode=Partial, gby=[trajectory_id@0 as trajectory_id], aggr=[count(Int64(1)), min(t.turn_index), max(t.token_count)]
+              RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+                ModelRegionExec: calls=[ai_filter], tables=[agent_traces]
+
+model region:
 logical:
-  Limit: 50
-    Sort: first_fix ASC NULLS LAST, t.trajectory_id ASC NULLS LAST
-      Aggregate: group by t.trajectory_id; fixes = count(*), first_fix = min(t.turn_index), longest = max(t.token_count); having fixes >= 2
-        Project: t.trajectory_id, t.turn_index, t.token_count
-          SemanticFilter
-            PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the agent trace above whether, by the end of the trace, the agent has implemented a plausible fix that directly addresses the reported issue. A fix must include a code or configuration change whose purpose is to correct the issue. Inspection, reproduction, tests without a fix, and unrelated edits do not count.\n\nInstruction: answer TRUE if the agent has implemented a plausible fix that directly addresses the reported issue. Answer FALSE otherwise.', t.trace) (selectivity=30.3%)
-            Scan agent_traces as t [trace, trajectory_id, turn_index, token_count]
+  Projection: t.trajectory_id, t.turn_index, t.token_count
+    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Judge strictly from the agent trace above whether, by the end of the trace, the agent has implemented a plausible fix that directly addresses the reported issue. A fix must include a code or configuration change whose purpose is to correct the issue. Inspection, reproduction, tests without a fix, and unrelated edits do not count.\n\n{0}\n\nInstruction: answer TRUE if the agent has implemented a plausible fix that directly addresses the reported issue. Answer FALSE otherwise."), t.trace), named_struct(Utf8("selectivity"), Float64(0.3030474040632054))), filter: __quail_answer_1, returns: []
+      SubqueryAlias: t
+        TableScan: agent_traces projection=[trace, trajectory_id, turn_index, token_count]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
-  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
+  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                                                      est. rows   est. pass   est. time
-  Sort: first_fix ASC NULLS LAST, t.trajectory_id ASC NULLS LAST
-    fetch=50
-    Aggregate: t.trajectory_id, fixes, first_fix, longest
-      group by t.trajectory_id
-      fixes = count(*), first_fix = min(t.turn_index), longest = max(t.token_count)
-      having fixes >= 2
-      Project: t.trajectory_id, t.turn_index, t.token_count                                 1.8
-        AiFilter: t                                                                         1.8                 19.2 ms
-          KV: not stored
-          predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')                         6       30.3%
-          Scan agent_traces as t                                                              6
-            tokens=78, mean_document_tokens=13
+                                                                  est. rows   est. pass   est. time
+  AiFilter: t                                                           1.8                 13.9 ms
+    KV: not stored
+    predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')           6       30.3%
+    Scan agent_traces as t                                                6
+      tokens=66, mean_document_tokens=11
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

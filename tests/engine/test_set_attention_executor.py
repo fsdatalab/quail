@@ -41,7 +41,7 @@ class _Pieces:
         return ids
 
 
-def test_one_mixed_pass_decodes_a_yes_no_a_choice_and_a_read():
+def test_a_mixed_pass_decodes_codes_and_a_pointer_read_takes_the_likeliest_span():
     from quail.backends.quail.executor.pass_groups import (
         SetQuestion,
         _decode,
@@ -65,8 +65,7 @@ def test_one_mixed_pass_decodes_a_yes_no_a_choice_and_a_read():
     assert probabilities.argmax(-1).tolist() == [0, 1]
     assert spans.tolist() == [[4, 6, 0.9], [0, 0, 0.1]]
 
-
-def test_a_pointer_read_takes_the_likeliest_span_or_nothing():
+    # a pointer read takes the likeliest span or nothing
     torch = pytest.importorskip("torch")
     from quail.backends.quail.executor.readout import pointer_spans
 
@@ -153,8 +152,19 @@ def test_set_attention_lets_the_state_read_every_question_and_each_question_itse
     torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-5)
 
 
-def test_a_label_packed_with_a_filter_answers_only_the_rows_the_filter_keeps(
-        monkeypatch):
+class _OneGroup:
+    """Asks a pass group by handing back answers given in advance."""
+
+    def __init__(self, answers):
+        self.answers = answers
+        self.asked = []
+
+    def group(self, pass_group, kept):
+        self.asked.append(len(kept))
+        return self.answers
+
+
+def test_a_label_or_score_packed_with_another_step_answers_the_rows_that_step_keeps():
     from quail.backends.quail.executor import pipeline
     from quail.backends.quail.executor.pass_groups import GroupAnswers
     from quail.physical import AiClassify, AiFilter, ClassifySpec
@@ -165,33 +175,24 @@ def test_a_label_packed_with_a_filter_answers_only_the_rows_the_filter_keeps(
                         scoring="set_choice", label_token_ids=((5,), (6,)))
     nodes = (AiFilter(node_id="f", alias="r", pass_group=0),
              AiClassify(node_id="c", spec=spec, pass_group=0))
-    asked = []
-
-    def one_pass(state, questions, prefixes, **_):
-        asked.append(len(prefixes))
-        # the filter passes rows 0 and 2; the label is answered for all four
-        return GroupAnswers(np.arange(4), [
-            np.array([1.0, -1.0, 2.0, -3.0]),
-            np.array([[0.9, 0.1], [0.2, 0.8], [0.3, 0.7], [0.6, 0.4]])],
-            [4, 4], tokens=100)
-
-    monkeypatch.setattr(pipeline, "run_pass_group", one_pass)
+    # the filter passes rows 0 and 2; the label is answered for all four
+    ask = _OneGroup(GroupAnswers(np.arange(4), [
+        np.array([1.0, -1.0, 2.0, -3.0]),
+        np.array([[0.9, 0.1], [0.2, 0.8], [0.3, 0.7], [0.6, 0.4]])],
+        [4, 4], tokens=100))
     state = SimpleNamespace(loaded_model=SimpleNamespace(model_spec=D1_2B_BF16))
 
-    results = pipeline.execute_set_steps(state, nodes, [10, 11, 12, 13],
-                                         [[0]] * 4)
+    results = pipeline.set_steps(state, nodes, [10, 11, 12, 13], [[0]] * 4, ask)
 
     labels = results["c"].outputs["rows:r"]
-    assert asked == [4]
+    assert ask.asked == [4]
     assert results["f"].outputs["rows:r"].ids["r"].to_pylist() == [10, 12]
     assert labels.ids["r"].to_pylist() == [10, 12]
     assert labels.column("mood").to_pylist() == ["happy", "sad"]
     assert (results["f"].metrics.fresh_tokens, results["c"].metrics.fresh_tokens) \
         == (100, 0)
 
-
-def test_a_score_packed_with_a_label_reads_its_answers_for_every_row(
-        monkeypatch):
+    # a score packed with a label reads its answers for every row
     from quail.backends.quail.executor import pipeline
     from quail.backends.quail.executor.pass_groups import GroupAnswers
     from quail.physical import AiClassify, AiScore, ClassifySpec, ScoreSpec
@@ -206,16 +207,12 @@ def test_a_score_packed_with_a_label_reads_its_answers_for_every_row(
     nodes = (AiScore(node_id="s", spec=score, pass_group=0),
              AiClassify(node_id="c", spec=label, pass_group=0))
 
-    def one_pass(state, questions, prefixes, **_):
-        assert [question.kind for question in questions] == ["score", "choice"]
-        return GroupAnswers(np.arange(3), [
-            np.array([0.9, 0.2, 0.3]),
-            np.array([[0.9, 0.1], [0.2, 0.8], [0.6, 0.4]])], [3, 3], tokens=100)
-
-    monkeypatch.setattr(pipeline, "run_pass_group", one_pass)
+    ask = _OneGroup(GroupAnswers(np.arange(3), [
+        np.array([0.9, 0.2, 0.3]),
+        np.array([[0.9, 0.1], [0.2, 0.8], [0.6, 0.4]])], [3, 3], tokens=100))
     state = SimpleNamespace(loaded_model=SimpleNamespace(model_spec=D1_2B_BF16))
 
-    results = pipeline.execute_set_steps(state, nodes, [10, 11, 12], [[0]] * 3)
+    results = pipeline.set_steps(state, nodes, [10, 11, 12], [[0]] * 3, ask)
 
     scored = results["s"].outputs["rows:r"]
     assert scored.ids["r"].to_pylist() == [10, 11, 12]
@@ -224,3 +221,53 @@ def test_a_score_packed_with_a_label_reads_its_answers_for_every_row(
         == ["happy", "sad", "happy"]
     assert (results["s"].metrics.fresh_tokens, results["c"].metrics.fresh_tokens) \
         == (100, 0)
+
+
+def test_a_later_step_asks_only_the_documents_the_step_before_kept(monkeypatch):
+    from helpers.fakes import (
+        cpu_arena,
+        fake_pack,
+        fake_pipeline,
+        fake_readout,
+        fake_torch,
+    )
+
+    from quail.backends.quail.executor import chunk
+    from quail.backends.quail.executor.set_passes import (
+        Passes,
+        own_stage,
+        run_passes,
+    )
+    from quail.backends.quail.executor.stages import Stage, StageRequests
+
+    monkeypatch.setattr(chunk, "pack_chunk", fake_pack)
+
+    def forward_chunk(packed):
+        # a pass's answer: whether its document token is even, then, at
+        # the second step, whether it is a multiple of four
+        return [int(spec["prefix"][0]) % (2 if suffix[0] == 7 else 4) == 0
+                for spec in packed.specs for suffix in spec["suffixes"]]
+
+    state = SimpleNamespace(
+        torch=fake_torch(), chunk_tokens=8, gpu_timing=False,
+        loaded_model=SimpleNamespace(
+            arena=cpu_arena(64), input_staging=None,
+            pipeline=fake_pipeline(whole_sequences=True,
+                                   forward_chunk=forward_chunk)))
+    readout = fake_readout()
+    documents = [[10], [11], [12], [13], [16]]
+
+    first = run_passes(state, [Stage(suffixes=[[7]], readout=readout)], Passes(
+        stages=[0] * 5, states=documents, suffix_tokens=[1] * 5,
+        owners=list(range(5))), label="first step")
+    kept = [index for index, value in zip(first.owners, first.values) if value]
+    second = Passes(stages=[0] * len(kept), states=[documents[i] for i in kept],
+                    suffix_tokens=[2] * len(kept), owners=kept,
+                    requests=[StageRequests([[8, 9]]) for _ in kept])
+    run_passes(state, [own_stage(state, readout, "second step", second)], second,
+               label="second step")
+
+    assert {index: bool(value) for index, value in
+            zip(second.owners, second.values)} == {0: False, 2: True, 4: True}
+    # each of the three kept documents' passes: one state token, two asked
+    assert second.tokens == 3 * (1 + 2)

@@ -19,7 +19,7 @@ from quail.backends.quail.executor.attention import Engine
 from quail.backends.quail.executor.gdn import gdn_core
 from quail.backends.quail.executor.models.base import ModelPipeline, overlaid_rows
 from quail.backends.quail.executor.moe import init_moe_workspace
-from quail.cost.budgets import kernel_index_cap
+from quail.common.budgets import kernel_index_cap
 
 
 class Qwen35Pipeline(ModelPipeline):

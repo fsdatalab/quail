@@ -1,28 +1,23 @@
 """Capabilities and entry points for the Quail engine."""
 
+from __future__ import annotations
+
 import os
-from typing import Any
 
 from quail.backends.base import GpuContext
 from quail.backends.quail.executor.models import supported_archs
 from quail.backends.quail.executor.runtime import QuailModelExecution
-from quail.backends.quail.lowering import plan_region
+from quail.backends.quail.graph import region_report
 from quail.backends.quail.worker import (
-    execute_quail_request,
-    prepare_quail_request,
+    boot_record,
+    quail_workers,
     release_quail_request,
 )
-from quail.planner.optimizer.candidates import (
-    ModelRegion,
-    PhysicalCandidate,
-    SupportResult,
-)
-from quail.planner.optimizer.context import PlanningContext
-from quail.specs import DEVICES
+from quail.specs import DEVICES, SupportResult
 
 
 class QuailBackend:
-    """Plan and start Quail model execution."""
+    """Start Quail model execution; the Rust planner plans its queries."""
 
     name = "quail"
     engine_name = "quail"
@@ -55,20 +50,34 @@ class QuailBackend:
                 f"for {model.name!r}")
         return SupportResult.accept()
 
-    def plan(self, region: ModelRegion,
-             context: PlanningContext) -> tuple[PhysicalCandidate, ...]:
-        return plan_region(region, context)
-
     def start(self, context: GpuContext) -> QuailModelExecution:
         return QuailModelExecution(context)
 
-    def prepare_request(self, context) -> None:
-        """Boot the GPU for a request before its documents are ready."""
-        prepare_quail_request(context)
+    def workers(self, config):
+        """Return the GPUs' workers for a session's configuration."""
+        return quail_workers(config.model, config.device, config.backend,
+                             config.gpus)
 
-    def execute_request(self, context) -> Any:
-        """Run one Quail request inside a compute process."""
-        return execute_quail_request(context)
+    def report_region(self, plan, ran: list, boots: list, seconds: float,
+                      device) -> dict:
+        """Report a region's run on workers that Rust drove.
+
+        Args:
+            plan: The region's physical plan.
+            ran: Per worker, what it ran: its counters as JSON and its
+                nodes' output tables.
+            boots: Each worker's boot record.
+            seconds: Seconds the region took on the workers.
+            device: The GPUs' device spec.
+
+        Returns:
+            The run's report, with its outputs under "_outputs".
+        """
+        report = region_report(plan.graph, ran, seconds, device, gpus=plan.gpus,
+                               gpu_timing=plan.settings.get("gpu_timing", False))
+        boot = boot_record(boots)
+        report.update(boot_s=boot["boot_s"], boot_kind=boot["kind"], boot=boot)
+        return report
 
     def release_request(self, state) -> None:
         """Release the GPU processes and the model loaded for one configuration."""

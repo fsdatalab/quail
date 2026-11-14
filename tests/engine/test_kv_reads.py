@@ -19,12 +19,9 @@ from helpers.kv_checker import (
 pytest.importorskip("torch")
 
 
-@pytest.fixture(params=[("tree", False, False), ("unified", True, True)],
-                ids=["tree", "sliding-canvas"])
-def arena_kind(request, monkeypatch):
-    """(attention path, sliding layers, canvas row), with CPU staging."""
-    cpu_staging(monkeypatch)
-    return request.param
+# (attention path, sliding layers, canvas row) by name
+ARENA_KINDS = {"tree": ("tree", False, False),
+               "sliding-canvas": ("unified", True, True)}
 
 
 def corpus(rng, n, header_tokens, piece_tokens):
@@ -80,14 +77,7 @@ def named(case, check, *args, **options):
         raise AssertionError(f"{case}: {error}") from error
 
 
-def test_small_filters_joins_and_filters_feeding_joins(arena_kind):
-    """Short documents on arenas a few of them fill.
-
-    A join whose child shares its first page with a retained anchor of
-    an earlier join runs last: the anchor trimmed its window, so on a
-    sliding arena the child cannot borrow the rows the anchor dropped
-    and packs whole; elsewhere it borrows the page.
-    """
+def check_small_filters_joins_and_filters_feeding_joins(arena_kind):
     for seed in range(6):
         rng = random.Random(seed)
         documents, setup = small(rng, arena_kind, 40, (40, 80, 400), (24, 60))
@@ -110,3 +100,101 @@ def test_small_filters_joins_and_filters_feeding_joins(arena_kind):
                   canvas=(99,) if canvas else (), pages=12,
                   sliding_pages=12, budget=200, page_tokens=16)
     check_join_after_join([parent, child], *join_parts(), setup)
+
+    # a negated filter chain keeps the documents answered no
+    rng = random.Random(7)
+    documents, setup = small(rng, arena_kind, 40, (40, 80, 400), (24, 60))
+    named("negated filter", check_filter, documents, questions(rng), setup,
+          negated=True)
+
+
+def test_small_filters_joins_and_filters_feeding_joins(monkeypatch):
+    """Short documents on arenas a few of them fill.
+
+    A join whose child shares its first page with a retained anchor of
+    an earlier join runs last: the anchor trimmed its window, so on a
+    sliding arena the child cannot borrow the rows the anchor dropped
+    and packs whole; elsewhere it borrows the page.
+    """
+    cpu_staging(monkeypatch)
+    for name, arena_kind in ARENA_KINDS.items():
+        named(name, check_small_filters_joins_and_filters_feeding_joins,
+              arena_kind)
+
+
+def check_a_document_longer_than_a_pass_prefills_over_passes_and_answers_alike(
+        monkeypatch, path, window, canvas, state_slots):
+    """Documents of up to 160 tokens on a 40-token pass, then a roomy one.
+
+    A document longer than two passes writes its prefix over three or
+    more, its KV accumulating in its pages; borrowers wait for it, and
+    the checking model fails any read of a row not yet written.
+    """
+    from quail.backends.quail.executor import chunk as chunk_mod
+
+    cpu_staging(monkeypatch)
+    pieces = {}
+    real_pack = chunk_mod.pack_chunk
+
+    def counting_pack(torch_, arena, specs, **options):
+        for spec in specs:
+            if spec.get("prefix") is not None:
+                pieces[spec["key"]] = pieces.get(spec["key"], 0) + 1
+        return real_pack(torch_, arena, specs, **options)
+
+    monkeypatch.setattr(chunk_mod, "pack_chunk", counting_pack)
+    rng = random.Random(11)
+    documents = corpus(rng, 16, (0, 20, 40), (30, 45, 60))
+    assert max(map(len, documents)) > 80
+    for budget in (40, 400):
+        setup = Setup(path=path, window=window, canvas=canvas, pages=120,
+                      sliding_pages=120, budget=budget, state_slots=state_slots)
+        pieces.clear()
+        named(f"filter budget {budget}", check_filter, documents,
+              [[90, 91, 92, 93], [90, 91, 94]], setup)
+        assert (max(pieces.values()) >= 3) == (budget == 40)
+        named(f"join budget {budget}", check_join, documents, *join_parts(),
+              setup, retain=True)
+        named(f"feed budget {budget}", check_feed, documents, [90, 91, 92],
+              *join_parts(), setup)
+
+
+def test_a_document_longer_than_a_pass_prefills_over_passes_and_answers_alike(
+        monkeypatch):
+    for name, (path, window, canvas, state_slots) in {
+        "tree": ("tree", None, (), 0),
+        "tree-sliding": ("tree", 32, (), 0),
+        "unified": ("unified", None, (), 0),
+        "sliding-canvas": ("unified", 32, (99,), 0),
+        "hybrid": ("unified", None, (), 24),
+        "hybrid-sliding": ("unified", 32, (), 24),
+    }.items():
+        with monkeypatch.context() as patch:
+            named(
+                name,
+                check_a_document_longer_than_a_pass_prefills_over_passes_and_answers_alike,
+                patch, path, window, canvas, state_slots)
+
+
+def test_an_unpaged_filter_writes_a_long_document_in_pages_over_passes(
+        monkeypatch):
+    from helpers.kv_checker import Run, answer, chain, passthrough
+
+    from quail.backends.quail.executor.stage_executor import StageExecutor
+    from quail.backends.quail.executor.stages import filter_stages
+
+    cpu_staging(monkeypatch)
+    documents = [list(range(100)), [7] * 20]
+    question = [90, 91, 92]
+    answers = {chain(document + question): answer(chain(document + question))
+               for document in documents}
+    run = Run(Setup(path="unified", pages=40, budget=32), answers)
+    got, _, tokens = StageExecutor(
+        run.torch, run.arena, run.pipeline,
+        filter_stages([question], passthrough()), documents, 32,
+        anchor_keys=[("d", 0), ("d", 1)], paged=False).run()
+    assert {d: [int(bit) for bit in row] for d, row in got[0].items()} == {
+        d: [answers[chain(document + question)]]
+        for d, document in enumerate(documents)}
+    assert tokens == 100 + 20 + 2 * len(question)
+    assert not run.arena.accounting.owned

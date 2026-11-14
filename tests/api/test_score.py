@@ -1,24 +1,22 @@
-"""AI.SCORE parsing, planning, execution, and score semantics."""
+"""AI.SCORE parsing, planning, execution, and score semantics.
+
+The transcript test holds its expected transcript: the plan's AI
+operators, the questions the model answered, and the rows
+(helpers/transcript.py).
+"""
 
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from helpers.fakes import letter_tokens
-from helpers.oracle import Oracle, finish
+from helpers.planning import compile_sql, read_operators
+from helpers.sessions import TOKENIZER
+from helpers.transcript import Transcripts, assert_transcript
 
 import quail
+from quail.api.config import EngineConfig
 from quail.catalog import Catalog, DocumentProvider
-from quail.frontend.sql import compile_sql
-from quail.logical import ColumnRef, RegularPredicate, SemanticJoin
-from quail.physical import (
-    AiClassify,
-    AiScore,
-    Filter,
-    decode_graph,
-    encode_graph,
-)
-from quail.planner.plan import EngineConfig
+from quail.physical import AiScore, Filter
 
 PROJECTION_SQL = (
     "SELECT d.id, "
@@ -62,7 +60,7 @@ def catalog(tmp_path):
 
 
 def _session(
-    catalog, *, model="qwen3-reranker-0.6b-bf16", gpus=1, tokenizer=_tokens
+    catalog, *, model="qwen3-reranker-0.6b-bf16", gpus=1, tokenizer=TOKENIZER
 ):
     session = quail.Session(
         EngineConfig(model=model, device="h100-sxm", gpus=gpus),
@@ -86,14 +84,7 @@ def test_score_plan_shape_query_text_and_round_trip(catalog):
     score_filter = next(
         node for node in physical.nodes if isinstance(node, Filter)
     )
-    assert score_filter.predicate == RegularPredicate(
-        ColumnRef("d", "", "score"), ">=", 0.7)
-    graph = physical.graph
-    decoded = decode_graph(
-        encode_graph(graph, session.registry.codecs),
-        session.registry.codecs,
-    )
-    assert decoded == graph
+    assert str(score_filter.predicate) == "d.score >= 0.7"
 
     for template, query_text in QUERY_TEXTS:
         query = session.sql(
@@ -104,67 +95,147 @@ def test_score_plan_shape_query_text_and_round_trip(catalog):
         assert score.spec.query_template == query_text, template
     session.close()
 
-    plan = compile_sql(
+    found = read_operators(compile_sql(
         "SELECT q.id, d.id FROM queries q JOIN documents d ON "
         "0.8 > AI.SCORE(PROMPT('Is {1} relevant to {0}', q.text, d.body)) "
         "WHERE 0.5 <= AI.SCORE(PROMPT('Refund? {0}', d.body))",
         catalog,
-    )
-    join = plan.root.input
-    assert isinstance(join, SemanticJoin)
-    assert (join.predicate.comparison, join.predicate.value) == ("<", 0.8)
-    assert join.predicate.expression.aliases() == ("q", "d")
-    (predicate,) = plan.operators().filters["d"]
+    ))
+    (join,) = found.joins
+    # the test reads the score as its one column, swapped to its left
+    assert join.predicate.test.text == "{0} < 0.8"
+    assert [arg.alias for arg in join.predicate.call["prompt"].args] == ["q", "d"]
+    ((alias, (predicate,)),) = found.filters
+    assert alias == "d"
     expression = predicate.expression
-    assert (expression.comparison, expression.value) == (">=", 0.5)
+    assert expression.test.text == "{0} >= 0.5"
 
 
-def test_scores_and_labels_keep_their_types_and_prior_columns(catalog):
-    def mixed():
-        return Oracle(labels=lambda spec, ids: spec.labels[ids[0] % 2])
-
-    session = _session(catalog, model="qwen3-4b-fp8", tokenizer=letter_tokens)
+def test_scores_and_labels_keep_their_types_and_the_columns_before_them():
     score = "AI.SCORE(PROMPT('Refund? {0}', d.body))"
     label = "AI.CLASSIFY(PROMPT('Topic {0}', d.body), ARRAY['refund','praise'])"
-    for columns in (f"{score} AS s, {label} AS topic",
-                    f"{label} AS topic, {score} AS s"):
-        for predicate, expected in (
-                ("", [(1, "refund"), (2, "praise")]),
-                (f"WHERE {score} >= 0.15", [(2, "praise")]),
-                (f"WHERE {label} IN ('praise') AND {score} >= 0.15",
-                 [(2, "praise")])):
-            query = session.sql(
-                f"SELECT d.id, {columns} FROM documents d {predicate}")
-            physical = query.plan()
-            classifications = [node for node in physical.nodes
-                               if isinstance(node, AiClassify)]
-            assert len(classifications) == 1
-            assert classifications[0].spec.labels == ("refund", "praise")
-            assert sum(type(node) is AiScore for node in physical.nodes) == 1
-            if "IN" in predicate:
-                assert any(isinstance(node, Filter)
-                           and node.predicate.value == ("praise",)
-                           for node in physical.nodes)
-            decoded = decode_graph(
-                encode_graph(physical.graph, session.registry.codecs),
-                session.registry.codecs)
-            assert decoded == physical.graph
-            result = finish(query, mixed())
-            rows = result.collect()
-            assert list(zip(rows.column("d.id").to_pylist(),
-                            rows.column("topic").to_pylist())) == expected
-            assert rows.column("s").to_pylist() == pytest.approx(
-                [document / 10 for document, _ in expected])
-            assert rows.schema.field("topic").type == pa.string()
-            assert rows.schema.field("s").type == pa.float64()
-    # A pair score retains a one-document classification from its input.
-    query = session.sql(
+    queries = [f"SELECT d.id, {columns} FROM documents d {predicate}"
+               for columns in (f"{score} AS s, {label} AS topic",
+                               f"{label} AS topic, {score} AS s")
+               for predicate in ("", f"WHERE {score} >= 0.15",
+                                 f"WHERE {label} IN ('praise') AND {score} >= 0.15")]
+    # a pair score keeps a one-document classification from its input
+    queries.append(
         f"SELECT q.id, d.id, {label} AS topic, "
         "AI.SCORE(PROMPT('Relevance {0} {1}', q.text, d.body)) AS relevance "
         "FROM queries q CROSS JOIN documents d")
-    assert finish(query, mixed()).collect().column(
-        "topic").to_pylist() == ["refund", "praise", "refund", "praise"]
-    session.close()
+
+    def answer(kind, prompt, rows):
+        if kind == "label":
+            return "refund" if rows == ("d1",) else "praise"
+        # eighths: a float32, as the executor reads a score, holds them
+        return sum(int(row[1:]) for row in rows) / 8
+
+    tables = {"documents": pa.table({"id": ["d1", "d2"],
+                                     "body": ["refund please", "all good"]}),
+              "queries": pa.table({"id": ["q1", "q2"],
+                                   "text": ["refund", "shipping"]})}
+    with Transcripts(tables, answer) as runs:
+        assert_transcript("\n".join(runs.query(sql, columns=True)
+                                     for sql in queries), """\
+--- SELECT d.id, AI.SCORE(PROMPT('Refund? {0}', d.body)) AS s, AI.CLASSIFY(PROMPT('Topic
+    {0}', d.body), ARRAY['refund','praise']) AS topic FROM documents d  ---
+plan
+  s = ai_score('Refund? {0}', d.body)
+  topic = ai_classify('Topic {0}', d.body, make_array('refund', 'praise'))
+asked 4 of 4
+  'Refund? {0}': d1 0.125, d2 0.25
+  'Topic {0}': d1 'refund', d2 'praise'
+columns d.id string, s double, topic string
+rows 2
+  d1, 0.125, 'refund'
+  d2, 0.25, 'praise'
+
+--- SELECT d.id, AI.SCORE(PROMPT('Refund? {0}', d.body)) AS s, AI.CLASSIFY(PROMPT('Topic
+    {0}', d.body), ARRAY['refund','praise']) AS topic FROM documents d WHERE
+    AI.SCORE(PROMPT('Refund? {0}', d.body)) >= 0.15 ---
+plan
+  topic = ai_classify('Topic {0}', d.body, make_array('refund', 'praise'))
+  s = ai_score('Refund? {0}', d.body), filter: s >= Float64(0.15)
+asked 3 of 3
+  'Refund? {0}': d1 0.125, d2 0.25
+  'Topic {0}': d2 'praise'
+columns d.id string, s double, topic string
+rows 1
+  d2, 0.25, 'praise'
+
+--- SELECT d.id, AI.SCORE(PROMPT('Refund? {0}', d.body)) AS s, AI.CLASSIFY(PROMPT('Topic
+    {0}', d.body), ARRAY['refund','praise']) AS topic FROM documents d WHERE
+    AI.CLASSIFY(PROMPT('Topic {0}', d.body), ARRAY['refund','praise']) IN ('praise') AND
+    AI.SCORE(PROMPT('Refund? {0}', d.body)) >= 0.15 ---
+plan
+  topic = ai_classify('Topic {0}', d.body, make_array('refund', 'praise')), filter:
+      topic = 'praise'
+  s = ai_score('Refund? {0}', d.body), filter: s >= Float64(0.15)
+asked 3 of 3
+  'Refund? {0}': d1 0.125, d2 0.25
+  'Topic {0}': d2 'praise'
+columns d.id string, s double, topic string
+rows 1
+  d2, 0.25, 'praise'
+
+--- SELECT d.id, AI.CLASSIFY(PROMPT('Topic {0}', d.body), ARRAY['refund','praise']) AS
+    topic, AI.SCORE(PROMPT('Refund? {0}', d.body)) AS s FROM documents d  ---
+plan
+  s = ai_score('Refund? {0}', d.body)
+  topic = ai_classify('Topic {0}', d.body, make_array('refund', 'praise'))
+asked 4 of 4
+  'Refund? {0}': d1 0.125, d2 0.25
+  'Topic {0}': d1 'refund', d2 'praise'
+columns d.id string, topic string, s double
+rows 2
+  d1, 'refund', 0.125
+  d2, 'praise', 0.25
+
+--- SELECT d.id, AI.CLASSIFY(PROMPT('Topic {0}', d.body), ARRAY['refund','praise']) AS
+    topic, AI.SCORE(PROMPT('Refund? {0}', d.body)) AS s FROM documents d WHERE
+    AI.SCORE(PROMPT('Refund? {0}', d.body)) >= 0.15 ---
+plan
+  topic = ai_classify('Topic {0}', d.body, make_array('refund', 'praise'))
+  s = ai_score('Refund? {0}', d.body), filter: s >= Float64(0.15)
+asked 3 of 3
+  'Refund? {0}': d1 0.125, d2 0.25
+  'Topic {0}': d2 'praise'
+columns d.id string, topic string, s double
+rows 1
+  d2, 'praise', 0.25
+
+--- SELECT d.id, AI.CLASSIFY(PROMPT('Topic {0}', d.body), ARRAY['refund','praise']) AS
+    topic, AI.SCORE(PROMPT('Refund? {0}', d.body)) AS s FROM documents d WHERE
+    AI.CLASSIFY(PROMPT('Topic {0}', d.body), ARRAY['refund','praise']) IN ('praise') AND
+    AI.SCORE(PROMPT('Refund? {0}', d.body)) >= 0.15 ---
+plan
+  topic = ai_classify('Topic {0}', d.body, make_array('refund', 'praise')), filter:
+      topic = 'praise'
+  s = ai_score('Refund? {0}', d.body), filter: s >= Float64(0.15)
+asked 3 of 3
+  'Refund? {0}': d1 0.125, d2 0.25
+  'Topic {0}': d2 'praise'
+columns d.id string, topic string, s double
+rows 1
+  d2, 'praise', 0.25
+
+--- SELECT q.id, d.id, AI.CLASSIFY(PROMPT('Topic {0}', d.body),
+    ARRAY['refund','praise']) AS topic, AI.SCORE(PROMPT('Relevance {0} {1}', q.text,
+    d.body)) AS relevance FROM queries q CROSS JOIN documents d ---
+plan
+  relevance = ai_score('Relevance {0} {1}', q.text, d.body)
+  topic = ai_classify('Topic {0}', d.body, make_array('refund', 'praise'))
+asked 6 of 8
+  'Topic {0}': d1 'refund', d2 'praise'
+  'Relevance {0} {1}': q1+d1 0.25, q1+d2 0.375, q2+d1 0.375, q2+d2 0.5
+columns q.id string, d.id string, topic string, relevance double
+rows 4
+  q1, d1, 'refund', 0.25
+  q1, d2, 'praise', 0.375
+  q2, d1, 'refund', 0.375
+  q2, d2, 'praise', 0.5
+""")
 
 
 def test_a_set_attention_score_plans_a_document_longer_than_one_page(tmp_path):

@@ -122,7 +122,8 @@ def gated_delta_reference(q, k, v, g, beta, state, lengths, scale):
 def run_filter(torch, arena, pipeline, answers, documents, questions, budget,
                 document_done=None):
     """Run Boolean filter stages over the documents; return bits per document."""
-    from quail.backends.quail.executor.stages import filter_stages, run_stages
+    from quail.backends.quail.executor.stage_executor import StageExecutor
+    from quail.backends.quail.executor.stages import filter_stages
 
     stages = filter_stages(questions, answers)
     last = len(stages) - 1
@@ -140,11 +141,11 @@ def run_filter(torch, arena, pipeline, answers, documents, questions, budget,
         if finished:
             document_done(finished)
 
-    stage_answers, _, _ = run_stages(
+    stage_answers, _, _ = StageExecutor(
         torch, arena, pipeline, stages, documents, budget,
         anchor_keys=list(range(len(documents))), on_settled=on_settled,
         attention_mode="unified", default_attention="unified",
-        on_chunk=on_chunk if document_done is not None else None)
+        on_chunk=on_chunk if document_done is not None else None).run()
     bits = {}
     for stage in stage_answers:
         for document, row in stage.items():

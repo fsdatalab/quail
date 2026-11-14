@@ -1,7 +1,6 @@
 """Lazy copy preparation and diagnostic parity with the host token rule."""
 
 import json
-from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -10,6 +9,7 @@ import torch
 from helpers.extract_fakes import make_spec
 from helpers.extract_reference import Decoder
 from helpers.extract_reference import ReferenceInputs as ExtractionInputs
+from test_kv_reads import named
 from test_map_decode import events_torch
 
 from quail.backends.quail.executor.map_decoder import MapDecoder
@@ -22,26 +22,21 @@ def inputs(spec, vocabulary, texts):
 
 
 # every setting appears in some case
-@pytest.mark.parametrize("dtype,draft_tokens,num_questions", [
-    (torch.float32, 0, 1),
-    (torch.bfloat16, 4, 41),
-])
-def test_copy_traces_match_the_host_rule_on_the_same_logits(
+def check_copy_traces_match_the_host_rule_on_the_same_logits(
     monkeypatch, tmp_path, dtype, draft_tokens, num_questions
 ):
     text = "five days or five years. five years."
     spec, vocabulary = make_spec(text)
-    spec = replace(
-        spec,
+    spec = spec.replace(
         top_tokens=4,
         max_answer_tokens=12,
         draft_tokens=draft_tokens,
         first_window_chars=1,
         window_chars=8,
     )
-    extra_stop = vocabulary.tokenizer.encode_ids("none")[0]
+    extra_stop = vocabulary.tokenizer("none")[0]
     vocabulary.tokenizer.stop_ids = (*vocabulary.tokenizer.stop_ids, extra_stop)
-    vocabulary.tokenizer.is_stop[extra_stop] = True
+    vocabulary.is_stop[extra_stop] = True
     state = SimpleNamespace(loaded_model=SimpleNamespace(arena=SimpleNamespace()))
     documents = ExtractionInputs(
         state, [spec] * num_questions, vocabulary, [0], None, [text]
@@ -49,9 +44,9 @@ def test_copy_traces_match_the_host_rule_on_the_same_logits(
     size = len(vocabulary.vocab)
     head = torch.eye(size, dtype=dtype)
     logits = torch.full((num_questions, 20, size), -10.0, dtype=dtype)
-    first = vocabulary.tokenizer.encode_ids("five")[0]
-    alternate = vocabulary.tokenizer.encode_ids(" five")[0]
-    continuations = [vocabulary.tokenizer.encode_ids(word)[0]
+    first = vocabulary.tokenizer("five")[0]
+    alternate = vocabulary.tokenizer(" five")[0]
+    continuations = [vocabulary.tokenizer(word)[0]
                      for word in (" years", " days")]
     logits[:, 0, [first, alternate]] = 2
     for q in range(num_questions):
@@ -115,11 +110,26 @@ def test_copy_traces_match_the_host_rule_on_the_same_logits(
         assert expected[-1]["chosen"] == -1
 
 
+def test_copy_traces_match_the_host_rule_on_the_same_logits(monkeypatch, tmp_path):
+    for dtype, draft_tokens, num_questions in [
+        (torch.float32, 0, 1),
+        (torch.bfloat16, 4, 41),
+    ]:
+        # trace files append, so each case writes its own directory
+        directory = tmp_path / f"questions-{num_questions}"
+        directory.mkdir()
+        named(
+            f"dtype={dtype} draft_tokens={draft_tokens} "
+            f"num_questions={num_questions}",
+            check_copy_traces_match_the_host_rule_on_the_same_logits,
+            monkeypatch=monkeypatch, tmp_path=directory, dtype=dtype,
+            draft_tokens=draft_tokens, num_questions=num_questions)
+
+
 def test_a_replayed_copy_prepares_the_continuation_after_a_rejected_draft():
     text = "five days or five years long lease"
     spec, vocabulary = make_spec(text, "five")
-    spec = replace(
-        spec,
+    spec = spec.replace(
         top_tokens=4,
         max_answer_tokens=8,
         draft_tokens=4,
@@ -140,7 +150,7 @@ def test_a_replayed_copy_prepares_the_continuation_after_a_rejected_draft():
         return values
 
     first, years, longer = [
-        vocabulary.tokenizer.encode_ids(word)[0] for word in ("five", " years", " long")
+        vocabulary.tokenizer(word)[0] for word in ("five", " years", " long")
     ]
     decoder.start(0, 0, 0, [0, 1])
     decoder.submit(logits(first), [0], [0], None)

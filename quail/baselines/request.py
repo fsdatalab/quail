@@ -10,15 +10,12 @@ from typing import Any
 from quail.backends.base import GpuContext
 from quail.backends.resources import release_models
 from quail.baselines.execution import RequestModelExecution
-from quail.baselines.nodes import RequestExecution
-from quail.baselines.planning import plan_request_backend
 from quail.execution.metrics import scalar_node_metrics
 from quail.execution.runner import ExecutionContext, GenericRunner, compute_subgraph
 from quail.execution.runtimes import ModelNodeRuntime
 from quail.execution.types import PhysicalResponse, export_physical_outputs
-from quail.physical import Scan
-from quail.planner.optimizer.candidates import SupportResult
-from quail.specs import DEVICES
+from quail.physical import RequestExecution, Scan
+from quail.specs import DEVICES, SupportResult
 
 
 def execute_request_graph(context, backend, engine_state, boot):
@@ -113,8 +110,8 @@ def _warm_boot() -> dict:
     }
 
 
-# Architectures the request backends do not serve. vLLM 0.29 has no
-# LFM3 model; SGLang's support was not checked.
+# Architectures the request backends do not serve: vLLM 0.29 has no
+# LFM3 model.
 UNSERVED_ARCHS = frozenset({"lfm3"})
 
 
@@ -142,7 +139,7 @@ class LoadedRequestEngine:
 class RequestBackend:
     """A model backend that submits one request per prompt to an engine.
 
-    The engine adapter boots vLLM or SGLang and returns a client with
+    The engine adapter boots vLLM and returns a client with
     generate, reset_prefix_cache, and run_filter_sequence. The submission
     strategies decide how filter stages, join tuples, and maps become
     requests.
@@ -195,16 +192,16 @@ class RequestBackend:
                 f"does not return")
         return SupportResult.accept()
 
-    def plan(self, region, context):
-        return plan_request_backend(
-            region,
-            context,
-            backend_name=self.name,
-            filter_submission=self.filter_submission,
-            join_submission=self.join_submission,
-            answer_submission=self.answer_submission,
-            scores_labels=getattr(self.engine, "scores_labels", False),
-        )
+    @property
+    def request_settings(self) -> dict:
+        """How Rust's planner submits this backend's operators."""
+        return {
+            "backend_name": self.name,
+            "filter_submission": self.filter_submission,
+            "join_submission": self.join_submission,
+            "answer_submission": self.answer_submission,
+            "scores_labels": getattr(self.engine, "scores_labels", False),
+        }
 
     def start(self, context):
         return RequestModelExecution(context)

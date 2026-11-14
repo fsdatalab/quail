@@ -9,9 +9,6 @@ aggregate, having, sort, and fetch steps are the clauses that follow.
 
 from __future__ import annotations
 
-from sqlglot import exp
-
-from quail.logical.prompts import map_instruction
 from quail_b.substrait import (
     Aggregate,
     Classify,
@@ -22,10 +19,14 @@ from quail_b.substrait import (
     InList,
     PlanInfo,
     Sort,
+    StartsWith,
 )
 
 AGGREGATE_SQL = {"count": "COUNT", "sum": "SUM", "avg": "AVG", "min": "MIN",
                  "max": "MAX"}
+
+# an AI.MAP prompt is the document, a blank line, then the instruction
+MAP_DOCUMENT = "{0}\n\n"
 
 
 def build_query(session, info: PlanInfo, selectivity=None,
@@ -44,9 +45,17 @@ def build_query(session, info: PlanInfo, selectivity=None,
     return session.sql(query_sql(info, selectivity), order=order)
 
 
+# Snowflake string literal escapes, backslash first
+_ESCAPES = (("\\", "\\\\"), ("'", "\\'"), ("\n", "\\n"), ("\t", "\\t"),
+            ("\f", "\\f"), ("\b", "\\b"),
+            ("\r", "\\r"))
+
+
 def sql_string(text: str) -> str:
-    """Return text as a SQL string literal in the Snowflake dialect."""
-    return exp.Literal.string(text).sql(dialect="snowflake")
+    """Quote text as a Snowflake string literal."""
+    for character, escaped in _ESCAPES:
+        text = text.replace(character, escaped)
+    return f"'{text}'"
 
 
 def _literal(value) -> str:
@@ -92,11 +101,11 @@ def query_sql(info: PlanInfo, selectivity=None) -> str:
     for item in info.sae_features:
         outputs[item.output] = (
             f"AI.SAE_FEATURES({prompt(item.prompt, item.relation)}, "
-            f"pooling => {sql_string(item.pooling)})")
+            f"{{'pooling': {sql_string(item.pooling)}}})")
     for item in info.maps:
         outputs[item.output] = (
             f"AI.MAP({document(item.relation)}, "
-            f"{sql_string(map_instruction(item.prompt))}, {item.max_tokens})")
+            f"{sql_string(item.prompt.removeprefix(MAP_DOCUMENT))}, {item.max_tokens})")
     for struct in info.structs:
         extracts = [extract for extract in info.extracts
                     if info.struct_of(extract) == struct]
@@ -117,9 +126,14 @@ def query_sql(info: PlanInfo, selectivity=None) -> str:
     selected = list(dict.fromkeys(field(name) for name in info.select))
 
     def tested(name: str) -> str:
-        """Name an output SELECT computes; otherwise write its call."""
+        """Write the call that computes an output; otherwise name the column.
+
+        SQL reads SELECT's aliases only in GROUP BY, HAVING, and ORDER BY,
+        so WHERE and an aggregate's argument repeat the call; the planner
+        asks the model once for both.
+        """
         name = field(name)
-        return outputs[name] if name in outputs and name not in selected else name
+        return outputs.get(name, name)
 
     measures = {}
     if info.aggregate is not None:
@@ -155,6 +169,9 @@ def query_sql(info: PlanInfo, selectivity=None) -> str:
                 (prompts[(item.relation, item.output)], frozenset(item.accepted)))
             where.append(test if fraction is None
                          else f"HINT({test}{_options(fraction)})")
+        elif isinstance(item, StartsWith):
+            where.append(f"{tested(item.output)} ILIKE "
+                         f"{sql_string(item.prefix + '%')}")
     joins, joined = [], {info.base_alias}
     for join in info.joins:
         left, right = join.relations

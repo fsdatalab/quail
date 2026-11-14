@@ -1,27 +1,23 @@
 logical:
-  Project: r.id, sentiment, complaint
-    SemanticClassify: complaint
-      PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the review above what it criticizes most about the movie.', r.body) labels=['poor acting', 'poor writing', 'poor visual effects', 'slow pacing', 'weak ending', 'too long', 'too violent', 'no specific complaint']
-      Filter: r.sentiment IN ('negative', 'mixed') (selectivity=58.5%)
-        SemanticClassify: sentiment
-          PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the review above which category best describes the overall sentiment it expresses about the movie.', r.body) labels=['positive', 'negative', 'neutral', 'mixed']
-          Scan reviews as r [body, id]
+  Projection: r.id, sentiment, complaint
+    AiNode: complaint = ai_classify(prompt(Utf8("Judge strictly from the review above what it criticizes most about the movie.\n\n{0}"), r.body), make_array(Utf8("poor acting"), Utf8("poor writing"), Utf8("poor visual effects"), Utf8("slow pacing"), Utf8("weak ending"), Utf8("too long"), Utf8("too violent"), Utf8("no specific complaint")))
+      AiNode: sentiment = ai_classify(prompt(Utf8("Judge strictly from the review above which category best describes the overall sentiment it expresses about the movie.\n\n{0}"), r.body), make_array(Utf8("positive"), Utf8("negative"), Utf8("neutral"), Utf8("mixed"))), filter: hint(sentiment = Utf8("negative") OR sentiment = Utf8("mixed"), named_struct(Utf8("selectivity"), Float64(0.5846)))
+        SubqueryAlias: r
+          TableScan: reviews projection=[id, body]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
-  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
+  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                        est. rows   est. time
-  Project: r.id, sentiment, complaint
-    AiClassify: complaint over r                                      11.7 ms
-      rule=trie_decode, labels=8, label tokens=104
-      Filter: r.sentiment IN ('negative', 'mixed')
-        AiClassify: sentiment over r [1]                              22.8 ms
-          rule=trie_decode, labels=4, label tokens=28
-          Scan reviews as r                                    12
-            tokens=158, mean_document_tokens=13.2
-    Reuse [1]
+                                                      est. rows   est. time
+  AiClassify: complaint over r                                      8.85 ms
+    rule=trie_decode, labels=8, label tokens=83
+    Filter: r.sentiment IN ('negative', 'mixed')
+      AiClassify: sentiment over r                                  18.2 ms
+        rule=trie_decode, labels=4, label tokens=27
+        Scan reviews as r                                    12
+          tokens=134, mean_document_tokens=11.2
   Pipeline on r: ai-classify:0 -> filter:r:0 -> ai-classify:1 (each document runs every operator with its KV resident)
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

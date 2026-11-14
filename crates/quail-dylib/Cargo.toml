@@ -1,0 +1,13 @@
+[package]
+name = "quail-dylib"
+version.workspace = true
+edition = "2024"
+license = "MIT"
+description = "Quail and its dependencies as one shared library, for test programs to link"
+publish = false
+
+[lib]
+crate-type = ["dylib"]
+
+[dependencies]
+quail = { package = "quail-engine", path = "../quail" }

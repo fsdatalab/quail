@@ -4,7 +4,8 @@ import time
 
 from quail.backends.quail.executor.model_loading import full_output_head
 from quail.backends.quail.executor.readout import AsyncSlotMargins
-from quail.backends.quail.executor.stages import Stage, filter_stages, run_stages
+from quail.backends.quail.executor.stage_executor import StageExecutor
+from quail.backends.quail.executor.stages import Stage, filter_stages
 from quail.progress import Progress, logger, quiet
 
 # ------------------------------------------------------------- warmup
@@ -97,7 +98,7 @@ def _warm_recurrent(torch, arena, pipeline):
 
 def _warm_run(*args, **kwargs):
     """Run warm-up stages; their log lines say warm-up, not a query stage."""
-    return run_stages(*args, label="kernel warmup", summary=False, **kwargs)
+    return StageExecutor(*args, label="kernel warmup", summary=False, **kwargs).run()
 
 
 def _forward_warm(torch, arena, pipeline, async_ans, budget, *,

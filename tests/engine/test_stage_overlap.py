@@ -5,7 +5,7 @@ from helpers.fakes import cpu_staging
 from helpers.kv_checker import Run, Setup, answer, chain, passthrough
 
 from quail.backends.quail.executor.stage_executor import StageExecutor
-from quail.backends.quail.executor.stages import Stage, StageRequests, run_stages
+from quail.backends.quail.executor.stages import Stage, StageRequests
 
 
 @pytest.mark.parametrize("path", ["tree"])
@@ -30,11 +30,11 @@ def test_append_stages_launch_between_document_decisions(path, budget, pages,
     executors = []
     original = StageExecutor._run_one
 
-    def launch(self, groups, decode=None, replays=()):
+    def launch(self, groups, decode=None, replays=(), prefills=()):
         assert len(self.own) <= len(documents)
         executors[:] = [self]
         events.append(("launch", tuple(groups)))
-        return original(self, groups, decode, replays)
+        return original(self, groups, decode, replays, prefills)
 
     def decide(j):
         def keep(a, row):
@@ -52,9 +52,10 @@ def test_append_stages_launch_between_document_decisions(path, budget, pages,
               for j, suffix in enumerate(suffixes)]
     setup = Setup(path=path, budget=budget, pages=pages)
     run = Run(setup, answers)
-    out, _, tokens = run_stages(
+    out, _, tokens = StageExecutor(
         run.torch, run.arena, run.pipeline, stages, documents, budget,
-        anchor_keys=[("d", a) for a in range(len(documents))], attention_mode=path)
+        anchor_keys=[("d", a) for a in range(len(documents))],
+        attention_mode=path).run()
     for (a, j), want in expected.items():
         assert out[j][a] == want
     assert tokens == sum(map(len, documents)) + len(documents) * (

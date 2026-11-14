@@ -1,23 +1,20 @@
 logical:
-  Project: c.id, topic
-    Filter: c.topic IN ('politics', 'history') (selectivity=9.2%)
-      SemanticClassify: topic
-        PROMPT('DOCUMENT:\n{0}\n\nJudge strictly from the claim above which topic it is about.', c.claim) labels=['politics', 'sports', 'film and television', 'music', 'literature', 'science', 'history', 'geography', 'business', 'religion', 'other']
-        Scan claims as c [claim, id]
+  Projection: c.id, topic
+    AiNode: topic = ai_classify(prompt(Utf8("Judge strictly from the claim above which topic it is about.\n\n{0}"), c.claim), make_array(Utf8("politics"), Utf8("sports"), Utf8("film and television"), Utf8("music"), Utf8("literature"), Utf8("science"), Utf8("history"), Utf8("geography"), Utf8("business"), Utf8("religion"), Utf8("other"))), filter: hint(topic = Utf8("politics") OR topic = Utf8("history"), named_struct(Utf8("selectivity"), Float64(0.092)))
+      SubqueryAlias: c
+        TableScan: claims projection=[id, claim]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
-  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
+  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                       est. rows   est. time
-  Project: c.id, topic
-    Filter: c.topic IN ('politics', 'history')
-      AiClassify: topic over c [1]                                     12 ms
-        rule=trie_decode, labels=11, label tokens=92
-        Scan claims as c                                       6
-          tokens=42, mean_document_tokens=7
-    Reuse [1]
+                                                     est. rows   est. time
+  Filter: c.topic IN ('politics', 'history')
+    AiClassify: topic over c                                       9.65 ms
+      rule=trie_decode, labels=11, label tokens=88
+      Scan claims as c                                       6
+        tokens=42, mean_document_tokens=7
   Pipeline on c: ai-classify:0 -> filter:c:0 (each document runs every operator with its KV resident)
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

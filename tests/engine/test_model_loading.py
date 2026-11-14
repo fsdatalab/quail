@@ -1,6 +1,7 @@
 """CPU tests for model files, retained answer weights, and readouts."""
 
 import gc
+import json
 import weakref
 from types import SimpleNamespace
 
@@ -13,7 +14,6 @@ from quail.backends.quail.executor.model_loading import (
     retain_answer_head,
 )
 from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers, AsyncScores
-from quail.builtins import built_in_registry
 
 
 @pytest.fixture
@@ -70,12 +70,7 @@ def test_retained_answer_weights_ownership_and_answer_rows(torch):
     retain_answer_head(torch, model, [1, 3, 5])
     cpu_torch = SimpleNamespace(tensor=lambda values, **kwargs: torch.tensor(values))
 
-    def tokenizer(word, **kwargs):
-        return {"input_ids": [
-            5 if "false" in word.lower() else 3 if word.startswith(" ") else 1]}
-
-    first = AnswerRows.from_tokenizer(cpu_torch, torch.nn.functional, model,
-                                      tokenizer)
+    first = AnswerRows(cpu_torch, torch.nn.functional, model, [1, 3], [5])
     second = AnswerRows(cpu_torch, torch.nn.functional, model, [3, 1], [5])
     assert first.weights is second.weights is model.quail_answer_weights
     assert first(hidden) == second(hidden) == expected
@@ -90,7 +85,7 @@ def clear_model_paths():
     model_loading.resolve_model_path.cache_clear()
 
 
-def test_model_files_are_resolved_once_and_cached_before_children_start(
+def test_model_files_are_resolved_once_and_cached(
         monkeypatch, tmp_path, clear_model_paths):
     calls = []
 
@@ -110,69 +105,21 @@ def test_model_files_are_resolved_once_and_cached_before_children_start(
         "Qwen/model", "revision-a", include_weights=False) == first
     assert "*.safetensors" not in calls[2]["allow_patterns"]
 
-    # the files are cached before the GPU children start
-    from quail.backends.quail import worker
-
-    events = []
-    registry = built_in_registry()
-
-    def resolve(name, revision):
-        events.append("resolve")
-        assert revision == registry.model("qwen3-4b-fp8").revision
-        return str(tmp_path)
-
-    def round_fn(kind, subs):
-        events.append("boot")
-        assert kind == "boot"
-        assert len(subs) == 8
-        assert all(sub["registry"] is registry
-                   and sub["model_path"] == str(tmp_path) for sub in subs)
-        return [{"boot_s": 3.0, "kind": "cold"}] * 8
-
-    def ensure(count, configuration):
-        events.append("children")
-        assert count == 8
-        assert configuration == ("qwen3-4b-fp8", "h100-sxm", "quail", 8)
-        return SimpleNamespace(round=round_fn)
-
-    def run_graph(*args):
-        assert events == ["resolve", "children", "boot"]
-        events.append("query")
-        return {"_outputs": {}, "boot_s": 0.0, "wall_s": 7.0}
-
-    clock = iter([10.0, 12.0, 15.0])
-    monkeypatch.setattr(worker.time, "perf_counter", lambda: next(clock))
-    monkeypatch.setattr(worker, "resolve_model_path", resolve)
-    monkeypatch.setattr(worker, "_ensure_children", ensure)
-    monkeypatch.setattr(worker, "execute_distributed_graph", run_graph)
-    result = worker.execute_quail_multi({
-        "documents": {}, "gpus": 8, "model": "qwen3-4b-fp8",
-        "physical_plan": {"device": "h100-sxm", "backend": "quail"},
-        "chunk_tokens": 100, "true_ids": [1], "false_ids": [2],
-    }, registry, object())
-    assert events == ["resolve", "children", "boot", "query"]
-    assert result.metrics["boot_s"] == 5.0
-    assert result.metrics["boot"]["model_files_s"] == 2.0
-    assert result.metrics["wall_s"] == 7.0
-
 
 def test_a_base_model_without_a_turn_close_ends_answers_at_its_config_eos(
         tmp_path):
-    from quail.backends.quail.executor.tokenizer import (
-        ModelTokenizer,
-        _config_eos_token,
-    )
 
-    class NoEosId:    # Gigatoken's Hugging Face view of a base checkpoint
-        eos_token_id = None
+    from helpers.sessions import TOKENIZER
 
-        def __len__(self):
-            return 4
+    from quail.common.tokens import Tokenizer
 
-        def convert_tokens_to_ids(self, token):
-            return {"<|endoftext|>": 2}[token]
-
+    # a base checkpoint keeps its end of text as an added token
+    tokenizer = json.loads((TOKENIZER / "tokenizer.json").read_text())
+    eos = len(tokenizer["model"]["vocab"])
+    tokenizer["added_tokens"] = [{
+        "id": eos, "content": "<|endoftext|>", "single_word": False,
+        "lstrip": False, "rstrip": False, "normalized": False, "special": True}]
+    (tmp_path / "tokenizer.json").write_text(json.dumps(tokenizer))
     (tmp_path / "tokenizer_config.json").write_text(
         '{"eos_token": "<|endoftext|>"}')
-    tokenizer = ModelTokenizer(NoEosId(), "", _config_eos_token(tmp_path))
-    assert tokenizer.stop_ids == (2,)
+    assert list(Tokenizer(tmp_path).stop_ids) == [eos]

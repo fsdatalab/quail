@@ -8,23 +8,22 @@ import pyarrow as pa
 from quail.backends.quail.executor.model_loading import full_output_head
 from quail.backends.quail.executor.operators.join import (
     JoinQuestions,
-    join_pass_stage,
+    join_passes,
 )
-from quail.backends.quail.executor.parts import gpu_seconds, input_staging
 from quail.backends.quail.executor.pass_groups import (
     option_columns,
     option_probabilities,
 )
 from quail.backends.quail.executor.readout import AsyncPassReadout
-from quail.backends.quail.executor.stages import run_stages
+from quail.backends.quail.executor.set_passes import own_stage, run_passes
 from quail.backends.quail.reranker import (
     classify_outputs,
     probability_column,
     score_rows,
     scored_batch,
 )
+from quail.common.expressions import PROBABILITIES_SUFFIX
 from quail.execution.metrics import NodeMetrics, NodeResult
-from quail.logical import PROBABILITIES_SUFFIX
 from quail.progress import answer_sink
 
 
@@ -50,6 +49,36 @@ class SetLabels:
     suffix_tokens: int = 0
 
 
+def labeled_result(node, rows, values, priors=(), value_type=None,
+                   probabilities=None, **metrics) -> NodeResult:
+    """A set-attention score's or classification's NodeResult.
+
+    Args:
+        node: The AiScore or AiClassify.
+        rows: The rows answered, one column per alias.
+        values: Their scores or labels.
+        priors: The Rows of each of its rows inputs.
+        value_type: The values' Arrow type; None for float64.
+        probabilities: A classification's label probabilities per row,
+            or None.
+        **metrics: The NodeMetrics fields; extension gets the output name
+            and aliases.
+    """
+    spec = node.spec
+    scored = score_rows(rows, spec.aliases, spec.name, values, value_type)
+    if probabilities is not None:
+        scored = scored.with_column(spec.name + PROBABILITIES_SUFFIX,
+                                    probability_column(spec.labels, probabilities))
+    for prior in priors:
+        scored = scored.joined(prior, spec.aliases[0])
+    sink = answer_sink()
+    if sink is not None and len(rows):
+        sink(scored_batch(node, rows, values))
+    metrics["extension"] = {"output": spec.name, "aliases": list(spec.aliases),
+                            **metrics.get("extension", {})}
+    return NodeResult(classify_outputs(node, scored), NodeMetrics(**metrics))
+
+
 def classify_result(node, ids, labels: SetLabels, priors) -> NodeResult:
     """A classification's NodeResult: the labeled rows joined with its inputs.
 
@@ -62,25 +91,15 @@ def classify_result(node, ids, labels: SetLabels, priors) -> NodeResult:
     spec = node.spec
     labeled = [index for index, label in enumerate(labels.labels)
                if label is not None]
-    rows = np.asarray([[ids[index]] for index in labeled],
-                      dtype=np.int32).reshape(-1, 1)
-    values = [labels.labels[index] for index in labeled]
-    scored = score_rows(rows, spec.aliases, spec.name, values, pa.string())
-    if spec.probabilities:
-        scored = scored.with_column(
-            spec.name + PROBABILITIES_SUFFIX,
-            probability_column(spec.labels, labels.probabilities[labeled]))
-    for prior in priors:
-        scored = scored.joined(prior, spec.aliases[0])
-    sink = answer_sink()
-    if sink is not None and len(rows):
-        sink(scored_batch(node, rows, values))
-    return NodeResult(classify_outputs(node, scored), NodeMetrics(
+    return labeled_result(
+        node, np.asarray([[ids[index]] for index in labeled],
+                         dtype=np.int32).reshape(-1, 1),
+        [labels.labels[index] for index in labeled], priors, pa.string(),
+        labels.probabilities[labeled] if spec.probabilities else None,
         input_rows=len(ids), output_rows=len(labeled),
         evaluated_documents=len(labeled), fresh_tokens=labels.tokens,
         gpu_s=labels.gpu_s, chunks=labels.chunks,
-        extension={"output": spec.name, "aliases": list(spec.aliases),
-                   "input_rows": len(ids), "suffix_tokens": labels.suffix_tokens}))
+        extension={"input_rows": len(ids), "suffix_tokens": labels.suffix_tokens})
 
 
 def score_result(node, ids, scores, priors, cost, suffix_tokens) -> NodeResult:
@@ -94,22 +113,14 @@ def score_result(node, ids, scores, priors, cost, suffix_tokens) -> NodeResult:
         cost: The fresh tokens, GPU seconds, and forward passes it led.
         suffix_tokens: Its question's tokens, summed over the rows.
     """
-    spec = node.spec
-    rows = np.asarray(ids, dtype=np.int32).reshape(-1, 1)
-    scored = score_rows(rows, spec.aliases, spec.name, np.asarray(scores))
-    for prior in priors:
-        scored = scored.joined(prior, spec.aliases[0])
-    sink = answer_sink()
-    if sink is not None and len(rows):
-        sink(scored_batch(node, rows, scores))
-    return NodeResult(classify_outputs(node, scored), NodeMetrics(
+    return labeled_result(
+        node, np.asarray(ids, dtype=np.int32).reshape(-1, 1), scores, priors,
         input_rows=len(ids), output_rows=len(ids), evaluated_documents=len(ids),
         fresh_tokens=cost["tokens"], gpu_s=cost["gpu_s"], chunks=cost["chunks"],
-        extension={"output": spec.name, "aliases": list(spec.aliases),
-                   "input_rows": len(ids), "suffix_tokens": suffix_tokens}))
+        extension={"input_rows": len(ids), "suffix_tokens": suffix_tokens})
 
 
-def joined_label_passes(state, node, join) -> NodeResult:
+def joined_labels(state, node, join) -> NodeResult:
     """Classify the pairs a join kept, as option-code questions in each anchor's passes.
 
     Each anchor document is the state again; each partner the join kept
@@ -119,7 +130,7 @@ def joined_label_passes(state, node, join) -> NodeResult:
     Args:
         state: The query's execution state.
         node: The AiClassify over the join's pairs.
-        join: The JoinPart that ran the join, under set attention.
+        join: The JoinOperator that ran the join, under set attention.
     """
     spec = node.spec
     (join_node,) = [member for member in join.nodes if node.classifies_join(member)]
@@ -145,24 +156,23 @@ def joined_label_passes(state, node, join) -> NodeResult:
     targets = sorted({token for ids in spec.label_token_ids for token in ids})
     torch = state.torch
     model_spec = state.loaded_model.model_spec
-    stage, states, owners = join_pass_stage(
-        questions, join.inputs["prefixes"], sorted(kept), kept.get,
-        join.inputs["partner_documents"],
-        AsyncPassReadout(torch, torch.nn.functional,
-                         full_output_head(state.loaded_model.model), targets, None),
-        model_spec.set_size, state.chunk_tokens)
-    tokens, spans = 0, []
+    passes = join_passes(questions, join.inputs["prefixes"], sorted(kept), kept.get,
+                         join.inputs["partner_documents"], model_spec.set_size,
+                         state.chunk_tokens)
+    passes.stages = [0] * len(passes.states)
+    readout = AsyncPassReadout(torch, torch.nn.functional,
+                               full_output_head(state.loaded_model.model), targets,
+                               None)
+    label = f"classify {spec.name}"
+    run_passes(state, [own_stage(state, readout, label, passes)], passes,
+               label=label)
     rows = np.zeros((0, 2), dtype=np.int32)
     values = np.zeros(0, dtype=object)
-    if stage is not None:
-        answers, spans, tokens = run_stages(
-            torch, state.loaded_model.arena, state.loaded_model.pipeline, [stage],
-            states, state.chunk_tokens, staging=input_staging(state),
-            gpu_timing=state.gpu_timing, paged=False, label=f"classify {spec.name}")
+    if passes.states:
         # every pass's question rows, in pass order, and their pairs: an
         # anchor's passes cover its kept partners in order
-        logits = np.concatenate([np.asarray(answers[0][index][0], dtype=np.float64)
-                                 for index in range(len(owners))])
+        logits = np.concatenate([np.asarray(value, dtype=np.float64)
+                                 for value in passes.values])
         chosen = option_probabilities(
             logits, option_columns(spec.label_token_ids, targets),
             model_spec.answer_temperature).argmax(-1)
@@ -174,14 +184,9 @@ def joined_label_passes(state, node, join) -> NodeResult:
         rows = np.stack((np.repeat(np.asarray(join.ids, dtype=np.int64)[anchors],
                                    counts), partners), -1).astype(np.int32)
         values = np.asarray(spec.labels, dtype=object)[chosen]
-    pairs = rows
-    scored = score_rows(rows, spec.aliases, spec.name, list(values), pa.string())
-    sink = answer_sink()
-    if sink is not None and len(rows):
-        sink(scored_batch(node, rows, list(values)))
-    return NodeResult(classify_outputs(node, scored), NodeMetrics(
-        input_rows=len(pairs), output_rows=len(pairs),
-        evaluated_document_pairs=len(pairs), fresh_tokens=tokens,
-        gpu_s=gpu_seconds(spans), chunks=len(spans),
-        extension={"output": spec.name, "aliases": list(spec.aliases),
-                   "input_rows": len(pairs)}))
+    return labeled_result(
+        node, rows, list(values), value_type=pa.string(),
+        input_rows=len(rows), output_rows=len(rows),
+        evaluated_document_pairs=len(rows), fresh_tokens=passes.tokens,
+        gpu_s=passes.gpu_s, chunks=passes.chunks,
+        extension={"input_rows": len(rows)})

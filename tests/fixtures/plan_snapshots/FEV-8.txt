@@ -1,54 +1,49 @@
 logical:
-  Project: c1.id, e1.id, c2.id, e2.id
-    SemanticJoin (full)
-      PROMPT('Does the Wikipedia passage in DOCUMENT {1} support the claim in DOCUMENT {0}?', c2.claim, e2.text) (selectivity=0.217%)
-      Join
-        cross
-        SemanticJoin (full)
-          PROMPT('Does the Wikipedia passage in DOCUMENT {1} refute or contradict the claim in DOCUMENT {0}?', c2.claim, e1.text) (selectivity=0.332%)
-          Join
-            cross
-            SemanticJoin (full)
-              PROMPT('Does the Wikipedia passage in DOCUMENT {1} support the claim in DOCUMENT {0}?', c1.claim, e1.text) (selectivity=0.217%)
-              Join
-                cross
-                Scan claims as c1 [claim, id]
-                Scan evidence as e1 [text, id]
-            Scan claims as c2 [claim, id]
-        Scan evidence as e2 [text, id]
+  Projection: c1.id, e1.id, c2.id, e2.id
+    AiNode: __quail_answer_3 = ai_filter(prompt(Utf8("Does the Wikipedia passage in DOCUMENT {1} support the claim in DOCUMENT {0}?"), c2.claim, e2.text), named_struct(Utf8("selectivity"), Float64(0.002167247386759582))), filter: __quail_answer_3, returns: []
+      Cross Join:
+        Projection: c1.id, e1.id, c2.id, c2.claim
+          AiNode: __quail_answer_2 = ai_filter(prompt(Utf8("Does the Wikipedia passage in DOCUMENT {1} refute or contradict the claim in DOCUMENT {0}?"), c2.claim, e1.text), named_struct(Utf8("selectivity"), Float64(0.00332404181184669))), filter: __quail_answer_2, returns: []
+            Cross Join:
+              Projection: c1.id, e1.id, e1.text
+                AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Does the Wikipedia passage in DOCUMENT {1} support the claim in DOCUMENT {0}?"), c1.claim, e1.text), named_struct(Utf8("selectivity"), Float64(0.002167247386759582))), filter: __quail_answer_1, returns: []
+                  Cross Join:
+                    SubqueryAlias: c1
+                      TableScan: claims projection=[id, claim]
+                    SubqueryAlias: e1
+                      TableScan: evidence projection=[id, text]
+              SubqueryAlias: c2
+                TableScan: claims projection=[id, claim]
+        SubqueryAlias: e2
+          TableScan: evidence projection=[id, text]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
-  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
+  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
                                                                             est. rows   est. pass   est. time
-  Project: c1.id, e1.id, c2.id, e2.id
-    Recombine: c1, e1, c2, e2
-      AiJoin: anchor=e1 [3]                                                                           19.3 ms
+  AiJoin: anchor=c2                                                                                   1.08 ms
+    KV: anchor=not resident, retain after join=no
+    join 3 full (c2, e2)  PROMPT('Does the Wikipedia passage in DO…')               0      0.217%
+    Barrier: next_anchor=c2
+      AiJoin: anchor=e1 [3]                                                                           17.4 ms
         KV: anchor=not resident, retain after join=yes
         join 1 full (e1, c1)  PROMPT('Does the Wikipedia passage in DO…')          36      0.217%
         Scan evidence as e1                                                         6
-          tokens=114, mean_document_tokens=19
+          tokens=102, mean_document_tokens=17
         Scan claims as c1 [1]                                                       6
           tokens=42, mean_document_tokens=7
-      AiJoin: anchor=e1 [4]                                                                           1.09 ms
+      AiJoin: anchor=e1                                                                               1.09 ms
         KV: anchor=from an earlier join, retain after join=no
         join 2 full (e1, c2)  PROMPT('Does the Wikipedia passage in DO…')         0.5      0.332%
         Reuse [3]
         Scan claims as c2 [2]                                                       6
           tokens=42, mean_document_tokens=7
-      AiJoin: anchor=c2                                                                               1.08 ms
-        KV: anchor=not resident, retain after join=no
-        join 3 full (c2, e2)  PROMPT('Does the Wikipedia passage in DO…')           0      0.217%
-        Barrier: next_anchor=c2 [5]
-          Reuse [3]
-          Reuse [4]
-          Reuse [1]
-          Reuse [2]
-          Scan evidence as e2                                                       6
-            tokens=114, mean_document_tokens=19
-      Reuse [5]
+      Reuse [1]
+      Reuse [2]
+      Scan evidence as e2                                                           6
+        tokens=102, mean_document_tokens=17
   Pipeline on e1: ai_join:e1 -> ai_join:e1:predicate:1 (each document runs every operator with its KV resident)
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

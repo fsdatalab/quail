@@ -118,9 +118,17 @@ def build(session, name: str):
     return build_query(session, benchmark.get_query(name))
 
 
+def map_columns(query) -> list[tuple[str, object]]:
+    """Return the query's map answer columns and their prompts, in plan order."""
+    from quail.physical import decode_plan_value
+
+    return [(column["name"], decode_plan_value(json.dumps(column["call"]["prompt"])))
+            for column in json.loads(query.operators)["maps"]]
+
+
 def answer_columns(query) -> list[str]:
     """Return the query's map answer columns, in plan order."""
-    return [node.name for node in query.logical.operators().maps]
+    return [name for name, _ in map_columns(query)]
 
 
 def step_totals(steps: Path, first: int) -> tuple[int, int, int, int]:
@@ -152,7 +160,7 @@ def run_mode(mode: str, query_ids: list[str], scale_factor: float,
         The measurements as JSON.
     """
     from quail.baselines.vllm_trace import STEP_TRACE_ENV
-    from quail.cost.budgets import KV_POOL_TOKENS_ENV
+    from quail.common.budgets import KV_POOL_TOKENS_ENV
 
     # the engine's workers start with the Session and read these variables
     tag = f"{mode}-kv{kv_pool_tokens}" if kv_pool_tokens else mode
@@ -284,13 +292,13 @@ def estimate_sol(query: str, run_dir: str, mode: str, scale_factor: float,
         ids_by_table = register_tables(session, table, scale_factor, num_documents,
                                        num_contracts)
         built = build(session, query)
-        maps = {node.call.prompt: node for node in built.logical.operators().maps}
+        maps = {prompt: name for name, prompt in map_columns(built)}
         # the one saved column that is not an answer holds the row ids
         (id_column,) = set(saved) - set(answer_columns(built))
         written = {}
-        for prompt, node in maps.items():
-            ids = ids_by_table[node.call.prompt.args[0].provider]
-            by_id = dict(zip(map(str, saved[id_column]), saved[node.name]))
+        for prompt, name in maps.items():
+            ids = ids_by_table[prompt.args[0].provider]
+            by_id = dict(zip(map(str, saved[id_column]), saved[name]))
             written[prompt] = [by_id[str(row_id)] or "" for row_id in ids]
 
         def answer(prompt, assignment):

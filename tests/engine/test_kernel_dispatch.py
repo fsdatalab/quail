@@ -3,7 +3,7 @@
 import sys
 from types import ModuleType, SimpleNamespace
 
-import pytest
+from test_kv_reads import named
 
 from quail.backends.quail.executor.attention import (
     Engine,
@@ -11,11 +11,7 @@ from quail.backends.quail.executor.attention import (
 )
 
 
-@pytest.mark.parametrize("capability,head_dim,backend,version", [
-    ((9, 0), 128, "fa", 3),
-    ((10, 0), 512, "flashinfer", None),
-])
-def test_attention_dispatch_preserves_each_device_path(
+def check_attention_dispatch_preserves_each_device_path(
         monkeypatch, capability, head_dim, backend, version):
     calls = []
 
@@ -47,3 +43,16 @@ def test_attention_dispatch_preserves_each_device_path(
         assert args["fa_version"] == version
         assert args["block_table"] == "table"
         assert args["seqused_k"] == "used"
+
+
+def test_attention_dispatch_preserves_each_device_path(monkeypatch):
+    for capability, head_dim, backend, version in [
+        ((9, 0), 128, "fa", 3),
+        ((10, 0), 512, "flashinfer", None),
+    ]:
+        named(
+            f"capability={capability} head_dim={head_dim} "
+            f"backend={backend} version={version}",
+            check_attention_dispatch_preserves_each_device_path,
+            monkeypatch=monkeypatch, capability=capability, head_dim=head_dim,
+            backend=backend, version=version)

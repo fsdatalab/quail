@@ -7,7 +7,8 @@ from dataclasses import dataclass, replace
 import numpy as np
 import pyarrow as pa
 
-from quail.catalog.pairs import (
+from quail.common.pairs import (
+    COPIES,
     FIRST_DOCUMENT,
     columns_key,
     pair_ids_table,
@@ -216,6 +217,9 @@ def deduplicate(graph, nodes, inputs, context) -> Deduplicated | None:
                 value = _reduced_rows(value, alias, ids, keys[alias])
                 if value is None:
                     return None
+                if any(isinstance(member, AiFilter) and member.stop_key
+                       and member.alias == alias for member in nodes):
+                    value = _with_copies(value, alias, ids, keys[alias])
                 reduced[node.node_id][port.name] = value
         else:
             return None
@@ -258,6 +262,24 @@ def _reduced_rows(value, alias: str, ids, keys):
         return Rows({alias: pa.array(kept, pa.int32())}, rows.values)
     kept = pa.array(kept, pa.int32())
     return Rows({alias: kept}) if isinstance(value, Rows) else kept
+
+
+def _with_copies(value, alias: str, ids, keys) -> Rows:
+    """Reduced rows with a COPIES column: the documents each key stands for.
+
+    An AI filter's stop key counts a key document's survival once for
+    each copy, in the copy's own stop key group.
+    """
+    rows = value if isinstance(value, Rows) else Rows({alias: value})
+    ids = np.asarray(ids, dtype=np.int64)
+    order = np.argsort(keys[ids], kind="stable")
+    kept, starts = np.unique(keys[ids][order], return_index=True)
+    copies = pa.ListArray.from_arrays(
+        pa.array(np.append(starts, len(order)), pa.int32()),
+        pa.array(ids[order], pa.int32()))
+    if not np.array_equal(kept, document_ids(rows).to_numpy()):
+        raise ValueError(f"the reduced rows of {alias!r} are not its key documents")
+    return rows.with_column(COPIES, copies)
 
 
 def _read_pairs(context, aliases, table, keys, every, pairs, node, port,

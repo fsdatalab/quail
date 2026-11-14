@@ -1,29 +1,28 @@
 logical:
-  Project: c1.id, c2.id
-    SemanticJoin (full)
-      PROMPT('DOCUMENT {1} is the next call about the same deal as the sales call in DOCUMENT {0}. Does the sales rep in DOCUMENT {1} quote a price, discount, or payment term that differs from what the rep quoted for the same offer in DOCUMENT {0}? Answer TRUE if the two calls give different numbers for the same offer, FALSE if they give the same numbers or if one of the calls quotes none.', c1.transcript, c2.transcript) (selectivity=8.76%)
-      Join
-        on c1.id = c2.prev_call_id
-        Scan sales_calls as c1 [transcript, id]
-        Scan sales_calls as c2 [transcript, id, prev_call_id]
+  Projection: c1.id, c2.id
+    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("DOCUMENT {1} is the next call about the same deal as the sales call in DOCUMENT {0}. Does the sales rep in DOCUMENT {1} quote a price, discount, or payment term that differs from what the rep quoted for the same offer in DOCUMENT {0}? Answer TRUE if the two calls give different numbers for the same offer, FALSE if they give the same numbers or if one of the calls quotes none."), c1.transcript, c2.transcript), named_struct(Utf8("selectivity"), Float64(0.08763693270735524))), filter: __quail_answer_1, returns: []
+      Inner Join: c1.id = c2.prev_call_id
+        SubqueryAlias: c1
+          TableScan: sales_calls projection=[id, transcript]
+        SubqueryAlias: c2
+          TableScan: sales_calls projection=[id, prev_call_id, transcript]
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
-  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
+  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 
-                                                                                                          est. rows   est. pass   est. time
-  Project: c1.id, c2.id
-    AiJoin: anchor=c1                                                                                                               3.01 ms
-      KV: anchor=not resident, retain after join=no
-      join 1 full (c1, c2) over pairs from hash_join:c1-c2  PROMPT('DOCUMENT {1} is the next call ab…')           1       8.76%
-      Scan sales_calls as c1 [1]                                                                                  6
-        tokens=144, mean_document_tokens=24
-      Scan sales_calls as c2 [2]                                                                                  6
-        tokens=144, mean_document_tokens=24
-      HashJoin: c1.id = c2.prev_call_id
-        pairs kept: 0.02778 of the cross product
-        Reuse [1]
-        Reuse [2]
+                                                                                                        est. rows   est. pass   est. time
+  AiJoin: anchor=c1                                                                                                               2.18 ms
+    KV: anchor=not resident, retain after join=no
+    join 1 full (c1, c2) over pairs from hash_join:c1-c2  PROMPT('DOCUMENT {1} is the next call ab…')           1       8.76%
+    Scan sales_calls as c1 [1]                                                                                  6
+      tokens=132, mean_document_tokens=22
+    Scan sales_calls as c2 [2]                                                                                  6
+      tokens=132, mean_document_tokens=22
+    HashJoin: c1.id = c2.prev_call_id
+      pairs kept: 0.02778 of the cross product
+      Reuse [1]
+      Reuse [2]
   est. time is each node's work alone; node times do not add up to the plan estimate
   because chunk packing shares forward passes across nodes

@@ -1,109 +1,181 @@
-"""Sparse feature results and relational queries over their values."""
+"""Sparse feature results and relational queries over their values.
+
+Each transcript test holds its expected transcript: the plan's AI
+operators, the questions the model answered, and the rows
+(helpers/transcript.py).
+"""
 
 import pyarrow as pa
 import pytest
-from helpers.oracle import Oracle, finish
+from helpers.sessions import TOKENIZER
+from helpers.transcript import Transcripts, assert_transcript
 
 import quail
-from quail.backends.quail.executor.operators.sae_features import FEATURE_LIST
+from quail.api.config import EngineConfig
 from quail.catalog import DocumentProvider
-from quail.logical import CompileError
-from quail.physical import decode_graph, encode_graph
-from quail.planner.plan import EngineConfig
+from quail.common.expressions import CompileError
 
-REVIEWS = ["great sound", "meh", "broken zipper"]
-
-
-def _tokenize(text):
-    return [ord(character) for character in text]
+CONFIG = EngineConfig(model="qwen3.5-2b-sae-bf16", device="h100-sxm")
+REVIEWS = pa.table({"id": ["r0", "r1", "r2"],
+                    "body": ["great sound", "meh", "broken zipper"]})
+FEATURES = "AI.SAE_FEATURES(PROMPT('About? {0}', r.body), {'pooling': 'last'})"
+TOPIC = "AI.SAE_FEATURES(PROMPT('Topic? {0}', r.body), {'pooling': 'last'})"
+# one row per feature, as DataFusion's UNNEST in SELECT writes it
+ROWS = f"(SELECT r.id, UNNEST({FEATURES}) AS f FROM reviews r) x"
 
 
 @pytest.fixture()
 def session():
-    value = quail.Session(
-        EngineConfig(model="qwen3.5-2b-sae-bf16", device="h100-sxm"),
-        tokenizer=_tokenize)
-    value.register("reviews", DocumentProvider.from_table(
-        pa.table({"id": [7, 9, 11], "body": REVIEWS}), id_col="id"))
+    value = quail.Session(CONFIG, tokenizer=TOKENIZER)
+    value.register("reviews", DocumentProvider.from_table(REVIEWS, id_col="id"))
     yield value
     value.close()
 
 
-FEATURES = ("AI.SAE_FEATURES(PROMPT('{0}\\n\\nWhat is this review about?', "
-            "r.body), pooling => 'last')")
+def _answer(kind, prompt, rows):
+    """The model's features.
+
+    r<d> has feature d at strength d + 1, and feature 100 at 0.5; asked
+    the topic, every review has none.
+    """
+    if prompt == "Topic? {0}":
+        return []
+    index = int(rows[0][1:])
+    return [{"feature": index, "strength": float(index + 1)},
+            {"feature": 100, "strength": 0.5}]
 
 
-def test_features_run_returns_the_lists_and_the_answer_table(session):
-    query = session.sql(f"SELECT r.id, {FEATURES} AS features FROM reviews r")
-    oracle = Oracle(features=lambda spec, document: [
-        {"feature": document, "strength": float(document + 1) / 2}])
-    result = finish(query, oracle)
-    rows = result.collect()
-    assert rows.column("features").type == FEATURE_LIST
-    assert rows.column("features").to_pylist() == [
-        [{"feature": index, "strength": (index + 1) / 2}]
-        for index in range(3)]
-    answers = result.answer_tables["features"]["features"]
-    assert answers.num_rows == 3
+def _transcript(*queries, columns=()) -> str:
+    """The transcripts of `queries`; those in `columns` show column types."""
+    with Transcripts({"reviews": REVIEWS}, _answer, config=CONFIG) as runs:
+        return "\n".join(runs.query(sql, columns=sql in columns)
+                         for sql in queries)
 
 
-UNNEST = f"UNNEST({FEATURES}) AS f"
+def test_features_return_a_list_per_document_that_datafusion_unnests_and_filters():
+    listed = f"SELECT r.id, {FEATURES} AS features FROM reviews r"
+    assert_transcript(_transcript(
+        listed,
+        f"SELECT r.id, UNNEST({FEATURES}) AS f FROM reviews r",
+        "SELECT x.f['feature'] AS feature, COUNT(*) AS n, "
+        f"MAX(x.f['strength']) AS top FROM {ROWS} GROUP BY x.f['feature']",
+        f"SELECT x.id, x.f['feature'] AS feature FROM {ROWS} "
+        "WHERE NOT (x.f['strength'] < 1 OR x.f['feature'] = 100)",
+        f"SELECT x.f['feature'] AS feature FROM {ROWS} "
+        "WHERE x.f['strength'] > 2 OR x.id = 'r0'",
+        columns=(listed,)), """\
+--- SELECT r.id, AI.SAE_FEATURES(PROMPT('About? {0}', r.body), {'pooling': 'last'}) AS
+    features FROM reviews r ---
+plan
+  features = ai_sae_features('About? {0}', r.body, named_struct('pooling', 'last'))
+asked 3 of 3
+  'About? {0}': r0 [{'feature': 0, 'strength': 1.0}, {'feature': 100, 'strength': 0.5}],
+      r1 [{'feature': 1, 'strength': 2.0}, {'feature': 100, 'strength': 0.5}], r2
+      [{'feature': 2, 'strength': 3.0}, {'feature': 100, 'strength': 0.5}]
+columns r.id string, features list<item: struct<feature: int32, strength: float>>
+rows 3
+  r0, [{'feature': 0, 'strength': 1.0}, {'feature': 100, 'strength': 0.5}]
+  r1, [{'feature': 1, 'strength': 2.0}, {'feature': 100, 'strength': 0.5}]
+  r2, [{'feature': 2, 'strength': 3.0}, {'feature': 100, 'strength': 0.5}]
+
+--- SELECT r.id, UNNEST(AI.SAE_FEATURES(PROMPT('About? {0}', r.body), {'pooling':
+    'last'})) AS f FROM reviews r ---
+plan
+  __unnest_placeholder(AI.SAE_FEATURES('About? {0}', r.body,named_struct('pooling',
+      'last'))) = ai_sae_features('About? {0}', r.body, named_struct('pooling', 'last'))
+asked 3 of 3
+  'About? {0}': r0 [{'feature': 0, 'strength': 1.0}, {'feature': 100, 'strength': 0.5}],
+      r1 [{'feature': 1, 'strength': 2.0}, {'feature': 100, 'strength': 0.5}], r2
+      [{'feature': 2, 'strength': 3.0}, {'feature': 100, 'strength': 0.5}]
+rows 6
+  r0, {'feature': 0, 'strength': 1.0}
+  r0, {'feature': 100, 'strength': 0.5}
+  r1, {'feature': 1, 'strength': 2.0}
+  r1, {'feature': 100, 'strength': 0.5}
+  r2, {'feature': 100, 'strength': 0.5}
+  r2, {'feature': 2, 'strength': 3.0}
+
+--- SELECT x.f['feature'] AS feature, COUNT(*) AS n, MAX(x.f['strength']) AS top FROM
+    (SELECT r.id, UNNEST(AI.SAE_FEATURES(PROMPT('About? {0}', r.body), {'pooling':
+    'last'})) AS f FROM reviews r) x GROUP BY x.f['feature'] ---
+plan
+  __unnest_placeholder(AI.SAE_FEATURES('About? {0}', r.body,named_struct('pooling',
+      'last'))) = ai_sae_features('About? {0}', r.body, named_struct('pooling', 'last'))
+asked 3 of 3
+  'About? {0}': r0 [{'feature': 0, 'strength': 1.0}, {'feature': 100, 'strength': 0.5}],
+      r1 [{'feature': 1, 'strength': 2.0}, {'feature': 100, 'strength': 0.5}], r2
+      [{'feature': 2, 'strength': 3.0}, {'feature': 100, 'strength': 0.5}]
+rows 4
+  0, 1, 1.0
+  1, 1, 2.0
+  100, 3, 0.5
+  2, 1, 3.0
+
+--- SELECT x.id, x.f['feature'] AS feature FROM (SELECT r.id,
+    UNNEST(AI.SAE_FEATURES(PROMPT('About? {0}', r.body), {'pooling': 'last'})) AS f FROM
+    reviews r) x WHERE NOT (x.f['strength'] < 1 OR x.f['feature'] = 100) ---
+plan
+  __unnest_placeholder(AI.SAE_FEATURES('About? {0}', r.body,named_struct('pooling',
+      'last'))) = ai_sae_features('About? {0}', r.body, named_struct('pooling', 'last'))
+asked 3 of 3
+  'About? {0}': r0 [{'feature': 0, 'strength': 1.0}, {'feature': 100, 'strength': 0.5}],
+      r1 [{'feature': 1, 'strength': 2.0}, {'feature': 100, 'strength': 0.5}], r2
+      [{'feature': 2, 'strength': 3.0}, {'feature': 100, 'strength': 0.5}]
+rows 3
+  r0, 0
+  r1, 1
+  r2, 2
+
+--- SELECT x.f['feature'] AS feature FROM (SELECT r.id,
+    UNNEST(AI.SAE_FEATURES(PROMPT('About? {0}', r.body), {'pooling': 'last'})) AS f FROM
+    reviews r) x WHERE x.f['strength'] > 2 OR x.id = 'r0' ---
+plan
+  __unnest_placeholder(AI.SAE_FEATURES('About? {0}', r.body,named_struct('pooling',
+      'last'))) = ai_sae_features('About? {0}', r.body, named_struct('pooling', 'last'))
+asked 3 of 3
+  'About? {0}': r0 [{'feature': 0, 'strength': 1.0}, {'feature': 100, 'strength': 0.5}],
+      r1 [{'feature': 1, 'strength': 2.0}, {'feature': 100, 'strength': 0.5}], r2
+      [{'feature': 2, 'strength': 3.0}, {'feature': 100, 'strength': 0.5}]
+rows 3
+  0
+  100
+  2
+""")
 
 
-def _unnest_oracle():
-    # document d has feature d at strength d + 1, and feature 100 at 0.5
-    return Oracle(features=lambda spec, document: [
-        {"feature": document, "strength": float(document + 1)},
-        {"feature": 100, "strength": 0.5}])
+def test_an_empty_feature_list_is_not_null():
+    head = f"SELECT r.id, {TOPIC} AS features FROM reviews r WHERE "
+    assert_transcript(_transcript(
+        f"{head}{TOPIC} IS NULL", f"{head}{TOPIC} IS NOT NULL"), """\
+--- SELECT r.id, AI.SAE_FEATURES(PROMPT('Topic? {0}', r.body), {'pooling': 'last'}) AS
+    features FROM reviews r WHERE AI.SAE_FEATURES(PROMPT('Topic? {0}', r.body),
+    {'pooling': 'last'}) IS NULL ---
+plan
+  features = ai_sae_features('Topic? {0}', r.body, named_struct('pooling', 'last')),
+      filter: features IS NULL
+asked 3 of 3
+  'Topic? {0}': r0 [], r1 [], r2 []
+rows 0
+
+--- SELECT r.id, AI.SAE_FEATURES(PROMPT('Topic? {0}', r.body), {'pooling': 'last'}) AS
+    features FROM reviews r WHERE AI.SAE_FEATURES(PROMPT('Topic? {0}', r.body),
+    {'pooling': 'last'}) IS NOT NULL ---
+plan
+  features = ai_sae_features('Topic? {0}', r.body, named_struct('pooling', 'last')),
+      filter: features IS NOT NULL
+asked 3 of 3
+  'Topic? {0}': r0 [], r1 [], r2 []
+rows 3
+  r0, []
+  r1, []
+  r2, []
+""")
 
 
-def test_unnest_groups_rows_by_feature(session):
-    query = session.sql(
-        f"SELECT f.feature, COUNT(*) AS n, MAX(f.strength) AS top "
-        f"FROM reviews r, {UNNEST} GROUP BY f.feature ORDER BY n DESC")
-    codecs = session.registry.codecs
-    plan = query.plan()
-    assert decode_graph(encode_graph(plan.graph, codecs), codecs) == plan.graph
-    rows = finish(query, _unnest_oracle()).collect()
-    assert rows.to_pylist()[0] == {"f.feature": 100, "n": 3, "top": 0.5}
-    assert sorted(row["f.feature"] for row in rows.to_pylist()) == [0, 1, 2, 100]
-
-
-def test_not_and_or_of_unnested_fields_and_source_columns_filter_rows(session):
-    # feature 100 has strength 0.5 in every document; document d has
-    # feature d at strength d + 1
-    fields = session.sql(
-        f"SELECT r.id, f.feature FROM reviews r, {UNNEST} "
-        f"WHERE NOT (f.strength < 1 OR f.feature = 100) ORDER BY r.id")
-    assert finish(fields, _unnest_oracle()).collect().to_pylist() == [
-        {"r.id": 7, "f.feature": 0}, {"r.id": 9, "f.feature": 1},
-        {"r.id": 11, "f.feature": 2}]
-    mixed = session.sql(
-        f"SELECT f.feature FROM reviews r, {UNNEST} "
-        f"WHERE f.strength > 2 OR r.id = 7 ORDER BY f.feature")
-    assert finish(mixed, _unnest_oracle()).collect().to_pylist() == [
-        {"f.feature": 0}, {"f.feature": 2}, {"f.feature": 100}]
-
-
-def test_explain_shows_the_columns_an_unnest_returns(session):
-    query = session.sql(f"SELECT r.id, f.feature FROM reviews r, {UNNEST}")
-    assert "Project: r.id, f.feature" in query.explain()
-@pytest.mark.parametrize("comparison, num_rows", [("IS NULL", 0), ("IS NOT NULL", 3)])
-def test_feature_list_null_tests_keep_empty_lists(session, comparison, num_rows):
-    query = session.sql(
-        "SELECT r.id, AI.SAE_FEATURES(PROMPT('Topic? {0}', r.body), "
-        "pooling => 'last') AS features FROM reviews r "
-        f"WHERE features {comparison}")
-    assert finish(query, Oracle(features=lambda spec, document: []))\
-        .collect().num_rows == num_rows
-
-
-@pytest.mark.parametrize("test", ["features = 'x'", "LENGTH(features) > 0"])
-def test_feature_lists_must_be_unnested_before_testing_their_fields(session, test):
-    with pytest.raises(CompileError, match="UNNEST"):
-        session.sql(
-            "SELECT r.id, AI.SAE_FEATURES(PROMPT('Topic? {0}', r.body), "
-            "pooling => 'last') AS features FROM reviews r "
-            f"WHERE {test}")
-
-
+def test_a_text_test_of_a_feature_list_is_refused(session):
+    head = f"SELECT r.id, {TOPIC} AS features FROM reviews r WHERE "
+    for test, reason in (
+            ("{} = 'x'", r"AI\.SAE_FEATURES returns a list, so use UNNEST"),
+            ("LENGTH({}) > 0", r"LENGTH needs text, so use array_length.*UNNEST")):
+        with pytest.raises(CompileError, match=reason):
+            session.sql(head + test.format(TOPIC))

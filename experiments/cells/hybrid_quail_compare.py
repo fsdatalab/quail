@@ -87,13 +87,14 @@ def reference(model: str) -> dict:
     from transformers import AutoTokenizer
 
     from quail.baselines.vllm import VLLMEngine
-    from quail.planner.prompt_lowering import true_false_ids
+    from quail.common.tokens import model_answers
     from quail.specs import MODELS
 
     spec = MODELS[model]
     tokenizer = AutoTokenizer.from_pretrained(
         spec.hf_name, revision=spec.revision or None)
-    true_ids, false_ids = true_false_ids(tokenizer)
+    true_ids, false_ids, _ = model_answers(spec, lambda text: tokenizer(
+        text, add_special_tokens=False)["input_ids"])
     allowed = sorted(true_ids | false_ids)
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     class Engine(VLLMEngine):
@@ -149,7 +150,7 @@ def quail(model: str) -> dict:
     from quail.backends.quail.executor.models import build_pipeline
     from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
     from quail.backends.quail.worker import checkpoint_arena_args
-    from quail.cost import budgets
+    from quail.common import budgets
     from quail.specs import H100_SXM, MODELS
 
     spec = MODELS[model]

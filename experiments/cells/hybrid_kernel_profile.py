@@ -174,16 +174,18 @@ def quail(model: str, backend: str = "flashinfer",
     from quail.backends.quail.executor.model import load_model
     from quail.backends.quail.executor.models import build_pipeline
     from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
-    from quail.backends.quail.executor.stages import filter_stages, run_stages
+    from quail.backends.quail.executor.stage_executor import StageExecutor
+    from quail.backends.quail.executor.stages import filter_stages
     from quail.backends.quail.worker import checkpoint_arena_args
-    from quail.cost import budgets
-    from quail.planner.prompt_lowering import true_false_ids
+    from quail.common import budgets
+    from quail.common.tokens import model_answers
     from quail.specs import H100_SXM, MODELS
 
     spec = MODELS[model]
     tokenizer = AutoTokenizer.from_pretrained(
         spec.hf_name, revision=spec.revision or None)
-    true_ids, false_ids = true_false_ids(tokenizer)
+    true_ids, false_ids, _ = model_answers(spec, lambda text: tokenizer(
+        text, add_special_tokens=False)["input_ids"])
     budget = budgets.chunk_budget(spec, H100_SXM)
     loaded = load_model(spec.hf_name, spec.revision or None,
                         answer_token_ids=true_ids | false_ids,
@@ -208,8 +210,8 @@ def quail(model: str, backend: str = "flashinfer",
                          add_special_tokens=False)["input_ids"]
 
     def stage(batch):
-        run_stages(torch, arena, pipeline, filter_stages([question], answers),
-                   batch, budget, attention_mode="unified")
+        StageExecutor(torch, arena, pipeline, filter_stages([question], answers),
+                   batch, budget, attention_mode="unified").run()
         torch.cuda.synchronize()
         for key in arena.resident_keys():
             arena.free_key(key)
@@ -241,13 +243,14 @@ def vllm(model: str) -> dict:
     from transformers import AutoTokenizer
 
     from quail.baselines.vllm import VLLMEngine
-    from quail.planner.prompt_lowering import true_false_ids
+    from quail.common.tokens import model_answers
     from quail.specs import MODELS
 
     spec = MODELS[model]
     tokenizer = AutoTokenizer.from_pretrained(
         spec.hf_name, revision=spec.revision or None)
-    true_ids, false_ids = true_false_ids(tokenizer)
+    true_ids, false_ids, _ = model_answers(spec, lambda text: tokenizer(
+        text, add_special_tokens=False)["input_ids"])
     state, boot = VLLMEngine().boot(spec, sorted(true_ids | false_ids))
     client, params = state["client"], state["sampling_params"]
     documents = _documents(tokenizer)

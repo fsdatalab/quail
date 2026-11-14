@@ -5,7 +5,7 @@
 <h1 align="center">Quail</h1>
 
 <p align="center">
-  <b>An open-source inference engine for AI functions in SQL</b><br>
+  <b>SQL with AI functions on your GPUs</b><br>
   from the <a href="https://fsdatalab.github.io/">Full Stack Data Lab</a> at CMU
 </p>
 
@@ -15,75 +15,28 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License: MIT"></a>
 </p>
 
-Quail (QUery-Aware Inference Layer) runs LLMs over large datasets,
-from SQL, on your own GPUs. Quail's secret sauce is to optimize LLM
-inference and memory management for each query as a whole. This makes
-Quail lightning fast: **1.8x faster on average** than well-tuned vLLM
-baselines, and **up to 14x faster** on queries with AI joins
-([details](https://fsdatalab.github.io/blog/introducing-quail/))!
-
-```sql
-SELECT r.id,
-       AI.EXTRACT(r.body, {'actor': 'Which actor does the reviewer name?'}) AS review
-FROM reviews r
-WHERE AI.IF(PROMPT('Does this review discuss the ending?\n\n{0}', r.body))
-```
+Quail runs SQL with AI functions. Apache DataFusion parses, plans, and runs
+SQL around model regions. Quail runs the AI calls and related operators
+on the GPU in each model region.
 
 [Documentation](https://fsdatalab.github.io/quail) |
 [Quickstart](https://fsdatalab.github.io/quail/docs/user-guide/quickstart) |
-[Blog](https://fsdatalab.github.io/blog/) |
 [QUAIL-B](https://github.com/fsdatalab/quail-bench)
 
 ## Install
 
-Install [quail-engine from PyPI](https://pypi.org/project/quail-engine/).
-In Python, import `quail`.
+Use Python 3.12. Local AI calls require a supported CUDA GPU.
+Install the `quail-engine` package; import it as `quail`.
+
+E.g., install with uv:
 
 ```bash
 uv pip install quail-engine
 ```
 
-You need Python 3.12 and a CUDA GPU.
-
 ## Example
 
-```python
-import pyarrow as pa
-import quail
-
-reviews = pa.table({
-    "id": ["r1", "r2", "r3"],
-    "body": [
-        "A beautiful film with outstanding performances.",
-        "Terrible pacing and a nonsensical plot.",
-        "The cinematography was stunning, though the story dragged.",
-    ],
-})
-
-config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
-with quail.Session(config=config) as session:
-    session.register("reviews", quail.DocumentProvider.from_table(reviews, id_col="id"))
-    result = session.sql("""
-        SELECT r.id
-        FROM reviews r
-        WHERE AI.IF(PROMPT(
-            'Does this review mention a positive aspect of the movie?\n\n{0}',
-            r.body))
-    """, dialect="bq").collect()
-    print(result)
-```
-
-## Quail Server
-
-You can use Quail Server to run queries on the machine with your GPU.
-Start the HTTP server and set `endpoint` to its address. Your queries
-continue if you disconnect. `submit()` returns after the server saves
-your query. Use `get_run(query_id)` to reconnect later.
-
-```bash
-uv pip install "quail-engine[server]"
-quail-server
-```
+E.g., filter reviews on one H100 SXM:
 
 ```python
 import pyarrow as pa
@@ -93,62 +46,49 @@ reviews = pa.table({
     "id": ["r1", "r2"],
     "body": ["The ending was excellent.", "I liked the soundtrack."],
 })
-sql = """
-    SELECT r.id
-    FROM reviews r
-    WHERE AI.IF(PROMPT('Does this discuss the ending? {0}', r.body))
-"""
 config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
-
-with quail.Session(
-    config=config,
-    endpoint="http://127.0.0.1:8642",
-) as session:
-    session.register(
-        "reviews",
-        quail.DocumentProvider.from_table(reviews, id_col="id"),
-    )
-    run = session.sql(sql, dialect="bq").submit()
-    for status in run.watch():
-        print(status.phase["message"])
-    table = run.result().collect()
-    print(table)
+with quail.Session(config=config) as session:
+    session.register("reviews", quail.DocumentProvider.from_table(reviews, id_col="id"))
+    result = session.sql("""
+        SELECT r.id
+        FROM reviews r
+        WHERE AI.IF(PROMPT('Does this review discuss the ending? {0}', r.body))
+    """, dialect="bq").collect()
+    print(result)
 ```
 
-See [Quail Server](https://fsdatalab.github.io/quail/docs/user-guide/server).
+## Quail Server
+
+Use [Quail Server](https://fsdatalab.github.io/quail/docs/user-guide/server)
+to run queries on a remote GPU. Pass the server address as `endpoint`
+when you create the session. The server keeps accepted queries running
+after the client disconnects.
 
 ## Supported functions
 
-You can use filters and joins evaluated by a language model,
-`EXISTS` / `NOT EXISTS`, numeric scores (`AI.SCORE`), classification
-(`AI.CLASSIFY`), extracting text that answers a question (`AI.EXTRACT`),
-and writing a text answer for each document (`AI.MAP`).
+| AI function | Answer |
+| --- | --- |
+| `AI.IF` | Boolean, for filters and joins |
+| `AI.SCORE` | Numeric score |
+| `AI.CLASSIFY` | Label |
+| `AI.EXTRACT` | Text from a document |
+| `AI.EXTRACT_SPAN` | Character positions of the extracted text |
+| `AI.MAP` | Generated text |
+| `AI.SAE_FEATURES` | Sparse feature vector |
 
-You can write queries in two SQL dialects for AI functions:
-[Snowflake `AI_FILTER`](https://docs.snowflake.com/en/user-guide/snowflake-cortex/aisql)
-and
-[BigQuery `AI.IF`](https://cloud.google.com/blog/products/data-analytics/sql-reimagined-for-the-ai-era-with-bigquery-ai-functions).
+See the [SQL reference](https://fsdatalab.github.io/quail/docs/user-guide/sql).
 
 ## Supported models and GPUs
 
-Quail runs Qwen3, Qwen3.5, Qwen3.6, Qwen3.8, LFM2, d1, DiffusionGemma,
-and Decision 2.0 Kai models on NVIDIA H100 SXM, B200, L40S, and RTX PRO 6000
-Blackwell GPUs, with 1, 2, 4, or 8 GPUs per query. See
-[Supported models and GPUs](https://fsdatalab.github.io/quail/docs/user-guide/models)
-for each model's AI functions and GPU limits.
+See [Supported models and GPUs](https://fsdatalab.github.io/quail/docs/user-guide/models)
+for model names and GPU requirements. AI function support depends on the model.
 
 ## Development
 
-```bash
-uv run ruff check quail bench calibrate tests experiments tools
-uv run python tools/check_long_strings.py
-uv run python tools/check_names.py
-uv run vulture
-uv run lint-imports
-uv run pytest -q
-```
+Follow the [repository setup and checks](https://fsdatalab.github.io/quail/docs/contributing).
 
 ## Contributing
 
-See the [contributing guide](https://fsdatalab.github.io/quail/docs/contributing)
-for how to propose and submit changes.
+[Report a bug](https://github.com/fsdatalab/quail/issues) or follow the
+[contributing guide](https://fsdatalab.github.io/quail/docs/contributing)
+to submit a change.

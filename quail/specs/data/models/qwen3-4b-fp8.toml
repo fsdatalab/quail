@@ -1,0 +1,21 @@
+name = "qwen3-4b-fp8"
+params = 3.6e9  # dense params repeatedly used per token
+layers = 36
+hidden = 2560
+num_q_heads = 32
+num_kv_heads = 8
+d_head = 128
+ffn_width = 19456  # gate_up output: 2 x 9728 intermediate
+w_bytes = 1.0  # fp8 weights
+hf_name = "Qwen/Qwen3-4B-FP8"
+revision = "96b30dc13593a244a5e59e84687309f53c375cfa"
+kv_bytes = 2.0  # bf16 KV; the only stored dtype
+w_mem_bytes = 4.5e9  # measured footprint: fp8 weights + bf16
+                     # embeddings + block scales
+vocab = 151_936
+tied_head = true  # lm_head shares the embedding tensor, so
+                  # nothing moves off the GPU at load
+vllm_reserve_bytes = 6_442_450_944  # 6 * 1024**3
+turn_prefix = "<|im_start|>system\nYou are an expert at text analysis<|im_end|>\n<|im_start|>user\n"
+turn_suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+prompt_format = "qwen3-chat-text-analysis-v1"

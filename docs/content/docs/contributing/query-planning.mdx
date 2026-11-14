@@ -1,0 +1,158 @@
+---
+title: Planner overview
+---
+
+Quail performs physical query optimization: it reorders AI operators and
+reuses KV while preserving the SQL result for the same AI answers. Quail does
+not rewrite prompts or compare output quality, unlike semantic and
+approximate optimizers such as
+[DocETL (Shankar et al., 2025)](https://www.vldb.org/pvldb/vol18/p3035-shankar.pdf)
+and [MOAR (Wei, Shankar, et al., 2026)](https://arxiv.org/abs/2512.02289).
+
+At a high level, DataFusion plans and runs the relational operators, while
+Quail groups the AI operators and runs each group on the GPU.
+
+## Architecture
+
+DataFusion first builds a logical plan, which lists the query operations.
+DataFusion then builds a physical plan, which selects an implementation for
+each operation. Quail adds one `ModelRegionExec` physical operator for each
+group of AI calls.
+
+Quail waits for the input rows before it plans a model region. The input rows
+provide the token lengths and shared prefixes needed to estimate GPU time.
+
+<PlanningFigure />
+
+## Algorithms
+
+Quail starts with the logical plan from DataFusion.
+
+### Algorithm 1: derive
+
+`derive` moves filters, output columns, limits, and guards onto the AI
+operators able to use them. Each move removes model work without changing the
+query result.
+
+| Option | Quail uses the option to |
+| --- | --- |
+| `filter` | Stop an answer or drop a row as soon as a condition is known. |
+| `projection` | Return only the answer columns used later in the query. |
+| `fetch` | Stop after enough rows pass the operators below. |
+| `guard` | Skip an AI call when a row does not need an answer. |
+
+<PlannerAlgorithm name="derive" />
+
+### Algorithm 2: claim model regions
+
+`claim_model_regions` groups adjacent AI operators Quail can run together.
+DataFusion keeps every relational operator Quail cannot include in a model
+region.
+
+<PlannerAlgorithm name="claim" />
+
+### Algorithm 3: plan a model region
+
+DataFusion sends the input rows to the region planner. The planner tokenizes
+the documents and measures their shared prefixes. The planner then chooses
+the operator order, join order, prefix sharing, attention path, and KV
+retention with the lowest estimated GPU time.
+
+The planner can reuse resident KV, the cached keys and values for a document
+already on the GPU. The next AI operator can then append only its question.
+
+<PlannerAlgorithm name="region" />
+
+### Algorithm 4: run a pipeline
+
+The executor reads the physical plan and the options set by `derive`. The
+executor evaluates each filter while the model produces an answer, drops
+failed rows, and returns finished rows to DataFusion.
+
+DataFusion can send a dynamic filter from a join or sort while the model
+region runs. A dynamic filter contains values produced during the query and
+removes rows no longer able to reach the result.
+
+<PlannerAlgorithm name="execute" />
+
+### Preserve the query result
+
+Every planner rewrite must return the same rows as the original DataFusion
+plan. Each AI operator lists every column it reads, so Quail never moves the
+operator below a missing column. Quail recomputes every output column after
+each rewrite. Generated-query tests compare every optimization while enabled
+and disabled.
+
+## Follow one query
+
+The query filters reviews by year, asks whether each review mentions the
+ending, classifies each passing review, and stops after ten rows:
+
+```sql
+SELECT r.id,
+       AI.CLASSIFY(r.text, ['positive', 'negative', 'mixed']) AS sentiment
+FROM reviews r
+WHERE r.year = 2024
+  AND AI.IF(PROMPT('Does the review mention the ending? {0}', r.text))
+LIMIT 10;
+```
+
+<PlanStagesFigure />
+
+DataFusion moves the year condition into the scan. `derive` gives the answer
+condition to `AI.IF` and the limit to `AI.CLASSIFY`. Quail then removes the
+original filter and limit.
+
+`claim_model_regions` groups the two adjacent AI operators. DataFusion plans
+the scan and treats the model region as one physical operator. The region
+planner puts `AI.IF` first because each no answer removes a row before
+`AI.CLASSIFY` runs.
+
+<DeriveFigure />
+
+`AI.CLASSIFY` receives the fetch because it is the last AI operator. The
+fetch counts rows returned by the region. `AI.IF` applies the only remaining
+answer condition, so every row reaching `AI.CLASSIFY` counts toward the
+fetch.
+
+## Plan several model regions
+
+DataFusion splits AI operators into separate regions when a plain join lies
+between them. The query creates one region over reviews and one region over
+movies:
+
+```sql
+SELECT m.genre,
+       AI.CLASSIFY(
+           r.text,
+           ['acting', 'plot', 'cinematography', 'other']
+       ) AS topic,
+       COUNT(*) AS reviews
+FROM reviews r
+JOIN movies m ON r.movie_id = m.id
+JOIN critics c ON r.critic_id = c.id
+WHERE AI.IF(PROMPT('Is the review negative? {0}', r.text))
+  AND AI.IF(PROMPT('Does the plot involve time travel? {0}', m.plot))
+  AND c.country = 'US'
+GROUP BY m.genre, topic;
+```
+
+DataFusion carries rows and dynamic filters between the regions. Quail plans
+each region separately on the same loaded model and GPU.
+
+| Owner | Work |
+| --- | --- |
+| Model region 1 | Scan reviews, run `AI.IF`, then run `AI.CLASSIFY`. |
+| Model region 2 | Scan movies, then run `AI.IF`. |
+| DataFusion | Scan critics, join all three inputs, group the rows, and count them. |
+
+| Resource | Shared between regions? | Behavior |
+| --- | --- | --- |
+| Pipelines | No | A pipeline stays inside one region. |
+| KV and prefixes | No | Each region plans its own document inputs. |
+| Rows | Yes | Arrow batches pass through DataFusion operators. |
+| Dynamic filters | Yes | A completed join input can remove work from another region. |
+| Model and GPU | Yes | The same loaded model runs every region. |
+
+An AI join puts both input tables in one model region. The region planner can
+then choose the join order, the anchor, and KV reuse across both tables.

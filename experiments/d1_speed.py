@@ -8,7 +8,7 @@ Both cells run on one H100 SXM over the 4,995 IMDB-11 reviews at scale
 factor 0.1 and its question. The Liquid cell times
 ``model.system_one_batch`` after ``model.compile()``, at its default
 token budget and at Quail's chunk budget. The Quail cell times
-``run_pass_group`` for IMDB-11's classification alone, and one
+a pass group run for IMDB-11's classification alone, and one
 mixed pass group (a yes/no, a choice, and a read in each review's
 pass), then profiles one more run of each with the torch profiler. It
 prints the CUDA time by kernel and by kind, and the host share: the
@@ -123,14 +123,14 @@ def _quail_state():
     from quail.backends.quail.executor.model_loading import load_model
     from quail.backends.quail.executor.models import build_pipeline
     from quail.backends.quail.executor.readout import AnswerRows
-    from quail.catalog.tokens import GigatokenEncoder
-    from quail.cost import budgets
-    from quail.planner.prompt_lowering import answer_ids
+    from quail.common import budgets
+    from quail.common.tokens import Tokenizer
+    from quail.physical.lowering import answer_ids
     from quail.specs import D1_2B_BF16, H100_SXM
     from quail.specs.files import resolve_model_path
 
     spec, device = D1_2B_BF16, H100_SXM
-    encoder = GigatokenEncoder(resolve_model_path(spec.hf_name, spec.revision))
+    encoder = Tokenizer(resolve_model_path(spec.hf_name, spec.revision))
     true_ids, false_ids = answer_ids(spec, encoder)
     model = load_model(spec.hf_name, revision=spec.revision,
                        answer_token_ids=list(true_ids) + list(false_ids))
@@ -155,10 +155,10 @@ def _quail_state():
 
 def _classify_spec(encoder):
     """IMDB-11's classification as a ClassifySpec over the reviews."""
-    from quail.logical import ColumnRef
-    from quail.logical.prompts import bind_classify_prompt
+    from quail.api.prompts import bind_classify_prompt
+    from quail.common.expressions import ColumnRef
     from quail.physical import ClassifySpec
-    from quail.planner.prompt_lowering import lower_prompt, option_spellings
+    from quail.physical.lowering import lower_prompt, option_spellings
     from quail.specs import D1_2B_BF16
 
     spec = D1_2B_BF16
@@ -180,19 +180,24 @@ def _classify_spec(encoder):
 
 def _mixed_questions(encoder, choice):
     """A yes/no, IMDB-11's choice, and a read, as one pass group's SetQuestions."""
+    from quail.api.prompts import bind_extract_prompt, bind_prompt
     from quail.backends.quail.executor.pass_groups import SetQuestion, node_question
-    from quail.backends.quail.lowering import set_question_parts
-    from quail.logical import ColumnRef, bind_prompt
-    from quail.logical.prompts import PROMPT_LAYOUTS, bind_extract_prompt
+    from quail.common.expressions import ColumnRef
     from quail.physical import AiClassify
-    from quail.planner.prompt_lowering import lower_prompt, read_slot_offsets
+    from quail.physical.lowering import (
+        lower_prompt,
+        prompt_layout,
+        read_slot_offsets,
+        set_question_parts,
+    )
     from quail.specs import D1_2B_BF16
 
     spec = D1_2B_BF16
-    lowered = lower_prompt(bind_prompt(
+    prompt = bind_prompt(
         "Does the review praise the acting? {0}", ("body",), turn=spec.turn,
-        layout=spec.prompt_layout), encoder)
-    parts = set_question_parts(lowered, spec, encoder)
+        layout=spec.prompt_layout)
+    lowered = lower_prompt(prompt, encoder)
+    parts = set_question_parts(prompt, encoder)
     tail, cut = tuple(lowered.tail_token_ids), parts["state_tail_tokens"]
     yes_no = SetQuestion("yes_no", tuple(lowered.preamble_token_ids), tail[:cut],
                          tail[cut:], parts["question_header_token_ids"])
@@ -205,7 +210,7 @@ def _mixed_questions(encoder, choice):
     read = SetQuestion(
         "read", tuple(lowered.preamble_token_ids), tail[:cut], tail[cut:],
         tuple(encoder("QUESTION:\n")), slots=read_slot_offsets(
-            segments[-1], PROMPT_LAYOUTS[spec.prompt_layout].read_slots, encoder))
+            segments[-1], prompt_layout(spec.prompt_layout)["read_slots"], encoder))
     return [yes_no, node_question(AiClassify(node_id="label", spec=choice)), read]
 
 
@@ -280,9 +285,9 @@ def quail_profile() -> dict:
     """
     from dataclasses import replace
 
-    from quail.backends.quail.executor.pass_groups import run_pass_group
-    from quail.catalog.document_ends import document_ends
-    from quail.catalog.tokens import DocumentPrefixes
+    from quail.backends.quail.executor.pass_groups import PassGroup
+    from quail.common.document_ends import document_ends
+    from quail.common.tokens import DocumentPrefixes
 
     state, encoder = _quail_state()
     spec = _classify_spec(encoder)
@@ -295,13 +300,15 @@ def quail_profile() -> dict:
     questions = [replace(question, ends=ends)
                  for question in _mixed_questions(encoder, spec)]
     prefixes = DocumentPrefixes(first.head, documents["r"], rows)
+
+    def ask(asked):
+        return PassGroup(state, asked, prefixes).ask(prefixes)
+
     result = dict(
-        classify=_profile(
-            "classify", lambda: run_pass_group(state, questions[1:2], prefixes),
-            len(rows), lambda group: group.tokens),
-        mixed=_profile(
-            "mixed", lambda: run_pass_group(state, questions, prefixes),
-            len(rows), lambda group: group.tokens))
+        classify=_profile("classify", lambda: ask(questions[1:2]), len(rows),
+                          lambda group: group.tokens),
+        mixed=_profile("mixed", lambda: ask(questions), len(rows),
+                       lambda group: group.tokens))
     modal.Volume.from_name("quail-results").commit()
     print("RESULT quail " + json.dumps(result), flush=True)
     return result

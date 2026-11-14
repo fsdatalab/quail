@@ -20,7 +20,7 @@ from quail.backends.quail.executor.readout import (
 )
 from quail.backends.quail.executor.stages import Stage
 from quail.backends.quail.executor.state import QueryExecutionState
-from quail.catalog.tokens import concat_tokens
+from quail.common.tokens import concat_tokens
 from quail.execution.labels import (
     GreedyDecoder,
     best_label,
@@ -108,22 +108,6 @@ def label_requests(spec, targets=None) -> LabelRequests:
             frame, [[cue, *runs.runs[0]], *runs.runs[1:]], targets, False,
             None, rounds=runs.rounds)
     raise ValueError(f"unknown label scoring rule {spec.scoring!r}")
-
-
-def document_prefixes(spec, documents, rows) -> list:
-    """Combine the prompt head and document tokens for each input row.
-
-    Args:
-        spec: Single-document classification specification.
-        documents: Tokenized documents indexed by table alias and document ID.
-        rows: Document IDs to classify, in input order.
-
-    Returns:
-        One token sequence per input row.
-    """
-    head, _ = spec.prompt_token_parts
-    (alias,) = spec.aliases
-    return [concat_tokens(head, documents[alias][document]) for document in rows]
 
 
 @dataclass

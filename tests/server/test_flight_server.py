@@ -1,0 +1,227 @@
+"""Quail Server in Rust: a client uploads tables and runs SQL over Arrow Flight."""
+
+import contextlib
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pyarrow as pa
+import pyarrow.flight as flight
+import pytest
+from helpers.sessions import CONFIG
+
+import quail
+import quail.remote.client
+
+REPOSITORY = Path(__file__).resolve().parents[2]
+SERVER = Path(sys.executable).parent / "quail-server"
+WORKER = REPOSITORY / "tests" / "helpers" / "oracle_worker.py"
+
+REVIEWS = pa.table({
+    "id": [f"r{index}" for index in range(6)],
+    "body": [f"review {index} " + "pad " * index for index in range(6)],
+})
+QUERY = ("SELECT r.id FROM reviews r "
+         "WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) ORDER BY r.id")
+
+pytestmark = pytest.mark.skipif(
+    not SERVER.exists(),
+    reason="quail-server is not installed; run tools/build.sh")
+
+
+class _Client(flight.FlightClient):
+    """A Flight client that remembers the address it called."""
+
+    def __init__(self, endpoint):
+        super().__init__(endpoint)
+        self.endpoint = endpoint
+
+
+@contextlib.contextmanager
+def serving(data, delay=0.0, token=""):
+    """A Flight client of a server on `data` whose workers answer from an oracle.
+
+    Args:
+        data: The server's data directory.
+        delay: Seconds each filter answer takes.
+        token: The server's token; without one it takes every call.
+    """
+    options = flight.FlightCallOptions(headers=[] if not token else [
+        (b"authorization", f"Bearer {token}".encode())])
+    with socket.socket() as found:
+        found.bind(("127.0.0.1", 0))
+        port = found.getsockname()[1]
+    server = subprocess.Popen(
+        [str(SERVER), "--model", "qwen3-4b-fp8", "--device", "h100-sxm",
+         "--listen", f"127.0.0.1:{port}", "--data", str(data)],
+        env={**os.environ, "QUAIL_WORKER": f"{sys.executable} {WORKER}",
+             "QUAIL_ORACLE_DELAY": str(delay),
+             "QUAIL_SERVER_TOKEN": token})
+    try:
+        client = _Client(f"grpc://127.0.0.1:{port}")
+        deadline = time.monotonic() + 60
+        while True:
+            try:
+                list(client.list_actions(options))
+                break
+            except flight.FlightUnavailableError:
+                assert server.poll() is None, "quail-server exited"
+                assert time.monotonic() < deadline, "quail-server did not start"
+                time.sleep(0.1)
+        descriptor = flight.FlightDescriptor.for_path("reviews", "id")
+        writer, _ = client.do_put(descriptor, REVIEWS.schema, options)
+        writer.write_table(REVIEWS)
+        writer.close()
+        yield client
+    finally:
+        server.terminate()
+        server.wait(timeout=10)
+
+
+def _act(client, name, body) -> dict | list:
+    text = body if isinstance(body, str) else json.dumps(body)
+    answer, = client.do_action(flight.Action(name, text.encode()))
+    return json.loads(answer.body.to_pybytes())
+
+
+def _finished(client, submitted, seconds=30) -> dict:
+    """Wait for a submission to finish; return its status."""
+    deadline = time.monotonic() + seconds
+    while True:
+        status = _act(client, "status", submitted)
+        if status["state"] not in ("queued", "running"):
+            return status
+        assert time.monotonic() < deadline, status
+        time.sleep(0.05)
+
+
+def _rows(client, ticket) -> dict:
+    return client.do_get(flight.Ticket(ticket.encode())).read_all().to_pydict()
+
+
+def test_a_client_uploads_a_table_and_reads_the_rows_of_an_ai_query(tmp_path):
+    with serving(tmp_path) as client:
+        # the oracle keeps the documents at even positions
+        assert _rows(client, QUERY) == {"r.id": ["r0", "r2", "r4"]}
+        plan, = client.do_action(
+            flight.Action("explain", json.dumps({"sql": QUERY}).encode()))
+        assert "ModelRegionExec" in plan.body.to_pybytes().decode()
+        # a query that does not plan is the client's error, and the next runs
+        with pytest.raises(pa.ArrowInvalid, match="missing"):
+            _rows(client, "SELECT * FROM missing")
+        assert _rows(client, "SELECT count(*) AS n FROM reviews") == {"n": [6]}
+
+
+def test_a_session_with_an_endpoint_uploads_its_tables_and_runs_its_queries(
+        tmp_path):
+    with serving(tmp_path) as client, quail.Session(
+            CONFIG, endpoint=client.endpoint) as session:
+        session.register("notes", quail.DocumentProvider.from_table(
+            REVIEWS, id_col="id"))
+        query = session.sql(QUERY.replace("reviews", "notes"))
+        assert query.collect().to_pydict() == {"r.id": ["r0", "r2", "r4"]}
+        assert "ModelRegionExec" in query.explain()
+        run = query.submit(query_id="named")
+        assert run.wait(wait_s=0.05).num_rows == 3
+        assert session.get_run("named").result().count() == 3
+        failed = session.sql("SELECT * FROM missing").submit()
+        with pytest.raises(quail.QueryFailedError, match="missing"):
+            failed.result(wait_s=0.05)
+
+
+def test_a_session_uploads_a_batch_larger_than_grpcs_default_message_limit(
+        tmp_path):
+    long = pa.table({"id": ["n0", "n1"], "body": ["long " * 1_200_000, "short"]})
+    with serving(tmp_path) as client, quail.Session(
+            CONFIG, endpoint=client.endpoint) as session:
+        session.register("notes", quail.DocumentProvider.from_table(long, id_col="id"))
+        counted = session.sql("SELECT COUNT(*) AS num_notes FROM notes n")
+        assert counted.collect().to_pydict() == {"num_notes": [2]}
+
+
+def test_a_run_shows_its_plan_its_answers_its_report_and_its_port_tables(
+        tmp_path):
+    with serving(tmp_path) as client, quail.Session(
+            CONFIG, endpoint=client.endpoint) as session:
+        run = session.sql(QUERY).submit(query_id="shown")
+        seen = list(run.watch(wait_s=5))
+        last = seen[-1]
+        assert last.state == "succeeded" and last.ready
+        # the status changed at least when planned, ready, and finished
+        assert len({status.revision for status in seen}) >= 3
+        (plan,) = last.plans
+        assert "AiFilter" in plan["text"] and plan["estimated_seconds"] > 0
+        # the oracle answers its six documents as one chunk: one event
+        events = run.answers()
+        assert last.num_answers == events["next"] == 1
+        (event,) = events["answers"]
+        assert event["kind"] == "filter" and [
+            passed for _row, _stage, passed in event["documents"]
+        ] == [True, False, True, False, True, False]
+        assert run.answers(after=1) == {"answers": [], "next": 1}
+        (report,) = run.report()
+        assert report["fresh_tokens"] > 0 and report["wall_s"] > 0
+        assert last.tables and all(
+            session._remote.client.table("shown", index).num_rows
+            == saved["num_rows"] for index, saved in enumerate(last.tables))
+    # a server started again still has the answers and the report
+    with serving(tmp_path) as client:
+        assert _act(client, "answers", {"id": "shown"})["next"] == 1
+        assert _act(client, "report", "shown")["regions"][0]["fresh_tokens"] > 0
+
+
+def test_a_server_with_a_token_refuses_a_call_without_it(tmp_path):
+    with serving(tmp_path, token="secret") as client:
+        with pytest.raises(flight.FlightUnauthenticatedError):
+            _act(client, "list", "")
+        with quail.Session(CONFIG, endpoint=client.endpoint) as session:
+            with pytest.raises(flight.FlightUnauthenticatedError):
+                session.sql("SELECT 1").submit()
+        found = quail.remote.client.ServerClient(client.endpoint, token="secret")
+        assert found.submissions() == []
+
+
+def test_a_submission_keeps_its_status_and_rows_when_the_server_restarts(tmp_path):
+    with serving(tmp_path) as client:
+        submitted = _act(client, "submit", {"sql": QUERY, "id": "first"})
+        assert submitted["state"] in ("queued", "running", "succeeded")
+        status = _finished(client, "first")
+        assert (status["state"], status["num_rows"]) == ("succeeded", 3)
+        assert _rows(client, '{"query_id": "first"}') == {"r.id": ["r0", "r2", "r4"]}
+        # the same id runs the same query once, and names no other query
+        assert _act(client, "submit", {"sql": QUERY, "id": "first"}) == status
+        with pytest.raises(pa.ArrowInvalid, match="another query"):
+            _act(client, "submit", {"sql": "SELECT 1", "id": "first"})
+        failed = _act(client, "submit", {"sql": "SELECT * FROM missing"})
+        assert _finished(client, failed["id"])["state"] == "failed"
+    with serving(tmp_path) as client:
+        found = _act(client, "list", "")
+        assert [(one["id"], one["state"]) for one in found] == [
+            ("first", "succeeded"), (failed["id"], "failed")]
+        assert _rows(client, '{"query_id": "first"}') == {"r.id": ["r0", "r2", "r4"]}
+
+
+def test_a_timeout_or_a_cancel_stops_a_query_and_the_next_one_runs(tmp_path):
+    # six answers of 0.5 s each: the query takes about 3 s
+    with serving(tmp_path, delay=0.5) as client:
+        slow = _act(client, "submit", {"sql": QUERY, "timeout_s": 0.5})
+        waiting = _act(client, "submit", {"sql": QUERY, "id": "waiting"})
+        running = _act(client, "submit", {"sql": QUERY, "id": "running"})
+        # a waiting submission that is cancelled never runs
+        assert _act(client, "cancel", "waiting")["state"] == "cancelled"
+        status = _finished(client, slow["id"])
+        assert status["state"] == "failed" and "timed out" in status["error"]
+        # the next query runs on workers Quail started again
+        deadline = time.monotonic() + 30
+        while _act(client, "status", "running")["state"] != "running":
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        _act(client, "cancel", "running")
+        assert _finished(client, "running")["state"] == "cancelled"
+        assert waiting["state"] == "queued" and running["state"] == "queued"
+        last = _act(client, "submit", {"sql": "SELECT count(*) AS n FROM reviews"})
+        assert _finished(client, last["id"])["num_rows"] == 1
