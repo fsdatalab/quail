@@ -1,7 +1,7 @@
-"""A physical plan, a refusal to plan, and the edits that change a plan."""
+"""A physical plan and a refusal to plan."""
 
 import json
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 import _quail_native
@@ -35,15 +35,6 @@ class RefusalError(RuntimeError):
             f"{refusal.constraint}: needed {refusal.needed} "
             f"{refusal.unit}, available {refusal.available}. "
             + " ".join(refusal.reasons))
-
-
-class PlanEditError(ValueError):
-    """Raised by insert, remove, and move when an edit breaks a rule."""
-
-
-def _no_tokens(_text: str) -> list:
-    """Tokenize nothing: pricing an edited graph reads no new prompt."""
-    return []
 
 
 def _estimates(estimates: dict) -> dict:
@@ -82,8 +73,7 @@ def plan_from_json(found: dict):
         settings["candidates"] = tuple(
             {**candidate, "rewrites": tuple(candidate["rewrites"])}
             for candidate in settings["candidates"])
-    pricing = ({"fields": found["fields"], "pricer": found["pricer"]}
-               if "pricer" in found else None)
+    pricing = {"fields": found["fields"]} if "fields" in found else None
     return PhysicalPlan(
         model=envelope["model"], device=envelope["device"], gpus=envelope["gpus"],
         backend=envelope["backend"],
@@ -100,8 +90,7 @@ class PhysicalPlan:
     estimates holds, per node id, the node's own estimated seconds
     and, for a filter sequence a later join anchors on, the recompute it
     would pay if its KV were released instead of pinned. pricing holds
-    the planning context's fields and the pricer Rust wrote, which
-    price an edited graph again; a plan without it is not priced again.
+    the planning context's fields.
     operators records the selected operators for query execution and explain.
     """
 
@@ -132,72 +121,6 @@ class PhysicalPlan:
         object.__setattr__(self, "nodes", graph.nodes)
         object.__setattr__(self, "root", graph.root)
         object.__setattr__(self, "graph", graph)
-
-    def _edit(self, edit: dict) -> "PhysicalPlan":
-        """Apply an edit in Rust: rewire, set KV retention, validate, price.
-
-        The estimate includes recomputation when an edit separates filters
-        from a following join and their survivors were not already retained.
-
-        Raises:
-            PlanEditError: The edit names a missing node or edge, removes a
-                node that changes what the query means, or leaves an
-                invalid graph.
-        """
-        graph = json.loads(self.graph.to_json())
-        if self.pricing is not None:
-            retained = sorted(self.settings.get("retention", {}).get("initial", {}))
-            found, message = _quail_native.plan_operator(
-                "edit_plan", json.dumps(self.pricing["fields"]),
-                json.dumps({"pricer": self.pricing["pricer"], "graph": graph,
-                            "edit": edit, "retained": retained}),
-                _no_tokens)
-            if message is not None:
-                raise PlanEditError(message)
-            found = json.loads(found)
-            edited = PhysicalGraph.from_json(json.dumps(found["graph"]))
-            return self._edited(edited, estimated_seconds=found["seconds"],
-                                estimates=_estimates(found["estimates"]))
-        found, message = _quail_native.edit_graph(json.dumps(graph), json.dumps(edit))
-        if message is not None:
-            raise PlanEditError(message)
-        edited = PhysicalGraph.from_json(found)
-        return self._edited(edited, estimates={})
-
-    def _edited(self, edited: PhysicalGraph, **fields) -> "PhysicalPlan":
-        """Return the plan with an edited graph and its stages cut again."""
-        settings = self.settings
-        if "stages" in settings:
-            settings = {**settings, "stages": json.loads(
-                _quail_native.region_stages(edited.to_json(), self.gpus))}
-        return replace(self, nodes=edited.nodes, root=edited.root,
-                       settings=settings, **fields)
-
-    def insert(self, node, *, between: tuple) -> "PhysicalPlan":
-        """Put node on the edge from producer to consumer.
-
-        The consumer's port that read the producer reads the new node
-        instead, and the new node reads the producer. No other node
-        changes. The node must have no inputs yet and exactly one
-        output of the value type the edge carries.
-        """
-        return self._edit({"op": "insert", "node": json.loads(node.to_json()),
-                           "between": list(between)})
-
-    def remove(self, node_id: str) -> "PhysicalPlan":
-        """Take a node out; its consumers read its producer instead.
-
-        Allowed only for Barrier nodes with one input and one
-        output of the same value type. Removing a Scan,
-        AiFilter, AiJoin, or Limit would change
-        what the query means.
-        """
-        return self._edit({"op": "remove", "node_id": node_id})
-
-    def move(self, node_id: str, *, between: tuple) -> "PhysicalPlan":
-        """Remove a node and insert it on another edge."""
-        return self._edit({"op": "move", "node_id": node_id,
-                           "between": list(between)})
 
     def to_envelope(self) -> dict:
         """Encode the typed graph for a process boundary."""

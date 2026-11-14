@@ -279,19 +279,14 @@ class Query:
         return "\n\n".join([around, *(f"model region {index + 1}:\n{text}"
                                        for index, text in enumerate(texts))])
 
-    def run(self, plan=None, *, physical_executor=None) -> QueryResult:
+    def run(self, *, physical_executor=None) -> QueryResult:
         """Execute the query in the current process.
 
         Args:
-            plan: An edited PhysicalPlan of the query's one model region,
-                from plan().insert(), remove(), or move(); the planner's
-                own plan when omitted.
             physical_executor: Optional callable(PhysicalRequest) that
                 returns the PhysicalResponse, for tests without a GPU.
         """
-        if physical_executor is None:
-            return execute_query(self, plan=plan)
-        return execute_query(self, physical_executor=physical_executor, plan=plan)
+        return execute_query(self, physical_executor=physical_executor)
 
     def submit(self, **_options):
         """Submitting needs Quail Server; local queries use run()."""
@@ -453,15 +448,9 @@ class RegionQuery:
         return bool(input_scans(self.facts(self._operators_input),
                                 self.session.catalog))
 
-    def run(self, plan=None) -> QueryResult:
-        """Execute the query in the current process.
-
-        Args:
-            plan: An edited PhysicalPlan from plan().insert(),
-                remove(), or move(); the planner's own plan when
-                omitted.
-        """
-        return execute_query(self, plan=plan)
+    def run(self) -> QueryResult:
+        """Execute the query in the current process."""
+        return execute_query(self)
 
     def _prepare_physical(self):
         """Bind the query's tokenized inputs to its physical plan."""

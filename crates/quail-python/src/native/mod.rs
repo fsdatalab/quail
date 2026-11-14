@@ -10,7 +10,6 @@ mod workers;
 
 use std::io::Cursor;
 
-use crate::planning::pricer_fields;
 use crate::pyarrow::to_pyarrow;
 use datafusion::arrow::ipc::reader::StreamReader;
 use datafusion::common::{DataFusionError, Result};
@@ -103,15 +102,6 @@ impl NativeSession {
             })
             .map_err(python_error)?;
         Ok((to_pyarrow(py, schema, batches)?, explained))
-    }
-
-    /// Run an edited plan's envelope, as JSON, in place of the
-    /// planner's plan for the next model region; None runs the
-    /// planner's.
-    #[pyo3(signature = (envelope=None))]
-    fn edit_plan(&self, envelope: Option<&str>) -> PyResult<()> {
-        self.session.edit_plan(envelope.map(from_json).transpose()?);
-        Ok(())
     }
 
     /// Call `ready()` each time the workers have the model loaded for
@@ -659,37 +649,6 @@ fn plan_operator<'py>(
                 &found, &context, inputs, &oracles,
             ))
         }
-        "price" => {
-            let pricer = read_pricer(&get("pricer"))?;
-            let graph: quail_planner::physical::PhysicalGraph = json_value(get("graph"))?;
-            quail_planner::physical::validate_graph(&graph.nodes, &graph.root)
-                .map_err(PyValueError::new_err)?;
-            lowering_result(pricer.price(&context, &graph.nodes).map(|(seconds, estimates)| {
-                serde_json::json!({"seconds": seconds, "estimates": estimates})
-            }))
-        }
-        "edit_plan" => {
-            let pricer = read_pricer(&get("pricer"))?;
-            let graph: quail_planner::physical::PhysicalGraph = json_value(get("graph"))?;
-            let edit: quail_planner::edits::Edit = json_value(get("edit"))?;
-            let retained: std::collections::BTreeSet<String> = json_value(get("retained"))?;
-            let graph = quail_planner::physical::PhysicalGraph {
-                nodes: graph.nodes,
-                root: graph.root,
-            };
-            let edited = quail_planner::edits::edit_graph(&graph, &edit)
-                .map_err(quail_planner::CompileError::new)
-                .and_then(|edited| {
-                    let (seconds, estimates) = pricer.price(&context, &edited.nodes)?;
-                    let recompute =
-                        quail_planner::edits::recompute_seconds(&edited, &estimates, &retained);
-                    Ok(serde_json::json!({
-                        "graph": {"nodes": edited.nodes, "root": edited.root},
-                        "seconds": seconds + recompute, "estimates": estimates,
-                    }))
-                });
-            lowering_result(edited)
-        }
         "search_plan" => {
             let alternatives: Vec<(quail_planner::operators::Operators, Vec<String>)> =
                 json_value(get("alternatives"))?;
@@ -702,7 +661,6 @@ fn plan_operator<'py>(
                             "estimated_seconds": selected.plan.estimated_seconds,
                             "estimates": selected.plan.estimates,
                             "alternative": selected.alternative,
-                            "pricer": pricer_fields(&selected.plan.pricer),
                         }),
                         Err(refusal) => refusal_fields(&refusal),
                     },
@@ -1157,27 +1115,6 @@ fn execution_report(
     .to_string())
 }
 
-/// Apply an edit to a graph, set KV retention again, and validate it,
-/// without pricing: for a plan the planner did not price.
-///
-/// Returns (the graph as JSON, None) or (None, why the edit fails).
-#[pyfunction]
-fn edit_graph(graph: &str, edit: &str) -> PyResult<(Option<String>, Option<String>)> {
-    let graph: quail_planner::physical::PhysicalGraph = from_json(graph)?;
-    let edit: quail_planner::edits::Edit = from_json(edit)?;
-    let graph = quail_planner::physical::PhysicalGraph {
-        nodes: graph.nodes,
-        root: graph.root,
-    };
-    Ok(match quail_planner::edits::edit_graph(&graph, &edit) {
-        Ok(edited) => (
-            Some(serde_json::json!({"nodes": edited.nodes, "root": edited.root}).to_string()),
-            None,
-        ),
-        Err(error) => (None, Some(error)),
-    })
-}
-
 /// A region's facts as JSON, as `quail_planner::facts::region_facts`
 /// reads them from its operators, given as JSON.
 #[pyfunction]
@@ -1301,7 +1238,6 @@ pub fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(prompt_lowering, module)?)?;
     module.add_function(wrap_pyfunction!(plan_operator, module)?)?;
     module.add_function(wrap_pyfunction!(collect_answers, module)?)?;
-    module.add_function(wrap_pyfunction!(edit_graph, module)?)?;
     module.add_function(wrap_pyfunction!(region_facts, module)?)?;
     module.add_function(wrap_pyfunction!(limited_operators, module)?)?;
     module.add_function(wrap_pyfunction!(execution_report, module)?)?;
@@ -1356,53 +1292,4 @@ mod erased_json {
             serde_json::to_string(self).expect("a JSON value")
         }
     }
-}
-
-/// Read a plan's pricer from the JSON [`pricer_fields`] writes.
-fn read_pricer(value: &serde_json::Value) -> PyResult<quail_planner::pricing::PlanPricer> {
-    let bad = || PyValueError::new_err("a malformed plan pricer");
-    let stats: std::collections::BTreeMap<String, (i64, i64, i64)> =
-        json_value(value["stats"].clone())?;
-    let works: std::collections::BTreeMap<String, std::collections::BTreeMap<String, f64>> =
-        json_value(value["stage_works"].clone())?;
-    let mut stage_works = std::collections::BTreeMap::new();
-    for (position, fields) in works {
-        let field = |name: &str| quail_planner::cost::quantity::Quantity::Scalar(fields[name]);
-        stage_works.insert(
-            position.parse().map_err(|_| bad())?,
-            quail_planner::cost::work::Work {
-                tokens: field("tokens"),
-                pairs: field("pairs"),
-                kv_written: field("kv_written"),
-                kv_read: field("kv_read"),
-                sliding_pairs: field("sliding_pairs"),
-                sliding_kv_read: field("sliding_kv_read"),
-                state_written: field("state_written"),
-                state_read: field("state_read"),
-                sae_encoded: field("sae_encoded"),
-                ..Default::default()
-            },
-        );
-    }
-    Ok(quail_planner::pricing::PlanPricer {
-        chunk: value["chunk"].as_i64().ok_or_else(bad)?,
-        cap_pages: value["cap_pages"].as_i64().ok_or_else(bad)?,
-        stats: stats
-            .into_iter()
-            .map(
-                |(alias, (num_documents, total_tokens, max_document_tokens))| {
-                    (
-                        alias,
-                        quail_planner::plan_statistics::CorpusStats {
-                            num_documents,
-                            total_tokens,
-                            max_document_tokens,
-                        },
-                    )
-                },
-            )
-            .collect(),
-        stage_works,
-        expected_rows: json_value(value["expected_rows"].clone())?,
-    })
 }

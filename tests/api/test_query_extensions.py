@@ -54,7 +54,7 @@ def test_query_scans_provider_and_preserves_extension_objects(
     # Query.run binds execute_query at import, so patch it there
     monkeypatch.setattr(
         "quail.api.query.execute_query",
-        lambda q, plan=None: original(q, physical_executor=execute, plan=plan))
+        lambda q, physical_executor=None: original(q, physical_executor=execute))
 
     session.register(
         "documents", quail.DocumentProvider.from_parquet(path, id_col="id")

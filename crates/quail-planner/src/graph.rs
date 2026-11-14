@@ -52,7 +52,7 @@ pub struct PhysicalPlan {
     /// node id -> its explain entry: its seconds, and what releasing a
     /// filter sequence's KV would cost.
     pub estimates: Map<String, Value>,
-    /// What prices an edited graph again.
+    /// What prices the graph again after a physical rule rewrites it.
     pub pricer: PlanPricer,
 }
 

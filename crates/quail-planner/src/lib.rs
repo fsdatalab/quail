@@ -22,7 +22,6 @@ pub mod columns;
 pub mod constants;
 pub mod context;
 pub mod costs;
-pub mod edits;
 pub mod error;
 pub mod explain;
 pub mod expressions;

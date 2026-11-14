@@ -77,8 +77,7 @@ def test_explain_analyze_shows_measured_rows_beside_estimates(
     # Query.run binds execute_query at import, so patch it there
     monkeypatch.setattr(
         "quail.api.query.execute_query",
-        lambda q, physical_executor=executor, plan=None: original(
-            q, physical_executor=physical_executor, plan=plan))
+        lambda q, physical_executor=None: original(q, physical_executor=executor))
     planned = query.explain()
     text = query.explain(analyze=True)
 

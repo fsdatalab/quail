@@ -98,16 +98,14 @@ def _execute_physical(request, registry):
     return response
 
 
-def execute_query(query, physical_executor=None, plan=None,
-                  on_backend_ready=None, on_execution_ready=None, on_rows=None,
-                  hint=None):
+def execute_query(query, physical_executor=None, on_backend_ready=None,
+                  on_execution_ready=None, on_rows=None, hint=None):
     """Execute one query in its session's process.
 
     Args:
         query: The Query to run.
         physical_executor: Optional callable(PhysicalRequest) that
             returns the PhysicalResponse, for tests without a GPU.
-        plan: An edited PhysicalPlan to run instead of the planner's.
         on_backend_ready: Optional callback after model preparation.
         on_execution_ready: Optional callback after backend preparation and
             immediately before query execution.
@@ -119,13 +117,13 @@ def execute_query(query, physical_executor=None, plan=None,
     from quail.api.query import Query
 
     if isinstance(query, Query):
-        return _execute_in_datafusion(query, physical_executor, plan,
+        return _execute_in_datafusion(query, physical_executor,
                                       on_backend_ready, on_execution_ready)
-    return _execute_region(query, physical_executor, plan,
+    return _execute_region(query, physical_executor,
                            on_backend_ready, on_execution_ready, on_rows, hint)
 
 
-def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
+def _execute_in_datafusion(query, physical_executor, on_backend_ready,
                            on_execution_ready):
     """Run a query's SQL in DataFusion, which calls back for each model region.
 
@@ -139,9 +137,6 @@ def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
     from quail.api.context import SessionContext
 
     whole = query.bound_whole()
-    if plan is not None and query.num_regions != 1:
-        raise ValueError("an edited plan requires exactly one model region; "
-                         f"the query has {query.num_regions}")
     results, region_tables, region_s = [], [], []
     region_results = {}
     started = time.perf_counter()
@@ -163,7 +158,7 @@ def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
                     called()
 
         table, context, startup_s = _run_in_rust(
-            query, physical_executor, plan, ready, results, region_tables,
+            query, physical_executor, ready, results, region_tables,
             region_s, region_results)
         # starting the workers is model startup, not query time
         return _query_result(query, context, table, whole, started + startup_s,
@@ -172,10 +167,8 @@ def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
     def run_query(region, on_rows=None, hint=None):
         if region.region_id is None or region.region_id in region_results:
             raise RuntimeError("model region has a missing or duplicate logical ID")
-        if plan is not None and results:
-            raise RuntimeError("an edited plan is for a query of one model region")
         region_started = time.perf_counter()
-        result = _execute_region(region, physical_executor, plan,
+        result = _execute_region(region, physical_executor,
                                  on_backend_ready, on_execution_ready, on_rows, hint)
         region_s.append(time.perf_counter() - region_started)
         results.append(result)
@@ -190,7 +183,7 @@ def _execute_in_datafusion(query, physical_executor, plan, on_backend_ready,
                          region_tables, region_s, region_results)
 
 
-def _run_in_rust(query, source, plan, ready, results, region_tables, region_s,
+def _run_in_rust(query, source, ready, results, region_tables, region_s,
                  region_results):
     """Run a query whose model regions Rust runs on GPU workers.
 
@@ -202,8 +195,6 @@ def _run_in_rust(query, source, plan, ready, results, region_tables, region_s,
             ``start_workers(gpus)`` returns workers under "workers",
             ``report`` holds report fields to set, and ``close()`` stops
             the workers.
-        plan: An edited PhysicalPlan to run in place of the planner's,
-            for a query of one region, or None.
         ready: Callable() called once the workers have the model loaded
             for a region.
         results: Filled with each region's QueryResult, in run order.
@@ -237,16 +228,9 @@ def _run_in_rust(query, source, plan, ready, results, region_tables, region_s,
     # loading the tokenizer into the planner is startup as well
     _ = session.planner
     startup_s = time.perf_counter() - startup_started
-    if plan is not None:
-        if isinstance(plan, Refusal) or not hasattr(plan, "graph"):
-            raise TypeError("plan must be a PhysicalPlan")
-        plan.graph.validate(runtime_keys=set(registry.runtimes))
-        plan.graph.validate_backend(plan.backend)
     try:
         context = SessionContext(session, order=query.order, workers=workers)
         context.when_ready(ready)
-        if plan is not None:
-            context.edit_plan(plan)
         table = context.sql(query.text, query.dialect)
         regions = context.take_regions()
     finally:
@@ -259,8 +243,6 @@ def _run_in_rust(query, source, plan, ready, results, region_tables, region_s,
             order=query.order, tables=inputs, keep_order=True,
             region_id=found.get("region_id"))
         region.adopt_plan(found, scans)
-        if plan is not None:
-            region._plan = plan
         report = backend.report_region(
             region.plan(), ran, [json.loads(boot) for boot in boots], seconds,
             registry.device(config.device))
@@ -311,7 +293,7 @@ def _query_result(query, context, table, whole, started, results, region_tables,
     return result
 
 
-def _execute_region(query, physical_executor, plan, on_backend_ready,
+def _execute_region(query, physical_executor, on_backend_ready,
                     on_execution_ready, on_rows=None, hint=None):
     """Execute one model region's Query in its session's process.
 
@@ -319,11 +301,6 @@ def _execute_region(query, physical_executor, plan, on_backend_ready,
     row once, and the result holds them all as well.
     """
     total_started = time.perf_counter()
-    if plan is not None:
-        if isinstance(plan, Refusal) or not hasattr(plan, "graph"):
-            raise TypeError("plan must be a PhysicalPlan")
-        query.plan()            # tokenization and pair tables first
-        query._plan = plan
     plan = query.plan()
     if isinstance(plan, Refusal):
         raise RefusalError(plan)

@@ -1,7 +1,6 @@
 """Fixed join execution, filter retention, and answer reconstruction."""
 
 import pyarrow as pa
-import pytest
 from helpers.oracle import Oracle, oracle_executor
 from helpers.sessions import TOKENIZER
 
@@ -11,12 +10,10 @@ from quail.api.config import EngineConfig
 from quail.api.execute import execute_query
 from quail.execution.metrics import NodeMetrics
 from quail.physical import (
-    AiFilter,
     AiJoin,
-    Barrier,
     PortRef,
 )
-from quail.physical.plan import PlanEditError, graph_from_envelope
+from quail.physical.plan import graph_from_envelope
 from quail_b import prompts
 from quail_b.queries import FILTER_SELECTIVITY_ESTIMATES
 
@@ -107,7 +104,7 @@ FEV9_RUNS = [
 ]
 
 
-def test_fev9_executes_bound_and_edited_join_nodes_without_the_optimizer(
+def test_fev9_executes_bound_join_nodes_without_the_optimizer(
         monkeypatch):
     def unexpected_search(*args, **kwargs):
         raise AssertionError("execution planned the query again")
@@ -130,36 +127,6 @@ def test_fev9_executes_bound_and_edited_join_nodes_without_the_optimizer(
                 execute = fever_executor(check, empty)
                 result = execute_query(query, physical_executor=execute).collect()
         assert result.to_pylist() == ([] if empty else FEV9_ROWS), case
-
-    with _session() as session:
-        query = quailb.queries(session)["FEV-9"][1]()
-        plan = query.plan()
-        join = next(node for node in plan.nodes if isinstance(node, AiJoin))
-        sequence = next(node for node in plan.nodes
-                     if isinstance(node, AiFilter) and node.alias == join.anchor)
-        assert not sequence.keep_kv
-        edited = plan.insert(
-            Barrier(node_id=f"barrier:{sequence.alias}", next_anchor=sequence.alias,
-                    aliases=(sequence.alias,)),
-            between=(sequence.node_id, join.node_id))
-        # cut off from its join by the barrier, the sequence retains KV
-        assert edited.graph.node(sequence.node_id).keep_kv
-        assert edited != plan
-
-        seen = []
-
-        def check(request, graph):
-            seen.append([node.node_id for node in graph.nodes])
-            return {}
-
-        execute = fever_executor(check)
-        rows = execute_query(query, physical_executor=execute).collect()
-        edited_result = execute_query(
-            quailb.queries(session)["FEV-9"][1](), physical_executor=execute,
-            plan=edited)
-        assert f"barrier:{sequence.alias}" in seen[1]
-        assert f"barrier:{sequence.alias}" not in seen[0]
-        assert edited_result.collect().to_pylist() == rows.to_pylist() == FEV9_ROWS
 
 
 TOPIC_CALL = ("AI.CLASSIFY(PROMPT('What is {0} about?', c.claim), "
@@ -217,22 +184,3 @@ def test_classification_runs_beside_filters_and_joins(monkeypatch):
         # the classification ran first, over every claim
         labels = result.answer_tables["classifies"]["topic"]
         assert labels.column("topic").to_pylist() == ["science", "sport", "science"]
-
-
-def test_a_removed_barrier_restores_the_plan_and_a_filter_cannot_be_removed():
-    with _session() as session:
-        plan = quailb.queries(session)["FEV-9"][1]().plan()
-        join = next(node for node in plan.nodes if isinstance(node, AiJoin))
-        sequence = next(node for node in plan.nodes
-                        if isinstance(node, AiFilter) and node.alias == join.anchor)
-        barrier = f"barrier:{sequence.alias}"
-        edited = plan.insert(
-            Barrier(node_id=barrier, next_anchor=sequence.alias,
-                    aliases=(sequence.alias,)),
-            between=(sequence.node_id, join.node_id))
-        restored = edited.remove(barrier)
-        assert [node.node_id for node in restored.nodes] == [
-            node.node_id for node in plan.nodes]
-        assert not restored.graph.node(sequence.node_id).keep_kv
-        with pytest.raises(PlanEditError, match="would change what the query means"):
-            plan.remove(sequence.node_id)

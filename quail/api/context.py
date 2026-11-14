@@ -103,10 +103,6 @@ class SessionContext:
         except RuntimeError as error:
             raise RuntimeError(compile_message(error, text)) from None
 
-    def edit_plan(self, plan) -> None:
-        """Run an edited PhysicalPlan in place of the next region's own plan."""
-        self._native.edit_plan(json.dumps(plan.to_envelope()))
-
     def when_ready(self, ready: Callable | None) -> None:
         """Call ``ready()`` each time the workers have the model loaded for a region."""
         self._native.when_ready(ready)

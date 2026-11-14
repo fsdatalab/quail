@@ -138,12 +138,6 @@ impl Session {
         })
     }
 
-    /// Run an edited plan's envelope in place of the planner's plan
-    /// for the next model region, as [`Executor::edit_plan`] does.
-    pub fn edit_plan(&self, envelope: Option<serde_json::Value>) {
-        self.runner.edit_plan(envelope);
-    }
-
     /// Tell `observer` what happens as each model region runs, as
     /// [`Executor::observe`] does.
     pub fn observe(&self, observer: Option<Observer>, answers: bool) {

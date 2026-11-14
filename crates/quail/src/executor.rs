@@ -104,9 +104,6 @@ pub struct Executor {
     pub(crate) planning: Option<(Arc<Planner>, Settings)>,
     /// What each region of the running query ran on the workers.
     regions: Mutex<Vec<RegionRan>>,
-    /// A plan's envelope to run in place of the planner's, for a query
-    /// of one region.
-    edited: Mutex<Option<serde_json::Value>>,
     /// Told what happens as a region runs on the workers, and whether
     /// the workers send it the model's answers.
     observer: Mutex<Option<(Observer, bool)>>,
@@ -244,7 +241,6 @@ impl Executor {
             execution: Mutex::new(()),
             planning: Some((planner, settings)),
             regions: Mutex::new(Vec::new()),
-            edited: Mutex::new(None),
             observer: Mutex::new(None),
         })
     }
@@ -273,7 +269,6 @@ impl Executor {
             execution: Mutex::new(()),
             planning,
             regions: Mutex::new(Vec::new()),
-            edited: Mutex::new(None),
             observer: Mutex::new(None),
         }
     }
@@ -297,12 +292,6 @@ impl Drop for CallerGuard<'_> {
 }
 
 impl Executor {
-    /// Run `envelope`, an edited plan's, in place of the plan the
-    /// planner makes for the next region; None runs the planner's.
-    pub fn edit_plan(&self, envelope: Option<serde_json::Value>) {
-        *self.edited.lock().expect("the edited lock") = envelope;
-    }
-
     /// Tell `observer` what happens as each region runs on the workers;
     /// None tells nobody. With `answers`, the workers also send the
     /// model's answers as it gives them, one message for each chunk.
@@ -740,13 +729,8 @@ impl Executor {
             .plan(&operators, tables, settings)
             .map_err(compile)?;
         let mut planned = outcome_json(&outcome).map_err(compile)?;
-        if planned.get("envelope").is_some() {
-            if let Some(edited) = self.edited.lock().expect("the edited lock").take() {
-                planned["envelope"] = edited;
-            }
-            if settings.gpu_timing {
-                planned["envelope"]["settings"]["gpu_timing"] = true.into();
-            }
+        if planned.get("envelope").is_some() && settings.gpu_timing {
+            planned["envelope"]["settings"]["gpu_timing"] = true.into();
         }
         planned["logical"] = logical.into();
         planned["planning_s"] = started.elapsed().as_secs_f64().into();

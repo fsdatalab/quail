@@ -9,7 +9,7 @@
 //! runs the column placements and the plan search with the model's
 //! tokenizer.
 
-use quail_planner::constants::{NULL_DOCUMENT, SAMPLE_ROWS, WORK_FIELDS};
+use quail_planner::constants::{NULL_DOCUMENT, SAMPLE_ROWS};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -85,14 +85,13 @@ pub type PlannedRegion = (String, Vec<ScanInputs>);
 pub struct Planned {
     pub selected: Selected,
     pub operators: Operators,
-    /// The planning context's fields, as Python's planner reads them, to
-    /// price an edited plan the same way.
+    /// The planning context's fields, as Python's planner reads them.
     pub fields: serde_json::Value,
 }
 
 /// What [`Planner::plan`] returns for a region, beside its scans.
 pub enum PlanOutcome {
-    /// Quail's backend's plan, priced, which an edit prices again.
+    /// Quail's backend's plan, priced.
     Planned(Box<Planned>),
     /// The refusal of every alternative.
     Refused(Refusal),
@@ -675,45 +674,6 @@ fn is_column(expression: &ValueExpression) -> bool {
     }
 }
 
-/// A work's quantities in [`WORK_FIELDS`] order.
-pub fn work_values(
-    work: &quail_planner::cost::work::Work,
-) -> [&quail_planner::cost::quantity::Quantity; 9] {
-    [
-        &work.tokens,
-        &work.pairs,
-        &work.kv_written,
-        &work.kv_read,
-        &work.sliding_pairs,
-        &work.sliding_kv_read,
-        &work.state_written,
-        &work.state_read,
-        &work.sae_encoded,
-    ]
-}
-
-/// A plan's pricer as JSON, for Python to hand back when it reprices an
-/// edited plan.
-pub fn pricer_fields(pricer: &quail_planner::pricing::PlanPricer) -> serde_json::Value {
-    let work = |work: &quail_planner::cost::work::Work| {
-        WORK_FIELDS
-            .iter()
-            .zip(work_values(work))
-            .map(|(name, value)| (name.to_string(), serde_json::Value::from(value.total())))
-            .collect::<serde_json::Map<String, serde_json::Value>>()
-    };
-    serde_json::json!({
-        "chunk": pricer.chunk,
-        "cap_pages": pricer.cap_pages,
-        "stats": pricer.stats.iter().map(|(alias, stats)| (alias.clone(), serde_json::json!(
-            [stats.num_documents, stats.total_tokens, stats.max_document_tokens]
-        ))).collect::<serde_json::Map<String, serde_json::Value>>(),
-        "stage_works": pricer.stage_works.iter().map(|(position, found)| (position.to_string(),
-            serde_json::Value::Object(work(found)))).collect::<serde_json::Map<String, serde_json::Value>>(),
-        "expected_rows": pricer.expected_rows,
-    })
-}
-
 /// A request backend's plan of the first alternative it does not refuse,
 /// as Python's backend search selected it: a request backend prices no
 /// plan, so ties go to the earlier alternative. The plan's settings list
@@ -806,7 +766,6 @@ pub fn planned_json(planned: &Planned) -> Result<serde_json::Value, CompileError
         "estimated_seconds": plan.estimated_seconds,
         "estimates": plan.estimates,
         "alternative": planned.selected.alternative,
-        "pricer": pricer_fields(&plan.pricer),
         "operators": operators_json(&planned.operators)?,
         "fields": planned.fields,
     }))

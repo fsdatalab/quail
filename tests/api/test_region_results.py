@@ -28,26 +28,6 @@ def session():
         yield session
 
 
-def test_edited_plan_scope_is_rejected_before_execution_context(session, monkeypatch):
-    edited = session.sql(SINGLE).plan()
-    calls = []
-
-    def forbidden(*args, **kwargs):
-        calls.append((args, kwargs))
-        pytest.fail("invalid edited-plan scope reached execution")
-
-    queries = [(session.sql(sql), count)
-               for sql, count in (("SELECT * FROM reviews", 0), (CHAIN, 2))]
-    # Binding is already complete. Even constructing the execution context is
-    # too late to reject the scope, before any model callback or GPU work.
-    monkeypatch.setattr("quail.api.context.SessionContext", forbidden)
-    for query, count in queries:
-        assert query.num_regions == count
-        with pytest.raises(ValueError, match=f"exactly one model region.*has {count}"):
-            query.run(plan=edited, physical_executor=forbidden)
-    assert calls == []
-
-
 def _run(query):
     requests = []
     execute = oracle_executor(Oracle(filters=lambda *_: True))
