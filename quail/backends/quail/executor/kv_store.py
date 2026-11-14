@@ -6,9 +6,9 @@ same prefix tokens. A restore replaces the forward pass over the prefix
 with a copy of the same bytes: the store is lossless.
 
 Host memory is pinned in segments up to capacity_bytes. Pinning a
-gibibyte takes a few hundred milliseconds, so a thread pins segments
-ahead of the saves, and a save that finds no pinned room is skipped: the
-prefix is saved the next time a query frees it. A saved prefix holds
+gibibyte takes a few hundred milliseconds and stalls other CUDA calls,
+so a thread pins every segment while the worker boots, and the first
+save waits for it. A saved prefix holds
 extents of token records, one record per token: its K and V of every
 layer. When the store is full and a save needs room, the prefix with
 the lowest credit leaves (GreedyDual-Size): a prefix's credit is the
@@ -36,10 +36,8 @@ from quail.common.tokens import token_array
 # tokens one gather and copy moves; bounds the device memory a flush
 # takes beside the arena
 FLUSH_TOKENS = 1024
-# one pinned allocation; small enough that pinning one stalls no pass
+# one pinned allocation
 SEGMENT_BYTES = 1 << 28
-# pinned bytes the pinning thread keeps free ahead of the saves
-SPARE_BYTES = 8 << 30
 # a worker's store pins at most this share of the host's memory, and at
 # most HOST_BYTES
 HOST_FRACTION = 0.5
@@ -104,10 +102,6 @@ class _Segment:
     records: object
     free: list = field(default_factory=list)    # sorted (first record, count)
 
-    @property
-    def free_records(self) -> int:
-        return sum(count for _, count in self.free)
-
     def take(self, count: int):
         """Remove and return up to count records as (first record, count)."""
         if not self.free:
@@ -145,8 +139,8 @@ class KVStore:
             dimension) of one token.
         dtype: The pool's element type.
         capacity_bytes: Host bytes the store may pin.
-        device: The pool's device. For a CUDA device host memory is
-            pinned, by a thread; otherwise segments are made as saves
+        device: The pool's device. For a CUDA device a thread pins the
+            host memory at once; otherwise segments are made as saves
             need them.
         prefill_seconds: Callable(tokens) -> the seconds a forward pass
             over a prefix of that length takes; None counts tokens.
@@ -174,22 +168,25 @@ class KVStore:
         self._restores = []    # the same, for records to write into the pool
         self._queued = []      # _Saved whose extents the queued copies use
         self.reset_stats()
-        # the pinning thread appends to segments under the lock, and
-        # wakes when the free pinned records fall under the spare
-        self._lock = threading.Lock()
-        self._wake = threading.Event()
         self._closed = False
         self._thread = None
         if self.pinned and self.max_segments:
             self._thread = threading.Thread(
-                target=self._pin_ahead, name="quail-kv-store", daemon=True)
+                target=self._pin, name="quail-kv-store", daemon=True)
             self._thread.start()
-            self._wake.set()
 
     def close(self) -> None:
         """Stop the pinning thread."""
         self._closed = True
-        self._wake.set()
+        self._pinned()
+
+    def _pin(self) -> None:
+        """Pin every segment; runs on the pinning thread."""
+        while not self._closed and len(self.segments) < self.max_segments:
+            self.segments.append(self._new_segment())
+
+    def _pinned(self) -> None:
+        """Wait for the pinning thread, which no query runs beside."""
         if self._thread is not None:
             self._thread.join()
             self._thread = None
@@ -199,7 +196,7 @@ class KVStore:
         self.saved_tokens = 0
         self.restored_tokens = 0
         self.dropped_tokens = 0
-        self.skipped_tokens = 0    # freed prefixes that found no pinned room
+        self.skipped_tokens = 0    # freed prefixes larger than the store
         self.flush_seconds = 0.0   # host seconds queueing the copies
 
     def stats(self) -> dict:
@@ -239,54 +236,29 @@ class KVStore:
                 pin_memory=self.pinned)
         return _Segment(records, [(0, self.segment_records)])
 
-    def _free_records(self) -> int:
-        return sum(segment.free_records for segment in self.segments)
-
-    def _pin_ahead(self) -> None:
-        """Pin segments while the free pinned records are under the spare."""
-        spare = SPARE_BYTES // self.record_bytes
-        while True:
-            self._wake.wait()
-            self._wake.clear()
-            while not self._closed and len(self.segments) < self.max_segments:
-                with self._lock:
-                    if self._free_records() >= spare:
-                        break
-                segment = self._new_segment()
-                with self._lock:
-                    self.segments.append(segment)
-            if self._closed:
-                return
-
     def _allocate(self, tokens: int):
-        """Extents for tokens records, or None when no pinned room is ready.
-
-        A full store drops its lowest-credit prefixes to make room. One
-        still pinning segments drops nothing: the save is skipped.
-        """
+        """Extents for tokens records, dropping low-credit prefixes; None if short."""
+        self._pinned()
         extents, left = [], tokens
-        with self._lock:
-            while left:
-                taken = None
-                for index, segment in enumerate(self.segments):
-                    taken = segment.take(left)
-                    if taken is not None:
-                        break
-                if (taken is None and self._thread is None
-                        and len(self.segments) < self.max_segments):
-                    index = len(self.segments)
-                    self.segments.append(self._new_segment())
-                    taken = self.segments[index].take(left)
-                if taken is None and (len(self.segments) < self.max_segments
-                                      or not self._drop_lowest()):
+        while left:
+            taken = None
+            for index, segment in enumerate(self.segments):
+                taken = segment.take(left)
+                if taken is not None:
+                    break
+            if (taken is None and not self.pinned
+                    and len(self.segments) < self.max_segments):
+                index = len(self.segments)
+                self.segments.append(self._new_segment())
+                taken = self.segments[index].take(left)
+            if taken is None:
+                if not self._drop_lowest():
                     for segment, first, count in extents:
                         self.segments[segment].give(first, count)
-                    extents = None
-                    break
-                if taken is not None:
-                    extents.append((index, *taken))
-                    left -= taken[1]
-        self._wake.set()
+                    return None
+                continue
+            extents.append((index, *taken))
+            left -= taken[1]
         return extents
 
     def _credit(self, content: bytes, saved) -> None:
