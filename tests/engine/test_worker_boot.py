@@ -44,7 +44,8 @@ def booted(monkeypatch):
     install_fake_torch(monkeypatch)
     monkeypatch.setattr(worker, "set_gpu_index", lambda index: None)
     monkeypatch.setattr(worker, "say", lambda message: None)
-    for name in ("load_model", "AnswerRows", "KVArena", "AsyncAnswers"):
+    for name in ("load_model", "AnswerRows", "KVArena", "AsyncAnswers",
+                 "attach_host_store"):
         monkeypatch.setattr(worker, name, lambda *a, **k: SimpleNamespace())
     monkeypatch.setattr(worker, "build_pipeline",
                         lambda *a, **k: SimpleNamespace(piecewise_graphs=None))

@@ -22,6 +22,7 @@ the same methods:
 - attention inputs: layer_kv, paged_kv, block_table, block_table_rows
 - counters: reset_stats, evicted_keys, evicted_pages,
   evicted_prefix_tokens
+- the host store: attach_store, note_prefix, stored, restore, flush_store
 """
 
 import math
@@ -53,6 +54,9 @@ class KVArena:
     every-token pages, with sliding pages converted at the pools' size
     ratio, so a count that fits admits in both pools.
     """
+
+    # host memory for freed document prefixes (kv_store.KVStore), or None
+    store = None
 
     def __init__(self, num_layers: int, num_pages: int, page_tokens: int,
                  num_kv_heads: int, d_head: int, dtype=None, device="cuda",
@@ -117,6 +121,11 @@ class KVArena:
         # the pools cannot fragment the allocator between each other
         storage = torch.empty(2 * sum(sizes), dtype=self.dtype, device=self.device)
         parts = storage.split([size for size in sizes for _ in range(2)])
+        # every layer's K and V as one tensor, which the host store copies
+        # from and to; None when the layers' pools differ
+        self._pool = (storage.view(2 * len(shapes), *shapes[0])
+                      if len(set(shapes)) == 1 else None)
+        self._prefix_notes = {}   # key -> (content id, tokens) of its prefix
         self.k = [part.view(shape) for part, shape in zip(parts[::2], shapes)]
         self.v = [part.view(shape) for part, shape in zip(parts[1::2], shapes)]
         # one checkpoint per slot: the recurrent state in fp32 and the
@@ -162,10 +171,45 @@ class KVArena:
         if (num_pages, num_sliding_pages, num_state_slots) == (
                 self.num_pages, self.num_sliding_pages, self.num_state_slots):
             return
+        # queued saves read the pools this rebuild replaces
+        self.flush_store()
         page_tokens = self.page_tokens
-        self.k = self.v = None
+        self.k = self.v = self._pool = None
         self.gdn_state = self.gdn_state_rows = self.conv_state = None
         self._build(num_pages, page_tokens, num_sliding_pages, num_state_slots)
+
+    # ---- the host store --------------------------------------------------
+
+    def attach_store(self, store) -> None:
+        """Save freed document prefixes to store and restore them from it.
+
+        Raises:
+            ValueError: The arena's layers differ, slide, or keep
+                checkpoints, which the store's records do not hold.
+        """
+        if self._pool is None or self.sliding is not None or self.num_state_slots:
+            raise ValueError("the host store needs one pool shape and no "
+                             "sliding window or checkpoints")
+        self.store = store
+
+    def note_prefix(self, key, content: bytes, tokens: int) -> None:
+        """Record that the key's first tokens are the written prefix `content`."""
+        if self.store is not None:
+            self._prefix_notes[key] = (content, tokens)
+
+    def stored(self, content: bytes, tokens: int) -> bool:
+        """Whether the host store holds the prefix with this id and length."""
+        return self.store is not None and self.store.has(content, tokens)
+
+    def restore(self, key, content: bytes, tokens: int) -> None:
+        """Queue the stored prefix's KV into a resident key's first rows."""
+        self.store.restore(content, self._rows[key][:tokens])
+        self._prefix_notes[key] = (content, tokens)
+
+    def flush_store(self) -> None:
+        """Run queued saves and restores; called before a pass writes KV."""
+        if self.store is not None:
+            self.store.flush(self._pool)
 
     # ---- checkpoints ---------------------------------------------------
 
@@ -245,6 +289,8 @@ class KVArena:
         self.evicted_prefix_tokens = 0
         self.memory_trace = []
         self.events = []
+        if self.store is not None:
+            self.store.reset_stats()
 
     def write_trace_files(self) -> None:
         """Write the trace files queries left, then forget them."""
@@ -710,6 +756,10 @@ class KVArena:
         if key in self._holds or key in self._reading:
             self._deferred.add(key)
             return 0
+        if self.store is not None:
+            note = self._prefix_notes.pop(key, None)
+            if note is not None and self.accounting.tokens[key] >= note[1]:
+                self.store.save(note[0], self._rows[key][:note[1]])
         self._window_floor.pop(key, None)
         self._trimmed.discard(key)
         self._rows.pop(key)

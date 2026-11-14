@@ -67,13 +67,15 @@ def record_model_result(node, result: NodeResult,
 def execution_context(state, payload, graph: PhysicalGraph) -> ExecutionContext:
     """Bind a query's inputs, retention, and runtimes to one GPU executor.
 
-    The arena is emptied first: nothing survives from the last query, and
-    trace files it left are written.
+    The arena is emptied first, and trace files the last query left are
+    written. The host store keeps the document prefixes the arena frees,
+    so this query restores the ones it reads again.
     """
     arena = state["gpu"].arena
     arena.write_trace_files()
     for key in arena.resident_keys():
         arena.free_key(key)
+    arena.flush_store()
     arena.reset_stats()
     # the peak memory reported is this query's, not the process's
     state["gpu"].torch.cuda.reset_peak_memory_stats()
@@ -127,6 +129,7 @@ def execution_measurements(context: ExecutionContext) -> dict:
             "evicted_keys": arena.evicted_keys,
             "evicted_pages": arena.evicted_pages,
             "evicted_prefix_tokens": arena.evicted_prefix_tokens,
+            **({} if arena.store is None else {"host_store": arena.store.stats()}),
         },
         "memory": memory_report(gpu),
     }

@@ -258,3 +258,20 @@ class NodeTypes:
 
     def report(self) -> dict:
         return {"types": list(self.types)}
+
+
+def test_a_second_query_restores_the_documents_the_first_read():
+    with quail.Session(CONFIG, tokenizer=TOKENIZER) as session:
+        session.register("reviews", quail.DocumentProvider.from_table(pa.table({
+            "id": [f"r{i}" for i in range(6)],
+            "review": [f"kept review {i} " + "pad " * 20 for i in range(6)],
+        }), id_col="id"))
+        first = _run(session.sql(FILTER_SQL), make_executor(TRUTH))
+        second = _run(session.sql(FILTER_SQL), make_executor(TRUTH))
+    assert sorted(second.to_rows()) == sorted(first.to_rows()) == [("r0",), ("r3",)]
+    stores = [result.report["kv_manager"]["host_store"] for result in (first, second)]
+    assert stores[0]["restored_tokens"] == 0
+    # the first query saved each document as it freed it, and the second
+    # read all six from the store
+    assert stores[1]["restored_tokens"] == stores[0]["saved_tokens"] > 0
+    assert stores[1]["saved_tokens"] == 0

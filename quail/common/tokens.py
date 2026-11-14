@@ -386,7 +386,7 @@ def documents_from_table(table: pa.Table):
         table.column("offsets") if "offsets" in table.column_names else None)
 
 
-def _token_array(document):
+def token_array(document):
     """A document's integer token ids as an int32 array."""
     parts = getattr(document, "token_parts", (document,))
     arrays = [np.asarray(part.numpy() if hasattr(part, "numpy") else list(part),
@@ -399,7 +399,7 @@ def _token_array(document):
 
 def _token_lists(documents) -> pa.Table:
     """Documents' integer token ids as a table of one int32 list column."""
-    arrays = [_token_array(documents[index]) for index in range(len(documents))]
+    arrays = [token_array(documents[index]) for index in range(len(documents))]
     offsets = np.zeros(len(arrays) + 1, dtype=np.int64)
     np.cumsum([len(array) for array in arrays], out=offsets[1:])
     values = np.concatenate(arrays) if arrays else np.empty(0, dtype=np.int32)

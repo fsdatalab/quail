@@ -14,6 +14,7 @@ from quail.backends.quail.executor.admission import (
     OversizedDocumentError,
     OwnRequests,
 )
+from quail.backends.quail.executor.kv_store import content_id
 from quail.backends.quail.executor.readout_groups import ReadoutGroups
 from quail.backends.quail.executor.stages import (
     PendingAnswers,
@@ -70,6 +71,9 @@ def forward_chunk(pipeline, arena, chunk):
     temporaries whether the pass returns or raises.
     """
     try:
+        # freed prefixes are saved, and admitted ones restored, before
+        # this pass writes the pages
+        arena.flush_store()
         if pipeline.piecewise_graphs is not None:
             out = pipeline.piecewise_graphs.forward(chunk)
         else:
@@ -349,6 +353,13 @@ class StageExecutor:
         for a in resident:
             self.arena.pin(self.keys[a])
 
+        # each document prefix's id in the host store, which holds the
+        # KV of prefixes freed by earlier operators and queries
+        self.contents = ([content_id(prefix) for prefix in self.prefixes]
+                         if self.paged and getattr(self.arena, "store", None)
+                         is not None else None)
+        self._anchors = ({} if self.contents is None
+                         else {key: a for a, key in enumerate(self.keys)})
         self.asking = any(stage.requests is not None or stage.own_suffixes
                           for stage in self.stages)
         try:
@@ -387,6 +398,7 @@ class StageExecutor:
                 chunked_prefill=self.paged,
                 start_stages=start_stages,
                 one_stage=self.whole_sequences,
+                stored=None if self.contents is None else self._stored,
             )
         except OversizedDocumentError as error:
             raise ValueError(f"{self.label}: document {self.keys[error.anchor]}: "
@@ -564,10 +576,20 @@ class StageExecutor:
             return can_borrow(doc, parent, same_chunk)
         return check
 
+    def _stored(self, anchor) -> bool:
+        """Whether the host store holds the document's prefix KV."""
+        return self.arena.stored(self.contents[anchor], self.prefix_lengths[anchor])
+
     def _reserve(self, anchor, borrow, rows):
-        """Reserve a document's KV and checkpoints before admitting its work."""
+        """Reserve a document's KV and checkpoints before admitting its work.
+
+        A fresh document whose prefix the host store holds has it copied
+        into the reserved pages; the admission packs no prefix for it.
+        """
         key = self.keys[anchor]
         prefix = self.prefix_lengths[anchor]
+        restore = (self.contents is not None and borrow is None
+                   and not self.arena.is_resident(key) and self._stored(anchor))
         parent, shared = (None, 0) if borrow is None else borrow
         points = tuple(t for t in self.share_points[anchor]
                        if shared < t < prefix)
@@ -586,6 +608,8 @@ class StageExecutor:
                 key, prefix, capacity_tokens=capacity, borrow=borrowed,
                 extension=self._extends, share_points=points):
             return False
+        if restore:
+            self.arena.restore(key, self.contents[anchor], prefix)
         return self._reserved(anchor, key, parent)
 
     def _reserved(self, anchor, key, parent):
@@ -1125,6 +1149,10 @@ class StageExecutor:
             # a prefix written in pieces keeps its window until written
             if key not in self._prefill_keys:
                 self.arena.trim_window(key)
+                anchor = self._anchors.get(key)
+                if anchor is not None:
+                    self.arena.note_prefix(key, self.contents[anchor],
+                                           self.prefix_lengths[anchor])
         # the earlier passes' readouts finished before this forward pass
         # started, so their answers are decided while the GPU runs it;
         # a readout of many rows launches enough kernels to fill the

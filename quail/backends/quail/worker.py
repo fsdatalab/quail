@@ -20,6 +20,7 @@ import _quail_native
 from quail.backends.base import GpuContext
 from quail.backends.quail.executor.arena import KVArena
 from quail.backends.quail.executor.cuda_graphs import PiecewiseGraphs
+from quail.backends.quail.executor.kv_store import attach_host_store
 from quail.backends.quail.executor.model_loading import load_model
 from quail.backends.quail.executor.models import build_pipeline
 from quail.backends.quail.executor.readout import (
@@ -104,6 +105,7 @@ class LoadedGpu:
                              num_sliding_pages=sliding_pages,
                              **checkpoint_arena_args(spec, device, budget,
                                                      full_pages))
+        attach_host_store(self.arena)
         self.arena_s = time.perf_counter() - t0
         self.pool_bytes = pool_bytes(self.arena)
 

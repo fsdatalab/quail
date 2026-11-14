@@ -216,9 +216,11 @@ def _check_first_rows_precede_the_last_answer(family, text, truth):
     # the model writes a map's or an extraction's answer over several
     # passes: with a few more rows, the first rows' answers go on while
     # it has later rows still to read
+    # each family reads documents of its own: the worker keeps the KV of
+    # documents an earlier family read, and a kept document takes no pass
     reviews = pa.table({
         "id": [f"r{index}" for index in range(8)],
-        "body": [f"{body}{index}" for index, body in enumerate(
+        "body": [f"{family}: {body}{index}" for index, body in enumerate(
             REVIEWS.column("body").to_pylist() * 2)],
         "stars": REVIEWS.column("stars").to_pylist() * 2})
     contracts = pa.table({
@@ -289,13 +291,18 @@ def test_a_failure_inside_a_region_names_its_line_in_the_error():
     session.close()
 
 
-def _reviews_context(oracle, rows: int):
-    """A context over `rows` reviews r00, r01, ..., answered by `oracle`."""
+def _reviews_context(oracle, rows: int, word: str = "review"):
+    """A context over `rows` reviews r00, r01, ..., answered by `oracle`.
+
+    Each body repeats `word`; a test whose passes must read its documents
+    afresh names a word no earlier run read, since the worker keeps the KV
+    of documents it has read.
+    """
     session = quail.Session(CONFIG, tokenizer=TOKENIZER)
     context = quail.SessionContext(session, physical_executor=oracle_executor(oracle))
     reviews = pa.table({
         "id": [f"r{index:02d}" for index in range(rows)],
-        "body": [f"review number {index} " * 4 for index in range(rows)],
+        "body": [f"{word} number {index} " * 4 for index in range(rows)],
         "stars": [index % 5 for index in range(rows)],
     })
     context.register("reviews", quail.DocumentProvider.from_table(reviews, id_col="id"))
@@ -345,11 +352,12 @@ def _check_a_top_k_over_a_score_skips_rows(where):
     # after r04
     hinted = Oracle(**TOP_K_SCORES, tightens_after={2, 4},
                     chunk_tokens=SMALL_PASS)
-    context = _reviews_context(hinted, 12)
+    word = "filtered" if where else "review"
+    context = _reviews_context(hinted, 12, word)
     assert _rows(context.sql(text)) == TOP_K_ROWS, where
     # without the LIMIT the sort holds every row and hands no threshold
     every = Oracle(**TOP_K_SCORES)
-    whole = _reviews_context(every, 12)
+    whole = _reviews_context(every, 12, word)
     assert _rows(whole.sql(text.replace(" LIMIT 3", "")))[:3] == TOP_K_ROWS, where
     assert _scored_rows(every) == 12, where
     # r03 may still score above r01's 0.3; once r00, r02, and r04 hold

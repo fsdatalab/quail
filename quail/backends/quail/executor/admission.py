@@ -279,6 +279,10 @@ class JoinAdmission:
         one_stage: Whether each anchor asks only its start stage and
             settles there, as a whole-sequence pass does; a limit then
             counts the anchors that survive the last stage.
+        stored: Optional callable(anchor) -> bool, asked as a fresh
+            anchor is admitted; True means reserve copies its prefix KV
+            into its pages, so it packs no prefix tokens and borrows
+            nothing.
 
     Each chunk fills in priority order: partner streams cut by the
     previous chunk, then anchors starting their next stage, then the
@@ -306,7 +310,8 @@ class JoinAdmission:
                  frame_writes=None, limit=None, survival=None, extra_tokens=None,
                  stop_groups=None, stop_width=1, reserve=None, dependencies=None,
                  gated=(), num_key_survivors=1, skip=None,
-                 chunked_prefill=False, start_stages=None, one_stage=False):
+                 chunked_prefill=False, start_stages=None, one_stage=False,
+                 stored=None):
         k = len(stage_suffixes)
         self.answer_dtypes = (list(answer_dtype) if isinstance(answer_dtype, list)
                               else [answer_dtype] * k)
@@ -322,6 +327,7 @@ class JoinAdmission:
             self.dependents.setdefault((parent, stage), []).append(anchor)
         self.advance = advance
         self.skip = skip
+        self.stored = stored
         self.limit = limit
         self.survival = survival
         self.survivors = 0
@@ -791,7 +797,9 @@ class JoinAdmission:
                     for group in self.groups[a] if group not in self._group_done):
                 hold.append(a)      # the group's anchors in flight are enough
                 continue
-            borrow = self.borrowing.decide(a, admitted)
+            stored = (self.stored is not None and bool(self._carried[a])
+                      and self.stored(a))
+            borrow = None if stored else self.borrowing.decide(a, admitted)
             if borrow == Borrowing.WAIT:
                 hold.append(a)      # its parent is still queued
                 continue
@@ -812,7 +820,7 @@ class JoinAdmission:
                 if not self._zero_cost:
                     break
                 continue
-            carried = (self._carried[a] if borrow is None
+            carried = (0 if stored else self._carried[a] if borrow is None
                        else self.prefix[a] - borrow[1])
             long = self.chunked_prefill and carried + self._first[a] > self.chunk_budget
             if long and not room:

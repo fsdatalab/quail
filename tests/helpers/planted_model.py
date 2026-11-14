@@ -24,6 +24,7 @@ from quail.backends.quail import QuailModelExecution
 from quail.backends.quail.executor.arena import KVArena
 from quail.backends.quail.executor.chunk import InputStaging
 from quail.backends.quail.executor.extract.vocabulary import same_word
+from quail.backends.quail.executor.kv_store import KVStore
 from quail.backends.quail.executor.sae import SaeEncoder
 from quail.backends.quail.prompts import join_request
 from quail.physical import (
@@ -44,6 +45,8 @@ UNLIKELY = -100.0
 LABEL_SHARE = 0.8
 # the arena's pages and tokens per page, and the features a row keeps
 PAGES, PAGE_TOKENS, KEPT_FEATURES = 1 << 14, 16, 8
+# host bytes of the store that keeps freed document prefixes
+STORE_BYTES = 1 << 24
 
 
 def _alias(name):
@@ -55,6 +58,14 @@ def _alias(name):
     while isinstance(name, tuple):
         name = name[1] if name[0] == "extract" else name[0]
     return name
+
+
+class _Arena(KVArena):
+    """An arena that records the prefix lengths the host store restored."""
+
+    def restore(self, key, content, tokens):
+        self.__dict__.setdefault("restored", {})[key] = tokens
+        super().restore(key, content, tokens)
 
 
 class PlantedModel:
@@ -73,7 +84,6 @@ class PlantedModel:
         self.vocabulary = gpu.execution.loaded_model.vocabulary
         self.yes = min(settings["true_ids"])
         self.no = min(settings["false_ids"])
-        self.pages = {}         # arena page -> the prefix tokens it holds
         self.kv = {}            # arena key -> the tokens its KV holds
         self.prefix_tokens = {}  # arena key -> the tokens before its questions
         self.memo = {}          # (node id, ids) -> the planted answer
@@ -91,15 +101,15 @@ class PlantedModel:
         """Return each read row's scores over the vocabulary."""
         ids = chunk.input_ids.tolist()
         positions = chunk.positions.tolist()
-        page = self.arena.page_tokens
-        # a document may borrow pages a document later in the chunk writes
+        # the pool holds each prefix token, where a borrower and the host
+        # store read it; a document may borrow pages a document later in
+        # the chunk writes
+        keys, _ = self.arena.layer_kv(0)
         for key, row0, suffix0, _ in chunk.row_spans:
             if suffix0 > row0 and self.arena.is_resident(key):
-                owned = self.arena.owned_pages(key)
-                for row in range(row0, suffix0):
-                    held = self.pages.setdefault(owned[positions[row] // page],
-                                                 [None] * page)
-                    held[positions[row] % page] = ids[row]
+                rows = self.arena.capacity_rows(key)[positions[row0:suffix0]]
+                keys[rows, 0, 0] = torch.tensor(ids[row0:suffix0],
+                                                dtype=keys.dtype)
         prompts = {}    # read row -> (its arena key, the tokens up to it)
         for span in chunk.row_spans:
             self._follow(ids, positions, *span, prompts)
@@ -110,7 +120,7 @@ class PlantedModel:
             bounds = decode.sequence_offsets.tolist()
             for begin, end in zip(bounds, bounds[1:]):
                 key = self.arena.answer_keys[int(decode.slots[begin])]
-                held = self.kv[key][:int(decode.positions[begin])]
+                held = self._held(key)[:int(decode.positions[begin])]
                 for row in range(first + begin, first + end):
                     held = [*held, ids[row]]
                     prompts[row] = (key, held)
@@ -135,11 +145,7 @@ class PlantedModel:
         """
         if suffix0 > row0:
             # a prefix follows the pages before it: its own, or borrowed
-            start, page = positions[row0], self.arena.page_tokens
-            owned = self.arena.owned_pages(key) if start else ()
-            borrowed = [self.pages[owned[at // page]][at % page]
-                        for at in range(start)]
-            self.kv[key] = borrowed + ids[row0:suffix0]
+            self.kv[key] = self._pool_tokens(key, positions[row0]) + ids[row0:suffix0]
             self.prefix_tokens[key] = len(self.kv[key])
         # a row follows the latest row before it at the position before
         # its own: the row before it in its suffix, or its trie parent
@@ -148,7 +154,7 @@ class PlantedModel:
         for row in range(suffix0, end):
             at = positions[row]
             before = latest.get(at - 1)
-            held = [*(self.kv[key][:at] if before is None else before), ids[row]]
+            held = [*(self._held(key)[:at] if before is None else before), ids[row]]
             latest[at] = held
             prompts[row] = (key, held)
             last = row + 1 == end or positions[row + 1] != at + 1
@@ -156,6 +162,21 @@ class PlantedModel:
                 # the first suffix's tokens are the ones a group may keep
                 self.kv[key] = held
             first = first and not last
+
+    def _held(self, key):
+        """The tokens the key's KV holds, read from the pool once restored."""
+        if key not in self.kv:
+            tokens = self.arena.restored[key]
+            self.kv[key] = self._pool_tokens(key, tokens)
+            self.prefix_tokens[key] = tokens
+        return self.kv[key]
+
+    def _pool_tokens(self, key, count):
+        """The first count tokens in the key's pages."""
+        if not count:
+            return []
+        rows = self.arena.capacity_rows(key)[:count]
+        return self.arena.layer_kv(0)[0][rows, 0, 0].long().tolist()
 
     # ---- answering a row ------------------------------------------
 
@@ -465,8 +486,10 @@ def load(spec, device, gpu_index, gpus):
     except IndexError:
         pass
     tokenizer = StoppingTokenizer(encoder())
-    arena = KVArena(num_layers=1, num_pages=PAGES, page_tokens=PAGE_TOKENS,
-                    num_kv_heads=1, d_head=1, dtype=torch.float32, device="cpu")
+    arena = _Arena(num_layers=1, num_pages=PAGES, page_tokens=PAGE_TOKENS,
+                   num_kv_heads=1, d_head=1, dtype=torch.float32, device="cpu")
+    arena.attach_store(KVStore(torch, (2, 1, 1), torch.float32, STORE_BYTES,
+                               codec="raw", device="cpu"))
     pipeline = fake_pipeline()
     execution = QuailModelExecution(SimpleNamespace(
         model=spec, device=device, gpu_index=gpu_index, gpus=gpus))
