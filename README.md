@@ -34,6 +34,9 @@ E.g., install with uv:
 uv pip install quail-engine
 ```
 
+To run the code on `main`, which can be ahead of the last release,
+[install from source](https://fsdatalab.github.io/quail/docs/contributing).
+
 ## Example
 
 E.g., filter reviews on one H100 SXM:
@@ -63,6 +66,12 @@ Use [Quail Server](https://fsdatalab.github.io/quail/docs/user-guide/server)
 to run queries on a remote GPU. Pass the server address as `endpoint`
 when you create the session. The server keeps accepted queries running
 after the client disconnects.
+
+## Rust
+
+A Rust program adds the `quail-engine` crate and calls `quail::Session`,
+or adds Quail's AI functions to its own DataFusion session. See
+[Use Quail from Rust](https://fsdatalab.github.io/quail/docs/contributing#use-quail-from-rust).
 
 ## Supported functions
 
