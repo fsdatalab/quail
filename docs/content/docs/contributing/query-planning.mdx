@@ -1,10 +1,22 @@
 ---
-title: Query planning
+title: Planner overview
 ---
 
-Use the planner guide to follow one SQL query from DataFusion's logical plan
-to Quail's GPU executor. DataFusion plans and runs the relational operators.
-Quail plans and runs the AI operators.
+Quail's planner changes how a query runs without changing what the query
+asks. Quail can reorder AI operators, share prefixes and KV, choose an
+attention path, and stop after enough rows pass. Quail does not rewrite
+prompts or split AI functions into new tasks. Quail also does not estimate
+output quality to trade accuracy for cost.
+
+[DocETL (Shankar et al., 2025)](https://www.vldb.org/pvldb/vol18/p3035-shankar.pdf)
+and [MOAR (Wei, Shankar, et al., 2026)](https://arxiv.org/abs/2512.02289)
+perform semantic and approximate query optimization. The systems rewrite LLM
+operations and compare plans with estimated output quality. Quail instead
+performs physical query optimization: every rewrite preserves the SQL result
+for the same AI answers.
+
+DataFusion plans and runs the relational operators. Quail plans and runs the
+AI operators.
 
 ## Architecture
 
