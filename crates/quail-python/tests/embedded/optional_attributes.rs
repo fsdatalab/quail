@@ -4,7 +4,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
 fn engine(attribute: &str, behavior: &str) -> Py<PyAny> {
-    Python::initialize();
+    crate::start_python();
     Python::attach(|py| {
         let module = PyModule::from_code(
             py,

@@ -95,9 +95,17 @@ Quail source edits still require compiling and linking Quail itself.
   `cargo clippy --workspace --all-targets --locked`, and
   `cargo fmt --check` for Rust checks. Building a narrow `-p` selection
   can change Arrow's features (notably `ffi`) and rebuild DataFusion.
+  The Python module and the workspace must build one set of
+  dependencies: `tools/check_features.py` reports a dependency whose
+  features differ between them, and `crates/quail-python/Cargo.toml`
+  turns the missing features on.
   Check/clippy also need metadata-only artifacts distinct from a full
   build. Embedded-Python tests and the extension may rebuild PyO3 and
   Quail for their different linking requirements.
+- Each test program and example links its own copy of DataFusion, about
+  300 MB. Add a Rust integration test as a module of the crate's one
+  test program, not as a new file directly in `tests/`. Cargo keeps the
+  files of old builds; `cargo sweep` (cargo-sweep) deletes them.
 - After a successful native build, run `.venv/bin/python -m pytest`
   or `uv run --no-sync pytest` to test without an implicit build.
   Rebuild after Rust edits. `uv run --frozen pytest` synchronizes first

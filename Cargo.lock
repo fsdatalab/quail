@@ -2718,6 +2718,7 @@ dependencies = [
  "async-trait",
  "datafusion",
  "futures",
+ "futures-channel",
  "pyo3",
  "pyo3-build-config",
  "quail",
@@ -2725,7 +2726,11 @@ dependencies = [
  "quail-planner",
  "serde",
  "serde_json",
+ "slab",
+ "smallvec",
  "tokio",
+ "tokio-stream",
+ "tokio-util",
 ]
 
 [[package]]

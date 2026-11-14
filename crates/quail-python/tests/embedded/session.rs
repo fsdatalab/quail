@@ -1,11 +1,7 @@
 //! A Rust program runs a query through Quail's Python executor, with
 //! the model answered by the test oracle in `tests/helpers/oracle.py`.
-//!
-//! The interpreter imports `_quail_native` built from this workspace, so
-//! the test does not depend on the module `uv sync` last installed.
 
-use std::path::PathBuf;
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 
 use datafusion::arrow::array::{RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -13,7 +9,6 @@ use datafusion::common::Result;
 use datafusion::datasource::MemTable;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
-use quail_python::native::_quail_native;
 
 /// An engine on the test configuration whose model keeps reviews r0, r2,
 /// and r3 for the question `q1:`.
@@ -29,17 +24,8 @@ engine = Engine(session, oracle_executor(Oracle(filters={'r': {'q1:': [1, 0, 1, 
 ";
 
 fn engine() -> Py<PyAny> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    if std::env::var_os("VIRTUAL_ENV").is_none() {
-        // SAFETY: set before Python starts, while no other thread reads it
-        unsafe { std::env::set_var("VIRTUAL_ENV", root.join(".venv")) };
-    }
-    // Python imports a built-in module before one on its path; the table
-    // of built-in modules is read when Python starts
-    static BUILT_IN: Once = Once::new();
-    BUILT_IN.call_once(|| pyo3::append_to_inittab!(_quail_native));
-    quail_python::start_python().expect("Python starts");
-    let tests = root.join("tests");
+    crate::start_python();
+    let tests = crate::root().join("tests");
     Python::attach(|py| {
         py.import("sys")?
             .getattr("path")?

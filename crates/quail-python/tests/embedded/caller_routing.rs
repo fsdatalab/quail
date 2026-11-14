@@ -1,7 +1,6 @@
 //! CPU-only concurrent callers, including sessions sharing one executor.
 
-use std::path::PathBuf;
-use std::sync::{Arc, Once, mpsc};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use datafusion::arrow::array::{RecordBatch, StringArray};
@@ -9,7 +8,7 @@ use datafusion::common::Result;
 use datafusion::datasource::MemTable;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
-use quail_python::{Executor, Session, native::_quail_native};
+use quail_python::{Executor, Session};
 
 const ENGINE: &std::ffi::CStr = c"
 import threading
@@ -53,16 +52,7 @@ engine = Engine()
 ";
 
 fn engine() -> Py<PyAny> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    static INITIALIZE: Once = Once::new();
-    INITIALIZE.call_once(|| {
-        if std::env::var_os("VIRTUAL_ENV").is_none() {
-            // SAFETY: before this test binary starts Python or any worker.
-            unsafe { std::env::set_var("VIRTUAL_ENV", root.join(".venv")) };
-        }
-        pyo3::append_to_inittab!(_quail_native);
-        quail_python::start_python().expect("Python starts");
-    });
+    crate::start_python();
     Python::attach(|py| {
         PyModule::from_code(py, ENGINE, c"caller_engine.py", c"caller_engine")
             .unwrap()

@@ -42,6 +42,7 @@ jobs:
       # builds _quail_native and quail-server with the Rust that
       # rust-toolchain.toml pins; cargo test reuses the dependencies
       - run: tools/build.sh --compile
+      - run: python3 tools/check_features.py
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked

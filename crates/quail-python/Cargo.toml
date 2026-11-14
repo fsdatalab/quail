@@ -25,7 +25,19 @@ quail-datafusion = { path = "../quail-datafusion" }
 quail-planner = { path = "../quail-planner" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "signal"] }
+
+# The Python module builds this package alone, and `cargo build
+# --workspace` builds it with quail-server. Cargo compiles DataFusion
+# again when a shared dependency's features differ between the two
+# builds, so the features quail-server turns on are turned on here:
+# "net" and "signal" above, and the packages below.
+# tools/check_features.py reports a difference.
+futures-channel = "0.3"
+slab = "0.4"
+smallvec = { version = "1", features = ["const_new"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tokio-util = { version = "0.7", features = ["codec"] }
 
 [build-dependencies]
 pyo3-build-config = "0.30"
