@@ -15,10 +15,11 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License: MIT"></a>
 </p>
 
-Quail runs SQL with AI functions on your GPUs. An AI function asks a
-model about the text in a row and returns the answer as a SQL value.
-Apache DataFusion runs the SQL, and Quail runs the AI functions on the
-GPU.
+Quail runs SQL that asks a language model about your rows: keep the
+reviews that discuss the ending, label each support ticket, or join each
+claim to the passages that support it. You write each question as an AI
+function, such as `AI.IF` or `AI.CLASSIFY`. Apache DataFusion runs the
+SQL, and Quail runs the model on your GPUs.
 
 [Documentation](https://fsdatalab.github.io/quail) |
 [Quickstart](https://fsdatalab.github.io/quail/docs/user-guide/quickstart) |
