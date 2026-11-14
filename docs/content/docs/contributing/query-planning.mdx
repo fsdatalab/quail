@@ -9,6 +9,9 @@ approximate optimizers such as
 [DocETL (Shankar et al., 2025)](https://www.vldb.org/pvldb/vol18/p3035-shankar.pdf)
 and [MOAR (Wei, Shankar, et al., 2026)](https://arxiv.org/abs/2512.02289).
 
+At a high level, DataFusion plans and runs the relational operators, while
+Quail groups the AI operators and runs each group on the GPU.
+
 ## Architecture
 
 DataFusion first builds a logical plan, which lists the query operations.
