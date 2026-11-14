@@ -8,8 +8,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from quail.backends.base import GpuContext
+from quail.backends.quail.executor.images import RegionImages
 from quail.backends.resources import release_models
 from quail.baselines.execution import RequestModelExecution
+from quail.baselines.images import ImagePrompts
 from quail.execution.metrics import scalar_node_metrics
 from quail.execution.runner import ExecutionContext, GenericRunner, compute_subgraph
 from quail.execution.runtimes import ModelNodeRuntime
@@ -20,12 +22,6 @@ from quail.specs import DEVICES, SupportResult
 
 def execute_request_graph(context, backend, engine_state, boot):
     """Run a request backend over its compute subgraph."""
-    try:
-        import torch
-    except ImportError:
-        torch = None
-
-
     envelope = context.request.plan
     documents = {
         node.alias: context.request.inputs[node.input_id].documents
@@ -51,6 +47,26 @@ def execute_request_graph(context, backend, engine_state, boot):
             "document_texts": document_texts,
         },
     ))
+    client = engine_state["client"]
+    images = RegionImages(documents, context.request.column_tables())
+    if images:
+        if not hasattr(client, "image_pad_id"):
+            raise ValueError(f"{backend.name} reads no image documents")
+        client.images = ImagePrompts(images, client.image_pad_id())
+    try:
+        return _run_request_graph(context, backend, engine_state, boot,
+                                  model_execution, documents)
+    finally:
+        if images:
+            client.images = None
+
+
+def _run_request_graph(context, backend, engine_state, boot, model_execution,
+                       documents):
+    try:
+        import torch
+    except ImportError:
+        torch = None
     if engine_state["client"].reset_prefix_cache() is False:
         raise RuntimeError("request engine did not reset its prefix cache")
     if torch is not None and torch.cuda.is_available():

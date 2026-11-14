@@ -130,7 +130,9 @@ class PiecewiseBuffers:
         self.ids.zero_()
         self.positions.zero_()
         self.ids[:chunk.tokens].copy_(chunk.input_ids)
-        self.positions[:chunk.tokens].copy_(chunk.positions)
+        rotary = getattr(chunk, "rotary", None)
+        self.positions[:chunk.tokens].copy_(
+            chunk.positions if rotary is None else rotary)
         writes = chunk_writes(chunk)
         self.writes.copy(writes)
         if self.sliding_writes is not None:

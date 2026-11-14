@@ -4,7 +4,7 @@ Each UTF-8 byte is one token, whose id is the byte's value, except that a
 space and one or two letters, such as " A" or " no", is one token, and so
 is each answer word in ANSWER_WORDS, with or without a space before it, so
 a short answer label and a model's yes and no are one token as a model's
-are. Run from the repository
+are. The VISION_TOKENS come last, as added tokens. Run from the repository
 root:
 
     uv run python tests/helpers/make_tokenizer.py
@@ -16,6 +16,8 @@ from pathlib import Path
 
 from tokenizers.pre_tokenizers import ByteLevel
 
+# the special tokens around an image's tokens, after every other token
+VISION_TOKENS = ("<|vision_start|>", "<|vision_end|>")
 ANSWER_WORDS = ("yes", "Yes", "YES", "no", "No", "NO", "true", "True", "TRUE",
                 "false", "False", "FALSE")
 
@@ -59,11 +61,17 @@ def build() -> dict:
                     merges.append([joined, piece])
                 joined += piece
                 vocab.setdefault(joined, len(vocab))
+    added = []
+    for token in VISION_TOKENS:
+        added.append({"id": len(vocab), "content": token, "single_word": False,
+                      "lstrip": False, "rstrip": False, "normalized": False,
+                      "special": True})
+        vocab[token] = len(vocab)
     return {
         "version": "1.0",
         "truncation": None,
         "padding": None,
-        "added_tokens": [],
+        "added_tokens": added,
         "normalizer": None,
         "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": False,
                           "trim_offsets": False, "use_regex": False},

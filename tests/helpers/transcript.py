@@ -119,8 +119,10 @@ class Transcripts:
             ids = table.column(id_column).to_pylist()
             self._rows.update(ids)
             for name in table.column_names:
-                if name != id_column and pa.types.is_string(
-                        table.schema.field(name).type):
+                kind = table.schema.field(name).type
+                # a text or image column holds documents
+                if name != id_column and (pa.types.is_string(kind)
+                                          or pa.types.is_binary(kind)):
                     for row, text in zip(ids, table.column(name).to_pylist(),
                                          strict=True):
                         if text is not None and row not in holders.get(text, []):
@@ -179,7 +181,8 @@ class Transcripts:
         return max(found, key=len) if found else "?"
 
     def _truth(self, kind, question, texts):
-        if len(texts) == 1 and texts[0].startswith(PAIR_LAYOUT.format(0)):
+        if (len(texts) == 1 and isinstance(texts[0], str)
+                and texts[0].startswith(PAIR_LAYOUT.format(0))):
             # a pair asked as one document, by the run with every pushdown off
             texts = tuple(re.split(PAIR_LAYOUT.format(r"\d+"), texts[0])[1:])
         rows = tuple(self._ids.get(text, repr(text)) for text in texts)

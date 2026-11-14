@@ -141,7 +141,11 @@ fn first_documents(
 /// column the document reads.
 fn texts(document: &ScanColumn, columns: &Table) -> Result<Option<ArrayRef>, CompileError> {
     let expression = match document {
-        ScanColumn::Unnamed(name) => return column(columns, name),
+        // the executor reads an image's pixels from its value columns
+        ScanColumn::Unnamed(name) => {
+            return Ok(column(columns, name)?
+                .filter(|found| !crate::images::holds_images(found.data_type())));
+        }
         ScanColumn::Expression(expression) => expression,
     };
     let held = |name: &str| columns.0.index_of(name).is_ok();
@@ -152,6 +156,12 @@ fn texts(document: &ScanColumn, columns: &Table) -> Result<Option<ArrayRef>, Com
     let chunks = (columns.1.iter())
         .map(|batch| built.evaluate(batch, false))
         .collect::<Result<Vec<_>, _>>()?;
+    if chunks
+        .first()
+        .is_some_and(|found| crate::images::holds_images(found.data_type()))
+    {
+        return Ok(None);
+    }
     let chunks: Vec<&dyn Array> = chunks.iter().map(AsRef::as_ref).collect();
     // a scan of no rows has no batch, and its text is no rows
     if chunks.is_empty() {
@@ -227,6 +237,17 @@ pub fn request_tables(
                 FIRST_DOCUMENT.into(),
                 first_documents(tokens, columns, rows)?,
             ));
+        }
+        // the executor reads an image document's pixels from its column
+        let source = (operators.scans.iter())
+            .find(|found| &found.alias == alias)
+            .and_then(|found| crate::planning::source_column(&found.column));
+        if let Some(source) = source
+            && !values.iter().any(|(name, _)| name == &source)
+            && let Some(images) = column(columns, &source)?
+            && crate::images::holds_images(images.data_type())
+        {
+            values.push((source, images));
         }
         if let Some(absent) = column(columns, NULL_DOCUMENT)? {
             values.push((NULL_DOCUMENT.into(), absent));

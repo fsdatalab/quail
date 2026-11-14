@@ -51,6 +51,9 @@ class Chunk:
             more than its last row; None when every answer is one row.
         decode_rows: The DecodeRows packed after the groups, or None.
             Their rows come last in the chunk and in final_indices.
+        rotary: Each row's rotary position where it is not its
+            position: (3, rows) for a chunk with image tokens, or
+            (rows,) for rows after an image; None otherwise.
     """
 
     input_ids: Any
@@ -65,6 +68,7 @@ class Chunk:
     fresh_keys: tuple = ()
     rows_per_answer: np.ndarray | None = None
     decode_rows: Any = None
+    rotary: Any = None
 
 
 @dataclass

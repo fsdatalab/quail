@@ -29,6 +29,18 @@ pub const PROBABILITIES_SUFFIX: &str = "_probabilities";
 /// The value column that is TRUE for each NULL document of a scan.
 pub const NULL_DOCUMENT: &str = "__null_document";
 
+// ---- images
+
+/// The first token id of an image's tokens in a token store. Each image
+/// takes the ids from its own first id up, one per image token, so two
+/// documents share a token only where they hold the same image; the
+/// executor reads each id's embedding from the vision encoder instead of
+/// the vocabulary.
+pub const IMAGE_TOKEN_BASE: i32 = 1 << 30;
+/// The pixels on each side of an image token: Qwen's 16-pixel patch,
+/// merged 2 by 2.
+pub const IMAGE_TOKEN_PIXELS: u32 = 32;
+
 // ---- classification
 
 /// The text before each label of a classification prompt.

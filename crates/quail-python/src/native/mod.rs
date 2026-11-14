@@ -1234,6 +1234,8 @@ pub fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module.add("SPAN_SUFFIX", shared::SPAN_SUFFIX)?;
         module.add("PROBABILITIES_SUFFIX", shared::PROBABILITIES_SUFFIX)?;
         module.add("NULL_DOCUMENT", shared::NULL_DOCUMENT)?;
+        module.add("IMAGE_TOKEN_BASE", shared::IMAGE_TOKEN_BASE)?;
+        module.add("IMAGE_TOKEN_PIXELS", shared::IMAGE_TOKEN_PIXELS)?;
         module.add("LABEL_PREFIX", shared::LABEL_PREFIX)?;
         module.add("DEFAULT_SELECTIVITY", shared::DEFAULT_SELECTIVITY)?;
         module.add("FIRST_WINDOW_CHARS", shared::FIRST_WINDOW_CHARS)?;

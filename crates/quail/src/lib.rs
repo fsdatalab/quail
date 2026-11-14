@@ -32,6 +32,7 @@ use quail_dylib as _;
 
 mod executor;
 pub mod finished;
+mod images;
 pub mod planning;
 pub mod region_run;
 pub mod report;

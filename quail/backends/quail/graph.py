@@ -6,6 +6,7 @@ import json
 
 import _quail_native
 
+from quail.backends.quail.executor.images import RegionImages
 from quail.backends.quail.executor.memory import memory_report
 from quail.backends.quail.retention import apply_retention
 from quail.common.pairs import columns_key
@@ -163,6 +164,9 @@ def serve_region(state, payload, graph: PhysicalGraph, end, wanted,
     """
     context = execution_context(state, payload, graph)
     torch, arena = state["gpu"].torch, state["gpu"].arena
+    pipeline = state["gpu"].pipeline
+    if hasattr(pipeline, "images"):
+        pipeline.images = RegionImages(payload["documents"], payload["columns"])
     try:
         with torch.inference_mode():
             results = serve_stages(
@@ -172,6 +176,8 @@ def serve_region(state, payload, graph: PhysicalGraph, end, wanted,
         # the region is timed until its end, so the files fall inside it
         arena.write_trace_files()
     finally:
+        if hasattr(pipeline, "images"):
+            pipeline.images = None
         for key in arena.resident_keys():
             arena.free_key(key)
     end.ran(*ran_message(results, execution_measurements(context)))

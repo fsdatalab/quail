@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use arrow::array::{Array, ArrayRef, AsArray, RecordBatch, StringArray};
+use arrow::array::{Array, ArrayRef, AsArray, RecordBatch};
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
 use arrow::row::{RowConverter, SortField};
@@ -126,6 +126,8 @@ pub struct Planner {
     /// (identity, document column, whether it holds character ranges)
     /// -> the token store of a table read whole, kept for later queries.
     stores: Mutex<HashMap<(String, String, bool), Arc<TokenStore>>>,
+    /// The first token id of each image the session's documents hold.
+    images: Mutex<crate::images::ImageIds>,
 }
 
 fn arrow_error(error: impl std::fmt::Display) -> CompileError {
@@ -148,6 +150,7 @@ impl Planner {
         Ok(Self {
             tokenizer: HfTokenizer::from_file(tokenizer_file).map_err(arrow_error)?,
             stores: Mutex::new(HashMap::new()),
+            images: Mutex::new(crate::images::ImageIds::default()),
         })
     }
 
@@ -200,7 +203,9 @@ impl Planner {
             let rows = tables
                 .get(&scan.provider)
                 .ok_or_else(|| CompileError::new(format!("no rows for table {}", scan.provider)))?;
-            let store = self.token_store(scan, rows, extracted.contains(&scan.alias))?;
+            let reads_images = settings.model["vision_tower"].as_bool().unwrap_or(false);
+            let store =
+                self.token_store(scan, rows, extracted.contains(&scan.alias), reads_images)?;
             let mut names = scan.columns.clone();
             // the executor reads the document's text to locate answers in it
             if let Some(source) = source_column(&scan.column)
@@ -371,6 +376,7 @@ impl Planner {
         scan: &Scan,
         rows: &TableRows,
         with_offsets: bool,
+        reads_images: bool,
     ) -> Result<Arc<TokenStore>, CompileError> {
         let key = rows
             .identity
@@ -400,10 +406,29 @@ impl Planner {
             ScanColumn::Unnamed(_) => None,
         };
         for batch in &rows.batches {
-            let texts = document_texts(&scan.column, built.as_ref(), batch)?;
-            writer
-                .write_texts(&self.tokenizer, &texts)
-                .map_err(arrow_error)?;
+            let values = document_values(&scan.column, built.as_ref(), batch)?;
+            if crate::images::holds_images(values.data_type()) {
+                if !reads_images {
+                    return Err(CompileError::new(
+                        "the model reads no images; an image document needs a model \
+                         with a vision tower, such as qwen3.5-4b-fp8",
+                    ));
+                }
+                if with_offsets {
+                    return Err(CompileError::new(
+                        "AI.EXTRACT copies its answers from a document's text, and an \
+                         image has none",
+                    ));
+                }
+                let mut ids = self.images.lock().expect("the image ids lock");
+                let tokens = crate::images::image_token_lists(&values, &self.tokenizer, &mut ids)?;
+                writer.write(tokens).map_err(arrow_error)?;
+            } else {
+                let text = cast(&values, &DataType::Utf8).map_err(arrow_error)?;
+                writer
+                    .write_texts(&self.tokenizer, text.as_string::<i32>())
+                    .map_err(arrow_error)?;
+            }
         }
         let store = Arc::new(writer.finish());
         if let Some(key) = key {
@@ -533,13 +558,13 @@ fn scans_of<'a>(alternatives: impl Iterator<Item = &'a Operators>) -> Vec<Scan> 
     found
 }
 
-/// The text of a scan's document column in one batch, the column
+/// The values of a scan's document column in one batch, the column
 /// built as `built` when it is an expression.
-fn document_texts(
+fn document_values(
     column: &ScanColumn,
     built: Option<&PhysicalValue>,
     batch: &RecordBatch,
-) -> Result<StringArray, CompileError> {
+) -> Result<ArrayRef, CompileError> {
     let values = match (column, built) {
         (_, Some(built)) => built.evaluate(batch, false)?,
         (ScanColumn::Unnamed(name), None) => batch
@@ -550,8 +575,7 @@ fn document_texts(
             return Err(CompileError::new("a document expression is not built"));
         }
     };
-    let text = cast(&values, &DataType::Utf8).map_err(arrow_error)?;
-    Ok(text.as_string::<i32>().clone())
+    Ok(values)
 }
 
 /// The fraction of each join's cross product its equalities keep,
@@ -652,7 +676,7 @@ fn estimate_pair_fraction(left: &[ArrayRef], right: &[ArrayRef]) -> Result<f64, 
 
 /// The table column a document reads, or a struct column it reads a
 /// field of.
-fn source_column(column: &ScanColumn) -> Option<String> {
+pub(crate) fn source_column(column: &ScanColumn) -> Option<String> {
     fn root(expression: &ValueExpression) -> Option<String> {
         match expression {
             ValueExpression::ColumnRef(column) => Some(column.column.clone()),
