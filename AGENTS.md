@@ -68,19 +68,22 @@ cores). A matching cache can avoid it.
 Quail source edits still require compiling and linking Quail itself.
 
 - A developer who edits no Rust needs only uv. `tools/build.sh` looks
-  for a prebuilt `_quail_native` for the checkout's Rust sources
-  (`tools/native_key.py` prints their key) and installs it with no
-  compiler. CI uploads one for each change of the Rust sources on
-  `main` (`.github/workflows/native-wheels.yml`); run that workflow on a
-  branch to upload one for the branch. After a prebuilt install, run
-  tools with `uv run --no-sync`: a plain `uv run` compiles the module.
+  for a prebuilt wheel for the checkout's Rust sources
+  (`tools/native_key.py` prints their key) and installs its
+  `_quail_native` and `quail-server` with no compiler. CI uploads one
+  for each change of the Rust sources on `main`
+  (`.github/workflows/publish.yml`); run that workflow on a branch to
+  upload one for the branch. The Modal image downloads the same wheel.
+  After a prebuilt install, run tools with `uv run --no-sync`: a plain
+  `uv run` compiles the module.
 - `tools/build.sh --compile` builds the module from source, as does
   `tools/build.sh` when no prebuilt module matches. The rest of this
   section is about that build.
 - Install rustup and uv first; Linux x86_64 also needs clang and lld.
   Run `tools/build.sh --compile` from any shell. It prefers
   `${CARGO_HOME:-$HOME/.cargo}/bin`, uses `rust-toolchain.toml`, prints
-  the selected compiler and paths, and runs `uv sync --frozen`.
+  the selected compiler and paths, runs `uv sync --frozen`, and
+  builds `quail-server` with `cargo build --workspace --locked`.
   Rustup downloads the pinned compiler if needed. The script does not
   change global tool links or Cargo configuration.
 - Keep that Cargo home and `target/` between commands. Maturin must not

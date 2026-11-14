@@ -11,7 +11,7 @@ title: Developers
 - the Quail version or commit, and the `EngineConfig` for an error in
   an AI call.
 
-## Build Quail
+## Run Quail from source
 
 Install [uv](https://docs.astral.sh/uv/). Quail uses Python 3.12.
 
@@ -21,13 +21,22 @@ cd quail
 tools/build.sh
 ```
 
-`tools/build.sh` installs the Python package from your checkout and the
-Rust module `_quail_native`. The script downloads a prebuilt module when
-CI has built one for your checkout's Rust sources, so you need no Rust
-compiler to work on the Python code. Run your tools with
-`uv run --no-sync` after a prebuilt install.
+`tools/build.sh` installs three things into `.venv`: the Python package
+from your checkout, the Rust module `_quail_native`, and the
+`quail-server` program. Run a program or the server from the checkout
+with `uv run --no-sync`:
 
-Edit Rust, and you compile the module yourself. Install
+```bash
+uv run --no-sync python my_program.py
+uv run --no-sync quail-server --model qwen3-4b-fp8 --device h100-sxm
+```
+
+`tools/build.sh` downloads the Rust parts when CI has built them for
+your checkout's Rust sources, so you need no Rust compiler to work on
+the Python code. CI builds them for each change of the Rust sources on
+`main`.
+
+Edit Rust, and you compile the Rust parts yourself. Install
 [rustup](https://rustup.rs), and clang and lld on Linux x86_64, then
 run `tools/build.sh --compile`. The first build compiles DataFusion and
 takes about 20 minutes on 4 cores; later builds reuse the compiled

@@ -10,13 +10,12 @@ Arrow Flight client can call the server too.
 
 ## Start the server
 
-Run the commands below from a repository checkout, on a machine with a
-[supported GPU](/docs/user-guide/models):
+Install Quail on a machine with a
+[supported GPU](/docs/user-guide/models), then start the server:
 
 ```bash
-tools/build.sh
-cargo build --workspace --locked
-target/debug/quail-server --model qwen3-4b-fp8 --device h100-sxm
+uv pip install quail-engine
+quail-server --model qwen3-4b-fp8 --device h100-sxm
 ```
 
 - The server needs `--model` and `--device`, and runs one model.

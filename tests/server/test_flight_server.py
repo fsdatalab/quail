@@ -18,7 +18,7 @@ import quail
 import quail.remote.client
 
 REPOSITORY = Path(__file__).resolve().parents[2]
-SERVER = REPOSITORY / "target" / "debug" / "quail-server"
+SERVER = Path(sys.executable).parent / "quail-server"
 WORKER = REPOSITORY / "tests" / "helpers" / "oracle_worker.py"
 
 REVIEWS = pa.table({
@@ -30,7 +30,7 @@ QUERY = ("SELECT r.id FROM reviews r "
 
 pytestmark = pytest.mark.skipif(
     not SERVER.exists(),
-    reason="quail-server is not built; run cargo build --workspace")
+    reason="quail-server is not installed; run tools/build.sh")
 
 
 class _Client(flight.FlightClient):

@@ -1,76 +1,82 @@
-name: Publish to PyPI
+name: Wheels
 
+# Builds one wheel per platform. A wheel holds the Python package, the
+# Rust module _quail_native, and the quail-server program.
+#
+# - A change of the Rust sources on main uploads the wheels to the
+#   `native-wheels` release, named by the key of the sources
+#   (tools/native_key.py). tools/build.sh and the Modal image download
+#   the module from there, so nobody else compiles it.
+# - A version tag also publishes the wheels to PyPI.
+# - A manual run uploads the wheels for any branch: Actions tab, or
+#   `gh workflow run publish.yml --ref <branch>`.
+#
+# PyPI trusts the file by name; keep the name publish.yml.
 on:
   push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".cargo/**"
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
       - "v[0-9]+.[0-9]+.[0-9]+rc[0-9]+"
       - "v[0-9]+.[0-9]+.[0-9]+[ab][0-9]+"
-  # build the packages without publishing, to check a release beforehand
   workflow_dispatch:
 
 jobs:
-  # one wheel per platform: _quail_native is built for Python's stable
-  # ABI (abi3), so a wheel serves every supported Python version
+  # _quail_native is built for Python's stable ABI (abi3), so one wheel
+  # per platform serves every supported Python version
   wheels:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - runner: ubuntu-latest
+            platform: linux-x86_64
           - runner: ubuntu-24.04-arm
+            platform: linux-aarch64
           - runner: macos-14
+            platform: macos-arm64
     runs-on: ${{ matrix.runner }}
     permissions:
-      contents: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      # PyPI accepts a Linux wheel only with a manylinux tag, which the
-      # manylinux container gives it
-      - name: Build
-        uses: PyO3/maturin-action@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      # PyPI accepts a Linux wheel only with a manylinux tag, so Linux
+      # builds run in the manylinux container; macOS builds on the runner
+      - if: runner.os == 'macOS'
+        run: tools/build_server.sh
+      - uses: PyO3/maturin-action@v1
         with:
           command: build
           args: --release --locked --out dist
           manylinux: "2_28"
           # .cargo/config.toml links Linux x86_64 builds with clang and lld
-          before-script-linux: dnf install -y clang lld
-        env:
-          CARGO_PROFILE_RELEASE_INCREMENTAL: "false"
-          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
-      - name: Upload release files
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+          before-script-linux: dnf install -y clang lld && tools/build_server.sh
+      - name: Upload to the native-wheels release
+        run: |
+          unzip -l dist/*.whl | grep -q "data/scripts/quail-server"
+          asset="quail_native-$(python3 tools/native_key.py)-${{ matrix.platform }}.whl"
+          cp dist/*.whl "$asset"
+          gh release view native-wheels >/dev/null 2>&1 \
+            || gh release create native-wheels --prerelease \
+                 --title "Prebuilt wheels" --notes "tools/build.sh downloads these." \
+            || true
+          gh release upload native-wheels "$asset" --clobber
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: dist-${{ matrix.runner }}
-          path: dist/
-
-  # the source package, for a platform with no wheel
-  sdist:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - name: Build
-        uses: PyO3/maturin-action@v1
-        with:
-          command: sdist
-          args: --out dist
-      - name: Upload release files
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: dist-sdist
+          name: dist-${{ matrix.platform }}
           path: dist/
 
   publish:
-    needs: [wheels, sdist]
-    # a manual run builds the packages and publishes nothing
-    if: github.event_name == 'push'
+    needs: wheels
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -78,18 +84,17 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
         with:
           enable-cache: false
           version: "0.12.13"
-      - name: Download release files
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           pattern: dist-*
           merge-multiple: true
           path: dist/
-      - name: Generate attestations
-        uses: astral-sh/attest-action@f589a42a7efb6fe400b4f400de60b4bc90390027
-      - name: Publish
-        run: uv publish
+      # the source package, for a platform with no wheel
+      - run: uv build --sdist
+      - uses: astral-sh/attest-action@f589a42a7efb6fe400b4f400de60b4bc90390027
+      - run: uv publish

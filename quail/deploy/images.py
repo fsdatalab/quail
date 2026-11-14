@@ -4,7 +4,9 @@ Each image mounts the quail package and the bench package, which is
 not in the wheel, so the benchmark runner imports inside a container.
 """
 
+import importlib.util
 import os
+import urllib.request
 from importlib.metadata import version
 from pathlib import Path
 
@@ -42,6 +44,10 @@ VLLM_PLUGIN_DIR = Path(__file__).parent / "vllm_plugin"
 # the Rust workspace the planner's native module builds from
 REPOSITORY = Path(__file__).resolve().parents[2]
 NATIVE_SOURCE = "/opt/quail-native"
+# where CI uploads a prebuilt native module for each key of the Rust
+# sources (.github/workflows/publish.yml)
+NATIVE_WHEELS_URL = ("https://github.com/fsdatalab/quail/releases/download/"
+                     "native-wheels")
 MATURIN = "maturin>=1.9,<2"
 # the native module alone, as a project: the image mounts the quail
 # package from source
@@ -91,13 +97,49 @@ def _is_rust_source(path: Path) -> bool:
     return path.suffix == ".rs"
 
 
-def _with_native_planner(image: modal.Image) -> modal.Image:
-    """Build the _quail_native module, which plans queries in Rust, into an image.
+def _prebuilt_native_url() -> str | None:
+    """Return the URL of the prebuilt _quail_native for this checkout's Rust.
 
-    The dependencies build in one layer, from the manifests and the lock
-    file alone, and Quail's crates in the next. An edit to Quail's Rust
-    then rebuilds only Quail's crates.
+    CI uploads one module per key of the Rust sources
+    (tools/native_key.py). None when it has uploaded none for these
+    sources, when the release cannot be reached, and inside a container,
+    where the image is already built.
     """
+    script = REPOSITORY / "tools" / "native_key.py"
+    if not modal.is_local() or not script.exists():
+        return None
+    spec = importlib.util.spec_from_file_location("native_key", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    url = f"{NATIVE_WHEELS_URL}/quail_native-{module.native_key()}-linux-x86_64.whl"
+    try:
+        with urllib.request.urlopen(
+                urllib.request.Request(url, method="HEAD"), timeout=10):
+            return url
+    except OSError:
+        return None
+
+
+def _with_native_planner(image: modal.Image) -> modal.Image:
+    """Put the _quail_native module, which plans queries in Rust, into an image.
+
+    The image downloads the module CI built for the checkout's Rust
+    sources when there is one. Otherwise it builds the module: the
+    dependencies in one layer, from the manifests and the lock file
+    alone, and Quail's crates in the next, so an edit to Quail's Rust
+    rebuilds only Quail's crates.
+    """
+    url = _prebuilt_native_url()
+    if url is not None:
+        # the image's environment has no pip; a wheel is a zip archive
+        fetch = f"import urllib.request as r; r.urlretrieve('{url}', '/tmp/native.whl')"
+        unpack = ("import sysconfig, zipfile; "
+                  "wheel = zipfile.ZipFile('/tmp/native.whl'); "
+                  "wheel.extractall(sysconfig.get_paths()['platlib'], [name for name "
+                  "in wheel.namelist() if name.startswith('_quail_native/')])")
+        return image.run_commands(
+            f'python -c "{fetch}"', f'python -c "{unpack}"',
+            "python -c 'import _quail_native; _quail_native.LOGICAL_RULES'")
     cargo = (f"cd {NATIVE_SOURCE} && PATH=$HOME/.cargo/bin:$PATH "
              # an image builds once: Cargo's default release settings,
              # not the workspace's fast-rebuild ones
