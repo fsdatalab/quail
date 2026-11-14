@@ -42,13 +42,6 @@ The first build takes about 20 minutes on 4 cores because it compiles
 DataFusion. Later builds reuse the compiled dependencies. Run the command
 again after each Rust change.
 
-Run cargo without `--workspace` and without `-p`. Rust test programs
-link DataFusion from one shared library, the crate `quail-dylib`, and
-`--workspace` builds the library in a way that breaks the link: "cannot
-satisfy dependencies so `std` only shows up once". Run
-`touch crates/quail-dylib/src/lib.rs` and build again to recover. A new
-Rust test program starts with `use quail_dylib as _;`.
-
 ## Understand how Quail works with DataFusion
 
 DataFusion parses the SQL and runs the relational operators, including scans,
