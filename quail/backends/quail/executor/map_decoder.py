@@ -21,6 +21,13 @@ from quail.backends.quail.executor.groups import FullAttentionGroup
 # copies of chosen tokens kept in flight before the host waits on the
 # oldest; two lets the host read a pass's tokens while the next runs
 IN_FLIGHT = 2
+# per extraction field: rounds that fed a draft, and of them the rounds
+# with several live positions; draft rows fed and written; rounds whose
+# draft the model left for another position, the draft rows unread after
+# it, and the draft rows unread after an answer's end
+DRAFT_COUNTS = ("draft_rounds", "draft_rounds_many_positions", "draft_rows",
+                "draft_rows_written", "draft_rounds_rejected",
+                "draft_rows_rejected", "draft_rows_after_end")
 
 
 @dataclass
@@ -96,6 +103,7 @@ class MapDecoder:
         # whether a document's branches read its shared pages together
         self.share = False
         self.copy_constraints = {}
+        self.draft_counts = {}
         self.copy_readouts = {}
         self.copy_groups = []
         self.copy_inputs = []
@@ -120,6 +128,8 @@ class MapDecoder:
     def configure_copy(self, first, slots, documents, specs):
         """Register extraction fields for setup after the first forward launch."""
         self.constrained[first:first + len(specs)] = True
+        for q in range(first, first + len(specs)):
+            self.draft_counts[q] = dict.fromkeys(DRAFT_COUNTS, 0)
         self.copy_inputs.append((first, slots, documents, specs))
 
     def _initialize(self):
@@ -786,6 +796,16 @@ class MapDecoder:
             last, 4:4 + state.constraint.mask_words]
         observed = ((self.num_streams[slots] > 1) & (self.drafts[slots] > 0)
                     & (values[first, 0] >= 0) & (indices[first] + 1 < self.limits[q]))
+        drafts = self.drafts[slots]
+        written = np.bincount(inverse, minlength=len(slots)) - 1
+        unread = drafts - written
+        chose = values[last, 0] >= 0
+        # the model chose a token of another position with draft rows unread
+        rejected = chose & (values[last, 3] == 0) & (unread > 0)
+        for name, count in zip(DRAFT_COUNTS, (
+                drafts > 0, (drafts > 0) & (self.num_streams[slots] > 1), drafts,
+                written, rejected, unread * rejected, unread * ~chose)):
+            self.draft_counts[q][name] += int(count.sum())
         buckets = live_buckets(self.num_streams[slots])
         np.add.at(state.trials, buckets[observed], 1)
         np.add.at(state.accepts, buckets[observed], values[first[observed], 3] > 0)

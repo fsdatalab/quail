@@ -146,6 +146,7 @@ class ExtractOperator(MapOperator):
                 steps=int(self.decoder.steps[self.first + q][self.slots[q]].sum()),
                 answer_tokens=int(np.maximum(0, lengths).sum()),
                 answers_stopped_early=int(self.decoder.stopped_early[self.first + q]),
+                **self.decoder.draft_counts[self.first + q],
                 suffix_tokens=(int(self.asked[q].sum())
                                * len(node.spec.prompt_token_parts[1]) + self.fed[q])))
         return fed
