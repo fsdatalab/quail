@@ -1,15 +1,18 @@
-r"""Ask CUAD clause questions about PDF page images: Quail and stock vLLM.
+r"""Ask CUAD clause questions about PDF pages, as page images and as text.
 
-Each contract's PDF becomes one row per page with AI.PDF_PAGES, and a
-query asks a vision model about each page image:
+Each contract's PDF becomes one row per page. A query asks Qwen3.5 about
+each page, read one of two ways:
 
-    SELECT p.id FROM pages p
+- image: the page image AI.PDF_PAGES renders, read by the vision encoder;
+- text: the page's stored text, AI.PARSE_DOCUMENT split at its page breaks.
+
+    SELECT p.id AS page_id FROM pages p
     WHERE AI.IF(PROMPT('Does this page state which law governs ...? {0}', p.image))
 
 The page labels say which pages hold each CUAD clause (the dataset's
-build_cuad_pdf.py on the quail-results volume). Each backend runs in its
-own container on the same rendered pages; the result is saved to the
-quail-results volume under /pdf_pages/<run id>/.
+build_cuad_pdf.py on the quail-results volume). Each mode runs in its own
+container on the same pages; the result is saved to the quail-results
+volume under /pdf_pages/<run id>/.
 
     uv run modal run --detach -m experiments.cells.pdf_pages \
       --subset small --model qwen3.5-4b-bf16 2>&1 | tee "$run_log"
@@ -22,10 +25,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 
 import modal
 
+from quail.backends.quail.executor.images import png_size
 from quail.deploy.images import gpu_image
 
 app = modal.App("quail-milestone1")
@@ -51,6 +56,7 @@ QUESTIONS = {
                        "or how long it lasts?",
 }
 PROMPT_TEMPLATE = "{question} Answer yes or no.\n\n{{0}}"
+TEXTS_SQL = "SELECT c.contract_id, AI.PARSE_DOCUMENT(c.pdf) AS text FROM contracts c"
 PAGES_SQL = (
     "SELECT c.contract_id || '/' || CAST(u['page'] AS VARCHAR) AS id, "
     "c.contract_id, u['page'] AS page, u['image'] AS image "
@@ -70,23 +76,27 @@ CLAUSE_LABELS = {
     "Expiration Date": "expiration date",
 }
 OTHER = "other"
-BOTH = ("Cap On Liability", "Termination For Convenience")
 
 
-def queries() -> dict[str, str]:
-    """Each query by name: one filter per clause, an AND, and a classification."""
+def queries(column: str = "image") -> dict[str, str]:
+    """Each query by name: one filter per clause, all four, and a classification.
+
+    Args:
+        column: The pages' document column, image or text.
+    """
+    def asks(category):
+        return f"AI.IF(PROMPT('{_prompt(category)}', p.{column}))"
+
     found = {f"filter: {category}": (
-        "SELECT p.id AS page_id FROM pages p "
-        f"WHERE AI.IF(PROMPT('{_prompt(category)}', p.image))")
+        f"SELECT p.id AS page_id FROM pages p WHERE {asks(category)}")
         for category in QUESTIONS}
-    terms = " AND ".join(f"AI.IF(PROMPT('{_prompt(category)}', p.image))"
-                         for category in BOTH)
-    found["filter: both clauses"] = (
-        f"SELECT p.id AS page_id FROM pages p WHERE {terms}")
+    tags = ", ".join(f"{asks(category)} AS tag_{index}"
+                     for index, category in enumerate(QUESTIONS))
+    found["tag: every clause"] = f"SELECT p.id AS page_id, {tags} FROM pages p"
     labels = ", ".join(f"'{label}'" for label in [*CLAUSE_LABELS.values(), OTHER])
     found["classify: clause"] = (
         "SELECT p.id AS page_id, AI.CLASSIFY(PROMPT('Which clause does this page "
-        f"state? {{0}}', p.image), [{labels}]) AS clause FROM pages p")
+        f"state? {{0}}', p.{column}), [{labels}]) AS clause FROM pages p")
     return found
 
 
@@ -151,58 +161,113 @@ def _rendered_pages(session, subset: str, edge: int):
         contracts.select(["contract_id", "pdf"]), id_col="contract_id"))
     started = time.perf_counter()
     pages = session.sql(PAGES_SQL.format(edge=edge)).collect()
+    # a column keeps its table's qualifier, such as c.contract_id
+    pages = pages.rename_columns([name.split(".")[-1] for name in pages.column_names])
     return pages, time.perf_counter() - started
+
+
+def _page_texts(session, subset: str):
+    """Each page's stored text, by AI.PARSE_DOCUMENT, and the seconds it took."""
+    import pyarrow as pa
+
+    started = time.perf_counter()
+    texts = session.sql(TEXTS_SQL).collect()
+    rows = []
+    for contract, text in zip(texts.column(0).to_pylist(),
+                              texts.column(1).to_pylist(), strict=True):
+        for page, found in enumerate((text or "").split("\f"), start=1):
+            rows.append({"id": f"{contract}/{page}", "contract_id": contract,
+                         "page": page, "text": found})
+    return pa.Table.from_pylist(rows), time.perf_counter() - started
+
+
+def _register_contracts(session, subset: str) -> None:
+    import pyarrow.parquet as pq
+
+    import quail
+
+    contracts = pq.read_table(f"{RESULTS}/cuad_pdf/{subset}/contracts.parquet")
+    session.register("contracts", quail.DocumentProvider.from_table(
+        contracts.select(["contract_id", "pdf"]), id_col="contract_id"))
+
+
+def _prompt_tokens(session, sql_prompt: str) -> int:
+    """The tokens of a prompt around its document: its turn and template."""
+    prefix, suffix = session.model.turn
+    template = sql_prompt.replace("''", "'").replace("{0}", "")
+    return len(session.tokenizer(prefix + template + suffix))
 
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=4 * 3600,
               volumes=volumes)
-def run_backend(backend: str, model: str, subset: str, edge: int,
-                run_id: str) -> dict:
-    """Run every query on one backend and save its rows and measurements."""
+def run_mode(mode: str, model: str, subset: str, edge: int, run_id: str) -> dict:
+    """Run every query over the pages read one way; save rows and measurements.
+
+    Args:
+        mode: image or text.
+        model: The model spec's name.
+        subset: small, medium, or synthetic.
+        edge: The page images' longest side, in pixels.
+        run_id: The run's folder on the volume.
+    """
     import pyarrow.parquet as pq
 
     import quail
     from bench.quailb import _submission_to_answer_s
 
-    if backend != "quail":
-        os.environ["QUAIL_VLLM_IMAGES"] = "1"
-    config = quail.EngineConfig(model=model, device="h100-sxm", backend=backend)
-    record = {"backend": backend, "model": model, "subset": subset,
+    config = quail.EngineConfig(model=model, device="h100-sxm")
+    record = {"mode": mode, "model": model, "subset": subset,
               "longest_edge": edge, "queries": {}}
     labels = (synthetic_pages(edge)[1] if subset == "synthetic" else pq.read_table(
         f"{RESULTS}/cuad_pdf/{subset}/page_labels.parquet").to_pylist())
     with quail.Session(config) as session:
-        pages, render_s = _rendered_pages(session, subset, edge)
-        record.update(pages=pages.num_rows, render_s=round(render_s, 2))
+        if mode == "image":
+            pages, prepare_s = _rendered_pages(session, subset, edge)
+            document_tokens = [2 + (width // 32) * (height // 32) for width, height in
+                               map(png_size, pages.column("image").to_pylist())]
+        else:
+            _register_contracts(session, subset)
+            pages, prepare_s = _page_texts(session, subset)
+            document_tokens = [len(session.tokenizer(text))
+                               for text in pages.column("text").to_pylist()]
+        record.update(pages=pages.num_rows, prepare_s=round(prepare_s, 2),
+                      document_tokens=sum(document_tokens))
         session.register("pages", quail.DocumentProvider.from_table(
-            pages.select(["id", "contract_id", "page", "image"]), id_col="id"))
-        for name, sql in queries().items():
+            pages.select(["id", "contract_id", "page", mode]), id_col="id"))
+        for name, sql in queries(mode).items():
+            prompts = re.findall(r"PROMPT\('((?:[^']|'')*)'", sql)
+            input_tokens = sum(
+                sum(document_tokens) + len(pages) * _prompt_tokens(session, prompt)
+                for prompt in prompts)
             submitted = time.perf_counter()
             query = session.sql(sql)
             frontend_s = time.perf_counter() - submitted
             result = query.run()
             query_s = _submission_to_answer_s(
-                backend, result.report, frontend_s=frontend_s,
-                answer_prepare_s=0.0)
+                "quail", result.report, frontend_s=frontend_s, answer_prepare_s=0.0)
             table = result.collect()
             ids = table.column("page_id").to_pylist()
-            metrics = result.report.get("backend_metrics", {})
-            found = {"query_s": round(query_s, 3),
-                     "prompt_tokens": metrics.get("prompt_tokens"),
-                     "boot_s": result.report.get("boot_s")}
+            found = {"query_s": round(query_s, 3), "input_tokens": input_tokens,
+                     "input_tokens_per_second": round(input_tokens / query_s),
+                     "usd_per_query": round(query_s / 3600 * H100_USD_PER_HOUR, 5)}
             if "clause" in table.column_names:
                 clauses = dict(zip(ids, table.column("clause").to_pylist()))
-                found.update(answers=clauses,
-                             accuracy=classify_scores(clauses, labels))
+                found["accuracy"] = classify_scores(clauses, labels)
+            elif "tag_0" in table.column_names:
+                found["accuracy"] = {
+                    category: scores(
+                        [page for page, tag in zip(ids, table.column(f"tag_{index}")
+                                                   .to_pylist()) if tag],
+                        labels, [category])
+                    for index, category in enumerate(QUESTIONS)}
             else:
                 found.update(ids=sorted(ids),
                              accuracy=scores(ids, labels, _categories(name)))
             record["queries"][name] = found
-            print(f"{backend} {name}: {query_s:.1f} s, {len(ids)} rows",
-                  flush=True)
+            print(f"{mode} {name}: {query_s:.1f} s, {len(ids)} rows", flush=True)
     directory = f"{RESULTS}/pdf_pages/{run_id}"
     os.makedirs(directory, exist_ok=True)
-    with open(f"{directory}/{backend}.json", "w") as out:
+    with open(f"{directory}/{mode}.json", "w") as out:
         json.dump(record, out)
     volumes[RESULTS].commit()
     return record
@@ -249,43 +314,30 @@ def scores(ids, labels, categories) -> dict:
 
 @app.local_entrypoint()
 def main(subset: str = "small", model: str = "qwen3.5-4b-bf16",
-         backends: str = "quail,stock_vllm", edge: int = 1024):
+         modes: str = "image,text", edge: int = 1024):
     run_id = time.strftime("%Y%m%d-%H%M%S") + f"-{subset}-{model}-{edge}"
-    calls = {backend: run_backend.spawn(backend, model, subset, edge, run_id)
-             for backend in backends.split(",")}
-    for backend, call in calls.items():
-        print(f"{backend} function call id: {call.object_id}", flush=True)
-    records = {backend: call.get() for backend, call in calls.items()}
+    calls = {mode: run_mode.spawn(mode, model, subset, edge, run_id)
+             for mode in modes.split(",")}
+    for mode, call in calls.items():
+        print(f"{mode} function call id: {call.object_id}", flush=True)
+    records = {mode: call.get() for mode, call in calls.items()}
     print(f"saved to quail-results:/pdf_pages/{run_id}/", flush=True)
     summarize(records)
 
 
+def summarize(records: dict) -> None:
+    """Print each query's time, throughput, cost, and accuracy per mode."""
+    for mode, record in records.items():
+        print(f"\n{mode}: {record['pages']} pages, {record['document_tokens']:,} "
+              f"document tokens, prepared in {record['prepare_s']} s")
+        for name, found in record["queries"].items():
+            print(f"  {name:36} {found['query_s']:7.1f} s "
+                  f"{found['input_tokens_per_second']:>9,} input tok/s "
+                  f"${found['usd_per_query']:.4f}/query  {found['accuracy']}")
+
+
 def _categories(name: str) -> list[str]:
     """The clause categories a query asks about."""
-    if name == "filter: both clauses":
-        return list(BOTH)
-    if name.startswith("classify"):
+    if not name.startswith("filter: "):
         return list(QUESTIONS)
     return [name.removeprefix("filter: ")]
-
-
-def summarize(records: dict) -> None:
-    """Print each query's time, throughput, cost, and accuracy per backend."""
-    vllm = records.get("stock_vllm")
-    for name in queries():
-        # the prompts a plan with every pushdown off asks of each page
-        questions = 1 if name.startswith("classify") else len(_categories(name))
-        print(f"\n{name}")
-        for backend, record in records.items():
-            found = record["queries"][name]
-            tokens = None
-            if vllm is not None:
-                single = [vllm["queries"][f"filter: {c}"]["prompt_tokens"]
-                          for c in QUESTIONS]
-                per_page = sum(single) / len(single) / vllm["pages"]
-                tokens = per_page * record["pages"] * questions
-            seconds = found["query_s"]
-            usd = seconds / 3600 * H100_USD_PER_HOUR
-            rate = f"{tokens / seconds:,.0f}" if tokens else "?"
-            print(f"  {backend:12} {seconds:8.1f} s  {rate:>10} input tok/s  "
-                  f"${usd:.4f}/query  {found['accuracy']}")
