@@ -116,6 +116,8 @@ class MapDecoder:
         self.copy_sources = np.full(n, -1, dtype=np.int64)
         self.num_streams = np.zeros(n, dtype=np.int64)
         self.steps = [np.zeros(n, dtype=np.int64) for _ in self.limits]
+        # per map, each document's rounds whose draft the model rejected
+        self.rejected_steps = [np.zeros(n, dtype=np.int64) for _ in self.limits]
         self.drafts = np.zeros(n, dtype=np.int64)
         # per map, its AnswerStop; the tokenizer decodes a map's text so far
         self.answer_stops = {}
@@ -802,6 +804,7 @@ class MapDecoder:
         chose = values[last, 0] >= 0
         # the model chose a token of another position with draft rows unread
         rejected = chose & (values[last, 3] == 0) & (unread > 0)
+        self.rejected_steps[q][slots] += rejected
         for name, count in zip(DRAFT_COUNTS, (
                 drafts > 0, (drafts > 0) & (self.num_streams[slots] > 1), drafts,
                 written, rejected, unread * rejected, unread * ~chose)):

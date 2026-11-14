@@ -236,6 +236,9 @@ class StageExecutor:
         self.pass_queued = []
         # per pass that decodes, its decode rows
         self.pass_decode_rows = []
+        # per pass, when its packing started and whether it held decode rows alone
+        self.pass_started = []
+        self.pass_decode_alone = []
         self.knee_rows = knee_rows
         self.recomputed_tokens = 0
         self.decode_cost = decode_cost
@@ -1094,6 +1097,9 @@ class StageExecutor:
         self._count_pass(part, chunk.tokens, decode, replays, reads, prefills)
         self.tokens += chunk.tokens
         self.pass_rows.append(chunk.tokens)
+        self.pass_started.append(started)
+        self.pass_decode_alone.append(
+            decode is not None and len(decode.positions) == chunk.tokens)
         if decode is not None:
             self.pass_decode_rows.append(len(decode.positions))
         self.pass_queued.append(bool(self.sched.pending or self.sched.waiting))
@@ -1263,6 +1269,10 @@ class StageExecutor:
             rows = np.asarray(self.pass_rows)
             details.append(f"{len(rows):,} forward passes of a median "
                            f"{int(np.median(rows)):,} rows")
+            alone = np.asarray(self.pass_decode_alone)
+            took = np.diff(np.asarray(self.pass_started + [time.perf_counter()]))
+            details.append(f"{int(alone.sum()):,} of decode rows alone over "
+                           f"{float(took[alone].sum()):.1f} s")
             if self.knee_rows:
                 # a pass below the size where it becomes compute-bound,
                 # while documents wait, is one admission left short

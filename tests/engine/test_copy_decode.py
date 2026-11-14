@@ -331,6 +331,8 @@ def check_copy_branches_match_reference_after_filters_and_limits(
         assert extension["draft_rounds_rejected"] <= extension["draft_rounds"]
         assert (extension["draft_rows"] > 0) == bool(draft_tokens)
         rejected += extension["draft_rounds_rejected"]
+        assert (extension["max_steps_unrejected"] <= extension["max_steps"]
+                <= extension["steps"])
     assert not arena.accounting.owned
     if state_slots:
         assert len(arena.accounting.free_slots) == state_slots

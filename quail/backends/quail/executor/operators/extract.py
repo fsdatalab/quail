@@ -141,9 +141,13 @@ class ExtractOperator(MapOperator):
         self.counts = []
         for q, node in enumerate(self.nodes):
             lengths = self.decoder.lengths[self.first + q][self.slots[q]]
+            steps = self.decoder.steps[self.first + q][self.slots[q]]
+            rejected = self.decoder.rejected_steps[self.first + q][self.slots[q]]
             self.counts.append(dict(
                 none=int((lengths <= 0).sum()),
-                steps=int(self.decoder.steps[self.first + q][self.slots[q]].sum()),
+                steps=int(steps.sum()),
+                max_steps=int(steps.max(initial=0)),
+                max_steps_unrejected=int((steps - rejected).max(initial=0)),
                 answer_tokens=int(np.maximum(0, lengths).sum()),
                 answers_stopped_early=int(self.decoder.stopped_early[self.first + q]),
                 **self.decoder.draft_counts[self.first + q],
