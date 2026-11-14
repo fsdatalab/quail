@@ -15,8 +15,9 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License: MIT"></a>
 </p>
 
-Quail runs SQL with AI functions. Apache DataFusion parses, plans, and
-runs the SQL, and Quail runs the AI functions on your GPUs.
+Quail runs SQL with AI functions on your GPUs. An AI function, such as
+`AI.IF`, sends a row's text to a model and returns the model's answer.
+Apache DataFusion parses, plans, and runs the rest of the SQL.
 
 [Documentation](https://fsdatalab.github.io/quail) |
 [Quickstart](https://fsdatalab.github.io/quail/docs/user-guide/quickstart) |
@@ -31,10 +32,9 @@ Quail needs Python 3.12 and a
 uv pip install quail-engine
 ```
 
-The package is `quail-engine`, and you import it as `quail`. The code on
-`main` can be ahead of the last release;
-[install from source](https://fsdatalab.github.io/quail/docs/contributing)
-to run it.
+The package is `quail-engine`, and you import it as `quail`.
+[Install from source](https://fsdatalab.github.io/quail/docs/contributing)
+to run the code on `main`, which can be ahead of the last release.
 
 ## Example
 
@@ -102,7 +102,8 @@ shows both.
 
 ## Contributing
 
-[Report a bug](https://github.com/fsdatalab/quail/issues) on GitHub. To
-change Quail, follow the
-[developer guide](https://fsdatalab.github.io/quail/docs/contributing):
-it says how to build from source and which checks to run.
+[Report a bug](https://github.com/fsdatalab/quail/issues) on GitHub.
+Follow the
+[developer guide](https://fsdatalab.github.io/quail/docs/contributing)
+to change Quail; the guide says how to build from source and which
+checks to run.
