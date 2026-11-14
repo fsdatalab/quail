@@ -475,7 +475,6 @@ html > body[data-scroll-locked] {
 }
 
 .planning-stage-grid > section,
-.planning-tree,
 .planning-table-scroll {
   border: 1px solid var(--color-fd-border);
   border-radius: 0.5rem;
@@ -567,25 +566,12 @@ html > body[data-scroll-locked] {
   margin: 0.55rem 0;
 }
 
-.planning-pipeline.compact {
-  grid-template-columns: 1fr auto 1fr;
-}
-
 .planning-stage-grid .planning-pipeline {
   grid-template-columns: minmax(0, 1fr);
 }
 
 .planning-stage-grid .planning-pipeline > span {
-  transform: rotate(90deg);
-  text-align: center;
-}
-
-.planning-tree .planning-pipeline {
-  grid-template-columns: minmax(0, 1fr);
-}
-
-.planning-tree .planning-pipeline > span {
-  transform: rotate(90deg);
+  transform: rotate(-90deg);
   text-align: center;
 }
 
@@ -624,33 +610,8 @@ html > body[data-scroll-locked] {
   border-bottom: 0;
 }
 
-.planning-tree {
-  padding: 1rem;
-}
-
-.planning-tree > .planning-node {
-  max-width: 22rem;
-  margin: 0 auto;
-}
-
-.tree-children {
-  display: grid;
-  align-items: start;
-  gap: 0.8rem;
-}
-
-.tree-children.two {
-  grid-template-columns: minmax(0, 2fr) minmax(11rem, 1fr);
-}
-
-.tree-branch.narrow {
-  max-width: 18rem;
-  justify-self: center;
-}
-
 @media (max-width: 720px) {
-  .planning-stage-grid,
-  .tree-children.two {
+  .planning-stage-grid {
     grid-template-columns: minmax(0, 1fr);
   }
 

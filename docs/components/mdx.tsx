@@ -9,7 +9,6 @@ import {
   DeriveFigure,
   PlannerAlgorithm,
   PlanStagesFigure,
-  SeveralRegionsFigure,
 } from './planning-details';
 import { PlanningFigure } from './planning-figure';
 import { QueryOutput } from './query-output';
@@ -27,7 +26,6 @@ export function getMDXComponents(components?: MDXComponents) {
     PlanStagesFigure,
     PlanningFigure,
     QueryOutput,
-    SeveralRegionsFigure,
     Step,
     Steps,
     Tab,

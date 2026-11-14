@@ -131,10 +131,14 @@ WHERE AI.IF(PROMPT('Is the review negative? {0}', r.text))
 GROUP BY m.genre, topic;
 ```
 
-<SeveralRegionsFigure />
-
 DataFusion carries rows and dynamic filters between the regions. Quail plans
 each region separately on the same loaded model and GPU.
+
+| Owner | Work |
+| --- | --- |
+| Model region 1 | Scan reviews, run `AI.IF`, then run `AI.CLASSIFY`. |
+| Model region 2 | Scan movies, then run `AI.IF`. |
+| DataFusion | Scan critics, join all three inputs, group the rows, and count them. |
 
 | Resource | Shared between regions? | Behavior |
 | --- | --- | --- |
