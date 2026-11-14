@@ -436,6 +436,24 @@ html > body[data-scroll-locked] {
   margin: 1.5rem 0 2rem;
 }
 
+.planner-algorithm {
+  margin: 1rem 0 2rem;
+  overflow-x: auto;
+  border-left: 2px solid var(--color-fd-primary);
+  background: color-mix(in srgb, var(--color-fd-muted) 45%, transparent);
+  padding: 0.9rem 1rem;
+  color: var(--color-fd-foreground);
+  font-family: var(--font-quail-mono), monospace;
+  font-size: 0.78rem;
+  font-variant-ligatures: none;
+  line-height: 1.65;
+  white-space: pre;
+}
+
+.planner-algorithm code {
+  font: inherit;
+}
+
 .dark .planning-detail {
   --df: #6fc0d8;
   --df-soft: #17313a;
