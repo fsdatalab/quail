@@ -10,4 +10,4 @@ publish = false
 crate-type = ["dylib"]
 
 [dependencies]
-quail = { path = "../quail" }
+quail = { package = "quail-engine", path = "../quail" }

@@ -176,7 +176,9 @@ Quail source edits still require compiling and linking Quail itself.
 # Names
 
 - The project is Quail (QUery-Aware Inference Layer); the package is
-  `quail`.
+  `quail`. On PyPI and crates.io the name is `quail-engine`; the Rust
+  library is `quail`, and it re-exports `quail-datafusion` as
+  `quail::extension` and `quail-planner` as `quail::planner`.
 - quail-b, the benchmark, lives in
   https://github.com/fsdatalab/quail-bench and is installed here as
   `quail_b`, pinned to a commit in `pyproject.toml`. `bench/` is

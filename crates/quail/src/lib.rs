@@ -3,7 +3,7 @@
 //! Quail adds AI functions to DataFusion and runs the model work of a
 //! query on the GPU:
 //!
-//! - `quail_datafusion::QuailExtension` is the DataFusion extension: the
+//! - [`extension::QuailExtension`] is the DataFusion extension: the
 //!   AI functions, Quail's optimizer rules, and model regions. It hands
 //!   each model region to a `RegionRunner`.
 //! - [`Executor`] is Quail's `RegionRunner`. It plans each model region
@@ -23,7 +23,7 @@
 //!
 //! // or add Quail to a DataFusion session of your own
 //! let executor = Arc::new(quail::Executor::open(&config)?);
-//! let state = quail_datafusion::QuailExtension::new(executor).register(state)?;
+//! let state = quail::extension::QuailExtension::new(executor).register(state)?;
 //! ```
 
 // links DataFusion and Quail from the shared library
@@ -57,6 +57,12 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::executor::RegionCall;
+/// Quail's DataFusion extension: the AI functions, the optimizer rules,
+/// and model regions, for a program with its own DataFusion session.
+pub use quail_datafusion as extension;
+/// The planner of one model region.
+pub use quail_planner as planner;
+
 pub use crate::executor::{
     EngineRegion, Executor, InputHint, Observer, RegionEngine, RegionEvent, RegionRan, RegionSink,
     Scan, ScannedTable, region_json,

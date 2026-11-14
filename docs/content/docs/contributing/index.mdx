@@ -76,17 +76,40 @@ rules decide what each AI call asks the model. Quail then plans each
 
 `query.explain()` prints the plan the steps produce.
 
-## Add Quail to your own DataFusion session
+## Use Quail from Rust
 
-A Rust program with its own DataFusion functions and rules can add
-Quail's AI functions beside them. Depend on the `quail-datafusion`
-crate and on DataFusion 55.2, the version Quail builds against:
+Add the `quail-engine` crate, and DataFusion 55.2, the version Quail
+builds against. The crate's library is named `quail`:
 
 ```toml
 [dependencies]
 datafusion = "55.2.0"
-quail-datafusion = { git = "https://github.com/fsdatalab/quail" }
+quail-engine = { git = "https://github.com/fsdatalab/quail" }
 ```
+
+Quail starts one Python process per GPU to run the model, so install
+the Python package in the environment `VIRTUAL_ENV` names:
+`pip install quail-engine`.
+
+`quail::Session` runs SQL with AI functions:
+
+```rust
+let config = quail::EngineConfig::new("qwen3-4b-fp8", "h100-sxm");
+let session = quail::Session::new(&config)?;
+session.register_table("reviews", reviews)?;
+let rows = session.sql(
+    "SELECT r.id FROM reviews r \
+     WHERE AI.IF(PROMPT('Does the reviewer ask for a refund? {0}', r.body))",
+)?;
+```
+
+[`quickstart.rs`](https://github.com/fsdatalab/quail/blob/main/crates/quail/examples/quickstart.rs)
+is the complete program.
+
+### Add Quail to your own DataFusion session
+
+A Rust program with its own DataFusion functions and rules can add
+Quail's AI functions beside them, with `quail::extension::QuailExtension`.
 
 `QuailExtension::register` adds the AI functions, Quail's optimizer
 rules, and Quail's query planner to your `SessionState`:
@@ -100,11 +123,10 @@ let state = QuailExtension::new(runner).register(host)?;
 let context = SessionContext::new_with_state(state);
 ```
 
-- `runner` runs the model. `quail::Executor::open(&config)?` from the
-  `quail` crate runs it on your GPUs and needs Quail's Python package
-  installed, because each GPU worker is a Python process.
+- `runner` runs the model. `Arc::new(quail::Executor::open(&config)?)`
+  runs it on your GPUs.
 - `register_rules` keeps your own query planner. Your planner then
-  calls `quail_datafusion::claim_model_regions` on the optimized plan
+  calls `quail::extension::claim_model_regions` on the optimized plan
   and adds `QuailExtension::extension_planner()` to its extension
   planners.
 - `register` returns an error when your session already has a function

@@ -20,7 +20,7 @@ arrow = { version = "59.3.2", default-features = false, features = ["ffi", "ipc"
 # a Rust program links libpython and starts the interpreter; maturin sets
 # PYO3_BUILD_EXTENSION_MODULE, so the Python module does not link it
 pyo3 = { version = "0.30", features = ["abi3-py312"] }
-quail = { path = "../quail" }
+quail = { package = "quail-engine", path = "../quail" }
 quail-datafusion = { path = "../quail-datafusion" }
 quail-planner = { path = "../quail-planner" }
 serde = { version = "1", features = ["derive"] }

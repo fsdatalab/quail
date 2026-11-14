@@ -2666,23 +2666,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "quail"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "async-trait",
- "datafusion",
- "futures",
- "memmap2",
- "quail-datafusion",
- "quail-dylib",
- "quail-planner",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "quail-datafusion"
 version = "0.1.0"
 dependencies = [
@@ -2702,7 +2685,24 @@ dependencies = [
 name = "quail-dylib"
 version = "0.1.0"
 dependencies = [
- "quail",
+ "quail-engine",
+]
+
+[[package]]
+name = "quail-engine"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "datafusion",
+ "futures",
+ "memmap2",
+ "quail-datafusion",
+ "quail-dylib",
+ "quail-planner",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -2730,9 +2730,9 @@ dependencies = [
  "futures-channel",
  "pyo3",
  "pyo3-build-config",
- "quail",
  "quail-datafusion",
  "quail-dylib",
+ "quail-engine",
  "quail-planner",
  "serde",
  "serde_json",
@@ -2751,7 +2751,7 @@ dependencies = [
  "arrow-flight",
  "datafusion",
  "futures",
- "quail",
+ "quail-engine",
  "serde",
  "serde_json",
  "tokio",
