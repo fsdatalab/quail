@@ -53,6 +53,8 @@ def execute_request_graph(context, backend, engine_state, boot):
         if not hasattr(client, "image_pad_id"):
             raise ValueError(f"{backend.name} reads no image documents")
         client.images = ImagePrompts(images, client.image_pad_id())
+        # an image has no text: its prompt goes as token ids and a picture
+        model_execution.submit_text = False
     try:
         return _run_request_graph(context, backend, engine_state, boot,
                                   model_execution, documents)

@@ -62,14 +62,31 @@ def _prompt(category: str) -> str:
     return PROMPT_TEMPLATE.format(question=QUESTIONS[category]).replace("'", "''")
 
 
+# the classification's label for each clause, and for a page of none
+CLAUSE_LABELS = {
+    "Governing Law": "governing law",
+    "Termination For Convenience": "termination for convenience",
+    "Cap On Liability": "cap on liability",
+    "Expiration Date": "expiration date",
+}
+OTHER = "other"
+BOTH = ("Cap On Liability", "Termination For Convenience")
+
+
 def queries() -> dict[str, str]:
-    """Each query by name: one filter per clause, and their OR."""
+    """Each query by name: one filter per clause, an AND, and a classification."""
     found = {f"filter: {category}": (
-        f"SELECT p.id FROM pages p WHERE AI.IF(PROMPT('{_prompt(category)}', "
-        "p.image))") for category in QUESTIONS}
-    terms = " OR ".join(f"AI.IF(PROMPT('{_prompt(category)}', p.image))"
-                        for category in QUESTIONS)
-    found["filter: any clause"] = f"SELECT p.id FROM pages p WHERE {terms}"
+        "SELECT p.id AS page_id FROM pages p "
+        f"WHERE AI.IF(PROMPT('{_prompt(category)}', p.image))")
+        for category in QUESTIONS}
+    terms = " AND ".join(f"AI.IF(PROMPT('{_prompt(category)}', p.image))"
+                         for category in BOTH)
+    found["filter: both clauses"] = (
+        f"SELECT p.id AS page_id FROM pages p WHERE {terms}")
+    labels = ", ".join(f"'{label}'" for label in [*CLAUSE_LABELS.values(), OTHER])
+    found["classify: clause"] = (
+        "SELECT p.id AS page_id, AI.CLASSIFY(PROMPT('Which clause does this page "
+        f"state? {{0}}', p.image), [{labels}]) AS clause FROM pages p")
     return found
 
 
@@ -167,14 +184,20 @@ def run_backend(backend: str, model: str, subset: str, edge: int,
             query_s = _submission_to_answer_s(
                 backend, result.report, frontend_s=frontend_s,
                 answer_prepare_s=0.0)
-            ids = sorted(result.collect().column("id").to_pylist())
+            table = result.collect()
+            ids = table.column("page_id").to_pylist()
             metrics = result.report.get("backend_metrics", {})
-            record["queries"][name] = {
-                "query_s": round(query_s, 3), "ids": ids,
-                "prompt_tokens": metrics.get("prompt_tokens"),
-                "boot_s": result.report.get("boot_s"),
-                "accuracy": scores(ids, labels, _categories(name)),
-            }
+            found = {"query_s": round(query_s, 3),
+                     "prompt_tokens": metrics.get("prompt_tokens"),
+                     "boot_s": result.report.get("boot_s")}
+            if "clause" in table.column_names:
+                clauses = dict(zip(ids, table.column("clause").to_pylist()))
+                found.update(answers=clauses,
+                             accuracy=classify_scores(clauses, labels))
+            else:
+                found.update(ids=sorted(ids),
+                             accuracy=scores(ids, labels, _categories(name)))
+            record["queries"][name] = found
             print(f"{backend} {name}: {query_s:.1f} s, {len(ids)} rows",
                   flush=True)
     directory = f"{RESULTS}/pdf_pages/{run_id}"
@@ -185,10 +208,36 @@ def run_backend(backend: str, model: str, subset: str, edge: int,
     return record
 
 
+def _clauses(labels) -> dict[str, set[str]]:
+    """Each labeled page's clause categories, by page id."""
+    found: dict[str, set[str]] = {}
+    for row in labels:
+        if row["category"] not in QUESTIONS:
+            continue
+        clauses = found.setdefault(f"{row['contract_id']}/{row['page']}", set())
+        if row["present"]:
+            clauses.add(row["category"])
+    return found
+
+
+def classify_scores(answers: dict, labels) -> dict:
+    """The share of pages whose label names one of their clauses, or other."""
+    truth = _clauses(labels)
+    right = sum(
+        (answer == OTHER and not truth[page]) or any(
+            CLAUSE_LABELS[category] == answer for category in truth[page])
+        for page, answer in answers.items())
+    return {"accuracy": round(right / max(1, len(answers)), 3),
+            "pages": len(answers)}
+
+
 def scores(ids, labels, categories) -> dict:
-    """Precision, recall, and F1 of returned page ids against labels."""
-    truth = {row["contract_id"] + "/" + str(row["page"])
-             for row in labels if row["present"] and row["category"] in categories}
+    """Precision, recall, and F1 of returned page ids against labels.
+
+    A page is labeled when it holds every one of the categories.
+    """
+    truth = {page for page, clauses in _clauses(labels).items()
+             if set(categories) <= clauses}
     found = set(ids)
     hit = len(found & truth)
     precision = hit / len(found) if found else 0.0
@@ -213,7 +262,9 @@ def main(subset: str = "small", model: str = "qwen3.5-4b-bf16",
 
 def _categories(name: str) -> list[str]:
     """The clause categories a query asks about."""
-    if name.endswith("any clause"):
+    if name == "filter: both clauses":
+        return list(BOTH)
+    if name.startswith("classify"):
         return list(QUESTIONS)
     return [name.removeprefix("filter: ")]
 
@@ -222,7 +273,8 @@ def summarize(records: dict) -> None:
     """Print each query's time, throughput, cost, and accuracy per backend."""
     vllm = records.get("stock_vllm")
     for name in queries():
-        questions = len(_categories(name))
+        # the prompts a plan with every pushdown off asks of each page
+        questions = 1 if name.startswith("classify") else len(_categories(name))
         print(f"\n{name}")
         for backend, record in records.items():
             found = record["queries"][name]

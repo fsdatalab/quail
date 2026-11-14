@@ -107,21 +107,32 @@ def engine_environment(spec):
     """Scope vLLM's process selection to construction of one engine."""
     from vllm import envs
 
-    key = "VLLM_ENABLE_V1_MULTIPROCESSING"
-    previous = os.environ.get(key)
+    settings = {}
     # vLLM 0.26 reads process selection from the environment in LLM's
     # constructor, and caches what it read; its public LLM API has no
     # per-instance override
-    envs.disable_envs_cache()
     if spec.vision_tower or spec.canvas_tokens == 1:
-        os.environ[key] = "0"
+        settings["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    # an engine that takes images feeds embeddings, not token ids: a
+    # compiled graph saved for text alone loads and then fails, so it
+    # keeps its own cache. vLLM 0.29's V2 model runner fails in a Gated
+    # DeltaNet kernel while it captures such an engine's graphs
+    if spec.vision_tower and os.environ.get("QUAIL_VLLM_IMAGES"):
+        root = os.environ.get("VLLM_CACHE_ROOT",
+                              os.path.expanduser("~/.cache/vllm"))
+        settings["VLLM_CACHE_ROOT"] = root.rstrip("/") + "-images"
+        settings["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+    previous = {key: os.environ.get(key) for key in settings}
+    envs.disable_envs_cache()
+    os.environ.update(settings)
     try:
         yield
     finally:
-        if previous is None:
-            os.environ.pop(key, None)
-        else:
-            os.environ[key] = previous
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
         envs.disable_envs_cache()
 
 
