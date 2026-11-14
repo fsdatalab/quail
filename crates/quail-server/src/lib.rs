@@ -390,6 +390,10 @@ impl FlightService for QuailService {
     }
 }
 
+/// The largest Arrow batch a client uploads in one message. gRPC's
+/// default, 4 MiB, is smaller than one batch of long documents.
+const MAX_UPLOAD_MESSAGE_BYTES: usize = 1 << 30;
+
 /// How to call the program.
 pub const USAGE: &str = "usage: quail-server --model <model> --device <device> \
 [--gpus <n>] [--backend <backend>] [--listen <address>] [--data <directory>]";
@@ -440,12 +444,11 @@ pub fn run(
     );
     tokio::runtime::Runtime::new()?.block_on(
         tonic::transport::Server::builder()
-            .add_service(
-                arrow_flight::flight_service_server::FlightServiceServer::with_interceptor(
-                    service,
-                    move |request| check_token(token.as_deref(), request),
-                ),
-            )
+            .add_service(tonic::service::interceptor::InterceptedService::new(
+                arrow_flight::flight_service_server::FlightServiceServer::new(service)
+                    .max_decoding_message_size(MAX_UPLOAD_MESSAGE_BYTES),
+                move |request| check_token(token.as_deref(), request),
+            ))
             .serve_with_shutdown(address, stopped()),
     )?;
     queue.close();
