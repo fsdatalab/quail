@@ -111,8 +111,8 @@ for status in run.watch():
             print(event["alias"], event["documents"])
 ```
 
-An answer event reports one chunk, a group of prompts the model reads
-in one pass. An event's `kind` is `filter`, `join`, `score`, or `evict`.
+An answer event reports one batch: the tokens the model reads in one
+forward pass. An event's `kind` is `filter`, `join`, `score`, or `evict`.
 A filter event lists each document's row, the last stage to ask about
 the document, and whether the document passed.
 
