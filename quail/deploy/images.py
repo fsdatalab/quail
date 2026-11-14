@@ -113,8 +113,11 @@ def _prebuilt_native_url() -> str | None:
     spec.loader.exec_module(module)
     url = f"{NATIVE_WHEELS_URL}/quail_native-{module.native_key()}-linux-x86_64.whl"
     try:
+        # GitHub redirects to a link signed for GET, which refuses a HEAD;
+        # one byte answers whether the wheel exists
         with urllib.request.urlopen(
-                urllib.request.Request(url, method="HEAD"), timeout=10):
+                urllib.request.Request(url, headers={"Range": "bytes=0-0"}),
+                timeout=10):
             return url
     except OSError:
         return None
