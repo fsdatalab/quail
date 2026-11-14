@@ -2,58 +2,117 @@
 title: SQL reference
 ---
 
-Quail accepts SQL with AI functions.
-[Apache DataFusion](https://datafusion.apache.org/) parses the SQL and
-runs every operator except the AI functions, which Quail runs on the
-GPU.
+Use the SQL reference to look up AI function arguments and supported SQL
+syntax.
 
 <Cards>
   <Card title="AI functions" href="/docs/user-guide/sql/ai-functions"
-        description="Arguments, answers, and limits for each AI function." />
-  <Card title="SQL functions" href="/docs/user-guide/sql/sql-functions"
-        description="SQL clauses and expressions around AI calls." />
+        description="Arguments, return values, and options for each AI function." />
+  <Card title="SQL with AI functions" href="/docs/user-guide/sql/sql-functions"
+        description="How DataFusion SQL affects AI calls and model work." />
 </Cards>
 
-## Write a query
+## Simple queries
 
-Register a `reviews` table with IDs in `id` and text in `body`. The
-query below returns the IDs of reviews discussing the ending:
+The examples read `reviews(id, body, stars, category)` and
+`aspects(id, name, category)`.
+
+### Read columns
+
+`SELECT` returns stored columns without calling the model:
+
+```sql
+SELECT r.id, r.stars
+FROM reviews r
+LIMIT 10;
+```
+
+### Filter rows with the model
+
+`AI.IF` in `WHERE` keeps reviews the model considers positive:
 
 ```sql
 SELECT r.id
 FROM reviews r
-WHERE AI.IF(PROMPT('Does this review discuss the ending? {0}', r.body));
+WHERE AI.IF(PROMPT('Is the review positive? {0}', r.body));
 ```
 
-Pass the SQL text to `session.sql(text)`. `sql()` reads Snowflake
-syntax by default; pass `dialect="bq"` for BigQuery syntax.
-`AI_FILTER` is the Snowflake spelling of `AI.IF`.
+### Return an AI answer
 
-## SQL around the model's work
-
-Quail groups AI calls reading the same rows into a *model region* and
-runs each model region on the GPU. DataFusion runs every other
-operator: plain filters, joins, grouping, sorting, and limits.
-
-The query below classifies reviews with more than three stars and
-counts each label:
+`AI.CLASSIFY` in `SELECT` adds one sentiment label to each row:
 
 ```sql
-SELECT AI.CLASSIFY(PROMPT('Tone? {0}', r.body), ['good', 'bad']) AS tone,
+SELECT r.id,
+       AI.CLASSIFY(r.body, ['positive', 'negative', 'mixed']) AS sentiment
+FROM reviews r;
+```
+
+## More involved queries
+
+### Filter, score, sort, and limit
+
+The ordinary filter removes reviews below four stars before `AI.SCORE`
+reads the remaining reviews. `ORDER BY` then returns the ten reviews with
+the highest refund scores:
+
+```sql
+SELECT r.id,
+       AI.SCORE(PROMPT('Does the reviewer request a refund? {0}', r.body))
+           AS refund_score
+FROM reviews r
+WHERE r.stars >= 4
+ORDER BY refund_score DESC NULLS LAST
+LIMIT 10;
+```
+
+### Join rows with stored and AI conditions
+
+The category comparison limits the candidate pairs. `AI.IF` then keeps
+each pair the model considers related:
+
+```sql
+SELECT r.id, a.name
+FROM reviews r
+JOIN aspects a
+  ON r.category = a.category
+ AND AI.IF(PROMPT('Does the review discuss the aspect? {0} {1}',
+                  r.body, a.name));
+```
+
+### Aggregate answers
+
+`GROUP BY` counts the rows for each label returned by `AI.CLASSIFY`:
+
+```sql
+SELECT AI.CLASSIFY(r.body, ['positive', 'negative', 'mixed']) AS sentiment,
        COUNT(*) AS reviews
 FROM reviews r
-WHERE r.stars > 3
-GROUP BY tone
+GROUP BY sentiment
 ORDER BY reviews DESC;
 ```
 
-The model reads only the reviews passing `r.stars > 3`. DataFusion
-groups and sorts the labels the model region returns.
+### Use one AI answer in another AI function
 
-`query.explain()` shows the plans. `query.plan()` returns one physical
-plan per model region, as a tuple when the query has several model
-regions.
+The common table expression (CTE) gives each summary a column name. The
+outer query classifies each summary:
 
-Use a [CTE](/docs/user-guide/sql/sql-functions#with) or a `FROM` subquery
-when an AI call needs to read an aggregate or window value. DataFusion
-computes the value before the next model region reads it.
+```sql
+WITH summaries AS (
+    SELECT r.id,
+           AI.MAP(r.body, 'Summarize the review.', 32) AS summary
+    FROM reviews r
+)
+SELECT s.id,
+       AI.CLASSIFY(s.summary, ['praise', 'complaint', 'mixed']) AS kind
+FROM summaries s;
+```
+
+## SQL dialects
+
+`session.sql()` parses Snowflake syntax by default. Pass `dialect="bq"`
+to parse BigQuery syntax. The dialect changes ordinary SQL syntax and the
+syntax for AI function options.
+
+[DataFusion's SQL reference](https://datafusion.apache.org/user-guide/sql/index.html)
+documents ordinary SQL syntax. The Quail pages document the AI functions
+and their use with ordinary SQL.

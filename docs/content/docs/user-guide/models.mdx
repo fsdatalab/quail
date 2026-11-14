@@ -1,188 +1,110 @@
 ---
-title: Supported models and GPUs
+title: Models and GPUs
 ---
 
-You choose a model and a GPU with `model` and `device` in
-`EngineConfig`. One GPU must hold one complete copy of the model.
+Choose a model for the AI functions in your query, then choose a GPU able to
+run the model. Start with Qwen3 4B on an H100 unless your query needs a
+specialized model.
 
-## Models
-
-| Model | `model` value | Weight precision | AI functions |
-| --- | --- | --- | --- |
-| Qwen3 4B | `"qwen3-4b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT`, `AI.MAP` |
-| Qwen3 32B | `"qwen3-32b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT`, `AI.MAP` |
-| DiffusionGemma 26B-A4B | `"diffusion-gemma-26b-a4b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY` |
-| Qwen3 Reranker 0.6B | `"qwen3-reranker-0.6b-bf16"` | BF16 | `AI.SCORE` |
-| Qwen3 Reranker 4B | `"qwen3-reranker-4b-bf16"` | BF16 | `AI.SCORE` |
-| Decision 2.0 Kai 0.6B | `"decision-2.0-kai-0.6b-bf16"` | BF16 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY` |
-| Qwen3.5 4B | `"qwen3.5-4b-bf16"` | BF16 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT`, `AI.MAP` |
-| Qwen3.5 4B | `"qwen3.5-4b-fp8"` | FP8 and BF16 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT`, `AI.MAP` |
-| Qwen3.5 27B | `"qwen3.5-27b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT`, `AI.MAP` |
-| Qwen3.6 35B-A3B | `"qwen3.6-35b-a3b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT`, `AI.MAP` |
-| Qwen3.8 27B | `"qwen3.8-27b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT`, `AI.MAP` |
-| LFM2 2.6B | `"lfm2-2.6b-bf16"` | BF16 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT`, `AI.MAP` |
-| d1-2B | `"d1-2b-bf16"` | BF16 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT` |
-| d1-2B, FP8 weights | `"d1-2b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT` |
-| Qwen3.5 2B Base with Qwen-Scope SAE | `"qwen3.5-2b-sae-bf16"` | BF16 | `AI.SAE_FEATURES` |
-
-A model supporting `AI.EXTRACT` also supports `AI.EXTRACT_SPAN`.
-FP8 stores each weight as an 8-bit floating point number, and BF16
-stores each weight as a 16-bit floating point number.
-
-d1-2B's `AI.SCORE` reads one table only. Quail converts the `d1-2b-fp8`
-weights to FP8 as it loads them, because Liquid publishes no FP8
-checkpoint of d1-2B.
-
-## GPUs
-
-| GPU | `device` value |
-| --- | --- |
-| NVIDIA H100 SXM | `"h100-sxm"` |
-| NVIDIA L40S | `"l40s"` |
-| NVIDIA B200 | `"b200"` |
-| NVIDIA RTX PRO 6000 Blackwell Server Edition | `"rtx-pro-6000-blackwell-server"` |
-
-L40S does not run DiffusionGemma or the Qwen3.5, Qwen3.6, and Qwen3.8
-models. Quail also checks at planning time whether the model fits in
-GPU memory.
-
-## Configure a session
-
-The configuration below selects Qwen3 4B on one H100 SXM:
+<Tabs items={['Python', 'Rust']} groupId="models-language" className="quail-code-tabs">
+<Tab value="python" id="configure-python">
 
 ```python
 import quail
 
-config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
+config = quail.EngineConfig(
+    model="qwen3-4b-fp8",
+    device="h100-sxm",
+)
 ```
 
-Pass `config` to `quail.Session`. Quail downloads the model files your
-machine lacks.
+</Tab>
+<Tab value="rust" id="configure-rust">
 
-### Use several GPUs
+```rust
+use quail::EngineConfig;
 
-Set `gpus` to 1, 2, 4, or 8 on one machine; the default is 1. Each GPU
-holds one complete copy of the model, and Quail does not split a model's
-weights across GPUs. Add `gpus=4` to the configuration to use four GPUs.
-
-## DiffusionGemma
-
-DiffusionGemma uses
-[`RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic`](https://huggingface.co/RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic).
-Set `HF_TOKEN` to a Hugging Face token with access to the gated weights.
-
-`canvas_draws` limits the attempts per document for `AI.CLASSIFY` and
-for `AI.SCORE` over one table; the default is 4. Quail makes more
-attempts when the first attempt is uncertain, and averages the
-probabilities of all attempts. Set `canvas_draws=1` in `EngineConfig`
-to use one attempt. A classification of joined rows always uses one
-attempt, and `AI.IF` ignores `canvas_draws`.
-
-## Decision 2.0 Kai 0.6B
-
-[Decision 2.0 Kai](https://huggingface.co/vllm-sr/Decision-2.0-Kai-0.6B)
-scores supplied answers:
-
-| Function | Answer |
-| --- | --- |
-| `AI.IF` | `AI.IF` selects between Yes and No. |
-| `AI.SCORE` | `AI.SCORE` returns the probability of Yes in a choice between Yes and No. |
-| `AI.CLASSIFY` | `AI.CLASSIFY` returns the supplied label with the highest score. |
-
-Check the scores against labeled examples before you choose a threshold.
-
-## Qwen3 rerankers
-
-The rerankers support `AI.SCORE` only. A reranker reads the first
-document of a two-document prompt as the search query, and the second
-as the candidate document.
-
-## Qwen3.5 2B Base with Qwen-Scope SAE
-
-`qwen3.5-2b-sae-bf16` supports only `AI.SAE_FEATURES`.
-The model uses the layer-11
-[Qwen-Scope SAE](https://huggingface.co/Qwen/SAE-Res-Qwen3.5-2B-Base-W32K-L0_100)
-with 32,768 features and keeps the 100 strongest features per token.
-Use a separate session with another model for the other AI functions.
-
-## No local GPU? Use Modal
-
-Install [Modal](https://modal.com) and
-log in on your machine:
-
-```bash
-uv pip install modal==1.5.4
-modal setup
+let config = EngineConfig::new("qwen3-4b-fp8", "h100-sxm");
 ```
 
-Save the program below as `run_quail.py`. The program filters two
-reviews on an H100 and saves the model files and compiled kernels on
-Modal volumes:
+</Tab>
+</Tabs>
+
+Quail downloads missing model files when a session first runs a query.
+
+## General-purpose models
+
+Every model in the table supports `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`,
+`AI.EXTRACT`, `AI.EXTRACT_SPAN`, and `AI.MAP`.
+
+| Model | `model` value | Precision |
+| --- | --- | --- |
+| Qwen3 4B | `qwen3-4b-fp8` | FP8 |
+| Qwen3 32B | `qwen3-32b-fp8` | FP8 |
+| Qwen3.5 4B | `qwen3.5-4b-bf16` | BF16 |
+| Qwen3.5 4B | `qwen3.5-4b-fp8` | FP8 and BF16 |
+| Qwen3.5 27B | `qwen3.5-27b-fp8` | FP8 |
+| Qwen3.6 35B-A3B | `qwen3.6-35b-a3b-fp8` | FP8 |
+| Qwen3.8 27B | `qwen3.8-27b-fp8` | FP8 |
+| LFM2 2.6B | `lfm2-2.6b-bf16` | BF16 |
+
+FP8 stores each model weight as an 8-bit floating-point number. BF16 stores
+each model weight as a 16-bit floating-point number.
+
+## Models with limited functions
+
+| Model | `model` value | Supported AI functions |
+| --- | --- | --- |
+| DiffusionGemma 26B-A4B | `diffusion-gemma-26b-a4b-fp8` | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY` |
+| Decision 2.0 Kai 0.6B | `decision-2.0-kai-0.6b-bf16` | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY` |
+| Qwen3 Reranker 0.6B | `qwen3-reranker-0.6b-bf16` | `AI.SCORE` |
+| Qwen3 Reranker 4B | `qwen3-reranker-4b-bf16` | `AI.SCORE` |
+| d1-2B | `d1-2b-bf16` | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT`, `AI.EXTRACT_SPAN` |
+| d1-2B | `d1-2b-fp8` | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT`, `AI.EXTRACT_SPAN` |
+| Qwen3.5 2B Base with Qwen-Scope SAE | `qwen3.5-2b-sae-bf16` | `AI.SAE_FEATURES` |
+
+The d1-2B models run `AI.SCORE` over one table only. The FP8 d1-2B model
+converts the published BF16 weights to FP8 while loading them.
+
+DiffusionGemma needs a Hugging Face token with access to the
+[`RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic`](https://huggingface.co/RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic)
+weights. Set the token in `HF_TOKEN` before Quail loads the model.
+
+Decision 2.0 Kai and the Qwen3 rerankers score supplied answers instead of
+writing text. Check their scores against labeled examples before choosing a
+threshold.
+
+## GPUs
+
+Set `device` to the value for your GPU:
+
+| GPU | `device` value | Model support |
+| --- | --- | --- |
+| NVIDIA H100 SXM | `h100-sxm` | All supported models |
+| NVIDIA B200 | `b200` | All supported models |
+| NVIDIA RTX PRO 6000 Blackwell Server Edition | `rtx-pro-6000-blackwell-server` | All supported models |
+| NVIDIA L40S | `l40s` | Qwen3, Qwen3 rerankers, Decision 2.0 Kai, LFM2, and d1-2B |
+
+The L40S cannot run DiffusionGemma or the Qwen3.5, Qwen3.6, and Qwen3.8
+models because their attention kernel does not support the L40S. Quail also
+checks whether the selected model fits in GPU memory when it plans a query.
+
+## Use more than one GPU
+
+Set `gpus` to `1`, `2`, `4`, or `8`. Each GPU holds one complete model copy,
+and each copy runs part of the input rows. Quail does not split one model copy
+across several GPUs.
 
 ```python
-import modal
-
-app = modal.App("quail-engine")
-weights = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)
-kernels = modal.Volume.from_name("quail-kernel-cache", create_if_missing=True)
-image = (
-    modal.Image.from_registry(
-        "nvidia/cuda:13.0.1-devel-ubuntu24.04", add_python="3.12")
-    .entrypoint([])
-    .uv_pip_install("quail-engine==0.1.0")
-    .env({
-        "HF_HOME": "/model-cache",
-        "QUAIL_CACHE_DIR": "/kernel-cache/quail",
-    })
+config = quail.EngineConfig(
+    model="qwen3-4b-fp8",
+    device="h100-sxm",
+    gpus=4,
 )
-
-@app.function(
-    image=image,
-    gpu="H100!",
-    memory=98304,
-    timeout=1200,
-    volumes={"/model-cache": weights, "/kernel-cache": kernels},
-)
-def run_query():
-    import pyarrow as pa
-    import quail
-
-    reviews = pa.table({
-        "id": ["r1", "r2"],
-        "body": ["The acting was excellent.", "The plot was confusing."],
-    })
-    config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
-    with quail.Session(config=config) as session:
-        session.register("reviews", quail.DocumentProvider.from_table(
-            reviews, id_col="id"))
-        result = session.sql("""
-            SELECT r.id FROM reviews r
-            WHERE AI.IF(PROMPT('Does this review praise the acting? {0}', r.body))
-        """, dialect="bq").run()
-        return result.collect(), result.report
-
-@app.local_entrypoint()
-def main():
-    call = run_query.spawn()
-    print(f"function call id: {call.object_id}", flush=True)
-    rows, report = call.get()
-    print(rows.to_pylist())
-    print(report)
 ```
 
-### Run and retrieve the result
+## Use a remote GPU
 
-```bash
-modal run --detach run_quail.py 2>&1 | tee run_quail.log
-```
-
-Keep the function call ID from the log. The program below reads the
-rows after a disconnect:
-
-```python
-import modal
-
-call_id = input("Function call ID from run_quail.log: ")
-rows, report = modal.FunctionCall.from_id(call_id).get()
-print(rows.to_pylist())
-```
+Run [Quail Server](/docs/user-guide/server) on a machine with a supported GPU
+when your local machine has no supported GPU. Your local client can submit a
+query and reconnect while the server continues the run.

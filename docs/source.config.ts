@@ -18,6 +18,11 @@ export const docs = defineDocs({
 
 export default defineConfig({
   mdxOptions: {
+    rehypeCodeOptions: {
+      addLanguageClass: true,
+      themes: { light: 'github-light', dark: 'github-dark' },
+      defaultColor: false,
+    },
     remarkPlugins: [remarkMath, remarkKatexInline],
   },
 });

@@ -1,17 +1,13 @@
 ---
-title: Developers
+title: Developer guide
 ---
 
-## Report a bug
+The developer guide is for people who want to work on Quail. The guide
+explains how to set up the repository, how Quail works with DataFusion, and
+how Quail plans a query. The guide then lists the checks to run before you
+submit a change.
 
-[Open an issue](https://github.com/fsdatalab/quail/issues) and include:
-
-- a minimal example reproducing the bug;
-- the behavior you expected and the behavior you saw;
-- the Quail version or commit, and the `EngineConfig` for an error in
-  an AI call.
-
-## Run Quail from source
+## Set up Quail from source
 
 Install [uv](https://docs.astral.sh/uv/). Quail uses Python 3.12.
 
@@ -21,51 +17,90 @@ cd quail
 tools/build.sh
 ```
 
-`tools/build.sh` installs three things into `.venv`: the Python package
-from your checkout, the Rust module `_quail_native`, and the
-`quail-server` program. Run a program or the server from the checkout
-with `uv run --no-sync`:
+`tools/build.sh` installs three things into `.venv`: the Python package from
+your checkout, the Rust module `_quail_native`, and the `quail-server`
+program. Run a program or the server from the checkout with
+`uv run --no-sync`:
 
 ```bash
 uv run --no-sync python my_program.py
 uv run --no-sync quail-server --model qwen3-4b-fp8 --device h100-sxm
 ```
 
-`tools/build.sh` downloads the Rust parts when CI has built them for
-your checkout's Rust sources, so you need no Rust compiler to work on
-the Python code. CI builds them for each change of the Rust sources on
-`main`.
+The build script downloads prebuilt Rust parts when CI has built them for the
+same Rust sources. Python changes do not need a Rust compiler when the
+prebuilt parts are available.
 
-Edit Rust, and you compile the Rust parts yourself. Install
-[rustup](https://rustup.rs), and clang and lld on Linux x86_64, then
-run `tools/build.sh --compile`. The first build compiles DataFusion and
-takes about 20 minutes on 4 cores; later builds reuse the compiled
-dependencies. Run `tools/build.sh --compile` again after each Rust edit.
+Rust changes need a local Rust build. Install [rustup](https://rustup.rs),
+clang, and lld, then run:
 
-## How Quail plans a query
+```bash
+tools/build.sh --compile
+```
 
-Quail plans a query in two parts. DataFusion plans the SQL, and Quail's
-rules decide what each AI call asks the model. Quail then plans each
-*model region*: a group of AI calls running together on the GPU.
+The first build takes about 20 minutes on 4 cores because it compiles
+DataFusion. Later builds reuse the compiled dependencies. Run the command
+again after each Rust change.
+
+## Understand how Quail works with DataFusion
+
+DataFusion parses the SQL and runs the relational operators, including scans,
+plain filters, joins, aggregates, sorts, and limits. Quail adds the AI
+functions and runs the model.
+
+Quail extends a DataFusion session in four steps:
+
+1. Quail registers SQL functions such as `AI.IF` and `AI.MAP`.
+2. DataFusion turns the SQL into a logical plan. A logical plan lists the
+   query operations without choosing how to run them.
+3. Quail's optimizer rules represent each AI call as an `AiNode`. An `AiNode`
+   is a logical-plan node for one AI call. The rules place each node among the
+   DataFusion operators.
+4. Quail groups related AI calls into a model region. A model region contains
+   the part of the query Quail plans and runs.
+
+DataFusion runs the operators below a model region and sends their rows to
+Quail as Arrow batches. Quail runs the model and returns finished rows.
+DataFusion then runs the remaining operators.
 
 <PlanningFigure />
 
-| Step | Code |
-| --- | --- |
-| `lower_ai_calls` | `crates/quail-datafusion/src/rules/lower.rs` |
-| `merge_repeated_ai_calls` | `crates/quail-datafusion/src/rules/repeated.rs` |
-| `derive` | `crates/quail-datafusion/src/rules/derive/` |
-| `place_ai_nodes` | `crates/quail-datafusion/src/rules/placement.rs` |
-| `claim_model_regions` | `crates/quail-datafusion/src/region/` |
-| Region planner | `crates/quail-planner/` |
-| Executor | `crates/quail/` and `quail/backends/quail/` |
+The DataFusion integration lives in `crates/quail-datafusion`:
 
-`query.explain()` prints the plan the steps produce.
+| Code | Purpose |
+| --- | --- |
+| `functions` | Register the AI functions. |
+| `ai` | Represent one AI call as an `AiNode`. |
+| `rules` | Place and simplify the AI calls. |
+| `region` | Create and run model regions. |
+| `derive` | Read a model region from its DataFusion plan. |
+
+## Understand Quail's query planner
+
+Quail's query planner chooses how each model region runs on the GPU. The
+planner orders the AI operators and chooses the rows each operator evaluates.
+The operator order determines which prompts can share prefixes and KV. KV
+stores the model's keys and values for prompt tokens already processed. The
+planner then orders the model requests and assigns GPU memory to KV.
+
+The planner lives in `crates/quail-planner`. The executor lives in
+`crates/quail` and `quail/backends/quail`.
+
+| Code | Purpose |
+| --- | --- |
+| `operators`, `expressions`, `facts` | Describe the model region. |
+| `inputs` | Tokenize the document columns and measure shared prefixes. |
+| `cost` | Estimate time and memory for the model and GPU. |
+| `search`, `optimize`, `pricing` | Choose the operator and join order. |
+| `physical` | Describe the plan the executor runs. |
+
+`query.explain()` prints the planned query. `result.explain()` prints the
+plan with measured row counts and times after the query finishes.
 
 ## Use Quail from Rust
 
-Add the `quail-engine` crate, and DataFusion 55.2, the version Quail
-builds against. The crate's library is named `quail`:
+Add the `quail-engine` crate and DataFusion 55.2, the version Quail builds
+against. The crate's library is named `quail`:
 
 ```toml
 [dependencies]
@@ -73,9 +108,12 @@ datafusion = "55.2.0"
 quail-engine = { git = "https://github.com/fsdatalab/quail" }
 ```
 
-Quail starts one Python process per GPU to run the model, so install
-the Python package in the environment `VIRTUAL_ENV` names:
-`pip install quail-engine`.
+Quail starts one Python process per GPU to run the model. Install the Python
+package in the environment named by `VIRTUAL_ENV`:
+
+```bash
+pip install quail-engine
+```
 
 `quail::Session` runs SQL with AI functions:
 
@@ -94,11 +132,11 @@ is the complete program.
 
 ### Add Quail to your own DataFusion session
 
-A Rust program with its own DataFusion functions and rules can add
-Quail's AI functions beside them, with `quail::extension::QuailExtension`.
+A Rust program with its own DataFusion functions and rules can add Quail with
+`quail::extension::QuailExtension`.
 
-`QuailExtension::register` adds the AI functions, Quail's optimizer
-rules, and Quail's query planner to your `SessionState`:
+`QuailExtension::register` adds the AI functions, Quail's optimizer rules,
+and Quail's query planner to your `SessionState`:
 
 ```rust
 let host = SessionStateBuilder::new()
@@ -109,21 +147,23 @@ let state = QuailExtension::new(runner).register(host)?;
 let context = SessionContext::new_with_state(state);
 ```
 
-- `runner` runs the model. `Arc::new(quail::Executor::open(&config)?)`
-  runs it on your GPUs.
-- `register_rules` keeps your own query planner. Your planner then
-  calls `quail::extension::claim_model_regions` on the optimized plan
-  and adds `QuailExtension::extension_planner()` to its extension
-  planners.
-- `register` returns an error when your session already has a function
-  under one of Quail's names.
+The `runner` runs the model. Use
+`Arc::new(quail::Executor::open(&config)?)` to run it on your GPUs.
+
+Call `register_rules` when you need to keep your own query planner. Your
+planner must call `quail::extension::claim_model_regions` on the optimized
+plan and add `QuailExtension::extension_planner()` to its extension planners.
 
 [`host_session.rs`](https://github.com/fsdatalab/quail/blob/main/crates/quail-datafusion/examples/host_session.rs)
-is a complete program: a host function, a host optimizer rule, and
-`AI.IF` in one SQL statement. Run it with
-`cargo run --example host_session`.
+is a complete program. Run it with:
+
+```bash
+cargo run --example host_session
+```
 
 ## Check a change
+
+Run the Python checks:
 
 ```bash
 uv run ruff check quail bench calibrate tests experiments tools
@@ -132,8 +172,13 @@ uv run python tools/check_names.py
 uv run vulture
 uv run lint-imports
 uv run --no-sync pytest -q
-cargo test --locked
-cargo clippy --all-targets --locked
+```
+
+Run the Rust checks after a successful native build:
+
+```bash
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked
 cargo fmt --check
 ```
 
@@ -142,5 +187,14 @@ holds the rules for writing, names, tests, and GPU runs.
 
 ## Submit a pull request
 
-Explain the problem and how the change fixes it. List the checks you
-ran and their results. State what remains unverified.
+Explain the problem and how the change fixes it. List the checks you ran and
+their results. State any unverified behavior.
+
+## Report a bug
+
+[Open an issue](https://github.com/fsdatalab/quail/issues) and include:
+
+- a minimal example reproducing the bug;
+- the behavior you expected and the behavior you saw;
+- the Quail version or commit;
+- the `EngineConfig` for an error in an AI call.

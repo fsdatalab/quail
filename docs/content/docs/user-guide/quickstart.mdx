@@ -2,68 +2,199 @@
 title: Quickstart
 ---
 
+Filter the 100,000 reviews in the
+[Stanford IMDB dataset](https://huggingface.co/datasets/stanfordnlp/imdb).
+The query keeps reviews that mention a positive aspect of the movie.
+
+The quickstart runs the examples from a Quail source checkout:
+
+```bash
+git clone https://github.com/fsdatalab/quail.git
+cd quail
+```
+
 ## Install
 
 Quail needs Python 3.12 and a
 [supported CUDA GPU](/docs/user-guide/models).
-Install `quail-engine` and import it as `quail`:
+
+<Tabs items={['Python', 'Rust']} groupId="quickstart-language" className="quail-code-tabs">
+<Tab value="python" id="install-python">
+
+Create a Python environment and install Quail:
 
 ```bash
+uv venv --python 3.12
+source .venv/bin/activate
 uv pip install quail-engine
+```
+
+</Tab>
+<Tab value="rust" id="install-rust">
+
+The Rust crate runs a Python process for the model. The build script
+compiles the Rust crate and installs the Python package into `.venv`.
+
+Install rustup, clang, and lld as described in the
+[build instructions](/docs/contributing), then run:
+
+```bash
+tools/build.sh --compile
+source .venv/bin/activate
+```
+
+</Tab>
+</Tabs>
+
+## Download the reviews
+
+A helper script downloads all three dataset splits and writes
+`reviews.arrow`. Run the command from the repository root:
+
+```bash
+python crates/quail/examples/download_reviews.py
 ```
 
 ## Run an AI filter
 
-The program below filters the 100,000 reviews in the
-[Stanford IMDB dataset](https://huggingface.co/datasets/stanfordnlp/imdb)
-on an H100 SXM. It keeps the reviews mentioning a positive aspect of the
-movie:
+`AI.IF` asks whether each review mentions a positive aspect. The
+function keeps a row when the model answers yes.
 
-```python
+Both programs register the Arrow table as `reviews`, run the same SQL,
+and print the matching IDs.
+
+<Tabs items={['Python', 'Rust']} groupId="quickstart-language" className="quail-code-tabs">
+<Tab value="python" id="run-python">
+
+```python title="crates/quail/examples/imdb_filter.py"
+import sys
+
 import pyarrow as pa
 import quail
-from datasets import concatenate_datasets, load_dataset
 
-imdb = load_dataset("stanfordnlp/imdb")
-all_reviews = concatenate_datasets([imdb["train"], imdb["test"], imdb["unsupervised"]])
-reviews = pa.table({
-    "id": [f"review-{i}" for i in range(len(all_reviews))],
-    "body": all_reviews.data.table.column("text"),
-})
+path = sys.argv[1] if len(sys.argv) > 1 else "reviews.arrow"
+with pa.memory_map(path, "r") as source:
+    reviews = pa.ipc.open_file(source).read_all()
+
+sql = """
+SELECT r.id
+FROM reviews r
+WHERE AI.IF(PROMPT(
+    'Does this review mention a positive aspect of the movie? {0}',
+    r.body
+))
+"""
 
 config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
+provider = quail.DocumentProvider.from_table(reviews, id_col="id")
+
 with quail.Session(config=config) as session:
-    session.register("reviews", quail.DocumentProvider.from_table(reviews, id_col="id"))
-    query = session.sql("""
-        SELECT r.id
-        FROM reviews r
-        WHERE AI.IF(PROMPT(
-            'Does this review mention a positive aspect of the movie? {0}',
-            r.body))
-    """, dialect="bq")
-    result = query.run()
-    print(result.collect())
-    print(result.explain())
+    session.register("reviews", provider)
+    table = session.sql(sql, dialect="bq").collect()
+
+print(f"Matching reviews: {table.num_rows}")
+print(table.slice(0, 10).to_pandas().to_markdown(index=False))
 ```
 
-`register()` makes the table available in SQL. `AI.IF` keeps a row when
-the model answers yes. `collect()` returns the kept IDs in a
-`pyarrow.Table`.
+```bash
+python crates/quail/examples/imdb_filter.py reviews.arrow
+```
 
-## See the plan and measured cost
+```text title="Output"
+Matching reviews: 81143
+| r.id      |
+|:----------|
+| review-0  |
+| review-2  |
+| review-3  |
+| review-8  |
+| review-9  |
+| review-10 |
+| review-11 |
+| review-12 |
+| review-13 |
+| review-14 |
+```
 
-`result.explain()` prints the plan with its measurements, as the
-program does. `query.explain()` prints the plan with estimates and does
-not run the model. `query.explain(analyze=True)` runs the query again.
+</Tab>
+<Tab value="rust" id="run-rust">
 
-`result.report` holds the query time and token counts.
-[Metrics](/docs/user-guide/metrics) shows how to calculate GPU cost.
+```rust title="crates/quail/examples/imdb_filter.rs"
+use std::fs::File;
+use std::sync::Arc;
 
-## Write more queries
+use datafusion::arrow::ipc::reader::FileReader;
+use datafusion::arrow::util::pretty::print_batches;
+use datafusion::common::Result;
+use datafusion::datasource::MemTable;
+use quail::{EngineConfig, Session};
 
-The [SQL reference](/docs/user-guide/sql) lists the other AI functions.
-[Running queries](/docs/user-guide/sessions) covers table registration
-and session reuse.
+const SQL: &str = r#"
+SELECT r.id
+FROM reviews r
+WHERE AI.IF(PROMPT(
+    'Does this review mention a positive aspect of the movie? {0}',
+    r.body
+))
+"#;
+
+fn main() -> Result<()> {
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "reviews.arrow".to_string());
+    let reader = FileReader::try_new(File::open(path)?, None)?;
+    let schema = reader.schema();
+    let batches = reader.collect::<std::result::Result<Vec<_>, _>>()?;
+    let reviews = MemTable::try_new(schema, vec![batches])?;
+
+    let config = EngineConfig::new("qwen3-4b-fp8", "h100-sxm");
+    let session = Session::new(&config)?;
+    session.register_table("reviews", Arc::new(reviews))?;
+    let (_, batches) = session.sql_in_dialect(SQL, Some("BigQuery"))?;
+
+    let num_reviews: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+    println!("Matching reviews: {num_reviews}");
+    if let Some(batch) = batches.first() {
+        print_batches(&[batch.slice(0, batch.num_rows().min(10))])?;
+    }
+    Ok(())
+}
+```
+
+```bash
+cargo run -p quail-engine --example imdb_filter -- reviews.arrow
+```
+
+```text title="Output"
+Matching reviews: 81143
++--------------+
+| r.id         |
++--------------+
+| review-28005 |
+| review-28007 |
+| review-28008 |
+| review-28011 |
+| review-28012 |
+| review-28017 |
+| review-28019 |
+| review-28020 |
+| review-28028 |
+| review-28029 |
++--------------+
+```
+
+</Tab>
+</Tabs>
+
+## Continue
+
+- [Results and plans](/docs/user-guide/results) shows estimated and measured
+  query plans.
+- [Metrics](/docs/user-guide/metrics) explains query time, token counts, and
+  GPU cost.
+- [SQL reference](/docs/user-guide/sql) lists the other AI functions.
+- [Running queries](/docs/user-guide/sessions) covers table registration and
+  session reuse.
 
 ## Run on Modal
 

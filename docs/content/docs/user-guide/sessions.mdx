@@ -2,31 +2,40 @@
 title: Running queries
 ---
 
-A session holds your model configuration and your registered tables.
-Reuse one session for every query over the same tables.
+Use a session to choose a model and make tables available to SQL.
+The session can run several queries without registering the tables again.
 
-## Create a session
+## Configure a session
 
-Set `model` and `device` in `EngineConfig`; neither has a default.
-`gpus` defaults to 1. [Models and GPUs](/docs/user-guide/models) lists
-the supported values.
+Set `model` and `device` in `EngineConfig`. Both fields are required.
+The `gpus` field defaults to 1. [Models and GPUs](/docs/user-guide/models)
+lists the supported values.
 
 ## Register tables
 
-`session.register(name, provider)` makes a table available in SQL under
-`name`. Each provider needs an `id_col`, the column identifying a row.
+Register each data source before you use it in SQL. `DocumentProvider`
+connects Quail to the supported sources:
 
-| Factory | Source |
+| Method | Source |
 | --- | --- |
-| `DocumentProvider.from_table(table, id_col)` | In-memory Arrow table |
+| `DocumentProvider.from_table(table, id_col)` | In-memory [PyArrow table](https://arrow.apache.org/docs/python/generated/pyarrow.Table.html) |
 | `DocumentProvider.from_parquet(path, id_col)` | Parquet file or directory |
 | `DocumentProvider.from_ipc(path, id_col)` | Arrow IPC file |
-| `DocumentProvider.from_dataset(dataset, id_col)` | `pyarrow.dataset.Dataset` |
+| `DocumentProvider.from_dataset(dataset, id_col)` | [PyArrow dataset](https://arrow.apache.org/docs/python/dataset.html) |
 | `DocumentProvider.from_hf(dataset, id_col)` | Hugging Face repository name; optional `split`, `config`, and `revision` |
+
+Each method returns a `TableProvider`. A table provider supplies table
+columns and rows to Quail. `session.register(name, provider)` makes the
+provider available in SQL under `name`.
+
+Each table provider needs an `id_col`. The `id_col` value names the column
+used to identify each row. Implement `quail.TableProvider` to read another
+data source.
 
 ## Run a query
 
-The program below registers two reviews and filters them:
+For example, the program below registers two reviews and returns each
+review the model considers positive:
 
 ```python
 import pyarrow as pa
@@ -38,33 +47,113 @@ reviews = pa.table({
 })
 config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
 with quail.Session(config=config) as session:
-    session.register("reviews", quail.DocumentProvider.from_table(reviews, id_col="id"))
-    rows = session.sql("""
-        SELECT r.id FROM reviews r
-        WHERE AI.IF(PROMPT('Is this review positive? {0}', r.body))
-    """, dialect="bq").collect()
-    print(rows)
+    provider = quail.DocumentProvider.from_table(reviews, id_col="id")
+    session.register("reviews", provider)
+    query = session.sql("""
+        SELECT r.id
+        FROM reviews r
+        WHERE AI.IF(PROMPT('Is the following review positive? {0}', r.body))
+    """, dialect="bq")
+    result = query.run()
+    print(result.collect())
+```
+
+```text title="Output"
+pyarrow.Table
+r.id: string
+----
+r.id: [["r1","r2"]]
 ```
 
 `sql()` returns a [`Query`](/docs/user-guide/results#read-the-results).
-`collect()` runs the query and returns an Arrow table. Use `run()` when
-you also need the plan and metrics.
+`run()` runs the query and returns a `QueryResult`. `result.collect()`
+returns the rows as an Arrow table without running the query again.
+
+## Inspect a query
+
+`query.explain()` returns the estimated plan without running the model.
+`result.explain()` returns the measured plan after `query.run()` finishes.
+`result.report` holds the query time and token counts.
+Use the estimated plan to check the query before GPU work starts. Use the
+measured plan and report to find the most expensive query steps.
+
+```python title="Estimated plan"
+print(query.explain())
+```
+
+```text title="Output"
+logical:
+  Projection: r.id
+    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Is the following review positive? {0}"), r.body)), filter: __quail_answer_1, returns: []
+      SubqueryAlias: r
+        TableScan: reviews projection=[id, body]
+
+physical: backend=quail, model=qwen3-4b-fp8, gpus=1
+  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
+  architecture=qwen3 (36 layers), weights=fp8
+  kernels: linear layers: fp8 GEMM (DeepGEMM)
+
+                                                                  est. rows   est. pass   est. time
+  AiFilter: r                                                           0.4                 1.09 ms
+    KV: not stored
+    predicate 1  PROMPT('DOCUMENT:\n{0}\n\nIs the following …')           2        20%*
+    Scan reviews as r                                                     2
+      tokens=10, mean_document_tokens=5
+  * no selectivity was given; the planner assumes 20%
+  est. time is each node's work alone; node times do not add up to the plan estimate
+  because chunk packing shares forward passes across nodes
+```
+
+```python title="Measured plan"
+print(result.explain())
+```
+
+```text title="Output"
+                    est. rows   rows   est. pass   pass      time   fresh tokens
+AiFilter: r                0.4      2                      11.3 ms            100
+  KV: not stored
+  predicate 1                2      2        20%*   100%
+  Scan: r                    2      2                      1.21 ms
+    tokens=10, mean_document_tokens=5
+* no selectivity was given; the planner assumes 20%
+```
+
+```python title="Report"
+print(f"Query time: {result.report['wall_s']:.2f} s")
+print(f"Fresh tokens: {result.report['fresh_tokens']}")
+print(f"GPU cost: ${result.report['usd_per_query']:.6f}")
+```
+
+```text title="Output"
+Query time: 0.02 s
+Fresh tokens: 100
+GPU cost: $0.000020
+```
+
+[Query results and plans](/docs/user-guide/results) explains each plan and
+measurement.
 
 ## Run on Quail Server
 
 Pass `endpoint` to submit queries to
-[Quail Server](/docs/user-guide/server). Replace the session line in the
-program with
-`with quail.Session(config=config, endpoint="grpc://127.0.0.1:50051") as session:`.
+[Quail Server](/docs/user-guide/server). Set `endpoint` to the server's
+address when you create the session. For example, use
+`grpc://127.0.0.1:50051` for a server on the same computer.
 
-`sql()` then returns a
-[`RemoteQuery`](/docs/user-guide/server#submit-a-query). The server keeps
-running an accepted query after the client exits. Save the query ID from
-`submit()` to read the query from another client.
+`sql()` returns a [`RemoteQuery`](/docs/user-guide/server#submit-a-query),
+which represents a query on Quail Server. The server keeps an accepted
+query running after the client exits. Save the query ID from `submit()`
+to read the query from another client.
 
 ## Use several GPUs
 
 Set `gpus` in `EngineConfig`. Each GPU holds one complete copy of the
-model. Replace the configuration in the program with
-`quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm", gpus=4)`
-to use four GPUs.
+model. For example, the following configuration uses four GPUs:
+
+```python
+config = quail.EngineConfig(
+    model="qwen3-4b-fp8",
+    device="h100-sxm",
+    gpus=4,
+)
+```

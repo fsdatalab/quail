@@ -42,6 +42,24 @@ The examples use the default Snowflake dialect. BigQuery syntax
 (`dialect="bq"`) writes an options object such as
 `{'selectivity': 0.3}` as `STRUCT(0.3 AS selectivity)`.
 
+## Use AI answers in SQL
+
+Use an AI function wherever SQL accepts the function's return type. A
+relational operator filters, joins, groups, sorts, or limits rows.
+DataFusion applies relational operators to the values returned by AI
+functions.
+
+- `SELECT` returns an AI answer as a result column. A projection is the
+  list of expressions after `SELECT`.
+- `WHERE` keeps rows based on an AI answer.
+- `JOIN ... ON` keeps pairs of rows based on an AI answer.
+- `GROUP BY` and aggregate functions summarize AI answers.
+- `HAVING` filters groups based on an AI answer.
+- `ORDER BY` sorts rows by an AI answer.
+
+Each function entry lists the supported uses. [SQL with AI functions](./sql-functions)
+shows how DataFusion operators affect AI calls and model work.
+
 ## Functions
 
 ### `PROMPT(template, value, ...)`
@@ -55,6 +73,7 @@ WHERE AI.IF(PROMPT('Does the review discuss the ending? {0}', r.body));
 | | |
 | --- | --- |
 | **Description** | `PROMPT` builds the text the model reads: the template with each placeholder replaced by a value. `{0}` is the first value after the template, and `{1}` is the second. Every value needs a placeholder. |
+| **Use in SQL** | Use `PROMPT` as the input to `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, or `AI.SAE_FEATURES`. `PROMPT` does not return a result column by itself. |
 | **Result** | `(1)`, `(2)` |
 | **Values** | Columns of one table form one document, and one column may appear twice. Columns of two tables form a pair; see [Joining](#joining). |
 
@@ -69,6 +88,7 @@ WHERE AI.IF(PROMPT('Does the reviewer ask for a refund? {0}', r.body));
 | | |
 | --- | --- |
 | **Description** | `AI.IF` returns `TRUE` when the model answers yes to the prompt, and `FALSE` when the model answers no. `WHERE AI.IF(...)` keeps the rows with a yes; `WHERE NOT AI.IF(...)` keeps the rows with a no. |
+| **Use in SQL** | Use `AI.IF` in `SELECT`, `WHERE`, `JOIN ... ON`, `HAVING`, `CASE`, or any other Boolean expression. |
 | **Result** | `(3)` |
 | **Alias** | `AI_FILTER` |
 | **Options** | `selectivity`, `anchor`; see [Options](#options). |
@@ -84,6 +104,7 @@ FROM reviews r;
 | | |
 | --- | --- |
 | **Description** | `AI.SCORE` returns a `FLOAT64` from 0 to 1. A higher score is a stronger yes. A score is not the probability of a correct answer, so choose a threshold from labeled examples. |
+| **Use in SQL** | Use `AI.SCORE` in `SELECT`. Compare the score in `WHERE`, `JOIN ... ON`, or `HAVING`. Use the score in `ORDER BY` or an aggregate function. |
 | **Result** | `(1, 0.02)`, `(2, 0.1)`, `(3, 0.94)` |
 | **Alias** | `AI_SCORE` |
 | **Options** | `selectivity`; see [Options](#options). |
@@ -99,6 +120,7 @@ FROM reviews r;
 | | |
 | --- | --- |
 | **Description** | `AI.CLASSIFY` returns the one label from `categories` the model chooses, as a `STRING`. |
+| **Use in SQL** | Use `AI.CLASSIFY` in `SELECT`. Compare the label in `WHERE`, `JOIN ... ON`, or `HAVING`. Use the label in `GROUP BY`, `ORDER BY`, or an aggregate function. |
 | **Result** | `(1, 'positive')`, `(2, 'negative')`, `(3, 'mixed')` |
 | **Alias** | `AI_CLASSIFY` |
 | **input** | A text column, or a `PROMPT` over one document or a pair. |
@@ -117,6 +139,7 @@ FROM reviews r;
 | | |
 | --- | --- |
 | **Description** | `AI.EXTRACT` returns a struct with one `STRING` field per question. Each field holds text copied from the document. A field is `NULL` when the document has no answer. Read a field as `AI.EXTRACT(...)['complaint']`. |
+| **Use in SQL** | Use the returned struct in `SELECT`. Read a field in `SELECT`, `WHERE`, `JOIN ... ON`, `GROUP BY`, `HAVING`, or `ORDER BY`. |
 | **Result** | `(1, {complaint: NULL})`, `(2, {complaint: 'the ending made no sense'})`, `(3, {complaint: 'I want my money back'})` |
 | **Alias** | `AI_EXTRACT` |
 | **input** | A text column. |
@@ -134,6 +157,7 @@ FROM reviews r;
 | | |
 | --- | --- |
 | **Description** | `AI.EXTRACT_SPAN` returns a struct with one field per question, as `AI.EXTRACT` does for the same arguments. Each field is a span: the `start` and `end` character positions of the answer in the document. `end` is one past the last character, so Python's `body[start:end]` is the answer. |
+| **Use in SQL** | Use the returned struct in `SELECT`. Read a span or its `start` and `end` fields in `SELECT`, `WHERE`, `JOIN ... ON`, `GROUP BY`, `HAVING`, or `ORDER BY`. |
 | **Result** | `(1, {complaint: NULL})`, `(2, {complaint: {start: 14, end: 38}})`, `(3, {complaint: {start: 17, end: 37}})` |
 | **Alias** | `AI_EXTRACT_SPAN` |
 
@@ -148,6 +172,7 @@ FROM reviews r;
 | | |
 | --- | --- |
 | **Description** | `AI.MAP` returns the `STRING` the model writes for the document. The text has no whitespace at its start or end. |
+| **Use in SQL** | Use `AI.MAP` in `SELECT`. Compare the text in `WHERE`, `JOIN ... ON`, or `HAVING`. Use the text in `GROUP BY`, `ORDER BY`, or an aggregate function. |
 | **Result** | `(1, 'Praises the ending and the cast.')`, `(2, 'Says the film is too long and the ending makes no sense.')`, `(3, 'Likes the music but wants a refund.')` |
 | **Alias** | `AI_MAP` |
 | **input** | A text column. |
@@ -166,6 +191,7 @@ FROM reviews r;
 | | |
 | --- | --- |
 | **Description** | `AI.SAE_FEATURES` returns a list of `{feature, strength}` structs, strongest first. A sparse autoencoder (SAE), a second model reading the first model's internal state, computes the features. A feature is an integer ID with no text label. A strength is a nonnegative activation, not a probability. |
+| **Use in SQL** | Use `AI.SAE_FEATURES` in `SELECT`. Use `UNNEST` to return one row per feature. Use list functions to measure or filter the returned list. |
 | **Result** | `(1, [{feature: 18113, strength: 6.2}, {feature: 902, strength: 2.4}, ...])`, and so on for each row. |
 | **Alias** | `AI_SAE_FEATURES` |
 | **prompt** | A `PROMPT` over one document column. |
@@ -184,6 +210,7 @@ WHERE HINT(AI.CLASSIFY(r.body, ['positive', 'negative', 'mixed']) = 'negative',
 | | |
 | --- | --- |
 | **Description** | `HINT` returns the value of `condition`. The `selectivity` option gives the fraction of rows you expect to pass `condition`. Quail uses the fraction to order its work; the fraction does not change which rows pass. |
+| **Use in SQL** | Wrap a Boolean condition in `WHERE`, `JOIN ... ON`, `HAVING`, `CASE`, or any other Boolean expression. |
 | **Result** | `(2)` |
 | **Options** | `HINT` takes `selectivity` only. |
 
@@ -207,7 +234,7 @@ reads one column from each table.
 SELECT r.id, a.aspect
 FROM reviews r
 JOIN aspects a
-  ON AI.IF(PROMPT('Does the review discuss this aspect? {0} {1}', r.body, a.aspect));
+  ON AI.IF(PROMPT('Does the review discuss the aspect? {0} {1}', r.body, a.aspect));
 ```
 
 Result: `(1, 'ending')`, `(2, 'ending')`, `(3, 'music')`.
@@ -229,7 +256,7 @@ SELECT r.id
 FROM reviews r
 WHERE NOT EXISTS (
     SELECT 1 FROM aspects a
-    WHERE AI.IF(PROMPT('Does the review praise this aspect? {0} {1}',
+    WHERE AI.IF(PROMPT('Does the review praise the aspect? {0} {1}',
                        r.body, a.aspect)));
 ```
 

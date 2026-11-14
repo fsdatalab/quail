@@ -2,104 +2,97 @@
 title: Metrics
 ---
 
-`result.report` holds the measurements of a finished run.
-[`result.explain()`](/docs/user-guide/results#measure-the-plan)
-compares each operator's measurements with its estimates.
+Use `result.report` to read the time, model work, memory, and GPU cost of
+one finished run. Use `result.explain()` to compare measurements for each
+query operation.
 
-## Read a query report
+The examples continue the H100 run from
+[Query results and plans](/docs/user-guide/results).
 
-The program below needs an open session with the `reviews` table from
-[Running queries](/docs/user-guide/sessions):
+## Print a summary
 
 ```python
-query = session.sql("""
-    SELECT r.id FROM reviews r
-    WHERE AI.IF(PROMPT('Does this review discuss the ending? {0}', r.body))
-""", dialect="bq")
-result = query.run()
 report = result.report
-print("Model region execution seconds:", report["wall_s"])
-print("Model startup seconds:", report["boot_s"])
-print("Token positions computed:", report["fresh_tokens"])
+print(f"AI execution: {report['wall_s']:.2f} s")
+print(f"Model startup: {report['boot_s']:.1f} s")
+print(f"Fresh tokens: {report['fresh_tokens']}")
+print(f"Cached tokens: {report['cached_tokens']}")
+print(f"Peak GPU memory: {report['peak_gib']:.2f} GiB")
+print(f"GPU cost: ${report['usd_per_query']:.6f}")
 ```
 
-The report of a query with one model region holds the region's
-measurements and a separate `datafusion_s` field. A query with several
-model regions has one report per region in `result.report["regions"]`.
-A query with no AI call has no model region report.
-
-## Query totals
-
-### Execution time
-
-| Field | Meaning |
-| --- | --- |
-| `wall_s` | `wall_s` is the seconds the model region ran, without model startup and result collection. |
-| `boot_s` | `boot_s` is the seconds of model startup. |
-| `worker_total_s` | `worker_total_s` is the seconds the GPU worker spent on the model region, with startup and result preparation. It leaves out DataFusion's work outside the region. |
-| `datafusion_s` | `datafusion_s` is the seconds outside the model region: SQL planning and the surrounding operators. Only a query with one region has the field. |
-| `boot_kind` | `boot_kind` is `"cold"` when the model or its kernels needed preparation, and `"warm"` otherwise. |
-
-`report["boot"]` breaks startup into `load_model_s`, `arena_s`, and
-`warm_kernels_s`: weight loading, KV allocation, and kernel preparation.
-
-### Token counts
-
-| Field | Meaning |
-| --- | --- |
-| `fresh_tokens` | `fresh_tokens` counts the token positions the model computed. A position computed twice counts twice. |
-| `cached_tokens` | `cached_tokens` counts the token positions read from saved KV. |
-
-`fresh_tokens` leaves out the tokens Quail read from saved KV. Do not
-read `fresh_tokens` as the total input tokens.
-
-## Operator metrics
-
-`report["node_metrics"]` maps operator IDs to measurements.
-`explain(verbose=True)` shows the IDs.
-
-| Field | Meaning |
-| --- | --- |
-| `wall_s` | `wall_s` is the operator's time in seconds. |
-| `input_rows`, `output_rows` | `input_rows` and `output_rows` count the rows or pairs the operator received and returned. |
-| `evaluated_documents` | `evaluated_documents` counts the documents the model read. |
-| `evaluated_document_pairs` | `evaluated_document_pairs` counts the document pairs the model read. |
-| `fresh_tokens`, `cached_tokens` | `fresh_tokens` and `cached_tokens` are the operator's token counts, as in [Token counts](#token-counts). |
-
-Each operator reports only the fields it measures. Do not add operator
-times to get the query time.
-
-## Filters and joins
-
-`report["stages"]` holds the measurements of each `AI.IF` filter and
-join. One operator can have several entries.
-
-| Field | Meaning |
-| --- | --- |
-| `op` | `op` is `"filter"` or `"join"`. |
-| `written_position` | `written_position` is the filter's or join's position in the query, counted from zero. `explain()` counts positions from one. |
-| `provided_selectivity` | `provided_selectivity` is the selectivity given in SQL, or `None`. |
-| `observed_selectivity` | `observed_selectivity` is the fraction of documents or pairs the model passed. |
-| `evaluated` | `evaluated` counts the documents a filter read. |
-| `tuples` | `tuples` counts the pairs a join read. |
-| `alias` | `alias` is a filter's table alias. |
-| `anchor`, `partners` | `anchor` and `partners` are a join's table aliases. |
-
-Quail can run filters and joins in another order than the query wrote
-them. `node_metrics` holds the score and classification measurements.
-
-## GPU cost
-
-The program below estimates the GPU cost of the model region in the
-query from [Read a query report](#read-a-query-report):
-
-```python
-hourly_price = query.session.device.usd_per_hour
-gpus = query.session.config.gpus
-cost_usd = report["wall_s"] / 3600 * gpus * hourly_price
-print("Model region GPU cost in dollars:", cost_usd)
+```text title="Output"
+AI execution: 0.02 s
+Model startup: 28.5 s
+Fresh tokens: 100
+Cached tokens: 0
+Peak GPU memory: 52.97 GiB
+GPU cost: $0.000020
 ```
 
-The estimate uses the hourly price in Quail's device configuration.
-The estimate leaves out model startup and DataFusion's work outside the
-region, so your rental bill is higher.
+The values depend on the query, model, GPU, and warm state. A warm state
+means the model and kernels are already prepared.
+
+## Time
+
+| Field | Meaning |
+| --- | --- |
+| `wall_s` | Time spent running the AI operations. The value excludes model startup. |
+| `boot_s` | Time spent loading the model and preparing GPU execution. |
+| `boot_kind` | Startup state: `"cold"` when Quail prepares the model or kernels, or `"warm"` when preparation is already complete. |
+| `worker_total_s` | Total worker time, including startup and result preparation. |
+| `datafusion_s` | Time spent planning SQL and running DataFusion operators outside the AI work. |
+
+Use `wall_s` to compare query execution. Report `boot_s` separately when
+startup matters.
+
+## Tokens and rows
+
+| Field | Meaning |
+| --- | --- |
+| `fresh_tokens` | Token positions computed by the model. A position computed twice counts twice. |
+| `cached_tokens` | Token positions read from KV, the cached attention state. |
+| `evaluated_documents` | Documents read by AI operations. |
+| `evaluated_document_pairs` | Document pairs read by AI joins. |
+| `documents_per_second` | Evaluated documents divided by AI execution time. |
+
+Fresh and cached tokens measure different work. Do not add them to estimate
+the original input length because repeated computation can count one token
+position more than once.
+
+## Memory and cost
+
+| Field | Meaning |
+| --- | --- |
+| `peak_gib` | Highest GPU memory use during the run, in gibibytes. |
+| `usd_per_query` | GPU cost for AI execution, excluding startup and DataFusion work. |
+
+Quail calculates `usd_per_query` from `wall_s`, the number of GPUs, and the
+hourly price in the device configuration. A rental bill can be higher
+because the process also uses the GPU during startup and idle time.
+
+## Operation metrics
+
+`report["node_metrics"]` maps each operation ID to its measurements.
+`result.explain()` presents the main fields in the measured plan, so start
+with the plan before reading the dictionary.
+
+| Field | Meaning |
+| --- | --- |
+| `wall_s` | Time spent in the operation. |
+| `input_rows` | Rows or pairs received by the operation. |
+| `output_rows` | Rows or pairs returned by the operation. |
+| `evaluated_documents` | Documents read by the model. |
+| `evaluated_document_pairs` | Document pairs read by the model. |
+| `fresh_tokens` | Token positions computed by the model. |
+| `cached_tokens` | Token positions read from KV. |
+
+Each operation reports only the fields it measures. Operation times can
+overlap, so their sum is not the query time.
+
+## Queries with several AI regions
+
+An AI region is a group of AI functions Quail runs together. A query with
+one region stores the fields directly in `result.report`. A query with
+several regions stores one report per region in `result.report["regions"]`.
+A query without an AI function has no AI region report.

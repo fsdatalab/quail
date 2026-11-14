@@ -7,10 +7,12 @@ import type { MDXComponents } from 'mdx/types';
 import { ApiClass, ApiMethod } from './api-reference';
 import { PlanningFigure } from './planning-figure';
 import { QueryOutput } from './query-output';
+import { CodeExample } from './code-example';
 
 export function getMDXComponents(components?: MDXComponents) {
   return {
     ...defaultMdxComponents,
+    pre: CodeExample,
     ApiClass,
     ApiMethod,
     Callout,
