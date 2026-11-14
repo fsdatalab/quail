@@ -40,7 +40,7 @@ jobs:
             platform: linux-x86_64
           - runner: ubuntu-24.04-arm
             platform: linux-aarch64
-          - runner: macos-14
+          - runner: macos-latest
             platform: macos-arm64
     runs-on: ${{ matrix.runner }}
     permissions:
