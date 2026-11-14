@@ -71,8 +71,6 @@ for AI calls. Read it from the inputs upward:
 - `AiNode` computes an answer and can filter rows using that answer.
 - `Projection` selects result columns.
 
-See [Logical plans](/docs/architecture/logical-plans) for optimizer rules.
-
 ### Read the physical plan
 
 The *physical plan* specifies how Quail runs one model region.
@@ -87,9 +85,8 @@ It includes GPU settings and estimates for each operator.
 A `*` marks a default selectivity. The default is 20%.
 E.g., a filter over three reviews has an estimate of 0.6 passing rows.
 
-Time estimates use peak compute rates and memory bandwidth.
-See [Cost estimates](/docs/architecture/optimizer#cost-estimates)
-before treating them as expected query times.
+Time estimates use peak compute rates and memory bandwidth, so a
+query on a GPU takes longer than its estimate.
 
 ### Show execution settings
 

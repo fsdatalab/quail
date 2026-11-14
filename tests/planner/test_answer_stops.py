@@ -4,7 +4,7 @@ should_stop_answers_early gives a map or extraction the region's exact
 tests of its answer alone; the executor stops an answer once one is
 decided not TRUE on the text so far, or, when nothing else reads the
 answer, once every one is decided TRUE. The oracle writes each answer
-one character a token. The transcripts, in transcripts/, show the plan,
+one character a token. The transcripts show the plan,
 each answer and where it stopped, the answer tokens written, and the
 rows (helpers/transcript.py).
 """
@@ -47,7 +47,36 @@ def test_a_map_stops_each_answer_once_its_prefix_test_is_decided():
             f"SELECT r.id FROM reviews r WHERE {VERDICT}",
             # the SELECT list reads each answer the test keeps whole
             f"SELECT r.id, AI_MAP(r.body, 'Is it kind?') AS v FROM reviews r "
-            f"WHERE {VERDICT}")))
+            f"WHERE {VERDICT}")), """\
+--- SELECT r.id FROM reviews r WHERE LEFT(AI_MAP(r.body, 'Is it kind?'), 3) = 'yes' ---
+plan
+  __quail_column_1 = ai_map(r.body, 'Is it kind?'), filter: left(__quail_column_1,
+      Int64(3)) = 'yes'
+asked 6 of 6
+  'Is it kind?': r0 'yes, it is kind' stopped at 'yes', r1 'no, it is not kind' stopped
+      at 'no', r2 'yes, it is kind' stopped at 'yes', r3 'no, it is not kind' stopped at
+      'no', r4 'yes, it is kind' stopped at 'yes', r5 'no, it is not kind' stopped at
+      'no'
+wrote 6 of 48 answer tokens
+rows 3
+  r0
+  r2
+  r4
+
+--- SELECT r.id, AI_MAP(r.body, 'Is it kind?') AS v FROM reviews r WHERE
+    LEFT(AI_MAP(r.body, 'Is it kind?'), 3) = 'yes' ---
+plan
+  v = ai_map(r.body, 'Is it kind?'), filter: left(v, Int64(3)) = 'yes'
+asked 6 of 6
+  'Is it kind?': r0 'yes, it is kind', r1 'no, it is not kind' stopped at 'no', r2 'yes,
+      it is kind', r3 'no, it is not kind' stopped at 'no', r4 'yes, it is kind', r5
+      'no, it is not kind' stopped at 'no'
+wrote 24 of 48 answer tokens
+rows 3
+  r0, 'yes, it is kind'
+  r2, 'yes, it is kind'
+  r4, 'yes, it is kind'
+""")
 
 
 def test_an_extraction_stops_once_no_span_of_its_document_can_pass():
@@ -57,7 +86,20 @@ def test_an_extraction_stops_once_no_span_of_its_document_can_pass():
     with Transcripts({"reviews": REVIEWS}, _answer, written=True) as runs:
         assert_transcript(runs.query(
             f"SELECT r.id, {call} AS e FROM reviews r "
-            f"WHERE LEFT({call}['w'], 7) = 'March 3'"))
+            f"WHERE LEFT({call}['w'], 7) = 'March 3'"), """\
+--- SELECT r.id, AI_EXTRACT(r.body, {'w': 'When?'}) AS e FROM reviews r WHERE
+    LEFT(AI_EXTRACT(r.body, {'w': 'When?'})['w'], 7) = 'March 3' ---
+plan
+  e = ai_extract(r.body, named_struct('w', 'When?')), filter: left(get_field(e, 'w'),
+      Int64(7)) = 'March 3', returns: [e]
+asked 6 of 6
+  'When?': r0 'March 3, 2020 was', r1 'May 2021' stopped at 'M', r2 'March 9' stopped at
+      'M', r3 'Jan 1' stopped at 'J', r4 'March 30', r5 'Apr 2' stopped at 'A'
+wrote 27 of 48 answer tokens
+rows 2
+  r0, {'w': 'March 3, 2020 was'}
+  r4, {'w': 'March 30'}
+""")
 
 
 def test_a_join_on_a_maps_answer_stops_each_answer_that_can_match_no_key(
@@ -70,7 +112,20 @@ def test_a_join_on_a_maps_answer_stops_each_answer_that_can_match_no_key(
                      written=True) as runs:
         assert_transcript(runs.query(
             "SELECT r.id, v.id FROM vendors v JOIN reviews r "
-            "ON v.name = AI.MAP(r.body, 'Name the vendor.', 16)"))
+            "ON v.name = AI.MAP(r.body, 'Name the vendor.', 16)"), """\
+--- SELECT r.id, v.id FROM vendors v JOIN reviews r ON v.name = AI.MAP(r.body, 'Name the
+    vendor.', 16) ---
+plan
+  __quail_call_1 = ai_map(r.body, 'Name the vendor.', Int64(16))
+asked 6 of 6
+  'Name the vendor.': r0 'Acme', r1 'Initech Systems' stopped at 'I', r2 'Globex', r3
+      'Zeta Corporation' stopped at 'Z', r4 'Acme', r5 'Hooli' stopped at 'H'
+wrote 17 of 17 answer tokens
+rows 3
+  r0, v0
+  r2, v1
+  r4, v0
+""")
 
 
 def test_explain_says_when_a_map_stops_an_answer():

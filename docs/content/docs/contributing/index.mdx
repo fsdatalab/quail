@@ -1,5 +1,5 @@
 ---
-title: Overview
+title: Developers
 ---
 
 ## Report a bug
@@ -11,13 +11,11 @@ title: Overview
 - The Quail version or commit. For an AI call error, include the
   `EngineConfig`.
 
-## Prepare the repository
+## Build Quail
 
 Install [uv](https://docs.astral.sh/uv/) and
 [rustup](https://rustup.rs). Linux x86_64 also requires clang and lld.
 Quail uses Python 3.12.
-
-E.g., clone the repository and build the development installation:
 
 ```bash
 git clone https://github.com/fsdatalab/quail.git
@@ -25,41 +23,43 @@ cd quail
 tools/build.sh
 ```
 
-The script runs `uv sync --frozen` with the repository's pinned Rust
-toolchain. Keep the same Cargo home and `target/` directory between
-builds so Cargo can reuse compiled dependencies. See
-[`AGENTS.md`](https://github.com/fsdatalab/quail/blob/main/AGENTS.md#building)
-for build troubleshooting.
+Run `tools/build.sh` again after each Rust edit.
 
-## Make a change
+## How Quail plans a query
 
-Discuss substantial changes in an issue before implementation.
-Include tests and documentation with the change.
+Quail plans a query in two parts. DataFusion plans the SQL, and Quail's
+rules decide what each AI call asks the model. Quail then plans each
+*model region*: a group of AI calls that run together on the GPU.
 
-| Path | Contents |
+<Mermaid chart={`flowchart TD
+    sql["SQL"]
+    bind["DataFusion parses and binds the SQL"]
+    lower["lower_ai_calls: each AI call becomes an AiNode"]
+    merge["merge_repeated_ai_calls: a call written twice becomes one AiNode"]
+    derive["derive: each AiNode gets its filter, fetch, guard, and returned columns"]
+    place["place_ai_nodes: each AiNode moves next to the table it reads"]
+    claim["claim_model_regions: adjacent AiNodes become one model region"]
+    plan["quail-planner: orders the region's operators by cost"]
+    run["Executor: runs the region on GPU workers"]
+    rest["DataFusion: runs scans, joins, sorts, and limits"]
+    sql --> bind --> lower --> merge --> derive --> place --> claim
+    claim --> plan --> run
+    claim --> rest
+`} />
+
+| Step | Code |
 | --- | --- |
-| `quail/api/` | `Session` and `Query` |
-| `quail/catalog/` | Table providers |
-| `crates/quail-datafusion/` | DataFusion extension: AI functions, optimizer rules, model regions |
-| `crates/quail-planner/` | Planner of one model region, with the cost model (`src/cost/`) and physical plan types (`src/physical/`) |
-| `crates/quail-python/` | Rust `Session` and `Executor`, and the `_quail_native` Python module (`src/native/`) |
-| `quail/physical/` | Python physical plan definitions |
-| `quail/backends/quail/` | GPU executor |
-| `quail/specs/` | Model and device specifications |
-| `quail/remote/`, `crates/quail-server/` | Quail Server's Python client, and the server |
-| `tests/`, `experiments/` | CPU tests and GPU experiments |
-| `docs/`, `demos/` | Documentation and examples |
+| `lower_ai_calls` | `crates/quail-datafusion/src/rules/lower.rs` |
+| `merge_repeated_ai_calls` | `crates/quail-datafusion/src/rules/repeated.rs` |
+| `derive` | `crates/quail-datafusion/src/rules/derive/` |
+| `place_ai_nodes` | `crates/quail-datafusion/src/rules/placement.rs` |
+| `claim_model_regions` | `crates/quail-datafusion/src/region/` |
+| Region planner | `crates/quail-planner/` |
+| Executor | `crates/quail/` and `quail/backends/quail/` |
 
-Follow the writing and naming rules in
-[`AGENTS.md`](https://github.com/fsdatalab/quail/blob/main/AGENTS.md).
-See [Architecture](/docs/architecture) for query execution and
-[Extending Quail](/docs/extending) for extension interfaces.
+`query.explain()` prints the plan the steps produce.
 
-## Check the change
-
-### Code checks
-
-E.g., run the CPU checks from the repository root:
+## Check a change
 
 ```bash
 uv run ruff check quail bench calibrate tests experiments tools
@@ -68,33 +68,15 @@ uv run python tools/check_names.py
 uv run vulture
 uv run lint-imports
 uv run --no-sync pytest -q
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked
+cargo fmt --check
 ```
 
-Rebuild with `tools/build.sh` after Rust edits. Also run
-`cargo test --workspace --locked`,
-`cargo clippy --workspace --all-targets --locked`, and `cargo fmt --check`.
-
-For model execution changes, use
-[`experiments/run_gpu_tests.py`](https://github.com/fsdatalab/quail/blob/main/experiments/run_gpu_tests.py)
-to run the relevant tests on Modal.
-For performance changes, follow the [benchmark guide](/docs/contributing/benchmark).
-
-### Documentation checks
-
-Follow [the writing guide](https://github.com/fsdatalab/quail/blob/main/docs/writing-style.md).
-E.g., install dependencies and start the local site:
-
-```bash
-pnpm --dir docs install --frozen-lockfile
-pnpm --dir docs dev
-```
-
-Check the changed pages at [the local site](http://localhost:3000/quail).
-Then run `pnpm --dir docs types:check` and `pnpm --dir docs build`.
+[`AGENTS.md`](https://github.com/fsdatalab/quail/blob/main/AGENTS.md)
+holds the rules for writing, names, tests, and GPU runs.
 
 ## Submit a pull request
 
-Explain the problem and how the change fixes it.
-List the checks you ran and their results. State what remains unverified.
-For performance changes, include configurations and measurements with
-links to the saved results.
+Explain the problem and how the change fixes it. List the checks you
+ran and their results. State what remains unverified.

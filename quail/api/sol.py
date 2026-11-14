@@ -23,11 +23,10 @@ Every operator in the plan is priced or refused: an AI.SCORE
 predicate or column, a LIMIT, or a join without full semantics raises
 NotImplementedError.
 
-docs/content/docs/architecture/optimizer.mdx describes the model. The
-Rust planner in ``_quail_native`` runs the search, calling back into
-the oracles for each answer; the work counting and component pricing
-are the planner's own, and the search does not call or simulate the
-production planner.
+The Rust planner in ``_quail_native`` runs the search, calling back
+into the oracles for each answer; the work counting and component
+pricing are the planner's own, and the search does not call or simulate
+the production planner.
 """
 
 from __future__ import annotations

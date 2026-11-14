@@ -178,7 +178,3 @@ call_id = input("Function call ID from run_quail.log: ")
 rows, report = modal.FunctionCall.from_id(call_id).get()
 print(rows.to_pylist())
 ```
-
-## Add a model or device
-
-See [Custom models and GPUs](/docs/extending/models).

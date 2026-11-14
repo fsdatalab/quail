@@ -4,23 +4,27 @@ A transcript test runs a query on an oracle model and writes, as text,
 what Quail did: each AI operator of the plan with its guard, filter, and
 fetch; each question the model answered, by prompt and row, in the order
 the operators asked; and the rows the query returned. The test passes
-when the text matches the expected transcript saved beside the test, in
-``transcripts/<test name>.txt``. A change in what Quail asks shows up as
-a diff of that file, which a reviewer reads in place of counts.
+when the text matches the expected transcript, a string literal written
+in the test itself as the second argument of ``assert_transcript``. A
+change in what Quail asks shows up as a diff of the test, which a
+reviewer reads in place of counts.
 
 Each query also runs with every pushdown off. The transcript fails if the
 two return different rows, and says how many of that run's questions
 Quail asked.
 
-Run ``QUAIL_UPDATE_TRANSCRIPTS=1 uv run pytest ...`` to write the
-expected transcripts from the current behavior, then read the diff.
+Run ``QUAIL_UPDATE_TRANSCRIPTS=1 uv run pytest ...`` to write each
+expected transcript into its test from the current behavior, then read
+the diff. A new test passes ``""`` as its expected transcript first.
 """
 
 from __future__ import annotations
 
+import ast
 import inspect
 import os
 import re
+import textwrap
 from pathlib import Path
 from typing import NamedTuple
 
@@ -252,22 +256,55 @@ class Transcripts:
         lines += ["  " + ", ".join(
             value if isinstance(value, str) and value in self._rows
             else _shown(value) for value in row) for row in rows]
-        return "\n".join(lines) + "\n"
+        return "\n".join(_wrapped(line) for line in lines) + "\n"
 
 
-def assert_transcript(text: str, name: str | None = None) -> None:
-    """Compare a transcript with the one saved for the calling test.
+def _wrapped(line: str) -> str:
+    """A line in rows of at most 88 characters, the later ones indented."""
+    indent = " " * (len(line) - len(line.lstrip()) + 4)
+    return "\n".join(textwrap.wrap(
+        line, 88, subsequent_indent=indent, break_long_words=False,
+        break_on_hyphens=False)) or line
+
+
+def assert_transcript(text: str, expected: str) -> None:
+    """Compare a transcript with the expected one written in the test.
+
+    With QUAIL_UPDATE_TRANSCRIPTS set, write the transcript into the
+    calling test's source as this call's second argument instead.
 
     Args:
         text: The transcript.
-        name: The saved transcript's name; the calling test's when None.
+        expected: The expected transcript, a string literal.
     """
-    caller = inspect.stack()[1]
-    name = name or caller.function
-    path = Path(caller.filename).parent / "transcripts" / f"{name}.txt"
     if os.environ.get(UPDATE):
-        path.parent.mkdir(exist_ok=True)
-        path.write_text(text)
+        if text != expected:
+            caller = inspect.stack()[1]
+            _write_expected(Path(caller.filename), caller.function, text)
         return
-    assert path.exists(), f"no transcript {path}; run with {UPDATE}=1"
-    assert text == path.read_text(), f"{path} differs; run with {UPDATE}=1 and diff"
+    assert text == expected, f"the transcript differs; run with {UPDATE}=1 and diff"
+
+
+def _write_expected(path: Path, test: str, text: str) -> None:
+    """Replace the expected transcript of a test's assert_transcript call."""
+    source = path.read_text()
+    function = next(
+        node for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef) and node.name == test)
+    (call,) = [
+        node for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", None) == "assert_transcript"]
+    literal = call.args[1]
+    lines = source.splitlines(keepends=True)
+    start = sum(map(len, lines[:literal.lineno - 1])) + len(
+        lines[literal.lineno - 1].encode()[:literal.col_offset].decode())
+    end = sum(map(len, lines[:literal.end_lineno - 1])) + len(
+        lines[literal.end_lineno - 1].encode()[:literal.end_col_offset].decode())
+    body = text.replace("\\", "\\\\").replace('"""', '\\"\\"\\"')
+    # the literal opens on a line of its own when the call's line is full
+    before = source[:start].rstrip(" ")
+    opening = len(before) - before.rfind("\n") + 4
+    gap = " " if opening <= 88 else "\n" + " " * (function.col_offset + 8)
+    gap = "" if before.endswith("\n") else gap
+    path.write_text(f'{before}{gap}"""\\\n{body}"""{source[end:]}')

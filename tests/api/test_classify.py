@@ -1,6 +1,6 @@
 """AI.CLASSIFY: label scoring, prompt text, planning, execution, and results.
 
-The transcript tests' expected text is in transcripts/: the plan's AI
+Each transcript test holds its expected transcript: the plan's AI
 operators, the questions the model answered, and the rows
 (helpers/transcript.py).
 """
@@ -117,7 +117,91 @@ def test_a_classification_returns_and_tests_its_labels():
         "AND AI.CLASSIFY(PROMPT('Topic? {0}', d.body), ARRAY['a', 'b']) < 'b' "
         "AND AI.CLASSIFY(PROMPT('Topic? {0}', d.body), ARRAY['a', 'b']) "
         "IS NOT NULL",
-        columns=(unnamed,)))
+        columns=(unnamed,)), """\
+--- SELECT d.id, AI.CLASSIFY(PROMPT('Which topic? {0}', d.body), ARRAY['refund',
+    'shipping', 'praise']) AS topic FROM documents d WHERE AI.CLASSIFY(PROMPT('Which
+    topic? {0}', d.body), ARRAY['refund', 'shipping', 'praise'], {'selectivity': 0.5})
+    IN ('refund', 'shipping') ---
+plan
+  topic = ai_classify('Which topic? {0}', d.body, make_array('refund', 'shipping',
+      'praise')), filter: topic = 'refund' OR topic = 'shipping'
+asked 3 of 3
+  'Which topic? {0}': d0 'refund', d1 'praise', d2 'praise'
+rows 1
+  d0, 'refund'
+
+--- SELECT d.id, AI.CLASSIFY(PROMPT('Which topic? {0}', d.body), ARRAY['refund',
+    'shipping', 'praise']) AS topic FROM documents d ---
+plan
+  topic = ai_classify('Which topic? {0}', d.body, make_array('refund', 'shipping',
+      'praise'))
+asked 3 of 3
+  'Which topic? {0}': d0 'refund', d1 'praise', d2 'praise'
+rows 3
+  d0, 'refund'
+  d1, 'praise'
+  d2, 'praise'
+
+--- SELECT d.id, AI.CLASSIFY(PROMPT('Which topic? {0}', d.body), ARRAY['refund',
+    'shipping', 'praise']) FROM documents d ---
+plan
+  AI.CLASSIFY('Which topic? {0}', d.body,make_array('refund', 'shipping', 'praise')) =
+      ai_classify('Which topic? {0}', d.body, make_array('refund', 'shipping',
+      'praise'))
+asked 3 of 3
+  'Which topic? {0}': d0 'refund', d1 'praise', d2 'praise'
+columns d.id string, AI.CLASSIFY(prompt(Utf8("Which topic? {0}"),
+    d.body),make_array(Utf8("refund"), Utf8("shipping"), Utf8("praise"))) string
+rows 3
+  d0, 'refund'
+  d1, 'praise'
+  d2, 'praise'
+
+--- SELECT d.id FROM documents d WHERE AI.CLASSIFY(PROMPT('Which topic? {0}', d.body),
+    ARRAY['refund', 'shipping', 'praise']) = 'refund' ---
+plan
+  __quail_column_1 = ai_classify('Which topic? {0}', d.body, make_array('refund',
+      'shipping', 'praise')), filter: __quail_column_1 = 'refund'
+asked 3 of 3
+  'Which topic? {0}': d0 'refund', d1 'praise', d2 'praise'
+rows 1
+  d0
+
+--- SELECT d.id FROM documents d WHERE 'refund' = AI.CLASSIFY(PROMPT('Which topic? {0}',
+    d.body), ARRAY['refund', 'shipping', 'praise']) ---
+plan
+  __quail_column_1 = ai_classify('Which topic? {0}', d.body, make_array('refund',
+      'shipping', 'praise')), filter: __quail_column_1 = 'refund'
+asked 3 of 3
+  'Which topic? {0}': d0 'refund', d1 'praise', d2 'praise'
+rows 1
+  d0
+
+--- SELECT d.id FROM documents d WHERE AI.CLASSIFY(PROMPT('Number {0}', d.body), ['1',
+    '2']) IN (1) ---
+plan
+  __quail_column_1 = ai_classify('Number {0}', d.body, make_array('1', '2')), filter:
+      CAST(__quail_column_1 AS Int64) = Int64(1)
+asked 3 of 3
+  'Number {0}': d0 '1', d1 '1', d2 '1'
+rows 3
+  d0
+  d1
+  d2
+
+--- SELECT d.id FROM documents d WHERE AI.CLASSIFY(PROMPT('Topic? {0}', d.body),
+    ARRAY['a', 'b']) IN ('a', 'b') AND AI.CLASSIFY(PROMPT('Topic? {0}', d.body),
+    ARRAY['a', 'b']) < 'b' AND AI.CLASSIFY(PROMPT('Topic? {0}', d.body), ARRAY['a',
+    'b']) IS NOT NULL ---
+plan
+  __quail_column_1 = ai_classify('Topic? {0}', d.body, make_array('a', 'b')), filter:
+      (__quail_column_1 = 'a' OR __quail_column_1 = 'b') AND __quail_column_1 < 'b' AND
+      __quail_column_1 IS NOT NULL
+asked 3 of 3
+  'Topic? {0}': d0 'a', d1 'b', d2 'b'
+rows 1
+  d0
+""")
 
 
 def test_a_test_of_a_label_and_a_column_over_no_rows_returns_no_rows(session):
@@ -135,7 +219,31 @@ def test_a_classification_whose_probabilities_are_not_read_asks_for_none():
         f"SELECT x.topic, COUNT(*) AS n FROM (SELECT d.id, {asked} AS topic "
         "FROM documents d) x GROUP BY x.topic",
         f"SELECT d.id FROM documents d WHERE {asked} IN ('praise')",
-        answers=_answers(topics=("praise", "shipping", "praise"))))
+        answers=_answers(topics=("praise", "shipping", "praise"))), """\
+--- SELECT x.topic, COUNT(*) AS n FROM (SELECT d.id, AI.CLASSIFY(PROMPT('Which topic?
+    {0}', d.body), ARRAY['refund', 'shipping', 'praise'], {'probabilities': true}) AS
+    topic FROM documents d) x GROUP BY x.topic ---
+plan
+  topic = ai_classify('Which topic? {0}', d.body, make_array('refund', 'shipping',
+      'praise'), named_struct('probabilities', Boolean(false)))
+asked 3 of 3
+  'Which topic? {0}': d0 'praise', d1 'shipping', d2 'praise'
+rows 2
+  'praise', 2
+  'shipping', 1
+
+--- SELECT d.id FROM documents d WHERE AI.CLASSIFY(PROMPT('Which topic? {0}', d.body),
+    ARRAY['refund', 'shipping', 'praise'], {'probabilities': true}) IN ('praise') ---
+plan
+  __quail_column_1 = ai_classify('Which topic? {0}', d.body, make_array('refund',
+      'shipping', 'praise'), named_struct('probabilities', Boolean(false))), filter:
+      __quail_column_1 = 'praise'
+asked 3 of 3
+  'Which topic? {0}': d0 'praise', d1 'shipping', d2 'praise'
+rows 2
+  d0
+  d2
+""")
 
 
 def test_label_probabilities_come_back_beside_the_label_and_an_extraction(
@@ -213,7 +321,42 @@ def test_a_classification_labels_only_the_pairs_a_join_keeps():
         f"JOIN aspects a ON {PAIR_MENTIONS}",
         # DataFusion tests a joined row's label on the region's rows
         f"SELECT d.id, a.id FROM documents d JOIN aspects a ON {PAIR_MENTIONS} "
-        f"WHERE {PAIR_STANCE} = 'praise'"))
+        f"WHERE {PAIR_STANCE} = 'praise'"), """\
+--- SELECT d.id, a.id, AI.CLASSIFY(PROMPT('Stance? {0} {1}', d.body, a.aspect),
+    ARRAY['praise', 'complaint']) AS stance FROM documents d JOIN aspects a ON
+    AI_FILTER(PROMPT('Mentions? {0} {1}', d.body, a.aspect)) ---
+plan
+  stance = ai_classify('Stance? {0} {1}', d.body, a.aspect, make_array('praise',
+      'complaint'))
+  __quail_answer_1 = ai_filter('Mentions? {0} {1}', d.body, a.aspect), filter:
+      __quail_answer_1, returns: []
+asked 10 of 10
+  'Mentions? {0} {1}': a0+d0 TRUE, a0+d1 TRUE, a0+d2 FALSE, a1+d0 TRUE, a1+d1 TRUE,
+      a1+d2 FALSE
+  'Stance? {0} {1}': a0+d0 'complaint', a0+d1 'complaint', a1+d0 'praise', a1+d1
+      'complaint'
+rows 4
+  d0, a0, 'complaint'
+  d0, a1, 'praise'
+  d1, a0, 'complaint'
+  d1, a1, 'complaint'
+
+--- SELECT d.id, a.id FROM documents d JOIN aspects a ON AI_FILTER(PROMPT('Mentions? {0}
+    {1}', d.body, a.aspect)) WHERE AI.CLASSIFY(PROMPT('Stance? {0} {1}', d.body,
+    a.aspect), ARRAY['praise', 'complaint']) = 'praise' ---
+plan
+  __quail_column_1 = ai_classify('Stance? {0} {1}', d.body, a.aspect,
+      make_array('praise', 'complaint'))
+  __quail_answer_1 = ai_filter('Mentions? {0} {1}', d.body, a.aspect), filter:
+      __quail_answer_1, returns: []
+asked 10 of 10
+  'Mentions? {0} {1}': a0+d0 TRUE, a0+d1 TRUE, a0+d2 FALSE, a1+d0 TRUE, a1+d1 TRUE,
+      a1+d2 FALSE
+  'Stance? {0} {1}': a0+d0 'complaint', a0+d1 'complaint', a1+d0 'praise', a1+d1
+      'complaint'
+rows 1
+  d0, a1
+""")
 
 
 def test_a_pair_classification_runs_above_its_join_in_one_pipeline(session):
@@ -271,7 +414,40 @@ def test_a_label_test_drops_documents_before_the_next_classification_asks():
         # the second test on topic drops d0 before kind asks
         _classify_then_filter(("topic", ("refund", "shipping")),
                               ("kind", ("complaint",)), ("topic", ("refund",))),
-        answers=_answers(topics=("shipping", "praise", "praise"))))
+        answers=_answers(topics=("shipping", "praise", "praise"))), """\
+--- SELECT d.id, AI.CLASSIFY(PROMPT('Which topic? {0}', d.body), ARRAY['refund',
+    'shipping', 'praise']) AS topic, AI.CLASSIFY(PROMPT('Which kind? {0}', d.body),
+    ARRAY['complaint', 'question']) AS kind FROM documents d WHERE
+    AI.CLASSIFY(PROMPT('Which topic? {0}', d.body), ARRAY['refund', 'shipping',
+    'praise'], {'selectivity': 0.5}) IN ('refund', 'shipping') ---
+plan
+  kind = ai_classify('Which kind? {0}', d.body, make_array('complaint', 'question'))
+  topic = ai_classify('Which topic? {0}', d.body, make_array('refund', 'shipping',
+      'praise')), filter: topic = 'refund' OR topic = 'shipping'
+asked 4 of 4
+  'Which topic? {0}': d0 'shipping', d1 'praise', d2 'praise'
+  'Which kind? {0}': d0 'complaint'
+rows 1
+  d0, 'shipping', 'complaint'
+
+--- SELECT d.id, AI.CLASSIFY(PROMPT('Which topic? {0}', d.body), ARRAY['refund',
+    'shipping', 'praise']) AS topic, AI.CLASSIFY(PROMPT('Which kind? {0}', d.body),
+    ARRAY['complaint', 'question']) AS kind FROM documents d WHERE
+    AI.CLASSIFY(PROMPT('Which topic? {0}', d.body), ARRAY['refund', 'shipping',
+    'praise'], {'selectivity': 0.5}) IN ('refund', 'shipping') AND
+    AI.CLASSIFY(PROMPT('Which kind? {0}', d.body), ARRAY['complaint', 'question'],
+    {'selectivity': 0.5}) IN ('complaint') AND AI.CLASSIFY(PROMPT('Which topic? {0}',
+    d.body), ARRAY['refund', 'shipping', 'praise'], {'selectivity': 0.5}) IN ('refund')
+    ---
+plan
+  kind = ai_classify('Which kind? {0}', d.body, make_array('complaint', 'question')),
+      filter: kind = 'complaint'
+  topic = ai_classify('Which topic? {0}', d.body, make_array('refund', 'shipping',
+      'praise')), filter: (topic = 'refund' OR topic = 'shipping') AND topic = 'refund'
+asked 3 of 3
+  'Which topic? {0}': d0 'shipping', d1 'praise', d2 'praise'
+rows 0
+""")
 
 
 def test_streamed_classifications_and_their_tests_share_one_pipeline(session):

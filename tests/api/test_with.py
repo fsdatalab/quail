@@ -1,6 +1,6 @@
 """WITH: common table expressions whose results later AI operators read.
 
-Each transcript test's transcript, in transcripts/, shows the plan, the
+Each transcript test's transcript shows the plan, the
 questions the model answered, and the rows (helpers/transcript.py). A
 question about an extracted text names the text.
 """
@@ -87,13 +87,54 @@ def _transcript(*queries, answer=_answer) -> str:
 
 def test_an_extraction_in_a_cte_is_scored_by_its_extracted_text():
     # a NULL clause has a NULL score: the model is not asked about it
-    assert_transcript(_transcript(EXTRACT_THEN_SCORE))
+    assert_transcript(_transcript(EXTRACT_THEN_SCORE), """\
+---  WITH clauses AS (     SELECT c.id,            AI.EXTRACT(c.text, {'terms': 'What is
+    the termination clause?'}) AS clause     FROM contracts c ) SELECT x.id, x.clause,
+    AI.SCORE(PROMPT('Can the tenant terminate early? {0}', x.clause.terms))
+    AS score FROM clauses x  ---
+plan
+  score = ai_score('Can the tenant terminate early? {0}', get_field(x.column_1,
+      'terms'))
+  clause = ai_extract(c.text, named_struct('terms', 'What is the termination clause?')),
+      returns: [clause]
+asked 5 of 5
+  'What is the termination clause?': 1 'Tenant may terminate early with notice', 2 NULL,
+      3 'Early termination is forbidden'
+  'Can the tenant terminate early? {0}': 'Early termination is forbidden' 0.125, 'Tenant
+      may terminate early with notice' 0.875
+rows 3
+  1, {'terms': 'Tenant may terminate early with notice'}, 0.875
+  2, {'terms': None}, NULL
+  3, {'terms': 'Early termination is forbidden'}, 0.125
+""")
 
 
 def test_a_cte_runs_once_however_many_times_it_is_read():
     # the extraction once, though the join reads it twice; the CTE nothing
     # reads never runs, and the contract with no clause matches nothing
-    assert_transcript(_transcript((READ_TWICE, {"dialect": "bq"})))
+    assert_transcript(_transcript((READ_TWICE, {"dialect": "bq"})), """\
+---  WITH clauses AS (     SELECT c.id,            AI.EXTRACT(c.text, STRUCT('What is
+    the termination clause?' AS terms))                AS clause     FROM contracts c ),
+    unused AS (     SELECT c.id FROM contracts c WHERE AI.IF(PROMPT('never asked: {0}',
+    c.text)) ) SELECT a.id, b.id AS other FROM clauses a JOIN clauses b   ON
+    AI.IF(PROMPT('same clause? {0} {1}', a.clause.terms, b.clause.terms))  ---
+plan
+  __quail_answer_1 = ai_filter('same clause? {0} {1}', get_field(a.clause, 'terms'),
+      get_field(b.clause, 'terms')), filter: __quail_answer_1, returns: []
+  clause = ai_extract(c.text, named_struct('terms', 'What is the termination clause?')),
+      returns: [clause]
+asked 7 of 10
+  'What is the termination clause?': 1 'Tenant may terminate early with notice', 2 NULL,
+      3 'Early termination is forbidden'
+  'same clause? {0} {1}': 'Early termination is forbidden'+'Early termination is
+      forbidden' TRUE, 'Early termination is forbidden'+'Tenant may terminate early with
+      notice' FALSE, 'Tenant may terminate early with notice'+'Early termination is
+      forbidden' FALSE, 'Tenant may terminate early with notice'+'Tenant may terminate
+      early with notice' TRUE
+rows 2
+  1, 1
+  3, 3
+""")
 
 
 def test_a_cte_that_filters_or_classifies_returns_the_rows_its_reader_selects():
@@ -104,7 +145,45 @@ def test_a_cte_that_filters_or_classifies_returns_the_rows_its_reader_selects():
         # DataFusion names the reader's columns
         ("WITH k AS (SELECT c.id, AI.CLASSIFY(c.text, ['lease', 'note']) AS kind "
          "FROM contracts c) SELECT k.id, k.kind FROM k WHERE k.kind = 'lease'",
-         {"columns": True})))
+         {"columns": True})), """\
+---  WITH first AS (     SELECT c.id FROM contracts c WHERE AI.IF(PROMPT('keep {0}',
+    c.text))     ORDER BY c.id LIMIT 2) SELECT f.id AS result_id FROM first f WHERE f.id
+    > 0  ---
+plan
+  __quail_answer_1 = ai_filter('keep {0}', c.text), filter: __quail_answer_1, returns:
+      []
+asked 3 of 3
+  'keep {0}': 1 TRUE, 2 FALSE, 3 TRUE
+rows 2
+  1
+  3
+
+---  WITH kept AS (     SELECT c.id, c.text FROM contracts c WHERE AI.IF(PROMPT('keep
+    {0}', c.text))) SELECT a.id, b.id AS other FROM contracts a JOIN kept b ON
+    AI.IF(PROMPT('same? {0} {1}', a.text, b.text))  ---
+plan
+  __quail_answer_2 = ai_filter('same? {0} {1}', a.text, b.text), filter:
+      __quail_answer_2, returns: []
+  __quail_answer_1 = ai_filter('keep {0}', c.text), filter: __quail_answer_1, returns:
+      []
+asked 9 of 9
+  'keep {0}': 1 TRUE, 2 FALSE, 3 TRUE
+  'same? {0} {1}': 1+1 TRUE, 1+2 FALSE, 1+3 FALSE, 3+1 FALSE, 3+2 FALSE, 3+3 TRUE
+rows 2
+  1, 1
+  3, 3
+
+--- WITH k AS (SELECT c.id, AI.CLASSIFY(c.text, ['lease', 'note']) AS kind FROM
+    contracts c) SELECT k.id, k.kind FROM k WHERE k.kind = 'lease' ---
+plan
+  kind = ai_classify(c.text, make_array('lease', 'note')), filter: kind = 'lease'
+asked 3 of 3
+  '?': 1 'lease', 2 'note', 3 'lease'
+columns k.id int64, k.kind string
+rows 2
+  1, 'lease'
+  3, 'lease'
+""")
 
 
 def test_a_cte_join_can_reuse_an_alias_from_the_ctes_scope():
@@ -114,7 +193,32 @@ def test_a_cte_join_can_reuse_an_alias_from_the_ctes_scope():
            "FROM kept k JOIN contracts c ON k.id = c.id")
     query = (sql, {"columns": True})
     assert_transcript(_transcript(query, answer=lambda *_: True)
-                      + "\n" + _transcript(query, answer=lambda *_: False))
+                      + "\n" + _transcript(query, answer=lambda *_: False), """\
+--- WITH kept AS (SELECT c.id, c.text FROM contracts c WHERE AI.IF(PROMPT('keep {0}',
+    c.text))) SELECT k.id AS contract_id, c.text AS contract_text FROM kept k JOIN
+    contracts c ON k.id = c.id ---
+plan
+  __quail_answer_1 = ai_filter('keep {0}', c.text), filter: __quail_answer_1, returns:
+      []
+asked 3 of 3
+  'keep {0}': 1 TRUE, 2 TRUE, 3 TRUE
+columns contract_id int64, contract_text string
+rows 3
+  1, 'Lease ends on March 3. Tenant may terminate early with notice.'
+  2, 'No dates here. Nothing about ending.'
+  3, 'Lease ends in 2030. Early termination is forbidden.'
+
+--- WITH kept AS (SELECT c.id, c.text FROM contracts c WHERE AI.IF(PROMPT('keep {0}',
+    c.text))) SELECT k.id AS contract_id, c.text AS contract_text FROM kept k JOIN
+    contracts c ON k.id = c.id ---
+plan
+  __quail_answer_1 = ai_filter('keep {0}', c.text), filter: __quail_answer_1, returns:
+      []
+asked 3 of 3
+  'keep {0}': 1 FALSE, 2 FALSE, 3 FALSE
+columns contract_id int64, contract_text string
+rows 0
+""")
 
 
 def test_a_cte_is_a_model_region_of_its_own_when_an_ai_operator_reads_it():

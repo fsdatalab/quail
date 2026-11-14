@@ -4,7 +4,7 @@ AI_{f→b}(AI_{f→a}(R)) = π_{*, a→b}(AI_{f→a}(R)). The lowering gives
 calls written the same way in one SELECT list and WHERE one AiNode;
 merge_repeated_ai_calls merges an AiNode into the same call below it,
 such as an AI.IF written twice. It runs before derive, so derive gives
-the one node what every read of its answer needs. The transcript, in transcripts/, shows
+the one node what every read of its answer needs. The transcript shows
 the plan, the questions the model answered, and the rows
 (helpers/transcript.py).
 """
@@ -64,7 +64,58 @@ def test_a_call_written_twice_asks_the_model_once_per_row():
             f"SELECT d.id, d.t, {TONE.replace('r.body', 'd.body')} AS u FROM "
             f"(SELECT r.id, r.body, {TONE} AS t FROM reviews r) d",
             f"SELECT r.id, {WHEN} AS e FROM reviews r "
-            f"WHERE {WHEN}['w'] IS NOT NULL")))
+            f"WHERE {WHEN}['w'] IS NOT NULL")), """\
+--- SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('kind: {0}', r.body)) AND
+    AI_FILTER(PROMPT('kind: {0}', r.body)) ---
+plan
+  __quail_answer_1 = ai_filter('kind: {0}', r.body), filter: __quail_answer_1, returns:
+      []
+asked 6 of 10
+  'kind: {0}': r0 FALSE, r1 TRUE, r2 TRUE, r3 FALSE, r4 TRUE, r5 TRUE
+rows 4
+  r1
+  r2
+  r4
+  r5
+
+--- SELECT r.id, AI_CLASSIFY(PROMPT('tone: {0}', r.body), ['a', 'b']) AS t FROM reviews
+    r WHERE AI_CLASSIFY(PROMPT('tone: {0}', r.body), ['a', 'b']) = 'a' ---
+plan
+  t = ai_classify('tone: {0}', r.body, make_array('a', 'b')), filter: t = 'a'
+asked 6 of 6
+  'tone: {0}': r0 'a', r1 'b', r2 'a', r3 'b', r4 'a', r5 'b'
+rows 3
+  r0, 'a'
+  r2, 'a'
+  r4, 'a'
+
+--- SELECT d.id, d.t, AI_CLASSIFY(PROMPT('tone: {0}', d.body), ['a', 'b']) AS u FROM
+    (SELECT r.id, r.body, AI_CLASSIFY(PROMPT('tone: {0}', r.body), ['a', 'b']) AS t FROM
+    reviews r) d ---
+plan
+  t = ai_classify('tone: {0}', r.body, make_array('a', 'b'))
+asked 6 of 12
+  'tone: {0}': r0 'a', r1 'b', r2 'a', r3 'b', r4 'a', r5 'b'
+rows 6
+  r0, 'a', 'a'
+  r1, 'b', 'b'
+  r2, 'a', 'a'
+  r3, 'b', 'b'
+  r4, 'a', 'a'
+  r5, 'b', 'b'
+
+--- SELECT r.id, AI_EXTRACT(r.body, {'w': 'When?'}) AS e FROM reviews r WHERE
+    AI_EXTRACT(r.body, {'w': 'When?'})['w'] IS NOT NULL ---
+plan
+  e = ai_extract(r.body, named_struct('w', 'When?')), filter: get_field(e, 'w') IS NOT
+      NULL, returns: [e]
+asked 6 of 6
+  'When?': r0 'b0', r1 NULL, r2 'b2', r3 NULL, r4 'b4', r5 NULL
+rows 3
+  r0, {'w': 'b0'}
+  r2, {'w': 'b2'}
+  r4, {'w': 'b4'}
+""")
 
 
 def test_a_query_of_two_model_regions_reports_each_region(sessions):

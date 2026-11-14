@@ -1,7 +1,0 @@
---- SELECT r.id FROM r WHERE AI.CLASSIFY(PROMPT('q: {0}', r.body), ['a', 'b']) IS NULL ---
-plan
-  __quail_column_1 = ai_classify('q: {0}', r.body, make_array('a', 'b')), filter: __quail_column_1 IS NULL
-asked 1 of 1
-  'q: {0}': r0 'a'
-rows 1
-  r1

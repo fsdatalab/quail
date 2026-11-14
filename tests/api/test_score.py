@@ -1,6 +1,6 @@
 """AI.SCORE parsing, planning, execution, and score semantics.
 
-The transcript test's expected text is in transcripts/: the plan's AI
+The transcript test holds its expected transcript: the plan's AI
 operators, the questions the model answered, and the rows
 (helpers/transcript.py).
 """
@@ -137,7 +137,105 @@ def test_scores_and_labels_keep_their_types_and_the_columns_before_them():
                                    "text": ["refund", "shipping"]})}
     with Transcripts(tables, answer) as runs:
         assert_transcript("\n".join(runs.query(sql, columns=True)
-                                     for sql in queries))
+                                     for sql in queries), """\
+--- SELECT d.id, AI.SCORE(PROMPT('Refund? {0}', d.body)) AS s, AI.CLASSIFY(PROMPT('Topic
+    {0}', d.body), ARRAY['refund','praise']) AS topic FROM documents d  ---
+plan
+  s = ai_score('Refund? {0}', d.body)
+  topic = ai_classify('Topic {0}', d.body, make_array('refund', 'praise'))
+asked 4 of 4
+  'Refund? {0}': d1 0.125, d2 0.25
+  'Topic {0}': d1 'refund', d2 'praise'
+columns d.id string, s double, topic string
+rows 2
+  d1, 0.125, 'refund'
+  d2, 0.25, 'praise'
+
+--- SELECT d.id, AI.SCORE(PROMPT('Refund? {0}', d.body)) AS s, AI.CLASSIFY(PROMPT('Topic
+    {0}', d.body), ARRAY['refund','praise']) AS topic FROM documents d WHERE
+    AI.SCORE(PROMPT('Refund? {0}', d.body)) >= 0.15 ---
+plan
+  topic = ai_classify('Topic {0}', d.body, make_array('refund', 'praise'))
+  s = ai_score('Refund? {0}', d.body), filter: s >= Float64(0.15)
+asked 3 of 3
+  'Refund? {0}': d1 0.125, d2 0.25
+  'Topic {0}': d2 'praise'
+columns d.id string, s double, topic string
+rows 1
+  d2, 0.25, 'praise'
+
+--- SELECT d.id, AI.SCORE(PROMPT('Refund? {0}', d.body)) AS s, AI.CLASSIFY(PROMPT('Topic
+    {0}', d.body), ARRAY['refund','praise']) AS topic FROM documents d WHERE
+    AI.CLASSIFY(PROMPT('Topic {0}', d.body), ARRAY['refund','praise']) IN ('praise') AND
+    AI.SCORE(PROMPT('Refund? {0}', d.body)) >= 0.15 ---
+plan
+  topic = ai_classify('Topic {0}', d.body, make_array('refund', 'praise')), filter:
+      topic = 'praise'
+  s = ai_score('Refund? {0}', d.body), filter: s >= Float64(0.15)
+asked 3 of 3
+  'Refund? {0}': d1 0.125, d2 0.25
+  'Topic {0}': d2 'praise'
+columns d.id string, s double, topic string
+rows 1
+  d2, 0.25, 'praise'
+
+--- SELECT d.id, AI.CLASSIFY(PROMPT('Topic {0}', d.body), ARRAY['refund','praise']) AS
+    topic, AI.SCORE(PROMPT('Refund? {0}', d.body)) AS s FROM documents d  ---
+plan
+  s = ai_score('Refund? {0}', d.body)
+  topic = ai_classify('Topic {0}', d.body, make_array('refund', 'praise'))
+asked 4 of 4
+  'Refund? {0}': d1 0.125, d2 0.25
+  'Topic {0}': d1 'refund', d2 'praise'
+columns d.id string, topic string, s double
+rows 2
+  d1, 'refund', 0.125
+  d2, 'praise', 0.25
+
+--- SELECT d.id, AI.CLASSIFY(PROMPT('Topic {0}', d.body), ARRAY['refund','praise']) AS
+    topic, AI.SCORE(PROMPT('Refund? {0}', d.body)) AS s FROM documents d WHERE
+    AI.SCORE(PROMPT('Refund? {0}', d.body)) >= 0.15 ---
+plan
+  topic = ai_classify('Topic {0}', d.body, make_array('refund', 'praise'))
+  s = ai_score('Refund? {0}', d.body), filter: s >= Float64(0.15)
+asked 3 of 3
+  'Refund? {0}': d1 0.125, d2 0.25
+  'Topic {0}': d2 'praise'
+columns d.id string, topic string, s double
+rows 1
+  d2, 'praise', 0.25
+
+--- SELECT d.id, AI.CLASSIFY(PROMPT('Topic {0}', d.body), ARRAY['refund','praise']) AS
+    topic, AI.SCORE(PROMPT('Refund? {0}', d.body)) AS s FROM documents d WHERE
+    AI.CLASSIFY(PROMPT('Topic {0}', d.body), ARRAY['refund','praise']) IN ('praise') AND
+    AI.SCORE(PROMPT('Refund? {0}', d.body)) >= 0.15 ---
+plan
+  topic = ai_classify('Topic {0}', d.body, make_array('refund', 'praise')), filter:
+      topic = 'praise'
+  s = ai_score('Refund? {0}', d.body), filter: s >= Float64(0.15)
+asked 3 of 3
+  'Refund? {0}': d1 0.125, d2 0.25
+  'Topic {0}': d2 'praise'
+columns d.id string, topic string, s double
+rows 1
+  d2, 'praise', 0.25
+
+--- SELECT q.id, d.id, AI.CLASSIFY(PROMPT('Topic {0}', d.body),
+    ARRAY['refund','praise']) AS topic, AI.SCORE(PROMPT('Relevance {0} {1}', q.text,
+    d.body)) AS relevance FROM queries q CROSS JOIN documents d ---
+plan
+  relevance = ai_score('Relevance {0} {1}', q.text, d.body)
+  topic = ai_classify('Topic {0}', d.body, make_array('refund', 'praise'))
+asked 6 of 8
+  'Topic {0}': d1 'refund', d2 'praise'
+  'Relevance {0} {1}': q1+d1 0.25, q1+d2 0.375, q2+d1 0.375, q2+d2 0.5
+columns q.id string, d.id string, topic string, relevance double
+rows 4
+  q1, d1, 'refund', 0.25
+  q1, d2, 'praise', 0.375
+  q2, d1, 'refund', 0.375
+  q2, d2, 'praise', 0.5
+""")
 
 
 def test_a_set_attention_score_plans_a_document_longer_than_one_page(tmp_path):

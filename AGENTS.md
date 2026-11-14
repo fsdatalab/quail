@@ -56,8 +56,8 @@ CI runs these on every pull request. Run them before pushing:
 - `tools/check_long_strings.py` flags string literals over 200
   characters. Long content is allowed when its name identifies content
   (a name containing PROMPT, TEMPLATE, SQL, QUERY, HTML, or TEXT), kept in a
-  prompts module or folder, or plainly HTML or SQL. Docstrings are
-  exempt. Shorten long messages and log lines.
+  prompts module or folder, or plainly HTML or SQL. Docstrings and
+  expected transcripts are exempt. Shorten long messages and log lines.
 - `tools/check_names.py` reports two names for one concept or one
   name for two: duplicate function bodies, a parameter passed on
   under another keyword, identifiers that differ by a synonym, and a
@@ -109,6 +109,38 @@ Quail source edits still require compiling and linking Quail itself.
   executor runs the graph; `tests/helpers/planted_model.py` is the
   forward pass, which answers each prompt from the truth. Do not add
   another fake of the executor or the model.
+- A test of a query is a transcript test. The test runs the query and
+  compares a transcript, the text of what Quail did, with the expected
+  transcript written in the test:
+
+      def test_an_or_asks_only_where_the_column_is_not_true():
+          assert_transcript(_transcript(
+              f"SELECT r.id FROM reviews r WHERE r.long OR {KIND}"), """\
+      --- SELECT r.id FROM reviews r WHERE r.long OR AI_FILTER(...) ---
+      plan
+        __quail_answer_1 = ai_filter('kind: {0}', r.body), guard: r.long IS NOT TRUE
+      asked 3 of 6
+        'kind: {0}': r1 FALSE, r2 TRUE, r4 TRUE
+      rows 5
+        r0
+        ...
+      """)
+
+  - A transcript shows the plan's AI operators, each question the model
+    answered, and the rows returned. "asked 3 of 6" compares Quail with
+    the same query run with every pushdown off; the two runs must
+    return the same rows.
+  - Write a new test with `""` as the expected transcript. Run
+    `QUAIL_UPDATE_TRANSCRIPTS=1 uv run --no-sync pytest <file>` to write
+    the transcript into the test, then read the diff before you commit.
+  - `tests/helpers/transcript.py` builds the transcript;
+    `tests/planner/test_guards.py` is a worked example.
+  - Andrew Lamb describes the method in
+    [Transcript Testing](https://andrew.nerdnetworks.org/blog/2026/11/13/transcript-testing/);
+    [DataFusion's transcript tests](https://github.com/apache/datafusion/pull/26897)
+    are his example.
+  - Assert directly, without a transcript, on what a transcript does
+    not show: explain text, costs, error messages, and reports.
 - A bug fix gets one small regression case, in the test file that
   already covers that path. Name a test as a sentence stating the
   behavior, such as `test_a_failed_boot_releases_the_gpu`.

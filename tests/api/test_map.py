@@ -1,6 +1,6 @@
 """AI.MAP: the operator surface, its prompt, and its plan.
 
-The transcript tests' expected text is in transcripts/: the plan's AI
+Each transcript test holds its expected transcript: the plan's AI
 operators, the questions the model answered, and the rows
 (helpers/transcript.py).
 """
@@ -60,7 +60,47 @@ def test_a_map_writes_one_answer_per_document():
     assert_transcript(_transcript(
         f"SELECT r.id, AI.MAP(r.body, '{SUMMARY}', 32) AS summary FROM reviews r",
         # an unnamed map returns each answer under its SQL name
-        *unnamed, columns=unnamed))
+        *unnamed, columns=unnamed), """\
+--- SELECT r.id, AI.MAP(r.body, 'Summarize the review in one sentence.', 32) AS summary
+    FROM reviews r ---
+plan
+  summary = ai_map(r.body, 'Summarize the review in one sentence.', Int64(32))
+asked 3 of 3
+  'Summarize the review in one sentence.': r1 'summarize r1', r2 'summarize r2', r3
+      'summarize r3'
+rows 3
+  r1, 'summarize r1'
+  r2, 'summarize r2'
+  r3, 'summarize r3'
+
+--- SELECT r.id, AI.MAP(r.body, 'Summarize the review in one sentence.') FROM reviews r
+    ---
+plan
+  AI.MAP(r.body,'Summarize the review in one sentence.') = ai_map(r.body, 'Summarize the
+      review in one sentence.')
+asked 3 of 3
+  'Summarize the review in one sentence.': r1 'summarize r1', r2 'summarize r2', r3
+      'summarize r3'
+columns r.id string, AI.MAP(r.body,Utf8("Summarize the review in one sentence.")) string
+rows 3
+  r1, 'summarize r1'
+  r2, 'summarize r2'
+  r3, 'summarize r3'
+
+--- SELECT r.id, ai_map(r.body, 'Summarize the review in one sentence.') FROM reviews r
+    ---
+plan
+  ai_map(r.body,'Summarize the review in one sentence.') = ai_map(r.body, 'Summarize the
+      review in one sentence.')
+asked 3 of 3
+  'Summarize the review in one sentence.': r1 'summarize r1', r2 'summarize r2', r3
+      'summarize r3'
+columns r.id string, ai_map(r.body,Utf8("Summarize the review in one sentence.")) string
+rows 3
+  r1, 'summarize r1'
+  r2, 'summarize r2'
+  r3, 'summarize r3'
+""")
 
 
 def test_a_map_writes_up_to_its_answer_token_limit_after_the_document(session):
@@ -84,7 +124,20 @@ def test_a_map_writes_up_to_its_answer_token_limit_after_the_document(session):
 def test_a_map_writes_only_the_documents_the_filter_before_it_keeps():
     assert_transcript(_transcript(
         f"SELECT r.id, AI.MAP(r.body, '{SUMMARY}', 64) AS summary FROM reviews r "
-        "WHERE AI_FILTER(PROMPT('Negative? {0}', r.body)) ORDER BY r.id LIMIT 1"))
+        "WHERE AI_FILTER(PROMPT('Negative? {0}', r.body)) ORDER BY r.id LIMIT 1"), """\
+--- SELECT r.id, AI.MAP(r.body, 'Summarize the review in one sentence.', 64) AS summary
+    FROM reviews r WHERE AI_FILTER(PROMPT('Negative? {0}', r.body)) ORDER BY r.id LIMIT
+    1 ---
+plan
+  summary = ai_map(r.body, 'Summarize the review in one sentence.', Int64(64))
+  __quail_answer_1 = ai_filter('Negative? {0}', r.body), filter: __quail_answer_1,
+      returns: []
+asked 5 of 5
+  'Negative? {0}': r1 FALSE, r2 TRUE, r3 TRUE
+  'Summarize the review in one sentence.': r2 'summarize r2', r3 'summarize r3'
+rows 1, in order
+  r2, 'summarize r2'
+""")
 
 
 def test_a_map_shares_the_pipeline_of_the_filter_or_classification_before_it(
@@ -148,7 +201,35 @@ def test_a_plain_test_keeps_only_matching_map_answers():
         "WHERE m.topic = 'name r1'",
         # a map only tests read is computed once
         f"SELECT r.id FROM reviews r WHERE LENGTH({call}) > 3 "
-        f"AND {call} LIKE '% r1'", dialects={bigquery: "bq"}))
+        f"AND {call} LIKE '% r1'", dialects={bigquery: "bq"}), """\
+--- SELECT r.id, AI.MAP(r.body, 'Name the topic.', 16) AS topic FROM reviews r WHERE
+    AI.MAP(r.body, 'Name the topic.', 16) = 'name r1' ---
+plan
+  topic = ai_map(r.body, 'Name the topic.', Int64(16)), filter: topic = 'name r1'
+asked 3 of 3
+  'Name the topic.': r1 'name r1', r2 'name r2', r3 'name r3'
+rows 1
+  r1, 'name r1'
+
+--- WITH m AS (SELECT r.id, AI.MAP(r.body, 'Name the topic.', 16) AS topic FROM reviews
+    r) SELECT m.id, m.topic FROM m WHERE m.topic = 'name r1' ---
+plan
+  topic = ai_map(r.body, 'Name the topic.', Int64(16)), filter: topic = 'name r1'
+asked 3 of 3
+  'Name the topic.': r1 'name r1', r2 'name r2', r3 'name r3'
+rows 1
+  r1, 'name r1'
+
+--- SELECT r.id FROM reviews r WHERE LENGTH(AI.MAP(r.body, 'Name the topic.', 16)) > 3
+    AND AI.MAP(r.body, 'Name the topic.', 16) LIKE '% r1' ---
+plan
+  __quail_column_1 = ai_map(r.body, 'Name the topic.', Int64(16)), filter:
+      character_length(__quail_column_1) > Int32(3) AND __quail_column_1 LIKE '% r1'
+asked 3 of 3
+  'Name the topic.': r1 'name r1', r2 'name r2', r3 'name r3'
+rows 1
+  r1
+""")
 
 
 def test_a_plain_test_of_a_map_follows_it_in_its_pipeline(session):

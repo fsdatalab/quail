@@ -1,6 +1,6 @@
 """quail.SessionContext: DataFusion binds the query, Quail runs each model region.
 
-Each transcript test's transcript, in transcripts/, shows the plan, the
+Each transcript test's transcript shows the plan, the
 questions the model answered, and the rows (helpers/transcript.py).
 """
 
@@ -457,7 +457,59 @@ def test_sql_around_a_region_runs_in_datafusion():
         (f"SELECT c.id, AI.EXTRACT({fields}) AS lease, "
          f"AI.EXTRACT_SPAN({fields}) AS lease_span FROM contracts c "
          f"WHERE AI.EXTRACT_SPAN({fields})['end']['start'] < 15",
-         {"columns": True})))
+         {"columns": True})), """\
+--- SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) UNION ALL
+    SELECT a.id FROM aspects a ORDER BY id ---
+plan
+  __quail_answer_1 = ai_filter('q1: {0}', r.body), filter: __quail_answer_1, returns: []
+asked 4 of 4
+  'q1: {0}': r0 TRUE, r1 FALSE, r2 TRUE, r3 TRUE
+columns id string
+rows 5, in order
+  a0
+  a1
+  r0
+  r2
+  r3
+
+--- WITH kept AS (SELECT r.id, r.body FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}',
+    r.body)) ORDER BY r.id LIMIT 2) SELECT r.id FROM kept r WHERE AI_FILTER(PROMPT('q2:
+    {0}', r.body)) ORDER BY r.id ---
+plan
+  __quail_answer_2 = ai_filter('q2: {0}', r.column_1), filter: __quail_answer_2,
+      returns: []
+  __quail_answer_1 = ai_filter('q1: {0}', r.body), filter: __quail_answer_1, returns: []
+asked 6 of 6
+  'q1: {0}': r0 TRUE, r1 FALSE, r2 TRUE, r3 TRUE
+  'q2: {0}': r0 TRUE, r2 FALSE
+rows 1, in order
+  r0
+
+--- SELECT r.id FROM reviews__archive r WHERE r.stars > 1 AND AI_FILTER(PROMPT('q1:
+    {0}', r.body)) ---
+plan
+  __quail_answer_1 = ai_filter('q1: {0}', r.body), filter: __quail_answer_1, returns: []
+asked 3 of 3
+  'q1: {0}': r0 TRUE, r1 FALSE, r2 TRUE
+rows 2
+  r0
+  r2
+
+--- SELECT c.id, AI.EXTRACT(c.text, {'end': 'q6: When does it end?'}) AS lease,
+    AI.EXTRACT_SPAN(c.text, {'end': 'q6: When does it end?'}) AS lease_span FROM
+    contracts c WHERE AI.EXTRACT_SPAN(c.text, {'end': 'q6: When does it
+    end?'})['end']['start'] < 15 ---
+plan
+  lease = ai_extract(c.text, named_struct('end', 'q6: When does it end?')), filter:
+      get_field(lease_span, 'end', 'start') < Int32(15)
+asked 3 of 3
+  'q6: When does it end?': c0 '2027', c1 '2030', c2 NULL
+columns c.id string, lease struct<end: string>, lease_span struct<end: struct<start:
+    int32, end: int32>>
+rows 2
+  c0, {'end': '2027'}, {'end': {'start': 14, 'end': 18}}
+  c1, {'end': '2030'}, {'end': {'start': 14, 'end': 18}}
+""")
 
 
 def test_a_table_name_with_an_at_sign_is_refused():
@@ -499,7 +551,91 @@ def test_an_ai_call_beside_or_inside_a_join_is_answered_once_per_row(monkeypatch
         # an AI call in a correlated subquery
         f"SELECT v.id FROM v WHERE EXISTS (SELECT 1 FROM r WHERE {test})",
         f"SELECT v.id FROM v WHERE NOT EXISTS (SELECT 1 FROM r WHERE {test})",
-        f"SELECT v.id, (SELECT COUNT(*) FROM r WHERE {test}) AS n FROM v"))
+        f"SELECT v.id, (SELECT COUNT(*) FROM r WHERE {test}) AS n FROM v"), """\
+--- SELECT r.id, t.id, v.id FROM r CROSS JOIN t JOIN v ON v.rid = r.id WHERE
+    AI.IF(PROMPT('q: {0}', concat(r.body, ' ', t.body))) ---
+plan
+  __quail_answer_1 = ai_filter('q: {0}', __quail_rows_0.column_4)
+asked 4 of 4
+  'q: {0}': 'a c' TRUE, 'a d' TRUE, 'b c' TRUE, 'b d' TRUE
+rows 4
+  r0, t0, v0
+  r0, t1, v0
+  r1, t0, v1
+  r1, t1, v1
+
+--- SELECT r.id, v.id FROM r JOIN v ON r.id = v.rid AND AI.IF(PROMPT('q: {0}', r.body))
+    ---
+plan
+  __quail_call_1 = ai_filter('q: {0}', r.body), filter: __quail_call_1, returns: []
+asked 2 of 2
+  'q: {0}': r0 TRUE, r1 TRUE
+rows 2
+  r0, v0
+  r1, v1
+
+--- SELECT r.id, v.id FROM r LEFT JOIN v ON r.id = v.rid AND AI.IF(PROMPT('q: {0}',
+    r.body)) ---
+plan
+  __quail_call_1 = ai_filter('q: {0}', r.body)
+asked 2 of 2
+  'q: {0}': r0 TRUE, r1 TRUE
+rows 2
+  r0, v0
+  r1, v1
+
+--- SELECT r.id, v.id, AI.MAP(r.body, 'Name the vendor.', 16) AS m FROM r JOIN vendors v
+    ON v.name = AI.MAP(r.body, 'Name the vendor.', 16) ---
+plan
+  m = ai_map(r.body, 'Name the vendor.', Int64(16))
+asked 2 of 2
+  'Name the vendor.': r0 'Acme', r1 'Globex'
+rows 1
+  r0, n0, 'Acme'
+
+--- SELECT r.id, AI.IF(PROMPT('q: {0}', r.body)) AS k FROM r JOIN names v ON
+    AI.MAP(r.body, 'Name it.', 8) <> v.name ---
+plan
+  __quail_call_1 = ai_map(r.body, 'Name it.', Int64(8))
+  k = ai_filter('q: {0}', r.body)
+asked 4 of 4
+  'q: {0}': r0 TRUE, r1 TRUE
+  'Name it.': r0 'Acme', r1 'Globex'
+rows 2
+  r0, TRUE
+  r1, TRUE
+
+--- SELECT v.id FROM v WHERE EXISTS (SELECT 1 FROM r WHERE r.id = v.rid AND
+    AI.IF(PROMPT('q: {0}', r.body))) ---
+plan
+  __quail_answer_1 = ai_filter('q: {0}', r.body), filter: __quail_answer_1, fetch: 1 per
+      [id], returns: []
+asked 2 of 2
+  'q: {0}': r0 TRUE, r1 TRUE
+rows 2
+  v0
+  v1
+
+--- SELECT v.id FROM v WHERE NOT EXISTS (SELECT 1 FROM r WHERE r.id = v.rid AND
+    AI.IF(PROMPT('q: {0}', r.body))) ---
+plan
+  __quail_answer_1 = ai_filter('q: {0}', r.body), filter: __quail_answer_1, returns: []
+asked 2 of 2
+  'q: {0}': r0 TRUE, r1 TRUE
+rows 1
+  v2
+
+--- SELECT v.id, (SELECT COUNT(*) FROM r WHERE r.id = v.rid AND AI.IF(PROMPT('q: {0}',
+    r.body))) AS n FROM v ---
+plan
+  __quail_answer_1 = ai_filter('q: {0}', r.body), filter: __quail_answer_1, returns: []
+asked 2 of 2
+  'q: {0}': r0 TRUE, r1 TRUE
+rows 3
+  v0, 1
+  v1, 1
+  v2, 0
+""")
 
 
 def test_a_join_filter_keeps_a_document_while_it_keeps_one_of_its_copies(
@@ -515,7 +651,18 @@ def test_a_join_filter_keeps_a_document_while_it_keeps_one_of_its_copies(
     assert_transcript(_transcript(
         tables,
         "SELECT r.id, d.id FROM r JOIN d ON r.id = d.rid "
-        "WHERE r.stars >= 2 AND AI.IF(PROMPT('ok? {0}', d.name))"))
+        "WHERE r.stars >= 2 AND AI.IF(PROMPT('ok? {0}', d.name))"), """\
+--- SELECT r.id, d.id FROM r JOIN d ON r.id = d.rid WHERE r.stars >= 2 AND
+    AI.IF(PROMPT('ok? {0}', d.name)) ---
+plan
+  __quail_answer_1 = ai_filter('ok? {0}', d.name), filter: __quail_answer_1, returns: []
+asked 3 of 3
+  'ok? {0}': d0/d2 TRUE, d1 TRUE, d3 TRUE
+rows 3
+  r1, d1
+  r2, d2
+  r3, d3
+""")
 
 
 NULL_DOCUMENT_CALL = "AI.CLASSIFY(PROMPT('q: {0}', r.body), ['a', 'b'])"
@@ -535,7 +682,17 @@ def _null_document_transcript(*queries) -> str:
 
 def test_a_test_of_a_null_documents_label_keeps_the_null_row():
     assert_transcript(_null_document_transcript(
-        f"SELECT r.id FROM r WHERE {NULL_DOCUMENT_CALL} IS NULL"))
+        f"SELECT r.id FROM r WHERE {NULL_DOCUMENT_CALL} IS NULL"), """\
+--- SELECT r.id FROM r WHERE AI.CLASSIFY(PROMPT('q: {0}', r.body), ['a', 'b']) IS NULL
+    ---
+plan
+  __quail_column_1 = ai_classify('q: {0}', r.body, make_array('a', 'b')), filter:
+      __quail_column_1 IS NULL
+asked 1 of 1
+  'q: {0}': r0 'a'
+rows 1
+  r1
+""")
 
 
 def test_an_ai_call_of_a_null_document_is_null_and_asks_no_model():
@@ -550,4 +707,58 @@ def test_an_ai_call_of_a_null_document_is_null_and_asks_no_model():
         # a NULL written without a type is a NULL document too
         "SELECT AI.IF(PROMPT('q: {0}', NULL)) AS k",
         # v1 has no partner; its row has no document, so no answer
-        f"SELECT v.id, {call} AS c FROM r RIGHT JOIN v ON {call} = v.name"))
+        f"SELECT v.id, {call} AS c FROM r RIGHT JOIN v ON {call} = v.name"), """\
+--- SELECT r.id, AI.CLASSIFY(PROMPT('q: {0}', r.body), ['a', 'b']) AS c FROM r ---
+plan
+  c = ai_classify('q: {0}', r.body, make_array('a', 'b'))
+asked 1 of 1
+  'q: {0}': r0 'a'
+rows 2
+  r0, 'a'
+  r1, NULL
+
+--- SELECT r.id FROM r WHERE AI.IF(PROMPT('q: {0}', r.body)) ---
+plan
+  __quail_answer_1 = ai_filter('q: {0}', r.body), filter: __quail_answer_1, returns: []
+asked 1 of 1
+  'q: {0}': r0 TRUE
+rows 1
+  r0
+
+--- SELECT r.id FROM r WHERE NOT AI.IF(PROMPT('q: {0}', r.body)) ---
+plan
+  __quail_answer_1 = ai_filter('q: {0}', r.body), filter: NOT __quail_answer_1, returns:
+      []
+asked 1 of 1
+  'q: {0}': r0 TRUE
+rows 0
+
+--- SELECT r.id, v.id, AI.SCORE(PROMPT('q: {0} {1}', r.body, v.name)) AS s FROM r CROSS
+    JOIN v ---
+plan
+  s = ai_score('q: {0} {1}', r.body, v.name)
+asked 2 of 2
+  'q: {0} {1}': r0+v0 0.5, r0+v1 0.5
+rows 4
+  r0, v0, 0.5
+  r0, v1, 0.5
+  r1, v0, NULL
+  r1, v1, NULL
+
+--- SELECT AI.IF(PROMPT('q: {0}', NULL)) AS k ---
+plan
+  k = ai_filter('q: {0}', __quail_rows_1.column_0)
+asked 0 of 0
+rows 1
+  NULL
+
+--- SELECT v.id, AI.CLASSIFY(PROMPT('q: {0}', r.body), ['a', 'b']) AS c FROM r RIGHT
+    JOIN v ON AI.CLASSIFY(PROMPT('q: {0}', r.body), ['a', 'b']) = v.name ---
+plan
+  c = ai_classify('q: {0}', r.body, make_array('a', 'b'))
+asked 1 of 1
+  'q: {0}': r0 'a'
+rows 2
+  v0, 'a'
+  v1, NULL
+""")

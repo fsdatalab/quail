@@ -1,6 +1,6 @@
 """AI.EXTRACT: the operator surface, its prompt, and its plan.
 
-The transcript tests' expected text is in transcripts/: the plan's AI
+Each transcript test holds its expected transcript: the plan's AI
 operators, the questions the model answered, and the rows
 (helpers/transcript.py).
 """
@@ -284,7 +284,67 @@ def test_an_extraction_returns_each_fields_answer_and_span():
                   "ORDER BY c.id LIMIT 1")
     assert_transcript(_transcript(both, top, scored, top_answer,
                                   columns=(both, top, scored),
-                                  ordered=(top, top_answer)))
+                                  ordered=(top, top_answer)), """\
+--- SELECT c.id, AI.EXTRACT(c.text, {'ends': 'When does the lease end?', 'rent': 'What
+    is the rent?'}) AS lease, AI.EXTRACT_SPAN(c.text, {'ends': 'When does the lease
+    end?', 'rent': 'What is the rent?'}) AS lease_span FROM contracts c ---
+plan
+  lease = ai_extract(c.text, named_struct('ends', 'When does the lease end?', 'rent',
+      'What is the rent?'))
+asked 8 of 8
+  'When does the lease end?': c1 'March 3, 2027', c2 NULL, c3 'March 3, 2027', c4 NULL
+  'What is the rent?': c1 '$2,000', c2 NULL, c3 NULL, c4 NULL
+columns c.id string, lease struct<ends: string, rent: string>, lease_span struct<ends:
+    struct<start: int32, end: int32>, rent: struct<start: int32, end: int32>>
+rows 4
+  c1, {'ends': 'March 3, 2027', 'rent': '$2,000'}, {'ends': {'start': 14, 'end': 27},
+      'rent': {'start': 37, 'end': 43}}
+  c2, {'ends': None, 'rent': None}, {'ends': None, 'rent': None}
+  c3, {'ends': 'March 3, 2027', 'rent': None}, {'ends': {'start': 13, 'end': 26},
+      'rent': None}
+  c4, {'ends': None, 'rent': None}, {'ends': None, 'rent': None}
+
+--- SELECT c.id, AI.EXTRACT(c.text, {'ends': 'When does the lease end?', 'rent': 'What
+    is the rent?'}) AS lease, AI.EXTRACT_SPAN(c.text, {'ends': 'When does the lease
+    end?', 'rent': 'What is the rent?'}) AS lease_span FROM contracts c ORDER BY c.id
+    DESC LIMIT 1 ---
+plan
+  lease = ai_extract(c.column_1, named_struct('ends', 'When does the lease end?',
+      'rent', 'What is the rent?'))
+asked 2 of 8
+  'When does the lease end?': c4 NULL
+  'What is the rent?': c4 NULL
+columns c.id string, lease struct<ends: string, rent: string>, lease_span struct<ends:
+    struct<start: int32, end: int32>, rent: struct<start: int32, end: int32>>
+rows 1, in order
+  c4, {'ends': None, 'rent': None}, {'ends': None, 'rent': None}
+
+--- SELECT c.id, AI.SCORE(PROMPT('Is this a lease? {0}', c.text)) AS score,
+    AI.EXTRACT(c.text, {'ends': 'When does the lease end?'}) AS lease,
+    AI.EXTRACT_SPAN(c.text, {'ends': 'When does the lease end?'}) AS lease_span FROM
+    contracts c WHERE AI.SCORE(PROMPT('Is this a lease? {0}', c.text)) > 0.25 ---
+plan
+  lease = ai_extract(c.text, named_struct('ends', 'When does the lease end?'))
+  score = ai_score('Is this a lease? {0}', c.text), filter: score > Float64(0.25)
+asked 6 of 6
+  'Is this a lease? {0}': c1 0.125, c2 0.25, c3 0.375, c4 0.5
+  'When does the lease end?': c3 'March 3, 2027', c4 NULL
+columns c.id string, score double, lease struct<ends: string>, lease_span struct<ends:
+    struct<start: int32, end: int32>>
+rows 2
+  c3, 0.375, {'ends': 'March 3, 2027'}, {'ends': {'start': 13, 'end': 26}}
+  c4, 0.5, {'ends': None}, {'ends': None}
+
+--- SELECT c.id, AI.EXTRACT(c.text, {'ends': 'When does the lease end?'}) AS lease FROM
+    contracts c ORDER BY c.id LIMIT 1 ---
+plan
+  lease = ai_extract(c.column_1, named_struct('ends', 'When does the lease end?')),
+      returns: [lease]
+asked 1 of 4
+  'When does the lease end?': c1 'March 3, 2027'
+rows 1, in order
+  c1, {'ends': 'March 3, 2027'}
+""")
 
 
 def test_an_extraction_of_no_rows_returns_no_rows(session):
@@ -297,7 +357,33 @@ def test_a_span_column_runs_with_or_without_a_matching_extraction():
     assert_transcript(_transcript(*(
         f"SELECT c.id AS contract_id, {other}"
         "AI.EXTRACT_SPAN(c.text, {'ends': 'Why?'}) AS lease_span FROM contracts c"
-        for other in ("", "AI.EXTRACT(c.text, {'ends': 'When?'}) AS lease, "))))
+        for other in ("", "AI.EXTRACT(c.text, {'ends': 'When?'}) AS lease, "))), """\
+--- SELECT c.id AS contract_id, AI.EXTRACT_SPAN(c.text, {'ends': 'Why?'}) AS lease_span
+    FROM contracts c ---
+plan
+  lease = ai_extract(c.text, named_struct('ends', 'Why?'))
+asked 4 of 4
+  'Why?': c1 'Rent', c2 NULL, c3 NULL, c4 NULL
+rows 4
+  c1, {'ends': {'start': 29, 'end': 33}}
+  c2, {'ends': None}
+  c3, {'ends': None}
+  c4, {'ends': None}
+
+--- SELECT c.id AS contract_id, AI.EXTRACT(c.text, {'ends': 'When?'}) AS lease,
+    AI.EXTRACT_SPAN(c.text, {'ends': 'Why?'}) AS lease_span FROM contracts c ---
+plan
+  __quail_column_1 = ai_extract(c.text, named_struct('ends', 'Why?'))
+  lease = ai_extract(c.text, named_struct('ends', 'When?')), returns: [lease]
+asked 8 of 8
+  'When?': c1 'March 3, 2027', c2 NULL, c3 'March 3, 2027', c4 NULL
+  'Why?': c1 'Rent', c2 NULL, c3 NULL, c4 NULL
+rows 4
+  c1, {'ends': 'March 3, 2027'}, {'ends': {'start': 29, 'end': 33}}
+  c2, {'ends': None}, {'ends': None}
+  c3, {'ends': 'March 3, 2027'}, {'ends': None}
+  c4, {'ends': None}, {'ends': None}
+""")
 
 
 def test_tests_of_answers_keep_the_documents_whose_answers_pass():
@@ -314,7 +400,52 @@ def test_tests_of_answers_keep_the_documents_whose_answers_pass():
         f"WHERE NOT ({LEASE_ENDS}['ends'] LIKE 'March%')",
         # SPLIT_PART is DataFusion's; Arrow compute has no such function
         "SELECT c.id FROM contracts c WHERE SPLIT_PART(AI.EXTRACT(c.text, "
-        "{'ends': 'When does it end?'})['ends'], ' ', 1) = 'March'"))
+        "{'ends': 'When does it end?'})['ends'], ' ', 1) = 'March'"), """\
+--- SELECT c.id, AI.EXTRACT(c.text, {'ends': 'When does the lease end?', 'rent': 'How
+    much?'}) AS lease FROM contracts c WHERE HINT(AI.EXTRACT(c.text, {'ends': 'When does
+    the lease end?', 'rent': 'How much?'})['ends'] IS NOT NULL, {'selectivity': 0.5})
+    AND HINT(AI.EXTRACT(c.text, {'ends': 'When does the lease end?', 'rent': 'How
+    much?'})['ends'] ILIKE '%march%', {'selectivity': 0.5}) AND
+    HINT(AI.EXTRACT_SPAN(c.text, {'ends': 'When does the lease end?', 'rent': 'How
+    much?'})['ends']['start'] < 20, {'selectivity': 0.5}) AND
+    HINT(LENGTH(AI.EXTRACT(c.text, {'ends': 'When does the lease end?', 'rent': 'How
+    much?'})['rent']) < 20, {'selectivity': 0.5}) ---
+plan
+  lease = ai_extract(c.text, named_struct('ends', 'When does the lease end?', 'rent',
+      'How much?')), filter: hint(get_field(lease, 'ends') IS NOT NULL,
+      named_struct('selectivity', Float64(0.5))) AND hint(get_field(lease, 'ends') ILIKE
+      '%march%', named_struct('selectivity', Float64(0.5))) AND
+      hint(get_field(lease_span, 'ends', 'start') < Int32(20),
+      named_struct('selectivity', Float64(0.5))) AND
+      hint(character_length(get_field(lease, 'rent')) < Int32(20),
+      named_struct('selectivity', Float64(0.5))), returns: [lease]
+asked 6 of 6
+  'When does the lease end?': c1 'March 3, 2027', c2 NULL, c3 'March 3, 2027', c4 NULL
+  'How much?': c1 '$2,000', c3 NULL
+rows 1
+  c1, {'ends': 'March 3, 2027', 'rent': '$2,000'}
+
+--- SELECT c.id, AI.EXTRACT(c.text, {'ends': 'When does the lease end?'}) AS lease FROM
+    contracts c WHERE NOT (AI.EXTRACT(c.text, {'ends': 'When does the lease
+    end?'})['ends'] LIKE 'March%') ---
+plan
+  lease = ai_extract(c.text, named_struct('ends', 'When does the lease end?')), filter:
+      get_field(lease, 'ends') NOT LIKE 'March%', returns: [lease]
+asked 4 of 4
+  'When does the lease end?': c1 'March 3, 2027', c2 NULL, c3 'March 3, 2027', c4 NULL
+rows 0
+
+--- SELECT c.id FROM contracts c WHERE SPLIT_PART(AI.EXTRACT(c.text, {'ends': 'When does
+    it end?'})['ends'], ' ', 1) = 'March' ---
+plan
+  __quail_column_1 = ai_extract(c.text, named_struct('ends', 'When does it end?')),
+      filter: split_part(get_field(__quail_column_1, 'ends'), ' ', Int64(1)) = 'March',
+      returns: [__quail_column_1]
+asked 4 of 4
+  'When does it end?': c1 'March 3, 2027', c2 'June 1, 2030', c3 NULL, c4 NULL
+rows 1
+  c1
+""")
 
 
 def test_not_and_or_of_answers_labels_and_columns_keep_the_rows_sql_would():
@@ -331,7 +462,84 @@ def test_not_and_or_of_answers_labels_and_columns_keep_the_rows_sql_would():
         # a label and an extracted answer
         f"SELECT c.id AS contract_id, {kind} AS kind, {LEASE_ENDS} AS lease "
         f"FROM contracts c WHERE {kind} = 'lease' "
-        f"OR {LEASE_ENDS}['ends'] IS NULL"))
+        f"OR {LEASE_ENDS}['ends'] IS NULL"), """\
+--- SELECT c.id, AI.EXTRACT(c.text, {'ends': 'When does the lease end?', 'rent': 'How
+    much?'}) AS lease FROM contracts c WHERE NOT (AI.EXTRACT(c.text, {'ends': 'When does
+    the lease end?', 'rent': 'How much?'})['ends'] IS NULL OR AI.EXTRACT_SPAN(c.text,
+    {'ends': 'When does the lease end?', 'rent': 'How much?'})['ends']['start'] < 0) ---
+plan
+  lease = ai_extract(c.text, named_struct('ends', 'When does the lease end?', 'rent',
+      'How much?')), filter: get_field(lease, 'ends') IS NOT NULL AND
+      get_field(lease_span, 'ends', 'start') >= Int32(0), returns: [lease]
+asked 6 of 6
+  'When does the lease end?': c1 'March 3, 2027', c2 NULL, c3 'March 3, 2027', c4 NULL
+  'How much?': c1 '$2,000', c3 NULL
+rows 2
+  c1, {'ends': 'March 3, 2027', 'rent': '$2,000'}
+  c3, {'ends': 'March 3, 2027', 'rent': None}
+
+--- SELECT c.id, AI.EXTRACT(c.text, {'ends': 'When does the lease end?', 'rent': 'How
+    much?'}) AS lease FROM contracts c WHERE AI.EXTRACT(c.text, {'ends': 'When does the
+    lease end?', 'rent': 'How much?'})['ends'] IS NULL OR AI.EXTRACT_SPAN(c.text,
+    {'ends': 'When does the lease end?', 'rent': 'How much?'})['ends']['start'] >= 0 ---
+plan
+  lease = ai_extract(c.text, named_struct('ends', 'When does the lease end?', 'rent',
+      'How much?')), filter: get_field(lease, 'ends') IS NULL OR get_field(lease_span,
+      'ends', 'start') >= Int32(0), returns: [lease]
+asked 8 of 8
+  'When does the lease end?': c1 'March 3, 2027', c2 NULL, c3 'March 3, 2027', c4 NULL
+  'How much?': c1 '$2,000', c2 NULL, c3 NULL, c4 NULL
+rows 4
+  c1, {'ends': 'March 3, 2027', 'rent': '$2,000'}
+  c2, {'ends': None, 'rent': None}
+  c3, {'ends': 'March 3, 2027', 'rent': None}
+  c4, {'ends': None, 'rent': None}
+
+--- SELECT c.id, AI.EXTRACT(c.text, {'ends': 'When does the lease end?', 'rent': 'How
+    much?'}) AS lease FROM contracts c WHERE NOT (AI.EXTRACT(c.text, {'ends': 'When does
+    the lease end?', 'rent': 'How much?'})['ends'] IS NULL AND c.id = 'c2') ---
+plan
+  lease = ai_extract(c.text, named_struct('ends', 'When does the lease end?', 'rent',
+      'How much?')), filter: get_field(lease, 'ends') IS NOT NULL OR c.id != 'c2',
+      returns: [lease]
+asked 7 of 7
+  'When does the lease end?': c1 'March 3, 2027', c2 NULL, c3 'March 3, 2027', c4 NULL
+  'How much?': c1 '$2,000', c3 NULL, c4 NULL
+rows 3
+  c1, {'ends': 'March 3, 2027', 'rent': '$2,000'}
+  c3, {'ends': 'March 3, 2027', 'rent': None}
+  c4, {'ends': None, 'rent': None}
+
+--- SELECT c.id, AI.EXTRACT(c.text, {'ends': 'When does the lease end?', 'rent': 'How
+    much?'}) AS lease FROM contracts c WHERE AI.EXTRACT(c.text, {'ends': 'When does the
+    lease end?', 'rent': 'How much?'})['ends'] = 'x' OR AI.EXTRACT(c.text, {'ends':
+    'When does the lease end?', 'rent': 'How much?'})['rent'] IS NOT NULL ---
+plan
+  lease = ai_extract(c.text, named_struct('ends', 'When does the lease end?', 'rent',
+      'How much?')), filter: get_field(lease, 'ends') = 'x' OR get_field(lease, 'rent')
+      IS NOT NULL, returns: [lease]
+asked 8 of 8
+  'How much?': c1 '$2,000', c2 NULL, c3 NULL, c4 NULL
+  'When does the lease end?': c1 'March 3, 2027', c2 NULL, c3 'March 3, 2027', c4 NULL
+rows 1
+  c1, {'ends': 'March 3, 2027', 'rent': '$2,000'}
+
+--- SELECT c.id AS contract_id, AI.CLASSIFY(c.text, ['lease', 'deed']) AS kind,
+    AI.EXTRACT(c.text, {'ends': 'When does the lease end?'}) AS lease FROM contracts c
+    WHERE AI.CLASSIFY(c.text, ['lease', 'deed']) = 'lease' OR AI.EXTRACT(c.text,
+    {'ends': 'When does the lease end?'})['ends'] IS NULL ---
+plan
+  lease = ai_extract(c.text, named_struct('ends', 'When does the lease end?')), returns:
+      [lease]
+  kind = ai_classify(c.text, make_array('lease', 'deed'))
+asked 8 of 8
+  '?': c1 'lease', c2 'lease', c3 'deed', c4 'deed'
+  'When does the lease end?': c1 'March 3, 2027', c2 NULL, c3 'March 3, 2027', c4 NULL
+rows 3
+  c1, 'lease', {'ends': 'March 3, 2027'}
+  c2, 'lease', {'ends': None}
+  c4, 'deed', {'ends': None}
+""")
 
 
 def test_tests_of_answers_follow_the_extraction_they_read(session):

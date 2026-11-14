@@ -1,8 +1,7 @@
 {
-  "title": "Contributing",
+  "title": "Developers",
   "pages": [
-    "index",
-    "benchmark"
+    "index"
   ],
   "defaultOpen": false
 }

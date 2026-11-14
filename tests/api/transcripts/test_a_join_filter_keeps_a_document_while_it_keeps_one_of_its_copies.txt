@@ -1,9 +1,0 @@
---- SELECT r.id, d.id FROM r JOIN d ON r.id = d.rid WHERE r.stars >= 2 AND AI.IF(PROMPT('ok? {0}', d.name)) ---
-plan
-  __quail_answer_1 = ai_filter('ok? {0}', d.name), filter: __quail_answer_1, returns: []
-asked 3 of 3
-  'ok? {0}': d0/d2 TRUE, d1 TRUE, d3 TRUE
-rows 3
-  r1, d1
-  r2, d2
-  r3, d3

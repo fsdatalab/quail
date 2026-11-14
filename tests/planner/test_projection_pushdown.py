@@ -167,4 +167,63 @@ def test_an_extraction_returns_and_asks_only_what_the_query_reads():
             # a field read through a renamed answer
             f"SELECT y.id, y.f.w AS w FROM (SELECT x.id, x.e AS f FROM {nested}) y",
             # the answer read whole asks every field
-            f"SELECT x.id, x.e FROM {nested}")))
+            f"SELECT x.id, x.e FROM {nested}")), """\
+--- SELECT x.id, x.e FROM (SELECT r.id, AI_EXTRACT(r.body, {'w': 'which?'}) AS e FROM
+    reviews r) x ---
+plan
+  e = ai_extract(r.body, named_struct('w', 'which?')), returns: [e]
+asked 3 of 3
+  'which?': r0 'ab', r1 NULL, r2 'ab'
+rows 3
+  r0, {'w': 'ab'}
+  r1, {'w': None}
+  r2, {'w': 'ab'}
+
+--- SELECT r.id, AI_EXTRACT(r.body, {'w': 'which?'}) AS e, AI_EXTRACT_SPAN(r.body, {'w':
+    'which?'}) AS e_span FROM reviews r ---
+plan
+  e = ai_extract(r.body, named_struct('w', 'which?'))
+asked 3 of 3
+  'which?': r0 'ab', r1 NULL, r2 'ab'
+rows 3
+  r0, {'w': 'ab'}, {'w': {'start': 0, 'end': 2}}
+  r1, {'w': None}, {'w': None}
+  r2, {'w': 'ab'}, {'w': {'start': 0, 'end': 2}}
+
+--- SELECT x.id, x.e.w AS w FROM (SELECT r.id, AI_EXTRACT(r.body, {'w': 'which?', 'v':
+    'what?', 'u': 'who?'}) AS e FROM reviews r) x ---
+plan
+  e = ai_extract(r.body, named_struct('w', 'which?')), returns: [e]
+asked 3 of 9
+  'which?': r0 'ab', r1 NULL, r2 'ab'
+rows 3
+  r0, 'ab'
+  r1, NULL
+  r2, 'ab'
+
+--- SELECT y.id, y.f.w AS w FROM (SELECT x.id, x.e AS f FROM (SELECT r.id,
+    AI_EXTRACT(r.body, {'w': 'which?', 'v': 'what?', 'u': 'who?'}) AS e FROM reviews r)
+    x) y ---
+plan
+  e = ai_extract(r.body, named_struct('w', 'which?')), returns: [e]
+asked 3 of 9
+  'which?': r0 'ab', r1 NULL, r2 'ab'
+rows 3
+  r0, 'ab'
+  r1, NULL
+  r2, 'ab'
+
+--- SELECT x.id, x.e FROM (SELECT r.id, AI_EXTRACT(r.body, {'w': 'which?', 'v': 'what?',
+    'u': 'who?'}) AS e FROM reviews r) x ---
+plan
+  e = ai_extract(r.body, named_struct('w', 'which?', 'v', 'what?', 'u', 'who?')),
+      returns: [e]
+asked 9 of 9
+  'which?': r0 'ab', r1 NULL, r2 'ab'
+  'what?': r0 'x', r1 NULL, r2 'y'
+  'who?': r0 'ab x', r1 NULL, r2 'ab y'
+rows 3
+  r0, {'w': 'ab', 'v': 'x', 'u': 'ab x'}
+  r1, {'w': None, 'v': None, 'u': None}
+  r2, {'w': 'ab', 'v': 'y', 'u': 'ab y'}
+""")
