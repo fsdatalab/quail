@@ -31,6 +31,8 @@ from _quail_native import IMAGE_TOKEN_BASE, IMAGE_TOKEN_PIXELS
 PATCH_PIXELS = 16
 TEMPORAL_PATCH = 2
 MERGE = IMAGE_TOKEN_PIXELS // PATCH_PIXELS
+# threads that decode a region's PNGs ahead of the vision encoder
+DECODE_THREADS = 8
 
 
 @dataclass(frozen=True)
@@ -141,6 +143,15 @@ class RegionImages:
             self.firsts[alias] = firsts
         order = sorted(self.images)
         self._sorted = np.asarray(order, dtype=np.int64)
+        # each image's pixels, decoded off the GPU loop's thread
+        self._pool = None
+        self._pixels: dict = {}
+        if self.images:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._pool = ThreadPoolExecutor(max_workers=DECODE_THREADS)
+            self._pixels = {first: self._pool.submit(decode_png, image.png)
+                            for first, image in self.images.items()}
         self._embeddings: dict[int, object] = {}
         # by arena key, and by image, the position of the image's first token
         self._starts: dict = {}
@@ -148,6 +159,14 @@ class RegionImages:
 
     def __bool__(self) -> bool:
         return bool(self.images)
+
+    def close(self) -> None:
+        """Stop decoding and drop every image's pixels and embeddings."""
+        if self._pool is not None:
+            self._pool.shutdown(wait=False, cancel_futures=True)
+            self._pool = None
+        self._pixels.clear()
+        self._embeddings.clear()
 
     def image_of(self, token: int) -> Image:
         """The image a token id belongs to."""
@@ -205,7 +224,10 @@ class RegionImages:
         device = visual_device(visual)
         patches, grids = [], []
         for first in firsts:
-            rgb = torch.from_numpy(decode_png(self.images[first].png).copy()).to(device)
+            pixels = self._pixels.pop(first, None)
+            pixels = (decode_png(self.images[first].png) if pixels is None
+                      else pixels.result())
+            rgb = torch.from_numpy(pixels.copy()).to(device)
             found, grid = pixel_patches(torch, rgb)
             patches.append(found)
             grids.append(grid)

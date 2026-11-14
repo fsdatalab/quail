@@ -317,6 +317,26 @@ Result: `(2)`.
 - A comparison drops `NULL` answers. Use `IS NULL` to keep them.
 - `LIMIT` stops the model once enough rows pass.
 
+## Page images
+
+A model with a vision tower, such as `qwen3.5-4b-fp8`, reads a `BINARY`
+column of PNG images as a document, in place of text. Each image's
+sides must be multiples of 32 pixels: the model reads one image token
+per 32 by 32 pixels. `AI.PDF_PAGES` renders PDF pages that way.
+
+```sql
+SELECT p.contract_id, p.page
+FROM pages p
+WHERE AI.IF(PROMPT('Does this page cap either party''s liability? {0}', p.image));
+```
+
+- `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, and `AI.MAP` read images.
+  `AI.EXTRACT` copies its answers from a document's text, so it refuses
+  an image; read the page's text with `AI.PARSE_DOCUMENT` instead.
+- Quail encodes each distinct image once per query and asks every
+  question of a page from the same image tokens.
+- A page of 1,024 by 768 pixels is 768 image tokens.
+
 ## NULL documents
 
 An AI function returns `NULL` for a `NULL` document and does not ask

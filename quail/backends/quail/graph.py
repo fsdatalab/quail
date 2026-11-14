@@ -176,7 +176,8 @@ def serve_region(state, payload, graph: PhysicalGraph, end, wanted,
         # the region is timed until its end, so the files fall inside it
         arena.write_trace_files()
     finally:
-        if hasattr(pipeline, "images"):
+        if getattr(pipeline, "images", None) is not None:
+            pipeline.images.close()
             pipeline.images = None
         for key in arena.resident_keys():
             arena.free_key(key)

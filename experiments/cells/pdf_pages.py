@@ -73,11 +73,61 @@ def queries() -> dict[str, str]:
     return found
 
 
+# the synthetic subset: pages of drawn text, each a clause or not, which
+# checks the image path without PDFs
+SYNTHETIC_PAGES = {
+    "Governing Law": "This Agreement shall be governed by and construed in "
+                     "accordance with the laws of the State of Delaware.",
+    "Termination For Convenience": "Either party may terminate this Agreement "
+                                   "at any time, for any reason, upon thirty "
+                                   "days written notice.",
+    "Cap On Liability": "In no event shall either party's aggregate liability "
+                        "exceed the fees paid in the twelve months before the "
+                        "claim.",
+    "Expiration Date": "This Agreement shall remain in effect for a term of "
+                       "three years from the Effective Date.",
+    None: "The Supplier shall deliver the Products to the Buyer's warehouse "
+          "in the quantities set out in each purchase order.",
+}
+
+
+def synthetic_pages(edge: int):
+    """Pages of drawn text, and their labels: each clause once per size."""
+    import io
+    import textwrap
+
+    import pyarrow as pa
+    from PIL import Image, ImageDraw, ImageFont
+
+    font = ImageFont.load_default(size=28)
+    rows, labels = [], []
+    for size_index, (width, height) in enumerate(
+            [(edge * 3 // 4 // 32 * 32, edge), (edge, edge * 3 // 4 // 32 * 32)]):
+        for index, (category, text) in enumerate(SYNTHETIC_PAGES.items()):
+            page = Image.new("RGB", (width, height), "white")
+            draw = ImageDraw.Draw(page)
+            draw.multiline_text((48, 64), textwrap.fill(text, 40), fill="black",
+                                font=font, spacing=12)
+            out = io.BytesIO()
+            page.save(out, format="PNG")
+            contract = f"s{size_index}"
+            rows.append({"id": f"{contract}/{index + 1}", "contract_id": contract,
+                         "page": index + 1, "image": out.getvalue()})
+            for known in QUESTIONS:
+                labels.append({"contract_id": contract, "page": index + 1,
+                               "category": known, "present": known == category})
+    return pa.Table.from_pylist(rows), labels
+
+
 def _rendered_pages(session, subset: str, edge: int):
     """The subset's pages as PNG images, and the seconds rendering took."""
     import pyarrow.parquet as pq
 
     import quail
+
+    if subset == "synthetic":
+        started = time.perf_counter()
+        return synthetic_pages(edge)[0], time.perf_counter() - started
 
     contracts = pq.read_table(f"{RESULTS}/cuad_pdf/{subset}/contracts.parquet")
     session.register("contracts", quail.DocumentProvider.from_table(
@@ -102,8 +152,8 @@ def run_backend(backend: str, model: str, subset: str, edge: int,
     config = quail.EngineConfig(model=model, device="h100-sxm", backend=backend)
     record = {"backend": backend, "model": model, "subset": subset,
               "longest_edge": edge, "queries": {}}
-    labels = pq.read_table(
-        f"{RESULTS}/cuad_pdf/{subset}/page_labels.parquet").to_pylist()
+    labels = (synthetic_pages(edge)[1] if subset == "synthetic" else pq.read_table(
+        f"{RESULTS}/cuad_pdf/{subset}/page_labels.parquet").to_pylist())
     with quail.Session(config) as session:
         pages, render_s = _rendered_pages(session, subset, edge)
         record.update(pages=pages.num_rows, render_s=round(render_s, 2))
