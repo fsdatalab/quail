@@ -140,15 +140,16 @@ fn is_score_test(term: &Expr) -> bool {
     })
 }
 
-/// The `AI.IF` calls of a term that asks the model nothing else and has
-/// no subquery, in written order: `AI.IF(...)` itself, or any expression
-/// of such calls and the input's columns, such as `NOT AI.IF(...)` or
-/// `r.flagged OR AI.IF(...)`. None for any other term.
+/// The `AI.IF` and `AI.SCORE` calls of a term that asks the model
+/// nothing else and has no subquery, in written order: `AI.IF(...)`
+/// itself, or any expression of such calls and the input's columns, such
+/// as `NOT AI.IF(...)`, `r.flagged OR AI.IF(...)`, or `AI.SCORE(...) >
+/// 0.5`. None for any other term.
 fn filter_calls(term: &Expr) -> Option<Vec<Expr>> {
     let mut calls: Vec<Expr> = Vec::new();
     let mut other = false;
     let _ = term.apply(|found| {
-        if function_name(found) == Some("ai_filter") {
+        if matches!(function_name(found), Some("ai_filter" | "ai_score")) {
             if !calls.contains(found) {
                 calls.push(found.clone());
             }
@@ -266,10 +267,9 @@ fn asked_node(
 
 /// Stack the `AiNode`s of each asked term on `input`, in written order.
 ///
-/// A term of `AI.IF` answers is one node per call, each returning its
-/// answer, below a `Filter` of the term with each answer in its call's
-/// place. A comparison of an `AI.SCORE` call is one node whose filter
-/// is the comparison.
+/// A term of `AI.IF` or `AI.SCORE` answers is one node per call, each
+/// returning its answer, below a `Filter` of the term with each answer
+/// in its call's place.
 ///
 /// `on` is the alias of the table whose JOIN's ON holds the terms, or
 /// None for a WHERE.
@@ -300,7 +300,11 @@ fn stack_asked(
         };
         let (mut test, hint) = unhint(&term);
         for (number, call) in calls.iter().enumerate() {
-            let (answer, index) = columns.answer_name();
+            let (mut answer, index) = columns.answer_name();
+            // a call the SELECT list also returns takes its name there
+            if columns.selected.iter().any(|(found, _)| found == call) {
+                answer = columns.name_for(call, input.schema());
+            }
             let read = Expr::Column(Column::from_name(answer.clone()));
             let mut node = answer_node(input, call, (answer, index), &written)?;
             if number + 1 == calls.len() {

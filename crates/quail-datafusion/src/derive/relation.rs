@@ -519,7 +519,9 @@ fn bind_answers(
             calls: Vec::new(),
             fields: Vec::new(),
         };
-        if node.is_predicate() {
+        // a tested score that returns its score is also a score column
+        let returned_score = node.function() == "ai_score" && !node.returned_fields().is_empty();
+        if node.is_predicate() && !returned_score {
             let tables: Vec<String> = walk.call_tables(&node.call).into_iter().collect();
             if node.function() != "ai_filter" || node.filter.is_some() || tables.len() != 1 {
                 continue;

@@ -24,8 +24,7 @@ rows 1, in order
 --- SELECT c.id, AI.SCORE(PROMPT('Is this a lease? {0}', c.text)) AS score, AI.EXTRACT(c.text, {'ends': 'When does the lease end?'}) AS lease, AI.EXTRACT_SPAN(c.text, {'ends': 'When does the lease end?'}) AS lease_span FROM contracts c WHERE AI.SCORE(PROMPT('Is this a lease? {0}', c.text)) > 0.25 ---
 plan
   lease = ai_extract(c.text, named_struct('ends', 'When does the lease end?'))
-  score = ai_score('Is this a lease? {0}', c.text)
-  __quail_answer_1 = ai_score('Is this a lease? {0}', c.text), filter: __quail_answer_1 > Float64(0.25), returns: []
+  score = ai_score('Is this a lease? {0}', c.text), filter: score > Float64(0.25)
 asked 6 of 6
   'Is this a lease? {0}': c1 0.125, c2 0.25, c3 0.375, c4 0.5
   'When does the lease end?': c3 'March 3, 2027', c4 NULL

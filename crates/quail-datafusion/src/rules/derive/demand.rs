@@ -858,6 +858,10 @@ fn project(node: &mut AiNode, above: &Demand) -> Option<(String, bool)> {
         return None;
     }
     let returns_answer = (node.returned_fields().iter()).any(|field| *field.name() == node.answer);
+    // a score only its own test reads returns nothing
+    if node.function() == "ai_score" && returns_answer && !read(&node.answer) {
+        node.projection = Some(Vec::new());
+    }
     if node.function() != "ai_filter" || !returns_answer {
         return None;
     }
