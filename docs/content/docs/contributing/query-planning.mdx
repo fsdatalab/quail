@@ -2,21 +2,12 @@
 title: Planner overview
 ---
 
-Quail's planner changes how a query runs without changing what the query
-asks. Quail can reorder AI operators, share prefixes and KV, choose an
-attention path, and stop after enough rows pass. Quail does not rewrite
-prompts or split AI functions into new tasks. Quail also does not estimate
-output quality to trade accuracy for cost.
-
+Quail performs physical query optimization: it reorders AI operators and
+reuses KV while preserving the SQL result for the same AI answers. Quail does
+not rewrite prompts or compare output quality, unlike semantic and
+approximate optimizers such as
 [DocETL (Shankar et al., 2025)](https://www.vldb.org/pvldb/vol18/p3035-shankar.pdf)
-and [MOAR (Wei, Shankar, et al., 2026)](https://arxiv.org/abs/2512.02289)
-perform semantic and approximate query optimization. The systems rewrite LLM
-operations and compare plans with estimated output quality. Quail instead
-performs physical query optimization: every rewrite preserves the SQL result
-for the same AI answers.
-
-DataFusion plans and runs the relational operators. Quail plans and runs the
-AI operators.
+and [MOAR (Wei, Shankar, et al., 2026)](https://arxiv.org/abs/2512.02289).
 
 ## Architecture
 
