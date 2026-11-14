@@ -13,9 +13,7 @@ title: Developers
 
 ## Build Quail
 
-Install [uv](https://docs.astral.sh/uv/) and
-[rustup](https://rustup.rs). Linux x86_64 also needs clang and lld.
-Quail uses Python 3.12.
+Install [uv](https://docs.astral.sh/uv/). Quail uses Python 3.12.
 
 ```bash
 git clone https://github.com/fsdatalab/quail.git
@@ -23,7 +21,17 @@ cd quail
 tools/build.sh
 ```
 
-Run `tools/build.sh` again after each Rust edit.
+`tools/build.sh` installs the Python package from your checkout and the
+Rust module `_quail_native`. The script downloads a prebuilt module when
+CI has built one for your checkout's Rust sources, so you need no Rust
+compiler to work on the Python code. Run your tools with
+`uv run --no-sync` after a prebuilt install.
+
+Edit Rust, and you compile the module yourself. Install
+[rustup](https://rustup.rs), and clang and lld on Linux x86_64, then
+run `tools/build.sh --compile`. The first build compiles DataFusion and
+takes about 20 minutes on 4 cores; later builds reuse the compiled
+dependencies. Run `tools/build.sh --compile` again after each Rust edit.
 
 ## How Quail plans a query
 
@@ -58,6 +66,45 @@ rules decide what each AI call asks the model. Quail then plans each
 | Executor | `crates/quail/` and `quail/backends/quail/` |
 
 `query.explain()` prints the plan the steps produce.
+
+## Add Quail to your own DataFusion session
+
+A Rust program with its own DataFusion functions and rules can add
+Quail's AI functions beside them. Depend on the `quail-datafusion`
+crate and on DataFusion 55.2, the version Quail builds against:
+
+```toml
+[dependencies]
+datafusion = "55.2.0"
+quail-datafusion = { git = "https://github.com/fsdatalab/quail" }
+```
+
+`QuailExtension::register` adds the AI functions, Quail's optimizer
+rules, and Quail's query planner to your `SessionState`:
+
+```rust
+let host = SessionStateBuilder::new()
+    .with_default_features()
+    .with_optimizer_rule(Arc::new(MyRule))
+    .build();
+let state = QuailExtension::new(runner).register(host)?;
+let context = SessionContext::new_with_state(state);
+```
+
+- `runner` runs the model. `quail::Executor::open(&config)?` from the
+  `quail` crate runs it on your GPUs and needs Quail's Python package
+  installed, because each GPU worker is a Python process.
+- `register_rules` keeps your own query planner. Your planner then
+  calls `quail_datafusion::claim_model_regions` on the optimized plan
+  and adds `QuailExtension::extension_planner()` to its extension
+  planners.
+- `register` returns an error when your session already has a function
+  under one of Quail's names.
+
+[`host_session.rs`](https://github.com/fsdatalab/quail/blob/main/crates/quail-datafusion/examples/host_session.rs)
+is a complete program: a host function, a host optimizer rule, and
+`AI.IF` in one SQL statement. Run it with
+`cargo run --example host_session`.
 
 ## Check a change
 

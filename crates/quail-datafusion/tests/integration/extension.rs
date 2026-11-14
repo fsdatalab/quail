@@ -213,3 +213,19 @@ fn an_expression_that_calls_a_hosts_function_is_refused_by_name() -> Result<()> 
     assert!(refused.message().contains("quail_test_shout"), "{refused}");
     Ok(())
 }
+
+#[path = "../../examples/host_session.rs"]
+mod host_session;
+
+#[tokio::test]
+async fn a_host_with_its_own_function_and_rule_runs_ai_functions_beside_them() -> Result<()> {
+    let (plan, rows) = host_session::run().await?;
+    // the host's rule rewrote its function, and Quail claimed the AI call
+    assert!(plan.contains("upper(r.body)"), "{plan}");
+    assert!(!plan.contains("shout("), "{plan}");
+    assert!(plan.contains("AiNode"), "{plan}");
+    // the stand-in model keeps the first review
+    assert!(rows.contains("| r1 | TOO SLOW. |"), "{rows}");
+    assert!(!rows.contains("r2"), "{rows}");
+    Ok(())
+}
