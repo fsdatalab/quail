@@ -3404,10 +3404,13 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "base64 0.23.1",
+ "fancy-regex",
+ "regex",
  "serde",
  "serde_json",
  "tokenizers",
  "toml",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -4103,7 +4106,6 @@ dependencies = [
  "ahash",
  "bitcannon",
  "dary_heap",
- "fancy-regex",
  "libc",
  "log",
  "memchr",

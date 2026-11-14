@@ -15,5 +15,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 # the 1.0 release candidate tokenizes about 30 times faster than 0.22
 # with the same ids; pinned until 1.0 is released
-tokenizers = { version = "=1.0.0-rc.3", default-features = false, features = ["parallelism", "serialize", "normalizers", "bpe", "unicode-scripts", "regex"] }
+tokenizers = { version = "=1.0.0-rc.3", default-features = false, features = ["parallelism", "serialize", "normalizers", "bpe", "unicode-scripts"] }
+# the pre-tokenizer regex the release candidate does not run, such as
+# Qwen3.5's (inputs/tokenizer.rs)
+fancy-regex = "0.19"
+regex = "1"
+unicode-normalization = "0.1"
 toml = "0.9"
