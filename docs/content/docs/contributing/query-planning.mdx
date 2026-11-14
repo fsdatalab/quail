@@ -146,10 +146,3 @@ each region separately on the same loaded model and GPU.
 
 An AI join puts both input tables in one model region. The region planner can
 then choose the join order, the anchor, and KV reuse across both tables.
-
-## Future work
-
-Model regions do not report a row estimate to DataFusion yet. A row estimate
-would let DataFusion place the smaller region on the build side of a hash
-join. The hash join could then send a dynamic filter to the larger region.
-GPU-time estimates could later improve the choice beyond row counts.
