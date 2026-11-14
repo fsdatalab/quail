@@ -106,5 +106,5 @@ shows both.
 [Report a bug](https://github.com/fsdatalab/quail/issues) on GitHub.
 Follow the
 [developer guide](https://fsdatalab.github.io/quail/docs/contributing)
-to change Quail; the guide says how to build from source and which
-checks to run.
+to contribute to Quail; the guide says how to build from source and
+which checks to run.
