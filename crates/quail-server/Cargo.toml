@@ -1,6 +1,6 @@
 [package]
 name = "quail-server"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 license = "MIT"
 description = "Quail Server: Quail's session over Arrow Flight"

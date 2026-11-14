@@ -1,6 +1,6 @@
 [package]
 name = "quail-datafusion"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 license = "MIT"
 description = "Quail's AI functions and model region planning as a DataFusion extension"
@@ -13,7 +13,7 @@ base64 = "0.23"
 # a region's expressions cross to the executor as datafusion-proto bytes
 datafusion-proto = { version = "55.2.0", default-features = false }
 futures = "0.3"
-quail-planner = { version = "0.1.0", path = "../quail-planner" }
+quail-planner.workspace = true
 serde_json = { version = "1", features = ["float_roundtrip"] }
 sqlparser = { version = "0.62.0", features = ["visitor"] }
 

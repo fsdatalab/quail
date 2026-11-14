@@ -20,6 +20,17 @@ default-members = [
     "crates/quail-python",
 ]
 
+# The one version of Quail: every crate inherits it, and the Python
+# package reads it from crates/quail-python (pyproject.toml, dynamic).
+# A release tag must equal it, with a leading v; publish.yml checks.
+[workspace.package]
+version = "0.1.0"
+
+# a published crate names the version of each Quail crate it depends on
+[workspace.dependencies]
+quail-planner = { version = "0.1.0", path = "crates/quail-planner" }
+quail-datafusion = { version = "0.1.0", path = "crates/quail-datafusion" }
+
 # The dev profile is the one to edit and rebuild with: `uv sync`, maturin,
 # `cargo test`. Dependencies (DataFusion, Arrow, ...) are compiled once at
 # opt-level 3 and stay cached in target/, so the planner runs at close to

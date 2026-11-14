@@ -1,6 +1,6 @@
 [project]
 name = "quail-engine"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Quail: a declarative query engine for AI.IF and AI_JOIN"
 readme = "README.md"
 license = "MIT"

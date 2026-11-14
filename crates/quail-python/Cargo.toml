@@ -1,6 +1,6 @@
 [package]
 name = "quail-python"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 license = "MIT"
 description = "Quail's Session and Executor, which run model regions on Quail's Python executor, and the _quail_native Python module"

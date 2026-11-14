@@ -1,6 +1,6 @@
 [package]
 name = "quail-engine"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 license = "MIT"
 description = "Quail: AI functions in SQL on DataFusion, with the model's work on GPU workers"
@@ -19,8 +19,8 @@ memmap2 = "0.9"
 datafusion = { version = "55.2.0", default-features = false, features = ["sql", "nested_expressions"] }
 # the same features as quail-python, so both build Arrow once
 arrow = { version = "59.3.2", default-features = false, features = ["ffi", "ipc"] }
-quail-datafusion = { version = "0.1.0", path = "../quail-datafusion" }
-quail-planner = { version = "0.1.0", path = "../quail-planner" }
+quail-datafusion.workspace = true
+quail-planner.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
