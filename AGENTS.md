@@ -1,22 +1,17 @@
 # Writing
 
-Write like two engineers talking at a whiteboard.
-
-- Lead with the answer, then the reasoning. Short sentences, one idea
-  each.
-- Use bullet points for anything longer than a few sentences.
-- Use everyday words. Define an unavoidable technical term once, in
-  one sentence, then use it the same way every time.
-- No analogies, metaphors, or dramatic shorthand. Say "the run is on
-  Modal", not "the flight is in the air"; say "saved", "finished",
-  "running", not "banked", "landed", "armed", "healthy".
-- Give an example with "For example," and all of its context: "For
-  example, imagine a table where each row is an agent trace…".
-- Give numbers, and say what each is compared with: "52.3 s, compared
-  with 47 s for the unavoidable work alone".
-- Do not start a sentence with a number.
-- When something failed or is uncertain, say so, and say what would
-  settle it.
+- Have a model of the user or person who asked the question. Start with
+  what they want to know or do, and build on what they already know.
+- Put the main subject and verb of every sentence at the beginning of
+  the sentence. Use tenses consistent with your model of the person who
+  asked the question.
+- Don't use demonstrative pronouns (this, these, that, those).
+- Make each sentence lead into the next sentence.
+- Use only words and phrases found in the dictionary or common
+  technical terms (simplified technical English). Define new or
+  ambiguous terms inline when you first introduce them.
+- Be as concise as possible.
+- Use as much of the person's original wording as possible.
 - Call the KV cache "KV".
 - Say "run" or "configuration" for the runs of an experiment, never
   "arm".
