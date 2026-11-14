@@ -41,6 +41,10 @@ SENTIMENT = "ARRAY['positive', 'negative', 'mixed']"
 GOVERNING_LAW = "Which state or country has its law govern this agreement?"
 RECOMMEND_MAP = ("Does the reviewer recommend the movie? Start with Yes or No, "
                  "then give the reason in one sentence.")
+LAW = f"AI.EXTRACT(c.text, {{'law': '{GOVERNING_LAW}'}})"
+DIRECTOR = ("AI.EXTRACT(r.body, {'director': 'Which director does the review "
+            "name?'})")
+RECOMMENDS = f"AI.MAP(r.body, '{RECOMMEND_MAP}', 64)"
 ENDING = "PROMPT('Does this review discuss the ending of the movie?\\n\\n{0}', r.body)"
 RECOMMEND = "PROMPT('Does the reviewer recommend the movie?\\n\\n{0}', r.body)"
 ACTING = "PROMPT('Does the review praise the acting?\\n\\n{0}', r.body)"
@@ -68,12 +72,11 @@ QUERIES = {
         f"SELECT r.id FROM reviews r WHERE AI.IF({RECOMMEND}) "
         f"OR AI.IF({ACTING})"), "rows"),
     "extract like contracts": ("derive.filters", (
-        f"SELECT c.id, AI.EXTRACT(c.text, {{'law': '{GOVERNING_LAW}'}}) AS e "
-        "FROM contracts c WHERE e.law LIKE '%Delaware%'"), "rows"),
+        f"SELECT c.id, {LAW} AS e FROM contracts c "
+        f"WHERE {LAW}['law'] LIKE '%Delaware%'"), "rows"),
     "extract like reviews": ("derive.filters", (
-        "SELECT r.id, AI.EXTRACT(r.body, {'director': 'Which director does the "
-        "review name?'}) AS e FROM reviews r "
-        "WHERE e.director LIKE '%Hitchcock%'"), "rows"),
+        f"SELECT r.id, {DIRECTOR} AS e FROM reviews r "
+        f"WHERE {DIRECTOR}['director'] LIKE '%Hitchcock%'"), "rows"),
     "in subquery": ("derive.fetch", (
         "SELECT t.id FROM support_traces t WHERE t.id IN (SELECT m.trace_id "
         f"FROM support_messages m WHERE m.role = 'user' AND AI.IF({CANCEL}))"),
@@ -125,18 +128,16 @@ QUERIES = {
     "no rows": ("place_ai_nodes", (
         f"SELECT c.id, AI.EXTRACT(c.text, {{'law': '{GOVERNING_LAW}'}}) AS e "
         "FROM contracts c WHERE c.token_count < 0"), "rows"),
-    # the model starts each answer with a space: 2600 of 5000 begin " Yes"
     "map prefix test": ("should_stop_answers_early", (
-        f"SELECT r.id FROM reviews r WHERE AI.MAP(r.body, '{RECOMMEND_MAP}', 64) "
-        "LIKE ' Yes%'"), "rows"),
+        f"SELECT r.id FROM reviews r WHERE {RECOMMENDS} LIKE 'Yes%'"), "rows"),
     # the projection reads the answer, so only answers that fail stop early
     "map prefix test with answers": ("should_stop_answers_early", (
-        f"SELECT r.id, AI.MAP(r.body, '{RECOMMEND_MAP}', 64) AS a FROM reviews r "
-        "WHERE a LIKE ' Yes%'"), "ids"),
+        f"SELECT r.id, {RECOMMENDS} AS a FROM reviews r "
+        f"WHERE {RECOMMENDS} LIKE 'Yes%'"), "ids"),
     # 5 of 45 contracts answer exactly "State of California"
     "extract equality test": ("should_stop_answers_early", (
-        f"SELECT c.id, AI.EXTRACT(c.text, {{'law': '{GOVERNING_LAW}'}}) AS e "
-        "FROM contracts c WHERE e.law = 'State of California'"), "ids"),
+        f"SELECT c.id, {LAW} AS e FROM contracts c "
+        f"WHERE {LAW}['law'] = 'State of California'"), "ids"),
 }
 # each group runs on its own H100
 GROUPS = {
