@@ -2,19 +2,19 @@
 title: Running queries
 ---
 
-A session holds your model configuration and registered tables.
-Reuse it for queries over the same inputs.
+A session holds your model configuration and your registered tables.
+Reuse one session for every query over the same tables.
 
-## Creating a session
+## Create a session
 
-Set `model` and `device` in `EngineConfig`. Neither has a default.
-`gpus` defaults to 1. See [Models and GPUs](/docs/user-guide/models)
-for supported values.
+Set `model` and `device` in `EngineConfig`; neither has a default.
+`gpus` defaults to 1. [Models and GPUs](/docs/user-guide/models) lists
+the supported values.
 
-## Registering tables
+## Register tables
 
-`session.register(name, provider)` makes a table available under `name`
-in SQL. Each provider requires an `id_col`.
+`session.register(name, provider)` makes a table available in SQL under
+`name`. Each provider needs an `id_col`, the column identifying a row.
 
 | Factory | Source |
 | --- | --- |
@@ -24,9 +24,9 @@ in SQL. Each provider requires an `id_col`.
 | `DocumentProvider.from_dataset(dataset, id_col)` | `pyarrow.dataset.Dataset` |
 | `DocumentProvider.from_hf(dataset, id_col)` | Hugging Face repository name; optional `split`, `config`, and `revision` |
 
-## Running queries
+## Run a query
 
-E.g., register two reviews and filter them:
+The program below registers two reviews and filters them:
 
 ```python
 import pyarrow as pa
@@ -47,22 +47,24 @@ with quail.Session(config=config) as session:
 ```
 
 `sql()` returns a [`Query`](/docs/user-guide/results#read-the-results).
-`collect()` runs it and returns an Arrow table. Use `run()` instead
-when you also need the plan and metrics.
+`collect()` runs the query and returns an Arrow table. Use `run()` when
+you also need the plan and metrics.
 
-## Running on Quail Server
+## Run on Quail Server
 
 Pass `endpoint` to submit queries to
-[Quail Server](/docs/user-guide/server).
-E.g., replace the session line above with
+[Quail Server](/docs/user-guide/server). Replace the session line in the
+program with
 `with quail.Session(config=config, endpoint="grpc://127.0.0.1:50051") as session:`.
 
-`sql()` returns a [`RemoteQuery`](/docs/user-guide/server#submit-a-query).
-Accepted queries continue after the client exits. Save the query ID
-from `submit()` to retrieve the query from another client.
+`sql()` then returns a
+[`RemoteQuery`](/docs/user-guide/server#submit-a-query). The server keeps
+running an accepted query after the client exits. Save the query ID from
+`submit()` to read the query from another client.
 
-## Multiple GPUs
+## Use several GPUs
 
-Set `gpus` in `EngineConfig`. Each GPU holds a complete model copy.
-E.g., replace the configuration above with
-`quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm", gpus=4)`.
+Set `gpus` in `EngineConfig`. Each GPU holds one complete copy of the
+model. Replace the configuration in the program with
+`quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm", gpus=4)`
+to use four GPUs.

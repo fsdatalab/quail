@@ -4,17 +4,17 @@ title: Developers
 
 ## Report a bug
 
-[Open an issue](https://github.com/fsdatalab/quail/issues) with:
+[Open an issue](https://github.com/fsdatalab/quail/issues) and include:
 
-- A minimal example that reproduces the bug.
-- The expected behavior and what happened.
-- The Quail version or commit. For an AI call error, include the
-  `EngineConfig`.
+- a minimal example reproducing the bug;
+- the behavior you expected and the behavior you saw;
+- the Quail version or commit, and the `EngineConfig` for an error in
+  an AI call.
 
 ## Build Quail
 
 Install [uv](https://docs.astral.sh/uv/) and
-[rustup](https://rustup.rs). Linux x86_64 also requires clang and lld.
+[rustup](https://rustup.rs). Linux x86_64 also needs clang and lld.
 Quail uses Python 3.12.
 
 ```bash
@@ -29,7 +29,7 @@ Run `tools/build.sh` again after each Rust edit.
 
 Quail plans a query in two parts. DataFusion plans the SQL, and Quail's
 rules decide what each AI call asks the model. Quail then plans each
-*model region*: a group of AI calls that run together on the GPU.
+*model region*: a group of AI calls running together on the GPU.
 
 <Mermaid chart={`flowchart TD
     sql["SQL"]

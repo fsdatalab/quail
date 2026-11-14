@@ -2,15 +2,15 @@
 title: Editing physical plans
 ---
 
-Edit a physical plan to compare execution schedules without changing
-the query. Plan editing requires a local session and a query with one
-model region.
+You can edit a physical plan to compare two ways of running one query.
+Plan editing needs a local session and a query with one model region.
 
 ## Run the example
 
-E.g., insert a `Barrier` between a filter and a join.
-The example plans on the CPU; it downloads a tokenizer if necessary.
-Save it as `edit_plan.py` and run `python edit_plan.py`:
+The program below inserts a `Barrier` between a filter and a join. A
+`Barrier` makes the join wait until the filter has finished. The program
+plans on the CPU and downloads a tokenizer when your machine has none.
+Save the program as `edit_plan.py` and run `python edit_plan.py`:
 
 ```python
 import pyarrow as pa
@@ -55,42 +55,44 @@ with quail.Session(config=config) as session:
 
 ## The query
 
-The filter keeps claims about a person. The join asks whether the
-matching passage supports each claim. `c.wiki_url = e.id` restricts
-the pairs that the model reads. The `anchor` option selects `c` as the
-side whose KV the join reuses.
+The filter keeps the claims about a person. The join asks whether the
+matching passage supports each claim. `c.wiki_url = e.id` limits the
+pairs the model reads. The `anchor` option names `c` as the table whose
+KV the join reuses.
 
 ## Inspect the plan
 
-`query.explain(verbose=True)` shows operator IDs and their connections.
-Use these IDs when editing another query; its IDs can differ.
+`query.explain(verbose=True)` shows each operator's ID and connections.
+Another query has other IDs, so read the IDs from its own plan before
+you edit it.
 
-Time estimates assume peak GPU compute rates and memory bandwidth.
-They are not measurements. On a GPU, use `query.run(plan=plan)` and
-`query.run(plan=edited)` to compare the two plans' reports.
+Quail estimates time from the GPU's peak compute rate and memory
+bandwidth; an estimate is not a measurement. Run `query.run(plan=plan)`
+and `query.run(plan=edited)` on a GPU to compare the reports of the two
+plans.
 
 ## Insert a barrier
 
-Without the barrier, a claim can enter the join as soon as it passes
-the filter. `Barrier` waits until the filter finishes before supplying
-passing claims to the join.
+The original plan lets a claim enter the join as soon as the claim
+passes the filter. `Barrier` holds the passing claims until the filter
+has finished, then gives them to the join.
 
-The edit enables KV retention on the filter. Available GPU memory
-limits how much KV Quail retains. On several GPUs, the join waits for
-the filter on every GPU.
+The edit turns on KV retention for the filter. GPU memory limits how
+much KV Quail retains. The join waits for the filter on every GPU when
+the session has several GPUs.
 
-`edited.remove("barrier:c")` restores the original plan.
-Only `Barrier` nodes can be removed.
+`edited.remove("barrier:c")` restores the original plan. `remove()`
+accepts `Barrier` nodes only.
 
 ## Plan editing API
 
 | Method | Effect |
 | --- | --- |
-| `plan.insert(node, between=(producer_id, consumer_id))` | Insert a node on an existing connection. Its value type must match. |
-| `plan.remove(node_id)` | Remove a barrier and reconnect its consumers. |
-| `plan.move(node_id, between=(producer_id, consumer_id))` | Move a barrier to another connection. |
-| `query.run(plan=edited)` | Run the edited physical plan. |
+| `plan.insert(node, between=(producer_id, consumer_id))` | `insert` puts a node on an existing connection. The node's value type must match the connection's. |
+| `plan.remove(node_id)` | `remove` takes a barrier out and reconnects its consumers. |
+| `plan.move(node_id, between=(producer_id, consumer_id))` | `move` puts a barrier on another connection. |
+| `query.run(plan=edited)` | `run` runs the edited physical plan. |
 
-Each edit returns a new plan. Quail checks connections and cycles,
-then updates estimates when the plan has cost information.
-Invalid edits raise `PlanEditError`.
+Each edit returns a new plan. Quail checks the connections and rejects
+a cycle, then updates the estimates when the plan has cost information.
+An invalid edit raises `PlanEditError`.

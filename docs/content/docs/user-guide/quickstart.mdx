@@ -4,9 +4,9 @@ title: Quickstart
 
 ## Install
 
-Quail requires Python 3.12 and a
+Quail needs Python 3.12 and a
 [supported CUDA GPU](/docs/user-guide/models).
-Install `quail-engine`; import it as `quail`:
+Install `quail-engine` and import it as `quail`:
 
 ```bash
 uv pip install quail-engine
@@ -14,9 +14,10 @@ uv pip install quail-engine
 
 ## Run an AI filter
 
-E.g., filter the 100,000 reviews in the
+The program below filters the 100,000 reviews in the
 [Stanford IMDB dataset](https://huggingface.co/datasets/stanfordnlp/imdb)
-on an H100 SXM. Keep reviews that mention a positive aspect of the movie:
+on an H100 SXM. It keeps the reviews mentioning a positive aspect of the
+movie:
 
 ```python
 import pyarrow as pa
@@ -45,25 +46,27 @@ with quail.Session(config=config) as session:
     print(result.explain())
 ```
 
-`register()` makes the table available in SQL. `AI.IF` keeps rows when
-the model answers `TRUE`. `collect()` returns their IDs in a `pyarrow.Table`.
+`register()` makes the table available in SQL. `AI.IF` keeps a row when
+the model answers yes. `collect()` returns the kept IDs in a
+`pyarrow.Table`.
 
 ## See the plan and measured cost
 
-The example prints the measured plan with `result.explain()`.
-Use `query.explain()` before `run()` to inspect estimates without
-running the model. `query.explain(analyze=True)` runs the query again.
+`result.explain()` prints the plan with its measurements, as the
+program does. `query.explain()` prints the plan with estimates and does
+not run the model. `query.explain(analyze=True)` runs the query again.
 
-Read query time and token counts from `result.report`.
-See [Metrics](/docs/user-guide/metrics) to calculate GPU cost.
+`result.report` holds the query time and token counts.
+[Metrics](/docs/user-guide/metrics) shows how to calculate GPU cost.
 
 ## Write more queries
 
-See the [SQL reference](/docs/user-guide/sql) for other AI functions.
+The [SQL reference](/docs/user-guide/sql) lists the other AI functions.
 [Running queries](/docs/user-guide/sessions) covers table registration
 and session reuse.
 
-## Running on Modal
+## Run on Modal
 
-Without a local GPU, use the complete
-[Modal example](/docs/user-guide/models#no-local-gpu-use-modal).
+Use the complete
+[Modal example](/docs/user-guide/models#no-local-gpu-use-modal) when you
+have no local GPU.

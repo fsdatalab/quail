@@ -2,25 +2,26 @@
 title: AI functions
 ---
 
-AI functions ask a [model](/docs/user-guide/models) about the text in
-each row and return its answer as a SQL value.
+An AI function asks a [model](/docs/user-guide/models) about the text in
+a row and returns the model's answer as a SQL value.
 
 | Function | Description |
 | --- | --- |
-| [`PROMPT(template, value, ...)`](#prompttemplate-value-) | The text the model reads: the template with each `{n}` replaced by a value. |
-| [`AI.IF(prompt[, options])`](#aiifprompt-options) | `TRUE` or `FALSE`: the model's answer to a yes-or-no question. |
-| [`AI.SCORE(prompt[, options])`](#aiscoreprompt-options) | A score from 0 to 1: how strongly the model answers yes. |
-| [`AI.CLASSIFY(input, categories[, options])`](#aiclassifyinput-categories-options) | One label from `categories`. |
-| [`AI.EXTRACT(input, questions)`](#aiextractinput-questions) | A struct of answers copied from the document. |
-| [`AI.EXTRACT_SPAN(input, questions)`](#aiextract_spaninput-questions) | A struct of the positions of those answers. |
-| [`AI.MAP(input, instruction[, max_tokens])`](#aimapinput-instruction-max_tokens) | Text the model writes for each document. |
-| [`AI.SAE_FEATURES(prompt, options)`](#aisae_featuresprompt-options) | A list of features and their strengths. |
-| [`HINT(condition, options)`](#hintcondition-options) | The value of `condition`, with an estimate of how many rows pass it. |
+| [`PROMPT(template, value, ...)`](#prompttemplate-value-) | `PROMPT` builds the text the model reads. |
+| [`AI.IF(prompt[, options])`](#aiifprompt-options) | `AI.IF` returns `TRUE` when the model answers yes to the prompt. |
+| [`AI.SCORE(prompt[, options])`](#aiscoreprompt-options) | `AI.SCORE` returns a number from 0 to 1; a higher number is a stronger yes. |
+| [`AI.CLASSIFY(input, categories[, options])`](#aiclassifyinput-categories-options) | `AI.CLASSIFY` returns the one label from `categories` the model chooses. |
+| [`AI.EXTRACT(input, questions)`](#aiextractinput-questions) | `AI.EXTRACT` returns each question's answer as text copied from the document. |
+| [`AI.EXTRACT_SPAN(input, questions)`](#aiextract_spaninput-questions) | `AI.EXTRACT_SPAN` returns the position of each `AI.EXTRACT` answer in the document. |
+| [`AI.MAP(input, instruction[, max_tokens])`](#aimapinput-instruction-max_tokens) | `AI.MAP` returns the text the model writes for the document. |
+| [`AI.SAE_FEATURES(prompt, options)`](#aisae_featuresprompt-options) | `AI.SAE_FEATURES` returns the model's strongest internal features for the prompt. |
+| [`HINT(condition, options)`](#hintcondition-options) | `HINT` returns `condition` and tells Quail what fraction of rows pass. |
 
 ## Example tables
 
-Every example on this page reads these two tables. A model's answer is
-not fixed, so each result shows what one model returned.
+Every example on the page reads two tables, `reviews` and `aspects`.
+A model can answer differently on another run, so each result shows
+what one model returned.
 
 `reviews`:
 
@@ -37,9 +38,9 @@ not fixed, so each result shows what one model returned.
 | 1 | ending |
 | 2 | music |
 
-The examples use the default Snowflake dialect. With `dialect="bq"`,
-write an options object such as `{'selectivity': 0.3}` as
-`STRUCT(0.3 AS selectivity)`.
+The examples use the default Snowflake dialect. BigQuery syntax
+(`dialect="bq"`) writes an options object such as
+`{'selectivity': 0.3}` as `STRUCT(0.3 AS selectivity)`.
 
 ## Functions
 
@@ -53,9 +54,9 @@ WHERE AI.IF(PROMPT('Does the review discuss the ending? {0}', r.body));
 
 | | |
 | --- | --- |
-| **Description** | Builds the text the model reads. `{0}` is the first value after the template, `{1}` the second. Every value needs a placeholder. |
+| **Description** | `PROMPT` builds the text the model reads: the template with each placeholder replaced by a value. `{0}` is the first value after the template, and `{1}` is the second. Every value needs a placeholder. |
 | **Result** | `(1)`, `(2)` |
-| **Values** | Columns of one table form one document, and the same column may appear twice. Columns of two tables form a pair; see [Joining](#joining). |
+| **Values** | Columns of one table form one document, and one column may appear twice. Columns of two tables form a pair; see [Joining](#joining). |
 
 ### `AI.IF(prompt[, options])`
 
@@ -67,7 +68,7 @@ WHERE AI.IF(PROMPT('Does the reviewer ask for a refund? {0}', r.body));
 
 | | |
 | --- | --- |
-| **Description** | Returns `TRUE` or `FALSE`. In `WHERE`, keeps the rows the model answers yes for; `NOT AI.IF(...)` keeps the others. |
+| **Description** | `AI.IF` returns `TRUE` when the model answers yes to the prompt, and `FALSE` when the model answers no. `WHERE AI.IF(...)` keeps the rows with a yes; `WHERE NOT AI.IF(...)` keeps the rows with a no. |
 | **Result** | `(3)` |
 | **Alias** | `AI_FILTER` |
 | **Options** | `selectivity`, `anchor`; see [Options](#options). |
@@ -82,7 +83,7 @@ FROM reviews r;
 
 | | |
 | --- | --- |
-| **Description** | Returns a `FLOAT64` from 0 to 1. A higher score is a stronger yes. A score is not a probability of being right; choose a threshold from labeled examples. |
+| **Description** | `AI.SCORE` returns a `FLOAT64` from 0 to 1. A higher score is a stronger yes. A score is not the probability of a correct answer, so choose a threshold from labeled examples. |
 | **Result** | `(1, 0.02)`, `(2, 0.1)`, `(3, 0.94)` |
 | **Alias** | `AI_SCORE` |
 | **Options** | `selectivity`; see [Options](#options). |
@@ -97,11 +98,11 @@ FROM reviews r;
 
 | | |
 | --- | --- |
-| **Description** | Returns one label from `categories` as a `STRING`. |
+| **Description** | `AI.CLASSIFY` returns the one label from `categories` the model chooses, as a `STRING`. |
 | **Result** | `(1, 'positive')`, `(2, 'negative')`, `(3, 'mixed')` |
 | **Alias** | `AI_CLASSIFY` |
 | **input** | A text column, or a `PROMPT` over one document or a pair. |
-| **categories** | At least two labels that differ ignoring case. Labels can carry descriptions of at most 25 words; give every label one: `[{'label': 'refund', 'description': 'asks for money back'}, ...]`. |
+| **categories** | A list of at least two labels. Two labels must differ by more than letter case. A label can carry a description of at most 25 words; give every label a description or none: `[{'label': 'refund', 'description': 'asks for money back'}, ...]`. |
 | **Options** | `selectivity`, `task_description`, `probabilities`; see [Options](#options). |
 
 ### `AI.EXTRACT(input, questions)`
@@ -115,7 +116,7 @@ FROM reviews r;
 
 | | |
 | --- | --- |
-| **Description** | Returns a struct with one `STRING` field per question, holding text copied from the document. A field is `NULL` when the document has no answer. Read a field as `AI.EXTRACT(...)['complaint']`. |
+| **Description** | `AI.EXTRACT` returns a struct with one `STRING` field per question. Each field holds text copied from the document. A field is `NULL` when the document has no answer. Read a field as `AI.EXTRACT(...)['complaint']`. |
 | **Result** | `(1, {complaint: NULL})`, `(2, {complaint: 'the ending made no sense'})`, `(3, {complaint: 'I want my money back'})` |
 | **Alias** | `AI_EXTRACT` |
 | **input** | A text column. |
@@ -132,7 +133,7 @@ FROM reviews r;
 
 | | |
 | --- | --- |
-| **Description** | Returns the struct `AI.EXTRACT` returns for the same arguments, with each field a span: `start` and `end` character positions. `end` is one past the last character, so Python's `body[start:end]` is the answer. |
+| **Description** | `AI.EXTRACT_SPAN` returns a struct with one field per question, as `AI.EXTRACT` does for the same arguments. Each field is a span: the `start` and `end` character positions of the answer in the document. `end` is one past the last character, so Python's `body[start:end]` is the answer. |
 | **Result** | `(1, {complaint: NULL})`, `(2, {complaint: {start: 14, end: 38}})`, `(3, {complaint: {start: 17, end: 37}})` |
 | **Alias** | `AI_EXTRACT_SPAN` |
 
@@ -146,12 +147,12 @@ FROM reviews r;
 
 | | |
 | --- | --- |
-| **Description** | Returns the `STRING` the model writes for the document, with no whitespace around it. |
+| **Description** | `AI.MAP` returns the `STRING` the model writes for the document. The text has no whitespace at its start or end. |
 | **Result** | `(1, 'Praises the ending and the cast.')`, `(2, 'Says the film is too long and the ending makes no sense.')`, `(3, 'Likes the music but wants a refund.')` |
 | **Alias** | `AI_MAP` |
 | **input** | A text column. |
 | **instruction** | A string literal. |
-| **max_tokens** | The most tokens in an answer: an integer from 1 to 32768. Default: 256. |
+| **max_tokens** | `max_tokens` limits the tokens in an answer. It is an integer from 1 to 32768, and its default is 256. |
 
 ### `AI.SAE_FEATURES(prompt, options)`
 
@@ -164,12 +165,12 @@ FROM reviews r;
 
 | | |
 | --- | --- |
-| **Description** | Returns a list of `{feature, strength}` structs from a sparse autoencoder (SAE), strongest first. A feature is an integer ID with no text label. A strength is a nonnegative activation, not a probability. |
+| **Description** | `AI.SAE_FEATURES` returns a list of `{feature, strength}` structs, strongest first. A sparse autoencoder (SAE), a second model reading the first model's internal state, computes the features. A feature is an integer ID with no text label. A strength is a nonnegative activation, not a probability. |
 | **Result** | `(1, [{feature: 18113, strength: 6.2}, {feature: 902, strength: 2.4}, ...])`, and so on for each row. |
 | **Alias** | `AI_SAE_FEATURES` |
 | **prompt** | A `PROMPT` over one document column. |
-| **pooling** | `'last'`: the features of the prompt's last token, at most 100. `'max'`: each feature's largest strength over all tokens, often thousands. |
-| **Model** | `qwen3.5-2b-sae-bf16` only. That model runs no other AI function. |
+| **pooling** | `'last'` returns the features of the prompt's last token, at most 100. `'max'` returns each feature's largest strength over all tokens, often thousands of features. |
+| **Model** | `AI.SAE_FEATURES` runs on `qwen3.5-2b-sae-bf16` only, and `qwen3.5-2b-sae-bf16` runs no other AI function. |
 
 ### `HINT(condition, options)`
 
@@ -182,9 +183,9 @@ WHERE HINT(AI.CLASSIFY(r.body, ['positive', 'negative', 'mixed']) = 'negative',
 
 | | |
 | --- | --- |
-| **Description** | Returns the value of `condition`. The `selectivity` option estimates the fraction of rows that pass it. Quail uses the estimate to order work; it does not change which rows pass. |
+| **Description** | `HINT` returns the value of `condition`. The `selectivity` option gives the fraction of rows you expect to pass `condition`. Quail uses the fraction to order its work; the fraction does not change which rows pass. |
 | **Result** | `(2)` |
-| **Options** | `selectivity` only. |
+| **Options** | `HINT` takes `selectivity` only. |
 
 ## Options
 
@@ -192,14 +193,14 @@ Pass options as an object, such as `{'selectivity': 0.3}`.
 
 | Option | Functions | Meaning |
 | --- | --- | --- |
-| `selectivity` | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `HINT` | The fraction of rows or pairs expected to pass the test. Default: 0.2. It changes speed, not answers. |
-| `anchor` | `AI.IF` in a join | The alias of the table whose rows the model reads first. Quail chooses one when it is omitted. |
-| `task_description` | `AI.CLASSIFY` | Extra instructions for the model. |
-| `probabilities` | `AI.CLASSIFY` | `true` adds a column `<alias>_probabilities` that maps each label to its probability. It appears only when the query returns the label directly, not when only `WHERE` reads it or SQL above groups it. |
+| `selectivity` | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `HINT` | `selectivity` is the fraction of rows or pairs you expect to pass the test. Its default is 0.2. It changes speed, not answers. |
+| `anchor` | `AI.IF` in a join | `anchor` is the alias of the table whose rows the model reads first. Quail chooses a table when you omit `anchor`. |
+| `task_description` | `AI.CLASSIFY` | `task_description` gives the model extra instructions. |
+| `probabilities` | `AI.CLASSIFY` | `true` adds a column `<alias>_probabilities`, a map from each label to its probability. Quail adds the column only when the query returns the label directly. A query whose `WHERE` alone reads the label, or whose SQL groups the label, gets no such column. |
 
 ## Joining
 
-`AI.IF` in `ON` asks the model about each pair of rows. Its `PROMPT`
+`AI.IF` in `ON` asks the model about each pair of rows. The `PROMPT`
 reads one column from each table.
 
 ```sql
@@ -211,16 +212,17 @@ JOIN aspects a
 
 Result: `(1, 'ending')`, `(2, 'ending')`, `(3, 'music')`.
 
-- Add an equality, such as `ON r.id = a.id AND AI.IF(...)`, to ask only
-  about pairs that match it.
-- `AI.SCORE(...) >= 0.8` in `ON` keeps the pairs that score at least 0.8.
+- Add an equality, such as `ON r.id = a.id AND AI.IF(...)`, and the
+  model reads only the pairs with equal values.
+- `AI.SCORE(...) >= 0.8` in `ON` keeps the pairs with a score of at
+  least 0.8.
 - `AI.CLASSIFY` over a `PROMPT` of two tables labels each pair.
 - `LEFT`, `RIGHT`, and `FULL` joins keep their unmatched rows as usual.
 
 ## EXISTS and NOT EXISTS
 
-An `AI.IF` in a subquery keeps the rows with at least one match
-(`EXISTS`) or with none (`NOT EXISTS`).
+`AI.IF` in a subquery keeps the rows with at least one match (`EXISTS`)
+or with no match (`NOT EXISTS`).
 
 ```sql
 SELECT r.id
@@ -231,12 +233,12 @@ WHERE NOT EXISTS (
                        r.body, a.aspect)));
 ```
 
-Result: `(2)`. With `EXISTS`, the result is `(1)`, `(3)`.
+Result: `(2)`. `EXISTS` returns `(1)`, `(3)`.
 
 ## Filter by category
 
-`WHERE` cannot read a `SELECT` alias. Repeat the call; the model answers
-it once.
+`WHERE` cannot read a `SELECT` alias. Repeat the call in `WHERE`; the
+model answers the two calls once.
 
 ```sql
 SELECT r.id,
@@ -247,9 +249,10 @@ WHERE AI.CLASSIFY(r.body, ['positive', 'negative', 'mixed']) IN ('negative', 'mi
 
 Result: `(2, 'negative')`, `(3, 'mixed')`.
 
-- Write the repeated call exactly the same way. Calls that differ only in
-  case, whitespace, or punctuation are an error.
-- A test that names a label outside `categories` is an error.
+- Write the repeated call exactly as the first call. Quail raises an
+  error for two calls differing only in case, whitespace, or
+  punctuation.
+- Quail raises an error for a test naming a label outside `categories`.
 
 ## Filter on answers
 
@@ -267,12 +270,12 @@ Result: `(2)`.
 - Compare a score with `<`, `<=`, `>`, or `>=` and a number from 0 to 1.
 - Test map text with `=`, `LIKE`, or `ILIKE`.
 - A comparison drops `NULL` answers. Use `IS NULL` to keep them.
-- A `LIMIT` stops the model once enough rows pass.
+- `LIMIT` stops the model once enough rows pass.
 
 ## NULL documents
 
-An AI function of a `NULL` document returns `NULL`, and the model is not
-asked. If `reviews` had a row `(4, NULL)`:
+An AI function returns `NULL` for a `NULL` document and does not ask
+the model. Suppose `reviews` also had a row `(4, NULL)`:
 
 ```sql
 SELECT r.id, AI.CLASSIFY(r.body, ['positive', 'negative', 'mixed']) AS sentiment
@@ -282,8 +285,8 @@ FROM reviews r;
 Result: `(1, 'positive')`, `(2, 'negative')`, `(3, 'mixed')`, `(4, NULL)`.
 
 - `WHERE AI.IF(...)` and `WHERE NOT AI.IF(...)` both drop row 4.
-- A `PROMPT` over several columns is `NULL` when any of them is.
+- `PROMPT` over several columns is `NULL` when one column is `NULL`.
 - A pair with a `NULL` document matches nothing in a join, and its
   `AI.SCORE` is `NULL`.
-- In `NOT EXISTS`, the model is still asked about a row whose document
-  is `NULL`, with empty text.
+- `NOT EXISTS` still asks the model about a row with a `NULL` document,
+  and the model reads empty text for the document.

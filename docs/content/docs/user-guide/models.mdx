@@ -2,8 +2,8 @@
 title: Supported models and GPUs
 ---
 
-Set `model` and `device` in `EngineConfig`. Each model copy must fit
-on one GPU.
+You choose a model and a GPU with `model` and `device` in
+`EngineConfig`. One GPU must hold one complete copy of the model.
 
 ## Models
 
@@ -25,11 +25,13 @@ on one GPU.
 | d1-2B, FP8 weights | `"d1-2b-fp8"` | FP8 | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT` |
 | Qwen3.5 2B Base with Qwen-Scope SAE | `"qwen3.5-2b-sae-bf16"` | BF16 | `AI.SAE_FEATURES` |
 
-Models that support `AI.EXTRACT` also support `AI.EXTRACT_SPAN`.
-FP8 uses 8-bit floating point weights; BF16 uses 16-bit floating point.
+A model supporting `AI.EXTRACT` also supports `AI.EXTRACT_SPAN`.
+FP8 stores each weight as an 8-bit floating point number, and BF16
+stores each weight as a 16-bit floating point number.
 
-For d1-2B, `AI.SCORE` reads one table only. Quail quantizes the
-`d1-2b-fp8` weights at load time; Liquid does not publish this FP8 checkpoint.
+d1-2B's `AI.SCORE` reads one table only. Quail converts the `d1-2b-fp8`
+weights to FP8 as it loads them, because Liquid publishes no FP8
+checkpoint of d1-2B.
 
 ## GPUs
 
@@ -40,12 +42,13 @@ For d1-2B, `AI.SCORE` reads one table only. Quail quantizes the
 | NVIDIA B200 | `"b200"` |
 | NVIDIA RTX PRO 6000 Blackwell Server Edition | `"rtx-pro-6000-blackwell-server"` |
 
-L40S does not support DiffusionGemma or the Qwen3.5, Qwen3.6, and
-Qwen3.8 models. Planning also checks whether the model fits in GPU memory.
+L40S does not run DiffusionGemma or the Qwen3.5, Qwen3.6, and Qwen3.8
+models. Quail also checks at planning time whether the model fits in
+GPU memory.
 
 ## Configure a session
 
-E.g., configure Qwen3 4B on one H100 SXM:
+The configuration below selects Qwen3 4B on one H100 SXM:
 
 ```python
 import quail
@@ -53,25 +56,27 @@ import quail
 config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
 ```
 
-Pass `config` to `quail.Session`. Quail downloads missing model files.
+Pass `config` to `quail.Session`. Quail downloads the model files your
+machine lacks.
 
-### Use multiple GPUs
+### Use several GPUs
 
-Set `gpus` to 1, 2, 4, or 8 on one machine. The default is 1.
-Each GPU holds a complete model copy; Quail does not split its weights.
-E.g., add `gpus=4` to the configuration above.
+Set `gpus` to 1, 2, 4, or 8 on one machine; the default is 1. Each GPU
+holds one complete copy of the model, and Quail does not split a model's
+weights across GPUs. Add `gpus=4` to the configuration to use four GPUs.
 
 ## DiffusionGemma
 
 DiffusionGemma uses
 [`RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic`](https://huggingface.co/RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic).
-Set `HF_TOKEN` with access to its gated weights.
+Set `HF_TOKEN` to a Hugging Face token with access to the gated weights.
 
-For `AI.CLASSIFY` and one-table `AI.SCORE`, `canvas_draws` limits attempts
-per document. The default is 4. If the first attempt is uncertain,
-Quail makes more attempts and averages their probabilities.
-Set `canvas_draws=1` in `EngineConfig` to use one attempt.
-Joined classifications always use one attempt. `AI.IF` ignores this setting.
+`canvas_draws` limits the attempts per document for `AI.CLASSIFY` and
+for `AI.SCORE` over one table; the default is 4. Quail makes more
+attempts when the first attempt is uncertain, and averages the
+probabilities of all attempts. Set `canvas_draws=1` in `EngineConfig`
+to use one attempt. A classification of joined rows always uses one
+attempt, and `AI.IF` ignores `canvas_draws`.
 
 ## Decision 2.0 Kai 0.6B
 
@@ -80,36 +85,39 @@ scores supplied answers:
 
 | Function | Answer |
 | --- | --- |
-| `AI.IF` | Selects between Yes and No. |
-| `AI.SCORE` | Probability of Yes when choosing between Yes and No. |
-| `AI.CLASSIFY` | Supplied label with the highest score. |
+| `AI.IF` | `AI.IF` selects between Yes and No. |
+| `AI.SCORE` | `AI.SCORE` returns the probability of Yes in a choice between Yes and No. |
+| `AI.CLASSIFY` | `AI.CLASSIFY` returns the supplied label with the highest score. |
 
-Check scores against labeled examples before choosing a threshold.
+Check the scores against labeled examples before you choose a threshold.
 
 ## Qwen3 rerankers
 
-The rerankers support `AI.SCORE` only. With two prompt documents, the
-first is the search query and the second is the candidate document.
+The rerankers support `AI.SCORE` only. A reranker reads the first
+document of a two-document prompt as the search query, and the second
+as the candidate document.
 
 ## Qwen3.5 2B Base with Qwen-Scope SAE
 
 `qwen3.5-2b-sae-bf16` supports only `AI.SAE_FEATURES`.
-It uses the layer-11
+The model uses the layer-11
 [Qwen-Scope SAE](https://huggingface.co/Qwen/SAE-Res-Qwen3.5-2B-Base-W32K-L0_100)
 with 32,768 features and keeps the 100 strongest features per token.
-Use a separate session with another model for other AI functions.
+Use a separate session with another model for the other AI functions.
 
 ## No local GPU? Use Modal
 
-Install [Modal](https://modal.com) and authenticate on the client:
+Install [Modal](https://modal.com) and
+log in on your machine:
 
 ```bash
 uv pip install modal==1.5.4
 modal setup
 ```
 
-E.g., save this program as `run_quail.py`. It filters two reviews on an
-H100 and saves model files and compiled kernels on Modal volumes:
+Save the program below as `run_quail.py`. The program filters two
+reviews on an H100 and saves the model files and compiled kernels on
+Modal volumes:
 
 ```python
 import modal
@@ -168,8 +176,8 @@ def main():
 modal run --detach run_quail.py 2>&1 | tee run_quail.log
 ```
 
-Keep the function call ID from the log.
-E.g., retrieve the rows after a disconnect:
+Keep the function call ID from the log. The program below reads the
+rows after a disconnect:
 
 ```python
 import modal

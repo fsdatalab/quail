@@ -2,11 +2,10 @@
 title: Introduction
 ---
 
-Quail runs SQL with AI functions. DataFusion parses, plans, and runs
-SQL around *model regions*: AI calls and the operators Quail runs with
-them on the GPU.
+Quail runs SQL with AI functions: SQL functions answered by a language
+model on a GPU.
 
-E.g., this query returns IDs of reviews that discuss the movie's ending.
+The query below returns the IDs of reviews discussing a movie's ending.
 The `reviews` table has an `id` column and review text in `body`:
 
 ```sql
@@ -15,17 +14,21 @@ FROM reviews r
 WHERE AI.IF(PROMPT('Does this review discuss the ending? {0}', r.body));
 ```
 
-`AI.IF` keeps rows when the model answers `TRUE`. Other
+`AI.IF` keeps a row when the model answers yes. Other
 [AI functions](/docs/user-guide/sql/ai-functions) return scores or labels,
 copy answers from documents, or write text.
 
+Quail runs the AI functions on the GPU, and
+[Apache DataFusion](https://datafusion.apache.org/) runs the rest of
+the SQL.
+
 ## Requirements
 
-- Python 3.12.
-- A [supported model and CUDA GPU](/docs/user-guide/models).
-  Each GPU holds one complete model copy.
-- Without a local GPU, use [Modal](/docs/user-guide/models#no-local-gpu-use-modal)
-  or connect to [Quail Server](/docs/user-guide/server).
+- Quail needs Python 3.12.
+- Quail needs a [supported model and CUDA GPU](/docs/user-guide/models).
+  Each GPU holds one complete copy of the model.
+- Use [Modal](/docs/user-guide/models#no-local-gpu-use-modal) or connect
+  to [Quail Server](/docs/user-guide/server) when you have no local GPU.
 
 ## Get started
 

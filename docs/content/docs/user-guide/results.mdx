@@ -2,16 +2,16 @@
 title: Query results and plans
 ---
 
-Use `query.run()` to keep rows and measurements from the same run.
-Use `query.explain()` to inspect the plan without running the model.
-For remote queries, see [Quail Server](/docs/user-guide/server).
+`query.run()` runs a query and keeps its rows and measurements together.
+`query.explain()` shows the plan and does not run the model.
+[Quail Server](/docs/user-guide/server) covers queries on a server.
 
-The examples require an open session with a `reviews` table containing
-`id` and `body`. See [Running queries](/docs/user-guide/sessions) for setup.
+The examples need an open session with a `reviews` table holding `id`
+and `body`. [Running queries](/docs/user-guide/sessions) shows the setup.
 
 ## Read the results
 
-E.g., return reviews that discuss the ending:
+The program below returns the reviews discussing the ending:
 
 ```python
 query = session.sql("""
@@ -24,10 +24,10 @@ print(result.collect().to_pydict())
 ```
 
 `run()` returns a `QueryResult`. `result.collect()` returns a
-`pyarrow.Table` without running the model again.
+`pyarrow.Table` and does not run the model again.
 `query.collect()` is a shortcut for `query.run().collect()`.
 
-E.g., read the completed query's rows in batches:
+`execute_stream()` reads the finished query's rows in batches:
 
 ```python
 with result.execute_stream(batch_rows=1024) as reader:
@@ -35,14 +35,14 @@ with result.execute_stream(batch_rows=1024) as reader:
         print(batch.to_pydict())
 ```
 
-Pass `limit` to either collection method to read fewer rows.
-This does not reduce the model work already completed.
+Pass `limit` to `collect()` or `execute_stream()` to read fewer rows.
+`limit` does not reduce the model work, which has already finished.
 
 ### Classification answers
 
-`result.answer_tables["classifies"]` contains computed labels,
-including labels for rows that later filters remove.
-E.g., classify the reviews and inspect the answer table:
+`result.answer_tables["classifies"]` holds every label the model
+computed, including the labels of rows a later filter removed. The
+program below classifies the reviews and prints the answer table:
 
 ```python
 classified = session.sql("""
@@ -53,73 +53,76 @@ classified = session.sql("""
 print(classified.answer_tables["classifies"]["sentiment"].to_pydict())
 ```
 
-The table contains `r` and `sentiment`. `r` holds zero-based input row
-indices, not review IDs. Joined answers have an index column for each
-table alias.
+The table has two columns, `r` and `sentiment`. `r` holds the row's
+position in the input, counted from zero, and not the review ID. An
+answer over joined rows has one position column per table alias.
 
 ## Preview the plan
 
-Call `query.explain()` before `run()` to plan without loading the model
-onto the GPU. Add `verbose=True` to see operator IDs and GPU settings.
+`query.explain()` plans the query and does not load the model onto the
+GPU. `verbose=True` adds operator IDs and GPU settings.
 
 ### Read the logical plan
 
-The *logical plan* is DataFusion's plan of the query, with `AiNode`s
-for AI calls. Read it from the inputs upward:
+The *logical plan* is DataFusion's plan of the query, with one `AiNode`
+per AI call. Read the plan from the bottom line upward:
 
 - `TableScan` reads a registered table.
-- `AiNode` computes an answer and can filter rows using that answer.
-- `Projection` selects result columns.
+- `AiNode` computes an answer and can filter rows on the answer.
+- `Projection` selects the result columns.
 
 ### Read the physical plan
 
-The *physical plan* specifies how Quail runs one model region.
-It includes GPU settings and estimates for each operator.
+The *physical plan* says how Quail runs one model region. The plan
+lists GPU settings and an estimate for each operator.
 
 | Column | Meaning |
 | --- | --- |
-| `est. rows` | Expected rows returned by an operator, or documents or pairs reaching a filter. |
-| `est. pass` | Selectivity: the fraction of documents or pairs expected to pass. |
-| `est. time` | Estimated GPU time. |
+| `est. rows` | `est. rows` is the rows Quail expects an operator to return, or the documents or pairs Quail expects to reach a filter. |
+| `est. pass` | `est. pass` is the selectivity: the fraction of documents or pairs Quail expects to pass. |
+| `est. time` | `est. time` is the estimated GPU time. |
 
-A `*` marks a default selectivity. The default is 20%.
-E.g., a filter over three reviews has an estimate of 0.6 passing rows.
+A `*` marks a default selectivity, which is 20%. A filter over three
+reviews then has an estimate of 0.6 passing rows.
 
-Time estimates use peak compute rates and memory bandwidth, so a
-query on a GPU takes longer than its estimate.
+Quail estimates time from the GPU's peak compute rate and memory
+bandwidth, so a query on a GPU takes longer than its estimate.
 
 ### Show execution settings
 
 `query.explain(verbose=True)` adds node connections and KV retention
-settings. Use it to [edit a physical plan](/docs/user-guide/editing-plans).
+settings. You need the node IDs to
+[edit a physical plan](/docs/user-guide/editing-plans).
 
 ## Measure the plan
 
 `result.explain()` adds measurements to the physical plan.
-It uses the completed run and does not call the model again.
+`result.explain()` reads the finished run and does not call the model
+again.
 
 | Column | Meaning |
 | --- | --- |
-| `rows` | Measured rows returned by an operator, or documents or pairs reaching a filter. |
-| `pass` | Measured selectivity. |
-| `time` | Measured operator time. |
-| `fresh tokens` | Token positions computed by the model. Recomputing a position counts again; reading saved KV does not. |
+| `rows` | `rows` is the measured rows an operator returned, or the documents or pairs reaching a filter. |
+| `pass` | `pass` is the measured selectivity. |
+| `time` | `time` is the measured operator time. |
+| `fresh tokens` | `fresh tokens` counts the token positions the model computed. A position computed twice counts twice; a position read from saved KV does not count. |
 
-Compare `rows` and `pass` with their estimates before comparing times.
-A filter that passes more rows gives later operators more work.
-Read query totals from `result.report`; see [Metrics](/docs/user-guide/metrics).
+Compare `rows` and `pass` with their estimates before you compare times.
+A filter passing more rows than estimated gives later operators more
+work. `result.report` holds the query totals; see
+[Metrics](/docs/user-guide/metrics).
 
 ### Run a query to inspect its measurements
 
-`query.explain(analyze=True)` runs the query and returns plans with
-measurements. Each call runs it again. Use `query.run()` when you also
-need the rows from that run.
+`query.explain(analyze=True)` runs the query and returns the plans with
+measurements. Each call runs the query again. Use `query.run()` when you
+also need the rows.
 
 ## Refusals
 
 A `Refusal` explains why a query cannot run with its configuration.
-E.g., the model's weights may exceed one GPU's memory.
+One reason is a model whose weights exceed one GPU's memory.
 
-`query.explain()` displays the reason. `query.run()` raises
-`quail.RefusalError`. Change the input or configuration that the reason
-identifies before trying again.
+`query.explain()` displays the reason, and `query.run()` raises
+`quail.RefusalError`. Change the input or the configuration named in the
+reason, then run the query again.

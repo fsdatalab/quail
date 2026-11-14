@@ -2,8 +2,10 @@
 title: SQL reference
 ---
 
-DataFusion parses, plans, and runs SQL. Quail runs AI calls on the GPU
-in model regions. Queries without AI calls run in DataFusion.
+Quail accepts SQL with AI functions.
+[Apache DataFusion](https://datafusion.apache.org/) parses the SQL and
+runs every operator except the AI functions, which Quail runs on the
+GPU.
 
 <Cards>
   <Card title="AI functions" href="/docs/user-guide/sql/ai-functions"
@@ -14,8 +16,8 @@ in model regions. Queries without AI calls run in DataFusion.
 
 ## Write a query
 
-E.g., register a `reviews` table with IDs in `id` and text in `body`.
-This query returns IDs of reviews that discuss the ending:
+Register a `reviews` table with IDs in `id` and text in `body`. The
+query below returns the IDs of reviews discussing the ending:
 
 ```sql
 SELECT r.id
@@ -23,17 +25,18 @@ FROM reviews r
 WHERE AI.IF(PROMPT('Does this review discuss the ending? {0}', r.body));
 ```
 
-Pass SQL text to `session.sql(text, dialect="bq")` for BigQuery syntax.
-Use `dialect="snowflake"` for Snowflake syntax, the default.
+Pass the SQL text to `session.sql(text)`. `sql()` reads Snowflake
+syntax by default; pass `dialect="bq"` for BigQuery syntax.
 `AI_FILTER` is the Snowflake spelling of `AI.IF`.
 
 ## SQL around the model's work
 
-A *model region* contains AI calls that read the same rows, and AI
-joins. DataFusion runs every other operator: plain filters, joins,
-grouping, sorting, and limits.
+Quail groups AI calls reading the same rows into a *model region* and
+runs each model region on the GPU. DataFusion runs every other
+operator: plain filters, joins, grouping, sorting, and limits.
 
-E.g., classify reviews with more than three stars and count each label:
+The query below classifies reviews with more than three stars and
+counts each label:
 
 ```sql
 SELECT AI.CLASSIFY(PROMPT('Tone? {0}', r.body), ['good', 'bad']) AS tone,
@@ -44,13 +47,13 @@ GROUP BY tone
 ORDER BY reviews DESC;
 ```
 
-The model reads only reviews that pass `r.stars > 3`.
-DataFusion groups and sorts the labels that the model region returns.
+The model reads only the reviews passing `r.stars > 3`. DataFusion
+groups and sorts the labels the model region returns.
 
-`query.explain()` shows the plans.
-`query.plan()` returns one physical plan per model region.
-For a query with several model regions, it returns a tuple of plans.
+`query.explain()` shows the plans. `query.plan()` returns one physical
+plan per model region, as a tuple when the query has several model
+regions.
 
 Use a [CTE](/docs/user-guide/sql/sql-functions#with) or a `FROM` subquery
-when an AI call needs to read an aggregate or window value.
-DataFusion computes those values before the next model region reads them.
+when an AI call needs to read an aggregate or window value. DataFusion
+computes the value before the next model region reads it.
