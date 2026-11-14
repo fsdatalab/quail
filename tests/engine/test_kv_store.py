@@ -51,21 +51,44 @@ def test_a_quantized_prefix_restores_within_half_a_step(codec, levels, ratio):
     assert store.record_bytes <= ratio * TENSORS * HEADS * DIM * 2
 
 
-def test_a_full_store_drops_the_prefix_used_longest_ago():
+def _full_store(pool):
+    """A store of 3072 records holding a long prefix and two short ones."""
+    store = KVStore(torch, (TENSORS, HEADS, DIM), torch.bfloat16,
+                    3072 * TENSORS * HEADS * DIM * 2, codec="raw", device="cpu",
+                    # a pass over a prefix costs its tokens and its token pairs
+                    prefill_seconds=lambda tokens: tokens + tokens * tokens / 2)
+    store.save(b"long", torch.arange(2048))
+    store.save(b"short", torch.arange(512))
+    store.save(b"other", torch.arange(512))
+    store.flush(pool)
+    return store
+
+
+def _held(store):
+    return {name for name in (b"long", b"short", b"other", b"new")
+            if name in store.saved}
+
+
+def test_a_full_store_drops_short_prefixes_before_a_long_one():
     pool = _pool(rows=4096)
-    store = _store("raw", capacity_bytes=3 * 1024 * TENSORS * HEADS * DIM * 2)
-    rows = torch.arange(1024)
-    for name in (b"a", b"b", b"c"):
-        store.save(name, rows)
+    store = _full_store(pool)
+    store.save(b"new", torch.arange(600))
     store.flush(pool)
-    store.restore(b"a", rows + 1024)       # "b" is now the oldest
-    store.flush(pool)
-    store.save(b"d", rows)
-    store.flush(pool)
-    assert [store.has(name, 1024) for name in (b"a", b"b", b"c", b"d")] == [
-        True, False, True, True]
+    # the long prefix saves the most seconds per byte, so both short ones left
+    assert _held(store) == {b"long", b"new"}
     assert store.stats()["dropped_tokens"] == 1024
-    assert torch.equal(pool[:, rows + 1024], pool[:, rows])
+
+
+def test_a_long_prefix_no_query_reads_leaves_after_short_ones_in_use():
+    pool = _pool(rows=8192)
+    store = _full_store(pool)
+    # each eviction raises the clock under the prefixes restored after it
+    for step in range(8):
+        store.save(b"filler %d" % step, torch.arange(512))
+        store.restore(b"filler %d" % step, torch.arange(4096, 4608))
+        store.flush(pool)
+    assert b"long" not in store.saved
+    assert torch.equal(pool[:, 4096:4608], pool[:, :512])
 
 
 def test_a_prefix_larger_than_the_store_is_not_saved():

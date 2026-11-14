@@ -6,9 +6,12 @@ same prefix tokens. A restore replaces the forward pass over the prefix
 with a copy.
 
 Host memory is pinned and grows in segments up to capacity_bytes. A
-saved prefix holds extents of token records; the least recently used
-prefixes leave when a save needs room. A record is one token's K and V
-of every layer, encoded by the codec:
+saved prefix holds extents of token records. When a save needs room,
+the prefix with the lowest credit leaves (GreedyDual-Size): a prefix's
+credit is the forward-pass seconds it saves per byte, so a long
+document outlasts short ones, plus a clock that rises with each
+eviction, so a prefix no query reads ages out. A record is one token's
+K and V of every layer, encoded by the codec:
 
 - "raw" keeps the pool's bytes;
 - "int8" keeps one signed byte per element and one fp16 scale per head
@@ -22,8 +25,9 @@ CUDA stream, so a restore reads what an earlier save wrote.
 """
 
 import hashlib
+import heapq
 import os
-from collections import OrderedDict
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -53,8 +57,13 @@ def host_memory_bytes() -> int:
     return physical
 
 
-def attach_host_store(arena) -> bool:
+def attach_host_store(arena, prefill_seconds=None) -> bool:
     """Give the arena a host store when its pools can use one.
+
+    Args:
+        arena: The KVArena.
+        prefill_seconds: Callable(tokens) -> forward-pass seconds of a
+            prefix, which orders the store's evictions.
 
     Returns:
         Whether a store was attached. An arena whose layers differ, slide,
@@ -65,7 +74,7 @@ def attach_host_store(arena) -> bool:
     store = KVStore(
         arena.torch, (2 * len(arena.shapes), *keys.shape[1:]), arena.dtype,
         int(HOST_FRACTION * host_memory_bytes()), codec=CODEC,
-        device=arena.device)
+        device=arena.device, prefill_seconds=prefill_seconds)
     try:
         arena.attach_store(store)
     except ValueError:
@@ -85,6 +94,7 @@ class _Saved:
     tokens: int
     extents: list     # (segment index, first record, record count)
     queued: int = 0    # queued copies that read or write the extents
+    credit: float = 0.0    # the eviction order: the lowest leaves first
 
 
 @dataclass
@@ -133,10 +143,12 @@ class KVStore:
         capacity_bytes: Host bytes the store may pin.
         codec: One of CODECS.
         device: The pool's device; host memory is pinned for a CUDA device.
+        prefill_seconds: Callable(tokens) -> the seconds a forward pass
+            over a prefix of that length takes; None counts tokens.
     """
 
     def __init__(self, torch, record_shape, dtype, capacity_bytes: int,
-                 codec: str = "int8", device="cuda"):
+                 codec: str = "int8", device="cuda", prefill_seconds=None):
         if codec not in CODECS:
             raise ValueError(f"codec must be one of {CODECS}, got {codec!r}")
         self.torch = torch
@@ -164,7 +176,10 @@ class KVStore:
         self.max_segments = capacity_bytes // (
             self.segment_records * self.record_bytes)
         self.segments = []
-        self.saved = OrderedDict()    # content id -> _Saved, least recent first
+        self.prefill_seconds = prefill_seconds or float
+        self.saved = {}        # content id -> _Saved
+        self._credits = []     # heap of (credit, content id), stale ones too
+        self._clock = 0.0      # the credit of the last prefix dropped
         self._saves = []       # (segment index, first record, count, rows)
         self._restores = []    # the same, for records to write into the pool
         self._queued = []      # _Saved whose extents the queued copies use
@@ -175,12 +190,16 @@ class KVStore:
         self.saved_tokens = 0
         self.restored_tokens = 0
         self.dropped_tokens = 0
+        self.pin_seconds = 0.0     # host seconds pinning new segments
+        self.flush_seconds = 0.0   # host seconds queueing the copies
 
     def stats(self) -> dict:
         """Return the counters since reset_stats and what the store holds."""
         return {"codec": self.codec, "saved_tokens": self.saved_tokens,
                 "restored_tokens": self.restored_tokens,
                 "dropped_tokens": self.dropped_tokens,
+                "pin_seconds": self.pin_seconds,
+                "flush_seconds": self.flush_seconds,
                 "held_tokens": self.held_tokens, "held_bytes": self.held_bytes,
                 "capacity_bytes": self.max_segments * self.segment_records
                 * self.record_bytes}
@@ -213,14 +232,16 @@ class KVStore:
                 index = len(self.segments)
                 # a tensor made in inference mode could not be written
                 # outside it, where a query boundary flushes
+                started = time.perf_counter()
                 with self.torch.inference_mode(False):
                     records = self.torch.empty(
                         (self.segment_records, self.record_bytes),
                         dtype=self.torch.uint8, pin_memory=self.pinned)
+                self.pin_seconds += time.perf_counter() - started
                 self.segments.append(_Segment(records, [(0, self.segment_records)]))
                 taken = self.segments[index].take(left)
             if taken is None:
-                if not self._drop_oldest():
+                if not self._drop_lowest():
                     for segment, first, count in extents:
                         self.segments[segment].give(first, count)
                     return None
@@ -229,17 +250,32 @@ class KVStore:
             left -= taken[1]
         return extents
 
-    def _drop_oldest(self) -> bool:
-        """Free the least recently used prefix no queued copy uses."""
-        for content, saved in self.saved.items():
+    def _credit(self, content: bytes, saved) -> None:
+        """Set a prefix's credit on a save or a restore."""
+        saved.credit = self._clock + (
+            self.prefill_seconds(saved.tokens) / (saved.tokens * self.record_bytes))
+        heapq.heappush(self._credits, (saved.credit, content))
+
+    def _drop_lowest(self) -> bool:
+        """Free the prefix with the lowest credit that no queued copy uses."""
+        queued, dropped = [], False
+        while self._credits and not dropped:
+            credit, content = heapq.heappop(self._credits)
+            saved = self.saved.get(content)
+            if saved is None or saved.credit != credit:
+                continue        # dropped, or credited again since
             if saved.queued:
+                queued.append((credit, content))
                 continue
             del self.saved[content]
             for segment, first, count in saved.extents:
                 self.segments[segment].give(first, count)
             self.dropped_tokens += saved.tokens
-            return True
-        return False
+            self._clock = credit
+            dropped = True
+        for entry in queued:
+            heapq.heappush(self._credits, entry)
+        return dropped
 
     # ---- queueing, called by the arena ----------------------------------
 
@@ -252,22 +288,20 @@ class KVStore:
         """
         tokens = int(rows.numel())
         saved = self.saved.get(content)
-        if saved is not None and saved.tokens == tokens:
-            self.saved.move_to_end(content)
-            return
         if saved is not None or not tokens:
             return
         extents = self._allocate(tokens)
         if extents is None:
             return
         saved = self.saved[content] = _Saved(tokens, extents)
+        self._credit(content, saved)
         self._queue(self._saves, saved, rows)
         self.saved_tokens += tokens
 
     def restore(self, content: bytes, rows) -> None:
         """Queue a copy of a saved prefix into the pool rows."""
         saved = self.saved[content]
-        self.saved.move_to_end(content)
+        self._credit(content, saved)
         self._queue(self._restores, saved, rows)
         self.restored_tokens += saved.tokens
 
@@ -288,8 +322,10 @@ class KVStore:
             pool: The arena's K and V of every layer as one tensor of
                 shape (tensors, rows, KV heads, head dimension).
         """
+        started = time.perf_counter()
         with self.torch.inference_mode():
             self._copy(pool)
+        self.flush_seconds += time.perf_counter() - started
         for saved in self._queued:
             saved.queued -= 1
         self._queued = []

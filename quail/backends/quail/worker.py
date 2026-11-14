@@ -34,6 +34,7 @@ from quail.backends.quail.executor.warmup import warm_kernels
 from quail.backends.quail.graph import payload_tables, serve_region
 from quail.backends.resources import freeze_loaded_objects, release_models
 from quail.common import budgets
+from quail.common.retention import RetentionPolicy, coefficients
 from quail.physical.plan import graph_from_envelope
 from quail.progress import (
     say,
@@ -105,7 +106,8 @@ class LoadedGpu:
                              num_sliding_pages=sliding_pages,
                              **checkpoint_arena_args(spec, device, budget,
                                                      full_pages))
-        attach_host_store(self.arena)
+        attach_host_store(self.arena, RetentionPolicy(
+            **coefficients(spec, device)).prefill_seconds)
         self.arena_s = time.perf_counter() - t0
         self.pool_bytes = pool_bytes(self.arena)
 
