@@ -70,11 +70,29 @@ WHERE AI.IF(PROMPT('Is this receipt''s total over 100,000 rupiah? {0}', r.image)
 | --- | --- | --- |
 | 174,600: returned, `meal` | 230,000: returned, `bakery or snacks` | 91,000: filtered out |
 
-You get answers for all 1,000 receipts in 100 seconds on one H100 with
-`qwen3.5-4b-bf16`, for $0.11. The filter was right on 96.8% of the 972
+You get answers for all 1,000 receipts in 92 seconds on one H100 with
+`qwen3.5-4b-bf16`, for $0.10. The filter was right on 96.8% of the 972
 receipts with a labeled total. The query runs fast because
 `AI.CLASSIFY` reuses the KV that `AI.IF` already computed for each
 receipt.
+
+### Shrink large images
+
+To make a query over large photos faster, shrink each photo with
+`AI.IMAGE`. The second argument sets the longest side, in pixels:
+
+```sql
+SELECT r.id,
+       AI.CLASSIFY(AI.IMAGE(r.image, 1024),
+                   ['meal', 'drinks only', 'bakery or snacks']) AS category
+FROM receipts r
+WHERE AI.IF(PROMPT('Is this receipt''s total over 100,000 rupiah? {0}',
+                   AI.IMAGE(r.image, 1024)));
+```
+
+CORD's photos are up to 4,224 pixels on a side. At 1,024 pixels, the
+query took 22 seconds instead of 92, for $0.02. The filter was right on
+96.7% of the receipts, against 96.8% at full size.
 
 ## PDFs
 
