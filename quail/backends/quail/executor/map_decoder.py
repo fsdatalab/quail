@@ -15,12 +15,20 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from quail.backends.quail.executor.answer_curves import AnswerCurves
 from quail.backends.quail.executor.chunk import DecodeRows
 from quail.backends.quail.executor.groups import FullAttentionGroup
 
 # copies of chosen tokens kept in flight before the host waits on the
 # oldest; two lets the host read a pass's tokens while the next runs
 IN_FLIGHT = 2
+# per extraction field: rounds that fed a draft, and of them the rounds
+# with several live positions; draft rows fed and written; rounds whose
+# draft the model left for another position, the draft rows unread after
+# it, and the draft rows unread after an answer's end
+DRAFT_COUNTS = ("draft_rounds", "draft_rounds_many_positions", "draft_rows",
+                "draft_rows_written", "draft_rounds_rejected",
+                "draft_rows_rejected", "draft_rows_after_end")
 
 
 @dataclass
@@ -77,6 +85,8 @@ class MapDecoder:
         self.fed = np.zeros(n, dtype=np.int64)         # decode rows packed
         # when a list, each settle appends the slots whose answers ended
         self.ended_log = None
+        # the answers' survival curves, built at their first use
+        self.answer_curves = None
         self.stopped = np.zeros(n, dtype=bool)         # read a stop token
         self.kv = FullAttentionGroup(n, page_tokens)
         self.device = head.device
@@ -96,6 +106,7 @@ class MapDecoder:
         # whether a document's branches read its shared pages together
         self.share = False
         self.copy_constraints = {}
+        self.draft_counts = {}
         self.copy_readouts = {}
         self.copy_groups = []
         self.copy_inputs = []
@@ -108,6 +119,8 @@ class MapDecoder:
         self.copy_sources = np.full(n, -1, dtype=np.int64)
         self.num_streams = np.zeros(n, dtype=np.int64)
         self.steps = [np.zeros(n, dtype=np.int64) for _ in self.limits]
+        # per map, each document's rounds whose draft the model rejected
+        self.rejected_steps = [np.zeros(n, dtype=np.int64) for _ in self.limits]
         self.drafts = np.zeros(n, dtype=np.int64)
         # per map, its AnswerStop; the tokenizer decodes a map's text so far
         self.answer_stops = {}
@@ -120,6 +133,10 @@ class MapDecoder:
     def configure_copy(self, first, slots, documents, specs):
         """Register extraction fields for setup after the first forward launch."""
         self.constrained[first:first + len(specs)] = True
+        for q, spec in enumerate(specs, first):
+            self.draft_counts[q] = dict.fromkeys(DRAFT_COUNTS, 0)
+            self.answer_slots.setdefault(q, slots[q - first])
+            self.expected_tokens[q] = spec.expected_answer_tokens
         self.copy_inputs.append((first, slots, documents, specs))
 
     def _initialize(self):
@@ -131,7 +148,10 @@ class MapDecoder:
             self._configure_copy(first, slots, documents, specs)
 
     def _configure_copy(self, first, slots, documents, specs):
-        from quail.backends.quail.executor.extract.copy import CopyConstraint
+        from quail.backends.quail.executor.extract.copy import (
+            CopyConstraint,
+            StreamRows,
+        )
         from quail.backends.quail.executor.readout import AsyncTopLogprobs
         from quail.common.draft_policy import LIVE_BUCKETS
 
@@ -145,14 +165,13 @@ class MapDecoder:
         self.copy_words = max(self.copy_words, constraint.mask_words)
         self.copy_trace_words = max(self.copy_trace_words, constraint.trace_width)
         self.copy_trace = constraint.trace or self.copy_trace
-        streams = constraint.stream_ids.repeat(len(specs), 1)
         index = np.zeros(len(self.map), dtype=np.int64)
         index[slots.flatten()] = np.arange(slots.size)
         group = SimpleNamespace(
             constraint=constraint, key=key,
             questions=np.arange(first, first + len(specs)), index=index,
-            streams=streams, alive=streams >= 0,
-            widths=np.full(slots.size, streams.shape[1], dtype=np.int64),
+            rows=StreamRows(constraint, slots.size),
+            widths=np.full(slots.size, constraint.max_positions, dtype=np.int64),
             source=self.torch.zeros(slots.size, dtype=self.torch.int64,
                                     device=self.device),
             masks=np.zeros((slots.size, constraint.mask_words), dtype=np.int64),
@@ -163,22 +182,29 @@ class MapDecoder:
         for q, spec in enumerate(specs):
             self.copy_document[slots[q]] = np.arange(len(documents.documents))
             self.copy_constraints[first + q] = SimpleNamespace(
-                constraint=constraint, spec=spec,
+                constraint=constraint, spec=spec, group=group,
                 sources=np.full(len(self.map), -1, dtype=np.int64),
                 masks=group.masks[q * slots.shape[1]:(q + 1) * slots.shape[1]],
                 trials=np.zeros(len(LIVE_BUCKETS)), accepts=np.zeros(len(LIVE_BUCKETS)),
                 rho=np.array([document.rho for document in documents.documents]))
 
+    def survival_curves(self):
+        """Return each map's survival curve over its answers so far."""
+        if self.answer_curves is None:
+            self.answer_curves = AnswerCurves(self)
+        self.answer_curves.update()
+        return self.answer_curves.whole
+
     def row_counts(self, running):
         """Return one chosen-token row and each answer's copy draft rows."""
         from quail.backends.quail.executor.extract.copy import STREAM_STRIDE
-        from quail.common.answers import answer_survival
         from quail.common.draft_policy import draft_lengths
 
         counts = np.ones(len(running), dtype=np.int64)
         written = np.zeros(len(running), dtype=np.int64)
         sizes = np.zeros(len(running), dtype=np.int64)
         curves = {}
+        whole = None
         for q, state in self.copy_constraints.items():
             mine = self.map[running] == q
             slots = running[mine]
@@ -189,12 +215,12 @@ class MapDecoder:
             if spec.draft_policy != "adaptive":
                 sizes[mine] = spec.draft_tokens
                 continue
-            curve = answer_survival(self.lengths[q], self.written[q],
-                                    spec.expected_answer_tokens,
-                                    spec.max_answer_tokens)
-            curves[q] = curve
+            if whole is None:
+                whole = self.survival_curves()
+            limit = int(self.limits[q])
+            curves[q] = curve = whole[q, :limit + 1]
             sizes[mine] = draft_lengths(
-                spec.draft_tokens, spec.max_answer_tokens, curve, written[mine],
+                spec.draft_tokens, limit, curve, written[mine],
                 self.num_streams[slots], state.rho[self.copy_document[slots]],
                 state.trials, state.accepts)
         for group in self.copy_groups:
@@ -304,35 +330,33 @@ class MapDecoder:
         self.paused[document] = False
         self.drafts[document] = 0
 
-    def eviction_order(self, curves=None, recompute_cost=None, page_holds=None,
-                       remaining=None):
+    def eviction_order(self, recompute_cost=None, page_holds=None, remaining=None):
         """Order running slots by page-hold time saved per recomputation second.
 
         Args:
-            curves: Per map, the survival curve to estimate remaining
-                tokens from; each map's own answers by default.
             recompute_cost: Prices rebuilding a slot's KV; without it,
                 slots are ordered by remaining tokens alone.
             page_holds: How many slots hold each page; a page another
                 slot also holds is not freed.
             remaining: Per slot, its expected remaining tokens; replaces
-                the estimate from curves.
+                the estimate from each map's survival curve.
         """
         from quail.common.answers import remaining_tokens
 
         running = np.flatnonzero((self.map >= 0) & ~self.paused)
         scores = np.zeros(len(self.map))
         written = np.zeros(len(self.map), dtype=np.int64)
+        whole = None
         for q in np.unique(self.map[running]):
             mine = running[self.map[running] == q]
             written[mine] = self.written[q][mine]
             if remaining is not None:
                 scores[mine] = remaining[mine]
                 continue
-            curve = remaining_tokens(
-                self.lengths[q], self.written[q], self.expected_tokens[q],
-                int(self.limits[q]), survival=None if curves is None else curves.get(q))
-            scores[mine] = curve[written[mine]]
+            if whole is None:
+                whole = self.survival_curves()
+            left = remaining_tokens(whole[q, :int(self.limits[q]) + 1])
+            scores[mine] = left[written[mine]]
         if recompute_cost is not None and len(running):
             num_pages = self.kv.num_pages[running]
             if page_holds is not None:
@@ -561,8 +585,8 @@ class MapDecoder:
         local = constraint.tensor(self.copy_document[slots])
         index = constraint.tensor(group.index[slots])
         limits = constraint.tensor(self.limits[self.map[slots]])
-        streams = group.streams[index, :stream_width]
-        alive = group.alive[index, :stream_width]
+        answers = group.index[slots]
+        streams, alive = group.rows.read(answers, local, stream_width)
         if num_streams < stream_width:
             streams, alive = constraint.compact(streams, alive, num_streams)
         source = group.source[index]
@@ -589,10 +613,8 @@ class MapDecoder:
             if self.copy_trace is not None:
                 out[take[:, 0], 4 + self.copy_words:] = traces[take[:, 1], take[:, 2]]
             del values, traces
-        group.alive[index, :stream_width] = False
-        group.alive[index, :num_streams] = alive
-        group.streams[index, :num_streams] = streams
-        group.widths[group.index[slots]] = num_streams
+        group.rows.write(answers, streams, alive)
+        group.widths[answers] = num_streams
         group.source[index] = source
         packed = constraint.packed_positions(streams, alive, local)
         out[:, 4:4 + constraint.mask_words] = packed[constraint.tensor(inverse)]
@@ -659,6 +681,9 @@ class MapDecoder:
                 self._read_copy(q, documents[mine], indices[mine], values[mine])
         self.stopped[documents[stop]] = True
         self.map[documents[ended]] = -1
+        for group in self.copy_groups:
+            mine = documents[ended & np.isin(maps, group.questions)]
+            group.rows.release(group.index[mine])
         if self.ended_log is not None:
             self.ended_log.append(documents[ended])
         self.copy_pending[documents[ended]] = False
@@ -707,6 +732,9 @@ class MapDecoder:
                 self.lengths[q][slot] = length
                 self.stopped[slot] = True
                 self.map[slot] = -1
+                if q in self.copy_constraints:
+                    group = self.copy_constraints[q].group
+                    group.rows.release(group.index[[slot]])
                 self.copy_pending[slot] = False
                 if self.ended_log is not None:
                     self.ended_log.append(np.array([slot]))
@@ -786,6 +814,17 @@ class MapDecoder:
             last, 4:4 + state.constraint.mask_words]
         observed = ((self.num_streams[slots] > 1) & (self.drafts[slots] > 0)
                     & (values[first, 0] >= 0) & (indices[first] + 1 < self.limits[q]))
+        drafts = self.drafts[slots]
+        written = np.bincount(inverse, minlength=len(slots)) - 1
+        unread = drafts - written
+        chose = values[last, 0] >= 0
+        # the model chose a token of another position with draft rows unread
+        rejected = chose & (values[last, 3] == 0) & (unread > 0)
+        self.rejected_steps[q][slots] += rejected
+        for name, count in zip(DRAFT_COUNTS, (
+                drafts > 0, (drafts > 0) & (self.num_streams[slots] > 1), drafts,
+                written, rejected, unread * rejected, unread * ~chose)):
+            self.draft_counts[q][name] += int(count.sum())
         buckets = live_buckets(self.num_streams[slots])
         np.add.at(state.trials, buckets[observed], 1)
         np.add.at(state.accepts, buckets[observed], values[first[observed], 3] > 0)

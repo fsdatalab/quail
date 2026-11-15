@@ -4,14 +4,19 @@
 /// Answers the prior counts as, until ended answers outweigh it.
 pub const PRIOR_WEIGHT: f64 = 20.0;
 
-/// S(t) for t = 0..=limit under geometric lengths with the given mean.
-pub fn prior_survival(expected_tokens: f64, limit: usize) -> Vec<f64> {
+/// The chance a geometric answer with the given mean goes on past a token.
+pub fn keep(expected_tokens: f64) -> f64 {
     let mean = if expected_tokens > 1.0 {
         expected_tokens
     } else {
         1.0
     };
-    let keep = 1.0 - 1.0 / mean;
+    1.0 - 1.0 / mean
+}
+
+/// S(t) for t = 0..=limit under geometric lengths with the given mean.
+pub fn prior_survival(expected_tokens: f64, limit: usize) -> Vec<f64> {
+    let keep = keep(expected_tokens);
     let mut curve: Vec<f64> = (0..=limit).map(|t| keep.powf(t as f64)).collect();
     curve[limit] = 0.0;
     curve
@@ -58,34 +63,6 @@ pub fn survival_rows(
             survival
         })
         .collect()
-}
-
-/// S(t), the chance an answer runs past t tokens, t = 0..=limit.
-///
-/// `lengths` holds each answer's length, -1 while it is being written;
-/// `written` the tokens each answer has written.
-pub fn answer_survival(
-    lengths: &[i64],
-    written: &[i64],
-    expected_tokens: f64,
-    limit: usize,
-    prior: Option<Vec<f64>>,
-) -> Vec<f64> {
-    let mut counts = vec![0_i64; limit + 1];
-    let mut events = vec![0_i64; limit + 1];
-    for (length, so_far) in lengths.iter().zip(written) {
-        let observed = if *length >= 0 { *length } else { *so_far };
-        if (observed as usize) <= limit {
-            counts[observed as usize] += 1;
-        }
-        if *length >= 0 && (*length as usize) <= limit {
-            events[*length as usize] += 1;
-        }
-    }
-    let prior = prior.unwrap_or_else(|| prior_survival(expected_tokens, limit));
-    survival_rows(&[counts], &[events], &[prior], &[limit])
-        .pop()
-        .expect("one row")
 }
 
 /// The expected tokens left after t tokens, t = 0..=limit.

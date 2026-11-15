@@ -25,9 +25,9 @@ fn tri(tokens: f64, window: i64) -> f64 {
     value(&triangle(&scalar(tokens), window))
 }
 
-/// The keep chance of `ExtractAssumptions`: 1 - 1/max(1, answer_tokens).
+/// The keep chance of the answer prior, for a whole mean answer length.
 fn keep(answer_tokens: i64) -> f64 {
-    1.0 - 1.0 / (answer_tokens as f64).max(1.0)
+    crate::cost::answers::keep(answer_tokens as f64)
 }
 
 /// `ExtractAssumptions.survival`: the chance an answer has more than
