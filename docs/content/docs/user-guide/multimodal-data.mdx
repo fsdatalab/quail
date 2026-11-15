@@ -56,7 +56,7 @@ session.register("receipts", quail.DocumentProvider.from_table(receipts, id_col=
 ```
 
 Finally, pass the image column to an AI function. In the query below,
-`AI.IF` keeps each receipt over 100,000 rupiah, and `AI.CLASSIFY` labels
+`AI.IF` keeps each receipt over 100,000 rupiah. `AI.CLASSIFY` then labels
 what each kept receipt paid for:
 
 ```sql
