@@ -153,8 +153,14 @@ pub fn plan_statistics(
             longest = Some(summary.mean());
         }
     }
-    let split =
-        arena_pages(model, &context.device, Some(chunk), longest).map_err(CompileError::new)?;
+    let split = arena_pages(
+        model,
+        &context.device,
+        Some(chunk),
+        longest,
+        context.writes_answers(),
+    )
+    .map_err(CompileError::new)?;
     for (alias, fraction) in &context.scan_fractions {
         if let Some(summary) = lengths.get_mut(alias) {
             *summary = summary.scale(*fraction);

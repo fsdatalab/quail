@@ -110,3 +110,77 @@ def test_hybrid_budget_reserves_checkpoints_and_two_execution_chunks(
     }
     with pytest.raises(ValueError, match="holds no checkpoint"):
         budgets.hybrid_arena_pages(model, H100_SXM, chunk, 1e7)
+
+
+def test_a_plan_without_an_answer_writer_gives_the_graph_memory_to_kv():
+    for model in (QWEN3_4B_FP8, QWEN3_5_4B_BF16):
+        chunk = budgets.chunk_budget(model, H100_SXM)
+        graphs = budgets.graph_memory_bytes(model, H100_SXM)
+        assert graphs > 0, model.name
+        assert (budgets.arena_bytes(model, H100_SXM, chunk, writes_answers=False)
+                - budgets.arena_bytes(model, H100_SXM, chunk)) == graphs, model.name
+    # Qwen3-4B: the 1,280 MiB reserve is 569 more pages of 16 tokens
+    page_bytes = QWEN3_4B_FP8.kappa * budgets.PAGE_TOKENS
+    kept = budgets.arena_tokens(QWEN3_4B_FP8, H100_SXM)
+    given = budgets.arena_tokens(QWEN3_4B_FP8, H100_SXM, writes_answers=False)
+    assert kept == 353_136
+    assert given - kept == 569 * budgets.PAGE_TOKENS
+    reserve = budgets.graph_memory_bytes(QWEN3_4B_FP8, H100_SXM)
+    assert reserve == 1_280 * 2**20
+    assert 568 < reserve / page_bytes < 569
+
+    # a hybrid model's pool grows by the reserve's 2,560 pages, and the
+    # worker counts its checkpoint slots from the same pool
+    model = replace(QWEN3_5_4B_BF16, w_mem_bytes=8_411_152_384)
+    chunk = budgets.chunk_budget(model, H100_SXM)
+    assert budgets.hybrid_pool_pages(model, H100_SXM, chunk) == 65_500
+    assert budgets.hybrid_pool_pages(
+        model, H100_SXM, chunk, writes_answers=False) == 68_060
+    kv_pages, _ = budgets.arena_pages(model, H100_SXM, chunk, 200,
+                                      writes_answers=False)
+    slots = budgets.checkpoint_slots(model, H100_SXM, chunk, kv_pages,
+                                     writes_answers=False)
+    assert slots > budgets.checkpoint_slots(model, H100_SXM, chunk, kv_pages)
+    retained = kv_pages - budgets.execution_pages(chunk)
+    assert retained + (slots + 1) * budgets.checkpoint_pages(model) <= 68_060
+
+    # a model without CUDA graphs has no reserve to give
+    assert budgets.graph_memory_bytes(DIFFUSION_GEMMA_26B_FP8, H100_SXM) == 0
+    chunk = budgets.chunk_budget(DIFFUSION_GEMMA_26B_FP8, H100_SXM)
+    assert (budgets.arena_bytes(DIFFUSION_GEMMA_26B_FP8, H100_SXM, chunk,
+                                writes_answers=False)
+            == budgets.arena_bytes(DIFFUSION_GEMMA_26B_FP8, H100_SXM, chunk))
+
+
+def test_only_a_plan_with_a_map_or_an_extraction_keeps_the_graph_memory():
+    import pyarrow as pa
+    from helpers.sessions import CONFIG, TOKENIZER
+
+    import quail
+
+    reviews = pa.table({"id": ["r0", "r1"], "body": ["kind words", "rude words"]})
+    queries = {
+        "score": "SELECT r.id, AI.SCORE(PROMPT('kind: {0}', r.body)) AS s "
+                 "FROM reviews r",
+        "filter": "SELECT r.id FROM reviews r "
+                  "WHERE AI_FILTER(PROMPT('kind: {0}', r.body))",
+        "map": "SELECT r.id, AI.MAP(r.body, 'Is it kind?') AS v FROM reviews r",
+        "extract": "SELECT r.id, AI.EXTRACT(r.body, {'w': 'Which word?'}) AS e "
+                   "FROM reviews r",
+    }
+    with quail.Session(CONFIG, tokenizer=TOKENIZER) as session:
+        session.register(
+            "reviews", quail.DocumentProvider.from_table(reviews, id_col="id"))
+        settings = {name: session.sql(sql).plan().settings
+                    for name, sql in queries.items()}
+    kept = budgets.arena_pages(QWEN3_4B_FP8, H100_SXM)
+    given = budgets.arena_pages(QWEN3_4B_FP8, H100_SXM, writes_answers=False)
+    assert given[0] - kept[0] == 569
+    for name in ("map", "extract"):
+        assert settings[name]["writes_answers"] is True, name
+        assert tuple(settings[name]["arena_pages"]) == kept, name
+        assert settings[name]["admission_tokens"] == 353_136, name
+    for name in ("score", "filter"):
+        assert settings[name]["writes_answers"] is False, name
+        assert tuple(settings[name]["arena_pages"]) == given, name
+        assert settings[name]["admission_tokens"] == 353_136 + 569 * 16, name

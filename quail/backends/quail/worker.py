@@ -131,17 +131,31 @@ class LoadedGpu:
         self.async_ans = None
         self.chunk_tokens = None
 
-    def bind_query(self, true_ids, false_ids, chunk_tokens, arena_pages=None):
+    def bind_query(self, true_ids, false_ids, chunk_tokens, arena_pages=None,
+                   *, writes_answers):
         """Attach the answer rows, readout, and chunk budget for one query.
 
         arena_pages resizes the KV pools to the plan's split; nothing
         survives in the arena between queries.
+
+        Args:
+            true_ids: The token ids of a true answer.
+            false_ids: The token ids of a false answer.
+            chunk_tokens: The tokens per forward pass.
+            arena_pages: The plan's (every-token, sliding-layer) pages,
+                or None to keep the pools.
+            writes_answers: Whether the plan holds AI.MAP or AI.EXTRACT.
+                The planner leaves the CUDA graph memory out of
+                arena_pages only for such a plan, so any other plan
+                releases the captured graphs before its arena takes
+                their memory.
         """
         if arena_pages is not None:
             slots = checkpoint_arena_args(
-                self.spec, self.device, chunk_tokens, arena_pages[0])
+                self.spec, self.device, chunk_tokens, arena_pages[0],
+                writes_answers)
             graphs = self.pipeline.piecewise_graphs
-            if (graphs is not None and tuple(arena_pages)
+            if graphs is not None and (not writes_answers or tuple(arena_pages)
                     != (self.arena.num_pages, self.arena.num_sliding_pages)):
                 self.torch.cuda.synchronize()
                 graphs.invalidate()
@@ -168,8 +182,14 @@ class LoadedGpu:
             async_scores=async_scores,
         )
 
-    def warm(self):
-        """Compile and warm kernels once.
+    def warm(self, writes_answers):
+        """Compile and warm kernels once, and capture the CUDA graphs.
+
+        Args:
+            writes_answers: Whether the plan holds AI.MAP or AI.EXTRACT,
+                which write answers token by token. Only their small
+                passes replay the CUDA graphs, so only their plan
+                captures the graphs.
 
         Returns:
             Tuple of (seconds spent warming, compilation tier).
@@ -184,7 +204,7 @@ class LoadedGpu:
                                     model=self.model)
                 tier = warm["tier"]
             graphs = self.pipeline.piecewise_graphs
-            if graphs is not None and graphs.prepare():
+            if graphs is not None and writes_answers and graphs.prepare():
                 tier = tier or "graphs"
         if tier is None:
             return 0.0, None
@@ -198,14 +218,19 @@ class LoadedGpu:
         self.execution.close()
 
 
-def checkpoint_arena_args(spec, device, chunk_tokens, kv_pages) -> dict:
-    """KVArena arguments for the checkpoint slots; empty without state layers."""
+def checkpoint_arena_args(spec, device, chunk_tokens, kv_pages,
+                          writes_answers=True) -> dict:
+    """KVArena arguments for the checkpoint slots; empty without state layers.
+
+    writes_answers is whether the plan holds AI.MAP or AI.EXTRACT, and so
+    leaves the CUDA graph memory out of the pool.
+    """
     if not spec.state_layers:
         return {}
     layers = len(spec.state_layers)
     return {
         "num_state_slots": budgets.checkpoint_slots(
-            spec, device, chunk_tokens, kv_pages),
+            spec, device, chunk_tokens, kv_pages, writes_answers),
         "gdn_state_shape": (layers, spec.gdn_value_heads,
                             spec.gdn_value_dim, spec.gdn_key_dim),
         "conv_state_shape": (layers, spec.conv_width - 1,
@@ -285,10 +310,11 @@ def _boot_record(gpu, cold, warm_s, warm_tier, t_boot):
 
 
 def _boot_gpu(gpu, backend, gpu_context, chunk_tokens, true_ids, false_ids,
-              arena_pages=None, *, model_path=None):
+              arena_pages=None, *, writes_answers, model_path=None):
     """Prepare a GPU for a query, releasing it when preparation fails.
 
     A gpu of None loads the model; otherwise the loaded GPU is reused.
+    writes_answers is whether the plan holds AI.MAP or AI.EXTRACT.
     """
     t_boot = time.perf_counter()
     cold = gpu is None
@@ -300,8 +326,9 @@ def _boot_gpu(gpu, backend, gpu_context, chunk_tokens, true_ids, false_ids,
             gpu = LoadedGpu(backend, gpu_context, true_ids + false_ids,
                             model_path=model_path)
         state["gpu"] = gpu
-        gpu.bind_query(true_ids, false_ids, chunk_tokens, arena_pages)
-        warm_s, warm_tier = gpu.warm()
+        gpu.bind_query(true_ids, false_ids, chunk_tokens, arena_pages,
+                       writes_answers=writes_answers)
+        warm_s, warm_tier = gpu.warm(writes_answers)
         if cold:
             freeze_loaded_objects()
         boot = _boot_record(gpu, cold, warm_s, warm_tier, t_boot)
@@ -378,7 +405,7 @@ def _boot_worker(state, setup) -> dict:
             gpu_index=state.gpu_index, gpus=setup["gpus"], model=spec,
             device=registry.device(setup["device"]), query_settings={}),
         setup["chunk_tokens"], setup["true_ids"], setup["false_ids"],
-        setup.get("arena_pages"),
+        setup.get("arena_pages"), writes_answers=setup["writes_answers"],
         # a setup without the model's files has the worker find them
         model_path=(setup["model_path"]
                     or resolve_model_path(spec.hf_name, spec.revision)))
