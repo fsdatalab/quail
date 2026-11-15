@@ -19,6 +19,8 @@ pdf-extract = "0.12.1"
 hayro = "0.9"
 # hayro already builds png, which encodes each page
 png = "0.18"
+# draws PDF pages and parses PDFs on every core
+rayon = "1.12"
 quail-planner.workspace = true
 serde_json = { version = "1", features = ["float_roundtrip"] }
 sqlparser = { version = "0.62.0", features = ["visitor"] }

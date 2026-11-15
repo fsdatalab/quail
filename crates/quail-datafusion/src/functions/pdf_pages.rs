@@ -38,6 +38,8 @@ use hayro::vello_cpu::color::palette::css::WHITE;
 use hayro::vello_cpu::{Pixmap, RasterizerSettings, RenderContext, Resources, TargetInit};
 use hayro::{RenderCache, RenderSettings, render_into};
 
+use rayon::prelude::*;
+
 use super::quiet::quietly;
 
 /// The pixels each side of an image is a multiple of: one Qwen vision
@@ -50,6 +52,10 @@ const DEFAULT_LONGEST_EDGE: u16 = 1536;
 /// The largest `longest_edge` a call may name: a square page of this
 /// size is 256 MB of pixels while hayro draws it.
 const MAX_LONGEST_EDGE: u16 = 8192;
+
+/// A PDF's pages, by number from 1, each with its PNG, or None for a
+/// page hayro cannot draw.
+type Pages = Vec<(usize, Option<Vec<u8>>)>;
 
 /// `AI.PDF_PAGES`, which returns each PDF's pages as PNG images.
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -190,11 +196,18 @@ fn pdf_pages(
     longest_edge: u16,
     range: (usize, Option<usize>),
 ) -> Result<ArrayRef> {
+    let files: Vec<Option<&[u8]>> = match pdfs.data_type() {
+        DataType::Binary => pdfs.as_binary::<i32>().iter().collect(),
+        DataType::LargeBinary => pdfs.as_binary::<i64>().iter().collect(),
+        DataType::BinaryView => pdfs.as_binary_view().iter().collect(),
+        other => return exec_err!("AI.PDF_PAGES reads a binary column, not {other}"),
+    };
+    let rendered = page_images(&files, longest_edge, range);
     let mut pages = ListBuilder::new(StructBuilder::from_fields(page_fields(), 0));
-    let mut append = |bytes: Option<&[u8]>| {
-        let Some(images) = bytes.and_then(|bytes| page_images(bytes, longest_edge, range)) else {
+    for images in rendered {
+        let Some(images) = images else {
             pages.append_null();
-            return;
+            continue;
         };
         let page = pages.values();
         for (number, image) in images {
@@ -207,42 +220,61 @@ fn pdf_pages(
             page.append(true);
         }
         pages.append(true);
-    };
-    match pdfs.data_type() {
-        DataType::Binary => pdfs.as_binary::<i32>().iter().for_each(&mut append),
-        DataType::LargeBinary => pdfs.as_binary::<i64>().iter().for_each(&mut append),
-        DataType::BinaryView => pdfs.as_binary_view().iter().for_each(&mut append),
-        other => return exec_err!("AI.PDF_PAGES reads a binary column, not {other}"),
     }
     Ok(Arc::new(pages.finish()))
 }
 
-/// Each page of a PDF in the range, by its number from 1, with its PNG,
-/// or None when hayro cannot read the file. A page hayro cannot draw
-/// has no PNG; only the pages in the range are drawn.
-#[allow(clippy::type_complexity)]
+/// Each PDF's pages in the range, by number from 1, with their PNGs, or
+/// None for a NULL PDF or one hayro cannot read. A page hayro cannot
+/// draw has no PNG; only the pages in the range are drawn.
+///
+/// The PDFs parse in parallel, and then every page of every PDF draws in
+/// parallel, so one long PDF uses every core.
 fn page_images(
-    bytes: &[u8],
+    files: &[Option<&[u8]>],
     longest_edge: u16,
     (first, last): (usize, Option<usize>),
-) -> Option<Vec<(usize, Option<Vec<u8>>)>> {
-    let pdf = quietly(|| Pdf::new(bytes.to_vec()).ok())??;
+) -> Vec<Option<Pages>> {
+    let parsed: Vec<Option<(Pdf, usize)>> = files
+        .par_iter()
+        .map(|bytes| {
+            let bytes = (*bytes)?;
+            let pdf = quietly(|| Pdf::new(bytes.to_vec()).ok())??;
+            let num_pages = quietly(|| pdf.pages().len())?;
+            Some((pdf, num_pages))
+        })
+        .collect();
+    let in_range = |num_pages: usize| {
+        let end = last.map_or(num_pages, |last| last.min(num_pages));
+        (first - 1)..end.max(first - 1)
+    };
+    let tasks: Vec<(usize, usize)> = parsed
+        .iter()
+        .enumerate()
+        .filter_map(|(file, found)| found.as_ref().map(|(_, num_pages)| (file, *num_pages)))
+        .flat_map(|(file, num_pages)| in_range(num_pages).map(move |index| (file, index)))
+        .collect();
     let settings = InterpreterSettings::default();
-    let cache = RenderCache::new();
-    quietly(|| {
-        pdf.pages()
-            .iter()
-            .enumerate()
-            .skip(first - 1)
-            .take(last.map_or(usize::MAX, |last| last + 1 - first))
-            .map(|(index, page)| {
-                (
-                    index + 1,
-                    quietly(|| page_image(page, &cache, &settings, longest_edge)).flatten(),
-                )
-            })
-            .collect()
-    })
+    // a RenderCache is not Send, so each thread keeps its own
+    let images: Vec<Option<Vec<u8>>> = tasks
+        .par_iter()
+        .map_init(RenderCache::new, |cache, &(file, index)| {
+            let (pdf, _) = parsed[file].as_ref().expect("a task's PDF parsed");
+            quietly(|| page_image(&pdf.pages()[index], cache, &settings, longest_edge)).flatten()
+        })
+        .collect();
+    let mut images = images.into_iter();
+    parsed
+        .iter()
+        .map(|found| {
+            let (_, num_pages) = found.as_ref()?;
+            Some(
+                in_range(*num_pages)
+                    .map(|index| (index + 1, images.next().expect("one image per task")))
+                    .collect(),
+            )
+        })
+        .collect()
 }
 
 /// The width and height in pixels of the image of a page `width_points`
@@ -423,9 +455,16 @@ mod tests {
         (info.width, info.height, pixels)
     }
 
+    /// The pages of one PDF, as `page_images` draws them.
+    fn one_pdf(pdf: &[u8], longest_edge: u16, range: (usize, Option<usize>)) -> Option<Pages> {
+        page_images(&[Some(pdf)], longest_edge, range)
+            .pop()
+            .unwrap()
+    }
+
     /// The width and height of each page's image, for one PDF.
     fn sizes(pdf: &[u8], longest_edge: u16) -> Vec<(u32, u32)> {
-        page_images(pdf, longest_edge, EVERY_PAGE)
+        one_pdf(pdf, longest_edge, EVERY_PAGE)
             .unwrap()
             .iter()
             .map(|(_, image)| {
@@ -482,7 +521,7 @@ mod tests {
 
     #[test]
     fn a_page_is_drawn_on_white_with_its_text() {
-        let images = page_images(
+        let images = one_pdf(
             &pdf(&[&line("Lease from March 2025.")], 612, 792, 0),
             1024,
             EVERY_PAGE,
@@ -504,7 +543,7 @@ mod tests {
         // 100 x 1000 points fits a 96 x 1024 image at 96 pixels wide and
         // 960 high, so 32 rows above and below the page stay white
         let tall = pdf(&["0 0 1 rg 0 0 100 1000 re f"], 100, 1000, 0);
-        let images = page_images(&tall, 1024, EVERY_PAGE).unwrap();
+        let images = one_pdf(&tall, 1024, EVERY_PAGE).unwrap();
         let (width, height, pixels) = decoded(images[0].1.as_ref().unwrap());
         assert_eq!((width, height), (96, 1024));
         let pixel = |x: usize, y: usize| &pixels[3 * (y * 96 + x)..][..3];
@@ -517,13 +556,49 @@ mod tests {
     fn a_range_draws_only_its_pages_and_numbers_them_from_the_pdfs_start() {
         let three = pdf(&[&line("one"), &line("two"), &line("three")], 612, 792, 0);
         let numbers = |range| -> Vec<usize> {
-            (page_images(&three, 64, range).unwrap().into_iter())
+            (one_pdf(&three, 64, range).unwrap().into_iter())
                 .map(|(number, _)| number)
                 .collect()
         };
         assert_eq!(numbers((2, Some(3))), [2, 3]);
         assert_eq!(numbers((3, Some(9))), [3]);
         assert_eq!(numbers((2, None)), [2, 3]);
+    }
+
+    #[test]
+    fn pages_drawn_in_parallel_return_to_their_own_pdf_in_order() {
+        let two = pdf(&[&line("one"), &line("two")], 612, 792, 0);
+        let three = pdf(&[&line("one"), &line("two"), &line("three")], 792, 612, 0);
+        let files = [
+            Some(&*two),
+            None,
+            Some(b"not a pdf".as_slice()),
+            Some(&*three),
+        ];
+        let drawn: Vec<Option<Vec<_>>> = page_images(&files, 256, EVERY_PAGE)
+            .into_iter()
+            .map(|pages| {
+                let size = |image: Option<Vec<u8>>| {
+                    let (width, height, _) = decoded(&image.unwrap());
+                    (width, height)
+                };
+                Some(
+                    pages?
+                        .into_iter()
+                        .map(|(number, image)| (number, size(image)))
+                        .collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            drawn,
+            [
+                Some(vec![(1, (192, 256)), (2, (192, 256))]),
+                None,
+                None,
+                Some(vec![(1, (256, 192)), (2, (256, 192)), (3, (256, 192))]),
+            ]
+        );
     }
 
     #[test]

@@ -3367,6 +3367,7 @@ dependencies = [
  "png",
  "quail-dylib",
  "quail-planner",
+ "rayon",
  "serde_json",
  "sqlparser",
  "tokio",
