@@ -14,31 +14,52 @@ from the page images directly.
 
 ## Images
 
-Store each PNG or JPEG in a `BINARY` column:
+Store each PNG or JPEG in a `BINARY` column. The program below loads the
+1,000 receipt photos of [CORD](https://huggingface.co/datasets/naver-clova-ix/cord-v2),
+a dataset of receipts from Indonesian restaurants and cafés:
 
 ```python
-from pathlib import Path
-
 import pyarrow as pa
+import pyarrow.parquet as pq
 import quail
+from huggingface_hub import HfApi, hf_hub_download
 
-paths = sorted(Path("receipts").glob("*.jpg"))
-photos = pa.table({
-    "path": [path.name for path in paths],
-    "image": pa.array([path.read_bytes() for path in paths], pa.binary()),
+repo = "naver-clova-ix/cord-v2"
+files = sorted(name for name in HfApi().list_repo_files(repo, repo_type="dataset")
+               if name.endswith(".parquet"))
+photos = pa.concat_tables(
+    pq.read_table(hf_hub_download(repo, name, repo_type="dataset"), columns=["image"])
+    for name in files)
+receipts = pa.table({
+    "id": [f"r{index}" for index in range(photos.num_rows)],
+    "image": pa.array([image["bytes"] for image in photos.column("image").to_pylist()],
+                      pa.binary()),
 })
 config = quail.EngineConfig(model="qwen3.5-4b-bf16", device="h100-sxm")
 session = quail.Session(config=config)
-session.register("photos", quail.DocumentProvider.from_table(photos, id_col="path"))
+session.register("receipts", quail.DocumentProvider.from_table(receipts, id_col="id"))
 ```
 
-Pass the column to an AI function. The query below returns each receipt
-over $100:
+Pass the column to an AI function. The query below checks expenses: it
+keeps each receipt over 100,000 rupiah, and labels what the receipt paid
+for:
 
 ```sql
-SELECT p.path FROM photos p
-WHERE AI.IF(PROMPT('Is this receipt over $100? {0}', p.image));
+SELECT r.id,
+       AI.CLASSIFY(r.image, ['meal', 'drinks only', 'bakery or snacks']) AS category
+FROM receipts r
+WHERE AI.IF(PROMPT('Is this receipt''s total over 100,000 rupiah? {0}', r.image));
 ```
+
+| ![A receipt for coffees and chicken katsu](./receipts/meal.jpg) | ![A receipt for a fresh cream cake](./receipts/cake.jpg) | ![A receipt for 91,000 rupiah](./receipts/under.jpg) |
+| --- | --- | --- |
+| 174,600: kept, `meal` | 230,000: kept, `bakery or snacks` | 91,000: not kept |
+
+On one H100, `qwen3.5-4b-bf16` answered the query over all 1,000
+receipts in 100 seconds, or $0.11, at 26,000 input tokens per second.
+The filter was right on 96.8% of the 972 receipts with a labeled total.
+`AI.CLASSIFY` reads the KV that `AI.IF` already computed for each kept
+receipt, so the model reads each photo once.
 
 Quail resizes each image as Qwen's image processor does. Each side
 becomes a multiple of 32 pixels, and the model reads one token per 32 by
@@ -50,6 +71,8 @@ tokens.
 Store each PDF in a `BINARY` column:
 
 ```python
+from pathlib import Path
+
 paths = sorted(Path("contracts").glob("*.pdf"))
 files = pa.table({
     "path": [path.name for path in paths],
@@ -123,3 +146,6 @@ tower are `qwen3.5-4b-bf16`, `qwen3.5-4b-fp8`, `qwen3.5-27b-fp8`,
 
 [AI functions](/docs/user-guide/sql/ai-functions#aipdf_pagespdf-longest_edge-first-last)
 lists every argument of `AI.PDF_PAGES` and `AI.PARSE_DOCUMENT`.
+
+The receipts are from CORD (Park et al., 2019), under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
