@@ -294,8 +294,8 @@ impl HfTokenizer {
         let mut texts: Vec<Option<(bool, String)>> = Vec::new();
         let (mut id, mut misses) = (0u32, 0u32);
         while misses < MISSES {
-            let found = match added.simple_id_to_token(id) {
-                Some(text) => Some((true, text)),
+            let found = match added.id_to_token_bytes(id) {
+                Some((bytes, _)) => Some((true, String::from_utf8_lossy(bytes).into_owned())),
                 None => model.id_to_token(id).map(|text| (false, text)),
             };
             misses = if found.is_some() { 0 } else { misses + 1 };
@@ -454,5 +454,38 @@ mod offset_tests {
         // the two tokens of é's two bytes both cover é
         let cafe = &found.offsets[found.boundaries[0] as usize..found.boundaries[1] as usize];
         assert_eq!(cafe.last(), Some(&(5, 6)));
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::HfTokenizer;
+
+    #[test]
+    fn a_split_regex_with_lookahead_tokenizes() {
+        // Qwen3.5's pre-tokenizer: a regex the native splitter does not cover
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tokenizer/tokenizer.json");
+        let mut config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("the fixture"))
+                .expect("JSON");
+        let byte_level = config["pre_tokenizer"].take();
+        config["pre_tokenizer"] = serde_json::json!({
+            "type": "Sequence",
+            "pretokenizers": [
+                {"type": "Split", "behavior": "Isolated", "invert": false, "pattern": {"Regex":
+                    "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"}},
+                byte_level,
+            ],
+        });
+        let directory = std::env::temp_dir().join(format!("quail-split-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("a folder");
+        let file = directory.join("tokenizer.json");
+        std::fs::write(&file, config.to_string()).expect("written");
+        let tokenizer = HfTokenizer::from_file(&file).expect("the tokenizer");
+        std::fs::remove_dir_all(&directory).expect("removed");
+        let text = "It's a café,  ok\n\nyes";
+        let ids = tokenizer.encode(text).expect("encoded");
+        assert_eq!(tokenizer.decode_bytes(&ids), text.as_bytes());
     }
 }
