@@ -130,12 +130,28 @@ pub fn graph_memory_bytes(model: &ModelSpec) -> i64 {
     }
 }
 
-/// Bytes left for KV after weights, activations, and CUDA graph storage.
-pub fn arena_bytes(model: &ModelSpec, device: &DeviceSpec, chunk_tokens: i64) -> f64 {
+/// Bytes left for KV after weights and activations, and after CUDA
+/// graph storage when the plan `writes_answers`.
+///
+/// Only a plan with AI.MAP or AI.EXTRACT, which write answers token by
+/// token, captures the CUDA graphs; any other plan gives their memory
+/// to KV. The chunk budget keeps the graph reserve for every plan,
+/// since a loaded model keeps its chunk budget across plans.
+pub fn arena_bytes(
+    model: &ModelSpec,
+    device: &DeviceSpec,
+    chunk_tokens: i64,
+    writes_answers: bool,
+) -> f64 {
+    let graphs = if writes_answers {
+        graph_memory_bytes(model) as f64
+    } else {
+        0.0
+    };
     device.mem_bytes * POOL_FRACTION
         - model.W_resident()
         - (ACT_RESERVE_CHUNKS * chunk_tokens) as f64 * model.act_per_token()
-        - graph_memory_bytes(model) as f64
+        - graphs
 }
 
 /// Sliding-layer pages one chunk's fresh prefixes take before trimming.
@@ -198,8 +214,13 @@ pub fn chunk_memory_bound(model: &ModelSpec, device: &DeviceSpec) -> i64 {
 }
 
 /// Pages a hybrid model shares between retained KV and checkpoints.
-pub fn hybrid_pool_pages(model: &ModelSpec, device: &DeviceSpec, chunk_tokens: i64) -> i64 {
-    let free = arena_bytes(model, device, chunk_tokens)
+pub fn hybrid_pool_pages(
+    model: &ModelSpec,
+    device: &DeviceSpec,
+    chunk_tokens: i64,
+    writes_answers: bool,
+) -> i64 {
+    let free = arena_bytes(model, device, chunk_tokens, writes_answers)
         - checkpoint_pass_bytes(model, CHECKPOINT_PASS_QUESTIONS, chunk_tokens) as f64;
     let page_bytes = model.kappa() * device.page_tokens as f64;
     floor_divide(free, page_bytes) as i64 - execution_pages(chunk_tokens, device.page_tokens)
@@ -211,13 +232,14 @@ pub fn checkpoint_slots(
     device: &DeviceSpec,
     chunk_tokens: i64,
     kv_pages: i64,
+    writes_answers: bool,
 ) -> i64 {
     let checkpoint = checkpoint_pages(model, device.page_tokens);
     if checkpoint == 0.0 {
         return 0;
     }
     let retained = kv_pages - execution_pages(chunk_tokens, device.page_tokens);
-    let pool = hybrid_pool_pages(model, device, chunk_tokens);
+    let pool = hybrid_pool_pages(model, device, chunk_tokens, writes_answers);
     0_i64.max(floor_divide((pool - retained) as f64, checkpoint) as i64 - 1)
 }
 
@@ -232,8 +254,9 @@ pub fn hybrid_arena_pages(
     device: &DeviceSpec,
     chunk_tokens: i64,
     mean_document_tokens: Option<f64>,
+    writes_answers: bool,
 ) -> Result<i64, String> {
-    let pool = hybrid_pool_pages(model, device, chunk_tokens);
+    let pool = hybrid_pool_pages(model, device, chunk_tokens, writes_answers);
     let checkpoint = checkpoint_pages(model, device.page_tokens);
     let (mean, document_pages) = match mean_document_tokens {
         None => (
@@ -283,8 +306,15 @@ pub fn arena_pages(
     device: &DeviceSpec,
     chunk_tokens: Option<i64>,
     mean_document_tokens: Option<f64>,
+    writes_answers: bool,
 ) -> Result<(i64, i64), String> {
-    let (full, sliding) = device_arena_pages(model, device, chunk_tokens, mean_document_tokens)?;
+    let (full, sliding) = device_arena_pages(
+        model,
+        device,
+        chunk_tokens,
+        mean_document_tokens,
+        writes_answers,
+    )?;
     Ok(match kv_pool_cap_tokens() {
         Some(cap) => (full.min(cap / device.page_tokens), sliding),
         None => (full, sliding),
@@ -301,6 +331,7 @@ pub fn device_arena_pages(
     device: &DeviceSpec,
     chunk_tokens: Option<i64>,
     mean_document_tokens: Option<f64>,
+    writes_answers: bool,
 ) -> Result<(i64, i64), String> {
     if !model.reuses_kv() {
         return Ok((
@@ -318,11 +349,17 @@ pub fn device_arena_pages(
     };
     if !model.state_layers().is_empty() {
         return Ok((
-            hybrid_arena_pages(model, device, chunk_tokens, mean_document_tokens)?,
+            hybrid_arena_pages(
+                model,
+                device,
+                chunk_tokens,
+                mean_document_tokens,
+                writes_answers,
+            )?,
             0,
         ));
     }
-    let free = arena_bytes(model, device, chunk_tokens);
+    let free = arena_bytes(model, device, chunk_tokens, writes_answers);
     let page_bytes_full = model.kappa_full() * device.page_tokens as f64;
     let page_bytes_sliding = model.kappa_sliding() * device.page_tokens as f64;
     if page_bytes_sliding == 0.0 {
@@ -369,14 +406,21 @@ pub fn arena_tokens(
     device: &DeviceSpec,
     chunk_tokens: Option<i64>,
     mean_document_tokens: Option<f64>,
+    writes_answers: bool,
 ) -> Result<i64, String> {
-    let (full, _) = arena_pages(model, device, chunk_tokens, mean_document_tokens)?;
+    let (full, _) = arena_pages(
+        model,
+        device,
+        chunk_tokens,
+        mean_document_tokens,
+        writes_answers,
+    )?;
     Ok(full * device.page_tokens)
 }
 
 /// Whether the leftover arena holds one chunk's sliding KV.
 pub fn sliding_kv_fits(model: &ModelSpec, device: &DeviceSpec, chunk_tokens: Option<i64>) -> bool {
-    model.sliding_window == 0 || arena_pages(model, device, chunk_tokens, None).is_ok()
+    model.sliding_window == 0 || arena_pages(model, device, chunk_tokens, None, true).is_ok()
 }
 
 /// Shrink a chunk until its activation reserve leaves its own KV.
@@ -392,7 +436,7 @@ fn chunk_leaving_kv(model: &ModelSpec, device: &DeviceSpec, chunk: i64) -> i64 {
         chunk = chunk.min(1_i64.max(floor_divide(free, per) as i64));
     }
     let full_pages = |chunk: i64| {
-        arena_pages(model, device, Some(chunk), None)
+        arena_pages(model, device, Some(chunk), None, true)
             .expect("a model without sliding layers")
             .0
     };

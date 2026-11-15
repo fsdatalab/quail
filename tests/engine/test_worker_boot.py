@@ -103,7 +103,7 @@ def test_a_worker_reuses_its_model_and_an_arena_resize_releases_pieces_that_writ
     gpu.arena = SimpleNamespace(
         k=[], v=[], gdn_state=None, conv_state=None,
         resize=lambda *pages, **kw: resized.append((pages, kw)))
-    gpu.bind_query([1], [2], 4096, arena_pages=(8, 2))
+    gpu.bind_query([1], [2], 4096, arena_pages=(8, 2), writes_answers=True)
     assert resized == [((8, 2), {"free_resident": True})]
     execution.bind_loaded_model(model=object(), arena=gpu.arena,
                                 pipeline=gpu.pipeline)
@@ -133,31 +133,70 @@ def test_a_worker_reuses_its_model_and_an_arena_resize_releases_pieces_that_writ
     gpu.spec = MODELS["qwen3-4b-fp8"]
     gpu.device = H100_SXM
     gpu.execution = SimpleNamespace(bind_query=lambda **kw: None)
-    gpu.bind_query([1], [2], 32, arena_pages=(8, 0))
+    gpu.bind_query([1], [2], 32, arena_pages=(8, 0), writes_answers=True)
     assert calls == ["resize"]
     calls.clear()
-    gpu.bind_query([1], [2], 32, arena_pages=(16, 0))
+    gpu.bind_query([1], [2], 32, arena_pages=(16, 0), writes_answers=True)
     assert calls == ["synchronize", "invalidate", "resize"]
 
 
 def test_a_worker_captures_cuda_graphs_only_for_a_plan_that_writes_answers(
         booted, monkeypatch):
-    captures = []
-    graphs = SimpleNamespace(prepare=lambda: captures.append("capture") or True)
+    events = []
+    arena = SimpleNamespace(
+        k=[], v=[], gdn_state=None, conv_state=None, num_pages=0,
+        num_sliding_pages=0)
+
+    def resize(num_pages, num_sliding_pages, **kw):
+        events.append(("resize", num_pages))
+        arena.num_pages, arena.num_sliding_pages = num_pages, num_sliding_pages
+
+    arena.resize = resize
+    monkeypatch.setattr(worker, "KVArena", lambda *a, **k: arena)
+    captured = []
+
+    def prepare():
+        if captured:
+            return False
+        captured.append(arena.num_pages)
+        events.append(("capture", arena.num_pages))
+        return True
+
+    def invalidate():
+        if captured:
+            events.append(("release", captured.pop()))
+
+    graphs = SimpleNamespace(prepare=prepare, invalidate=invalidate)
     monkeypatch.setattr(worker.PiecewiseGraphs, "for_specs", lambda *a: graphs)
     state = worker.WorkerState(0, registry=built_in_registry())
+    # the planner gives a plan without AI.MAP or AI.EXTRACT the graph memory
+    scores = {**SETUP, "arena_pages": [120, 0], "writes_answers": False}
+    writes = {**SETUP, "arena_pages": [100, 0], "writes_answers": True}
 
-    boot = worker._boot_worker(state, SETUP)
+    boot = worker._boot_worker(state, scores)
     assert (boot["kind"], boot["warm_tier"]) == ("cold", "compiled")
-    assert captures == []
+    assert events == [("resize", 120)]
 
-    # a later query with AI.MAP or AI.EXTRACT captures before it runs
-    boot = worker._boot_worker(state, {**SETUP, "writes_answers": True})
-    assert boot["warm_tier"] == "graphs"
-    assert captures == ["capture"]
+    # a later plan with AI.MAP shrinks the arena, then captures before it runs
+    events.clear()
+    assert worker._boot_worker(state, writes)["warm_tier"] == "graphs"
+    assert events == [("resize", 100), ("capture", 100)]
 
-    assert "warm_tier" not in worker._boot_worker(state, SETUP)
-    assert captures == ["capture"]
+    # the graphs stay for the next plan that writes answers
+    events.clear()
+    assert "warm_tier" not in worker._boot_worker(state, writes)
+    assert events == [("resize", 100)]
+
+    # a plan without one releases them before its arena takes their memory
+    events.clear()
+    assert "warm_tier" not in worker._boot_worker(state, scores)
+    assert events == [("release", 100), ("resize", 120)]
+
+    # even at an unchanged arena size, as under a KV pool cap
+    worker._boot_worker(state, writes)
+    events.clear()
+    worker._boot_worker(state, {**scores, "arena_pages": [100, 0]})
+    assert events == [("release", 100), ("resize", 100)]
 
 
 def test_a_failed_boot_releases_the_gpu_and_a_cold_boot_stays_out_of_collections(

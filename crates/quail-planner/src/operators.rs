@@ -227,6 +227,13 @@ pub struct Operators {
 }
 
 impl Operators {
+    /// Whether an operator writes answers token by token: AI.MAP or
+    /// AI.EXTRACT. Only such a plan captures the CUDA graphs and keeps
+    /// their memory out of the KV arena.
+    pub fn writes_answers(&self) -> bool {
+        !(self.maps.is_empty() && self.extracts.is_empty())
+    }
+
     /// These operators returning at most `fetch` rows, when DataFusion
     /// passes a LIMIT above the region down to it, so the model can stop
     /// once enough rows pass.

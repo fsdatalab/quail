@@ -901,6 +901,29 @@ impl Executor {
     }
 }
 
+/// What each worker boots for a plan, from the plan's envelope.
+///
+/// The planner sizes `arena_pages` by `writes_answers`, so the worker
+/// reads both from the same settings: it captures the CUDA graphs only
+/// for an arena that leaves their reserve.
+fn boot_setup(envelope: &serde_json::Value) -> Result<serde_json::Value> {
+    let settings = &envelope["settings"];
+    let Some(writes_answers) = settings["writes_answers"].as_bool() else {
+        return Err(DataFusionError::Execution(
+            "the plan's settings do not say whether it writes answers".into(),
+        ));
+    };
+    Ok(serde_json::json!({
+        "model": envelope["model"], "device": envelope["device"],
+        "backend": envelope["backend"], "gpus": envelope["gpus"],
+        "chunk_tokens": settings["chunk_tokens"], "true_ids": settings["true_ids"],
+        "false_ids": settings["false_ids"], "arena_pages": settings["arena_pages"],
+        "writes_answers": writes_answers,
+        // the worker finds the model's files and imports no extension
+        "model_path": null, "extensions": [],
+    }))
+}
+
 /// Run a region Rust planned on the executor's workers, sending its
 /// rows, as `conformed` gives them the region's schema, to `rows`;
 /// returns what the region ran.
@@ -953,18 +976,7 @@ fn run_on_workers(
         scans: &scanned,
         source_rows: &by_alias,
     };
-    let settings = &envelope["settings"];
-    let setup = serde_json::json!({
-        "model": envelope["model"], "device": envelope["device"],
-        "backend": envelope["backend"], "gpus": envelope["gpus"],
-        "chunk_tokens": settings["chunk_tokens"], "true_ids": settings["true_ids"],
-        "false_ids": settings["false_ids"], "arena_pages": settings["arena_pages"],
-        // only AI.MAP and AI.EXTRACT write answers token by token, in
-        // passes small enough to replay the CUDA graphs
-        "writes_answers": !(operators.maps.is_empty() && operators.extracts.is_empty()),
-        // the worker finds the model's files and imports no extension
-        "model_path": null, "extensions": [],
-    });
+    let setup = boot_setup(envelope)?;
     let finished = Arc::new(Mutex::new(planned.finished_rows()?));
     let hinted = hint.as_ref().map(|hint| {
         (operators.scans.iter())
@@ -1552,6 +1564,33 @@ impl TableProvider for ScannedTable {
 mod tests {
     use super::*;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+    #[test]
+    fn a_worker_boots_with_the_plans_arena_and_whether_the_plan_writes_answers() {
+        let envelope = |settings: serde_json::Value| {
+            serde_json::json!({
+                "model": "qwen3-4b-fp8", "device": "h100-sxm", "backend": "quail",
+                "gpus": 1, "settings": settings,
+            })
+        };
+        let setup = boot_setup(&envelope(serde_json::json!({
+            "chunk_tokens": 8192, "true_ids": [1], "false_ids": [2],
+            "arena_pages": [24_630, 0], "writes_answers": false,
+        })))
+        .unwrap();
+        assert_eq!(setup["arena_pages"], serde_json::json!([24_630, 0]));
+        assert_eq!(setup["writes_answers"], false);
+
+        // a plan that does not say is refused: its worker would run
+        // AI.MAP without the CUDA graphs
+        let refused = boot_setup(&envelope(serde_json::json!({"chunk_tokens": 8192})));
+        assert!(
+            refused
+                .unwrap_err()
+                .to_string()
+                .contains("whether it writes answers")
+        );
+    }
 
     #[test]
     fn hint_filtered_inputs_lose_their_whole_table_cache_identity() {

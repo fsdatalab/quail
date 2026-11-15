@@ -37,53 +37,62 @@ impl Budgets {
         })
     }
 
-    /// Bytes left for KV after weights, activations, and CUDA graphs.
-    fn arena_bytes(&self, chunk_tokens: i64) -> PyResult<f64> {
+    /// Bytes left for KV after weights and activations, and after CUDA
+    /// graphs when the plan writes answers.
+    #[pyo3(signature = (chunk_tokens, writes_answers=true))]
+    fn arena_bytes(&self, chunk_tokens: i64, writes_answers: bool) -> PyResult<f64> {
         Ok(budgets::arena_bytes(
             &self.model,
             self.device()?,
             chunk_tokens,
+            writes_answers,
         ))
     }
 
     /// Tokens of document KV that can be resident at once.
-    #[pyo3(signature = (chunk_tokens=None, mean_document_tokens=None))]
+    #[pyo3(signature = (chunk_tokens=None, mean_document_tokens=None, writes_answers=true))]
     fn arena_tokens(
         &self,
         chunk_tokens: Option<i64>,
         mean_document_tokens: Option<f64>,
+        writes_answers: bool,
     ) -> PyResult<i64> {
         budgets::arena_tokens(
             &self.model,
             self.device()?,
             chunk_tokens,
             mean_document_tokens,
+            writes_answers,
         )
         .map_err(PyValueError::new_err)
     }
 
     /// A hybrid model's arena KV pages.
-    #[pyo3(signature = (chunk_tokens, mean_document_tokens=None))]
+    #[pyo3(signature = (chunk_tokens, mean_document_tokens=None, writes_answers=true))]
     fn hybrid_arena_pages(
         &self,
         chunk_tokens: i64,
         mean_document_tokens: Option<f64>,
+        writes_answers: bool,
     ) -> PyResult<i64> {
         budgets::hybrid_arena_pages(
             &self.model,
             self.device()?,
             chunk_tokens,
             mean_document_tokens,
+            writes_answers,
         )
         .map_err(PyValueError::new_err)
     }
 
     /// Pages a hybrid model shares between retained KV and checkpoints.
-    fn hybrid_pool_pages(&self, chunk_tokens: i64) -> PyResult<i64> {
+    #[pyo3(signature = (chunk_tokens, writes_answers=true))]
+    fn hybrid_pool_pages(&self, chunk_tokens: i64, writes_answers: bool) -> PyResult<i64> {
         Ok(budgets::hybrid_pool_pages(
             &self.model,
             self.device()?,
             chunk_tokens,
+            writes_answers,
         ))
     }
 
@@ -161,28 +170,37 @@ impl Budgets {
     /// Pages of the two KV pools: (every-token pool, sliding-layer pool).
     ///
     /// Raises ValueError when the pool cannot hold a chunk's KV.
-    #[pyo3(signature = (chunk_tokens=None, mean_document_tokens=None))]
+    #[pyo3(signature = (chunk_tokens=None, mean_document_tokens=None, writes_answers=true))]
     fn arena_pages(
         &self,
         chunk_tokens: Option<i64>,
         mean_document_tokens: Option<f64>,
+        writes_answers: bool,
     ) -> PyResult<(i64, i64)> {
         budgets::arena_pages(
             &self.model,
             self.device()?,
             chunk_tokens,
             mean_document_tokens,
+            writes_answers,
         )
         .map_err(PyValueError::new_err)
     }
 
     /// Checkpoints the pool holds beside an arena of `kv_pages`.
-    fn checkpoint_slots(&self, chunk_tokens: i64, kv_pages: i64) -> PyResult<i64> {
+    #[pyo3(signature = (chunk_tokens, kv_pages, writes_answers=true))]
+    fn checkpoint_slots(
+        &self,
+        chunk_tokens: i64,
+        kv_pages: i64,
+        writes_answers: bool,
+    ) -> PyResult<i64> {
         Ok(budgets::checkpoint_slots(
             &self.model,
             self.device()?,
             chunk_tokens,
             kv_pages,
+            writes_answers,
         ))
     }
 

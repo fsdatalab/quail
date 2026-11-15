@@ -48,6 +48,15 @@ pub struct PlanningContext<'a> {
 }
 
 impl PlanningContext<'_> {
+    /// Whether the plan being planned writes answers token by token,
+    /// as [`Operators::writes_answers`]; true while the operators are
+    /// unknown, which keeps the CUDA graph reserve.
+    pub fn writes_answers(&self) -> bool {
+        self.operators
+            .as_ref()
+            .is_none_or(Operators::writes_answers)
+    }
+
     /// The fields of the model that prompt lowering reads.
     pub fn prompt_model(&self) -> PromptModel {
         PromptModel {
