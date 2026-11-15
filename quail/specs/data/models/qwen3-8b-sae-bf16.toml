@@ -16,14 +16,13 @@ w_bytes = 2.0  # bf16 weights
 hf_name = "Qwen/Qwen3-8B-Base"
 revision = "49e3418fbbbca6ecbdf9608b4d22e5a407081db4"
 kv_bytes = 2.0
-w_mem_bytes = 16_920_000_000  # an estimate, not yet measured: the
-                              # checkpoint's 8,190,735,360 bf16
-                              # parameters (16,381,470,720 bytes; the
-                              # dropped tail layers stay resident, as
-                              # keep_layers measured on Qwen3.5-2B-Base)
-                              # plus the SAE encoder (537,133,056).
+w_mem_bytes = 16_930_000_000  # measured: torch.cuda.memory_allocated
+                              # after load_model in
                               # experiments/cells/sae_agreement.py
-                              # records model_memory_bytes
+                              # (16,389,968,384) plus the SAE encoder
+                              # (537,133,056). The full 36-layer
+                              # size: the dropped tail layers stay
+                              # resident
 vocab = 151_936
 tied_head = false
 weight_precision = "bf16"
