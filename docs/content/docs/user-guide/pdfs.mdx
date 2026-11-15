@@ -1,0 +1,132 @@
+---
+title: Querying PDFs
+---
+
+Ask questions about PDFs by giving a vision model the page images. A
+vision model is a model with a vision tower, the part of the model that
+reads pixels. Quail draws each page with `AI.PDF_PAGES`, and the model
+reads the page as it looks, with its tables, charts, and scans. You do
+not parse the PDF to text first.
+
+## Load the PDFs
+
+Store each PDF's bytes in a `BINARY` column, one PDF per row:
+
+```python
+from pathlib import Path
+
+import pyarrow as pa
+import quail
+
+paths = sorted(Path("filings").glob("*.pdf"))
+files = pa.table({
+    "path": [path.name for path in paths],
+    "pdf": pa.array([path.read_bytes() for path in paths], pa.binary()),
+})
+config = quail.EngineConfig(model="qwen3.6-35b-a3b-fp8", device="h100-sxm")
+with quail.Session(config=config) as session:
+    session.register("files", quail.DocumentProvider.from_table(files, id_col="path"))
+```
+
+Quail reads each PDF only for the rows that pass the filters on other
+columns, so a filter such as `WHERE f.path LIKE '2025-%'` skips every
+other PDF.
+
+## Ask about each page
+
+`UNNEST(AI.PDF_PAGES(...))` returns one row per page. Ask the question in
+the outer query:
+
+```sql
+SELECT p.path, p.u['page'] AS page
+FROM (SELECT f.path, UNNEST(AI.PDF_PAGES(f.pdf, 1024)) AS u FROM files f) p
+WHERE AI.IF(PROMPT('Does this page cap either party''s liability? {0}',
+                   p.u['image']));
+```
+
+Quail encodes each distinct page image once per query, and every
+question about the page reads the same image tokens.
+
+## Ask about a whole PDF
+
+Pass the pages to the AI function without `UNNEST`, and the model reads
+them together as one document. A page range keeps a long PDF cheap: the
+first three pages often say what kind of document a PDF is.
+
+```sql
+SELECT f.path,
+       AI.CLASSIFY(AI.PDF_PAGES(f.pdf, 1024, 1, 3),
+                   ['annual report', 'contract', 'manual', 'other']) AS kind
+FROM files f;
+```
+
+Quail draws only the pages in the range, so a 1,000-page PDF costs three
+pages.
+
+## Choose an image size
+
+`longest_edge`, the second argument, sets the pixels on the longer side
+of each image. The model reads one image token per 32 by 32 pixels, so
+the size sets both the cost and the detail the model sees. A US Letter
+page at 1,024 pixels is 800 by 1,024 pixels, or 800 tokens.
+
+Start at 1,024 pixels. Go up to 1,536 or 2,048 pixels for small print and
+dense tables. The table below shows the trade-off on 498 contract pages,
+with `qwen3.5-4b-bf16` on one H100:
+
+| Input | Time per question | Accuracy (F1, average of 4 clauses) |
+| --- | --- | --- |
+| Page images at 1,024 pixels | 9.6 s | 0.71 |
+| Page images at 1,536 pixels | 22 s | 0.79 |
+| Stored text (`AI.PARSE_DOCUMENT`) | 6.9 s | 0.75 |
+
+The contracts are born digital, so their stored text was as accurate as
+the 1,024-pixel images, and faster. Page images still read what stored
+text loses: a scan stores no text at all.
+
+## Choose a model
+
+The models below have a vision tower. Every other model reads text only,
+and Quail refuses a page image on it.
+
+| Model | Time per question, 498 pages at 1,024 pixels |
+| --- | --- |
+| `qwen3.5-4b-bf16` | 9.6 s |
+| `qwen3.5-4b-fp8` | about 9 s |
+| `qwen3.6-35b-a3b-fp8` | 11.2 s |
+| `qwen3.5-27b-fp8` | 28 s |
+| `qwen3.8-27b-fp8` | 28 s |
+
+`qwen3.6-35b-a3b-fp8` is the best default. On the contract pages, its
+average clause F1 was 0.78, against 0.71 for `qwen3.5-4b-bf16`, for
+about the same time.
+
+## Read the stored text instead
+
+Quail has no OCR (optical character recognition) and no layout parser.
+`AI.PARSE_DOCUMENT` returns only the text a PDF stores, with a form feed
+between pages. A scanned page stores no text, and a table's cells come
+back as loose lines. Use the stored text only when you must:
+
+- `AI.EXTRACT` and `AI.EXTRACT_SPAN` copy answers from a document's text,
+  so they need text, not images.
+- A text-only model reads only text.
+- The PDFs are born digital, with no scans, and the questions are about
+  the words, not the layout.
+
+```sql
+SELECT f.path,
+       AI.EXTRACT(AI.PARSE_DOCUMENT(f.pdf),
+                  {'effective_date': 'What is the effective date?'}) AS answers
+FROM files f;
+```
+
+## Limits
+
+- Quail draws pages again in each query that calls `AI.PDF_PAGES`.
+  When many queries read the same pages, draw them once with
+  `session.sql(...).collect()` and register the result as a table.
+- A page whose fonts the PDF does not embed, such as CJK fonts, gets a
+  substitute font.
+- [AI functions](/docs/user-guide/sql/ai-functions#aipdf_pagespdf-longest_edge-first-last)
+  lists every argument of `AI.PDF_PAGES` and `AI.PARSE_DOCUMENT`.

@@ -32,6 +32,8 @@ def _answer(kind, prompt, rows):
     lease = "Lease" in rows[0]
     if kind == "filter":
         return lease
+    if kind == "extract":
+        return "March 2025" if lease else "two chairs"
     return "lease" if lease else "invoice"
 
 
@@ -110,6 +112,24 @@ asked 2 of 3
 rows 2
   f1
   f3
+""")
+
+
+def test_an_extraction_copies_its_answer_from_the_parsed_text():
+    assert_transcript(_transcript(
+        "SELECT f.id, AI.EXTRACT(AI.PARSE_DOCUMENT(f.pdf), "
+        "{'start': 'When does the lease start?'}) AS answers "
+        "FROM files f WHERE f.year = 2025 AND f.id = 'f1'"), """\
+--- SELECT f.id, AI.EXTRACT(AI.PARSE_DOCUMENT(f.pdf), {'start': 'When does the lease
+    start?'}) AS answers FROM files f WHERE f.year = 2025 AND f.id = 'f1' ---
+plan
+  answers = ai_extract(f.__quail_expr_0 AS AI.PARSE_DOCUMENT(f.pdf),
+      named_struct('start', 'When does the lease start?')), returns: [answers]
+asked 1 of 1
+  'When does the lease start?': 'Lease from March 2025.\\x0cRent is $2,400 a month.'
+      'March 2025'
+rows 1
+  f1, {'start': 'March 2025'}
 """)
 
 

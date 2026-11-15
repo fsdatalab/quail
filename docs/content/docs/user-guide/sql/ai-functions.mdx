@@ -192,7 +192,7 @@ WHERE f.year = 2025;
 
 | | |
 | --- | --- |
-| **Description** | `AI.PARSE_DOCUMENT` returns the `STRING` of text a PDF stores. A form feed (`'\f'`) separates the pages, and each page's text has no whitespace at its start or end. The text is `NULL` when the PDF is `NULL` or Quail cannot read it. A scanned page stores no text, so its text is empty. |
+| **Description** | `AI.PARSE_DOCUMENT` returns the `STRING` of text a PDF stores. A form feed (`'\f'`) separates the pages, and each page's text has no whitespace at its start or end. The text is `NULL` when the PDF is `NULL` or Quail cannot read it. A scanned page stores no text, so its text is empty: Quail has no OCR. |
 | **Use in SQL** | Pass the text to another AI function, or use it anywhere a `STRING` can go. Quail reads each PDF on the CPU, with no model, and only for the rows that pass the filters on other columns. |
 | **Result** | `('lease-17.pdf', 'lease')`, `('inv-0193.pdf', 'invoice')` |
 | **Alias** | `AI_PARSE_DOCUMENT` |
@@ -211,12 +211,12 @@ FROM (SELECT f.path, UNNEST(AI.PDF_PAGES(f.pdf)) AS u
 | --- | --- |
 | **Description** | `AI.PDF_PAGES` returns a list with one struct per page, in page order. `page` is the page's number, from 1, and `image` is the page as a PNG in 8-bit RGB. The list is `NULL` when the PDF is `NULL` or Quail cannot read it. An `image` is `NULL` when Quail cannot draw the page. |
 | **Image size** | The longer side of an image is `longest_edge` pixels. The other side keeps the page's shape, rounded to a multiple of 32 pixels. Quail draws the page as large as fits, in the center of the image, on white. A US Letter page is 1184 by 1536 pixels at the default. |
-| **Use in SQL** | Write `UNNEST(AI.PDF_PAGES(...)) AS u` in a subquery to return one row per page, and read a field in the outer query as `p.u['page']`. Without a subquery, read one field as `UNNEST(AI.PDF_PAGES(f.pdf))['page']`. Read one page without `UNNEST` as `array_element(AI.PDF_PAGES(f.pdf), 1)['image']`. Quail does not accept `UNNEST` or `FLATTEN` in `FROM`, or `AI.PDF_PAGES(f.pdf)[1]`. Quail draws each PDF on the CPU, with no model, and only for the rows that pass the filters on other columns. |
+| **Use in SQL** | Write `UNNEST(AI.PDF_PAGES(...)) AS u` in a subquery to return one row per page, and read a field in the outer query as `p.u['page']`. Read one field without a subquery as `UNNEST(AI.PDF_PAGES(f.pdf))['page']`. Read one page without `UNNEST` as `array_element(AI.PDF_PAGES(f.pdf), 1)['image']`. Quail does not accept `UNNEST` or `FLATTEN` in `FROM`, or `AI.PDF_PAGES(f.pdf)[1]`. Quail draws each PDF on the CPU, with no model, and only for the rows that pass the filters on other columns. |
 | **Result** | `('lease-17.pdf', 1, <PNG>)`, `('lease-17.pdf', 2, <PNG>)`, `('inv-0193.pdf', 1, <PNG>)` |
 | **Alias** | `AI_PDF_PAGES` |
 | **pdf** | A `BINARY` column that holds each PDF's bytes. |
 | **longest_edge** | An integer literal, in pixels: a multiple of 32 from 32 to 8192. Its default is 1536. |
-| **first**, **last** | Integer literals: the first and last pages to draw, counted from 1. `last` past the end, or left out, reads to the end; `first` defaults to 1. Quail draws only the pages in the range. |
+| **first**, **last** | Integer literals: the first and last pages to draw, counted from 1. `first` defaults to 1. `last` reads to the end when it is past the end or left out. Quail draws only the pages in the range. |
 
 ### `AI.SAE_FEATURES(prompt, options)`
 
@@ -342,12 +342,14 @@ Result: `(2)`.
 
 A model with a vision tower, such as `qwen3.5-4b-fp8`, reads a `BINARY`
 column of PNG images as a document, in place of text. Each image's
-sides must be multiples of 32 pixels: the model reads one image token
-per 32 by 32 pixels. `AI.PDF_PAGES` renders PDF pages that way.
+sides must be multiples of 32 pixels, because the model reads one image
+token per 32 by 32 pixels. `AI.PDF_PAGES` draws every page to such
+sides. [Querying PDFs](/docs/user-guide/pdfs) says when to read page
+images and when to read text.
 
 A document may also be several pages: the list `AI.PDF_PAGES` returns,
-or a list of `BINARY` parts, each a PNG or UTF-8 text. To classify each
-PDF from its first three pages:
+or a list of `BINARY` parts, each a PNG or UTF-8 text. The query below
+classifies each PDF from its first three pages:
 
 ```sql
 SELECT f.path,
