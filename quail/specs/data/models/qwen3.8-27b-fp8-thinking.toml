@@ -1,9 +1,0 @@
-# Qwen3.8 27B in thinking mode: the assistant turn opens a <think>
-# block, which the model writes and closes before its answer, as the
-# chat template's enable_thinking=True writes it. For AI.MAP with a
-# reasoning budget; a filter or classification reads the first token
-# of the turn, so it belongs on qwen3.8-27b-fp8.
-base = "qwen3.8-27b-fp8"
-name = "qwen3.8-27b-fp8-thinking"
-turn_suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n"
-prompt_format = "qwen3-chat-thinking-v1"

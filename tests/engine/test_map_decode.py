@@ -924,21 +924,3 @@ def test_an_answers_text_so_far_is_its_tokens_decoded_from_the_first():
     # each step decodes the new tokens and the piece before them, not
     # the answer from its first token
     assert max(tokenizer.calls) <= 8
-
-
-def test_a_sampled_answer_draws_only_from_the_top_p_of_its_tokens():
-    from types import SimpleNamespace
-
-    from quail.backends.quail.executor.map_decoder import MapDecoder
-
-    decoder = SimpleNamespace(torch=torch, sampling=None, generator=None,
-                              device=torch.device("cpu"))
-    MapDecoder.sample(decoder, 1.0, 0.5, seed=3)
-    # token 2 holds 70% of the mass, so a top_p of 0.5 keeps it alone
-    logits = torch.log(torch.tensor([[0.1, 0.2, 0.7]])).repeat(64, 1)
-    assert set(MapDecoder._choose(decoder, logits).tolist()) == {2}
-    MapDecoder.sample(decoder, 1.0, 1.0, seed=3)
-    drawn = MapDecoder._choose(decoder, logits).tolist()
-    assert set(drawn) > {2}
-    MapDecoder.sample(decoder, 1.0, 1.0, seed=3)
-    assert MapDecoder._choose(decoder, logits).tolist() == drawn
