@@ -3,9 +3,9 @@ title: Querying multimodal data
 ---
 
 You can also query your multimodal data in Quail, such as images and
-PDFs. Quail reads PNG and JPEG images directly. `AI.PDF_PAGES` turns
-each page of a PDF into an image. `AI.PARSE_DOCUMENT` returns the text
-in a PDF, using a basic tool,
+PDFs. You can pass PNG and JPEG images to an AI function directly. You
+can turn each page of a PDF into an image with `AI.PDF_PAGES`, or get
+the text in a PDF with `AI.PARSE_DOCUMENT`, which uses a basic tool,
 [pdf-extract](https://crates.io/crates/pdf-extract).
 
 Quail doesn't yet support OCR-based parsers. You can still get pretty
@@ -14,10 +14,12 @@ the page images directly.
 
 ## Images
 
-Quail reads each image from a `BINARY` column. The example below uses
+You query images by storing them in a `BINARY` column. The example
+below checks expenses in
 [CORD](https://huggingface.co/datasets/naver-clova-ix/cord-v2), a
 dataset of 1,000 receipt photos from Indonesian restaurants and cafés.
-CORD stores its photos in Parquet files on Hugging Face:
+
+First, download CORD's Parquet files from Hugging Face:
 
 ```python
 import pyarrow as pa
@@ -32,9 +34,8 @@ photos = pa.concat_tables(
     for name in sorted(names))
 ```
 
-Each row of `photos` holds a photo's bytes in `image['bytes']`. The
-`receipts` table keeps the bytes in a `BINARY` column, with an id for
-each receipt:
+Next, put each photo's bytes in a `BINARY` column, with an id for each
+receipt:
 
 ```python
 images = [image["bytes"] for image in photos.column("image").to_pylist()]
@@ -44,7 +45,7 @@ receipts = pa.table({
 })
 ```
 
-A session registers the table under a name that SQL can read:
+Then, register the table in a session, so SQL can read it:
 
 ```python
 import quail
@@ -54,9 +55,9 @@ session = quail.Session(config=config)
 session.register("receipts", quail.DocumentProvider.from_table(receipts, id_col="id"))
 ```
 
-An AI function takes the image column as its document. The query below
-checks expenses. `AI.IF` keeps each receipt over 100,000 rupiah.
-`AI.CLASSIFY` labels what each kept receipt paid for:
+Finally, pass the image column to an AI function. In the query below,
+`AI.IF` keeps each receipt over 100,000 rupiah, and `AI.CLASSIFY` labels
+what each kept receipt paid for:
 
 ```sql
 SELECT r.id,
@@ -69,24 +70,22 @@ WHERE AI.IF(PROMPT('Is this receipt''s total over 100,000 rupiah? {0}', r.image)
 | --- | --- | --- |
 | 174,600: kept, `meal` | 230,000: kept, `bakery or snacks` | 91,000: not kept |
 
-`qwen3.5-4b-bf16` answered the query over all 1,000 receipts in 100
-seconds on one H100. The query cost $0.11, at 26,000 input tokens per
-second. The filter was right on 96.8% of the 972 receipts with a
-labeled total.
-
+You get answers for all 1,000 receipts in 100 seconds on one H100 with
+`qwen3.5-4b-bf16`, for $0.11. The filter was right on 96.8% of the 972
+receipts with a labeled total. You pay to read each photo once:
 `AI.CLASSIFY` reuses the KV, the model's cached attention state, that
-`AI.IF` computed for each kept receipt. The model therefore reads each
-photo once.
+`AI.IF` already computed for each kept receipt.
 
-Quail resizes each image as Qwen's image processor does. Each side
-becomes a multiple of 32 pixels. The model reads one token per 32 by 32
-pixels. A 1,000 by 750 photo becomes 992 by 736 pixels, or 713 tokens.
+You pay for each image in tokens. Quail resizes each image as Qwen's
+image processor does, so each side becomes a multiple of 32 pixels. The
+model then reads one token per 32 by 32 pixels. A 1,000 by 750 photo
+becomes 992 by 736 pixels, or 713 tokens.
 
 ## PDFs
 
-Quail reads each PDF from a `BINARY` column too. The `files` table below
-holds legal contracts, such as leases and service agreements, from a
-folder named `contracts`:
+You store PDFs in a `BINARY` column too. The code below loads legal
+contracts, such as leases and service agreements, from a folder named
+`contracts`:
 
 ```python
 from pathlib import Path
@@ -101,10 +100,11 @@ session.register("files", quail.DocumentProvider.from_table(files, id_col="path"
 
 ### Ask about each page
 
-`AI.PDF_PAGES` returns a list of a PDF's pages, each a PNG image. The
-`UNNEST` function turns the list into one row per page. The query below
-finds each contract page with a liability cap, a clause that limits how
-much one party can owe the other:
+You ask about each page by turning each PDF into one row per page.
+`AI.PDF_PAGES` returns a list of a PDF's pages, each a PNG image, and
+the `UNNEST` function turns the list into rows. The query below finds
+each contract page with a liability cap, a clause that limits how much
+one party can owe the other:
 
 ```sql
 SELECT p.path, p.u['page'] AS page
@@ -115,7 +115,8 @@ WHERE AI.IF(PROMPT('Does this page cap either party''s liability? {0}',
 
 ### Ask about a whole PDF
 
-An AI function reads the list from `AI.PDF_PAGES` as one document. If
+You ask about a whole PDF by passing the list from `AI.PDF_PAGES`
+straight to an AI function, which reads the pages as one document. If
 you don't want to run the AI function on every page of a long PDF, you
 can set the first and last pages with the third and fourth arguments of
 `AI.PDF_PAGES`. The query below classifies each PDF from its first three
@@ -130,27 +131,23 @@ FROM files f;
 
 ### Choose a page size
 
-The second argument of `AI.PDF_PAGES` sets the longest side of each page
-image, in pixels. The default is 1,536. A US Letter page at 1,024 pixels
-is 800 tokens.
+You choose how many pixels the model reads with the second argument of
+`AI.PDF_PAGES`, the longest side of each page image. The default is
+1,536 pixels. A US Letter page at 1,024 pixels costs 800 tokens.
 
 ### Parse to text
 
 Quail does support a basic text parser, `AI.PARSE_DOCUMENT`, if you
-absolutely must parse. The function reads the text a PDF stores with the
-Rust crate [pdf-extract](https://crates.io/crates/pdf-extract), on the
-CPU. The function puts a form feed (`'\f'`) between pages.
+absolutely must parse. You get the text a PDF stores, read on the CPU by
+the Rust crate [pdf-extract](https://crates.io/crates/pdf-extract), with
+a form feed (`'\f'`) between pages. You should know two limits:
 
-pdf-extract has two limits:
+- You get an empty string for a scanned page, because pdf-extract does
+  no OCR. A scanned PDF holds pictures of its pages, not text.
+- You get `NULL` for a malformed PDF that pdf-extract cannot read.
 
-- pdf-extract does no OCR. A scanned PDF holds pictures of its pages,
-  not text. `AI.PARSE_DOCUMENT` therefore returns an empty string for a
-  scanned page.
-- pdf-extract cannot read some malformed PDFs. `AI.PARSE_DOCUMENT`
-  returns `NULL` for such PDFs.
-
-`AI.EXTRACT` copies its answers from a document's text. `AI.EXTRACT`
-therefore reads the output of `AI.PARSE_DOCUMENT`:
+You need the text to use `AI.EXTRACT`, which copies its answers from a
+document's text:
 
 ```sql
 SELECT f.path,
@@ -161,12 +158,12 @@ FROM files f;
 
 ## Choose a model
 
-A model needs a vision tower to read images. The models with a vision
-tower are `qwen3.5-4b-bf16`, `qwen3.5-4b-fp8`, `qwen3.5-27b-fp8`,
-`qwen3.8-27b-fp8`, and `qwen3.6-35b-a3b-fp8`.
+You need a model with a vision tower to read images:
+`qwen3.5-4b-bf16`, `qwen3.5-4b-fp8`, `qwen3.5-27b-fp8`,
+`qwen3.8-27b-fp8`, or `qwen3.6-35b-a3b-fp8`.
 
-[AI functions](/docs/user-guide/sql/ai-functions#aipdf_pagespdf-longest_edge-first-last)
-lists every argument of `AI.PDF_PAGES` and `AI.PARSE_DOCUMENT`.
+You can find every argument of `AI.PDF_PAGES`, `AI.PARSE_DOCUMENT`, and
+`AI.IMAGE` in [AI functions](/docs/user-guide/sql/ai-functions).
 
-CORD (Park et al., 2019) provides the receipts under
+The receipts come from CORD (Park et al., 2019), under
 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
