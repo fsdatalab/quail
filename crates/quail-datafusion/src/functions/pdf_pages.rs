@@ -228,8 +228,8 @@ fn pdf_pages(
 /// None for a NULL PDF or one hayro cannot read. A page hayro cannot
 /// draw has no PNG; only the pages in the range are drawn.
 ///
-/// The PDFs parse in parallel, and then every page of every PDF draws in
-/// parallel, so one long PDF uses every core.
+/// Every page of every PDF draws in parallel. DataFusion already reads
+/// each partition's rows on its own thread, but one long PDF is one row.
 fn page_images(
     files: &[Option<&[u8]>],
     longest_edge: u16,

@@ -17,14 +17,12 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, ArrayRef, AsArray, StringArray};
+use datafusion::arrow::array::{Array, ArrayRef, AsArray, StringBuilder};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{Result, exec_err, plan_err};
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
-
-use rayon::prelude::*;
 
 use super::quiet::quietly;
 
@@ -75,17 +73,15 @@ impl ScalarUDFImpl for ParseDocument {
 /// The text of each PDF in `documents`, a binary array: NULL for a NULL
 /// or unreadable PDF.
 fn document_texts(documents: &ArrayRef) -> Result<ArrayRef> {
-    let files: Vec<Option<&[u8]>> = match documents.data_type() {
-        DataType::Binary => documents.as_binary::<i32>().iter().collect(),
-        DataType::LargeBinary => documents.as_binary::<i64>().iter().collect(),
-        DataType::BinaryView => documents.as_binary_view().iter().collect(),
+    let mut texts = StringBuilder::with_capacity(documents.len(), 0);
+    let mut append = |bytes: Option<&[u8]>| texts.append_option(bytes.and_then(pdf_text));
+    match documents.data_type() {
+        DataType::Binary => documents.as_binary::<i32>().iter().for_each(&mut append),
+        DataType::LargeBinary => documents.as_binary::<i64>().iter().for_each(&mut append),
+        DataType::BinaryView => documents.as_binary_view().iter().for_each(&mut append),
         other => return exec_err!("AI.PARSE_DOCUMENT reads a binary column, not {other}"),
-    };
-    let texts: Vec<Option<String>> = files
-        .par_iter()
-        .map(|bytes| (*bytes).and_then(pdf_text))
-        .collect();
-    Ok(Arc::new(StringArray::from(texts)))
+    }
+    Ok(Arc::new(texts.finish()))
 }
 
 /// The text a PDF stores, its pages in order and each page trimmed, or
