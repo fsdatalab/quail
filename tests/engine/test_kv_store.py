@@ -126,19 +126,34 @@ def _write(arena, key, tokens, seed):
     return arena._pool[:, rows].clone()
 
 
-def test_a_freed_prefix_stays_in_the_arena_and_lends_its_whole_pages():
+def test_a_document_takes_over_the_kept_prefix_of_its_tokens():
     arena = _arena(pages=16)
     written = _write(arena, ("r", 0), 40, seed=1)
     arena.free_key(("r", 0))
     # the kept prefix's 3 pages count as free: an admission may take them
     assert arena.resident_keys() == [] and arena.free_pages == 16
-    kept, shared = arena.kept_prefix(b"content 1", 40)
-    assert shared == 32 and arena.kept_prefix(b"content 1", 39) == (None, 0)
-    # a document with the same prefix reads the kept pages and writes its own
-    assert arena.reserve(("s", 5), 40, capacity_tokens=48, borrow=(kept, shared))
-    rows = arena.capacity_rows(("s", 5))[:32]
-    assert torch.equal(arena._pool[:, rows], written[:, :32])
-    assert arena.store.stats()["saved_tokens"] == 0
+    kept = arena.kept_prefix(b"content 1", 40)
+    assert kept is not None and arena.kept_prefix(b"content 1", 39) is None
+    assert arena.reserve_kept(("s", 5), kept, capacity_tokens=64)
+    assert arena.kept_prefix(b"content 1", 40) is None
+    assert arena.prefix_tokens(("s", 5)) == 40 and arena.free_pages == 12
+    rows = arena.capacity_rows(("s", 5))[:40]
+    assert torch.equal(arena._pool[:, rows], written)
+    assert (arena.reused_tokens, arena.store.stats()["saved_tokens"]) == (40, 0)
+    # freed again, the document's prefix is kept again
+    arena.free_key(("s", 5))
+    assert arena.kept_prefix(b"content 1", 40) is not None
+
+
+def test_a_kept_prefix_stays_kept_when_its_document_cannot_grow():
+    arena = _arena(pages=4)
+    _write(arena, ("r", 0), 40, seed=1)
+    arena.free_key(("r", 0))
+    arena.activate(("busy", 0), 16)          # the only free page, pinned
+    kept = arena.kept_prefix(b"content 1", 40)
+    assert not arena.reserve_kept(("s", 5), kept, capacity_tokens=96)
+    assert arena.kept_prefix(b"content 1", 40) is not None
+    assert arena.resident_keys() == [("busy", 0)]
 
 
 def test_a_kept_prefix_computed_once_is_dropped_when_pages_run_short():
@@ -149,7 +164,7 @@ def test_a_kept_prefix_computed_once_is_dropped_when_pages_run_short():
     # kept pages count as free, and a document that needs them takes them
     assert arena.free_pages == 8
     assert arena.reserve(("r", 1), 100, capacity_tokens=128)
-    assert arena.kept_prefix(b"content 1", 40) == (None, 0)
+    assert arena.kept_prefix(b"content 1", 40) is None
     arena.flush_store()
     assert not arena.stored(b"content 1", 40)
 

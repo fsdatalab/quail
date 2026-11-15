@@ -464,7 +464,6 @@ class StageExecutor:
 
         self._held_parents = set()
         self._reserved_parents = {}
-        self._kept_borrows = {}    # document -> (kept key, tokens borrowed)
         self._prefill_keys = set()    # keys of prefixes part way written
         self.spans = []
         self.tokens = 0
@@ -585,38 +584,30 @@ class StageExecutor:
         """The prefix tokens whose KV the arena keeps or the host store holds.
 
         Returns:
-            (tokens supplied, tokens of them read from borrowed pages): a
-            kept prefix lends its whole pages, and the host store copies
-            the whole prefix into the document's own pages.
+            (tokens supplied, tokens of them that take no new pages): a
+            kept prefix brings its pages, and the host store copies the
+            prefix into pages the document reserves.
         """
         content, prefix = self.contents[anchor], self.prefix_lengths[anchor]
-        _, shared = self.arena.kept_prefix(content, prefix)
-        if shared:
-            return shared, shared
+        if self.arena.kept_prefix(content, prefix) is not None:
+            page = self.arena.page_tokens
+            return prefix, prefix // page * page
         return (prefix, 0) if self.arena.stored(content, prefix) else (0, 0)
-
-    def _borrowed(self, anchor) -> tuple:
-        """The key an admitted document borrows from and the tokens it borrows."""
-        if anchor in self._kept_borrows:
-            return self._kept_borrows[anchor]
-        parent = self.borrowing.parent(anchor)
-        return (None if parent is None else self.keys[parent],
-                self.borrowing.shared(anchor))
 
     def _reserve(self, anchor, borrow, rows):
         """Reserve a document's KV and checkpoints before admitting its work.
 
-        A fresh document whose prefix the arena keeps borrows the kept
-        prefix's whole pages, and one whose prefix the host store holds
-        has it copied into the reserved pages; the admission packs none
-        of those tokens.
+        A fresh document whose prefix the arena keeps takes the kept
+        prefix's pages, and one whose prefix the host store holds has it
+        copied into the reserved pages; the admission packs no prefix
+        for either.
         """
         key = self.keys[anchor]
         prefix = self.prefix_lengths[anchor]
         kept, restore = None, False
         if (self.contents is not None and borrow is None
                 and not self.arena.is_resident(key)):
-            kept, lent = self.arena.kept_prefix(self.contents[anchor], prefix)
+            kept = self.arena.kept_prefix(self.contents[anchor], prefix)
             restore = kept is None and self.arena.stored(
                 self.contents[anchor], prefix)
         parent, shared = (None, 0) if borrow is None else borrow
@@ -624,34 +615,28 @@ class StageExecutor:
                        if shared < t < prefix)
         capacity = prefix + self.capacity_extra
         borrowed = (self.keys[parent], shared) if shared else None
-        if kept is not None:
-            borrowed = (kept, lent)
         if self.answer_admission is not None:
             prompt_pages = (self.arena.growth_cost(key, capacity)
                             if self.arena.is_resident(key)
-                            else self.arena.page_cost(capacity - shared))
+                            else self.arena.page_cost(capacity - shared)
+                            if kept is None
+                            else self.arena.growth_cost(kept, capacity))
             if not self.answer_admission.allows(
                     anchor, self.arena.free_pages, prompt_pages):
                 if self.answer_admission.waits():
                     return False
                 # No answer can free pages: start with one page and grow.
+        if kept is not None:
+            if not self.arena.reserve_kept(key, kept, capacity):
+                return False
+            return self._reserved(anchor, key, parent)
         if not self.arena.reserve(
                 key, prefix, capacity_tokens=capacity, borrow=borrowed,
                 extension=self._extends, share_points=points):
             return False
         if restore:
             self.arena.restore(key, self.contents[anchor], prefix)
-        if kept is not None:
-            # the kept prefix stays until the pass that reads it has run
-            self._kept_borrows[anchor] = borrowed
-            self.arena.lend_kept(kept)
-            self.arena.read_state((kept,))
-            self._reserved_parents[anchor] = kept
-            self.arena.reused_tokens += lent
-            if lent == prefix:
-                # no pass writes the prefix: it is whole in borrowed pages
-                self.arena.note_prefix(key, self.contents[anchor], prefix)
-        elif self.contents is not None and borrow is None and not restore:
+        elif self.contents is not None and borrow is None:
             self.arena.note_computed(self.contents[anchor])
         return self._reserved(anchor, key, parent)
 
@@ -668,14 +653,6 @@ class StageExecutor:
             self.arena.hold(key, self.borrowers[anchor])
             self.arena.keep_window(key, self.lowest_borrow[anchor])
         return True
-
-    def _read(self, anchor) -> None:
-        """Let go of the KV an admitted document's first pass read."""
-        if anchor in self._reserved_parents:
-            self.arena.done_reading((self._reserved_parents.pop(anchor),))
-        kept = self._kept_borrows.pop(anchor, None)
-        if kept is not None:
-            self.arena.release_kept(kept[0])
 
     def _merged(self, j, start, end):
         """Return whether the group packs its frame and suffix as one entry."""
@@ -790,7 +767,8 @@ class StageExecutor:
             path = 0 if rewinds and start == 0 else self.appended[a]
             if request is not None:
                 path = max(0, path - request.discard)
-            parent, shared = self._borrowed(a) if carried else (None, 0)
+            parent, shared = ((self.borrowing.parent(a), self.borrowing.shared(a))
+                              if carried else (None, 0))
             prefix = None
             if carried:
                 prefix = self.prefixes[a][shared:] if shared else self.prefixes[a]
@@ -828,11 +806,11 @@ class StageExecutor:
                     rows = self.stages[j].canvas_rows * len(sufs)
             # under tree attention a borrowing document with one
             # suffix reads its parent's pages stacked with its siblings
-            read_key = parent if shared and self.stages[j].single else None
+            read_key = self.keys[parent] if shared and self.stages[j].single else None
             carry = {}
             if prefix is not None:
                 carry = dict(
-                    borrow_key=parent if shared else None,
+                    borrow_key=self.keys[parent] if shared else None,
                     share_points=self.share_points[a])
             kept = int(sufs.lengths.sum()) if append else 0
             if request is not None and request.write_suffix_tokens is not None:
@@ -1231,7 +1209,8 @@ class StageExecutor:
             parent = self.borrowing.tree_parent[a]
             if parent is not None:
                 self.arena.release(self.keys[parent])
-            self._read(a)
+            if a in self._reserved_parents:
+                self.arena.done_reading((self._reserved_parents.pop(a),))
 
     def run(self):
         """Drive admission and drain the launched answer handles in order."""
@@ -1306,7 +1285,8 @@ class StageExecutor:
                           if a < len(self.borrowing.tree_parent) else None)
                 if carried and start == 0 and parent is not None:
                     self.arena.release(self.keys[parent])
-                self._read(a)
+                if a in self._reserved_parents:
+                    self.arena.done_reading((self._reserved_parents.pop(a),))
         while self.outstanding:
             self._report_next()
         self._release_skipped()
