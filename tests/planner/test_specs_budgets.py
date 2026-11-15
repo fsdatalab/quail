@@ -84,7 +84,7 @@ def test_hybrid_budget_reserves_checkpoints_and_two_execution_chunks(
     from quail.backends.quail.worker import checkpoint_arena_args
     from quail.common.retention import retention_pages
 
-    model = replace(QWEN3_5_4B_BF16, w_mem_bytes=8_411_152_384)
+    model = replace(QWEN3_5_4B_BF16, w_mem_bytes=8_411_152_384, vision_mem_bytes=0.0)
     chunk = budgets.chunk_budget(model, H100_SXM)
     assert chunk == 116_508
     assert model.checkpoint_bytes == 51_511_296
@@ -110,3 +110,12 @@ def test_hybrid_budget_reserves_checkpoints_and_two_execution_chunks(
     }
     with pytest.raises(ValueError, match="holds no checkpoint"):
         budgets.hybrid_arena_pages(model, H100_SXM, chunk, 1e7)
+
+
+def test_a_vision_tower_takes_its_bytes_out_of_the_kv_pool():
+    text = replace(QWEN3_5_4B_BF16, vision_mem_bytes=0.0)
+    chunk = budgets.chunk_budget(text, H100_SXM)
+    pages = budgets.hybrid_pool_pages(text, H100_SXM, chunk)
+    vision = budgets.hybrid_pool_pages(QWEN3_5_4B_BF16, H100_SXM, chunk)
+    taken = QWEN3_5_4B_BF16.vision_mem_bytes / (16 * text.kappa)
+    assert pages - vision == pytest.approx(taken, abs=1)
