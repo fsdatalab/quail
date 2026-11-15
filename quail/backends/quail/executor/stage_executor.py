@@ -358,6 +358,10 @@ class StageExecutor:
         self.contents = ([content_id(prefix) for prefix in self.prefixes]
                          if self.paged and getattr(self.arena, "store", None)
                          is not None else None)
+        if self.contents is not None:
+            # prefixes freed since the last pass are stored before the
+            # admission asks for them
+            self.arena.flush_store()
         self._anchors = ({} if self.contents is None
                          else {key: a for a, key in enumerate(self.keys)})
         self.asking = any(stage.requests is not None or stage.own_suffixes

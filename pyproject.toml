@@ -18,6 +18,9 @@ dependencies = [
     "rich==15.0.0",
     # same version as the Modal image; vLLM has Linux wheels only
     "vllm==0.29.0; sys_platform == 'linux'",
+    # the GPU entropy coder of the host KV store; the cu13 build matches
+    # the Modal image's CUDA 13
+    "nvidia-nvcomp-cu13==6.0.0.12; sys_platform == 'linux'",
 ]
 
 [project.scripts]

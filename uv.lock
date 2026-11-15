@@ -1956,6 +1956,15 @@ wheels = [
 ]
 
 [[package]]
+name = "nvidia-libnvcomp-cu13"
+version = "6.0.0.12"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/56/44/1bd7f69e68bd6437063c4042b85145097a663018beba17e17e4959fbd9b0/nvidia_libnvcomp_cu13-6.0.0.12-py3-none-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:becef25cb59b0fbb593d05733be39936ad2f508dc148e2fb125611c28c50a705", size = 33187557, upload-time = "2026-10-13T16:53:33.335Z" },
+    { url = "https://files.pythonhosted.org/packages/25/4d/13c2fe98da55aa5155211c3579582bbe1fe17c9b6856d5a4267e4c70ac77/nvidia_libnvcomp_cu13-6.0.0.12-py3-none-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:d1cf156f7885b9b1ad17ac0059b678e04869466f81207e51fed330f8ffbfcd5a", size = 29765393, upload-time = "2026-10-13T16:53:57.558Z" },
+]
+
+[[package]]
 name = "nvidia-ml-py"
 version = "13.610.43"
 source = { registry = "https://pypi.org/simple" }
@@ -1971,6 +1980,18 @@ source = { registry = "https://pypi.org/simple" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/72/0d/daf50d44177ee0cbc7ff0a0c91eb5ff676c82be42f9a970bc7597f440c3a/nvidia_nccl_cu13-2.29.7-py3-none-manylinux_2_18_aarch64.whl", hash = "sha256:674a12383e3c38a1bcccae7d4f3633b37852230b6047883cb2f4c2d1b36d9bf5", size = 206014712, upload-time = "2026-03-03T05:34:20.843Z" },
     { url = "https://files.pythonhosted.org/packages/67/f4/58e4e91b6919367c7aafb8e36fce9aad1a3047e536bf7e2fd560927d3a4c/nvidia_nccl_cu13-2.29.7-py3-none-manylinux_2_18_x86_64.whl", hash = "sha256:edd81538446786ec3b73972543e53bb43bcaf0bfc8ef76cb679fcc390ffe136d", size = 205976000, upload-time = "2026-03-03T05:36:24.472Z" },
+]
+
+[[package]]
+name = "nvidia-nvcomp-cu13"
+version = "6.0.0.12"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "nvidia-libnvcomp-cu13" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b3/3e/c8c482f66250ba05c04162a81bb94e6ac6336909eadb378c63acf568ec02/nvidia_nvcomp_cu13-6.0.0.12-py3-none-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:2a249d72451afed47a29f05491399bffd1a31df1dc54145d8b1bcbc40d7b6d2c", size = 3965151, upload-time = "2026-10-13T16:58:12.613Z" },
+    { url = "https://files.pythonhosted.org/packages/e4/b5/198ac6e48031b220684f08ea0c29967c86704914c84db80d13b57c61df40/nvidia_nvcomp_cu13-6.0.0.12-py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:8386ba3ab6c968d001138eda0f66fe7b7a847e7241384a63232b1c2d50a79d74", size = 4206822, upload-time = "2026-10-13T16:58:32.091Z" },
 ]
 
 [[package]]
@@ -2675,6 +2696,7 @@ dependencies = [
     { name = "huggingface-hub" },
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
     { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'emscripten' or sys_platform == 'win32'" },
+    { name = "nvidia-nvcomp-cu13", marker = "sys_platform == 'linux'" },
     { name = "pyarrow" },
     { name = "rich" },
     { name = "transformers" },
@@ -2702,6 +2724,7 @@ requires-dist = [
     { name = "huggingface-hub", specifier = "==1.28.0" },
     { name = "numpy", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'", specifier = "==2.3.5" },
     { name = "numpy", marker = "sys_platform == 'emscripten' or sys_platform == 'win32'", specifier = "==2.5.2" },
+    { name = "nvidia-nvcomp-cu13", marker = "sys_platform == 'linux'", specifier = "==6.0.0.12" },
     { name = "pyarrow", specifier = "==25.0.1" },
     { name = "rich", specifier = "==15.0.0" },
     { name = "transformers", specifier = "==5.15.0" },
