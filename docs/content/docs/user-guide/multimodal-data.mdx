@@ -94,15 +94,14 @@ is 800 tokens.
 
 ### Parse to text
 
-If you absolutely must parse, use `AI.PARSE_DOCUMENT`. The function
-reads the text a PDF stores with the Rust crate
-[pdf-extract](https://crates.io/crates/pdf-extract), on the CPU, and
-puts a form feed (`'\f'`) between pages. pdf-extract has three limits:
+Quail does support a basic text parser, `AI.PARSE_DOCUMENT`, if you
+absolutely must parse. The function reads the text a PDF stores with the
+Rust crate [pdf-extract](https://crates.io/crates/pdf-extract), on the
+CPU, and puts a form feed (`'\f'`) between pages. pdf-extract has two
+limits:
 
 - It does no OCR. A scanned PDF holds pictures of its pages, not text,
   so `AI.PARSE_DOCUMENT` returns an empty string for a scanned page.
-- It returns text in the order the PDF draws it. A table's cells come
-  back as loose lines, and two columns can mix.
 - It cannot read some malformed PDFs. `AI.PARSE_DOCUMENT` returns `NULL`
   for them.
 
