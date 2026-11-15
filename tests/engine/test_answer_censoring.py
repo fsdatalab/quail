@@ -18,7 +18,7 @@ def test_censored_answers_leave_the_risk_set_and_known_lengths_give_the_tokens_l
     counts = np.bincount([2, 3, 4, 6], minlength=7)[None]
     events = np.bincount([2, 4, 6], minlength=7)[None]
     curve = survival_rows(counts, events, np.zeros((1, 7)), [6])[0]
-    remaining = remaining_tokens(None, None, 3, 6, survival=curve)
+    remaining = remaining_tokens(curve)
     survival = np.array([1, 1, .75, .75, .375, .375, 0])
     expected = np.cumsum(survival[::-1])[::-1]
     expected[:-1] /= survival[:-1]
@@ -29,7 +29,7 @@ def test_censored_answers_leave_the_risk_set_and_known_lengths_give_the_tokens_l
     # left: three answers end at 4; a zero prior adds no events or risk
     counts = events = np.bincount([4, 4, 4], minlength=7)[None]
     curve = survival_rows(counts, events, np.zeros((1, 7)), [6])[0]
-    remaining = remaining_tokens(None, None, 3, 6, survival=curve)
+    remaining = remaining_tokens(curve)
     np.testing.assert_allclose(remaining[:5], [4, 3, 2, 1, 0])
 
 

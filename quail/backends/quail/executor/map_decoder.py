@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from quail.backends.quail.executor.answer_curves import AnswerCurves
 from quail.backends.quail.executor.chunk import DecodeRows
 from quail.backends.quail.executor.groups import FullAttentionGroup
 
@@ -84,6 +85,8 @@ class MapDecoder:
         self.fed = np.zeros(n, dtype=np.int64)         # decode rows packed
         # when a list, each settle appends the slots whose answers ended
         self.ended_log = None
+        # the answers' survival curves, built at their first use
+        self.answer_curves = None
         self.stopped = np.zeros(n, dtype=bool)         # read a stop token
         self.kv = FullAttentionGroup(n, page_tokens)
         self.device = head.device
@@ -130,8 +133,10 @@ class MapDecoder:
     def configure_copy(self, first, slots, documents, specs):
         """Register extraction fields for setup after the first forward launch."""
         self.constrained[first:first + len(specs)] = True
-        for q in range(first, first + len(specs)):
+        for q, spec in enumerate(specs, first):
             self.draft_counts[q] = dict.fromkeys(DRAFT_COUNTS, 0)
+            self.answer_slots.setdefault(q, slots[q - first])
+            self.expected_tokens[q] = spec.expected_answer_tokens
         self.copy_inputs.append((first, slots, documents, specs))
 
     def _initialize(self):
@@ -181,16 +186,23 @@ class MapDecoder:
                 trials=np.zeros(len(LIVE_BUCKETS)), accepts=np.zeros(len(LIVE_BUCKETS)),
                 rho=np.array([document.rho for document in documents.documents]))
 
+    def survival_curves(self):
+        """Return each map's survival curve over its answers so far."""
+        if self.answer_curves is None:
+            self.answer_curves = AnswerCurves(self)
+        self.answer_curves.update()
+        return self.answer_curves.whole
+
     def row_counts(self, running):
         """Return one chosen-token row and each answer's copy draft rows."""
         from quail.backends.quail.executor.extract.copy import STREAM_STRIDE
-        from quail.common.answers import answer_survival
         from quail.common.draft_policy import draft_lengths
 
         counts = np.ones(len(running), dtype=np.int64)
         written = np.zeros(len(running), dtype=np.int64)
         sizes = np.zeros(len(running), dtype=np.int64)
         curves = {}
+        whole = None
         for q, state in self.copy_constraints.items():
             mine = self.map[running] == q
             slots = running[mine]
@@ -201,12 +213,12 @@ class MapDecoder:
             if spec.draft_policy != "adaptive":
                 sizes[mine] = spec.draft_tokens
                 continue
-            curve = answer_survival(self.lengths[q], self.written[q],
-                                    spec.expected_answer_tokens,
-                                    spec.max_answer_tokens)
-            curves[q] = curve
+            if whole is None:
+                whole = self.survival_curves()
+            limit = int(self.limits[q])
+            curves[q] = curve = whole[q, :limit + 1]
             sizes[mine] = draft_lengths(
-                spec.draft_tokens, spec.max_answer_tokens, curve, written[mine],
+                spec.draft_tokens, limit, curve, written[mine],
                 self.num_streams[slots], state.rho[self.copy_document[slots]],
                 state.trials, state.accepts)
         for group in self.copy_groups:
@@ -316,35 +328,33 @@ class MapDecoder:
         self.paused[document] = False
         self.drafts[document] = 0
 
-    def eviction_order(self, curves=None, recompute_cost=None, page_holds=None,
-                       remaining=None):
+    def eviction_order(self, recompute_cost=None, page_holds=None, remaining=None):
         """Order running slots by page-hold time saved per recomputation second.
 
         Args:
-            curves: Per map, the survival curve to estimate remaining
-                tokens from; each map's own answers by default.
             recompute_cost: Prices rebuilding a slot's KV; without it,
                 slots are ordered by remaining tokens alone.
             page_holds: How many slots hold each page; a page another
                 slot also holds is not freed.
             remaining: Per slot, its expected remaining tokens; replaces
-                the estimate from curves.
+                the estimate from each map's survival curve.
         """
         from quail.common.answers import remaining_tokens
 
         running = np.flatnonzero((self.map >= 0) & ~self.paused)
         scores = np.zeros(len(self.map))
         written = np.zeros(len(self.map), dtype=np.int64)
+        whole = None
         for q in np.unique(self.map[running]):
             mine = running[self.map[running] == q]
             written[mine] = self.written[q][mine]
             if remaining is not None:
                 scores[mine] = remaining[mine]
                 continue
-            curve = remaining_tokens(
-                self.lengths[q], self.written[q], self.expected_tokens[q],
-                int(self.limits[q]), survival=None if curves is None else curves.get(q))
-            scores[mine] = curve[written[mine]]
+            if whole is None:
+                whole = self.survival_curves()
+            left = remaining_tokens(whole[q, :int(self.limits[q]) + 1])
+            scores[mine] = left[written[mine]]
         if recompute_cost is not None and len(running):
             num_pages = self.kv.num_pages[running]
             if page_holds is not None:

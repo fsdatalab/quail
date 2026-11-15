@@ -32,7 +32,6 @@ from quail.backends.quail.executor.operators.filter import ConditionGate, Filter
 from quail.backends.quail.executor.operators.map import MapOperator
 from quail.backends.quail.executor.stage_executor import StageExecutor
 from quail.backends.quail.executor.stages import Stage
-from quail.common.answers import answer_survival
 from quail.common.decode import DecodeCost
 from quail.common.tokens import prefix_tree
 from quail.execution.answer_stops import answer_stop
@@ -479,6 +478,7 @@ def test_evicted_answers_recompute_exactly_with_gates_and_limits(monkeypatch):
 def test_eviction_takes_the_answers_with_the_most_tokens_left_to_write():
     decoder = MapDecoder(events_torch(0), torch.eye(VOCABULARY), 4,
                          [24, 6], [STOP], 4, expected_tokens=[12, 3])
+    decoder.answer_slots = {0: np.arange(2), 1: np.arange(2, 4)}
     for a, q in enumerate([0, 0, 1, 1]):
         decoder.start(a, q, 8, [0, 1, 2])
     decoder.written[0][:2] = [2, 23]
@@ -489,11 +489,6 @@ def test_eviction_takes_the_answers_with_the_most_tokens_left_to_write():
     assert order.index(2) < order.index(3)
     decoder.pause(0)
     assert 0 not in decoder.eviction_order()
-    curves = {q: answer_survival(decoder.lengths[q], decoder.written[q],
-                                 decoder.expected_tokens[q], int(decoder.limits[q]))
-              for q in range(len(decoder.limits))}
-    np.testing.assert_array_equal(decoder.eviction_order(curves),
-                                  decoder.eviction_order())
 
     # short prompts end after 3 tokens, long ones run to the limit; two
     # answers that wrote 2 tokens each differ only in their prompt length
@@ -725,7 +720,7 @@ def test_headroom_admission_admits_a_document_whose_prompt_and_headroom_fit():
     # survival curves match a full recount after answers end unseen
     decoder, admission = headroom_admission(num_documents=60, limit=32,
                                             expected_tokens=8)
-    admission.bucket_answers = 1
+    admission.curves.bucket_answers = 1
     stages = np.full(60, -1)
     admission.refresh(stages, free_pages=1000)
     rng = np.random.default_rng(5)
@@ -744,9 +739,9 @@ def test_headroom_admission_admits_a_document_whose_prompt_and_headroom_fit():
                                 lambda tokens: pages_for(tokens, 4),
                                 admission.decode_cost, bucket_answers=1)
     recount.refresh(stages, free_pages=1000)
-    assert np.array_equal(admission.map_counts, recount.map_counts)
-    assert np.allclose(admission.whole, recount.whole)
-    assert np.allclose(admission.curves, recount.curves)
+    assert np.array_equal(admission.curves.map_counts, recount.curves.map_counts)
+    assert np.allclose(admission.curves.whole, recount.curves.whole)
+    assert np.allclose(admission.curves.buckets, recount.curves.buckets)
 
 
 def test_headroom_goes_to_the_answers_whose_rebuild_risk_it_lowers_most():

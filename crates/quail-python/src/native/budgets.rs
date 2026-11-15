@@ -313,25 +313,6 @@ pub fn survival_rows<'py>(
     Ok(le_bytes(py, &curves.concat(), f64::to_le_bytes))
 }
 
-/// The survival curve of one question's answers so far, as float64 bytes.
-#[pyfunction]
-pub fn answer_survival<'py>(
-    py: Python<'py>,
-    lengths: PyBuffer<i64>,
-    written: PyBuffer<i64>,
-    expected_tokens: f64,
-    limit: usize,
-) -> PyResult<Bound<'py, PyBytes>> {
-    let curve = answers::answer_survival(
-        &lengths.to_vec(py)?,
-        &written.to_vec(py)?,
-        expected_tokens,
-        limit,
-        None,
-    );
-    Ok(le_bytes(py, &curve, f64::to_le_bytes))
-}
-
 /// The expected tokens still to write after each written length, as
 /// float64 bytes.
 #[pyfunction]
@@ -494,7 +475,6 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
         wrap_pyfunction!(retention_pages, module)?,
         wrap_pyfunction!(prior_survival, module)?,
         wrap_pyfunction!(survival_rows, module)?,
-        wrap_pyfunction!(answer_survival, module)?,
         wrap_pyfunction!(remaining_tokens, module)?,
         wrap_pyfunction!(live_buckets, module)?,
         wrap_pyfunction!(source_odds, module)?,

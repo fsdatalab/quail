@@ -7,7 +7,6 @@
 use std::collections::BTreeMap;
 
 use crate::cost::budgets::{floor_divide, pages_of, parallel_copies};
-use crate::cost::extract::{self, ExtractInputs};
 use crate::cost::quantity::{Quantity, numpy_sum};
 use crate::cost::score::score_fixed_tokens;
 use crate::cost::sol::{speed_of_light, unrounded_seconds};
@@ -17,7 +16,7 @@ use crate::physical::{AiFilterAttributes, PhysicalNode, build_pipelines, residen
 use serde_json::{Map, Value};
 
 use crate::classify::classify_statistics;
-use crate::columns::map_cost;
+use crate::columns::{answer_cost, extract_inputs, map_cost};
 use crate::context::PlanningContext;
 use crate::error::CompileError;
 use crate::plan_statistics::CorpusStats;
@@ -646,32 +645,17 @@ impl PlanPricer {
         match node {
             PhysicalNode::AiExtract(extract) => {
                 let spec = extract.attributes.spec.as_ref().expect("a spec");
-                let lengths: Vec<f64> = context.lengths(alias)?.iter().map(|l| *l as f64).collect();
-                let inputs = ExtractInputs {
-                    head_tokens: spec.prompt_token_parts[0].len() as i64,
-                    tail_tokens: spec.prompt_token_parts[1].len() as i64,
-                    window: 0,
-                    resident,
-                    max_answer_tokens: spec.max_answer_tokens,
-                    draft_tokens: spec.draft_tokens,
-                    draft_policy: spec.draft_policy.clone(),
-                    round_cost_per_token: spec.round_cost_per_token,
-                    answer_tokens: crate::constants::EXTRACT_ANSWER_TOKENS,
-                    recurrent: false,
-                };
+                let inputs = extract_inputs(spec, resident);
                 let seconds = |shared: &[f64]| {
-                    extract::estimate(
-                        spec.expected_rows,
-                        &lengths,
-                        shared,
+                    answer_cost(
+                        context,
+                        alias,
                         &inputs,
+                        spec.expected_rows,
+                        shared,
                         self.chunk,
-                        &context.model,
-                        &context.device,
-                        context.gpus,
                     )
                     .map(|cost| cost.seconds)
-                    .map_err(CompileError::new)
                 };
                 Ok(ratio(seconds(&shared_f64)?, seconds(&[])?))
             }

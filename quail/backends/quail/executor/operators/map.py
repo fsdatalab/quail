@@ -211,14 +211,22 @@ class MapOperator(ColumnOperator, ModelOperator):
         texts = [text.strip() for text in tokenizer.decode_batch(tokens)]
         return (pa.array(texts, pa.string()),)
 
+    def answered_positions(self, q):
+        """Return the documents whose rows answer q's table holds, by position."""
+        return np.flatnonzero(self.asked[q])
+
+    def answer_counts(self, q) -> dict:
+        """Return the operator's own counts of answer q, for its metrics."""
+        return {}
+
     def close(self, fresh, spans, stats, offset) -> dict:
-        """Build each map's answer table and attribute its GPU work."""
+        """Build each answer's table and attribute its GPU work."""
         own = [int(asked.sum()) * len(node.spec.prompt_token_parts[1]) + fed
                for asked, node, fed in zip(self.asked, self.nodes, self.fed)]
         for q, node in enumerate(self.nodes):
             spec = node.spec
-            asked = np.flatnonzero(self.asked[q])
-            tokens = self.decoder.answers(self.first + q, self._slots(q, asked))
+            asked = self.answered_positions(q)
+            lengths = self.decoder.lengths[self.first + q][self._slots(q, asked)]
             rows = join_prior_rows(self.answer_rows(q, asked), spec.aliases[0],
                                    self.priors, self.prior_tables)
             selected = stage_spans(spans, offset, offset + 1)
@@ -235,7 +243,7 @@ class MapOperator(ColumnOperator, ModelOperator):
                     extension={
                         "output": spec.name, "aliases": list(spec.aliases),
                         "input_rows": len(asked),
-                        "answer_tokens": int(sum(map(len, tokens))),
+                        "answer_tokens": int(np.maximum(0, lengths).sum()),
                         "decode_rows": self.fed[q],
                         "answers_stopped_early": int(
                             self.decoder.stopped_early[self.first + q]),
@@ -249,7 +257,8 @@ class MapOperator(ColumnOperator, ModelOperator):
                                              if q == 0 else 0),
                         "recomputed_tokens": (stats.get("recomputed_tokens", 0)
                                               if q == 0 else 0),
-                        **(admission_metrics(stats) if q == 0 else {})}))
+                        **(admission_metrics(stats) if q == 0 else {}),
+                        **self.answer_counts(q)}))
         return self._results
 
     def results(self) -> dict:

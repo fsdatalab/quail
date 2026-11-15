@@ -1297,7 +1297,8 @@ class StageExecutor:
         if details:
             detail("    " + "; ".join(details))
         if self.decoder is not None and self.summary:
-            curves = getattr(self.answer_admission, "bucket_curves", None)
+            curves = getattr(getattr(self.answer_admission, "curves", None),
+                             "bucket_curves", None)
             directory = os.environ.get(HEADROOM_TRACE_ENV)
             if curves and directory:
                 name = "".join(c if c.isalnum() else "_" for c in self.label)[:60]

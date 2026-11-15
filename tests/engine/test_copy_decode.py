@@ -321,9 +321,8 @@ def check_copy_branches_match_reference_after_filters_and_limits(
         assert extension["answer_tokens"] == sum(
             len(part.extraction.documents[d].answers[q].written) for d in asked
         )
-        assert extension["suffix_tokens"] == (
-            len(asked) * len(node.spec.prompt_token_parts[1]) + decoder.rows_fed[q]
-        )
+        assert extension["suffix_tokens"] == len(node.spec.prompt_token_parts[1])
+        assert extension["decode_rows"] == decoder.rows_fed[q]
         assert extension["steps"] >= len(asked)
         unread = (extension["draft_rows_rejected"]
                   + extension["draft_rows_after_end"])
