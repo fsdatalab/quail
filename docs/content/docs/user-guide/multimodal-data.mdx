@@ -14,12 +14,12 @@ the page images directly.
 
 ## Images
 
-You query images by storing them in a `BINARY` column. The example
+To query images, first store them in a `BINARY` column. The example
 below checks expenses in
 [CORD](https://huggingface.co/datasets/naver-clova-ix/cord-v2), a
 dataset of 1,000 receipt photos from Indonesian restaurants and cafés.
 
-First, download CORD's Parquet files from Hugging Face:
+Download CORD's Parquet files from Hugging Face:
 
 ```python
 import pyarrow as pa
@@ -83,9 +83,9 @@ becomes 992 by 736 pixels, or 713 tokens.
 
 ## PDFs
 
-You store PDFs in a `BINARY` column too. The code below loads legal
-contracts, such as leases and service agreements, from a folder named
-`contracts`:
+To query PDFs, first store them in a `BINARY` column too. The code
+below loads legal contracts, such as leases and service agreements, from
+a folder named `contracts`:
 
 ```python
 from pathlib import Path
@@ -100,7 +100,7 @@ session.register("files", quail.DocumentProvider.from_table(files, id_col="path"
 
 ### Ask about each page
 
-You ask about each page by turning each PDF into one row per page.
+To ask about each page, turn each PDF into one row per page.
 `AI.PDF_PAGES` returns a list of a PDF's pages, each a PNG image, and
 the `UNNEST` function turns the list into rows. The query below finds
 each contract page with a liability cap, a clause that limits how much
@@ -115,8 +115,8 @@ WHERE AI.IF(PROMPT('Does this page cap either party''s liability? {0}',
 
 ### Ask about a whole PDF
 
-You ask about a whole PDF by passing the list from `AI.PDF_PAGES`
-straight to an AI function, which reads the pages as one document. If
+To ask about a whole PDF, pass the list from `AI.PDF_PAGES` straight
+to an AI function, which reads the pages as one document. If
 you don't want to run the AI function on every page of a long PDF, you
 can set the first and last pages with the third and fourth arguments of
 `AI.PDF_PAGES`. The query below classifies each PDF from its first three
@@ -131,7 +131,7 @@ FROM files f;
 
 ### Choose a page size
 
-You choose how many pixels the model reads with the second argument of
+To choose how many pixels the model reads, set the second argument of
 `AI.PDF_PAGES`, the longest side of each page image. The default is
 1,536 pixels. A US Letter page at 1,024 pixels costs 800 tokens.
 
