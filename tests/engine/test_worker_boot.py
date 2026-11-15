@@ -62,6 +62,7 @@ ENVELOPE = {
 }
 SETUP = {"model": "qwen3-4b-fp8", "device": "h100-sxm", "backend": "quail",
          "gpus": 1, "model_path": None, "extensions": [],
+         "writes_answers": False,
          **ENVELOPE["settings"]}
 
 
@@ -139,6 +140,26 @@ def test_a_worker_reuses_its_model_and_an_arena_resize_releases_pieces_that_writ
     assert calls == ["synchronize", "invalidate", "resize"]
 
 
+def test_a_worker_captures_cuda_graphs_only_for_a_plan_that_writes_answers(
+        booted, monkeypatch):
+    captures = []
+    graphs = SimpleNamespace(prepare=lambda: captures.append("capture") or True)
+    monkeypatch.setattr(worker.PiecewiseGraphs, "for_specs", lambda *a: graphs)
+    state = worker.WorkerState(0, registry=built_in_registry())
+
+    boot = worker._boot_worker(state, SETUP)
+    assert (boot["kind"], boot["warm_tier"]) == ("cold", "compiled")
+    assert captures == []
+
+    # a later query with AI.MAP or AI.EXTRACT captures before it runs
+    boot = worker._boot_worker(state, {**SETUP, "writes_answers": True})
+    assert boot["warm_tier"] == "graphs"
+    assert captures == ["capture"]
+
+    assert "warm_tier" not in worker._boot_worker(state, SETUP)
+    assert captures == ["capture"]
+
+
 def test_a_failed_boot_releases_the_gpu_and_a_cold_boot_stays_out_of_collections(
         booted, monkeypatch):
     calls = []
@@ -155,20 +176,25 @@ def test_a_failed_boot_releases_the_gpu_and_a_cold_boot_stays_out_of_collections
 
     monkeypatch.setattr(worker.LoadedGpu, "warm", fail)
     with pytest.raises(RuntimeError, match="warm failed"):
-        worker._boot_gpu(None, backend, context, 100, [1], [2])
+        worker._boot_gpu(None, backend, context, 100, [1], [2],
+                         writes_answers=False)
     assert calls == [("release", ["gpu"])]
 
-    monkeypatch.setattr(worker.LoadedGpu, "warm", lambda self: (0.0, None))
-    gpu, boot = worker._boot_gpu(None, backend, context, 100, [1], [2])
+    monkeypatch.setattr(worker.LoadedGpu, "warm",
+                        lambda self, writes_answers: (0.0, None))
+    gpu, boot = worker._boot_gpu(None, backend, context, 100, [1], [2],
+                                 writes_answers=False)
     assert boot["kind"] == "cold"
-    again, boot = worker._boot_gpu(gpu, backend, context, 100, [1], [2])
+    again, boot = worker._boot_gpu(gpu, backend, context, 100, [1], [2],
+                                   writes_answers=False)
     assert again is gpu and boot["kind"] == "warm"
     assert calls == [("release", ["gpu"])]
 
     # a cold boot leaves the loaded objects out of later collections
     gc.unfreeze()
     try:
-        gpu, _ = worker._boot_gpu(None, backend, context, 100, [1], [2])
+        gpu, _ = worker._boot_gpu(None, backend, context, 100, [1], [2],
+                                  writes_answers=False)
         # a full collection inside a query skips the loaded model's objects
         assert not any(found is gpu for found in gc.get_objects())
     finally:

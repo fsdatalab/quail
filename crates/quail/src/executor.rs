@@ -959,6 +959,9 @@ fn run_on_workers(
         "backend": envelope["backend"], "gpus": envelope["gpus"],
         "chunk_tokens": settings["chunk_tokens"], "true_ids": settings["true_ids"],
         "false_ids": settings["false_ids"], "arena_pages": settings["arena_pages"],
+        // only AI.MAP and AI.EXTRACT write answers token by token, in
+        // passes small enough to replay the CUDA graphs
+        "writes_answers": !(operators.maps.is_empty() && operators.extracts.is_empty()),
         // the worker finds the model's files and imports no extension
         "model_path": null, "extensions": [],
     });
