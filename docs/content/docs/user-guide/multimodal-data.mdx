@@ -5,7 +5,8 @@ title: Querying multimodal data
 You can also query your multimodal data in Quail, such as images and
 PDFs. Quail reads PNG and JPEG images directly. For PDFs,
 `AI.PDF_PAGES` turns each page into an image, and `AI.PARSE_DOCUMENT`
-returns the text a PDF stores.
+returns the text in a PDF (using a basic tool,
+[pdf-extract](https://crates.io/crates/pdf-extract)).
 
 Quail doesn't yet support a text parser, such as OCR. You can still get
 pretty far without one, as modern open-source LLMs can answer questions
