@@ -636,7 +636,7 @@ class StageExecutor:
             return False
         if restore:
             self.arena.restore(key, self.contents[anchor], prefix)
-        elif self.contents is not None:
+        elif self.contents is not None and borrow is None:
             self.arena.note_computed(self.contents[anchor])
         return self._reserved(anchor, key, parent)
 
