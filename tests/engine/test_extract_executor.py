@@ -305,7 +305,7 @@ def _snapshot(part):
                 written=written, steps=int(part.decoder.steps[index][slot]),
                 done=part.decoder.lengths[index][slot] >= 0,
                 answer=values[0], span=spans[0], none_wins=not written))
-    return SimpleNamespace(**vars(part.extraction), counts=lambda q: part.counts[q])
+    return SimpleNamespace(**vars(part.extraction))
 
 
 def _extract_spec(monkeypatch, text, gold, spec=None, vocabulary=None, recurrent=False):
@@ -443,7 +443,9 @@ def test_a_pipeline_of_extractions_reads_each_document_once(
     assert dict(model.reads) == {document.key: 1 for document in stages.documents}
     # Whole pages are shared; each branch recomputes the partial document tail.
     prefixes = sum(len(document.prefix) for document in stages.documents)
-    fed = [stages.counts(q)["suffix_tokens"] for q in range(2)]
+    fed = [result.metrics.extension["input_rows"]
+           * result.metrics.extension["suffix_tokens"]
+           + result.metrics.extension["decode_rows"] for result in (first, second)]
     borrowed = first.metrics.extension["borrowed_prefix_tokens"]
     assert first.metrics.fresh_tokens == 2 * prefixes - borrowed + fed[0]
     assert second.metrics.fresh_tokens == fed[1] > 0

@@ -310,6 +310,7 @@ def check_copy_branches_match_reference_after_filters_and_limits(
     part.close(fresh, timed_spans, {}, len(stages) - 1)
     results = part.results()
     assert sum(result.metrics.fresh_tokens for result in results.values()) == fresh
+    rejected = 0
     for q, node in enumerate(nodes):
         result = results[node.node_id]
         asked = np.flatnonzero(part.asked[q])
@@ -320,10 +321,17 @@ def check_copy_branches_match_reference_after_filters_and_limits(
         assert extension["answer_tokens"] == sum(
             len(part.extraction.documents[d].answers[q].written) for d in asked
         )
-        assert extension["suffix_tokens"] == (
-            len(asked) * len(node.spec.prompt_token_parts[1]) + decoder.rows_fed[q]
-        )
+        assert extension["suffix_tokens"] == len(node.spec.prompt_token_parts[1])
+        assert extension["decode_rows"] == decoder.rows_fed[q]
         assert extension["steps"] >= len(asked)
+        unread = (extension["draft_rows_rejected"]
+                  + extension["draft_rows_after_end"])
+        assert extension["draft_rows_written"] + unread <= extension["draft_rows"]
+        assert extension["draft_rounds_rejected"] <= extension["draft_rounds"]
+        assert (extension["draft_rows"] > 0) == bool(draft_tokens)
+        rejected += extension["draft_rounds_rejected"]
+        assert (extension["max_steps_unrejected"] <= extension["max_steps"]
+                <= extension["steps"])
     assert not arena.accounting.owned
     if state_slots:
         assert len(arena.accounting.free_slots) == state_slots
@@ -332,6 +340,7 @@ def check_copy_branches_match_reference_after_filters_and_limits(
                        and token != decoder.tokens[q][slot, position]
                        for q, slot, position, token in fed), (
                            "the workload must continue after rejecting a draft")
+            assert rejected
 
 
 def test_copy_branches_match_reference_after_filters_and_limits(monkeypatch):

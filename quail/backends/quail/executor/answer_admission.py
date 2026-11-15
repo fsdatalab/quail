@@ -2,16 +2,9 @@
 
 import numpy as np
 
+from quail.backends.quail.executor.answer_curves import AnswerCurves
 from quail.backends.quail.executor.chunk import decode_groups
-from quail.common.answers import prior_survival, survival_rows
 from quail.common.work import Work
-
-
-def input_bucket(tokens):
-    """Return the input-length bucket: one per doubling of the prefix length."""
-    return np.floor(np.log2(np.maximum(np.asarray(tokens, dtype=float), 1.0))
-                    ).astype(np.int64)
-
 
 PRICE_STEPS = 24
 
@@ -247,27 +240,9 @@ class HeadroomAdmission:
         self.child_start = np.searchsorted(self.parent[order],
                                            np.arange(len(self.prefix) + 1))
         self.chunk_tokens = chunk_tokens
-        self.bucket_answers = bucket_answers
-        self.bucket = input_bucket(self.prefix)
-        self.num_buckets = int(self.bucket.max()) + 1 if len(self.prefix) else 1
-        limits = decoder.limits
-        self.width = int(limits.max()) + 1
-        # per map, the planner's geometric prior, 0 past the map's limit
-        self.prior = np.zeros((len(limits), self.width))
-        for q, limit in enumerate(limits):
-            self.prior[q, :limit + 1] = prior_survival(
-                decoder.expected_tokens[q], int(limit))
-        self.slot_map = np.full(len(self.prefix), -1, dtype=np.int64)
-        # per slot, its curve's row: map * num_buckets + bucket
-        self.slot_row = np.full(len(self.prefix), -1, dtype=np.int64)
-        self.slots = None
-        self.curves = None
-        self.whole = None
-        # per slot, the tokens it was last counted at and whether it had
-        # ended; per map and per curve row, those counts by token
-        self._observed = np.zeros(len(self.prefix), dtype=np.int64)
-        self._ended = np.zeros(len(self.prefix), dtype=bool)
-        self._watched = np.zeros(0, dtype=np.int64)
+        self.curves = decoder.answer_curves = AnswerCurves(
+            decoder, self.prefix, bucket_answers)
+        self.width = self.curves.width
         # anchors whose answers allows() priced and admit() counted
         self.committed = np.zeros(len(self.prefix), dtype=bool)
         self.stages = np.full(len(self.prefix), -1)
@@ -312,37 +287,6 @@ class HeadroomAdmission:
         # admissions that committed only some of a document's waiting answers
         self.partial_admissions = 0
 
-    def _bind(self):
-        decoder = self.decoder
-        self.slots = np.concatenate(
-            [np.asarray(slots, dtype=np.int64)
-             for slots in decoder.answer_slots.values()])
-        self.slot_map[self.slots] = np.concatenate(
-            [np.full(len(slots), q) for q, slots in decoder.answer_slots.items()])
-        maps = self.slot_map[self.slots]
-        self.slot_row[self.slots] = maps * self.num_buckets + self.bucket[self.slots]
-        self.rows = np.unique(self.slot_row[self.slots])
-        self.row_limit = np.repeat(decoder.limits, self.num_buckets)
-        num_maps, num_rows = len(decoder.limits), len(self.row_limit)
-        self.curves = np.zeros((num_rows, self.width))
-        self.whole = np.zeros((num_maps, self.width))
-        self.map_counts = np.zeros((num_maps, self.width), dtype=np.int64)
-        self.map_events = np.zeros((num_maps, self.width), dtype=np.int64)
-        self.row_counts = np.zeros((num_rows, self.width), dtype=np.int64)
-        self.row_events = np.zeros((num_rows, self.width), dtype=np.int64)
-        self.num_ended = np.zeros(num_rows, dtype=np.int64)
-        decoder.ended_log = []
-        slots = self.slots
-        self._count(slots, *self._observation(slots), sign=1)
-
-    @property
-    def bucket_curves(self):
-        """The curve of each (map, bucket) with answers, cut at its map's limit."""
-        if self.curves is None:
-            return {}
-        return {(int(row // self.num_buckets), int(row % self.num_buckets)):
-                self.curves[row, :self.row_limit[row] + 1] for row in self.rows}
-
     def refresh(self, stages, replays=(), replay_pages=0, free_pages=None):
         """Count held pages; with headroom, rebuild the curves and choose it.
 
@@ -362,87 +306,19 @@ class HeadroomAdmission:
         self._refreshes += 1
         writing = np.flatnonzero(self.decoder.map >= 0)
         running = writing[~self.decoder.paused[writing]]
-        self._update_curves(writing)
+        self.curves.update(writing)
         self.unplaced = {b for b in self.unplaced if stages[b] == -1}
         self.fixed_pages = int(sum(int(self.prompt_pages[b]) for b in self.unplaced))
         self._decision = None
         self._candidate = None
         self._added = {}
         if self.choose_headroom:
-            self._expected = self.whole.sum(axis=1)
+            self._expected = self.curves.whole.sum(axis=1)
             self._refresh_work(writing, replays)
             self._hold_running(running, free_pages)
             if self.traced:
                 self._record(running)
         self.headroom_pages = self.fixed_pages + int(self._remaining(running).sum())
-
-    def _observation(self, slots):
-        """Each slot's last token count and whether its answer ended."""
-        decoder = self.decoder
-        maps = self.slot_map[slots]
-        lengths = decoder.lengths[maps, slots]
-        ended = lengths >= 0
-        return np.where(ended, lengths, decoder.written[maps, slots]), ended
-
-    def _count(self, slots, observed, ended, sign):
-        """Add (sign 1) or remove (sign -1) slots' observations from the counts."""
-        maps, rows = self.slot_map[slots], self.slot_row[slots]
-        np.add.at(self.map_counts, (maps, observed), sign)
-        np.add.at(self.map_events, (maps[ended], observed[ended]), sign)
-        np.add.at(self.row_counts, (rows, observed), sign)
-        np.add.at(self.row_events, (rows[ended], observed[ended]), sign)
-        np.add.at(self.num_ended, rows[ended], sign)
-        if sign > 0:
-            self._observed[slots] = observed
-            self._ended[slots] = ended
-
-    def _update_curves(self, writing=None):
-        """Rebuild the curves of maps whose answers moved since the last update.
-
-        Only answers written now, at the last update, or ended since
-        can have moved.
-
-        Args:
-            writing: Slots whose answers are being written, or None to find them.
-        """
-        decoder = self.decoder
-        first = self.slots is None
-        if first:
-            self._bind()
-        if writing is None:
-            writing = np.flatnonzero(decoder.map >= 0)
-        watch = np.unique(np.concatenate([writing, self._watched, *decoder.ended_log]))
-        decoder.ended_log.clear()
-        self._watched = writing
-        watch = watch[self.slot_map[watch] >= 0]
-        observed, ended = self._observation(watch)
-        moved = (observed != self._observed[watch]) | (ended != self._ended[watch])
-        changed = np.zeros(len(decoder.limits), dtype=bool)
-        if moved.any():
-            slots = watch[moved]
-            self._count(slots, self._observed[slots], self._ended[slots], sign=-1)
-            self._count(slots, observed[moved], ended[moved], sign=1)
-            changed[self.slot_map[slots]] = True
-        if first:
-            changed[:] = True
-        if changed.any():
-            self._rebuild_curves(changed)
-
-    def _rebuild_curves(self, changed):
-        """Rebuild the whole-map and bucket curves of the changed maps."""
-        mine = np.flatnonzero(changed)
-        self.whole[mine] = survival_rows(self.map_counts[mine], self.map_events[mine],
-                                         self.prior[mine],
-                                         self.decoder.limits[mine])
-        rows = self.rows[changed[self.rows // self.num_buckets]]
-        self.curves[rows] = self.whole[rows // self.num_buckets]
-        # a bucket with few ended answers keeps its map's curve
-        rows = rows[self.num_ended[rows] >= self.bucket_answers]
-        if len(rows):
-            self.curves[rows] = survival_rows(self.row_counts[rows],
-                                              self.row_events[rows],
-                                              self.whole[rows // self.num_buckets],
-                                              self.row_limit[rows])
 
     def eviction_order(self):
         """Rank running answers for eviction, the first evicted first.
@@ -452,8 +328,8 @@ class HeadroomAdmission:
         """
         policy = None if self.decode_cost is None else self.decode_cost.recompute_cost
         holds = None if self.page_holds is None else self.page_holds()
-        self._update_curves()
-        return self.decoder.eviction_order(None, policy, holds,
+        self.curves.update()
+        return self.decoder.eviction_order(policy, holds,
                                            remaining=self._remaining_tokens())
 
     def _remaining_tokens(self):
@@ -463,7 +339,7 @@ class HeadroomAdmission:
         running = self._running()
         if not len(running):
             return remaining
-        curves = self.curves[self.slot_row[running]]
+        curves = self.curves.buckets[self.curves.slot_row[running]]
         tails = np.cumsum(curves[:, ::-1], axis=1)[:, ::-1]
         written = decoder.written[decoder.map[running], running]
         index = np.minimum(written, self.width - 1)
@@ -507,9 +383,9 @@ class HeadroomAdmission:
         if members not in self._added:
             decoder = self.decoder
             slots = self._answer_slots(members)
-            maps = self.slot_map[slots]
+            maps = self.curves.slot_map[slots]
             slots = slots[(decoder.lengths[maps, slots] < 0) & ~decoder.paused[slots]]
-            expected = self._expected[self.slot_map[slots]]
+            expected = self._expected[self.curves.slot_map[slots]]
             work = Work()
             if len(slots) and self.decode_cost is not None:
                 covered = np.zeros(len(slots), dtype=np.int64)
@@ -546,7 +422,7 @@ class HeadroomAdmission:
     def _answer_slots(self, members):
         """The answer slots among the anchors."""
         slots = np.asarray(members, dtype=np.int64)
-        return slots[self.slot_map[slots] >= 0]
+        return slots[self.curves.slot_map[slots] >= 0]
 
     def _waiting_members(self, anchor):
         """The anchor, then its document's other anchors not committed or placed."""
@@ -563,14 +439,14 @@ class HeadroomAdmission:
         Args:
             waiting: The scheduler's deque of released branches.
         """
-        if len(waiting) < 2 or self.curves is None:
+        if len(waiting) < 2 or self.curves.buckets is None:
             return
         anchors = np.fromiter(waiting, dtype=np.int64, count=len(waiting))
         _, inverse = np.unique(self.parent[anchors], return_inverse=True)
         first = np.full(inverse.max() + 1, len(anchors))
         np.minimum.at(first, inverse, np.arange(len(anchors)))
-        rows = self.slot_row[anchors]
-        expected = np.where(rows >= 0, self.curves[rows].sum(axis=1), 0.0)
+        rows = self.curves.slot_row[anchors]
+        expected = np.where(rows >= 0, self.curves.buckets[rows].sum(axis=1), 0.0)
         order = np.lexsort((-expected, first[inverse]))
         waiting.clear()
         waiting.extend(anchors[order].tolist())
@@ -615,8 +491,8 @@ class HeadroomAdmission:
         limits = self.decoder.limits[maps][:, None]
         pages = np.arange(-(-(self.width - 1) // page_tokens) + 1)
         held = np.minimum(limits, available[:, None])
-        flat = self.curves.reshape(-1)
-        base = (self.slot_row[slots] * self.width)[:, None]
+        flat = self.curves.buckets.reshape(-1)
+        base = (self.curves.slot_row[slots] * self.width)[:, None]
         reach = np.minimum(limits, held + 1 + pages * page_tokens)
         survived = flat[base + np.minimum(limits, written[:, None])]
         overrun = np.divide(flat[base + reach], survived, out=np.zeros(reach.shape),
@@ -630,13 +506,13 @@ class HeadroomAdmission:
         return risk
 
     def _record(self, running):
-        rows = self.slot_row[running]
+        rows = self.curves.slot_row[running]
         remaining = self._remaining(running)
-        num_answers = np.bincount(rows, minlength=len(self.curves))
-        pages = np.bincount(rows, weights=remaining, minlength=len(self.curves))
+        num_answers = np.bincount(rows, minlength=len(self.curves.buckets))
+        pages = np.bincount(rows, weights=remaining, minlength=len(self.curves.buckets))
         for row in np.flatnonzero(num_answers).tolist():
-            self.trace.append((self._refreshes, row // self.num_buckets,
-                               row % self.num_buckets, int(num_answers[row]),
+            self.trace.append((self._refreshes, row // self.curves.num_buckets,
+                               row % self.curves.num_buckets, int(num_answers[row]),
                                float(pages[row] / num_answers[row])))
 
     def _admission_risk(self, members):
@@ -646,7 +522,8 @@ class HeadroomAdmission:
         else:
             slots = self._answer_slots(members)
             risk = self._risk(
-                slots, self.slot_map[slots], np.zeros(len(slots), dtype=np.int64),
+                slots, self.curves.slot_map[slots],
+                np.zeros(len(slots), dtype=np.int64),
                 self.capacity[slots] - self.prompt[slots], self.prompt[slots])
             self._candidate = (members, slots, risk)
         return slots, risk
@@ -758,7 +635,8 @@ class HeadroomAdmission:
         self._candidate = None
         self.granted.extend(granted.tolist())
         self.granted_at.extend(zip([self._refreshes] * len(slots),
-                                   self.bucket[slots].tolist(), granted.tolist()))
+                                   self.curves.slot_bucket[slots].tolist(),
+                                   granted.tolist()))
         branch_pages = self._branch_pages(members)
         self.unplaced.update(members[1:])
         self.fixed_pages += branch_pages

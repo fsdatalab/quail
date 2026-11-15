@@ -1427,6 +1427,12 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                 Value::from(statistics.arena_pages.1),
             ]),
         );
+        // the arena above leaves the CUDA graph reserve only for a plan
+        // that writes answers, so the worker captures graphs by this value
+        settings.insert(
+            "writes_answers".into(),
+            Value::from(context.writes_answers()),
+        );
         settings.insert("admission_tokens".into(), Value::from(statistics.admission));
         settings.insert(
             "order_rule".into(),

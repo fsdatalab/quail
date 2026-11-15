@@ -337,7 +337,7 @@ pub fn validate_query(
     }
     if !sliding_kv_fits(model, device, None) {
         let chunk = chunk_budget(model, device);
-        let free = arena_bytes(model, device, chunk);
+        let free = arena_bytes(model, device, chunk, true);
         let floor = transient_sliding_pages(chunk, model.sliding_window, device.page_tokens);
         let needed = floor as f64 * model.kappa_sliding() * device.page_tokens as f64;
         return Ok(Some(Refusal::new(

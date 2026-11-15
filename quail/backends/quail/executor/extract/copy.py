@@ -155,6 +155,84 @@ def copy_tables(documents) -> SimpleNamespace:
     )
 
 
+class StreamRows:
+    """The live document positions of the answers being written, one row each.
+
+    An answer holds no row before its first token is chosen: until then
+    its streams are every position of its document, which the constraint
+    builds on demand. Its row returns to the pool when the answer ends, so
+    the rows held follow the answers running, not the documents of a query.
+
+    Args:
+        constraint: The CopyConstraint of the answers' documents.
+        num_answers: The answers that may ever hold a row.
+    """
+
+    def __init__(self, constraint, num_answers: int):
+        self.constraint = constraint
+        torch, device = constraint.torch, constraint.device
+        # per answer, its row of streams and alive, or -1
+        self.rows = np.full(num_answers, -1, dtype=np.int64)
+        self.unused = []
+        self.streams = torch.full((0, 1), -1, dtype=torch.int64, device=device)
+        self.alive = torch.zeros((0, 1), dtype=torch.bool, device=device)
+
+    def read(self, answers, documents, width):
+        """Return the answers' streams and which are alive, `width` wide.
+
+        Args:
+            answers: The answers' indices.
+            documents: Each answer's document index, on the device.
+            width: The row width, at least each held row's live streams.
+        """
+        constraint, torch = self.constraint, self.constraint.torch
+        held = self.rows[answers] >= 0
+        if not held.any():
+            streams = constraint.initial_streams(documents, width)
+            return streams, streams >= 0
+        streams = torch.full((len(answers), width), -1, dtype=torch.int64,
+                             device=constraint.device)
+        if not held.all():
+            at = constraint.tensor(np.flatnonzero(~held))
+            streams[at] = constraint.initial_streams(documents[at], width)
+        alive = streams >= 0
+        at = constraint.tensor(np.flatnonzero(held))
+        rows = constraint.tensor(self.rows[answers[held]])
+        kept = min(width, self.streams.shape[1])
+        streams[at, :kept] = self.streams[rows, :kept]
+        alive[at, :kept] = self.alive[rows, :kept]
+        return streams, alive
+
+    def write(self, answers, streams, alive):
+        """Keep the answers' streams, giving a row to each answer without one."""
+        torch, constraint = self.constraint.torch, self.constraint
+        new = answers[self.rows[answers] < 0]
+        short = len(new) - len(self.unused)
+        num_rows, width = self.streams.shape
+        if short > 0 or streams.shape[1] > width:
+            grown = max(num_rows + max(0, short), 2 * num_rows if short > 0 else 0)
+            self.unused.extend(range(num_rows, grown))
+            wider = torch.full((grown, max(width, streams.shape[1])), -1,
+                               dtype=torch.int64, device=constraint.device)
+            wider[:num_rows, :width] = self.streams
+            mask = torch.zeros(wider.shape, dtype=torch.bool,
+                               device=constraint.device)
+            mask[:num_rows, :width] = self.alive
+            self.streams, self.alive = wider, mask
+        for answer in new.tolist():
+            self.rows[answer] = self.unused.pop()
+        rows = constraint.tensor(self.rows[answers])
+        self.alive[rows] = False
+        self.streams[rows, :streams.shape[1]] = streams
+        self.alive[rows, :alive.shape[1]] = alive
+
+    def release(self, answers):
+        """Return the rows of ended answers to the pool."""
+        held = answers[self.rows[answers] >= 0]
+        self.unused.extend(self.rows[held].tolist())
+        self.rows[held] = -1
+
+
 class CopyConstraint:
     """Tokenized document positions shared by a pipeline's extraction fields.
 
@@ -199,11 +277,6 @@ class CopyConstraint:
         self.exhausted = np.zeros(len(self.characters), dtype=bool)
         self.prepared = np.empty(0, dtype=np.int64)
         self.num_positions = 0
-        starts = self.position_offsets_device[:-1, None]
-        columns = torch.arange(self.max_positions, device=self.device)
-        self.stream_ids = torch.where(
-            columns < self.position_offsets_device[1:, None] - starts,
-            (starts + columns) * STREAM_STRIDE, -1)
         self.document_key_starts_device = self.tensor(self.document_key_starts)
         self.document_key_ends_device = self.tensor(self.document_key_ends)
         self.key_option_starts = self.tensor(tables.key_option_starts)
@@ -473,6 +546,19 @@ class CopyConstraint:
             self.continuations_host[rows]
         )
         self.changed[positions] = False
+
+    def initial_streams(self, documents, width):
+        """Return every position of each document as a row of streams.
+
+        Args:
+            documents: The documents' indices, on the device.
+            width: The row width; positions past a document's last are -1.
+        """
+        starts = self.position_offsets_device[documents][:, None]
+        ends = self.position_offsets_device[documents + 1][:, None]
+        columns = self.torch.arange(width, device=self.device)
+        return self.torch.where(
+            columns < ends - starts, (starts + columns) * STREAM_STRIDE, -1)
 
     def tensor(self, value):
         host = self.torch.as_tensor(value)

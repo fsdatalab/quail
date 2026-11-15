@@ -10,7 +10,7 @@ use crate::cost::sae_features::SaeFeaturesCost;
 use crate::cost::sol::unrounded_seconds;
 use crate::cost::statistics::AliasStats;
 use crate::cost::work::packed;
-use crate::physical::{ExtractSpec, MapSpec, ModelCall, Prompt, SaeFeaturesSpec};
+use crate::physical::{ExtractSpec, MapSpec, Prompt, SaeFeaturesSpec};
 use serde::Serialize;
 
 use crate::context::PlanningContext;
@@ -53,15 +53,6 @@ fn bind(prompt: &Prompt) -> Bound {
             .map(|argument| (argument_alias(argument), column_name(argument, false)))
             .collect(),
     }
-}
-
-fn lengths_of(context: &PlanningContext, call: &ModelCall) -> Result<Vec<f64>, CompileError> {
-    let alias = argument_alias(&call.prompt.args[0]);
-    Ok(context
-        .lengths(&alias)?
-        .iter()
-        .map(|length| *length as f64)
-        .collect())
 }
 
 /// The spec of one column operator over `expected_rows` documents.
@@ -159,32 +150,82 @@ fn extract_spec(
     // one document token's KV read per round, in tokens of compute
     let token_seconds = coefficients(model, device, false).linear_seconds;
     spec.round_cost_per_token = model.kappa() / device.hbm_bw / token_seconds;
-    let inputs = ExtractInputs {
-        head_tokens: prompt.preamble_token_ids.len() as i64,
-        tail_tokens: prompt.tail_token_ids.len() as i64,
+    let alias = argument_alias(&call.prompt.args[0]);
+    let cost = answer_cost(
+        context,
+        &alias,
+        &extract_inputs(&spec, resident),
+        expected_rows,
+        &[],
+        chunk,
+    )?;
+    spec.estimated_seconds = cost.seconds;
+    spec.estimated_work = cost.work.values();
+    Ok(spec)
+}
+
+/// An extraction's settings as the cost model reads them.
+pub fn extract_inputs(spec: &ExtractSpec, resident: bool) -> ExtractInputs {
+    ExtractInputs {
+        head_tokens: spec.prompt_token_parts[0].len() as i64,
+        tail_tokens: spec.prompt_token_parts[1].len() as i64,
         window: 0,
         resident,
         max_answer_tokens: spec.max_answer_tokens,
         draft_tokens: spec.draft_tokens,
         draft_policy: spec.draft_policy.clone(),
         round_cost_per_token: spec.round_cost_per_token,
-        answer_tokens: EXTRACT_ANSWER_TOKENS,
+        answer_tokens: spec.expected_answer_tokens,
         recurrent: false,
-    };
-    let cost = extract::estimate(
+    }
+}
+
+/// A map's settings as the cost model reads them: an extraction that
+/// drafts no tokens.
+fn map_inputs(spec: &MapSpec, resident: bool) -> ExtractInputs {
+    ExtractInputs {
+        head_tokens: spec.prompt_token_parts[0].len() as i64,
+        tail_tokens: spec.prompt_token_parts[1].len() as i64,
+        window: 0,
+        resident,
+        max_answer_tokens: spec.max_answer_tokens,
+        draft_tokens: 0,
+        draft_policy: "fixed".to_string(),
+        round_cost_per_token: 0.0,
+        answer_tokens: spec.expected_answer_tokens,
+        recurrent: false,
+    }
+}
+
+/// The estimated cost of writing one answer per document of `alias`.
+///
+/// # Errors
+///
+/// The planner has no token counts for the alias's table.
+pub fn answer_cost(
+    context: &PlanningContext,
+    alias: &str,
+    inputs: &ExtractInputs,
+    expected_rows: f64,
+    shared: &[f64],
+    chunk: i64,
+) -> Result<extract::ExtractCost, CompileError> {
+    let lengths: Vec<f64> = context
+        .lengths(alias)?
+        .iter()
+        .map(|length| *length as f64)
+        .collect();
+    extract::estimate(
         expected_rows,
-        &lengths_of(context, call)?,
-        &[],
-        &inputs,
+        &lengths,
+        shared,
+        inputs,
         chunk,
-        model,
-        device,
+        &context.model,
+        &context.device,
         context.gpus,
     )
-    .map_err(CompileError::new)?;
-    spec.estimated_seconds = cost.seconds;
-    spec.estimated_work = cost.work.values();
-    Ok(spec)
+    .map_err(CompileError::new)
 }
 
 /// A map's estimated cost over its documents.
@@ -199,35 +240,14 @@ pub fn map_cost(
     resident: bool,
     shared: &[f64],
 ) -> Result<extract::ExtractCost, CompileError> {
-    let lengths: Vec<f64> = context
-        .lengths(&spec.aliases[0])?
-        .iter()
-        .map(|length| *length as f64)
-        .collect();
-    let inputs = ExtractInputs {
-        head_tokens: spec.prompt_token_parts[0].len() as i64,
-        tail_tokens: spec.prompt_token_parts[1].len() as i64,
-        window: 0,
-        resident,
-        max_answer_tokens: spec.max_answer_tokens,
-        draft_tokens: 0,
-        draft_policy: "fixed".to_string(),
-        round_cost_per_token: 0.0,
-        answer_tokens: spec.expected_answer_tokens,
-        recurrent: false,
-    };
-    let model = &context.model;
-    extract::estimate(
+    answer_cost(
+        context,
+        &spec.aliases[0],
+        &map_inputs(spec, resident),
         expected_rows,
-        &lengths,
         shared,
-        &inputs,
-        chunk_budget(model, &context.device),
-        model,
-        &context.device,
-        context.gpus,
+        chunk_budget(&context.model, &context.device),
     )
-    .map_err(CompileError::new)
 }
 
 fn map_spec(

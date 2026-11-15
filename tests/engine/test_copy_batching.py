@@ -95,9 +95,9 @@ def sequential_constrain(self, group, projected, documents, indices):
     local = constraint.tensor(self.copy_document[slots])
     index = constraint.tensor(group.index[slots])
     limits = constraint.tensor(self.limits[self.map[slots]])
-    stream_width = int(group.widths[group.index[slots]].max())
-    streams = group.streams[index, :stream_width]
-    alive = group.alive[index, :stream_width]
+    answers = group.index[slots]
+    stream_width = int(group.widths[answers].max())
+    streams, alive = group.rows.read(answers, local, stream_width)
     num_streams = int(np.where(indices[first] == 0, stream_width,
                               self.num_streams[slots]).max())
     num_streams = max(1, num_streams)
@@ -132,10 +132,8 @@ def sequential_constrain(self, group, projected, documents, indices):
             out[selected[valid_index], 4 + self.copy_words:] = bits[valid_index]
         active &= writes & hit & (at + 1 < limits)
         source = following
-    group.alive[index, :stream_width] = False
-    group.alive[index, :num_streams] = alive
-    group.streams[index, :num_streams] = streams
-    group.widths[group.index[slots]] = num_streams
+    group.rows.write(answers, streams, alive)
+    group.widths[answers] = num_streams
     group.source[index] = source
     packed = constraint.packed_positions(streams, alive, local)
     out[:, 4:4 + constraint.mask_words] = packed[constraint.tensor(inverse)]
@@ -176,28 +174,38 @@ def check_long_draft_choices_and_state_match_sequential_verification(
     inputs = verifier_inputs(decoder, vocabulary, mixed=True)
     group = inputs[0]
     decoder.limits[::3] = 30
-    ranks = group.alive.to(torch.int64).cumsum(dim=1)
-    group.alive &= ranks <= (1 + torch.arange(len(group.alive)) % 3)[:, None]
-    decoder.num_streams[:] = group.alive.sum(dim=1).numpy()[group.index]
-    columns = torch.arange(group.alive.shape[1])
-    last = torch.where(group.alive, columns, 0).max(dim=1).values
-    group.source[1::2] = group.streams.gather(1, last[:, None]).squeeze(1)[1::2]
-    saved = (group.alive.clone(), group.streams.clone(), group.source.clone(),
+    constraint = group.constraint
+    answers = np.arange(len(group.widths))
+    local = constraint.tensor(decoder.copy_document[np.argsort(group.index)[answers]])
+    width = constraint.max_positions
+
+    def state():
+        return group.rows.read(answers, local, width)
+
+    streams, alive = state()
+    ranks = alive.to(torch.int64).cumsum(dim=1)
+    alive &= ranks <= (1 + torch.arange(len(alive)) % 3)[:, None]
+    group.rows.write(answers, streams, alive)
+    decoder.num_streams[:] = alive.sum(dim=1).numpy()[group.index]
+    columns = torch.arange(alive.shape[1])
+    last = torch.where(alive, columns, 0).max(dim=1).values
+    group.source[1::2] = streams.gather(1, last[:, None]).squeeze(1)[1::2]
+    saved = (alive.clone(), streams.clone(), group.source.clone(),
              group.widths.copy())
     expected = sequential_constrain(decoder, *inputs)
-    final = (group.alive.clone(), group.streams.clone(), group.source.clone())
-    group.alive.copy_(saved[0])
-    group.streams.copy_(saved[1])
+    final = (*reversed(state()), group.source.clone())
+    group.rows.write(answers, saved[1], saved[0])
     group.source.copy_(saved[2])
     group.widths[:] = saved[3]
     decoder.workspace_bytes = workspace_bytes
     actual = decoder._constrain(*inputs)
+    streams, alive = state()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    torch.testing.assert_close(group.alive, final[0], rtol=0, atol=0)
-    torch.testing.assert_close(group.streams[group.alive], final[1][final[0]],
+    torch.testing.assert_close(alive, final[0], rtol=0, atol=0)
+    torch.testing.assert_close(streams[alive], final[1][final[0]],
                                rtol=0, atol=0)
     torch.testing.assert_close(group.source, final[2], rtol=0, atol=0)
-    assert (group.widths >= group.alive.sum(dim=1).numpy()).all()
+    assert (group.widths >= alive.sum(dim=1).numpy()).all()
     assert (actual[:, 0] == -2).any()
     assert (actual[:, 0] >= 0).any()
 
@@ -214,3 +222,15 @@ def test_long_draft_choices_and_state_match_sequential_verification(
             check_long_draft_choices_and_state_match_sequential_verification,
             monkeypatch=monkeypatch, tmp_path=tmp_path, trace=trace,
             num_fields=num_fields, workspace_bytes=workspace_bytes)
+
+
+def test_an_ended_answer_returns_its_stream_row():
+    decoder, vocabulary = copy_batch(2, num_documents=4, document_tokens=6)
+    rows = decoder.copy_groups[0].rows
+    assert (rows.rows >= 0).all() and len(rows.streams) == 8
+    for _ in range(8):
+        if not (decoder.map >= 0).any():
+            break
+        continuation(decoder, vocabulary)
+    assert not (decoder.map >= 0).any()
+    assert (rows.rows == -1).all() and sorted(rows.unused) == list(range(8))

@@ -62,43 +62,65 @@ def kernel_index_cap(model: ModelSpec) -> int:
 
 def arena_pages(model: ModelSpec, device: DeviceSpec,
                 chunk_tokens: int | None = None,
-                mean_document_tokens: float | None = None) -> tuple[int, int]:
+                mean_document_tokens: float | None = None,
+                writes_answers: bool = True) -> tuple[int, int]:
     """Return the pages of the two KV pools: (every-token, sliding-layer).
+
+    Args:
+        model: The model spec.
+        device: The device spec.
+        chunk_tokens: The tokens per forward pass, or None for the
+            chunk budget.
+        mean_document_tokens: The mean document length, or None.
+        writes_answers: Whether the plan holds AI.MAP or AI.EXTRACT.
+            Only such a plan captures the CUDA graphs; any other plan
+            gives the graph memory to KV.
 
     Raises:
         ValueError: The pool cannot hold a chunk's KV.
     """
-    return budgets_of(model, device).arena_pages(chunk_tokens, mean_document_tokens)
+    return budgets_of(model, device).arena_pages(
+        chunk_tokens, mean_document_tokens, writes_answers)
 
 
 def arena_tokens(model: ModelSpec, device: DeviceSpec,
                  chunk_tokens: int | None = None,
-                 mean_document_tokens: float | None = None) -> int:
+                 mean_document_tokens: float | None = None,
+                 writes_answers: bool = True) -> int:
     """Return the tokens of document KV that can be resident at once."""
-    return budgets_of(model, device).arena_tokens(chunk_tokens, mean_document_tokens)
+    return budgets_of(model, device).arena_tokens(
+        chunk_tokens, mean_document_tokens, writes_answers)
 
 
-def arena_bytes(model: ModelSpec, device: DeviceSpec, chunk_tokens: int) -> float:
-    """Return the bytes left for KV after weights, activations, and graphs."""
-    return budgets_of(model, device).arena_bytes(chunk_tokens)
+def arena_bytes(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
+                writes_answers: bool = True) -> float:
+    """Return the bytes left for KV after weights and activations.
+
+    A plan that writes answers also leaves the CUDA graph memory.
+    """
+    return budgets_of(model, device).arena_bytes(chunk_tokens, writes_answers)
 
 
 def hybrid_arena_pages(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
-                       mean_document_tokens: float | None) -> int:
+                       mean_document_tokens: float | None,
+                       writes_answers: bool = True) -> int:
     """Return a hybrid model's arena KV pages."""
     return budgets_of(model, device).hybrid_arena_pages(
-        chunk_tokens, mean_document_tokens)
+        chunk_tokens, mean_document_tokens, writes_answers)
 
 
-def hybrid_pool_pages(model: ModelSpec, device: DeviceSpec, chunk_tokens: int) -> int:
+def hybrid_pool_pages(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
+                      writes_answers: bool = True) -> int:
     """Return the pages a hybrid model shares between KV and checkpoints."""
-    return budgets_of(model, device).hybrid_pool_pages(chunk_tokens)
+    return budgets_of(model, device).hybrid_pool_pages(
+        chunk_tokens, writes_answers)
 
 
 def checkpoint_slots(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
-                     kv_pages: int) -> int:
+                     kv_pages: int, writes_answers: bool = True) -> int:
     """Return the checkpoints the pool holds beside an arena of `kv_pages`."""
-    return budgets_of(model, device).checkpoint_slots(chunk_tokens, kv_pages)
+    return budgets_of(model, device).checkpoint_slots(
+        chunk_tokens, kv_pages, writes_answers)
 
 
 def checkpoint_pages(model: ModelSpec, page_tokens: int = PAGE_TOKENS) -> float:

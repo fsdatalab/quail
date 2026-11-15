@@ -58,27 +58,13 @@ def survival_rows(counts, events, prior, limits) -> np.ndarray:
     return _array(found, np.float64).reshape(counts.shape)
 
 
-def answer_survival(lengths, written, expected_tokens, limit) -> np.ndarray:
-    """Return S(t), the chance an answer runs past t tokens, t = 0..limit.
-
-    Args:
-        lengths: Each answer's length, -1 while it is being written.
-        written: The tokens each answer has written.
-        expected_tokens: The prior's mean answer length.
-        limit: The answer token limit.
-    """
-    return _array(_quail_native.answer_survival(
-        _int64(lengths), _int64(written), float(expected_tokens), int(limit)),
-        np.float64)
-
-
-def remaining_tokens(lengths, written, expected_tokens, limit, *,
-                     survival=None) -> np.ndarray:
+def remaining_tokens(survival) -> np.ndarray:
     """Return E[L - t | L > t], the expected tokens left after t, t = 0..limit.
 
     With S(u) = P(L > u) and S(limit) = 0, this is the sum of S(u) / S(t)
     over u = t..limit - 1.
+
+    Args:
+        survival: S(t), the chance an answer runs past t tokens, t = 0..limit.
     """
-    if survival is None:
-        survival = answer_survival(lengths, written, expected_tokens, limit)
     return _array(_quail_native.remaining_tokens(_float64(survival)), np.float64)
