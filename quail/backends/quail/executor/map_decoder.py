@@ -148,7 +148,10 @@ class MapDecoder:
             self._configure_copy(first, slots, documents, specs)
 
     def _configure_copy(self, first, slots, documents, specs):
-        from quail.backends.quail.executor.extract.copy import CopyConstraint
+        from quail.backends.quail.executor.extract.copy import (
+            CopyConstraint,
+            StreamRows,
+        )
         from quail.backends.quail.executor.readout import AsyncTopLogprobs
         from quail.common.draft_policy import LIVE_BUCKETS
 
@@ -162,14 +165,13 @@ class MapDecoder:
         self.copy_words = max(self.copy_words, constraint.mask_words)
         self.copy_trace_words = max(self.copy_trace_words, constraint.trace_width)
         self.copy_trace = constraint.trace or self.copy_trace
-        streams = constraint.stream_ids.repeat(len(specs), 1)
         index = np.zeros(len(self.map), dtype=np.int64)
         index[slots.flatten()] = np.arange(slots.size)
         group = SimpleNamespace(
             constraint=constraint, key=key,
             questions=np.arange(first, first + len(specs)), index=index,
-            streams=streams, alive=streams >= 0,
-            widths=np.full(slots.size, streams.shape[1], dtype=np.int64),
+            rows=StreamRows(constraint, slots.size),
+            widths=np.full(slots.size, constraint.max_positions, dtype=np.int64),
             source=self.torch.zeros(slots.size, dtype=self.torch.int64,
                                     device=self.device),
             masks=np.zeros((slots.size, constraint.mask_words), dtype=np.int64),
@@ -180,7 +182,7 @@ class MapDecoder:
         for q, spec in enumerate(specs):
             self.copy_document[slots[q]] = np.arange(len(documents.documents))
             self.copy_constraints[first + q] = SimpleNamespace(
-                constraint=constraint, spec=spec,
+                constraint=constraint, spec=spec, group=group,
                 sources=np.full(len(self.map), -1, dtype=np.int64),
                 masks=group.masks[q * slots.shape[1]:(q + 1) * slots.shape[1]],
                 trials=np.zeros(len(LIVE_BUCKETS)), accepts=np.zeros(len(LIVE_BUCKETS)),
@@ -583,8 +585,8 @@ class MapDecoder:
         local = constraint.tensor(self.copy_document[slots])
         index = constraint.tensor(group.index[slots])
         limits = constraint.tensor(self.limits[self.map[slots]])
-        streams = group.streams[index, :stream_width]
-        alive = group.alive[index, :stream_width]
+        answers = group.index[slots]
+        streams, alive = group.rows.read(answers, local, stream_width)
         if num_streams < stream_width:
             streams, alive = constraint.compact(streams, alive, num_streams)
         source = group.source[index]
@@ -611,10 +613,8 @@ class MapDecoder:
             if self.copy_trace is not None:
                 out[take[:, 0], 4 + self.copy_words:] = traces[take[:, 1], take[:, 2]]
             del values, traces
-        group.alive[index, :stream_width] = False
-        group.alive[index, :num_streams] = alive
-        group.streams[index, :num_streams] = streams
-        group.widths[group.index[slots]] = num_streams
+        group.rows.write(answers, streams, alive)
+        group.widths[answers] = num_streams
         group.source[index] = source
         packed = constraint.packed_positions(streams, alive, local)
         out[:, 4:4 + constraint.mask_words] = packed[constraint.tensor(inverse)]
@@ -681,6 +681,9 @@ class MapDecoder:
                 self._read_copy(q, documents[mine], indices[mine], values[mine])
         self.stopped[documents[stop]] = True
         self.map[documents[ended]] = -1
+        for group in self.copy_groups:
+            mine = documents[ended & np.isin(maps, group.questions)]
+            group.rows.release(group.index[mine])
         if self.ended_log is not None:
             self.ended_log.append(documents[ended])
         self.copy_pending[documents[ended]] = False
@@ -729,6 +732,9 @@ class MapDecoder:
                 self.lengths[q][slot] = length
                 self.stopped[slot] = True
                 self.map[slot] = -1
+                if q in self.copy_constraints:
+                    group = self.copy_constraints[q].group
+                    group.rows.release(group.index[[slot]])
                 self.copy_pending[slot] = False
                 if self.ended_log is not None:
                     self.ended_log.append(np.array([slot]))
