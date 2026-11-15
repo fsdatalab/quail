@@ -71,8 +71,8 @@ WHERE AI.IF(PROMPT('Is this receipt''s total over 100,000 rupiah? {0}', r.image)
 | 174,600: kept, `meal` | 230,000: kept, `bakery or snacks` | 91,000: not kept |
 
 You get answers for all 1,000 receipts in 100 seconds on one H100 with
-`qwen3.5-4b-bf16`, for $0.11, and the filter was right on 96.8% of the
-972 receipts with a labeled total. The query runs fast because
+`qwen3.5-4b-bf16`, for $0.11. The filter was right on 96.8% of the 972
+receipts with a labeled total. The query runs fast because
 `AI.CLASSIFY` reuses the KV that `AI.IF` already computed for each
 receipt.
 
@@ -96,8 +96,8 @@ session.register("files", quail.DocumentProvider.from_table(files, id_col="path"
 ### Ask about each page
 
 To ask about each page, turn each PDF into one row per page.
-`AI.PDF_PAGES` returns a list of a PDF's pages, each a PNG image, and
-the `UNNEST` function turns the list into rows. The query below finds
+`AI.PDF_PAGES` returns a list of a PDF's pages, each a PNG image. The
+`UNNEST` function turns the list into rows. The query below finds
 each contract page with a liability cap, a clause that limits how much
 one party can owe the other:
 
