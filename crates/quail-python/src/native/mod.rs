@@ -323,6 +323,27 @@ fn read_and_write_plan(text: &str) -> PyResult<String> {
         .map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
+/// The (width, height) a model reads an image at, as the planner counts
+/// its tokens: `token_pixels` along each side of a token, and from
+/// `min_pixels` to `max_pixels`.
+///
+/// Raises a ValueError when the bytes are not a PNG or a JPEG the model
+/// reads.
+#[pyfunction]
+fn image_size(
+    image: &[u8],
+    token_pixels: u32,
+    min_pixels: u64,
+    max_pixels: u64,
+) -> PyResult<(u32, u32)> {
+    let sizing = quail::ImageSizing {
+        token_pixels,
+        min_pixels,
+        max_pixels,
+    };
+    quail::image_size(image, sizing).map_err(|error| PyValueError::new_err(error.to_string()))
+}
+
 /// Bind one AI function call's prompt, as `PromptBinder.bind` does.
 ///
 /// Returns (the Prompt as JSON, None), or (None, the CompileError's message).
@@ -1220,6 +1241,7 @@ pub fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<cost::CostModel>()?;
     budgets::register(module)?;
     module.add_function(wrap_pyfunction!(explain_plan, module)?)?;
+    module.add_function(wrap_pyfunction!(image_size, module)?)?;
     module.add_function(wrap_pyfunction!(serve, module)?)?;
     module.add_function(wrap_pyfunction!(parse_expression, module)?)?;
     module.add_function(wrap_pyfunction!(model_answers, module)?)?;
@@ -1234,6 +1256,7 @@ pub fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module.add("SPAN_SUFFIX", shared::SPAN_SUFFIX)?;
         module.add("PROBABILITIES_SUFFIX", shared::PROBABILITIES_SUFFIX)?;
         module.add("NULL_DOCUMENT", shared::NULL_DOCUMENT)?;
+        module.add("IMAGE_TOKEN_BASE", shared::IMAGE_TOKEN_BASE)?;
         module.add("LABEL_PREFIX", shared::LABEL_PREFIX)?;
         module.add("DEFAULT_SELECTIVITY", shared::DEFAULT_SELECTIVITY)?;
         module.add("FIRST_WINDOW_CHARS", shared::FIRST_WINDOW_CHARS)?;

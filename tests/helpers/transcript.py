@@ -63,6 +63,21 @@ def _shown(answer) -> str:
     return repr(answer)
 
 
+def _unheld(text) -> str:
+    """How a transcript names a document no table holds.
+
+    A computed text is quoted; computed images, such as pages
+    AI.PDF_PAGES renders, are counted and named by a hash of their bytes.
+    """
+    if isinstance(text, bytes) and text.startswith((b"\x89PNG", b"\xff\xd8\xff")):
+        import hashlib
+
+        # a JPEG is one image; joined pages are one PNG per header
+        count = text.count(b"IHDR") if text.startswith(b"\x89PNG") else 1
+        return f"<{count} images {hashlib.sha256(text).hexdigest()[:8]}>"
+    return repr(text)
+
+
 def _plan_line(line: str) -> str:
     line = line.strip().removeprefix("AiNode: ")
     while (start := line.find('prompt(Utf8("')) >= 0:
@@ -119,10 +134,19 @@ class Transcripts:
             ids = table.column(id_column).to_pylist()
             self._rows.update(ids)
             for name in table.column_names:
-                if name != id_column and pa.types.is_string(
-                        table.schema.field(name).type):
-                    for row, text in zip(ids, table.column(name).to_pylist(),
-                                         strict=True):
+                kind = table.schema.field(name).type
+                # a text or image column holds documents
+                parts = pa.types.is_list(kind) and (
+                    pa.types.is_binary(kind.value_type)
+                    or pa.types.is_struct(kind.value_type))
+                if name != id_column and (pa.types.is_string(kind)
+                                          or pa.types.is_binary(kind) or parts):
+                    values = table.column(name).to_pylist()
+                    if parts:
+                        values = [None if found is None else b"".join(
+                            part["image"] if isinstance(part, dict) else part
+                            for part in found) for found in values]
+                    for row, text in zip(ids, values, strict=True):
                         if text is not None and row not in holders.get(text, []):
                             holders.setdefault(text, []).append(row)
         self._ids = {text: "/".join(map(str, rows))
@@ -179,10 +203,11 @@ class Transcripts:
         return max(found, key=len) if found else "?"
 
     def _truth(self, kind, question, texts):
-        if len(texts) == 1 and texts[0].startswith(PAIR_LAYOUT.format(0)):
+        if (len(texts) == 1 and isinstance(texts[0], str)
+                and texts[0].startswith(PAIR_LAYOUT.format(0))):
             # a pair asked as one document, by the run with every pushdown off
             texts = tuple(re.split(PAIR_LAYOUT.format(r"\d+"), texts[0])[1:])
-        rows = tuple(self._ids.get(text, repr(text)) for text in texts)
+        rows = tuple(self._ids.get(text, _unheld(text)) for text in texts)
         prompt = self._prompt(question)
         answer = self._answer(kind, prompt, rows)
         if kind in ("map", "extract"):

@@ -32,11 +32,16 @@ class Qwen35Pipeline(ModelPipeline):
     warm_row_classes = False
     warm_joins = False
     gemm_warmup = False
+    # the vision encoder, and the images the running region's documents
+    # hold (executor/images.py)
+    visual = None
+    images = None
 
     def __init__(self, model, arena, *, spec, kernels="quail",
                  engine_class=Engine):
         text = getattr(model, "language_model", model)
         self.spec = spec
+        self.visual = getattr(model, "visual", None)
         self.arena = arena
         # vLLM's norms and rotary dispatch read the current config
         self.vllm_config = getattr(model, "quail_vllm_config", None)
@@ -181,13 +186,20 @@ class Qwen35Pipeline(ModelPipeline):
             raise ValueError(
                 "a Qwen3.5 chunk needs its Gated DeltaNet phases; the "
                 "arena has no checkpoint slots")
-        hidden = self.embed(chunk.input_ids)
+        if self.images:
+            import torch
+
+            hidden = self.images.embed(torch, self.visual, chunk, self.embed)
+        else:
+            hidden = self.embed(chunk.input_ids)
+        rotary = getattr(chunk, "rotary", None)
+        positions = chunk.positions if rotary is None else rotary
         residual = None
         for index, layer in enumerate(self.layers):
             x, residual = self._norm(layer.input_layernorm, hidden, residual)
             # arena layers are indexed by model layer
             chunk.meta["layer"] = index
-            x = self._mixer(index, x, chunk.positions, chunk)
+            x = self._mixer(index, x, positions, chunk)
             x, residual = self._norm(layer.post_attention_layernorm, x,
                                      residual)
             hidden = self.feed_forwards[index](x)

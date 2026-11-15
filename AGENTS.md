@@ -163,8 +163,10 @@ enforces the words:
 # Scope
 
 - The AI functions are `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`,
-  `AI.EXTRACT`, `AI.EXTRACT_SPAN`, `AI.MAP`, and `AI.SAE_FEATURES`.
-  DataFusion runs every other part of a query.
+  `AI.EXTRACT`, `AI.EXTRACT_SPAN`, `AI.MAP`, `AI.SAE_FEATURES`,
+  `AI.PARSE_DOCUMENT`, `AI.PDF_PAGES`, and `AI.IMAGE`. DataFusion runs
+  every other part of a query, and runs `AI.PARSE_DOCUMENT`,
+  `AI.PDF_PAGES`, and `AI.IMAGE` itself, with no model.
 - `AI.MAP` writes open-ended text, up to a limit on answer tokens.
   Speculation and forking are out of scope.
 - The models and devices are the files in `quail/specs/data`. Each

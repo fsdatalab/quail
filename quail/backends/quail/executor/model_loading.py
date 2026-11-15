@@ -204,15 +204,16 @@ def keep_layers(torch, model, num_layers: int):
 
 def load_model(model_name: str, revision: str | None = None, *,
                answer_token_ids, max_batched_tokens=None,
-               moe_backend=None, text_only=False, num_layers=None,
-               quantize_fp8=False):
+               moe_backend=None, text_only=False, images=False,
+               num_layers=None, quantize_fp8=False):
     """Load model weights and retain the answer rows and the full output head.
 
     max_batched_tokens is the largest chunk the model will see. vLLM's
     fused MoE kernels size their scratch buffers from it; a dense model
     ignores it. moe_backend is passed through as vLLM's moe_backend
     setting (see ModelSpec.moe_backend); None lets vLLM pick. text_only
-    takes no image or video input, for a checkpoint with a vision tower.
+    takes no video input, for a checkpoint with a vision tower, and no
+    image input unless images is True, which loads its vision encoder.
     num_layers keeps only the first decoder layers after the load, for a
     spec that reads an intermediate layer's residual stream.
     quantize_fp8 quantizes a bf16 LFM3 checkpoint's linear weights to fp8
@@ -237,7 +238,7 @@ def load_model(model_name: str, revision: str | None = None, *,
         model = load_lfm3(model_path, quantize_fp8=quantize_fp8)
     else:
         model = _load_vllm_model(model_path, max_batched_tokens, moe_backend,
-                                 text_only)
+                                 text_only, images)
     if num_layers is not None:
         keep_layers(torch, model, num_layers)
     retain_answer_head(torch, model, answer_token_ids)
@@ -246,7 +247,8 @@ def load_model(model_name: str, revision: str | None = None, *,
     return model
 
 
-def _load_vllm_model(model_path, max_batched_tokens, moe_backend, text_only):
+def _load_vllm_model(model_path, max_batched_tokens, moe_backend, text_only,
+                     images=False):
     """Load a checkpoint through vLLM's model loader, with no engine."""
     import torch
     from vllm.config import set_current_vllm_config
@@ -265,7 +267,8 @@ def _load_vllm_model(model_path, max_batched_tokens, moe_backend, text_only):
     if moe_backend is not None:
         args["moe_backend"] = moe_backend
     if text_only:
-        args["limit_mm_per_prompt"] = {"image": 0, "video": 0}
+        # an image limit of 0 leaves the vision encoder out
+        args["limit_mm_per_prompt"] = {"image": int(images), "video": 0}
     config = EngineArgs(**args).create_engine_config()
     _install_single_rank_groups(torch)
     with set_current_vllm_config(config):

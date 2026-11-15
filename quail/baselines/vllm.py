@@ -107,21 +107,32 @@ def engine_environment(spec):
     """Scope vLLM's process selection to construction of one engine."""
     from vllm import envs
 
-    key = "VLLM_ENABLE_V1_MULTIPROCESSING"
-    previous = os.environ.get(key)
+    settings = {}
     # vLLM 0.26 reads process selection from the environment in LLM's
     # constructor, and caches what it read; its public LLM API has no
     # per-instance override
-    envs.disable_envs_cache()
     if spec.vision_tower or spec.canvas_tokens == 1:
-        os.environ[key] = "0"
+        settings["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    # an engine that takes images feeds embeddings, not token ids: a
+    # compiled graph saved for text alone loads and then fails, so it
+    # keeps its own cache. vLLM 0.29's V2 model runner fails in a Gated
+    # DeltaNet kernel while it captures such an engine's graphs
+    if spec.vision_tower and os.environ.get("QUAIL_VLLM_IMAGES"):
+        root = os.environ.get("VLLM_CACHE_ROOT",
+                              os.path.expanduser("~/.cache/vllm"))
+        settings["VLLM_CACHE_ROOT"] = root.rstrip("/") + "-images"
+        settings["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+    previous = {key: os.environ.get(key) for key in settings}
+    envs.disable_envs_cache()
+    os.environ.update(settings)
     try:
         yield
     finally:
-        if previous is None:
-            os.environ.pop(key, None)
-        else:
-            os.environ[key] = previous
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
         envs.disable_envs_cache()
 
 
@@ -197,9 +208,17 @@ def diffusion_kwargs(spec) -> dict:
 
 
 def text_only_kwargs(spec) -> dict:
-    """Turn off image and video inputs of a checkpoint with a vision tower."""
+    """Turn off video inputs of a checkpoint with a vision tower.
+
+    Image inputs stay off unless ``QUAIL_VLLM_IMAGES`` is set: an engine
+    that takes images profiles its vision encoder and reserves its cache,
+    and its image processor needs the checkpoint's own tokenizer.
+    """
     if not spec.vision_tower:
         return {}
+    if os.environ.get("QUAIL_VLLM_IMAGES"):
+        return {"limit_mm_per_prompt": {"image": 1, "video": 0},
+                "tokenizer_mode": "auto"}
     return {"limit_mm_per_prompt": {"image": 0, "video": 0}}
 
 
@@ -226,9 +245,22 @@ class VLLMClient:
     def __init__(self, llm, capacity: dict):
         self.llm = llm
         self.capacity = capacity
+        # the running region's ImagePrompts, when its documents are images
+        self.images = None
+
+    def _prompt(self, prompt):
+        return prompt if self.images is None else self.images.prompt(prompt)
+
+    def _render(self, prompt):
+        return self.llm._preprocess_cmpl_one(self._prompt(prompt))
+
+    def image_pad_id(self) -> int:
+        """The id of the model's ``<|image_pad|>`` token."""
+        return self.llm.get_tokenizer().convert_tokens_to_ids("<|image_pad|>")
 
     def generate(self, prompts, sampling_params, use_tqdm=False):
-        return self.llm.generate(prompts, sampling_params, use_tqdm=use_tqdm)
+        return self.llm.generate([self._prompt(prompt) for prompt in prompts],
+                                 sampling_params, use_tqdm=use_tqdm)
 
     def decode_params(self, max_tokens: int, stop=None):
         """Build sampling parameters for greedy text generation.
@@ -267,7 +299,7 @@ class VLLMClient:
             max_num_seqs=self.capacity["max_num_seqs"],
             body_texts=body_texts,
             question_texts=question_texts,
-            render_prompt=self.llm._preprocess_cmpl_one,
+            render_prompt=self._render,
         )
 
     def run_extract_fields(self, sampling_params, body_ids, tail_ids, *,
@@ -289,7 +321,7 @@ class VLLMClient:
             max_num_seqs=self.capacity["max_num_seqs"],
             body_texts=body_texts,
             tail_texts=tail_texts,
-            render_prompt=self.llm._preprocess_cmpl_one,
+            render_prompt=self._render,
         )
 
 

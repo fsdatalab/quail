@@ -29,6 +29,9 @@ pub const FIRST_DOCUMENT: &str = "__first_document";
 /// The column of a token store that holds each document's token ids.
 const TOKEN_IDS: &str = "__quail_token_ids";
 
+/// The value column that holds a scan's image documents.
+const IMAGES: &str = "__quail_images";
+
 /// What a region reads of one scan: its alias, its token store, and
 /// the columns of its rows.
 pub type Scanned = (String, Table, Table);
@@ -37,32 +40,63 @@ fn arrow_error(error: arrow::error::ArrowError) -> CompileError {
     CompileError::new(error.to_string())
 }
 
-/// One column of a table, as one array.
-fn column(table: &Table, name: &str) -> Result<Option<ArrayRef>, CompileError> {
+/// One column of a table as its chunks, one per batch, so a column of
+/// many images reaches the executor without a copy.
+type Chunks = Vec<ArrayRef>;
+
+/// One column of a table, as its chunks: one empty chunk for a table of
+/// no batches.
+fn column_chunks(table: &Table, name: &str) -> Option<Chunks> {
     let (schema, batches) = table;
-    let Ok(index) = schema.index_of(name) else {
-        return Ok(None);
-    };
-    let chunks: Vec<&dyn Array> = (batches.iter())
-        .map(|batch| batch.column(index).as_ref())
-        .collect();
-    if chunks.is_empty() {
-        return Ok(Some(arrow::array::new_empty_array(
-            schema.field(index).data_type(),
-        )));
-    }
-    concat(&chunks).map(Some).map_err(arrow_error)
+    let index = schema.index_of(name).ok()?;
+    Some(match batches.is_empty() {
+        true => vec![new_empty_array(schema.field(index).data_type())],
+        false => (batches.iter())
+            .map(|batch| Arc::clone(batch.column(index)))
+            .collect(),
+    })
 }
 
-fn table_of(columns: Vec<(String, ArrayRef)>) -> Result<Table, CompileError> {
+/// One column of a table, as one array, for a key that compares rows
+/// across batches.
+fn column(table: &Table, name: &str) -> Result<Option<ArrayRef>, CompileError> {
+    let Some(chunks) = column_chunks(table, name) else {
+        return Ok(None);
+    };
+    concat(&chunks.iter().map(AsRef::as_ref).collect::<Vec<_>>())
+        .map(Some)
+        .map_err(arrow_error)
+}
+
+/// One array split into chunks of `lengths` rows, without a copy.
+fn split(values: &ArrayRef, lengths: &[usize]) -> Chunks {
+    let mut offset = 0;
+    (lengths.iter())
+        .map(|length| {
+            let chunk = values.slice(offset, *length);
+            offset += length;
+            chunk
+        })
+        .collect()
+}
+
+/// A table of one batch per chunk; every column has the same chunks.
+fn table_of(columns: Vec<(String, Chunks)>) -> Result<Table, CompileError> {
     let fields: Vec<Field> = columns
         .iter()
-        .map(|(name, values)| Field::new(name, values.data_type().clone(), true))
+        .map(|(name, chunks)| Field::new(name, chunks[0].data_type().clone(), true))
         .collect();
     let schema = Arc::new(Schema::new(fields));
-    let arrays = columns.into_iter().map(|(_, values)| values).collect();
-    let batch = RecordBatch::try_new(Arc::clone(&schema), arrays).map_err(arrow_error)?;
-    Ok((schema, vec![batch]))
+    let num_batches = columns.first().map_or(1, |(_, chunks)| chunks.len());
+    let batches = (0..num_batches)
+        .map(|index| {
+            let arrays = (columns.iter())
+                .map(|(_, chunks)| Arc::clone(&chunks[index]))
+                .collect();
+            RecordBatch::try_new(Arc::clone(&schema), arrays).map_err(arrow_error)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((schema, batches))
 }
 
 /// Values as keys that group by numeric equality: a dictionary is
@@ -137,11 +171,11 @@ fn first_documents(
     )))
 }
 
-/// The text of a scan's documents, when the scan's columns hold every
-/// column the document reads.
-fn texts(document: &ScanColumn, columns: &Table) -> Result<Option<ArrayRef>, CompileError> {
+/// A scan's documents, evaluated over each batch of its columns, when
+/// the columns hold every column the document reads.
+fn document_values(document: &ScanColumn, columns: &Table) -> Result<Option<Chunks>, CompileError> {
     let expression = match document {
-        ScanColumn::Unnamed(name) => return column(columns, name),
+        ScanColumn::Unnamed(name) => return Ok(column_chunks(columns, name)),
         ScanColumn::Expression(expression) => expression,
     };
     let held = |name: &str| columns.0.index_of(name).is_ok();
@@ -152,12 +186,18 @@ fn texts(document: &ScanColumn, columns: &Table) -> Result<Option<ArrayRef>, Com
     let chunks = (columns.1.iter())
         .map(|batch| built.evaluate(batch, false))
         .collect::<Result<Vec<_>, _>>()?;
-    let chunks: Vec<&dyn Array> = chunks.iter().map(AsRef::as_ref).collect();
     // a scan of no rows has no batch, and its text is no rows
     if chunks.is_empty() {
-        return Ok(Some(new_empty_array(&DataType::Utf8)));
+        return Ok(Some(vec![new_empty_array(&DataType::Utf8)]));
     }
-    concat(&chunks).map(Some).map_err(arrow_error)
+    Ok(Some(chunks))
+}
+
+/// The text of a scan's documents, when the scan's columns hold every
+/// column the document reads; None for image documents.
+fn texts(document: &ScanColumn, columns: &Table) -> Result<Option<Chunks>, CompileError> {
+    Ok(document_values(document, columns)?
+        .filter(|chunks| !crate::images::holds_images(chunks[0].data_type())))
 }
 
 /// The tables a region's workers read, by name: `documents:<alias>`
@@ -217,18 +257,32 @@ pub fn request_tables(
         let rows = deduplicated.get(alias);
         let mut values = Vec::new();
         for name in names.into_iter().flatten() {
-            let found = column(columns, name)?
+            let found = column_chunks(columns, name)
                 .ok_or_else(|| CompileError::new(format!("no column {name}")))?;
             values.push((name.clone(), found));
         }
         if let Some(rows) = rows {
             let (_, tokens, _) = scanned(alias)?;
-            values.push((
-                FIRST_DOCUMENT.into(),
-                first_documents(tokens, columns, rows)?,
-            ));
+            let lengths: Vec<usize> = match columns.1.is_empty() {
+                true => vec![0],
+                false => columns.1.iter().map(RecordBatch::num_rows).collect(),
+            };
+            let first = first_documents(tokens, columns, rows)?;
+            values.push((FIRST_DOCUMENT.into(), split(&first, &lengths)));
         }
-        if let Some(absent) = column(columns, NULL_DOCUMENT)? {
+        // the executor reads an image document's pixels from the first
+        // binary column: the document's values, such as p.u['image']
+        let document = (operators.scans.iter()).find(|found| &found.alias == alias);
+        if let Some(images) = document
+            .map(|found| document_values(&found.column, columns))
+            .transpose()?
+            .flatten()
+            .filter(|found| crate::images::holds_images(found[0].data_type()))
+        {
+            values.retain(|(name, _)| name != IMAGES);
+            values.insert(0, (IMAGES.into(), images));
+        }
+        if let Some(absent) = column_chunks(columns, NULL_DOCUMENT) {
             values.push((NULL_DOCUMENT.into(), absent));
         }
         if names.is_some() || rows.is_some() || !values.is_empty() {

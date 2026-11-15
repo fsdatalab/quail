@@ -39,6 +39,28 @@ def question_text(token_ids) -> str:
     return found.decode() if isinstance(found, bytes) else found
 
 
+def _joined(parts) -> bytes:
+    """A document of parts' bytes: each part, or each page's image, joined."""
+    return b"".join(part["image"] if isinstance(part, dict) else part
+                    for part in parts)
+
+
+def _images(columns):
+    """A scan's image documents: its binary value column, or None."""
+    if columns is None:
+        return None
+    for index, field in enumerate(columns.schema):
+        if pa.types.is_binary(field.type) or pa.types.is_large_binary(field.type):
+            return columns.column(index)
+        if pa.types.is_list(field.type) and (
+                pa.types.is_binary(field.type.value_type)
+                or pa.types.is_struct(field.type.value_type)):
+            # a document of parts, or of pages, is its parts' bytes, joined
+            return [None if parts is None else _joined(parts)
+                    for parts in columns.column(index).to_pylist()]
+    return None
+
+
 class Oracle:
     """The planted truth a fake model answers from, and what it was asked.
 
@@ -120,7 +142,9 @@ class Oracle:
         for alias, document in zip(aliases, ids):
             text = self.texts[alias][int(document)]
             text = text.as_py() if hasattr(text, "as_py") else text
-            found.append("" if text is None else str(text))
+            # an image document is its bytes
+            found.append("" if text is None else
+                         text if isinstance(text, bytes) else str(text))
         return tuple(found)
 
     def _sources(self, aliases, ids) -> tuple:
@@ -311,8 +335,8 @@ def _serve(oracle, path, description=None, gpu_index=0, gpus=1):
             plan = payload["physical_plan"]
             # the oracle answers about the region's documents
             oracle.documents = payload["documents"]
-            oracle.texts = {alias: payload["texts"].get(alias)
-                            for alias in payload["documents"]}
+            oracle.texts = {alias: payload["texts"].get(alias, _images(
+                payload["columns"].get(alias))) for alias in payload["documents"]}
             oracle.source_rows = {alias: rows.to_pylist() for alias, rows
                                   in payload["source_rows"].items()}
             graph = graph_from_envelope(plan)

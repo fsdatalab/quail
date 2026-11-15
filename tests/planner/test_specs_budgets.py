@@ -84,7 +84,7 @@ def test_hybrid_budget_reserves_checkpoints_and_two_execution_chunks(
     from quail.backends.quail.worker import checkpoint_arena_args
     from quail.common.retention import retention_pages
 
-    model = replace(QWEN3_5_4B_BF16, w_mem_bytes=8_411_152_384)
+    model = replace(QWEN3_5_4B_BF16, w_mem_bytes=8_411_152_384, vision_mem_bytes=0.0)
     chunk = budgets.chunk_budget(model, H100_SXM)
     assert chunk == 116_508
     assert model.checkpoint_bytes == 51_511_296
@@ -112,6 +112,15 @@ def test_hybrid_budget_reserves_checkpoints_and_two_execution_chunks(
         budgets.hybrid_arena_pages(model, H100_SXM, chunk, 1e7)
 
 
+def test_a_vision_tower_takes_its_bytes_out_of_the_kv_pool():
+    text = replace(QWEN3_5_4B_BF16, vision_mem_bytes=0.0)
+    chunk = budgets.chunk_budget(text, H100_SXM)
+    pages = budgets.hybrid_pool_pages(text, H100_SXM, chunk)
+    vision = budgets.hybrid_pool_pages(QWEN3_5_4B_BF16, H100_SXM, chunk)
+    taken = QWEN3_5_4B_BF16.vision_mem_bytes / (16 * text.kappa)
+    assert pages - vision == pytest.approx(taken, abs=1)
+
+
 def test_a_plan_without_an_answer_writer_gives_the_graph_memory_to_kv():
     for model in (QWEN3_4B_FP8, QWEN3_5_4B_BF16):
         chunk = budgets.chunk_budget(model, H100_SXM)
@@ -131,7 +140,8 @@ def test_a_plan_without_an_answer_writer_gives_the_graph_memory_to_kv():
 
     # a hybrid model's pool grows by the reserve's 2,560 pages, and the
     # worker counts its checkpoint slots from the same pool
-    model = replace(QWEN3_5_4B_BF16, w_mem_bytes=8_411_152_384)
+    # without the vision tower's reserve, which another test checks
+    model = replace(QWEN3_5_4B_BF16, w_mem_bytes=8_411_152_384, vision_mem_bytes=0.0)
     chunk = budgets.chunk_budget(model, H100_SXM)
     assert budgets.hybrid_pool_pages(model, H100_SXM, chunk) == 65_500
     assert budgets.hybrid_pool_pages(

@@ -6,7 +6,11 @@ import numpy as np
 import pyarrow as pa
 from pyarrow import compute as pc
 
-from quail.backends.quail.executor.model_operator import SingleNodeOperator
+from quail.backends.quail.executor.model_operator import (
+    SingleNodeOperator,
+    join_prior_rows,
+    prior_inputs,
+)
 from quail.backends.quail.executor.stages import Stage, filter_stages
 from quail.common.expressions import accepts
 from quail.common.pairs import COPIES, columns_key
@@ -31,8 +35,14 @@ class FilterOperator(SingleNodeOperator):
     def build(cls, region, nodes, chain):
         """Build one filter over the chain's documents."""
         query = region.query
-        return cls(nodes[0], region.document_ids(), query.async_answers,
-                   len(query.loaded_model.pipeline.canvas_ids))
+        node = nodes[0]
+        found = cls(node, region.document_ids(), query.async_answers,
+                    len(query.loaded_model.pipeline.canvas_ids))
+        if getattr(node, "answer", None) is not None:
+            # a filter that keeps every row carries the columns before it
+            found.priors, found.prior_tables = prior_inputs(
+                node, chain, region.node_inputs(node))
+        return found
 
     @classmethod
     def alone(cls, region, operators, table, settings):
@@ -63,6 +73,7 @@ class FilterOperator(SingleNodeOperator):
         self._keep_answer()
         self.answers = {}
         self.finished = []      # (document, passed) settled since the last take
+        self.priors, self.prior_tables = [], []
 
     @staticmethod
     def prepare_group(operators):
@@ -75,8 +86,14 @@ class FilterOperator(SingleNodeOperator):
             operator._keep_answer()
 
     def _keep_answer(self):
-        """Advance a document on the answer the filter keeps: no when negated."""
-        if self.node.negated:
+        """Advance a document on the answer the filter keeps: no when negated.
+
+        A filter that returns its answer keeps every document, so the next
+        operator asks about each from the same KV.
+        """
+        if getattr(self.node, "answer", None) is not None:
+            self.stages[0].decide = lambda _, row: True
+        elif self.node.negated:
             self.stages[0].decide = lambda _, row: not any(row)
 
     def settle(self, document, survived, row):
@@ -91,6 +108,9 @@ class FilterOperator(SingleNodeOperator):
         of the filter's rows port.
         """
         finished, self.finished = self.finished, []
+        # a filter's answer column is whole only once every document settled
+        if getattr(self.node, "answer", None) is not None:
+            return []
         sink = answer_sink()
         if sink is not None and finished:
             sink({"kind": "filter", "node": self.node.node_id,
@@ -112,10 +132,23 @@ class FilterOperator(SingleNodeOperator):
                                     + self.canvas_tokens)
 
     def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
-        return filter_result(
+        found = filter_result(
             self.node, self.answers, tokens, self.ids, gpu_s=gpu_s,
             chunks=chunks, borrowed_tokens=stats.get("borrowed_tokens", 0),
             pack_s=stats.get("pack_s", 0.0))
+        if getattr(self.node, "answer", None) is None:
+            return found
+        # every document asked, with its answer, after the columns before it
+        alias = self.node.alias
+        local = np.fromiter(self.answers, dtype=np.int64, count=len(self.answers))
+        positions = np.asarray(self.ids, dtype=np.int64)[local]
+        order = np.argsort(positions, kind="stable")
+        values = np.fromiter((bool(row[0]) for row in self.answers.values()),
+                             dtype=bool, count=len(self.answers))[order]
+        rows = Rows({alias: arrow_ids(positions[order])}).with_column(
+            self.node.answer, pa.array(values, pa.bool_()))
+        rows = join_prior_rows(rows, alias, self.priors, self.prior_tables)
+        return NodeResult({**found.outputs, f"rows:{alias}": rows}, found.metrics)
 
 
 class ConditionGate(SingleNodeOperator):

@@ -140,7 +140,8 @@ class GenericRunner:
                     inputs[member.node_id] = present_join_inputs(
                         member, inputs[member.node_id], context)
                 # a guarded node runs in a pipeline of its own
-                guard = guarded(node, inputs[node.node_id], context)
+                guard = guarded(node, inputs[node.node_id], context,
+                                runtime_answers=True)
                 if guard is not None:
                     inputs[node.node_id] = guard.inputs(inputs[node.node_id])
                 deduplicated = deduplicate(graph, pipeline, inputs, context)

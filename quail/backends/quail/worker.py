@@ -75,12 +75,16 @@ class LoadedGpu:
                                 max_batched_tokens=budget,
                                 moe_backend=spec.moe_backend,
                                 text_only=spec.vision_tower,
+                                images=(spec.vision_tower
+                                        and not spec.checkpoint_layers),
                                 num_layers=(spec.layers if spec.checkpoint_layers
                                             else None),
                                 quantize_fp8=(spec.arch == "lfm3"
                                               and spec.weight_precision == "fp8"))
         self.load_model_s = time.perf_counter() - t0
         self.weights_bytes = int(torch.cuda.memory_allocated())
+        say(f"loaded {self.weights_bytes / 2**30:.2f} GiB of weights in "
+            f"{self.load_model_s:.1f} s")
 
         # cuBLAS allocates its handle outside PyTorch's caching allocator.
         # At the warm-up peak the allocator holds every free byte, so

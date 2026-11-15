@@ -7,6 +7,8 @@ const config = {
   reactStrictMode: true,
   output: 'export',
   basePath: '/quail',
+  // a static host has no image optimizer, so pages link each image file
+  images: { unoptimized: true },
 };
 
 export default withMDX(config);

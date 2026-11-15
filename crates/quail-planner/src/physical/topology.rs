@@ -535,12 +535,14 @@ impl PhysicalNode {
     }
 
     /// Whether the executor runs the node in a pipeline of its own: a
-    /// node with a guard, an AI filter of an OR, or an AI filter that
-    /// returns its answer.
+    /// node with a guard, an AI filter with an alternative, or an AI
+    /// filter of an OR.
     pub fn runs_alone(&self) -> bool {
         let ored = matches!(self, PhysicalNode::AiFilter(node)
             if node.attributes.disjunction.is_some());
-        self.guard().is_some() || self.alternative().is_some() || self.answer().is_some() || ored
+        // an AI filter that returns its answer keeps every row, so the next
+        // node asks about each document from the same KV
+        self.guard().is_some() || self.alternative().is_some() || ored
     }
 
     /// The column an AI filter that keeps every row adds with its

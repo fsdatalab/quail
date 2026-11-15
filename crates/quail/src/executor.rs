@@ -1221,7 +1221,7 @@ fn with_region_id(payload: String, id: Option<usize>) -> Result<String> {
 fn source_lookup(
     input: &datafusion::logical_expr::LogicalPlan,
     batches: &[RecordBatch],
-) -> Result<Option<(RecordBatch, datafusion::arrow::array::UInt64Array)>> {
+) -> Result<Option<datafusion::arrow::array::UInt64Array>> {
     use datafusion::arrow::datatypes::DataType;
     use datafusion::common::Constraint;
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
@@ -1259,8 +1259,7 @@ fn source_lookup(
     let Some(first) = batches.first() else {
         return Ok(None);
     };
-    let rows = concat_batches(&first.schema(), batches)?;
-    let Ok(column) = rows.schema().index_of(&key) else {
+    let Ok(column) = first.schema().index_of(&key) else {
         return Ok(None);
     };
     let texts = |values: &ArrayRef| -> Result<Vec<Option<String>>> {
@@ -1287,11 +1286,17 @@ fn source_lookup(
             next += 1;
         }
     }
-    let found = texts(rows.column(column))?
-        .into_iter()
-        .map(|value| value.and_then(|value| positions.get(&value).copied()))
-        .collect();
-    Ok(Some((rows, found)))
+    // each batch's keys in turn, without joining the batches' other
+    // columns, which may hold gigabytes of images
+    let mut found = Vec::new();
+    for batch in batches {
+        found.extend(
+            texts(batch.column(column))?
+                .into_iter()
+                .map(|value| value.and_then(|value| positions.get(&value).copied())),
+        );
+    }
+    Ok(Some(found.into()))
 }
 
 /// An input's rows in the order of the registered table it holds rows of,
@@ -1303,13 +1308,52 @@ fn in_source_order(
     input: &datafusion::logical_expr::LogicalPlan,
     batches: &[RecordBatch],
 ) -> Result<Vec<RecordBatch>> {
-    use datafusion::arrow::compute::{sort_to_indices, take_record_batch};
-    let Some((rows, found)) = source_lookup(input, batches)? else {
+    use datafusion::arrow::compute::sort_to_indices;
+    let Some(found) = source_lookup(input, batches)? else {
         return Ok(batches.to_vec());
     };
     let order = sort_to_indices(&found, None, None)?;
-    Ok(vec![take_record_batch(&rows, &order)?])
+    ordered_batches(batches, order.values(), ORDERED_BATCH_BYTES)
 }
+
+/// The rows of `batches` in `order`, each row named by its row of all the
+/// batches, as batches of at most `max_bytes` each, so no column's
+/// offsets overflow however many images the batches hold.
+fn ordered_batches(
+    batches: &[RecordBatch],
+    order: &[u32],
+    max_bytes: usize,
+) -> Result<Vec<RecordBatch>> {
+    use datafusion::arrow::compute::interleave_record_batch;
+    // each row's batch and its row in the batch, by its row of all batches
+    let places: Vec<(usize, usize)> = (batches.iter().enumerate())
+        .flat_map(|(index, batch)| (0..batch.num_rows()).map(move |row| (index, row)))
+        .collect();
+    let row_bytes: Vec<usize> = (batches.iter())
+        .map(|batch| batch.get_array_memory_size() / batch.num_rows().max(1))
+        .collect();
+    let batches: Vec<&RecordBatch> = batches.iter().collect();
+    let mut ordered = Vec::new();
+    let mut group: Vec<(usize, usize)> = Vec::new();
+    let mut bytes = 0;
+    for position in order {
+        let place = places[*position as usize];
+        if !group.is_empty() && bytes + row_bytes[place.0] > max_bytes {
+            ordered.push(interleave_record_batch(&batches, &group)?);
+            group.clear();
+            bytes = 0;
+        }
+        group.push(place);
+        bytes += row_bytes[place.0];
+    }
+    if !group.is_empty() || ordered.is_empty() {
+        ordered.push(interleave_record_batch(&batches, &group)?);
+    }
+    Ok(ordered)
+}
+
+/// The most bytes of one batch [`in_source_order`] writes.
+const ORDERED_BATCH_BYTES: usize = 1 << 30;
 
 /// Each row's position in the registered table, for an input named
 /// `<table>@<alias>` that holds some of a registered table's rows; None
@@ -1322,7 +1366,7 @@ fn source_positions(
     if !name.contains(quail_planner::operators::INPUT_SEPARATOR) {
         return Ok(None);
     }
-    Ok(source_lookup(input, batches)?.map(|(_, found)| {
+    Ok(source_lookup(input, batches)?.map(|found| {
         (found.iter())
             .map(|position| position.map_or(-1, |position| position as i32))
             .collect()
@@ -1564,6 +1608,49 @@ impl TableProvider for ScannedTable {
 mod tests {
     use super::*;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+    #[test]
+    fn rows_in_source_order_split_into_batches_of_at_most_the_byte_limit() {
+        use datafusion::arrow::array::{AsArray, BinaryArray, Int32Array};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("image", DataType::Binary, false),
+        ]));
+        let batch = |ids: &[i32]| {
+            let images: Vec<Vec<u8>> = ids.iter().map(|id| vec![*id as u8; 100]).collect();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int32Array::from(ids.to_vec())),
+                    Arc::new(BinaryArray::from_iter_values(images)),
+                ],
+            )
+            .unwrap()
+        };
+        let batches = [batch(&[2, 0]), batch(&[3, 1])];
+        // rows 1, 3, 0, 2 of all batches hold ids 0, 1, 2, 3
+        let ordered = ordered_batches(&batches, &[1, 3, 0, 2], 300).unwrap();
+        assert!(ordered.len() > 1, "{} batches", ordered.len());
+        let ids: Vec<i32> = (ordered.iter())
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<datafusion::arrow::datatypes::Int32Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(ids, [0, 1, 2, 3]);
+        let images: Vec<u8> = (ordered.iter())
+            .flat_map(|batch| {
+                (batch.column(1).as_binary::<i32>().iter())
+                    .map(|image| image.unwrap()[0])
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(images, [0, 1, 2, 3]);
+    }
 
     #[test]
     fn a_worker_boots_with_the_plans_arena_and_whether_the_plan_writes_answers() {

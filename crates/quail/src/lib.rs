@@ -32,6 +32,7 @@ use quail_dylib as _;
 
 mod executor;
 pub mod finished;
+mod images;
 pub mod planning;
 pub mod region_run;
 pub mod report;
@@ -62,6 +63,8 @@ use crate::executor::RegionCall;
 pub use quail_datafusion as extension;
 /// The planner of one model region.
 pub use quail_planner as planner;
+
+pub use crate::images::{ImageSizing, image_size};
 
 pub use crate::executor::{
     EngineRegion, Executor, InputHint, Observer, RegionEngine, RegionEvent, RegionRan, RegionSink,

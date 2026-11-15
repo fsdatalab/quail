@@ -1,0 +1,268 @@
+"""Image documents: AI functions over a binary column of PNG page images.
+
+Each transcript test holds its expected transcript: the plan's AI
+operators, the questions the model answered, and the rows
+(helpers/transcript.py).
+"""
+
+import io
+
+import pyarrow as pa
+import pytest
+from helpers.images import jpeg, png
+from helpers.oracle import Oracle, oracle_executor
+from helpers.sessions import CONFIG, TOKENIZER
+from helpers.transcript import Transcripts, assert_transcript
+from PIL import Image as PILImage
+
+import quail
+from quail.api.config import EngineConfig
+
+VISION = EngineConfig(model="qwen3.5-4b-fp8", device="h100-sxm")
+# p1 and p3 hold the same image
+PAGES = pa.table({
+    "id": ["p1", "p2", "p3"],
+    "page": [1, 2, 1],
+    "image": pa.array([png(64, 96, 10), png(96, 64, 200), png(64, 96, 10)],
+                      pa.binary()),
+})
+
+
+def _answer(kind, prompt, rows):
+    """The model's answers: every page but p2 is a lease."""
+    if kind == "filter":
+        return rows[0] != "p2"
+    return "invoice" if rows[0] == "p2" else "lease"
+
+
+def _transcript(*queries, tables=None) -> str:
+    with Transcripts(tables or {"pages": PAGES}, _answer, config=VISION) as runs:
+        return "\n".join(runs.query(sql) for sql in queries)
+
+
+def test_a_filter_asks_about_each_distinct_page_image_once():
+    assert_transcript(_transcript(
+        "SELECT p.id FROM pages p "
+        "WHERE AI.IF(PROMPT('Is this page a lease? {0}', p.image))"), """\
+--- SELECT p.id FROM pages p WHERE AI.IF(PROMPT('Is this page a lease? {0}', p.image))
+    ---
+plan
+  __quail_answer_1 = ai_filter('Is this page a lease? {0}', p.image), filter:
+      __quail_answer_1, returns: []
+asked 2 of 3
+  'Is this page a lease? {0}': p1/p3 TRUE, p2 FALSE
+rows 2
+  p1
+  p3
+""")
+
+
+def test_a_classification_reads_page_images_that_pass_a_filter():
+    assert_transcript(_transcript(
+        "SELECT p.id, AI.CLASSIFY(p.image, ['lease', 'invoice']) AS kind "
+        "FROM pages p WHERE p.page = 1"), """\
+--- SELECT p.id, AI.CLASSIFY(p.image, ['lease', 'invoice']) AS kind FROM pages p WHERE
+    p.page = 1 ---
+plan
+  kind = ai_classify(p.image, make_array('lease', 'invoice'))
+asked 1 of 2
+  '?': p1/p3 'lease'
+rows 2
+  p1, 'lease'
+  p3, 'lease'
+""")
+
+
+def _context(config, table):
+    session = quail.Session(config, tokenizer=TOKENIZER)
+    oracle = Oracle()
+    oracle.catalog = session.catalog
+    context = quail.SessionContext(session, physical_executor=oracle_executor(oracle))
+    context.register("pages", quail.DocumentProvider.from_table(table, id_col="id"))
+    return session, context
+
+
+@pytest.mark.parametrize(("image", "message"), [
+    (png(32, 32 * 201), "at most 200 times its other side"),
+    (b"GIF89a, not a png", "must be a PNG or a JPEG"),
+])
+def test_an_image_quail_cannot_read_is_refused(image, message):
+    table = pa.table({"id": ["p1"], "image": pa.array([image], pa.binary())})
+    session, context = _context(VISION, table)
+    with session, pytest.raises(RuntimeError, match=message):
+        context.sql("SELECT p.id FROM pages p "
+                    "WHERE AI.IF(PROMPT('Is this page a lease? {0}', p.image))")
+
+
+def test_a_model_without_a_vision_tower_refuses_an_image():
+    session, context = _context(CONFIG, PAGES)
+    with session, pytest.raises(RuntimeError, match="reads no images"):
+        context.sql("SELECT p.id FROM pages p "
+                    "WHERE AI.IF(PROMPT('Is this page a lease? {0}', p.image))")
+
+
+def test_a_model_that_loads_part_of_its_checkpoint_refuses_an_image():
+    # the SAE spec loads 12 of its checkpoint's 24 layers and no vision tower
+    sae = EngineConfig(model="qwen3.5-2b-sae-bf16", device="h100-sxm")
+    session, context = _context(sae, PAGES)
+    with session, pytest.raises(RuntimeError, match="reads no images"):
+        context.sql("SELECT p.id FROM pages p "
+                    "WHERE AI.IF(PROMPT('Is this page a lease? {0}', p.image))")
+
+
+def test_an_extraction_from_an_image_is_refused():
+    session, context = _context(VISION, PAGES)
+    with session, pytest.raises(RuntimeError, match="an image has none"):
+        context.sql("SELECT p.id, AI.EXTRACT(p.image, {'date': 'When does it start?'}) "
+                    "AS e FROM pages p")
+
+
+def test_projected_questions_about_a_page_share_one_pipeline():
+    session, _ = _context(VISION, PAGES)
+    with session:
+        query = session.sql(
+            "SELECT p.id, AI.IF(PROMPT('Is this page a lease? {0}', p.image)) "
+            "AS lease, AI.IF(PROMPT('Is this page signed? {0}', p.image)) AS signed "
+            "FROM pages p")
+        pipelines = query.regions()[0].plan().graph.pipelines()
+    assert len({tuple(node.node_id for node in members)
+                for members in pipelines.values()}) == 1
+
+
+def test_projected_questions_answer_every_page():
+    assert_transcript(_transcript(
+        "SELECT p.id, AI.IF(PROMPT('Is this page a lease? {0}', p.image)) AS lease, "
+        "AI.IF(PROMPT('Is this page signed? {0}', p.image)) AS signed FROM pages p"),
+        """\
+--- SELECT p.id, AI.IF(PROMPT('Is this page a lease? {0}', p.image)) AS lease,
+    AI.IF(PROMPT('Is this page signed? {0}', p.image)) AS signed FROM pages p ---
+plan
+  signed = ai_filter('Is this page signed? {0}', p.image)
+  lease = ai_filter('Is this page a lease? {0}', p.image)
+asked 4 of 6
+  'Is this page a lease? {0}': p1/p3 TRUE, p2 FALSE
+  'Is this page signed? {0}': p1/p3 TRUE, p2 FALSE
+rows 3
+  p1, TRUE, TRUE
+  p2, FALSE, FALSE
+  p3, TRUE, TRUE
+""")
+
+
+def test_a_map_reads_a_document_of_page_images_and_text():
+    questions = pa.table({
+        "id": ["q1", "q2"],
+        "parts": pa.array([[png(64, 96, 10), b"How long is the lease?"],
+                           [png(64, 96, 10), png(96, 64, 200), b"Who signed it?"]],
+                          pa.list_(pa.binary())),
+    })
+    assert_transcript(_transcript(
+        "SELECT q.id, AI.MAP(q.parts, 'Answer.', 16) AS answer FROM questions q",
+        tables={"questions": questions}), """\
+--- SELECT q.id, AI.MAP(q.parts, 'Answer.', 16) AS answer FROM questions q ---
+plan
+  answer = ai_map(q.parts, 'Answer.', Int64(16))
+asked 2 of 2
+  'Answer.': q1 'lease', q2 'lease'
+rows 2
+  q1, 'lease'
+  q2, 'lease'
+""")
+
+
+def test_a_classification_reads_the_first_pages_of_each_pdf():
+    from helpers.pdfs import pdf
+
+    files = pa.table({"id": ["f1", "f2"], "pdf": pa.array([
+        pdf("Lease agreement.", "Rent terms.", "Signatures."),
+        pdf("Invoice.", "Line items.")], pa.binary())})
+    assert_transcript(_transcript(
+        "SELECT f.id, AI.CLASSIFY(AI.PDF_PAGES(f.pdf, 64, 1, 2), "
+        "['lease', 'invoice']) AS kind FROM files f",
+        tables={"files": files}), """\
+--- SELECT f.id, AI.CLASSIFY(AI.PDF_PAGES(f.pdf, 64, 1, 2), ['lease', 'invoice']) AS
+    kind FROM files f ---
+plan
+  kind = ai_classify(f.__quail_expr_0 AS
+      AI.PDF_PAGES(f.pdf,Int64(64),Int64(1),Int64(2)), make_array('lease', 'invoice'))
+asked 2 of 2
+  '?': <2 images 56b42290> 'lease', <2 images 8f102318> 'lease'
+rows 2
+  f1, 'lease'
+  f2, 'lease'
+""")
+
+
+def test_a_question_reads_each_page_of_an_unnest():
+    from helpers.pdfs import pdf
+
+    files = pa.table({"id": ["f1", "f2"], "pdf": pa.array([
+        pdf("Lease agreement.", "Rent terms."), pdf("Invoice.")], pa.binary())})
+    assert_transcript(_transcript(
+        "SELECT p.id, p.u['page'] AS page FROM (SELECT f.id, "
+        "UNNEST(AI.PDF_PAGES(f.pdf, 64)) AS u FROM files f) p "
+        "WHERE AI.IF(PROMPT('Is this page a lease? {0}', p.u['image']))",
+        tables={"files": files}), """\
+--- SELECT p.id, p.u['page'] AS page FROM (SELECT f.id, UNNEST(AI.PDF_PAGES(f.pdf, 64))
+    AS u FROM files f) p WHERE AI.IF(PROMPT('Is this page a lease? {0}', p.u['image']))
+    ---
+plan
+  __quail_answer_1 = ai_filter('Is this page a lease? {0}', get_field(p.u, 'image')),
+      filter: __quail_answer_1, returns: []
+asked 3 of 3
+  'Is this page a lease? {0}': <1 images 107f1fde> TRUE, <1 images d1934d8c> TRUE, <1
+      images fc0237ea> TRUE
+rows 3
+  f1, 1
+  f1, 2
+  f2, 1
+""")
+
+
+def test_a_jpeg_and_a_png_of_any_size_are_image_documents():
+    photos = pa.table({"id": ["p1", "p2"], "image": pa.array(
+        [jpeg(100, 75), png(60, 96, 10)], pa.binary())})
+    assert_transcript(_transcript(
+        "SELECT p.id FROM photos p "
+        "WHERE AI.IF(PROMPT('Is this a lease? {0}', p.image))",
+        tables={"photos": photos}), """\
+--- SELECT p.id FROM photos p WHERE AI.IF(PROMPT('Is this a lease? {0}', p.image)) ---
+plan
+  __quail_answer_1 = ai_filter('Is this a lease? {0}', p.image), filter:
+      __quail_answer_1, returns: []
+asked 2 of 2
+  'Is this a lease? {0}': p1 TRUE, p2 FALSE
+rows 1
+  p1
+""")
+
+
+def test_ai_image_shrinks_a_photo_to_its_longest_edge():
+    photos = pa.table({"id": ["p1", "p2"], "image": pa.array(
+        [jpeg(1000, 750), png(300, 200)], pa.binary())})
+    session, context = _context(VISION, photos)
+    with session:
+        table = context.sql("SELECT p.id, AI.IMAGE(p.image, 512) AS small FROM pages p "
+                            "ORDER BY p.id")
+    sizes = [PILImage.open(io.BytesIO(image)).size
+             for image in table.column("small").to_pylist()]
+    # the photo shrinks; the small image keeps its size
+    assert sizes == [(512, 384), (300, 200)]
+
+
+def test_a_question_reads_a_shrunk_photo():
+    photos = pa.table({"id": ["p1"], "image": pa.array([jpeg(1000, 750)], pa.binary())})
+    assert_transcript(_transcript(
+        "SELECT p.id FROM photos p "
+        "WHERE AI.IF(PROMPT('Is this a lease? {0}', AI.IMAGE(p.image, 512)))",
+        tables={"photos": photos}), """\
+--- SELECT p.id FROM photos p WHERE AI.IF(PROMPT('Is this a lease? {0}',
+    AI.IMAGE(p.image, 512))) ---
+plan
+  __quail_answer_1 = ai_filter('Is this a lease? {0}', p.__quail_expr_0), filter:
+      __quail_answer_1, returns: []
+asked 1 of 1
+  'Is this a lease? {0}': <1 images bb6fdb89> TRUE
+rows 1
+  p1
+""")

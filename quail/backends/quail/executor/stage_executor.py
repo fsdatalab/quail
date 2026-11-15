@@ -70,7 +70,14 @@ def forward_chunk(pipeline, arena, chunk):
     temporaries whether the pass returns or raises.
     """
     try:
-        if pipeline.piecewise_graphs is not None:
+        images = getattr(pipeline, "images", None)
+        if images:
+            chunk.rotary = images.rotary_positions(
+                chunk, getattr(arena, "answer_keys", ()))
+        # a graph embeds token ids from the vocabulary only
+        rotary = getattr(chunk, "rotary", None)
+        if (pipeline.piecewise_graphs is not None
+                and (rotary is None or rotary.dim() == 1)):
             out = pipeline.piecewise_graphs.forward(chunk)
         else:
             out = pipeline.forward_chunk(chunk)

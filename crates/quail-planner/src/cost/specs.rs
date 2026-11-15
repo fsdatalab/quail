@@ -176,6 +176,23 @@ pub struct ModelSpec {
     pub layer_kinds: Vec<String>,
     #[serde(default)]
     pub vision_tower: bool,
+    /// Bytes the vision tower takes beside the text weights: its weights,
+    /// its encoder calls' activations, and a chunk's image embeddings.
+    #[serde(default)]
+    pub vision_mem_bytes: f64,
+    /// The image processor's patch side in pixels, its patches merged
+    /// along each side of one image token, and the fewest and most pixels
+    /// it reads an image at (`patch_size`, `merge_size`,
+    /// `size.shortest_edge`, and `size.longest_edge` in a checkpoint's
+    /// preprocessor_config.json).
+    #[serde(default)]
+    pub image_patch_pixels: i64,
+    #[serde(default)]
+    pub image_merge: i64,
+    #[serde(default)]
+    pub image_min_pixels: i64,
+    #[serde(default)]
+    pub image_max_pixels: i64,
     #[serde(default)]
     pub max_num_seqs: i64,
     #[serde(default)]
@@ -387,7 +404,7 @@ impl ModelSpec {
     /// Model weight bytes resident on the GPU.
     #[allow(non_snake_case)]
     pub fn W_resident(&self) -> f64 {
-        self.W_mem()
+        self.W_mem() + self.vision_mem_bytes
     }
 
     /// Reserved activation bytes per batched token.
