@@ -20,12 +20,18 @@ use quail_planner::inputs::HfTokenizer;
 
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
 
-/// Whether a document column of this type holds images.
+/// Whether a document column of this type holds images: a binary
+/// column of PNGs, or a list column whose binary parts are each a PNG
+/// or UTF-8 text.
 pub(crate) fn holds_images(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Binary | DataType::LargeBinary | DataType::BinaryView
-    )
+    match data_type {
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => true,
+        DataType::List(part) | DataType::LargeList(part) => matches!(
+            part.data_type(),
+            DataType::Binary | DataType::LargeBinary | DataType::BinaryView
+        ),
+        _ => false,
+    }
 }
 
 /// The width and height a PNG's header gives, or None for other bytes.
@@ -92,29 +98,77 @@ pub(crate) fn image_token_lists(
     let start = special("<|vision_start|>")? as i32;
     let end = special("<|vision_end|>")? as i32;
     let mut lists = LargeListBuilder::new(Int32Builder::new());
-    let mut append = |image: Option<&[u8]>| -> Result<(), CompileError> {
-        if let Some(bytes) = image {
-            let count = image_tokens(bytes)?;
-            let first = ids.first_id(bytes, count)?;
-            let tokens = lists.values();
-            tokens.append_value(start);
+    // one part's tokens: a PNG's image tokens, or else its UTF-8 text's
+    let mut part = |bytes: &[u8], tokens: &mut Int32Builder, text: bool| {
+        if text && !bytes.starts_with(PNG_SIGNATURE) {
+            let text = std::str::from_utf8(bytes).map_err(|_| {
+                CompileError::new("a document part is neither a PNG nor UTF-8 text")
+            })?;
+            let found = tokenizer.encode(text).map_err(|error| {
+                CompileError::new(format!("a document part does not tokenize: {error}"))
+            })?;
             tokens.append_values(
-                &(first..first + count as i32).collect::<Vec<_>>(),
-                &vec![true; count as usize],
+                &found.iter().map(|id| *id as i32).collect::<Vec<_>>(),
+                &vec![true; found.len()],
             );
-            tokens.append_value(end);
+            return Ok(());
         }
-        lists.append(true);
-        Ok(())
+        let count = image_tokens(bytes)?;
+        let first = ids.first_id(bytes, count)?;
+        tokens.append_value(start);
+        tokens.append_values(
+            &(first..first + count as i32).collect::<Vec<_>>(),
+            &vec![true; count as usize],
+        );
+        tokens.append_value(end);
+        Ok::<(), CompileError>(())
+    };
+    let parts = |list: &ArrayRef| -> Result<Vec<Option<Vec<u8>>>, CompileError> {
+        Ok(match list.data_type() {
+            DataType::Binary => list
+                .as_binary::<i32>()
+                .iter()
+                .map(|v| v.map(<[u8]>::to_vec))
+                .collect(),
+            DataType::LargeBinary => list
+                .as_binary::<i64>()
+                .iter()
+                .map(|v| v.map(<[u8]>::to_vec))
+                .collect(),
+            DataType::BinaryView => list
+                .as_binary_view()
+                .iter()
+                .map(|v| v.map(<[u8]>::to_vec))
+                .collect(),
+            other => {
+                return Err(CompileError::new(format!(
+                    "an image column is binary, not {other}"
+                )));
+            }
+        })
     };
     match values.data_type() {
-        DataType::Binary => values.as_binary::<i32>().iter().try_for_each(&mut append)?,
-        DataType::LargeBinary => values.as_binary::<i64>().iter().try_for_each(&mut append)?,
-        DataType::BinaryView => values.as_binary_view().iter().try_for_each(&mut append)?,
-        other => {
-            return Err(CompileError::new(format!(
-                "an image column is binary, not {other}"
-            )));
+        DataType::List(_) | DataType::LargeList(_) => {
+            let lengths: Vec<Option<ArrayRef>> = match values.data_type() {
+                DataType::List(_) => values.as_list::<i32>().iter().collect(),
+                _ => values.as_list::<i64>().iter().collect(),
+            };
+            for document in lengths {
+                if let Some(found) = document {
+                    for bytes in parts(&found)?.into_iter().flatten() {
+                        part(&bytes, lists.values(), true)?;
+                    }
+                }
+                lists.append(true);
+            }
+        }
+        _ => {
+            for image in parts(values)? {
+                if let Some(bytes) = image {
+                    part(&bytes, lists.values(), false)?;
+                }
+                lists.append(true);
+            }
         }
     }
     Ok(lists.finish())

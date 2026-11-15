@@ -9,6 +9,7 @@ their previous result before laying out rows at the accepted prefix's end.
 
 from __future__ import annotations
 
+import os
 from collections import deque
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -116,6 +117,37 @@ class MapDecoder:
         self.partial_texts = {}
         self.tokenizer = None
         self.stopped_early = np.zeros(len(self.limits), dtype=np.int64)
+        # (temperature, top_p) when answers are sampled, None for greedy
+        self.sampling = None
+        self.generator = None
+
+    def sample(self, temperature: float, top_p: float, seed: int) -> None:
+        """Draw each answer token from the top-p of the tempered distribution.
+
+        Args:
+            temperature: The divisor of the logits; above 0.
+            top_p: The probability mass of the likeliest tokens kept.
+            seed: The seed of the draws.
+        """
+        if temperature <= 0 or not 0 < top_p <= 1:
+            raise ValueError(f"temperature {temperature} and top_p {top_p} "
+                             "must be above 0, and top_p at most 1")
+        self.sampling = (temperature, top_p)
+        self.generator = self.torch.Generator(device=self.device)
+        self.generator.manual_seed(seed)
+
+    def _choose(self, logits):
+        """Each row's next token: the likeliest, or a draw when sampling."""
+        if self.sampling is None:
+            return logits.argmax(dim=1)
+        torch = self.torch
+        temperature, top_p = self.sampling
+        probabilities = torch.softmax(logits.float() / temperature, dim=1)
+        ordered, order = probabilities.sort(dim=1, descending=True)
+        # keep the likeliest tokens whose mass before them is under top_p
+        ordered[(ordered.cumsum(dim=1) - ordered) >= top_p] = 0.0
+        drawn = torch.multinomial(ordered, 1, generator=self.generator)
+        return order.gather(1, drawn).squeeze(1)
 
     def configure_copy(self, first, slots, documents, specs):
         """Register extraction fields for setup after the first forward launch."""
@@ -513,7 +545,7 @@ class MapDecoder:
             end = min(start + AsyncTopLogprobs.BLOCK_ROWS, len(hidden))
             logits = torch.nn.functional.linear(
                 hidden[start:end].to(self.head.dtype), self.head)
-            chosen[start:end] = logits.argmax(dim=1)
+            chosen[start:end] = self._choose(logits)
             for key, (readout, questions) in self.copy_readouts.items():
                 mine = np.flatnonzero(np.isin(maps[start:end], questions))
                 if not len(mine):
@@ -801,6 +833,11 @@ class MapDecoder:
                 for document in documents]
 
 
+# AI.MAP samples its answers when set, such as
+# "temperature=1.0,top_p=0.95,seed=7"; greedy otherwise
+SAMPLING_SETTING = "QUAIL_MAP_SAMPLING"
+
+
 def map_decoder(state, limits, num_documents: int, expected_tokens=None) -> MapDecoder:
     """Return a decoder for a pipeline's maps on the loaded model."""
     from quail.backends.quail.executor.model_loading import full_output_head
@@ -814,4 +851,9 @@ def map_decoder(state, limits, num_documents: int, expected_tokens=None) -> MapD
             state.loaded_model.model_spec, state.chunk_tokens),
         row_budget=state.chunk_tokens)
     decoder.tokenizer = state.loaded_model.tokenizer
+    sampling = os.environ.get(SAMPLING_SETTING)
+    if sampling:
+        found = dict(part.split("=", 1) for part in sampling.split(","))
+        decoder.sample(float(found.get("temperature", 1.0)),
+                       float(found.get("top_p", 1.0)), int(found.get("seed", 0)))
     return decoder

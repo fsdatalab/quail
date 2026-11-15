@@ -135,3 +135,24 @@ rows 3
   p2, FALSE, FALSE
   p3, TRUE, TRUE
 """)
+
+
+def test_a_map_reads_a_document_of_page_images_and_text():
+    questions = pa.table({
+        "id": ["q1", "q2"],
+        "parts": pa.array([[png(64, 96, 10), b"How long is the lease?"],
+                           [png(64, 96, 10), png(96, 64, 200), b"Who signed it?"]],
+                          pa.list_(pa.binary())),
+    })
+    assert_transcript(_transcript(
+        "SELECT q.id, AI.MAP(q.parts, 'Answer.', 16) AS answer FROM questions q",
+        tables={"questions": questions}), """\
+--- SELECT q.id, AI.MAP(q.parts, 'Answer.', 16) AS answer FROM questions q ---
+plan
+  answer = ai_map(q.parts, 'Answer.', Int64(16))
+asked 2 of 2
+  'Answer.': q1 'lease', q2 'lease'
+rows 2
+  q1, 'lease'
+  q2, 'lease'
+""")

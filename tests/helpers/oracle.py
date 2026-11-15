@@ -43,9 +43,14 @@ def _images(columns):
     """A scan's image documents: its binary value column, or None."""
     if columns is None:
         return None
-    return next((columns.column(index) for index, field in enumerate(columns.schema)
-                 if pa.types.is_binary(field.type)
-                 or pa.types.is_large_binary(field.type)), None)
+    for index, field in enumerate(columns.schema):
+        if pa.types.is_binary(field.type) or pa.types.is_large_binary(field.type):
+            return columns.column(index)
+        if pa.types.is_list(field.type) and pa.types.is_binary(field.type.value_type):
+            # a document of parts is its parts' bytes, joined
+            return [None if parts is None else b"".join(parts)
+                    for parts in columns.column(index).to_pylist()]
+    return None
 
 
 class Oracle:

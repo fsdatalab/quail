@@ -121,10 +121,14 @@ class Transcripts:
             for name in table.column_names:
                 kind = table.schema.field(name).type
                 # a text or image column holds documents
+                parts = pa.types.is_list(kind) and pa.types.is_binary(kind.value_type)
                 if name != id_column and (pa.types.is_string(kind)
-                                          or pa.types.is_binary(kind)):
-                    for row, text in zip(ids, table.column(name).to_pylist(),
-                                         strict=True):
+                                          or pa.types.is_binary(kind) or parts):
+                    values = table.column(name).to_pylist()
+                    if parts:
+                        values = [None if found is None else b"".join(found)
+                                  for found in values]
+                    for row, text in zip(ids, values, strict=True):
                         if text is not None and row not in holders.get(text, []):
                             holders.setdefault(text, []).append(row)
         self._ids = {text: "/".join(map(str, rows))

@@ -99,3 +99,19 @@ def test_each_image_token_takes_its_own_embedding_and_text_takes_the_vocabulary(
             input_ids=ids, host_ids=ids.numpy()), text)
     assert hidden[:, 0].tolist() == [3, 4, 5, -1, 0, 1, 2]
     assert visual.calls == 1
+
+
+def test_a_document_of_two_images_shifts_each_row_by_the_images_before_it():
+    # image a: 2 columns by 3 rows; image b: 2 by 2, after a word of text
+    a, b = range(FIRST, FIRST + 6), range(FIRST + 6, FIRST + 10)
+    parts = pa.array([[png(64, 96), b"between", png(64, 64)]], pa.list_(pa.binary()))
+    document = [START, *a, END, 9, START, *b, END, 10]
+    images = RegionImages({"pages": [document]}, {"pages": pa.table({"parts": parts})})
+    ids = [7, 8, *document]
+    chunk = _chunk(ids, list(range(len(ids))), [(KEY, 0, len(ids), len(ids))])
+    rotary = images.rotary_positions(chunk, ()).numpy()
+    # after image a, positions advance by its 3 rows, not its 6 tokens
+    assert rotary[0].tolist() == [0, 1, 2, 3, 3, 3, 3, 3, 3, 6, 7, 8,
+                                  9, 9, 9, 9, 11, 12]
+    assert rotary[1, 12:16].tolist() == [9, 9, 10, 10]
+    assert rotary[2, 12:16].tolist() == [9, 10, 9, 10]

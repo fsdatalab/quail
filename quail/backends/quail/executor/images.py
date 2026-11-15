@@ -31,6 +31,7 @@ from _quail_native import IMAGE_TOKEN_BASE, IMAGE_TOKEN_PIXELS
 PATCH_PIXELS = 16
 TEMPORAL_PATCH = 2
 MERGE = IMAGE_TOKEN_PIXELS // PATCH_PIXELS
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 # threads that decode a region's PNGs ahead of the vision encoder
 DECODE_THREADS = 8
 # the most patches one vision encoder call reads, which bounds its
@@ -122,27 +123,26 @@ class RegionImages:
 
     def __init__(self, documents: dict, columns: dict):
         self.images: dict[int, Image] = {}
-        # by alias, each document's image's first token id, or -1
-        self.firsts: dict[str, np.ndarray] = {}
+        # by alias, each document's images' first token ids, in order
+        self.firsts: dict[str, list[tuple[int, ...]]] = {}
         for alias, table in columns.items():
-            pngs = _binary_column(table)
-            if pngs is None or alias not in documents:
+            column = _binary_column(table)
+            if column is None or alias not in documents:
                 continue
             store = documents[alias]
-            firsts = np.full(len(store), -1, dtype=np.int64)
-            for index, png in enumerate(pngs.to_pylist()):
-                if png is None:
-                    continue
-                tokens = store[index]
-                first = int(_token_at(tokens, 1))
-                if first < IMAGE_TOKEN_BASE:
-                    continue
-                firsts[index] = first
-                if first not in self.images:
-                    width, height = png_size(png)
-                    self.images[first] = Image(
-                        first, height // IMAGE_TOKEN_PIXELS,
-                        width // IMAGE_TOKEN_PIXELS, png)
+            firsts = []
+            for index, value in enumerate(column.to_pylist()):
+                parts = value if isinstance(value, list) else [value]
+                pngs = [part for part in parts
+                        if part is not None and part.startswith(PNG_SIGNATURE)]
+                found = tuple(_image_firsts(_tokens_of(store[index]))) if pngs else ()
+                firsts.append(found)
+                for first, png in zip(found, pngs, strict=True):
+                    if first not in self.images:
+                        width, height = png_size(png)
+                        self.images[first] = Image(
+                            first, height // IMAGE_TOKEN_PIXELS,
+                            width // IMAGE_TOKEN_PIXELS, png)
             self.firsts[alias] = firsts
         order = sorted(self.images)
         self._sorted = np.asarray(order, dtype=np.int64)
@@ -186,13 +186,12 @@ class RegionImages:
         at = int(np.searchsorted(self._sorted, token, side="right")) - 1
         return self.images[int(self._sorted[at])]
 
-    def key_image(self, key) -> Image | None:
-        """The image an arena key's document holds, or None."""
+    def key_images(self, key) -> list[Image]:
+        """The images an arena key's document holds, in order."""
         found = document_key(key)
         if found is None or found[0] not in self.firsts:
-            return None
-        first = int(self.firsts[found[0]][found[1]])
-        return self.images.get(first) if first >= 0 else None
+            return []
+        return [self.images[first] for first in self.firsts[found[0]][found[1]]]
 
     # ---- embeddings ---------------------------------------------------
 
@@ -294,7 +293,8 @@ class RegionImages:
 
         Returns (3, rows) positions for a chunk with image tokens, the
         rows' positions less their images' shifts for one without, and
-        None when no row follows an image.
+        None when no row follows an image. A document of several images
+        shifts each row by every image that ends before it.
 
         Args:
             chunk: The packed chunk.
@@ -305,41 +305,57 @@ class RegionImages:
         rotary = np.broadcast_to(positions, (3, len(positions))).copy()
         changed = False
         for key, row0, _, end in chunk.row_spans:
-            image = self.key_image(key)
-            if image is None:
+            images = self.key_images(key)
+            if not images:
                 continue
             rows = slice(row0, end)
             found = ids[rows]
             marked = found >= IMAGE_TOKEN_BASE
-            if marked.any():
-                index = np.flatnonzero(marked)
-                within = found[index].astype(np.int64) - image.first
-                start = int(positions[row0 + index[0]] - within[0])
-                self._starts[key] = start
-                self._image_starts[image.first] = start
-                grid_row, grid_column = np.divmod(within, image.columns)
-                rotary[0, row0 + index] = start
-                rotary[1, row0 + index] = start + grid_row
-                rotary[2, row0 + index] = start + grid_column
-                changed = True
-            # a document that borrowed its image's KV starts it where its
+            starts = self._starts.setdefault(key, {})
+            index = np.flatnonzero(marked)
+            if len(index):
+                firsts = self._sorted[np.searchsorted(
+                    self._sorted, found[index], side="right") - 1]
+                for first in np.unique(firsts).tolist():
+                    at = int(np.flatnonzero(firsts == first)[0])
+                    start = int(positions[row0 + index[at]]
+                                - (found[index[at]] - first))
+                    starts[first] = start
+                    self._image_starts[first] = start
+            # a document that borrowed an image's KV starts it where its
             # lender does
-            start = self._starts.get(key, self._image_starts.get(image.first))
-            if start is None:
+            for image in images:
+                if image.first not in starts and image.first in self._image_starts:
+                    starts[image.first] = self._image_starts[image.first]
+            known = sorted((starts[image.first], image) for image in images
+                           if image.first in starts)
+            if not known:
                 continue
-            past = (positions[rows] >= start + image.tokens) & ~marked
-            rotary[:, row0 + np.flatnonzero(past)] -= image.shift
+            ends = np.array([start + image.tokens for start, image in known])
+            shifted = np.cumsum([image.shift for _, image in known])
+            before = np.searchsorted(ends, positions[rows], side="right")
+            shift = np.where(before > 0, shifted[np.maximum(before, 1) - 1], 0)
+            plain = np.flatnonzero(~marked)
+            rotary[:, row0 + plain] -= shift[plain]
+            if len(index):
+                within = found[index] - firsts
+                columns = np.array([self.images[first].columns
+                                    for first in firsts.tolist()])
+                anchors = np.array([starts[first] for first in firsts.tolist()])
+                anchors = anchors - shift[index]
+                grid_row, grid_column = np.divmod(within, columns)
+                rotary[0, row0 + index] = anchors
+                rotary[1, row0 + index] = anchors + grid_row
+                rotary[2, row0 + index] = anchors + grid_column
             changed = True
         decode = chunk.decode_rows
         if decode is not None and len(decode):
             first = len(ids) - len(decode)
             for row, slot in enumerate(np.asarray(decode.slots).tolist()):
-                key = answer_keys[slot]
-                image = self.key_image(key)
-                if image is None:
-                    continue
-                rotary[:, first + row] -= image.shift
-                changed = True
+                images = self.key_images(answer_keys[slot])
+                if images:
+                    rotary[:, first + row] -= sum(image.shift for image in images)
+                    changed = True
         if not changed:
             return None
         import torch
@@ -364,19 +380,30 @@ def _host(values, device_values) -> np.ndarray:
     return device_values.cpu().numpy().astype(np.int64)
 
 
-def _token_at(tokens, index):
-    parts = getattr(tokens, "token_parts", (tokens,))
-    for part in parts:
-        values = part.numpy() if hasattr(part, "numpy") else np.asarray(part)
-        if index < len(values):
-            return values[index]
-        index -= len(values)
-    return -1
+def _tokens_of(document) -> np.ndarray:
+    """A document's token ids as one array."""
+    parts = getattr(document, "token_parts", (document,))
+    arrays = [part.numpy() if hasattr(part, "numpy") else np.asarray(part)
+              for part in parts]
+    return np.concatenate(arrays) if arrays else np.zeros(0, dtype=np.int64)
+
+
+def _image_firsts(tokens: np.ndarray) -> list[int]:
+    """The first token id of each image in a document's tokens, in order."""
+    marked = tokens >= IMAGE_TOKEN_BASE
+    begins = marked & ~np.concatenate([[False], marked[:-1]])
+    return tokens[begins].astype(np.int64).tolist()
 
 
 def _binary_column(table: pa.Table):
+    """A scan's document column: binary PNGs, or a list of binary parts."""
+    def binary(kind):
+        return pa.types.is_binary(kind) or pa.types.is_large_binary(kind)
+
     for index, field in enumerate(table.schema):
-        if pa.types.is_binary(field.type) or pa.types.is_large_binary(field.type):
+        kind = field.type
+        if binary(kind) or ((pa.types.is_list(kind) or pa.types.is_large_list(kind))
+                            and binary(kind.value_type)):
             return table.column(index)
     return None
 
