@@ -1,4 +1,5 @@
-//! `AI.PDF_PAGES(pdf [, longest_edge])`: each page of a PDF as a PNG.
+//! `AI.PDF_PAGES(pdf [, longest_edge [, first [, last]]])`: each page of
+//! a PDF in the range as a PNG.
 //!
 //! The function draws each page with `hayro`, on the CPU and without a
 //! model, for a vision model to read. DataFusion runs it as it runs any
@@ -72,9 +73,9 @@ impl ScalarUDFImpl for PdfPages {
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
         match arg_types {
-            [] | [_, _, _, ..] => plan_err!(
-                "AI.PDF_PAGES takes a binary column of PDFs and an optional longest_edge; \
-                 it takes {} arguments",
+            [] | [_, _, _, _, _, ..] => plan_err!(
+                "AI.PDF_PAGES takes a binary column of PDFs, and optionally longest_edge, \
+                 the first page, and the last page; it takes {} arguments",
                 arg_types.len()
             ),
             [
@@ -95,23 +96,29 @@ impl ScalarUDFImpl for PdfPages {
         if let Some(longest_edge) = args.scalar_arguments.get(1) {
             longest_edge_pixels(*longest_edge)?;
         }
+        page_range(
+            args.scalar_arguments.get(2).copied().flatten(),
+            args.scalar_arguments.get(3).copied().flatten(),
+        )?;
         Ok(Arc::new(Field::new(self.name(), pages, true)))
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        let (pdf, longest_edge) = match args.args.as_slice() {
-            [pdf] => (pdf, DEFAULT_LONGEST_EDGE),
-            [pdf, longest_edge] => {
-                let literal = match longest_edge {
-                    ColumnarValue::Scalar(literal) => Some(literal),
-                    ColumnarValue::Array(_) => None,
-                };
-                (pdf, longest_edge_pixels(literal)?)
-            }
-            _ => return exec_err!("AI.PDF_PAGES takes one or two arguments"),
+        let literal = |index: usize| match args.args.get(index) {
+            Some(ColumnarValue::Scalar(literal)) => Some(literal),
+            _ => None,
         };
+        let Some(pdf) = args.args.first() else {
+            return exec_err!("AI.PDF_PAGES takes a binary column of PDFs");
+        };
+        let longest_edge = if args.args.len() > 1 {
+            longest_edge_pixels(literal(1))?
+        } else {
+            DEFAULT_LONGEST_EDGE
+        };
+        let pages = page_range(literal(2), literal(3))?;
         let pdfs = pdf.to_array(args.number_rows)?;
-        Ok(ColumnarValue::Array(pdf_pages(&pdfs, longest_edge)?))
+        Ok(ColumnarValue::Array(pdf_pages(&pdfs, longest_edge, pages)?))
     }
 }
 
@@ -152,20 +159,48 @@ fn longest_edge_pixels(longest_edge: Option<&ScalarValue>) -> Result<u16> {
     }
 }
 
-/// The pages of each PDF in `pdfs`, a binary array: NULL for a NULL or
-/// unreadable PDF.
-fn pdf_pages(pdfs: &ArrayRef, longest_edge: u16) -> Result<ArrayRef> {
+/// The pages from `first` to `last`, counted from 1 and inclusive; `last`
+/// None reads to the end. An error unless each is a positive integer
+/// literal and `first` is at most `last`.
+fn page_range(
+    first: Option<&ScalarValue>,
+    last: Option<&ScalarValue>,
+) -> Result<(usize, Option<usize>)> {
+    let page = |value: Option<&ScalarValue>, name: &str| -> Result<Option<usize>> {
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        match value.cast_to(&DataType::Int64)? {
+            ScalarValue::Int64(Some(found)) if found >= 1 => Ok(Some(found as usize)),
+            _ => plan_err!("AI.PDF_PAGES takes the {name} page as an integer literal from 1"),
+        }
+    };
+    let first = page(first, "first")?.unwrap_or(1);
+    let last = page(last, "last")?;
+    if last.is_some_and(|last| last < first) {
+        return plan_err!("AI.PDF_PAGES takes a last page no earlier than its first page");
+    }
+    Ok((first, last))
+}
+
+/// The pages of each PDF in `pdfs`, a binary array, from the range's
+/// first page to its last: NULL for a NULL or unreadable PDF.
+fn pdf_pages(
+    pdfs: &ArrayRef,
+    longest_edge: u16,
+    range: (usize, Option<usize>),
+) -> Result<ArrayRef> {
     let mut pages = ListBuilder::new(StructBuilder::from_fields(page_fields(), 0));
     let mut append = |bytes: Option<&[u8]>| {
-        let Some(images) = bytes.and_then(|bytes| page_images(bytes, longest_edge)) else {
+        let Some(images) = bytes.and_then(|bytes| page_images(bytes, longest_edge, range)) else {
             pages.append_null();
             return;
         };
         let page = pages.values();
-        for (index, image) in images.into_iter().enumerate() {
+        for (number, image) in images {
             page.field_builder::<Int32Builder>(0)
                 .expect("page is the first field")
-                .append_value(index as i32 + 1);
+                .append_value(number as i32);
             page.field_builder::<BinaryBuilder>(1)
                 .expect("image is the second field")
                 .append_option(image);
@@ -182,16 +217,30 @@ fn pdf_pages(pdfs: &ArrayRef, longest_edge: u16) -> Result<ArrayRef> {
     Ok(Arc::new(pages.finish()))
 }
 
-/// The PNG of each page of a PDF, in page order, or None when hayro
-/// cannot read the file. A page hayro cannot draw has no PNG.
-fn page_images(bytes: &[u8], longest_edge: u16) -> Option<Vec<Option<Vec<u8>>>> {
+/// Each page of a PDF in the range, by its number from 1, with its PNG,
+/// or None when hayro cannot read the file. A page hayro cannot draw
+/// has no PNG; only the pages in the range are drawn.
+#[allow(clippy::type_complexity)]
+fn page_images(
+    bytes: &[u8],
+    longest_edge: u16,
+    (first, last): (usize, Option<usize>),
+) -> Option<Vec<(usize, Option<Vec<u8>>)>> {
     let pdf = quietly(|| Pdf::new(bytes.to_vec()).ok())??;
     let settings = InterpreterSettings::default();
     let cache = RenderCache::new();
     quietly(|| {
         pdf.pages()
             .iter()
-            .map(|page| quietly(|| page_image(page, &cache, &settings, longest_edge)).flatten())
+            .enumerate()
+            .skip(first - 1)
+            .take(last.map_or(usize::MAX, |last| last + 1 - first))
+            .map(|(index, page)| {
+                (
+                    index + 1,
+                    quietly(|| page_image(page, &cache, &settings, longest_edge)).flatten(),
+                )
+            })
             .collect()
     })
 }
@@ -302,6 +351,8 @@ mod tests {
 
     use super::*;
 
+    const EVERY_PAGE: (usize, Option<usize>) = (1, None);
+
     /// The content stream that shows one line of Helvetica text.
     fn line(text: &str) -> String {
         format!("BT /F1 12 Tf 72 540 Td ({text}) Tj ET")
@@ -374,10 +425,10 @@ mod tests {
 
     /// The width and height of each page's image, for one PDF.
     fn sizes(pdf: &[u8], longest_edge: u16) -> Vec<(u32, u32)> {
-        page_images(pdf, longest_edge)
+        page_images(pdf, longest_edge, EVERY_PAGE)
             .unwrap()
             .iter()
-            .map(|image| {
+            .map(|(_, image)| {
                 let (width, height, _) = decoded(image.as_ref().unwrap());
                 (width, height)
             })
@@ -391,7 +442,7 @@ mod tests {
             pdf(&lease, 612, 792, 0),
             pdf(&[&line("Invoice for one desk.")], 612, 792, 0),
         ]));
-        let pages = pdf_pages(&pdfs, 1536).unwrap();
+        let pages = pdf_pages(&pdfs, 1536, EVERY_PAGE).unwrap();
         assert_eq!(pages.data_type(), &pages_type());
         let pages = pages.as_list::<i32>();
         let numbers = |row: usize| {
@@ -431,9 +482,13 @@ mod tests {
 
     #[test]
     fn a_page_is_drawn_on_white_with_its_text() {
-        let images =
-            page_images(&pdf(&[&line("Lease from March 2025.")], 612, 792, 0), 1024).unwrap();
-        let (_, _, pixels) = decoded(images[0].as_ref().unwrap());
+        let images = page_images(
+            &pdf(&[&line("Lease from March 2025.")], 612, 792, 0),
+            1024,
+            EVERY_PAGE,
+        )
+        .unwrap();
+        let (_, _, pixels) = decoded(images[0].1.as_ref().unwrap());
         assert_eq!(pixels[..3], [255, 255, 255]);
         let dark = pixels
             .as_chunks::<3>()
@@ -449,8 +504,8 @@ mod tests {
         // 100 x 1000 points fits a 96 x 1024 image at 96 pixels wide and
         // 960 high, so 32 rows above and below the page stay white
         let tall = pdf(&["0 0 1 rg 0 0 100 1000 re f"], 100, 1000, 0);
-        let images = page_images(&tall, 1024).unwrap();
-        let (width, height, pixels) = decoded(images[0].as_ref().unwrap());
+        let images = page_images(&tall, 1024, EVERY_PAGE).unwrap();
+        let (width, height, pixels) = decoded(images[0].1.as_ref().unwrap());
         assert_eq!((width, height), (96, 1024));
         let pixel = |x: usize, y: usize| &pixels[3 * (y * 96 + x)..][..3];
         assert_eq!(pixel(48, 16), [255, 255, 255]);
@@ -459,9 +514,22 @@ mod tests {
     }
 
     #[test]
+    fn a_range_draws_only_its_pages_and_numbers_them_from_the_pdfs_start() {
+        let three = pdf(&[&line("one"), &line("two"), &line("three")], 612, 792, 0);
+        let numbers = |range| -> Vec<usize> {
+            (page_images(&three, 64, range).unwrap().into_iter())
+                .map(|(number, _)| number)
+                .collect()
+        };
+        assert_eq!(numbers((2, Some(3))), [2, 3]);
+        assert_eq!(numbers((3, Some(9))), [3]);
+        assert_eq!(numbers((2, None)), [2, 3]);
+    }
+
+    #[test]
     fn a_file_that_is_not_a_pdf_has_no_pages() {
         let pdfs: ArrayRef = Arc::new(BinaryArray::from(vec![Some(b"not a pdf".as_slice()), None]));
-        let pages = pdf_pages(&pdfs, 1536).unwrap();
+        let pages = pdf_pages(&pdfs, 1536, EVERY_PAGE).unwrap();
         assert_eq!(pages.null_count(), 2);
     }
 

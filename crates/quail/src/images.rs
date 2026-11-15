@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, AsArray, Int32Builder, LargeListArray, LargeListBuilder};
 use arrow::datatypes::DataType;
@@ -19,6 +20,8 @@ use quail_planner::error::CompileError;
 use quail_planner::inputs::HfTokenizer;
 
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+/// The field of a page struct that holds its PNG, as AI.PDF_PAGES names it.
+const PAGE_IMAGE: &str = "image";
 
 /// Whether a document column of this type holds images: a binary
 /// column of PNGs, or a list column whose binary parts are each a PNG
@@ -26,10 +29,14 @@ const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
 pub(crate) fn holds_images(data_type: &DataType) -> bool {
     match data_type {
         DataType::Binary | DataType::LargeBinary | DataType::BinaryView => true,
-        DataType::List(part) | DataType::LargeList(part) => matches!(
-            part.data_type(),
-            DataType::Binary | DataType::LargeBinary | DataType::BinaryView
-        ),
+        DataType::List(part) | DataType::LargeList(part) => match part.data_type() {
+            DataType::Binary | DataType::LargeBinary | DataType::BinaryView => true,
+            // the pages AI.PDF_PAGES returns: each its number and its image
+            DataType::Struct(fields) => fields
+                .find(PAGE_IMAGE)
+                .is_some_and(|(_, field)| holds_images(field.data_type())),
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -124,6 +131,15 @@ pub(crate) fn image_token_lists(
         Ok::<(), CompileError>(())
     };
     let parts = |list: &ArrayRef| -> Result<Vec<Option<Vec<u8>>>, CompileError> {
+        let list = match list.data_type() {
+            DataType::Struct(_) => list
+                .as_struct()
+                .column_by_name(PAGE_IMAGE)
+                .cloned()
+                .ok_or_else(|| CompileError::new("a page has no image field"))?,
+            _ => Arc::clone(list),
+        };
+        let list = &list;
         Ok(match list.data_type() {
             DataType::Binary => list
                 .as_binary::<i32>()

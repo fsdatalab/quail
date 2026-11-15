@@ -156,3 +156,26 @@ rows 2
   q1, 'lease'
   q2, 'lease'
 """)
+
+
+def test_a_classification_reads_the_first_pages_of_each_pdf():
+    from helpers.pdfs import pdf
+
+    files = pa.table({"id": ["f1", "f2"], "pdf": pa.array([
+        pdf("Lease agreement.", "Rent terms.", "Signatures."),
+        pdf("Invoice.", "Line items.")], pa.binary())})
+    assert_transcript(_transcript(
+        "SELECT f.id, AI.CLASSIFY(AI.PDF_PAGES(f.pdf, 64, 1, 2), "
+        "['lease', 'invoice']) AS kind FROM files f",
+        tables={"files": files}), """\
+--- SELECT f.id, AI.CLASSIFY(AI.PDF_PAGES(f.pdf, 64, 1, 2), ['lease', 'invoice']) AS
+    kind FROM files f ---
+plan
+  kind = ai_classify(f.__quail_expr_0 AS
+      AI.PDF_PAGES(f.pdf,Int64(64),Int64(1),Int64(2)), make_array('lease', 'invoice'))
+asked 2 of 2
+  '?': <2 images 56b42290> 'lease', <2 images 8f102318> 'lease'
+rows 2
+  f1, 'lease'
+  f2, 'lease'
+""")

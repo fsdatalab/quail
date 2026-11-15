@@ -133,6 +133,9 @@ class RegionImages:
             firsts = []
             for index, value in enumerate(column.to_pylist()):
                 parts = value if isinstance(value, list) else [value]
+                # the pages AI.PDF_PAGES returns: each its number and image
+                parts = [part.get("image") if isinstance(part, dict) else part
+                         for part in parts]
                 pngs = [part for part in parts
                         if part is not None and part.startswith(PNG_SIGNATURE)]
                 found = tuple(_image_firsts(_tokens_of(store[index]))) if pngs else ()
@@ -400,10 +403,14 @@ def _binary_column(table: pa.Table):
     def binary(kind):
         return pa.types.is_binary(kind) or pa.types.is_large_binary(kind)
 
+    def pages(kind):
+        return (pa.types.is_struct(kind) and kind.get_field_index("image") >= 0
+                and binary(kind.field("image").type))
+
     for index, field in enumerate(table.schema):
         kind = field.type
         if binary(kind) or ((pa.types.is_list(kind) or pa.types.is_large_list(kind))
-                            and binary(kind.value_type)):
+                            and (binary(kind.value_type) or pages(kind.value_type))):
             return table.column(index)
     return None
 

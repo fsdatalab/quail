@@ -15,7 +15,7 @@ a row and returns the model's answer as a SQL value.
 | [`AI.EXTRACT_SPAN(input, questions)`](#aiextract_spaninput-questions) | `AI.EXTRACT_SPAN` returns the position of each `AI.EXTRACT` answer in the document. |
 | [`AI.MAP(input, instruction[, max_tokens])`](#aimapinput-instruction-max_tokens) | `AI.MAP` returns the text the model writes for the document. |
 | [`AI.PARSE_DOCUMENT(document)`](#aiparse_documentdocument) | `AI.PARSE_DOCUMENT` returns the text a PDF stores, for other AI functions to read. |
-| [`AI.PDF_PAGES(pdf[, longest_edge])`](#aipdf_pagespdf-longest_edge) | `AI.PDF_PAGES` returns each page of a PDF as a PNG image. |
+| [`AI.PDF_PAGES(pdf[, longest_edge[, first[, last]]])`](#aipdf_pagespdf-longest_edge-first-last) | `AI.PDF_PAGES` returns each page of a PDF in a range as a PNG image. |
 | [`AI.SAE_FEATURES(prompt, options)`](#aisae_featuresprompt-options) | `AI.SAE_FEATURES` returns the model's strongest internal features for the prompt. |
 | [`HINT(condition, options)`](#hintcondition-options) | `HINT` returns `condition` and tells Quail what fraction of rows pass. |
 
@@ -198,7 +198,7 @@ WHERE f.year = 2025;
 | **Alias** | `AI_PARSE_DOCUMENT` |
 | **document** | A `BINARY` column that holds each PDF's bytes. |
 
-### `AI.PDF_PAGES(pdf[, longest_edge])`
+### `AI.PDF_PAGES(pdf[, longest_edge[, first[, last]]])`
 
 ```sql
 SELECT p.path, p.u['page'] AS page, p.u['image'] AS image
@@ -216,6 +216,7 @@ FROM (SELECT f.path, UNNEST(AI.PDF_PAGES(f.pdf)) AS u
 | **Alias** | `AI_PDF_PAGES` |
 | **pdf** | A `BINARY` column that holds each PDF's bytes. |
 | **longest_edge** | An integer literal, in pixels: a multiple of 32 from 32 to 8192. Its default is 1536. |
+| **first**, **last** | Integer literals: the first and last pages to draw, counted from 1. `last` past the end, or left out, reads to the end; `first` defaults to 1. Quail draws only the pages in the range. |
 
 ### `AI.SAE_FEATURES(prompt, options)`
 
@@ -343,6 +344,17 @@ A model with a vision tower, such as `qwen3.5-4b-fp8`, reads a `BINARY`
 column of PNG images as a document, in place of text. Each image's
 sides must be multiples of 32 pixels: the model reads one image token
 per 32 by 32 pixels. `AI.PDF_PAGES` renders PDF pages that way.
+
+A document may also be several pages: the list `AI.PDF_PAGES` returns,
+or a list of `BINARY` parts, each a PNG or UTF-8 text. To classify each
+PDF from its first three pages:
+
+```sql
+SELECT f.path,
+       AI.CLASSIFY(AI.PDF_PAGES(f.pdf, 1024, 1, 3),
+                   ['annual report', 'contract', 'manual', 'other']) AS kind
+FROM files f;
+```
 
 ```sql
 SELECT p.contract_id, p.page

@@ -88,3 +88,22 @@ def test_a_longest_edge_that_is_not_a_multiple_of_32_is_refused(context):
 def test_pages_of_text_are_refused(context):
     with pytest.raises(RuntimeError, match="reads a binary column of PDFs, not Utf8"):
         context.sql("SELECT AI.PDF_PAGES(f.id) FROM files f")
+
+
+def test_a_page_range_renders_only_its_pages(context):
+    three = pa.table({"id": ["f1"], "pdf": pa.array(
+        [pdf("Page one.", "Page two.", "Page three.")], pa.binary())})
+    context.register("three", quail.DocumentProvider.from_table(three, id_col="id"))
+    pages = lambda sql: context.sql(sql).column("page").to_pylist()  # noqa: E731
+    assert pages("SELECT UNNEST(AI.PDF_PAGES(t.pdf, 256, 2, 3))['page'] AS page "
+                 "FROM three t") == [2, 3]
+    # a last page past the end reads to the end, and no last page as well
+    assert pages("SELECT UNNEST(AI.PDF_PAGES(t.pdf, 256, 3, 9))['page'] AS page "
+                 "FROM three t") == [3]
+    assert pages("SELECT UNNEST(AI.PDF_PAGES(t.pdf, 256, 2))['page'] AS page "
+                 "FROM three t") == [2, 3]
+
+
+def test_a_last_page_before_the_first_is_refused(context):
+    with pytest.raises(RuntimeError, match="no earlier than its first page"):
+        context.sql("SELECT AI.PDF_PAGES(f.pdf, 256, 3, 2) FROM files f")

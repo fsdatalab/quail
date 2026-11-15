@@ -53,7 +53,7 @@ mod tests {
     fn every_built_in_spec_reads() {
         let models = read_models(&data("models")).unwrap();
         let devices = read_devices(&data("devices")).unwrap();
-        assert_eq!(models.len(), 15);
+        assert_eq!(models.len(), 16);
         assert_eq!(devices.len(), 4);
         for model in models.values() {
             let json = serde_json::to_value(model).unwrap();
