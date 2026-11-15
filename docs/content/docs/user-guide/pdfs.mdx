@@ -2,18 +2,13 @@
 title: Querying PDFs
 ---
 
-You can query a dataset of PDFs with SQL, and ask a model about each
-page or each PDF. You render the pages with `AI.PDF_PAGES`, and a vision
-model reads the page images, so you do not convert the PDFs to text
-first. You need a model with a vision tower: `qwen3.5-4b-bf16`,
-`qwen3.5-4b-fp8`, `qwen3.5-27b-fp8`, `qwen3.8-27b-fp8`, or
-`qwen3.6-35b-a3b-fp8`.
+If you have a dataset of PDFs and want to run analytics on it, use
+`AI.PDF_PAGES` to get to pixels. Then ask questions about the pixels.
+You do not need to go through a parser to get to text.
 
-## Find the pages that answer a question
+## Load PDFs
 
-You load each PDF's bytes into a `BINARY` column, then ask the question
-of every page. The program below returns each contract page that caps
-liability:
+Store each PDF's bytes in a `BINARY` column:
 
 ```python
 from pathlib import Path
@@ -27,24 +22,26 @@ files = pa.table({
     "pdf": pa.array([path.read_bytes() for path in paths], pa.binary()),
 })
 config = quail.EngineConfig(model="qwen3.5-4b-bf16", device="h100-sxm")
-with quail.Session(config=config) as session:
-    session.register("files", quail.DocumentProvider.from_table(files, id_col="path"))
-    print(session.sql("""
-        SELECT p.path, p.u['page'] AS page
-        FROM (SELECT f.path, UNNEST(AI.PDF_PAGES(f.pdf, 1024)) AS u FROM files f) p
-        WHERE AI.IF(PROMPT('Does this page cap either party''s liability? {0}',
-                           p.u['image']))
-    """).run().collect())
+session = quail.Session(config=config)
+session.register("files", quail.DocumentProvider.from_table(files, id_col="path"))
 ```
 
-`UNNEST` turns each PDF's list of pages into one row per page, so you
-get one answer per page.
+## Ask questions about pages
 
-## Label each PDF
+`AI.PDF_PAGES` returns each page as a PNG image. `UNNEST` returns one row
+per page. The query below returns each page that caps liability:
 
-You leave out `UNNEST` to ask one question of a whole PDF. You can also
-pass a page range, so a long PDF costs only the pages the model reads.
-The query below labels each PDF from its first three pages:
+```sql
+SELECT p.path, p.u['page'] AS page
+FROM (SELECT f.path, UNNEST(AI.PDF_PAGES(f.pdf, 1024)) AS u FROM files f) p
+WHERE AI.IF(PROMPT('Does this page cap either party''s liability? {0}',
+                   p.u['image']));
+```
+
+## Ask questions about a whole PDF
+
+Pass the pages without `UNNEST`. A page range sets the pages Quail
+reads. The query below classifies each PDF from its first three pages:
 
 ```sql
 SELECT f.path,
@@ -53,18 +50,23 @@ SELECT f.path,
 FROM files f;
 ```
 
-## Choose the image size
+## Choose a model
 
-You set the longer side of each page image, in pixels, with the second
-argument of `AI.PDF_PAGES`. The model reads one token per 32 by 32
-pixels, so a US Letter page at 1,024 pixels costs 800 tokens. You can
-raise the size for small print; the default is 1,536.
+A model needs a vision tower to read pixels. The models with a vision
+tower are `qwen3.5-4b-bf16`, `qwen3.5-4b-fp8`, `qwen3.5-27b-fp8`,
+`qwen3.8-27b-fp8`, and `qwen3.6-35b-a3b-fp8`.
 
-## Extract fields from a PDF's text
+## Choose an image size
 
-You need text, not images, to use `AI.EXTRACT`, because it copies each
-answer from the document. `AI.PARSE_DOCUMENT` returns the text a PDF
-stores. Quail has no OCR, so a scanned page gives you no text:
+The second argument of `AI.PDF_PAGES` sets the longest side of each
+image, in pixels. The default is 1,536. A model reads one token per 32
+by 32 pixels. A US Letter page at 1,024 pixels is 800 tokens.
+
+## Parse to text
+
+Quail does not support a text parser yet. If you absolutely must parse,
+`AI.PARSE_DOCUMENT` returns the text a PDF stores. A scanned page stores
+no text. `AI.EXTRACT` needs text:
 
 ```sql
 SELECT f.path,
