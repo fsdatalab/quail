@@ -73,9 +73,11 @@ WHERE AI.IF(PROMPT('Does this page cap either party''s liability? {0}',
 
 ### Ask about a whole PDF
 
-An AI function reads the list from `AI.PDF_PAGES` as one document. The
-third and fourth arguments of `AI.PDF_PAGES` set the first and last
-pages. The query below classifies each PDF from its first three pages:
+An AI function reads the list from `AI.PDF_PAGES` as one document. If
+you don't want to run the AI function on every page of a long PDF, you
+can set the first and last pages with the third and fourth arguments of
+`AI.PDF_PAGES`. The query below classifies each PDF from its first three
+pages:
 
 ```sql
 SELECT f.path,
