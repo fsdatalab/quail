@@ -149,7 +149,10 @@ def quail(model_name: str) -> dict:
     tokenizer = AutoTokenizer.from_pretrained(spec.hf_name,
                                               revision=spec.revision or None)
     prompts = _prompts(spec, tokenizer)
+    # the loader keeps answer rows of the head, which no feature reads
     loaded = load_model(spec.hf_name, spec.revision or None,
+                        answer_token_ids=tokenizer(
+                            "TRUE FALSE", add_special_tokens=False)["input_ids"],
                         max_batched_tokens=BUDGET,
                         text_only=spec.vision_tower, num_layers=spec.layers)
     model_memory_bytes = torch.cuda.memory_allocated()
