@@ -56,8 +56,8 @@ session.register("receipts", quail.DocumentProvider.from_table(receipts, id_col=
 ```
 
 Finally, pass the image column to an AI function. In the query below,
-`AI.IF` keeps each receipt over 100,000 rupiah. `AI.CLASSIFY` then labels
-what each kept receipt paid for:
+`AI.IF` finds each receipt over 100,000 rupiah. `AI.CLASSIFY` then labels
+what each receipt over the limit paid for:
 
 ```sql
 SELECT r.id,
@@ -68,7 +68,7 @@ WHERE AI.IF(PROMPT('Is this receipt''s total over 100,000 rupiah? {0}', r.image)
 
 | ![A receipt for coffees and chicken katsu](./receipts/meal.jpg) | ![A receipt for a fresh cream cake](./receipts/cake.jpg) | ![A receipt for 91,000 rupiah](./receipts/under.jpg) |
 | --- | --- | --- |
-| 174,600: kept, `meal` | 230,000: kept, `bakery or snacks` | 91,000: not kept |
+| 174,600: returned, `meal` | 230,000: returned, `bakery or snacks` | 91,000: filtered out |
 
 You get answers for all 1,000 receipts in 100 seconds on one H100 with
 `qwen3.5-4b-bf16`, for $0.11. The filter was right on 96.8% of the 972

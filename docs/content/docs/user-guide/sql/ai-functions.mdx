@@ -211,7 +211,7 @@ FROM (SELECT f.path, UNNEST(AI.PDF_PAGES(f.pdf)) AS u
 | | |
 | --- | --- |
 | **Description** | `AI.PDF_PAGES` returns a list with one struct per page, in page order. `page` is the page's number, from 1, and `image` is the page as a PNG in 8-bit RGB. The list is `NULL` when the PDF is `NULL` or Quail cannot read it. An `image` is `NULL` when Quail cannot draw the page. |
-| **Image size** | The longer side of an image is `longest_edge` pixels. The other side keeps the page's shape, rounded to a multiple of 32 pixels. Quail draws the page as large as fits, in the center of the image, on white. A US Letter page is 1184 by 1536 pixels at the default. |
+| **Image size** | The longer side of an image is `longest_edge` pixels. The other side follows the page's shape, rounded to a multiple of 32 pixels. Quail draws the page as large as fits, in the center of the image, on white. A US Letter page is 1184 by 1536 pixels at the default. |
 | **Use in SQL** | Write `UNNEST(AI.PDF_PAGES(...)) AS u` in a subquery to return one row per page, and read a field in the outer query as `p.u['page']`. Read one field without a subquery as `UNNEST(AI.PDF_PAGES(f.pdf))['page']`. Read one page without `UNNEST` as `array_element(AI.PDF_PAGES(f.pdf), 1)['image']`. Quail does not accept `UNNEST` or `FLATTEN` in `FROM`, or `AI.PDF_PAGES(f.pdf)[1]`. Quail draws each PDF on the CPU, with no model, and only for the rows that pass the filters on other columns. |
 | **Result** | `('lease-17.pdf', 1, <PNG>)`, `('lease-17.pdf', 2, <PNG>)`, `('inv-0193.pdf', 1, <PNG>)` |
 | **Alias** | `AI_PDF_PAGES` |
@@ -230,7 +230,7 @@ WHERE AI.IF(PROMPT('Is this receipt''s total over 100,000 rupiah? {0}',
 
 | | |
 | --- | --- |
-| **Description** | `AI.IMAGE` returns an image whose longer side is at most `longest_edge` pixels. The function keeps the image's shape and its format: a PNG stays a lossless PNG, and a JPEG becomes a JPEG at quality 90. An image already small enough keeps its bytes. The image is `NULL` when the input is `NULL` or is not a PNG or a JPEG. |
+| **Description** | `AI.IMAGE` returns an image whose longer side is at most `longest_edge` pixels. The function preserves the image's shape and its format: a PNG stays a lossless PNG, and a JPEG becomes a JPEG at quality 90. An image already small enough comes back unchanged. The image is `NULL` when the input is `NULL` or is not a PNG or a JPEG. |
 | **Use in SQL** | Pass the image to an AI function to cut the tokens a model reads: the model reads one token per 32 by 32 pixels. Quail shrinks each image on the CPU, with no model, and only for the rows that pass the filters on other columns. |
 | **Alias** | `AI_IMAGE` |
 | **image** | A `BINARY` column of PNG or JPEG images. |
