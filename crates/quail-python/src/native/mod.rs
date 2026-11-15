@@ -323,14 +323,19 @@ fn read_and_write_plan(text: &str) -> PyResult<String> {
         .map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
-/// The (width, height) the model reads an image at, as the planner
-/// counts its tokens.
+/// The (width, height) a model reads an image at, as the planner counts
+/// its tokens: `token_pixels` along each side of a token, and at most
+/// `max_pixels`.
 ///
 /// Raises a ValueError when the bytes are not a PNG or a JPEG the model
 /// reads.
 #[pyfunction]
-fn image_size(image: &[u8]) -> PyResult<(u32, u32)> {
-    quail::image_size(image).map_err(|error| PyValueError::new_err(error.to_string()))
+fn image_size(image: &[u8], token_pixels: u32, max_pixels: u64) -> PyResult<(u32, u32)> {
+    let sizing = quail::ImageSizing {
+        token_pixels,
+        max_pixels,
+    };
+    quail::image_size(image, sizing).map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
 /// Bind one AI function call's prompt, as `PromptBinder.bind` does.
@@ -1246,7 +1251,6 @@ pub fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module.add("PROBABILITIES_SUFFIX", shared::PROBABILITIES_SUFFIX)?;
         module.add("NULL_DOCUMENT", shared::NULL_DOCUMENT)?;
         module.add("IMAGE_TOKEN_BASE", shared::IMAGE_TOKEN_BASE)?;
-        module.add("IMAGE_TOKEN_PIXELS", shared::IMAGE_TOKEN_PIXELS)?;
         module.add("LABEL_PREFIX", shared::LABEL_PREFIX)?;
         module.add("DEFAULT_SELECTIVITY", shared::DEFAULT_SELECTIVITY)?;
         module.add("FIRST_WINDOW_CHARS", shared::FIRST_WINDOW_CHARS)?;

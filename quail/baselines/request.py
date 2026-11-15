@@ -48,7 +48,8 @@ def execute_request_graph(context, backend, engine_state, boot):
         },
     ))
     client = engine_state["client"]
-    images = RegionImages(documents, context.request.column_tables())
+    images = RegionImages(documents, context.request.column_tables(),
+                          context.registry.model(envelope["model"]))
     if images:
         if not hasattr(client, "image_pad_id"):
             raise ValueError(f"{backend.name} reads no image documents")

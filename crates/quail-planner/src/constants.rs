@@ -37,9 +37,6 @@ pub const NULL_DOCUMENT: &str = "__null_document";
 /// executor reads each id's embedding from the vision encoder instead of
 /// the vocabulary.
 pub const IMAGE_TOKEN_BASE: i32 = 1 << 30;
-/// The pixels on each side of an image token: Qwen's 16-pixel patch,
-/// merged 2 by 2.
-pub const IMAGE_TOKEN_PIXELS: u32 = 32;
 
 // ---- classification
 

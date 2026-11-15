@@ -8,7 +8,7 @@ use std::sync::Arc;
 use arrow::array::{
     Array, ArrayRef, AsArray, Float32Array, Float64Array, Int32Array, RecordBatch, new_empty_array,
 };
-use arrow::compute::{cast, concat};
+use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::row::{RowConverter, SortField};
 use quail_datafusion::derive::expressions::PhysicalValue;
@@ -54,7 +54,9 @@ fn column(table: &Table, name: &str) -> Result<Option<ArrayRef>, CompileError> {
             schema.field(index).data_type(),
         )));
     }
-    concat(&chunks).map(Some).map_err(arrow_error)
+    crate::shared::concat_chunks(&chunks)
+        .map(Some)
+        .map_err(arrow_error)
 }
 
 fn table_of(columns: Vec<(String, ArrayRef)>) -> Result<Table, CompileError> {
@@ -163,7 +165,9 @@ fn document_values(
     if chunks.is_empty() {
         return Ok(Some(new_empty_array(&DataType::Utf8)));
     }
-    concat(&chunks).map(Some).map_err(arrow_error)
+    crate::shared::concat_chunks(&chunks)
+        .map(Some)
+        .map_err(arrow_error)
 }
 
 /// The text of a scan's documents, when the scan's columns hold every

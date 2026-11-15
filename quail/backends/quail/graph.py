@@ -167,7 +167,8 @@ def serve_region(state, payload, graph: PhysicalGraph, end, wanted,
     torch, arena = state["gpu"].torch, state["gpu"].arena
     pipeline = state["gpu"].pipeline
     if hasattr(pipeline, "images"):
-        pipeline.images = RegionImages(payload["documents"], payload["columns"])
+        pipeline.images = RegionImages(payload["documents"], payload["columns"],
+                                       pipeline.spec)
     try:
         with torch.inference_mode():
             results = serve_stages(

@@ -64,7 +64,7 @@ pub use quail_datafusion as extension;
 /// The planner of one model region.
 pub use quail_planner as planner;
 
-pub use crate::images::image_size;
+pub use crate::images::{ImageSizing, image_size};
 
 pub use crate::executor::{
     EngineRegion, Executor, InputHint, Observer, RegionEngine, RegionEvent, RegionRan, RegionSink,

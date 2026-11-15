@@ -180,6 +180,16 @@ pub struct ModelSpec {
     /// its encoder calls' activations, and a chunk's image embeddings.
     #[serde(default)]
     pub vision_mem_bytes: f64,
+    /// The image processor's patch side in pixels, its patches merged
+    /// along each side of one image token, and the most pixels it reads
+    /// an image at (`patch_size`, `merge_size`, and `size.longest_edge` in
+    /// a checkpoint's preprocessor_config.json).
+    #[serde(default)]
+    pub image_patch_pixels: i64,
+    #[serde(default)]
+    pub image_merge: i64,
+    #[serde(default)]
+    pub image_max_pixels: i64,
     #[serde(default)]
     pub max_num_seqs: i64,
     #[serde(default)]

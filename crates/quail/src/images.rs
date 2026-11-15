@@ -3,7 +3,8 @@
 //!
 //! The model reads an image at the size [`image_size`] gives, as Qwen's
 //! image processor resizes it. An image of `w` by `h` pixels at that
-//! size is `(w / 32) * (h / 32)` image tokens
+//! size is `(w / t) * (h / t)` image tokens, where `t` is the model's
+//! [`ImageSizing::token_pixels`],
 //! between the model's vision start and end tokens. Each image token's
 //! id is [`IMAGE_TOKEN_BASE`] or more, unique to the image's bytes, so
 //! the planner counts, shares, and deduplicates image documents as it
@@ -17,18 +18,45 @@ use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, AsArray, Int32Builder, LargeListArray, LargeListBuilder};
 use arrow::datatypes::DataType;
-use quail_planner::constants::{IMAGE_TOKEN_BASE, IMAGE_TOKEN_PIXELS};
+use quail_planner::constants::IMAGE_TOKEN_BASE;
 use quail_planner::error::CompileError;
 use quail_planner::inputs::HfTokenizer;
 
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
 const JPEG_SIGNATURE: &[u8] = b"\xff\xd8\xff";
-/// The most pixels Qwen3.5's image processor reads an image at
-/// (`longest_edge` in its preprocessor_config.json).
-const MAX_PIXELS: f64 = 16_777_216.0;
 /// The longest an image's longer side may be, as a multiple of its
-/// shorter side, as Qwen's image processor allows.
+/// shorter side, as Qwen's `smart_resize` allows.
 const MAX_ASPECT: u32 = 200;
+
+/// How a model's image processor sizes an image, from the model's spec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageSizing {
+    /// The pixels along each side of one image token: the patch's side
+    /// times the patches merged along a side.
+    pub token_pixels: u32,
+    /// The most pixels the model reads an image at.
+    pub max_pixels: u64,
+}
+
+impl ImageSizing {
+    /// The sizing a model spec, as JSON, gives; None when the model
+    /// loads no vision encoder.
+    pub(crate) fn of_model(model: &serde_json::Value) -> Option<Self> {
+        let field = |name: &str| model[name].as_u64().unwrap_or(0);
+        // a spec that loads only some of its checkpoint's layers loads no
+        // vision encoder
+        if !model["vision_tower"].as_bool().unwrap_or(false) || field("checkpoint_layers") != 0 {
+            return None;
+        }
+        let token_pixels =
+            u32::try_from(field("image_patch_pixels") * field("image_merge")).ok()?;
+        let max_pixels = field("image_max_pixels");
+        (token_pixels > 0 && max_pixels > 0).then_some(Self {
+            token_pixels,
+            max_pixels,
+        })
+    }
+}
 /// The field of a page struct that holds its PNG, as AI.PDF_PAGES names it.
 const PAGE_IMAGE: &str = "image";
 
@@ -96,15 +124,16 @@ fn jpeg_size(bytes: &[u8]) -> Option<(u32, u32)> {
 }
 
 /// The width and height the model reads an image at: each side a
-/// multiple of 32 pixels and the area at most [`MAX_PIXELS`], as Qwen's
-/// `smart_resize` gives them. Unlike `smart_resize`, a small image stays
-/// small rather than growing to 65,536 pixels.
+/// multiple of the sizing's token pixels and the area at most its
+/// maximum, as Qwen's `smart_resize` gives them. Unlike `smart_resize`,
+/// a small image stays small rather than growing to the processor's
+/// minimum.
 ///
 /// # Errors
 ///
 /// The bytes are not a PNG or a JPEG, or the image has no pixels or is
 /// over 200 times as long as it is wide.
-pub fn image_size(bytes: &[u8]) -> Result<(u32, u32), CompileError> {
+pub fn image_size(bytes: &[u8], sizing: ImageSizing) -> Result<(u32, u32), CompileError> {
     let Some((width, height)) = png_size(bytes).or_else(|| jpeg_size(bytes)) else {
         return Err(CompileError::new(
             "an image document must be a PNG or a JPEG, such as a page AI.PDF_PAGES renders",
@@ -116,13 +145,14 @@ pub fn image_size(bytes: &[u8]) -> Result<(u32, u32), CompileError> {
              side; one is {width} by {height}"
         )));
     }
-    let factor = f64::from(IMAGE_TOKEN_PIXELS);
+    let factor = f64::from(sizing.token_pixels);
+    let max_pixels = sizing.max_pixels as f64;
     let (width, height) = (f64::from(width), f64::from(height));
     // Python's round(), which rounds a half to the even multiple
     let mut sides =
         [height, width].map(|side| factor.max((side / factor).round_ties_even() * factor));
-    if sides[0] * sides[1] > MAX_PIXELS {
-        let beta = (height * width / MAX_PIXELS).sqrt();
+    if sides[0] * sides[1] > max_pixels {
+        let beta = (height * width / max_pixels).sqrt();
         sides = [height, width].map(|side| factor.max((side / beta / factor).floor() * factor));
     }
     Ok((sides[1] as u32, sides[0] as u32))
@@ -176,6 +206,7 @@ pub(crate) fn image_token_lists(
     values: &ArrayRef,
     tokenizer: &HfTokenizer,
     ids: &mut ImageIds,
+    sizing: ImageSizing,
 ) -> Result<LargeListArray, CompileError> {
     let special = |token: &str| {
         tokenizer.added_token_id(token).ok_or_else(|| {
@@ -202,7 +233,7 @@ pub(crate) fn image_token_lists(
             );
             return Ok(());
         }
-        let count = image_tokens(bytes)?;
+        let count = image_tokens(bytes, sizing)?;
         let first = ids.first_id(bytes, count)?;
         tokens.append_value(start);
         tokens.append_values(
@@ -272,11 +303,12 @@ pub(crate) fn image_token_lists(
     Ok(lists.finish())
 }
 
-/// The image tokens of an image: one per 32 by 32 pixels of the size
-/// the model reads it at.
-fn image_tokens(bytes: &[u8]) -> Result<i64, CompileError> {
-    let (width, height) = image_size(bytes)?;
-    Ok(i64::from(width / IMAGE_TOKEN_PIXELS) * i64::from(height / IMAGE_TOKEN_PIXELS))
+/// The image tokens of an image: one per token's square of pixels, at
+/// the size the model reads it.
+fn image_tokens(bytes: &[u8], sizing: ImageSizing) -> Result<i64, CompileError> {
+    let (width, height) = image_size(bytes, sizing)?;
+    let side = sizing.token_pixels;
+    Ok(i64::from(width / side) * i64::from(height / side))
 }
 
 #[cfg(test)]
@@ -301,12 +333,46 @@ mod tests {
         bytes
     }
 
+    /// Qwen3.5's image processor: 16-pixel patches, merged 2 by 2.
+    const QWEN: ImageSizing = ImageSizing {
+        token_pixels: 32,
+        max_pixels: 16_777_216,
+    };
+
     #[test]
     fn an_image_is_one_token_per_32_pixels_square() {
-        assert_eq!(image_tokens(&png(320, 256)).unwrap(), 80);
-        assert_eq!(image_tokens(&jpeg(320, 256)).unwrap(), 80);
-        assert!(image_tokens(b"not an image at all, longer than 24").is_err());
-        assert!(image_tokens(&png(64, 64 * 201)).is_err());
+        assert_eq!(image_tokens(&png(320, 256), QWEN).unwrap(), 80);
+        assert_eq!(image_tokens(&jpeg(320, 256), QWEN).unwrap(), 80);
+        assert!(image_tokens(b"not an image at all, longer than 24", QWEN).is_err());
+        assert!(image_tokens(&png(64, 64 * 201), QWEN).is_err());
+    }
+
+    #[test]
+    fn a_model_with_other_patches_sizes_an_image_its_own_way() {
+        // 14-pixel patches merged 2 by 2, as Qwen2-VL reads them
+        let other = ImageSizing {
+            token_pixels: 28,
+            max_pixels: 1_000_000,
+        };
+        assert_eq!(image_size(&png(1000, 750), other).unwrap(), (1008, 756));
+        assert_eq!(image_tokens(&png(1000, 750), other).unwrap(), 36 * 27);
+        // over the maximum, the image shrinks below a million pixels
+        let (width, height) = image_size(&png(4000, 3000), other).unwrap();
+        assert!(width * height <= 1_000_000, "{width} by {height}");
+    }
+
+    #[test]
+    fn a_spec_reads_images_only_when_it_loads_its_vision_tower() {
+        let spec = serde_json::json!({"vision_tower": true, "image_patch_pixels": 16,
+                                      "image_merge": 2, "image_max_pixels": 16_777_216});
+        assert_eq!(ImageSizing::of_model(&spec), Some(QWEN));
+        let mut partial = spec.clone();
+        partial["checkpoint_layers"] = 24.into();
+        assert_eq!(ImageSizing::of_model(&partial), None);
+        assert_eq!(
+            ImageSizing::of_model(&serde_json::json!({"vision_tower": false})),
+            None
+        );
     }
 
     #[test]
@@ -320,9 +386,9 @@ mod tests {
             ((20000, 15000), (4704, 3520)),
             ((1040, 1040), (1024, 1024)),
         ] {
-            assert_eq!(image_size(&png(width, height)).unwrap(), resized);
+            assert_eq!(image_size(&png(width, height), QWEN).unwrap(), resized);
         }
-        assert_eq!(image_size(&jpeg(1000, 750)).unwrap(), (992, 736));
+        assert_eq!(image_size(&jpeg(1000, 750), QWEN).unwrap(), (992, 736));
     }
 
     #[test]

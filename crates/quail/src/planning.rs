@@ -203,12 +203,8 @@ impl Planner {
             let rows = tables
                 .get(&scan.provider)
                 .ok_or_else(|| CompileError::new(format!("no rows for table {}", scan.provider)))?;
-            // a spec that loads only some of its checkpoint's layers loads no
-            // vision encoder
-            let reads_images = settings.model["vision_tower"].as_bool().unwrap_or(false)
-                && settings.model["checkpoint_layers"].as_i64().unwrap_or(0) == 0;
-            let store =
-                self.token_store(scan, rows, extracted.contains(&scan.alias), reads_images)?;
+            let sizing = crate::images::ImageSizing::of_model(&settings.model);
+            let store = self.token_store(scan, rows, extracted.contains(&scan.alias), sizing)?;
             let mut names = scan.columns.clone();
             // the executor reads the document's text to locate answers in it
             if let Some(source) = source_column(&scan.column)
@@ -379,7 +375,7 @@ impl Planner {
         scan: &Scan,
         rows: &TableRows,
         with_offsets: bool,
-        reads_images: bool,
+        sizing: Option<crate::images::ImageSizing>,
     ) -> Result<Arc<TokenStore>, CompileError> {
         let key = rows
             .identity
@@ -411,12 +407,12 @@ impl Planner {
         for batch in &rows.batches {
             let values = document_values(&scan.column, built.as_ref(), batch)?;
             if crate::images::holds_images(values.data_type()) {
-                if !reads_images {
+                let Some(sizing) = sizing else {
                     return Err(CompileError::new(
                         "the model reads no images; an image document needs a model \
                          that loads its vision tower, such as qwen3.5-4b-fp8",
                     ));
-                }
+                };
                 if with_offsets {
                     return Err(CompileError::new(
                         "AI.EXTRACT copies its answers from a document's text, and an \
@@ -424,7 +420,8 @@ impl Planner {
                     ));
                 }
                 let mut ids = self.images.lock().expect("the image ids lock");
-                let tokens = crate::images::image_token_lists(&values, &self.tokenizer, &mut ids)?;
+                let tokens =
+                    crate::images::image_token_lists(&values, &self.tokenizer, &mut ids, sizing)?;
                 writer.write(tokens).map_err(arrow_error)?;
             } else {
                 let text = cast(&values, &DataType::Utf8).map_err(arrow_error)?;

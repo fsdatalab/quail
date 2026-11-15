@@ -12,7 +12,11 @@ use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
+use arrow::array::{Array, ArrayRef};
 use arrow::buffer::Buffer;
+use arrow::compute::{cast, concat};
+use arrow::datatypes::DataType;
+use arrow::error::ArrowError;
 use arrow::ipc::convert::fb_to_schema;
 use arrow::ipc::reader::{FileDecoder, read_footer_length};
 use arrow::ipc::writer::{FileWriter, IpcWriteOptions};
@@ -35,6 +39,50 @@ const ALIGNMENT: usize = 64;
 
 fn failure(error: impl std::fmt::Display) -> DataFusionError {
     DataFusionError::Execution(error.to_string())
+}
+
+/// One array of `chunks`, which may hold more than 2 GiB of bytes, such
+/// as a column of photos. An array whose 32-bit offsets cannot reach its
+/// bytes takes Arrow's large types, with 64-bit offsets, instead.
+///
+/// # Errors
+///
+/// The chunks differ in type, or do not concatenate even as large types.
+pub(crate) fn concat_chunks(chunks: &[&dyn Array]) -> std::result::Result<ArrayRef, ArrowError> {
+    match concat(chunks) {
+        Err(ArrowError::OffsetOverflowError(_)) if !chunks.is_empty() => concat_large(chunks),
+        found => found,
+    }
+}
+
+/// One array of `chunks`, in Arrow's large types.
+fn concat_large(chunks: &[&dyn Array]) -> std::result::Result<ArrayRef, ArrowError> {
+    let large = large_type(chunks[0].data_type());
+    let cast_chunks = (chunks.iter())
+        .map(|chunk| cast(*chunk, &large))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    concat(&cast_chunks.iter().map(AsRef::as_ref).collect::<Vec<_>>())
+}
+
+/// A type with 64-bit offsets wherever `data_type` has 32-bit ones.
+fn large_type(data_type: &DataType) -> DataType {
+    let large_field = |field: &arrow::datatypes::FieldRef| {
+        Arc::new(
+            field
+                .as_ref()
+                .clone()
+                .with_data_type(large_type(field.data_type())),
+        )
+    };
+    match data_type {
+        DataType::Binary => DataType::LargeBinary,
+        DataType::Utf8 => DataType::LargeUtf8,
+        DataType::List(field) | DataType::LargeList(field) => {
+            DataType::LargeList(large_field(field))
+        }
+        DataType::Struct(fields) => DataType::Struct(fields.iter().map(large_field).collect()),
+        other => other.clone(),
+    }
 }
 
 /// Write a table to a new file at `path`.
@@ -112,6 +160,29 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
 
     use super::*;
+
+    #[test]
+    fn chunks_past_32_bit_offsets_concatenate_as_large_types() {
+        use arrow::array::{AsArray, BinaryArray, ListArray, StructArray};
+        use arrow::buffer::OffsetBuffer;
+
+        // a column of pages, as AI.PDF_PAGES returns them
+        let pages = |images: &[&[u8]]| -> ArrayRef {
+            let field = Arc::new(Field::new("image", DataType::Binary, true));
+            let images: ArrayRef = Arc::new(BinaryArray::from_iter_values(images.iter()));
+            let pages = StructArray::from(vec![(field, images)]);
+            let item = Arc::new(Field::new("item", pages.data_type().clone(), true));
+            let offsets = OffsetBuffer::from_lengths([pages.len()]);
+            Arc::new(ListArray::new(item, offsets, Arc::new(pages), None))
+        };
+        let (first, second) = (pages(&[b"a", b"bc"]), pages(&[b"def"]));
+        let joined = concat_large(&[first.as_ref(), second.as_ref()]).unwrap();
+        let lists = joined.as_list::<i64>();
+        assert_eq!(lists.len(), 2);
+        let images = lists.values().as_struct().column(0).as_binary::<i64>();
+        let found: Vec<&[u8]> = images.iter().flatten().collect();
+        assert_eq!(found, [b"a".as_slice(), b"bc", b"def"]);
+    }
 
     fn directory(name: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("quail-{name}-{}", std::process::id()));

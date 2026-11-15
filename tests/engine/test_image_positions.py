@@ -14,17 +14,19 @@ from _quail_native import IMAGE_TOKEN_BASE
 from helpers.images import jpeg, png
 
 from quail.backends.quail.executor.images import RegionImages, decode_image
+from quail.specs import MODELS
 
 FIRST = IMAGE_TOKEN_BASE
 START, END = 3060, 3061
 # 2 columns by 3 rows of image tokens: 6 tokens, positions advance 3
 IMAGE = [START, *range(FIRST, FIRST + 6), END]
 KEY = ("pages", 0)
+SPEC = MODELS["qwen3.5-4b-bf16"]
 
 
 def _images():
     columns = {"pages": pa.table({"image": pa.array([png(64, 96)], pa.binary())})}
-    return RegionImages({"pages": [IMAGE]}, columns)
+    return RegionImages({"pages": [IMAGE]}, columns, SPEC)
 
 
 def _chunk(ids, positions, row_spans, decode=None):
@@ -106,7 +108,8 @@ def test_a_document_of_two_images_shifts_each_row_by_the_images_before_it():
     a, b = range(FIRST, FIRST + 6), range(FIRST + 6, FIRST + 10)
     parts = pa.array([[png(64, 96), b"between", png(64, 64)]], pa.list_(pa.binary()))
     document = [START, *a, END, 9, START, *b, END, 10]
-    images = RegionImages({"pages": [document]}, {"pages": pa.table({"parts": parts})})
+    images = RegionImages({"pages": [document]}, {"pages": pa.table({"parts": parts})},
+                          SPEC)
     ids = [7, 8, *document]
     chunk = _chunk(ids, list(range(len(ids))), [(KEY, 0, len(ids), len(ids))])
     rotary = images.rotary_positions(chunk, ()).numpy()
@@ -122,6 +125,6 @@ def test_an_image_decodes_at_the_size_the_planner_counts():
         tokens = rows * columns
         document = [START, *range(FIRST, FIRST + tokens), END]
         found = RegionImages({"pages": [document]}, {"pages": pa.table(
-            {"image": pa.array([image], pa.binary())})}).images[FIRST]
+            {"image": pa.array([image], pa.binary())})}, SPEC).images[FIRST]
         assert (found.rows, found.columns) == (rows, columns)
-        assert decode_image(found).shape == (32 * rows, 32 * columns, 3)
+        assert decode_image(found, 32).shape == (32 * rows, 32 * columns, 3)

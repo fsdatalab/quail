@@ -24,13 +24,11 @@ from dataclasses import dataclass
 
 import numpy as np
 import pyarrow as pa
-from _quail_native import IMAGE_TOKEN_BASE, IMAGE_TOKEN_PIXELS, image_size
+from _quail_native import IMAGE_TOKEN_BASE, image_size
 
-# Qwen's vision patch, the frames each patch covers, and the patches
-# merged into one token along each side
-PATCH_PIXELS = 16
+# the frames each of Qwen's vision patches covers; a still image fills
+# both with the same pixels
 TEMPORAL_PATCH = 2
-MERGE = IMAGE_TOKEN_PIXELS // PATCH_PIXELS
 IMAGE_SIGNATURES = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff")
 # threads that decode a region's images ahead of the vision encoder
 DECODE_THREADS = 8
@@ -85,12 +83,14 @@ def png_size(png: bytes) -> tuple[int, int]:
     return (int.from_bytes(png[16:20], "big"), int.from_bytes(png[20:24], "big"))
 
 
-def pixel_patches(torch, rgb):
+def pixel_patches(torch, rgb, patch_pixels: int, merge: int):
     """An image's pixels as the vision encoder's patches, in Qwen's order.
 
     Args:
         torch: The torch module.
         rgb: The image, (height, width, 3) uint8 on the GPU.
+        patch_pixels: The side of one patch, in pixels.
+        merge: The patches merged along each side of one image token.
 
     Returns:
         (patches, grid): (rows * columns * 4, 1536) float32 patches, and
@@ -98,21 +98,26 @@ def pixel_patches(torch, rgb):
         writes them.
     """
     height, width, _ = rgb.shape
-    grid_h, grid_w = height // PATCH_PIXELS, width // PATCH_PIXELS
+    grid_h, grid_w = height // patch_pixels, width // patch_pixels
     x = rgb.permute(2, 0, 1).float().div(255.0).sub(0.5).div(0.5)
     x = x.unsqueeze(0).expand(TEMPORAL_PATCH, -1, -1, -1)
-    x = x.reshape(1, TEMPORAL_PATCH, 3, grid_h // MERGE, MERGE, PATCH_PIXELS,
-                  grid_w // MERGE, MERGE, PATCH_PIXELS)
+    x = x.reshape(1, TEMPORAL_PATCH, 3, grid_h // merge, merge, patch_pixels,
+                  grid_w // merge, merge, patch_pixels)
     x = x.permute(0, 3, 6, 4, 7, 2, 1, 5, 8)
-    patches = x.reshape(grid_h * grid_w, 3 * TEMPORAL_PATCH * PATCH_PIXELS ** 2)
+    patches = x.reshape(grid_h * grid_w, 3 * TEMPORAL_PATCH * patch_pixels ** 2)
     return patches, (1, grid_h, grid_w)
 
 
-def decode_image(image: Image) -> np.ndarray:
-    """An image's pixels at the size the model reads, as (height, width, 3) uint8."""
+def decode_image(image: Image, token_pixels: int) -> np.ndarray:
+    """An image's pixels at the size the model reads, as (height, width, 3) uint8.
+
+    Args:
+        image: The image.
+        token_pixels: The pixels along each side of one image token.
+    """
     from PIL import Image as PILImage
 
-    width, height = image.columns * IMAGE_TOKEN_PIXELS, image.rows * IMAGE_TOKEN_PIXELS
+    width, height = image.columns * token_pixels, image.rows * token_pixels
     with PILImage.open(io.BytesIO(image.encoded)) as opened:
         rgb = opened.convert("RGB")
         # Qwen's image processor resizes with bicubic interpolation
@@ -129,9 +134,14 @@ class RegionImages:
         columns: The region's value columns by alias; an alias whose
             documents are images has a binary column of their PNGs or
             JPEGs.
+        spec: The model's spec, whose image fields size each image.
     """
 
-    def __init__(self, documents: dict, columns: dict):
+    def __init__(self, documents: dict, columns: dict, spec):
+        self.patch_pixels = spec.image_patch_pixels
+        self.merge = spec.image_merge
+        self.token_pixels = self.patch_pixels * self.merge
+        max_pixels = spec.image_max_pixels
         self.images: dict[int, Image] = {}
         # by alias, each document's images' first token ids, in order
         self.firsts: dict[str, list[tuple[int, ...]]] = {}
@@ -153,10 +163,10 @@ class RegionImages:
                 firsts.append(found)
                 for first, image in zip(found, encoded, strict=True):
                     if first not in self.images:
-                        width, height = image_size(image)
+                        width, height = image_size(image, self.token_pixels, max_pixels)
                         self.images[first] = Image(
-                            first, height // IMAGE_TOKEN_PIXELS,
-                            width // IMAGE_TOKEN_PIXELS, image)
+                            first, height // self.token_pixels,
+                            width // self.token_pixels, image)
             self.firsts[alias] = firsts
         order = sorted(self.images)
         self._sorted = np.asarray(order, dtype=np.int64)
@@ -167,7 +177,8 @@ class RegionImages:
             from concurrent.futures import ThreadPoolExecutor
 
             self._pool = ThreadPoolExecutor(max_workers=DECODE_THREADS)
-            self._pixels = {first: self._pool.submit(decode_image, image)
+            self._pixels = {first: self._pool.submit(decode_image, image,
+                                                     self.token_pixels)
                             for first, image in self.images.items()}
         self._embeddings: dict[int, object] = {}
         # (start, end) CUDA events around each encoder call, the seconds
@@ -257,7 +268,7 @@ class RegionImages:
         """
         batch, patches = [], 0
         for first in firsts:
-            size = MERGE * MERGE * self.images[first].tokens
+            size = self.merge * self.merge * self.images[first].tokens
             if batch and patches + size > ENCODER_PATCHES:
                 self._encode_batch(torch, visual, batch, dtype)
                 batch, patches = [], 0
@@ -277,11 +288,12 @@ class RegionImages:
         for first in firsts:
             waited = time.perf_counter()
             pixels = self._pixels.pop(first, None)
-            pixels = (decode_image(self.images[first]) if pixels is None
+            pixels = (decode_image(self.images[first], self.token_pixels)
+                      if pixels is None
                       else pixels.result())
             self.decode_wait_s += time.perf_counter() - waited
             rgb = torch.from_numpy(pixels.copy()).to(device)
-            found, grid = pixel_patches(torch, rgb)
+            found, grid = pixel_patches(torch, rgb, self.patch_pixels, self.merge)
             patches.append(found)
             grids.append(grid)
         pixel_values = torch.cat(patches).to(visual_dtype(visual))

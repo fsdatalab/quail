@@ -199,6 +199,13 @@ class ModelSpec:
     #                                  the text weights: its weights, its
     #                                  encoder calls' activations, and a
     #                                  chunk's image embeddings
+    # the image processor's patch side in pixels, its patches merged along
+    # each side of one image token, and the most pixels it reads an image
+    # at: patch_size, merge_size, and size.longest_edge in the checkpoint's
+    # preprocessor_config.json
+    image_patch_pixels: int = 0
+    image_merge: int = 0
+    image_max_pixels: int = 0
     max_num_seqs: int = 0    # sequences vLLM may run at once; 0 keeps the
     #                          engine setting. A hybrid model holds one
     #                          recurrent-state block per running sequence,
@@ -225,6 +232,11 @@ class ModelSpec:
             raise ValueError(
                 f"{self.name}: checkpoint_layers ({self.checkpoint_layers}) "
                 f"is below layers ({self.layers})")
+        if self.vision_tower and not self.checkpoint_layers and not (
+                self.image_patch_pixels and self.image_merge and self.image_max_pixels):
+            raise ValueError(
+                f"{self.name}: a vision tower needs image_patch_pixels, "
+                "image_merge, and image_max_pixels")
         if self.layer_kinds and len(self.layer_kinds) != self.layers:
             raise ValueError(
                 f"{self.name}: layer_kinds has {len(self.layer_kinds)} "
