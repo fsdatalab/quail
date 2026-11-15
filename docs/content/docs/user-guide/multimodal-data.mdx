@@ -90,9 +90,8 @@ WHERE AI.IF(PROMPT('Is this receipt''s total over 100,000 rupiah? {0}',
                    AI.IMAGE(r.image, 1024)));
 ```
 
-CORD's photos are up to 4,224 pixels on a side. At 1,024 pixels, the
-query took 22 seconds instead of 92, for $0.02. The filter was right on
-96.7% of the receipts, against 96.8% at full size.
+The query at 1,024 pixels ran 4 times faster on CORD's photos, at a drop
+of only 0.1 points in accuracy.
 
 ## PDFs
 
