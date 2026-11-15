@@ -129,7 +129,9 @@ def execution_measurements(context: ExecutionContext) -> dict:
             "evicted_keys": arena.evicted_keys,
             "evicted_pages": arena.evicted_pages,
             "evicted_prefix_tokens": arena.evicted_prefix_tokens,
-            **({} if arena.store is None else {"host_store": arena.store.stats()}),
+            **({} if arena.store is None else {
+                "host_store": arena.store.stats(),
+                "reused_tokens": arena.reused_tokens}),
         },
         "memory": memory_report(gpu),
     }

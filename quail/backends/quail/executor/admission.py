@@ -279,10 +279,11 @@ class JoinAdmission:
         one_stage: Whether each anchor asks only its start stage and
             settles there, as a whole-sequence pass does; a limit then
             counts the anchors that survive the last stage.
-        stored: Optional callable(anchor) -> bool, asked as a fresh
-            anchor that borrows nothing is admitted; True means reserve
-            copies its prefix KV into its pages, so it packs no prefix
-            tokens.
+        stored: Optional callable(anchor) -> (tokens, borrowed tokens),
+            asked as a fresh anchor that borrows nothing is admitted:
+            the leading prefix tokens whose KV reserve supplies, so the
+            anchor packs none of them, and how many of those it reads
+            from pages it borrows and so takes no pages for.
 
     Each chunk fills in priority order: partner streams cut by the
     previous chunk, then anchors starting their next stage, then the
@@ -802,11 +803,12 @@ class JoinAdmission:
                 hold.append(a)      # its parent is still queued
                 continue
             # a document that borrows reads its parent's pages; only one
-            # that would pack its whole prefix copies it from the store
-            stored = (borrow is None and self.stored is not None
-                      and bool(self._carried[a]) and self.stored(a))
-            need = (self._page_cost[a] if borrow is None
-                    else self.page_cost(self.prefix[a] - borrow[1] + self._extra))
+            # that would pack its whole prefix asks for KV kept or stored
+            supplied, lent = ((0, 0) if borrow is not None or self.stored is None
+                              or not self._carried[a] else self.stored(a))
+            need = (self._page_cost[a] if borrow is None and not lent
+                    else self.page_cost(self.prefix[a] + self._extra
+                                        - (lent if borrow is None else borrow[1])))
             if blocked and need:
                 hold.append(a)
                 if not self._zero_cost:
@@ -822,7 +824,7 @@ class JoinAdmission:
                 if not self._zero_cost:
                     break
                 continue
-            carried = (0 if stored else self._carried[a] if borrow is None
+            carried = (self._carried[a] - supplied if borrow is None
                        else self.prefix[a] - borrow[1])
             long = self.chunked_prefill and carried + self._first[a] > self.chunk_budget
             if long and not room:

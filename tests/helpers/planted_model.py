@@ -61,11 +61,13 @@ def _alias(name):
 
 
 class _Arena(KVArena):
-    """An arena that records the prefix lengths the host store restored."""
+    """An arena that records each reserved document's prefix length."""
 
-    def restore(self, key, content, tokens):
-        self.__dict__.setdefault("restored", {})[key] = tokens
-        super().restore(key, content, tokens)
+    def reserve(self, key, tokens, **options):
+        reserved = super().reserve(key, tokens, **options)
+        if reserved:
+            self.__dict__.setdefault("prefix_of", {})[key] = tokens
+        return reserved
 
 
 class PlantedModel:
@@ -164,9 +166,9 @@ class PlantedModel:
             first = first and not last
 
     def _held(self, key):
-        """The tokens the key's KV holds, read from the pool once restored."""
+        """The tokens the key's KV holds, read from the pool when it packed none."""
         if key not in self.kv:
-            tokens = self.arena.restored[key]
+            tokens = self.arena.prefix_of[key]
             self.kv[key] = self._pool_tokens(key, tokens)
             self.prefix_tokens[key] = tokens
         return self.kv[key]

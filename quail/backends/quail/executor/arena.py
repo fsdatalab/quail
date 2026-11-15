@@ -22,7 +22,17 @@ the same methods:
 - attention inputs: layer_kv, paged_kv, block_table, block_table_rows
 - counters: reset_stats, evicted_keys, evicted_pages,
   evicted_prefix_tokens
-- the host store: attach_store, note_prefix, stored, restore, flush_store
+- the host store: attach_store, note_prefix, kept_prefix, stored,
+  restore, flush_store
+
+With a host store, a freed document's prefix KV stays in the arena under
+a key named by its content (a kept prefix) while the arena has room. A
+document admitted later with the same prefix tokens borrows the kept
+prefix's whole pages and takes its place. free_pages counts a kept
+prefix's pages as free: an admission that needs them drops kept
+prefixes, oldest first, before any retained KV. A dropped prefix goes
+to the host store only when its tokens were computed twice, so a
+dataset read once costs no copy.
 """
 
 import math
@@ -31,6 +41,20 @@ import numpy as np
 
 from quail.backends.quail.executor.pages import PageArena, _evict_event
 from quail.progress import answer_sink
+
+# prefixes whose forward passes the arena counts before it starts over
+COMPUTED_CONTENTS = 1 << 21
+
+
+class _Kept:
+    """The arena key of a prefix kept after its document was freed."""
+
+    __slots__ = ("content", "tokens", "pages")
+
+    def __init__(self, content: bytes, tokens: int):
+        self.content = content
+        self.tokens = tokens
+        self.pages = 0    # pages dropping it frees, counted in free_pages
 
 
 class KVArena:
@@ -57,6 +81,8 @@ class KVArena:
 
     # host memory for freed document prefixes (kv_store.KVStore), or None
     store = None
+    # pages dropping every kept prefix frees; none without a store
+    _kept_pages = 0
 
     def __init__(self, num_layers: int, num_pages: int, page_tokens: int,
                  num_kv_heads: int, d_head: int, dtype=None, device="cuda",
@@ -126,6 +152,9 @@ class KVArena:
         self._pool = (storage.view(2 * len(shapes), *shapes[0])
                       if len(set(shapes)) == 1 else None)
         self._prefix_notes = {}   # key -> (content id, tokens) of its prefix
+        self._computed = {}       # content id -> forward passes over the prefix
+        self._kept = {}           # content id -> its _Kept key, oldest first
+        self._kept_pages = 0      # pages dropping every kept prefix frees
         self.k = [part.view(shape) for part, shape in zip(parts[::2], shapes)]
         self.v = [part.view(shape) for part, shape in zip(parts[1::2], shapes)]
         # one checkpoint per slot: the recurrent state in fp32 and the
@@ -166,12 +195,14 @@ class KVArena:
             self.drop_holds()
             for key in self.resident_keys():
                 self.free_key(key)
-        if self.accounting.owned:
+        if self.resident_keys():
             raise RuntimeError("the arena holds keys; free them before resizing")
         if (num_pages, num_sliding_pages, num_state_slots) == (
                 self.num_pages, self.num_sliding_pages, self.num_state_slots):
             return
-        # queued saves read the pools this rebuild replaces
+        # kept prefixes and queued saves read the pools this rebuild replaces
+        while self._drop_kept(protected=()):
+            pass
         self.flush_store()
         page_tokens = self.page_tokens
         self.k = self.v = self._pool = None
@@ -196,6 +227,82 @@ class KVArena:
         """Record that the key's first tokens are the written prefix `content`."""
         if self.store is not None:
             self._prefix_notes[key] = (content, tokens)
+
+    def kept_prefix(self, content: bytes, tokens: int):
+        """The kept prefix a fresh document of these prefix tokens may borrow.
+
+        Returns:
+            (kept key, tokens of its whole pages), or (None, 0) when the
+            arena keeps no such prefix or it fills no whole page.
+        """
+        key = self._kept.get(content)
+        shared = tokens // self.page_tokens * self.page_tokens
+        if key is None or key.tokens != tokens or not shared:
+            return None, 0
+        return key, shared
+
+    def _keep(self, key, content: bytes, tokens: int) -> int | None:
+        """Keep a freed key's prefix under its content; None if one is kept.
+
+        Returns the pages its rows past the prefix freed.
+        """
+        if content in self._kept:
+            return None
+        freed = self.accounting.rewind(key, tokens)
+        kept = self._kept[content] = _Kept(content, tokens)
+        self.accounting.rename(key, kept)
+        # pages a borrower shares stay when the kept prefix goes
+        kept.pages = int((self.accounting.holds[
+            self.accounting.table_pages(kept)] == 1).sum())
+        self._kept_pages += kept.pages
+        for table in (self._rows, self._capacity_rows, self._base,
+                      self._sliding_start):
+            table[kept] = table.pop(key)
+        self._stale_rows.discard(key)
+        self._window_floor.pop(key, None)
+        self._trimmed.discard(key)
+        self._refresh_rows(kept, tokens)
+        return freed
+
+    def note_computed(self, content: bytes) -> None:
+        """Count a forward pass over the prefix `content`."""
+        if len(self._computed) >= COMPUTED_CONTENTS:
+            self._computed.clear()
+        self._computed[content] = self._computed.get(content, 0) + 1
+
+    def lend_kept(self, key) -> None:
+        """An admitted document borrows the kept prefix: its pages are in use."""
+        self._kept_pages -= key.pages
+        key.pages = 0
+
+    def release_kept(self, key) -> None:
+        """Free a lent kept prefix once its borrower's pass has run.
+
+        The borrower holds the pages it borrowed, and is kept in its
+        turn when it is freed.
+        """
+        if self._kept.get(key.content) is key and key not in self._reading:
+            del self._kept[key.content]
+            self._free(key)
+
+    def _drop_kept(self, protected) -> bool:
+        """Drop the oldest kept prefix no admission reads.
+
+        The host store takes a prefix computed twice: some query read
+        it again after the arena had let it go.
+        """
+        if self.store is None:
+            return False
+        for content, key in self._kept.items():
+            if key in protected:
+                continue
+            del self._kept[content]
+            self._kept_pages -= key.pages
+            if self._computed.get(content, 0) >= 2:
+                self.store.save(content, self._rows[key])
+            self._free(key)
+            return True
+        return False
 
     def stored(self, content: bytes, tokens: int) -> bool:
         """Whether the host store holds the prefix with this id and length."""
@@ -287,6 +394,7 @@ class KVArena:
         self.evicted_keys = 0
         self.evicted_pages = 0
         self.evicted_prefix_tokens = 0
+        self.reused_tokens = 0     # prefix tokens borrowed from kept prefixes
         self.memory_trace = []
         self.events = []
         if self.store is not None:
@@ -508,20 +616,23 @@ class KVArena:
         cap = self.accounting.retention_cap_pages
         before = self.free_pages
         if cap is not None:
-            self.evict_retained(max(0, self.accounting.retained_pages - cap))
+            self.evict_retained(max(0, self.accounting.retained_pages - cap),
+                                kept=False)
         return self.free_pages - before
 
-    def evict_retained(self, pages_needed: int) -> tuple:
+    def evict_retained(self, pages_needed: int, kept: bool = True) -> tuple:
         """Evict retained prefixes in planned reuse priority order.
 
         Stops once pages_needed have come free, counted in every-token
-        pages. Returns the evicted keys.
+        pages. Kept prefixes go first unless kept is False, which a cap
+        on retained KV passes. Returns the evicted keys.
         """
-        start = self.free_pages
+        # pages on the free list: free_pages also counts kept prefixes
+        start = self.accounting.free_pages
         return self._evict_until(
-            lambda: self.free_pages - start >= pages_needed)
+            lambda: self.accounting.free_pages - start >= pages_needed, kept=kept)
 
-    def _evict_until(self, satisfied) -> tuple:
+    def _evict_until(self, satisfied, kept: bool = True) -> tuple:
         """Evict retained prefixes in priority order until satisfied() holds.
 
         A held key is never evicted: a queued borrower will read it. Nor
@@ -529,6 +640,9 @@ class KVArena:
         """
         keys = []
         keep = set(self._holds) | set(self._reading)
+        # a kept prefix costs a copy to bring back; retained KV costs a pass
+        while kept and not satisfied() and self._drop_kept(keep):
+            keys.append(_Kept)
         while not satisfied():
             victim = self.accounting.pop_retained_victim(keep=keep)
             if victim is None:
@@ -759,7 +873,12 @@ class KVArena:
         if self.store is not None:
             note = self._prefix_notes.pop(key, None)
             if note is not None and self.accounting.tokens[key] >= note[1]:
-                self.store.save(note[0], self._rows[key][:note[1]])
+                freed = self._keep(key, *note)
+                if freed is not None:
+                    return freed
+        return self._free(key)
+
+    def _free(self, key):
         self._window_floor.pop(key, None)
         self._trimmed.discard(key)
         self._rows.pop(key)
@@ -788,10 +907,13 @@ class KVArena:
 
     @property
     def free_pages(self) -> int:
-        """Free pages in every-token pages: the tighter pool decides."""
+        """Free pages in every-token pages: the tighter pool decides.
+
+        Counts the pages of kept prefixes, which an admission drops.
+        """
         free = self.accounting.free_pages
         if self.sliding is None:
-            return free
+            return free + self._kept_pages
         return min(free, self.sliding.free_pages * self.accounting.num_pages
                    // self.sliding.num_pages)
 
@@ -861,8 +983,12 @@ class KVArena:
         return self.accounting.tokens[key]
 
     def resident_keys(self) -> list:
-        """Every key holding pages, in allocation order."""
-        return list(self.accounting.owned)
+        """Every key an operator holds pages under, in allocation order.
+
+        Kept prefixes are left out: they stay across operators and queries.
+        """
+        return [key for key in self.accounting.owned
+                if not isinstance(key, _Kept)]
 
     def retained_keys(self) -> list:
         """Every key whose KV is kept for a later operator."""

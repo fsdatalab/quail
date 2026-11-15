@@ -260,7 +260,7 @@ class NodeTypes:
         return {"types": list(self.types)}
 
 
-def test_a_second_query_restores_the_documents_the_first_read():
+def test_a_second_query_reuses_the_documents_the_first_read():
     with quail.Session(CONFIG, tokenizer=TOKENIZER) as session:
         session.register("reviews", quail.DocumentProvider.from_table(pa.table({
             "id": [f"r{i}" for i in range(6)],
@@ -269,9 +269,10 @@ def test_a_second_query_restores_the_documents_the_first_read():
         first = _run(session.sql(FILTER_SQL), make_executor(TRUTH))
         second = _run(session.sql(FILTER_SQL), make_executor(TRUTH))
     assert sorted(second.to_rows()) == sorted(first.to_rows()) == [("r0",), ("r3",)]
-    stores = [result.report["kv_manager"]["host_store"] for result in (first, second)]
-    assert stores[0]["restored_tokens"] == 0
-    # the store kept each document the first query freed; the second
-    # read them from it and freed nothing new to save
-    assert stores[1]["restored_tokens"] > 0
-    assert stores[1]["saved_tokens"] == 0
+    managers = [result.report["kv_manager"] for result in (first, second)]
+    assert managers[0]["reused_tokens"] == 0
+    # the arena kept each document the first query freed, and the second
+    # borrowed their pages: nothing went to the host store or came from it
+    assert managers[1]["reused_tokens"] > 0
+    assert managers[1]["host_store"]["restored_tokens"] == 0
+    assert managers[1]["host_store"]["saved_tokens"] == 0

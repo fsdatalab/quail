@@ -527,9 +527,11 @@ def run_query(session, spec: QuerySpec, tables) -> RunOutput:
         output.measurements["kernel_cache_files"] = {
             "before": cache_before, "after": kernel_cache_files()}
         # quail-b's minimum counts every prefix a query reads, so the
-        # tokens whose KV the host store restored count as read here
-        restored = result.report.get("kv_manager", {}).get(
-            "host_store", {}).get("restored_tokens", 0)
+        # tokens whose KV the arena kept or the host store restored
+        # count as read here
+        manager = result.report.get("kv_manager", {})
+        restored = (manager.get("host_store", {}).get("restored_tokens", 0)
+                    + manager.get("reused_tokens", 0))
         output.measurements["restored_tokens"] = restored
         output.measurements["fresh_tokens"] += restored
     if session.config.backend in TEXT_VLLM_BACKENDS:

@@ -23,7 +23,8 @@ def apply_retention(arena, config, uses, survivors=None):
             arena.free_key(key)
     arena.configure_retention(
         policy(config, uses), min(config["cap_pages"], arena.num_pages))
-    arena.evict_retained(max(0, arena.retained_pages - arena.retention_cap_pages))
+    arena.evict_retained(max(0, arena.retained_pages - arena.retention_cap_pages),
+                         kept=False)
 
 
 def join_settlement(arena, keys, prefixes, node, config):

@@ -103,3 +103,69 @@ def test_a_prefix_larger_than_the_store_is_skipped():
 def test_a_content_id_names_the_tokens_not_their_container():
     assert content_id([5, 6, 7]) == content_id((5, 6, 7))
     assert content_id([5, 6, 7]) != content_id([5, 6])
+
+
+def _arena(pages):
+    from quail.backends.quail.executor.arena import KVArena
+
+    arena = KVArena(num_layers=TENSORS // 2, num_pages=pages, page_tokens=16,
+                    num_kv_heads=HEADS, d_head=DIM, dtype=torch.bfloat16,
+                    device="cpu")
+    arena.attach_store(_store(4096))
+    return arena
+
+
+def _write(arena, key, tokens, seed):
+    """Fill a fresh key's prefix rows and note them as written."""
+    arena.activate(key, tokens)
+    rows = arena.capacity_rows(key)[:tokens]
+    generator = torch.Generator().manual_seed(seed)
+    values = torch.randn((TENSORS, tokens, HEADS, DIM), generator=generator)
+    arena._pool[:, rows] = values.to(torch.bfloat16)
+    arena.note_prefix(key, b"content %d" % seed, tokens)
+    return arena._pool[:, rows].clone()
+
+
+def test_a_freed_prefix_stays_in_the_arena_and_lends_its_whole_pages():
+    arena = _arena(pages=16)
+    written = _write(arena, ("r", 0), 40, seed=1)
+    arena.free_key(("r", 0))
+    # the kept prefix's 3 pages count as free: an admission may take them
+    assert arena.resident_keys() == [] and arena.free_pages == 16
+    kept, shared = arena.kept_prefix(b"content 1", 40)
+    assert shared == 32 and arena.kept_prefix(b"content 1", 39) == (None, 0)
+    # a document with the same prefix reads the kept pages and writes its own
+    assert arena.reserve(("s", 5), 40, capacity_tokens=48, borrow=(kept, shared))
+    rows = arena.capacity_rows(("s", 5))[:32]
+    assert torch.equal(arena._pool[:, rows], written[:, :32])
+    assert arena.store.stats()["saved_tokens"] == 0
+
+
+def test_a_kept_prefix_computed_once_is_dropped_when_pages_run_short():
+    arena = _arena(pages=8)
+    _write(arena, ("r", 0), 40, seed=1)
+    arena.note_computed(b"content 1")
+    arena.free_key(("r", 0))
+    # kept pages count as free, and a document that needs them takes them
+    assert arena.free_pages == 8
+    assert arena.reserve(("r", 1), 100, capacity_tokens=128)
+    assert arena.kept_prefix(b"content 1", 40) == (None, 0)
+    arena.flush_store()
+    assert not arena.stored(b"content 1", 40)
+
+
+def test_a_kept_prefix_computed_twice_leaves_for_the_host_store():
+    arena = _arena(pages=8)
+    written = _write(arena, ("r", 0), 40, seed=1)
+    arena.note_computed(b"content 1")
+    arena.note_computed(b"content 1")
+    arena.free_key(("r", 0))
+    assert arena.reserve(("r", 1), 100, capacity_tokens=128)
+    arena.flush_store()
+    assert arena.stored(b"content 1", 40)
+    arena.free_key(("r", 1))
+    assert arena.reserve(("r", 2), 40, capacity_tokens=48)
+    arena.restore(("r", 2), b"content 1", 40)
+    arena.flush_store()
+    rows = arena.capacity_rows(("r", 2))[:40]
+    assert torch.equal(arena._pool[:, rows], written)

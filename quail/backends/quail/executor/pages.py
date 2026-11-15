@@ -176,6 +176,15 @@ class PageArena:
         self._forget_retained(key)
         return self.release_pages(borrowed + pages)
 
+    def rename(self, key, name) -> None:
+        """Give a resident key without checkpoints a new name, unpinned."""
+        if key in self.slots or key in self.ext_slots:
+            raise ValueError("a key with checkpoints keeps its name")
+        self._forget_retained(key)
+        self.pinned.discard(key)
+        for table in (self.owned, self.borrowed, self.tokens):
+            table[name] = table.pop(key)
+
     def pin(self, key) -> None:
         """Protect a resident key while an operator uses it."""
         if key not in self.owned:
