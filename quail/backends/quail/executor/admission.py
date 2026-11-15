@@ -280,7 +280,8 @@ class JoinAdmission:
             settles there, as a whole-sequence pass does; a limit then
             counts the anchors that survive the last stage.
         stored: Optional callable(anchor) -> (tokens, borrowed tokens),
-            asked as a fresh anchor that borrows nothing is admitted:
+            asked as a fresh anchor is admitted and preferred to a
+            borrow of fewer tokens:
             the leading prefix tokens whose KV reserve supplies, so the
             anchor packs none of them, and how many of those it reads
             from pages it borrows and so takes no pages for.
@@ -798,14 +799,19 @@ class JoinAdmission:
                     for group in self.groups[a] if group not in self._group_done):
                 hold.append(a)      # the group's anchors in flight are enough
                 continue
+            # KV kept or stored for the document beats a borrow of fewer
+            # tokens, and needs no parent
+            supplied, lent = ((0, 0) if self.stored is None or not self._carried[a]
+                              else self.stored(a))
             borrow = self.borrowing.decide(a, admitted)
-            if borrow == Borrowing.WAIT:
+            if supplied and (borrow == Borrowing.WAIT or borrow is None
+                             or borrow[1] < supplied):
+                borrow = None
+            elif borrow == Borrowing.WAIT:
                 hold.append(a)      # its parent is still queued
                 continue
-            # a document that borrows reads its parent's pages; only one
-            # that would pack its whole prefix asks for KV kept or stored
-            supplied, lent = ((0, 0) if borrow is not None or self.stored is None
-                              or not self._carried[a] else self.stored(a))
+            else:
+                supplied = lent = 0
             need = (self._page_cost[a] if borrow is None and not lent
                     else self.page_cost(self.prefix[a] + self._extra
                                         - (lent if borrow is None else borrow[1])))
