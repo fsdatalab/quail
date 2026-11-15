@@ -3,22 +3,17 @@ title: Querying multimodal data
 ---
 
 You can also query your multimodal data in Quail, such as images and
-PDFs. Quail reads PNG and JPEG images as documents. A model needs a
-vision tower to read pixels. The models with a
-vision tower are `qwen3.5-4b-bf16`, `qwen3.5-4b-fp8`, `qwen3.5-27b-fp8`,
-`qwen3.8-27b-fp8`, and `qwen3.6-35b-a3b-fp8`.
-
-Quail offers two functions for PDFs. `AI.PDF_PAGES` turns each page into
-an image. `AI.PARSE_DOCUMENT` returns the text a PDF stores.
+PDFs. Quail reads PNG and JPEG images directly. For PDFs,
+`AI.PDF_PAGES` turns each page into an image, and `AI.PARSE_DOCUMENT`
+returns the text a PDF stores.
 
 Quail doesn't yet support a text parser, such as OCR. You can still get
 pretty far without one, as modern open-source LLMs can answer questions
 from the page images directly.
 
-## Ask questions about images
+## Images
 
-Store each image's bytes in a `BINARY` column, and pass the column to an
-AI function:
+Store each PNG or JPEG in a `BINARY` column:
 
 ```python
 from pathlib import Path
@@ -34,10 +29,14 @@ photos = pa.table({
 config = quail.EngineConfig(model="qwen3.5-4b-bf16", device="h100-sxm")
 session = quail.Session(config=config)
 session.register("photos", quail.DocumentProvider.from_table(photos, id_col="path"))
-print(session.sql("""
-    SELECT p.path FROM photos p
-    WHERE AI.IF(PROMPT('Is this receipt over $100? {0}', p.image))
-""").run().collect())
+```
+
+Pass the column to an AI function. The query below returns each receipt
+over $100:
+
+```sql
+SELECT p.path FROM photos p
+WHERE AI.IF(PROMPT('Is this receipt over $100? {0}', p.image));
 ```
 
 Quail resizes each image as Qwen's image processor does. Each side
@@ -45,9 +44,9 @@ becomes a multiple of 32 pixels, and the model reads one token per 32 by
 32 pixels. A 1,000 by 750 photo becomes 992 by 736 pixels, or 713
 tokens.
 
-## Load PDFs
+## PDFs
 
-Store each PDF's bytes in a `BINARY` column:
+Store each PDF in a `BINARY` column:
 
 ```python
 paths = sorted(Path("contracts").glob("*.pdf"))
@@ -58,7 +57,7 @@ files = pa.table({
 session.register("files", quail.DocumentProvider.from_table(files, id_col="path"))
 ```
 
-## Ask questions about pages
+### Ask about each page
 
 `AI.PDF_PAGES` returns a list of a PDF's pages, each a PNG image. The
 `UNNEST` function turns the list into one row per page. The query below
@@ -71,7 +70,7 @@ WHERE AI.IF(PROMPT('Does this page cap either party''s liability? {0}',
                    p.u['image']));
 ```
 
-## Ask questions about a whole PDF
+### Ask about a whole PDF
 
 An AI function reads the list from `AI.PDF_PAGES` as one document. The
 third and fourth arguments of `AI.PDF_PAGES` set the first and last
@@ -84,13 +83,13 @@ SELECT f.path,
 FROM files f;
 ```
 
-## Choose a page size
+### Choose a page size
 
 The second argument of `AI.PDF_PAGES` sets the longest side of each page
 image, in pixels. The default is 1,536. A US Letter page at 1,024 pixels
 is 800 tokens.
 
-## Parse to text
+## Parse PDFs to text
 
 If you absolutely must parse, use `AI.PARSE_DOCUMENT`. A scanned page
 stores no text, so its text is empty. `AI.EXTRACT` needs text:
@@ -101,6 +100,12 @@ SELECT f.path,
                   {'effective_date': 'What is the effective date?'}) AS answers
 FROM files f;
 ```
+
+## Choose a model
+
+A model needs a vision tower to read images. The models with a vision
+tower are `qwen3.5-4b-bf16`, `qwen3.5-4b-fp8`, `qwen3.5-27b-fp8`,
+`qwen3.8-27b-fp8`, and `qwen3.6-35b-a3b-fp8`.
 
 [AI functions](/docs/user-guide/sql/ai-functions#aipdf_pagespdf-longest_edge-first-last)
 lists every argument of `AI.PDF_PAGES` and `AI.PARSE_DOCUMENT`.
