@@ -103,6 +103,18 @@ class Guarded:
         """Keep every row read, with the answer where asked and NULL elsewhere."""
         alias = self.node.alias
         port = f"rows:{alias}"
+        found = result.outputs[port]
+        if isinstance(found, Rows) and self.node.answer in found.column_names:
+            # the runtime wrote the answer of each row it asked
+            positions = pc.index_in(self.rows.ids[alias], value_set=found.ids[alias])
+            rows = self.rows
+            for name in found.column_names:
+                if name not in rows.column_names:
+                    rows = rows.with_column(
+                        name, pc.take(found.column(name), positions))
+            metrics = replace(result.metrics, input_rows=self.rows.num_rows,
+                              output_rows=rows.num_rows)
+            return NodeResult({**result.outputs, port: rows}, metrics)
         survivors = result.outputs[port].ids[alias] if isinstance(
             result.outputs[port], Rows) else result.outputs[port]
         passed = pc.is_in(self.rows.ids[alias], value_set=survivors)
@@ -264,7 +276,8 @@ def present_join_inputs(node, inputs: dict, context) -> dict:
     return found
 
 
-def guarded(node, inputs: dict, context) -> Guarded | NullPairs | None:
+def guarded(node, inputs: dict, context, *,
+            runtime_answers: bool = False) -> Guarded | NullPairs | None:
     """Evaluate a column node's guard over the rows it reads.
 
     Args:
@@ -272,6 +285,9 @@ def guarded(node, inputs: dict, context) -> Guarded | NullPairs | None:
         inputs: Its input port values.
         context: The execution context; its sources hold each table's
             column values by document id.
+        runtime_answers: Whether the runtime writes an AI filter's answer
+            column itself, keeping every row it reads, as Quail's GPU
+            executor does.
 
     Returns:
         The rows and which of them the model is asked about, or None for
@@ -281,7 +297,8 @@ def guarded(node, inputs: dict, context) -> Guarded | NullPairs | None:
         return pairs
     guard = getattr(node, "guard", None)
     alternative = getattr(node, "alternative", None)
-    answer = getattr(node, "answer", None)
+    # a runtime that writes a filter's answer column needs no guard for it
+    answer = None if runtime_answers else getattr(node, "answer", None)
     disjunction = getattr(node, "disjunction", None)
     absent = _document_alias(node) is not None and reads_null_documents(node, context)
     if (guard is None and alternative is None and answer is None

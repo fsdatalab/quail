@@ -103,3 +103,35 @@ def test_an_extraction_from_an_image_is_refused():
     with session, pytest.raises(RuntimeError, match="an image has none"):
         context.sql("SELECT p.id, AI.EXTRACT(p.image, {'date': 'When does it start?'}) "
                     "AS e FROM pages p")
+
+
+def test_projected_questions_about_a_page_share_one_pipeline():
+    session, _ = _context(VISION, PAGES)
+    with session:
+        query = session.sql(
+            "SELECT p.id, AI.IF(PROMPT('Is this page a lease? {0}', p.image)) "
+            "AS lease, AI.IF(PROMPT('Is this page signed? {0}', p.image)) AS signed "
+            "FROM pages p")
+        pipelines = query.regions()[0].plan().graph.pipelines()
+    assert len({tuple(node.node_id for node in members)
+                for members in pipelines.values()}) == 1
+
+
+def test_projected_questions_answer_every_page():
+    assert_transcript(_transcript(
+        "SELECT p.id, AI.IF(PROMPT('Is this page a lease? {0}', p.image)) AS lease, "
+        "AI.IF(PROMPT('Is this page signed? {0}', p.image)) AS signed FROM pages p"),
+        """\
+--- SELECT p.id, AI.IF(PROMPT('Is this page a lease? {0}', p.image)) AS lease,
+    AI.IF(PROMPT('Is this page signed? {0}', p.image)) AS signed FROM pages p ---
+plan
+  signed = ai_filter('Is this page signed? {0}', p.image)
+  lease = ai_filter('Is this page a lease? {0}', p.image)
+asked 4 of 6
+  'Is this page a lease? {0}': p1/p3 TRUE, p2 FALSE
+  'Is this page signed? {0}': p1/p3 TRUE, p2 FALSE
+rows 3
+  p1, TRUE, TRUE
+  p2, FALSE, FALSE
+  p3, TRUE, TRUE
+""")
