@@ -428,10 +428,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "bitcannon"
-version = "0.1.0-rc.3"
+name = "bit-set"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00208cafdc34c04a13092af3648cf21cc6d86fc08b831b18207d6f209ff9334a"
+checksum = "08807e080ed7f9d5433fa9b275196cfc35414f66a0c79d864dc51a0d825231a3"
+dependencies = [
+ "bit-vec",
+]
+
+[[package]]
+name = "bit-vec"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
+
+[[package]]
+name = "bitcannon"
+version = "0.1.0-rc.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f22d5cf2105730b71eee3ddd729acbcbf1e3e860f706a160ab1e5117591aa40"
 
 [[package]]
 name = "bitflags"
@@ -1496,6 +1511,17 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys",
+]
+
+[[package]]
+name = "fancy-regex"
+version = "0.19.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d301f5bf187b3c295fce6468d3875037a0bccc5f6b151c63cac2f85babf21912"
+dependencies = [
+ "bit-set",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -3306,9 +3332,9 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "tk-convert"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a67b6b8e8bcb4d10576eec88c962ed5092931ba2621596ddb35ff98929de767"
+checksum = "7860f1bccf45af43349a96dc9137f325cc5a1c9ccada5641a66348e32e197224"
 dependencies = [
  "bitcannon",
  "serde_json",
@@ -3317,13 +3343,14 @@ dependencies = [
 
 [[package]]
 name = "tk-encode"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "065ea1e7c9285a81d3190d0bd409f8311a2ebbcede8a355fe8fb33d766aaa9f7"
+checksum = "3d0b6f0774c6522a835e9528b9fc0f17b273c808952857135161fc353c9cd4c0"
 dependencies = [
  "ahash",
  "bitcannon",
  "dary_heap",
+ "fancy-regex",
  "libc",
  "log",
  "memchr",
@@ -3341,9 +3368,9 @@ dependencies = [
 
 [[package]]
 name = "tk-serialize"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "032f80db8335e6b44b3596d1a7cef42d0e561c64fef012f88b0888a477dc1131"
+checksum = "127746cfb2d5f47aba6156866cffbb1aa3fe6602bf9530543185658cc7d8122f"
 dependencies = [
  "base64 0.22.1",
  "bitcannon",
@@ -3353,9 +3380,9 @@ dependencies = [
 
 [[package]]
 name = "tk-train"
-version = "0.1.0-rc.3"
+version = "0.1.0-rc.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce480ea19cf91c1790087311be925535b21b4ffc23fbf1c7d504d544b716278f"
+checksum = "fd7554da217fac68ccd401e0beb62d6bf6529db29bc33cc35ecaad9963221de4"
 dependencies = [
  "ahash",
  "compact_str",
@@ -3370,9 +3397,9 @@ dependencies = [
 
 [[package]]
 name = "tokenizers"
-version = "1.0.0-rc.3"
+version = "1.0.0-rc.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df0e4d2415cd189e596f9575a08a8c97a5e56bbea0f08aff40148b20ddf4353a"
+checksum = "8303b617f840dac1e7ee161fc5ebe0709ff1cdf846136f2b3786a21afec980a0"
 dependencies = [
  "tk-convert",
  "tk-encode",
