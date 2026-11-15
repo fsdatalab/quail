@@ -17,7 +17,7 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, ArrayRef, AsArray, BinaryBuilder};
+use datafusion::arrow::array::{Array, ArrayRef, AsArray, LargeBinaryBuilder};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{Result, ScalarValue, exec_err, plan_err};
 use datafusion::logical_expr::{
@@ -60,7 +60,7 @@ impl ScalarUDFImpl for ShrinkImage {
             [
                 DataType::Binary | DataType::LargeBinary | DataType::BinaryView,
                 longest_edge,
-            ] if longest_edge.is_integer() => Ok(DataType::Binary),
+            ] if longest_edge.is_integer() => Ok(DataType::LargeBinary),
             [
                 DataType::Binary | DataType::LargeBinary | DataType::BinaryView,
                 _,
@@ -104,9 +104,11 @@ fn longest_edge_pixels(longest_edge: &ScalarValue) -> Result<u32> {
 }
 
 /// Each image of `images`, a binary array, shrunk to `longest_edge`:
-/// NULL for a NULL image or one that is not a PNG or a JPEG.
+/// NULL for a NULL image or one that is not a PNG or a JPEG. The images
+/// are `LargeBinary`, whose 64-bit offsets let DataFusion join batches of
+/// more than 2 GiB of images into one.
 fn shrunk_images(images: &ArrayRef, longest_edge: u32) -> Result<ArrayRef> {
-    let mut shrunk = BinaryBuilder::new();
+    let mut shrunk = LargeBinaryBuilder::new();
     let mut append =
         |bytes: Option<&[u8]>| shrunk.append_option(bytes.and_then(|b| shrink(b, longest_edge)));
     match images.data_type() {
