@@ -2,9 +2,12 @@
 title: Querying PDFs
 ---
 
-If you have a dataset of PDFs and want to run analytics on it, use
-`AI.PDF_PAGES` to get to pixels. Then ask questions about the pixels.
-You do not need to go through a parser to get to text.
+Quail offers two functions for PDFs. `AI.PDF_PAGES` turns each page into
+an image. `AI.PARSE_DOCUMENT` returns the text a PDF stores.
+
+Quail doesn't yet support a text parser, such as OCR. You can still get
+pretty far without one. A vision model answers questions from the page
+images directly.
 
 ## Load PDFs
 
@@ -66,9 +69,8 @@ by 32 pixels. A US Letter page at 1,024 pixels is 800 tokens.
 
 ## Parse to text
 
-Quail does not support a text parser yet. If you absolutely must parse,
-`AI.PARSE_DOCUMENT` returns the text a PDF stores. A scanned page stores
-no text. `AI.EXTRACT` needs text:
+If you absolutely must parse, use `AI.PARSE_DOCUMENT`. A scanned page
+stores no text, so its text is empty. `AI.EXTRACT` needs text:
 
 ```sql
 SELECT f.path,
