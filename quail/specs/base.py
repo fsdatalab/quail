@@ -200,11 +200,12 @@ class ModelSpec:
     #                                  encoder calls' activations, and a
     #                                  chunk's image embeddings
     # the image processor's patch side in pixels, its patches merged along
-    # each side of one image token, and the most pixels it reads an image
-    # at: patch_size, merge_size, and size.longest_edge in the checkpoint's
-    # preprocessor_config.json
+    # each side of one image token, and the fewest and most pixels it reads
+    # an image at: patch_size, merge_size, size.shortest_edge, and
+    # size.longest_edge in the checkpoint's preprocessor_config.json
     image_patch_pixels: int = 0
     image_merge: int = 0
+    image_min_pixels: int = 0
     image_max_pixels: int = 0
     max_num_seqs: int = 0    # sequences vLLM may run at once; 0 keeps the
     #                          engine setting. A hybrid model holds one

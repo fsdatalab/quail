@@ -52,6 +52,7 @@ fn session() -> &'static SessionContext {
     static SESSION: OnceLock<SessionContext> = OnceLock::new();
     SESSION.get_or_init(|| {
         let session = SessionContext::new();
+        session.register_udf(crate::functions::image::image_function().as_ref().clone());
         session.register_udf(
             crate::functions::parse_document::parse_document_function()
                 .as_ref()

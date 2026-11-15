@@ -69,11 +69,12 @@ def _unheld(text) -> str:
     A computed text is quoted; computed images, such as pages
     AI.PDF_PAGES renders, are counted and named by a hash of their bytes.
     """
-    if isinstance(text, bytes) and text.startswith(b"\x89PNG"):
+    if isinstance(text, bytes) and text.startswith((b"\x89PNG", b"\xff\xd8\xff")):
         import hashlib
 
-        return (f"<{text.count(b'IHDR')} images "
-                f"{hashlib.sha256(text).hexdigest()[:8]}>")
+        # a JPEG is one image; joined pages are one PNG per header
+        count = text.count(b"IHDR") if text.startswith(b"\x89PNG") else 1
+        return f"<{count} images {hashlib.sha256(text).hexdigest()[:8]}>"
     return repr(text)
 
 

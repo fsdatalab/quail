@@ -34,6 +34,8 @@ pub struct ImageSizing {
     /// The pixels along each side of one image token: the patch's side
     /// times the patches merged along a side.
     pub token_pixels: u32,
+    /// The fewest pixels the model reads an image at.
+    pub min_pixels: u64,
     /// The most pixels the model reads an image at.
     pub max_pixels: u64,
 }
@@ -50,9 +52,10 @@ impl ImageSizing {
         }
         let token_pixels =
             u32::try_from(field("image_patch_pixels") * field("image_merge")).ok()?;
-        let max_pixels = field("image_max_pixels");
+        let (min_pixels, max_pixels) = (field("image_min_pixels"), field("image_max_pixels"));
         (token_pixels > 0 && max_pixels > 0).then_some(Self {
             token_pixels,
+            min_pixels,
             max_pixels,
         })
     }
@@ -124,10 +127,8 @@ fn jpeg_size(bytes: &[u8]) -> Option<(u32, u32)> {
 }
 
 /// The width and height the model reads an image at: each side a
-/// multiple of the sizing's token pixels and the area at most its
-/// maximum, as Qwen's `smart_resize` gives them. Unlike `smart_resize`,
-/// a small image stays small rather than growing to the processor's
-/// minimum.
+/// multiple of the sizing's token pixels, and the area from its minimum
+/// to its maximum, as Qwen's `smart_resize` gives them.
 ///
 /// # Errors
 ///
@@ -146,7 +147,7 @@ pub fn image_size(bytes: &[u8], sizing: ImageSizing) -> Result<(u32, u32), Compi
         )));
     }
     let factor = f64::from(sizing.token_pixels);
-    let max_pixels = sizing.max_pixels as f64;
+    let (min_pixels, max_pixels) = (sizing.min_pixels as f64, sizing.max_pixels as f64);
     let (width, height) = (f64::from(width), f64::from(height));
     // Python's round(), which rounds a half to the even multiple
     let mut sides =
@@ -154,6 +155,9 @@ pub fn image_size(bytes: &[u8], sizing: ImageSizing) -> Result<(u32, u32), Compi
     if sides[0] * sides[1] > max_pixels {
         let beta = (height * width / max_pixels).sqrt();
         sides = [height, width].map(|side| factor.max((side / beta / factor).floor() * factor));
+    } else if sides[0] * sides[1] < min_pixels {
+        let beta = (min_pixels / (height * width)).sqrt();
+        sides = [height, width].map(|side| (side * beta / factor).ceil() * factor);
     }
     Ok((sides[1] as u32, sides[0] as u32))
 }
@@ -336,6 +340,7 @@ mod tests {
     /// Qwen3.5's image processor: 16-pixel patches, merged 2 by 2.
     const QWEN: ImageSizing = ImageSizing {
         token_pixels: 32,
+        min_pixels: 65_536,
         max_pixels: 16_777_216,
     };
 
@@ -352,6 +357,7 @@ mod tests {
         // 14-pixel patches merged 2 by 2, as Qwen2-VL reads them
         let other = ImageSizing {
             token_pixels: 28,
+            min_pixels: 3_136,
             max_pixels: 1_000_000,
         };
         assert_eq!(image_size(&png(1000, 750), other).unwrap(), (1008, 756));
@@ -364,7 +370,8 @@ mod tests {
     #[test]
     fn a_spec_reads_images_only_when_it_loads_its_vision_tower() {
         let spec = serde_json::json!({"vision_tower": true, "image_patch_pixels": 16,
-                                      "image_merge": 2, "image_max_pixels": 16_777_216});
+                                      "image_merge": 2, "image_min_pixels": 65_536,
+                                      "image_max_pixels": 16_777_216});
         assert_eq!(ImageSizing::of_model(&spec), Some(QWEN));
         let mut partial = spec.clone();
         partial["checkpoint_layers"] = 24.into();
@@ -378,11 +385,11 @@ mod tests {
     #[test]
     fn an_image_is_resized_as_qwens_image_processor_resizes_it() {
         // expected sizes from Hugging Face's smart_resize with Qwen3.5's
-        // preprocessor_config.json, but for 60 by 96, which stays small
+        // preprocessor_config.json; a small image grows to 65,536 pixels
         for ((width, height), resized) in [
             ((1184, 1536), (1184, 1536)),
             ((1000, 750), (992, 736)),
-            ((60, 96), (64, 96)),
+            ((60, 96), (224, 352)),
             ((20000, 15000), (4704, 3520)),
             ((1040, 1040), (1024, 1024)),
         ] {

@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{Array, ArrayRef, Int32Array, RecordBatch};
+use arrow::compute::concat;
 use datafusion::common::{DataFusionError, Result};
 use quail_datafusion::derive::expressions::PhysicalValue;
 use quail_planner::error::CompileError;
@@ -134,7 +135,7 @@ impl Planned<'_> {
                 true => built
                     .evaluate(&RecordBatch::new_empty(schema.clone()), false)
                     .map_err(compile)?,
-                false => crate::shared::concat_chunks(&chunks)?,
+                false => concat(&chunks)?,
             };
             found.insert(name, values);
         }

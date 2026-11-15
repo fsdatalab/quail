@@ -148,6 +148,7 @@ impl QuailExtension {
             state.register_udf(function)?;
         }
         state.register_udf(crate::functions::regexps::regexp_functions())?;
+        state.register_udf(crate::functions::image::image_function())?;
         state.register_udf(crate::functions::parse_document::parse_document_function())?;
         state.register_udf(crate::functions::pdf_pages::pdf_pages_function())?;
         if first {

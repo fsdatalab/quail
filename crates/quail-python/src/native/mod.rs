@@ -324,15 +324,21 @@ fn read_and_write_plan(text: &str) -> PyResult<String> {
 }
 
 /// The (width, height) a model reads an image at, as the planner counts
-/// its tokens: `token_pixels` along each side of a token, and at most
-/// `max_pixels`.
+/// its tokens: `token_pixels` along each side of a token, and from
+/// `min_pixels` to `max_pixels`.
 ///
 /// Raises a ValueError when the bytes are not a PNG or a JPEG the model
 /// reads.
 #[pyfunction]
-fn image_size(image: &[u8], token_pixels: u32, max_pixels: u64) -> PyResult<(u32, u32)> {
+fn image_size(
+    image: &[u8],
+    token_pixels: u32,
+    min_pixels: u64,
+    max_pixels: u64,
+) -> PyResult<(u32, u32)> {
     let sizing = quail::ImageSizing {
         token_pixels,
+        min_pixels,
         max_pixels,
     };
     quail::image_size(image, sizing).map_err(|error| PyValueError::new_err(error.to_string()))

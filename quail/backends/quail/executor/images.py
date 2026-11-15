@@ -141,7 +141,7 @@ class RegionImages:
         self.patch_pixels = spec.image_patch_pixels
         self.merge = spec.image_merge
         self.token_pixels = self.patch_pixels * self.merge
-        max_pixels = spec.image_max_pixels
+        bounds = (spec.image_min_pixels, spec.image_max_pixels)
         self.images: dict[int, Image] = {}
         # by alias, each document's images' first token ids, in order
         self.firsts: dict[str, list[tuple[int, ...]]] = {}
@@ -163,7 +163,7 @@ class RegionImages:
                 firsts.append(found)
                 for first, image in zip(found, encoded, strict=True):
                     if first not in self.images:
-                        width, height = image_size(image, self.token_pixels, max_pixels)
+                        width, height = image_size(image, self.token_pixels, *bounds)
                         self.images[first] = Image(
                             first, height // self.token_pixels,
                             width // self.token_pixels, image)

@@ -6,6 +6,7 @@
 //! region, which Quail plans and executes.
 
 pub(crate) mod field_access;
+pub(crate) mod image;
 pub(crate) mod parse_document;
 pub(crate) mod pdf_pages;
 mod quiet;

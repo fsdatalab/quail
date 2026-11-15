@@ -18,14 +18,17 @@ from quail.specs import MODELS
 
 FIRST = IMAGE_TOKEN_BASE
 START, END = 3060, 3061
-# 2 columns by 3 rows of image tokens: 6 tokens, positions advance 3
-IMAGE = [START, *range(FIRST, FIRST + 6), END]
+# a 256 by 320 image: 8 columns by 10 rows of image tokens, 80 tokens,
+# and positions advance 10, its rows
+COLUMNS, ROWS = 8, 10
+TOKENS = COLUMNS * ROWS
+IMAGE = [START, *range(FIRST, FIRST + TOKENS), END]
 KEY = ("pages", 0)
 SPEC = MODELS["qwen3.5-4b-bf16"]
 
 
 def _images():
-    columns = {"pages": pa.table({"image": pa.array([png(64, 96)], pa.binary())})}
+    columns = {"pages": pa.table({"image": pa.array([png(256, 320)], pa.binary())})}
     return RegionImages({"pages": [IMAGE]}, columns, SPEC)
 
 
@@ -40,13 +43,14 @@ def test_an_image_token_takes_its_grid_position_and_later_rows_follow_the_grid()
     ids = [7, 8, *IMAGE, 9, 10]
     chunk = _chunk(ids, list(range(len(ids))), [(KEY, 0, len(ids) - 2, len(ids))])
     rotary = images.rotary_positions(chunk, ()).numpy()
-    image = [3 + offset for offset in range(6)]
+    image = [3 + offset for offset in range(TOKENS)]
     assert rotary[:, :3].tolist() == [[0, 1, 2]] * 3
-    assert rotary[0, image].tolist() == [3] * 6
-    assert rotary[1, image].tolist() == [3, 3, 4, 4, 5, 5]
-    assert rotary[2, image].tolist() == [3, 4, 3, 4, 3, 4]
-    # the vision end token and the question after it
-    assert rotary[:, 9:].tolist() == [[6, 7, 8]] * 3
+    assert rotary[0, image].tolist() == [3] * TOKENS
+    grid = [divmod(index, COLUMNS) for index in range(TOKENS)]
+    assert rotary[1, image].tolist() == [3 + row for row, _ in grid]
+    assert rotary[2, image].tolist() == [3 + column for _, column in grid]
+    # the vision end token and the question after it start at 3 + ROWS
+    assert rotary[:, 3 + TOKENS:].tolist() == [[13, 14, 15]] * 3
 
 
 class _Decode:
@@ -64,9 +68,13 @@ def test_a_question_and_an_answer_after_an_earlier_image_shift_by_its_grid():
     ids = [7, 8, *IMAGE]
     images.rotary_positions(_chunk(ids, list(range(len(ids))),
                                    [(KEY, 0, len(ids), len(ids))]), ())
-    # a question of two rows, then one answer row whose slot is the key's
-    chunk = _chunk([9, 10, 11], [10, 11, 12], [(KEY, 0, 0, 2)], _Decode([0]))
-    assert images.rotary_positions(chunk, [KEY]).tolist() == [7, 8, 9]
+    # a question of two rows, then one answer row whose slot is the key's;
+    # each moves back by the image's 80 tokens less its 10 rows
+    first = len(ids)
+    chunk = _chunk([9, 10, 11], [first, first + 1, first + 2], [(KEY, 0, 0, 2)],
+                   _Decode([0]))
+    assert images.rotary_positions(chunk, [KEY]).tolist() == [
+        first - 70, first - 69, first - 68]
 
 
 def test_a_chunk_with_no_image_document_keeps_its_positions():
@@ -104,24 +112,27 @@ def test_each_image_token_takes_its_own_embedding_and_text_takes_the_vocabulary(
 
 
 def test_a_document_of_two_images_shifts_each_row_by_the_images_before_it():
-    # image a: 2 columns by 3 rows; image b: 2 by 2, after a word of text
-    a, b = range(FIRST, FIRST + 6), range(FIRST + 6, FIRST + 10)
-    parts = pa.array([[png(64, 96), b"between", png(64, 64)]], pa.list_(pa.binary()))
+    # image a: 8 columns by 10 rows; image b: 8 by 8, after a word of text
+    a, b = range(FIRST, FIRST + 80), range(FIRST + 80, FIRST + 144)
+    parts = pa.array([[png(256, 320), b"between", png(256, 256)]],
+                     pa.list_(pa.binary()))
     document = [START, *a, END, 9, START, *b, END, 10]
     images = RegionImages({"pages": [document]}, {"pages": pa.table({"parts": parts})},
                           SPEC)
     ids = [7, 8, *document]
     chunk = _chunk(ids, list(range(len(ids))), [(KEY, 0, len(ids), len(ids))])
     rotary = images.rotary_positions(chunk, ()).numpy()
-    # after image a, positions advance by its 3 rows, not its 6 tokens
-    assert rotary[0].tolist() == [0, 1, 2, 3, 3, 3, 3, 3, 3, 6, 7, 8,
-                                  9, 9, 9, 9, 11, 12]
-    assert rotary[1, 12:16].tolist() == [9, 9, 10, 10]
-    assert rotary[2, 12:16].tolist() == [9, 10, 9, 10]
+    # after image a, positions advance by its 10 rows, not its 80 tokens;
+    # after image b, by its 8 rows
+    assert rotary[0].tolist() == [0, 1, 2, *[3] * 80, 13, 14, 15, *[16] * 64, 24, 25]
+    b_tokens = slice(86, 150)
+    assert rotary[1, b_tokens].tolist() == [16 + index // 8 for index in range(64)]
+    assert rotary[2, b_tokens].tolist() == [16 + index % 8 for index in range(64)]
 
 
 def test_an_image_decodes_at_the_size_the_planner_counts():
-    for image, (rows, columns) in [(png(60, 96), (3, 2)), (jpeg(1000, 750), (23, 31))]:
+    # a small image grows to Qwen's 65,536 pixels; a large one keeps its shape
+    for image, (rows, columns) in [(png(60, 96), (11, 7)), (jpeg(1000, 750), (23, 31))]:
         tokens = rows * columns
         document = [START, *range(FIRST, FIRST + tokens), END]
         found = RegionImages({"pages": [document]}, {"pages": pa.table(

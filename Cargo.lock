@@ -2478,6 +2478,8 @@ dependencies = [
  "moxcms",
  "num-traits",
  "png",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -3363,6 +3365,7 @@ dependencies = [
  "datafusion-proto",
  "futures",
  "hayro",
+ "image",
  "pdf-extract",
  "png",
  "quail-dylib",

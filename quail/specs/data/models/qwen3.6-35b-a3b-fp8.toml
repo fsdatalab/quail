@@ -40,9 +40,11 @@ vision_tower = true
 # 1 GiB for an encoder call of 32,768 patches, and a full chunk's
 # image embeddings; an estimate, not a measurement
 vision_mem_bytes = 2_450_000_000
-# preprocessor_config.json: patch_size, merge_size, size.longest_edge
+# preprocessor_config.json: patch_size, merge_size, size.shortest_edge,
+# size.longest_edge
 image_patch_pixels = 16
 image_merge = 2
+image_min_pixels = 65_536
 image_max_pixels = 16_777_216
 attn_output_gate = true
 gdn_key_heads = 16

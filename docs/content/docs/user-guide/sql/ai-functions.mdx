@@ -16,6 +16,7 @@ a row and returns the model's answer as a SQL value.
 | [`AI.MAP(input, instruction[, max_tokens])`](#aimapinput-instruction-max_tokens) | `AI.MAP` returns the text the model writes for the document. |
 | [`AI.PARSE_DOCUMENT(document)`](#aiparse_documentdocument) | `AI.PARSE_DOCUMENT` returns the text a PDF stores, for other AI functions to read. |
 | [`AI.PDF_PAGES(pdf[, longest_edge[, first[, last]]])`](#aipdf_pagespdf-longest_edge-first-last) | `AI.PDF_PAGES` returns each page of a PDF in a range as a PNG image. |
+| [`AI.IMAGE(image, longest_edge)`](#aiimageimage-longest_edge) | `AI.IMAGE` returns an image shrunk so its longer side is at most `longest_edge` pixels. |
 | [`AI.SAE_FEATURES(prompt, options)`](#aisae_featuresprompt-options) | `AI.SAE_FEATURES` returns the model's strongest internal features for the prompt. |
 | [`HINT(condition, options)`](#hintcondition-options) | `HINT` returns `condition` and tells Quail what fraction of rows pass. |
 
@@ -217,6 +218,23 @@ FROM (SELECT f.path, UNNEST(AI.PDF_PAGES(f.pdf)) AS u
 | **pdf** | A `BINARY` column that holds each PDF's bytes. |
 | **longest_edge** | An integer literal, in pixels: a multiple of 32 from 32 to 8192. Its default is 1536. |
 | **first**, **last** | Integer literals: the first and last pages to draw, counted from 1. `first` defaults to 1. `last` reads to the end when it is past the end or left out. Quail draws only the pages in the range. |
+
+### `AI.IMAGE(image, longest_edge)`
+
+```sql
+SELECT r.id
+FROM receipts r
+WHERE AI.IF(PROMPT('Is this receipt''s total over 100,000 rupiah? {0}',
+                   AI.IMAGE(r.image, 1024)));
+```
+
+| | |
+| --- | --- |
+| **Description** | `AI.IMAGE` returns an image whose longer side is at most `longest_edge` pixels. The function keeps the image's shape and its format: a PNG stays a lossless PNG, and a JPEG becomes a JPEG at quality 90. An image already small enough keeps its bytes. The image is `NULL` when the input is `NULL` or is not a PNG or a JPEG. |
+| **Use in SQL** | Pass the image to an AI function to cut the tokens a model reads: the model reads one token per 32 by 32 pixels. Quail shrinks each image on the CPU, with no model, and only for the rows that pass the filters on other columns. |
+| **Alias** | `AI_IMAGE` |
+| **image** | A `BINARY` column of PNG or JPEG images. |
+| **longest_edge** | An integer literal, in pixels, from 1 to 8192. |
 
 ### `AI.SAE_FEATURES(prompt, options)`
 

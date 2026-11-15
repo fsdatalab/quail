@@ -5,12 +5,15 @@ operators, the questions the model answered, and the rows
 (helpers/transcript.py).
 """
 
+import io
+
 import pyarrow as pa
 import pytest
 from helpers.images import jpeg, png
 from helpers.oracle import Oracle, oracle_executor
 from helpers.sessions import CONFIG, TOKENIZER
 from helpers.transcript import Transcripts, assert_transcript
+from PIL import Image as PILImage
 
 import quail
 from quail.api.config import EngineConfig
@@ -229,6 +232,37 @@ plan
       __quail_answer_1, returns: []
 asked 2 of 2
   'Is this a lease? {0}': p1 TRUE, p2 FALSE
+rows 1
+  p1
+""")
+
+
+def test_ai_image_shrinks_a_photo_to_its_longest_edge():
+    photos = pa.table({"id": ["p1", "p2"], "image": pa.array(
+        [jpeg(1000, 750), png(300, 200)], pa.binary())})
+    session, context = _context(VISION, photos)
+    with session:
+        table = context.sql("SELECT p.id, AI.IMAGE(p.image, 512) AS small FROM pages p "
+                            "ORDER BY p.id")
+    sizes = [PILImage.open(io.BytesIO(image)).size
+             for image in table.column("small").to_pylist()]
+    # the photo shrinks; the small image keeps its size
+    assert sizes == [(512, 384), (300, 200)]
+
+
+def test_a_question_reads_a_shrunk_photo():
+    photos = pa.table({"id": ["p1"], "image": pa.array([jpeg(1000, 750)], pa.binary())})
+    assert_transcript(_transcript(
+        "SELECT p.id FROM photos p "
+        "WHERE AI.IF(PROMPT('Is this a lease? {0}', AI.IMAGE(p.image, 512)))",
+        tables={"photos": photos}), """\
+--- SELECT p.id FROM photos p WHERE AI.IF(PROMPT('Is this a lease? {0}',
+    AI.IMAGE(p.image, 512))) ---
+plan
+  __quail_answer_1 = ai_filter('Is this a lease? {0}', p.__quail_expr_0), filter:
+      __quail_answer_1, returns: []
+asked 1 of 1
+  'Is this a lease? {0}': <1 images bb6fdb89> TRUE
 rows 1
   p1
 """)
