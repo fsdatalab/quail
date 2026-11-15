@@ -2,15 +2,18 @@
 title: Querying PDFs
 ---
 
-Quail answers questions about a PDF from images of its pages.
-`AI.PDF_PAGES` renders the pages, and a model with a vision tower reads
-the images. The vision models are `qwen3.5-4b-bf16`, `qwen3.5-4b-fp8`,
-`qwen3.5-27b-fp8`, `qwen3.8-27b-fp8`, and `qwen3.6-35b-a3b-fp8`.
+You can query a dataset of PDFs with SQL, and ask a model about each
+page or each PDF. You render the pages with `AI.PDF_PAGES`, and a vision
+model reads the page images, so you do not convert the PDFs to text
+first. You need a model with a vision tower: `qwen3.5-4b-bf16`,
+`qwen3.5-4b-fp8`, `qwen3.5-27b-fp8`, `qwen3.8-27b-fp8`, or
+`qwen3.6-35b-a3b-fp8`.
 
-## Ask about each page
+## Find the pages that answer a question
 
-Put each PDF's bytes in a `BINARY` column, and render the pages in the
-query:
+You load each PDF's bytes into a `BINARY` column, then ask the question
+of every page. The program below returns each contract page that caps
+liability:
 
 ```python
 from pathlib import Path
@@ -34,14 +37,14 @@ with quail.Session(config=config) as session:
     """).run().collect())
 ```
 
-The query returns each page that caps liability. `UNNEST` turns each
-PDF's list of pages into one row per page.
+`UNNEST` turns each PDF's list of pages into one row per page, so you
+get one answer per page.
 
-## Ask about a whole PDF
+## Label each PDF
 
-Pass the pages without `UNNEST` to ask one question of the whole PDF.
-The third and fourth arguments of `AI.PDF_PAGES` limit the pages, so a
-long PDF costs only the pages you read:
+You leave out `UNNEST` to ask one question of a whole PDF. You can also
+pass a page range, so a long PDF costs only the pages the model reads.
+The query below labels each PDF from its first three pages:
 
 ```sql
 SELECT f.path,
@@ -50,18 +53,18 @@ SELECT f.path,
 FROM files f;
 ```
 
-## Set the image size
+## Choose the image size
 
-The second argument of `AI.PDF_PAGES` sets the longer side of each
-image, in pixels. The model reads one token per 32 by 32 pixels, so a
-US Letter page at 1,024 pixels is 800 tokens. Use a larger size for small
-print; the default is 1,536.
+You set the longer side of each page image, in pixels, with the second
+argument of `AI.PDF_PAGES`. The model reads one token per 32 by 32
+pixels, so a US Letter page at 1,024 pixels costs 800 tokens. You can
+raise the size for small print; the default is 1,536.
 
-## Read the text a PDF stores
+## Extract fields from a PDF's text
 
-Quail has no OCR. `AI.PARSE_DOCUMENT` returns the text a PDF stores, and
-a scanned page stores none. `AI.EXTRACT` needs text, so read the stored
-text to extract from a PDF:
+You need text, not images, to use `AI.EXTRACT`, because it copies each
+answer from the document. `AI.PARSE_DOCUMENT` returns the text a PDF
+stores. Quail has no OCR, so a scanned page gives you no text:
 
 ```sql
 SELECT f.path,
@@ -71,4 +74,4 @@ FROM files f;
 ```
 
 [AI functions](/docs/user-guide/sql/ai-functions#aipdf_pagespdf-longest_edge-first-last)
-lists every argument of both functions.
+lists every argument of `AI.PDF_PAGES` and `AI.PARSE_DOCUMENT`.
