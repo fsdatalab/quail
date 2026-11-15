@@ -29,6 +29,9 @@ pub const FIRST_DOCUMENT: &str = "__first_document";
 /// The column of a token store that holds each document's token ids.
 const TOKEN_IDS: &str = "__quail_token_ids";
 
+/// The value column that holds a scan's image documents.
+const IMAGES: &str = "__quail_images";
+
 /// What a region reads of one scan: its alias, its token store, and
 /// the columns of its rows.
 pub type Scanned = (String, Table, Table);
@@ -137,15 +140,14 @@ fn first_documents(
     )))
 }
 
-/// The text of a scan's documents, when the scan's columns hold every
-/// column the document reads.
-fn texts(document: &ScanColumn, columns: &Table) -> Result<Option<ArrayRef>, CompileError> {
+/// A scan's documents, evaluated over its columns, when the columns hold
+/// every column the document reads.
+fn document_values(
+    document: &ScanColumn,
+    columns: &Table,
+) -> Result<Option<ArrayRef>, CompileError> {
     let expression = match document {
-        // the executor reads an image's pixels from its value columns
-        ScanColumn::Unnamed(name) => {
-            return Ok(column(columns, name)?
-                .filter(|found| !crate::images::holds_images(found.data_type())));
-        }
+        ScanColumn::Unnamed(name) => return column(columns, name),
         ScanColumn::Expression(expression) => expression,
     };
     let held = |name: &str| columns.0.index_of(name).is_ok();
@@ -156,18 +158,19 @@ fn texts(document: &ScanColumn, columns: &Table) -> Result<Option<ArrayRef>, Com
     let chunks = (columns.1.iter())
         .map(|batch| built.evaluate(batch, false))
         .collect::<Result<Vec<_>, _>>()?;
-    if chunks
-        .first()
-        .is_some_and(|found| crate::images::holds_images(found.data_type()))
-    {
-        return Ok(None);
-    }
     let chunks: Vec<&dyn Array> = chunks.iter().map(AsRef::as_ref).collect();
     // a scan of no rows has no batch, and its text is no rows
     if chunks.is_empty() {
         return Ok(Some(new_empty_array(&DataType::Utf8)));
     }
     concat(&chunks).map(Some).map_err(arrow_error)
+}
+
+/// The text of a scan's documents, when the scan's columns hold every
+/// column the document reads; None for image documents.
+fn texts(document: &ScanColumn, columns: &Table) -> Result<Option<ArrayRef>, CompileError> {
+    Ok(document_values(document, columns)?
+        .filter(|values| !crate::images::holds_images(values.data_type())))
 }
 
 /// The tables a region's workers read, by name: `documents:<alias>`
@@ -238,16 +241,17 @@ pub fn request_tables(
                 first_documents(tokens, columns, rows)?,
             ));
         }
-        // the executor reads an image document's pixels from its column
-        let source = (operators.scans.iter())
-            .find(|found| &found.alias == alias)
-            .and_then(|found| crate::planning::source_column(&found.column));
-        if let Some(source) = source
-            && !values.iter().any(|(name, _)| name == &source)
-            && let Some(images) = column(columns, &source)?
-            && crate::images::holds_images(images.data_type())
+        // the executor reads an image document's pixels from the first
+        // binary column: the document's values, such as p.u['image']
+        let document = (operators.scans.iter()).find(|found| &found.alias == alias);
+        if let Some(images) = document
+            .map(|found| document_values(&found.column, columns))
+            .transpose()?
+            .flatten()
+            .filter(|found| crate::images::holds_images(found.data_type()))
         {
-            values.push((source, images));
+            values.retain(|(name, _)| name != IMAGES);
+            values.insert(0, (IMAGES.into(), images));
         }
         if let Some(absent) = column(columns, NULL_DOCUMENT)? {
             values.push((NULL_DOCUMENT.into(), absent));

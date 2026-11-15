@@ -188,3 +188,29 @@ rows 2
   f1, 'lease'
   f2, 'lease'
 """)
+
+
+def test_a_question_reads_each_page_of_an_unnest():
+    from helpers.pdfs import pdf
+
+    files = pa.table({"id": ["f1", "f2"], "pdf": pa.array([
+        pdf("Lease agreement.", "Rent terms."), pdf("Invoice.")], pa.binary())})
+    assert_transcript(_transcript(
+        "SELECT p.id, p.u['page'] AS page FROM (SELECT f.id, "
+        "UNNEST(AI.PDF_PAGES(f.pdf, 64)) AS u FROM files f) p "
+        "WHERE AI.IF(PROMPT('Is this page a lease? {0}', p.u['image']))",
+        tables={"files": files}), """\
+--- SELECT p.id, p.u['page'] AS page FROM (SELECT f.id, UNNEST(AI.PDF_PAGES(f.pdf, 64))
+    AS u FROM files f) p WHERE AI.IF(PROMPT('Is this page a lease? {0}', p.u['image']))
+    ---
+plan
+  __quail_answer_1 = ai_filter('Is this page a lease? {0}', get_field(p.u, 'image')),
+      filter: __quail_answer_1, returns: []
+asked 3 of 3
+  'Is this page a lease? {0}': <1 images 107f1fde> TRUE, <1 images d1934d8c> TRUE, <1
+      images fc0237ea> TRUE
+rows 3
+  f1, 1
+  f1, 2
+  f2, 1
+""")
