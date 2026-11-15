@@ -177,11 +177,7 @@ def score(run_id: str) -> dict:
 PARSER_MODEL = "qwen3.8-27b-fp8"
 PARSER_ANSWER_TOKENS = 8_192
 # parsed text the issue #148 experiment saved, by page id
-SAVED_PARSES = {
-    "lightonocr": "officeqa_nemotron/parsed_lightonocr.json",
-    "nemotron single": "officeqa_nemotron/parsed_single.json",
-    "nemotron triple": "officeqa_nemotron/parsed_triple.json",
-}
+SAVED_PARSES = {"lightonocr": "officeqa_nemotron/parsed_lightonocr.json"}
 TEXTS_SQL = "SELECT p.page_id, AI.PARSE_DOCUMENT(p.pdf) AS text FROM officeqa_pages p"
 
 
