@@ -33,6 +33,7 @@ from quail.physical import (
     PhysicalGraph,
     PortRef,
 )
+from quail.progress import say
 
 
 class RegionRuntime:
@@ -176,8 +177,13 @@ def serve_region(state, payload, graph: PhysicalGraph, end, wanted,
         # the region is timed until its end, so the files fall inside it
         arena.write_trace_files()
     finally:
-        if getattr(pipeline, "images", None) is not None:
-            pipeline.images.close()
+        images = getattr(pipeline, "images", None)
+        if images is not None:
+            if images.encoded:
+                say(f"vision encoder: {images.encoded} images in "
+                    f"{images.encoder_s():.2f} GPU s; waited "
+                    f"{images.decode_wait_s:.2f} s for decoded pixels")
+            images.close()
             pipeline.images = None
         for key in arena.resident_keys():
             arena.free_key(key)

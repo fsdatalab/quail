@@ -153,12 +153,22 @@ class RegionImages:
             self._pixels = {first: self._pool.submit(decode_png, image.png)
                             for first, image in self.images.items()}
         self._embeddings: dict[int, object] = {}
+        # (start, end) CUDA events around each encoder call, the seconds
+        # the GPU loop waited for decoded pixels, and the images encoded
+        self._encoder_events: list = []
+        self.decode_wait_s = 0.0
+        self.encoded = 0
         # by arena key, and by image, the position of the image's first token
         self._starts: dict = {}
         self._image_starts: dict[int, int] = {}
 
     def __bool__(self) -> bool:
         return bool(self.images)
+
+    def encoder_s(self) -> float:
+        """The GPU seconds the vision encoder took so far."""
+        return sum(start.elapsed_time(end) for start, end in
+                   self._encoder_events) / 1000.0
 
     def close(self) -> None:
         """Stop decoding and drop every image's pixels and embeddings."""
@@ -221,19 +231,32 @@ class RegionImages:
         """Run the vision encoder on images, keeping their embeddings."""
         if not firsts:
             return
+        import time
+
         device = visual_device(visual)
         patches, grids = [], []
         for first in firsts:
+            waited = time.perf_counter()
             pixels = self._pixels.pop(first, None)
             pixels = (decode_png(self.images[first].png) if pixels is None
                       else pixels.result())
+            self.decode_wait_s += time.perf_counter() - waited
             rgb = torch.from_numpy(pixels.copy()).to(device)
             found, grid = pixel_patches(torch, rgb)
             patches.append(found)
             grids.append(grid)
         pixel_values = torch.cat(patches).to(visual_dtype(visual))
         grid_thw = torch.tensor(grids, dtype=torch.int64, device=device)
+        timed = pixel_values.is_cuda
+        if timed:
+            start, end = (torch.cuda.Event(enable_timing=True),
+                          torch.cuda.Event(enable_timing=True))
+            start.record()
         embeddings = visual(pixel_values, grid_thw=grid_thw)
+        if timed:
+            end.record()
+            self._encoder_events.append((start, end))
+        self.encoded += len(firsts)
         sizes = [self.images[first].tokens for first in firsts]
         for first, found in zip(firsts, embeddings.split(sizes), strict=True):
             self._embeddings[first] = found.to(dtype)
