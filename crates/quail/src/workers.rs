@@ -484,12 +484,25 @@ impl Workers {
         let (program, arguments) = command
             .split_first()
             .ok_or_else(|| failure("a worker needs a command"))?;
+        // Worker `gpu` is the gpu-th device the server itself may use: an
+        // outer CUDA_VISIBLE_DEVICES (one server per GPU on a shared host)
+        // names those devices; without one, they are 0, 1, ...
+        let visible: Vec<String> = std::env::var("CUDA_VISIBLE_DEVICES")
+            .map(|devices| {
+                devices
+                    .split(',')
+                    .map(|device| device.trim().to_string())
+                    .filter(|device| !device.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
         for (gpu, path) in self.paths.iter().enumerate() {
+            let device = visible.get(gpu).cloned().unwrap_or_else(|| gpu.to_string());
             let process = Command::new(program)
                 .args(arguments)
                 .arg(path)
                 .arg(gpu.to_string())
-                .env("CUDA_VISIBLE_DEVICES", gpu.to_string())
+                .env("CUDA_VISIBLE_DEVICES", device)
                 .spawn()
                 .map_err(|error| failure(format!("cannot start {program}: {error}")))?;
             self.processes

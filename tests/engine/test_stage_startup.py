@@ -124,3 +124,22 @@ def test_a_worker_process_reads_a_regions_table_over_the_files_mapped_pages(
         {"gpu": str(gpu), "index": str(gpu), "in_file": True, "total": 499500}
         for gpu in range(2)]
     assert not found.alive()
+
+
+def test_a_worker_uses_the_gpus_an_outer_cuda_visible_devices_names(
+        tmp_path, monkeypatch):
+    script = tmp_path / "worker.py"
+    script.write_text(WORKER_TEXT)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3,5")
+    found = _quail_native.Workers(2)
+    try:
+        found.spawn([sys.executable, str(script)])
+        found.connect()
+        table = pa.table({"id": pa.array(range(10), pa.int32())})
+        ran = found.run_region(
+            "{}", [("documents:r", table)], graph().to_json(), "[]",
+            lambda table: None, lambda question: "null")
+    finally:
+        found.close()
+    # a server given GPUs 3 and 5 puts its two workers on them
+    assert [json.loads(text)["gpu"] for text, _ in ran] == ["3", "5"]
