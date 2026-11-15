@@ -6,8 +6,10 @@ Quail offers two functions for PDFs. `AI.PDF_PAGES` turns each page into
 an image. `AI.PARSE_DOCUMENT` returns the text a PDF stores.
 
 Quail doesn't yet support a text parser, such as OCR. You can still get
-pretty far without one. A vision model answers questions from the page
-images directly.
+pretty far without one, as modern open-source LLMs can answer questions
+from the page images directly. [PixelRAG](https://arxiv.org/abs/2606.28344)
+found that page screenshots beat parsed text for retrieval-augmented
+generation.
 
 ## Load PDFs
 
