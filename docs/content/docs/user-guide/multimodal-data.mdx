@@ -76,11 +76,6 @@ You get answers for all 1,000 receipts in 100 seconds on one H100 with
 `AI.CLASSIFY` reuses the KV that `AI.IF` already computed for each
 receipt.
 
-You pay for each image in tokens. Quail resizes each image as Qwen's
-image processor does, so each side becomes a multiple of 32 pixels. The
-model then reads one token per 32 by 32 pixels. A 1,000 by 750 photo
-becomes 992 by 736 pixels, or 713 tokens.
-
 ## PDFs
 
 To query PDFs, first store them in a `BINARY` column too. The code
