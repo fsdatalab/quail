@@ -71,10 +71,10 @@ WHERE AI.IF(PROMPT('Is this receipt''s total over 100,000 rupiah? {0}', r.image)
 | 174,600: kept, `meal` | 230,000: kept, `bakery or snacks` | 91,000: not kept |
 
 You get answers for all 1,000 receipts in 100 seconds on one H100 with
-`qwen3.5-4b-bf16`, for $0.11. The filter was right on 96.8% of the 972
-receipts with a labeled total. You pay to read each photo once:
-`AI.CLASSIFY` reuses the KV, the model's cached attention state, that
-`AI.IF` already computed for each kept receipt.
+`qwen3.5-4b-bf16`, for $0.11, and the filter was right on 96.8% of the
+972 receipts with a labeled total. The query runs fast because
+`AI.CLASSIFY` reuses the KV that `AI.IF` already computed for each
+receipt.
 
 You pay for each image in tokens. Quail resizes each image as Qwen's
 image processor does, so each side becomes a multiple of 32 pixels. The
