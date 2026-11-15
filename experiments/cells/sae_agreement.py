@@ -1,24 +1,26 @@
-"""Quail's layer 11 residual stream and SAE features against transformers.
+"""Quail's residual stream and SAE features against transformers.
 
-Two steps, each in its own container. reference runs Qwen3.5-2B-Base
-through transformers in bf16, hooks the residual stream after layer 11,
-and records, for each document-plus-question prompt, the last token's
-hidden state and its top 100 SAE features. quail loads the 12-layer
-qwen3.5-2b-sae-bf16 spec through Quail's loader, runs the same prompts
-as one-stage chunks, reads the residual rows the pipeline returns, and
-records the same values.
+Two steps, each in its own container, for a model spec with an SAE.
+reference runs the spec's checkpoint through transformers in bf16,
+hooks the residual stream after the spec's last layer (layer 11 of
+qwen3.5-2b-sae-bf16, layer 30 of qwen3-8b-sae-bf16), and records, for
+each document-plus-question prompt, the last token's hidden state and
+its top SAE features. quail loads the spec through Quail's loader, runs
+the same prompts as one-stage chunks, reads the residual rows the
+pipeline returns, and records the same values.
 
 Prediction: the last-token hidden states agree within bf16 tolerance
 (median relative error under 1 percent, maximum under 3 percent), and
-at least 90 percent of the prompts keep the same top 100 feature set.
+at least 90 percent of the prompts keep the same top feature set.
 The engines round their GEMMs differently, so boundary features may
 swap; the comparison also reports the mean feature overlap.
 
     uv run modal run --detach -m experiments.cells.sae_agreement \
-        2>&1 | tee /tmp/sae_agreement.log
+        --model qwen3-8b-sae-bf16 2>&1 | tee /tmp/sae_agreement.log
 
-Records: /results/ablations/qwen3.5-2b-sae-agreement-{reference,quail}.json
-and the comparison in .../qwen3.5-2b-sae-agreement.json.
+Records: /results/ablations/<model>-agreement-{reference,quail}.json.
+The quail record holds the comparison and model_memory_bytes, the
+measurement behind the spec's w_mem_bytes.
 """
 
 import json
@@ -40,7 +42,6 @@ VOLUMES = {"/root/.cache/huggingface": hf_cache,
            "/root/.cache/kernels": kernel_cache,
            "/results": results}
 
-MODEL = "qwen3.5-2b-sae-bf16"
 BUDGET = 8192
 QUESTION = "\n\nWhat is this text about?"
 HEAD = "DOCUMENT:\n"
@@ -72,15 +73,15 @@ def _prompts(spec, tokenizer):
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
               volumes=VOLUMES)
-def reference() -> dict:
-    """Transformers' layer 11 residual and features for each prompt."""
+def reference(model_name: str) -> dict:
+    """Transformers' residual after the spec's last layer, and its features."""
     import torch
     from huggingface_hub import hf_hub_download
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     from quail.specs import MODELS
 
-    spec = MODELS[MODEL]
+    spec = MODELS[model_name]
     tokenizer = AutoTokenizer.from_pretrained(spec.hf_name,
                                               revision=spec.revision or None)
     # device_map would need accelerate, which the image does not carry
@@ -99,8 +100,8 @@ def reference() -> dict:
 
     layers = model.model.layers if hasattr(model, "model") else (
         model.language_model.model.layers)
-    handle = layers[11].register_forward_hook(hook)
-    record = {"model": MODEL, "hidden": [], "features": []}
+    handle = layers[spec.layers - 1].register_forward_hook(hook)
+    record = {"model": model_name, "hidden": [], "features": []}
     with torch.no_grad():
         for document, tail in _prompts(spec, tokenizer):
             ids = torch.tensor([document + tail], device="cuda")
@@ -115,7 +116,7 @@ def reference() -> dict:
                 zip(index.tolist(), values.tolist()) if value > 0))
     handle.remove()
     results.reload()
-    with open(f"/results/ablations/{MODEL}-agreement-reference.json",
+    with open(f"/results/ablations/{model_name}-agreement-reference.json",
               "w") as out:
         json.dump(record, out)
     results.commit()
@@ -124,8 +125,8 @@ def reference() -> dict:
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3600,
               volumes=VOLUMES)
-def quail() -> dict:
-    """Quail's layer 11 residual and features, against the saved reference."""
+def quail(model_name: str) -> dict:
+    """Quail's residual and features, against the saved reference."""
     import numpy as np
     import torch
     import torch.nn.functional as functional
@@ -141,9 +142,9 @@ def quail() -> dict:
     from quail.common import budgets
     from quail.specs import H100_SXM, MODELS
 
-    spec = MODELS[MODEL]
+    spec = MODELS[model_name]
     results.reload()
-    with open(f"/results/ablations/{MODEL}-agreement-reference.json") as f:
+    with open(f"/results/ablations/{model_name}-agreement-reference.json") as f:
         reference_record = json.load(f)
     tokenizer = AutoTokenizer.from_pretrained(spec.hf_name,
                                               revision=spec.revision or None)
@@ -219,7 +220,7 @@ def quail() -> dict:
             len(reference_torch & reference_set)
             / max(len(reference_set), 1))
     record = {
-        "model": MODEL, "prompts": len(prompts),
+        "model": model_name, "prompts": len(prompts),
         "model_memory_bytes": model_memory_bytes,
         "hidden_relative_error_median": float(np.median(errors)),
         "hidden_relative_error_max": float(np.max(errors)),
@@ -228,15 +229,16 @@ def quail() -> dict:
         "quail_encoder_on_reference_hidden_overlap": float(
             np.mean(torch_against_reference)),
     }
-    with open(f"/results/ablations/{MODEL}-agreement-quail.json", "w") as out:
+    with open(f"/results/ablations/{model_name}-agreement-quail.json",
+              "w") as out:
         json.dump(record, out)
     results.commit()
     return record
 
 
 @app.local_entrypoint()
-def main(reuse_reference: bool = False):
+def main(model: str = "qwen3.5-2b-sae-bf16", reuse_reference: bool = False):
     if not reuse_reference:
-        print("reference:", reference.remote())
-    record = quail.remote()
+        print("reference:", reference.remote(model))
+    record = quail.remote(model)
     print(json.dumps(record, indent=2))

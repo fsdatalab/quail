@@ -62,6 +62,7 @@ each model weight as a 16-bit floating-point number.
 | d1-2B | `d1-2b-bf16` | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT`, `AI.EXTRACT_SPAN` |
 | d1-2B | `d1-2b-fp8` | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT`, `AI.EXTRACT_SPAN` |
 | Qwen3.5 2B Base with Qwen-Scope SAE | `qwen3.5-2b-sae-bf16` | `AI.SAE_FEATURES` |
+| Qwen3 8B Base with Qwen-Scope SAE | `qwen3-8b-sae-bf16` | `AI.SAE_FEATURES` |
 
 The d1-2B models run `AI.SCORE` over one table only. The FP8 d1-2B model
 converts the published BF16 weights to FP8 while loading them.

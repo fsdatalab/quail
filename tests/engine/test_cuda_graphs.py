@@ -20,6 +20,7 @@ from quail.specs import (
     QWEN3_5_2B_SAE_BF16,
     QWEN3_5_4B_BF16,
     QWEN3_6_35B_A3B_FP8,
+    QWEN3_8B_SAE_BF16,
 )
 
 torch = pytest.importorskip("torch")
@@ -58,9 +59,29 @@ def test_dense_models_capture_the_stock_vllm_sizes_and_other_models_stay_eager()
             2 * buckets[-1] * model.act_per_token), model.name
 
     # experts, SAE readouts, and LFM2 keep the eager path
-    for model in [QWEN3_6_35B_A3B_FP8, QWEN3_5_2B_SAE_BF16, LFM2_2_6B_BF16]:
+    for model in [QWEN3_6_35B_A3B_FP8, QWEN3_5_2B_SAE_BF16, QWEN3_8B_SAE_BF16,
+                  LFM2_2_6B_BF16]:
         assert PiecewiseGraphs.for_specs(None, model, H100_SXM) is None, model.name
         assert graph_memory_bytes(model, H100_SXM) == 0, model.name
+
+
+def test_a_qwen3_sae_model_returns_the_residual_stream_without_the_final_norm():
+    model = Qwen3Pipeline.__new__(Qwen3Pipeline)
+    model.spec = QWEN3_8B_SAE_BF16
+    model.embed = lambda ids: torch.ones(len(ids), 4)
+    model.layers = [None]
+    # the attention sum is the running residual; the MLP output is twice it
+    model.before_attention = lambda hidden, residual, positions, layer: (
+        hidden, hidden, hidden, hidden)
+    model.after_attention = lambda o_in, o_scale, residual, layer: 2 * residual
+    # the engine has no norm: a final norm would raise
+    model.engine = SimpleNamespace(attention=lambda q, k, v, chunk: (q, None))
+    assert model.forward_chunk(chunk()).tolist() == [[3.0] * 4]
+
+    observed = []
+    model.forward_hook = lambda stream, chunk: observed.append(stream.tolist())
+    assert model.forward_chunk(chunk()).tolist() == [[3.0] * 4]
+    assert observed == [[[3.0] * 4] * 5]
 
 
 def check_padding_never_reaches_attention(mode):

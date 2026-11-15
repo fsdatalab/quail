@@ -19,6 +19,7 @@ class Qwen3Pipeline(ModelPipeline):
                  engine_class=Engine):
         import torch
 
+        self.spec = spec
         self.layers = model.model.layers
         self.embed = model.model.embed_tokens
         self.final_norm = model.model.norm
@@ -128,6 +129,15 @@ class Qwen3Pipeline(ModelPipeline):
             o_in, o_scale = engine.attention(q, k, v, chunk)
             hidden = self.after_attention(o_in, o_scale, residual, layer)
         final = chunk.final_indices
+        if self.spec is not None and self.spec.sae is not None:
+            # the SAE reads the residual stream after the last layer: the
+            # MLP output not yet added (hidden) plus the running residual
+            if self.forward_hook is not None:
+                stream = hidden + residual
+                self.forward_hook(stream, chunk)
+                return stream.index_select(0, final)
+            return (hidden.index_select(0, final)
+                    + residual.index_select(0, final))
         last_hidden = hidden.index_select(0, final)
         last_residual = residual.index_select(0, final)
         normed, _ = engine.fused_add_rms_norm(

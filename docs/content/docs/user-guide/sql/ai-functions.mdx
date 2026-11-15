@@ -196,7 +196,7 @@ FROM reviews r;
 | **Alias** | `AI_SAE_FEATURES` |
 | **prompt** | A `PROMPT` over one document column. |
 | **pooling** | `'last'` returns the features of the prompt's last token, at most 100. `'max'` returns each feature's largest strength over all tokens, often thousands of features. |
-| **Model** | `AI.SAE_FEATURES` runs on `qwen3.5-2b-sae-bf16` only, and `qwen3.5-2b-sae-bf16` runs no other AI function. |
+| **Model** | `AI.SAE_FEATURES` runs on `qwen3.5-2b-sae-bf16` and `qwen3-8b-sae-bf16` only, and each runs no other AI function. Feature IDs differ between the two models. |
 
 ### `HINT(condition, options)`
 

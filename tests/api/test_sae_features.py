@@ -143,6 +143,26 @@ rows 3
 """)
 
 
+def test_features_run_on_the_qwen3_8b_sae_model():
+    config = EngineConfig(model="qwen3-8b-sae-bf16", device="h100-sxm")
+    with Transcripts({"reviews": REVIEWS}, _answer, config=config) as runs:
+        transcript = runs.query(f"SELECT r.id, {FEATURES} AS features FROM reviews r")
+    assert_transcript(transcript, """\
+--- SELECT r.id, AI.SAE_FEATURES(PROMPT('About? {0}', r.body), {'pooling': 'last'}) AS
+    features FROM reviews r ---
+plan
+  features = ai_sae_features('About? {0}', r.body, named_struct('pooling', 'last'))
+asked 3 of 3
+  'About? {0}': r0 [{'feature': 0, 'strength': 1.0}, {'feature': 100, 'strength': 0.5}],
+      r1 [{'feature': 1, 'strength': 2.0}, {'feature': 100, 'strength': 0.5}], r2
+      [{'feature': 2, 'strength': 3.0}, {'feature': 100, 'strength': 0.5}]
+rows 3
+  r0, [{'feature': 0, 'strength': 1.0}, {'feature': 100, 'strength': 0.5}]
+  r1, [{'feature': 1, 'strength': 2.0}, {'feature': 100, 'strength': 0.5}]
+  r2, [{'feature': 2, 'strength': 3.0}, {'feature': 100, 'strength': 0.5}]
+""")
+
+
 def test_an_empty_feature_list_is_not_null():
     head = f"SELECT r.id, {TOPIC} AS features FROM reviews r WHERE "
     assert_transcript(_transcript(

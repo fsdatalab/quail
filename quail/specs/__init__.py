@@ -27,6 +27,7 @@ MODAL_GPU_USD_PER_HOUR = {
 
 QWEN3_4B_FP8 = MODELS["qwen3-4b-fp8"]
 QWEN3_32B_FP8 = MODELS["qwen3-32b-fp8"]
+QWEN3_8B_SAE_BF16 = MODELS["qwen3-8b-sae-bf16"]
 QWEN3_5_2B_SAE_BF16 = MODELS["qwen3.5-2b-sae-bf16"]
 QWEN3_5_4B_BF16 = MODELS["qwen3.5-4b-bf16"]
 QWEN3_5_4B_FP8 = MODELS["qwen3.5-4b-fp8"]
@@ -73,7 +74,7 @@ def modal_gpu_type(device: str, gpus: int = 1) -> str:
 __all__ = ["ACT_BYTES_PER_HIDDEN", "AnswerCanvas", "DeviceSpec", "LayerKind",
            "ModelSpec",
            "Precision", "Role", "SaeSpec", "SupportResult", "MODELS", "DEVICES",
-           "QWEN3_4B_FP8",
+           "QWEN3_4B_FP8", "QWEN3_8B_SAE_BF16",
            "QWEN3_5_2B_SAE_BF16", "QWEN3_5_4B_BF16",
            "QWEN3_5_4B_FP8", "QWEN3_5_27B_FP8", "QWEN3_8_27B_FP8", "LFM2_2_6B_BF16",
            "QWEN3_32B_FP8", "QWEN3_6_35B_A3B_FP8",
