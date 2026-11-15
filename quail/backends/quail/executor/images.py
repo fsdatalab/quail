@@ -24,15 +24,15 @@ from dataclasses import dataclass
 
 import numpy as np
 import pyarrow as pa
-from _quail_native import IMAGE_TOKEN_BASE, IMAGE_TOKEN_PIXELS
+from _quail_native import IMAGE_TOKEN_BASE, IMAGE_TOKEN_PIXELS, image_size
 
 # Qwen's vision patch, the frames each patch covers, and the patches
 # merged into one token along each side
 PATCH_PIXELS = 16
 TEMPORAL_PATCH = 2
 MERGE = IMAGE_TOKEN_PIXELS // PATCH_PIXELS
-PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-# threads that decode a region's PNGs ahead of the vision encoder
+IMAGE_SIGNATURES = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff")
+# threads that decode a region's images ahead of the vision encoder
 DECODE_THREADS = 8
 # the most patches one vision encoder call reads, which bounds its
 # activations; a model spec's vision_mem_bytes reserves them
@@ -41,12 +41,16 @@ ENCODER_PATCHES = 32_768
 
 @dataclass(frozen=True)
 class Image:
-    """One image of a region: its first token id, size, and PNG bytes."""
+    """One image of a region: its first token id, size, and encoded bytes.
+
+    The size is the one the model reads the image at; the bytes are a
+    PNG or a JPEG.
+    """
 
     first: int
     rows: int
     columns: int
-    png: bytes
+    encoded: bytes
 
     @property
     def tokens(self) -> int:
@@ -104,12 +108,17 @@ def pixel_patches(torch, rgb):
     return patches, (1, grid_h, grid_w)
 
 
-def decode_png(png: bytes) -> np.ndarray:
-    """A PNG's pixels as (height, width, 3) uint8."""
+def decode_image(image: Image) -> np.ndarray:
+    """An image's pixels at the size the model reads, as (height, width, 3) uint8."""
     from PIL import Image as PILImage
 
-    with PILImage.open(io.BytesIO(png)) as opened:
-        return np.asarray(opened.convert("RGB"))
+    width, height = image.columns * IMAGE_TOKEN_PIXELS, image.rows * IMAGE_TOKEN_PIXELS
+    with PILImage.open(io.BytesIO(image.encoded)) as opened:
+        rgb = opened.convert("RGB")
+        # Qwen's image processor resizes with bicubic interpolation
+        if rgb.size != (width, height):
+            rgb = rgb.resize((width, height), PILImage.Resampling.BICUBIC)
+        return np.asarray(rgb)
 
 
 class RegionImages:
@@ -118,7 +127,8 @@ class RegionImages:
     Args:
         documents: The region's token documents by alias.
         columns: The region's value columns by alias; an alias whose
-            documents are images has a binary column of their PNGs.
+            documents are images has a binary column of their PNGs or
+            JPEGs.
     """
 
     def __init__(self, documents: dict, columns: dict):
@@ -136,16 +146,17 @@ class RegionImages:
                 # the pages AI.PDF_PAGES returns: each its number and image
                 parts = [part.get("image") if isinstance(part, dict) else part
                          for part in parts]
-                pngs = [part for part in parts
-                        if part is not None and part.startswith(PNG_SIGNATURE)]
-                found = tuple(_image_firsts(_tokens_of(store[index]))) if pngs else ()
+                encoded = [part for part in parts
+                           if part is not None and part.startswith(IMAGE_SIGNATURES)]
+                found = (tuple(_image_firsts(_tokens_of(store[index])))
+                         if encoded else ())
                 firsts.append(found)
-                for first, png in zip(found, pngs, strict=True):
+                for first, image in zip(found, encoded, strict=True):
                     if first not in self.images:
-                        width, height = png_size(png)
+                        width, height = image_size(image)
                         self.images[first] = Image(
                             first, height // IMAGE_TOKEN_PIXELS,
-                            width // IMAGE_TOKEN_PIXELS, png)
+                            width // IMAGE_TOKEN_PIXELS, image)
             self.firsts[alias] = firsts
         order = sorted(self.images)
         self._sorted = np.asarray(order, dtype=np.int64)
@@ -156,7 +167,7 @@ class RegionImages:
             from concurrent.futures import ThreadPoolExecutor
 
             self._pool = ThreadPoolExecutor(max_workers=DECODE_THREADS)
-            self._pixels = {first: self._pool.submit(decode_png, image.png)
+            self._pixels = {first: self._pool.submit(decode_image, image)
                             for first, image in self.images.items()}
         self._embeddings: dict[int, object] = {}
         # (start, end) CUDA events around each encoder call, the seconds
@@ -266,7 +277,7 @@ class RegionImages:
         for first in firsts:
             waited = time.perf_counter()
             pixels = self._pixels.pop(first, None)
-            pixels = (decode_png(self.images[first].png) if pixels is None
+            pixels = (decode_image(self.images[first]) if pixels is None
                       else pixels.result())
             self.decode_wait_s += time.perf_counter() - waited
             rgb = torch.from_numpy(pixels.copy()).to(device)

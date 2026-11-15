@@ -7,7 +7,7 @@ operators, the questions the model answered, and the rows
 
 import pyarrow as pa
 import pytest
-from helpers.images import png
+from helpers.images import jpeg, png
 from helpers.oracle import Oracle, oracle_executor
 from helpers.sessions import CONFIG, TOKENIZER
 from helpers.transcript import Transcripts, assert_transcript
@@ -80,8 +80,8 @@ def _context(config, table):
 
 
 @pytest.mark.parametrize(("image", "message"), [
-    (png(60, 96), "multiple of 32 pixels"),
-    (b"GIF89a, not a png", "must be a PNG"),
+    (png(32, 32 * 201), "at most 200 times its other side"),
+    (b"GIF89a, not a png", "must be a PNG or a JPEG"),
 ])
 def test_an_image_quail_cannot_read_is_refused(image, message):
     table = pa.table({"id": ["p1"], "image": pa.array([image], pa.binary())})
@@ -213,4 +213,22 @@ rows 3
   f1, 1
   f1, 2
   f2, 1
+""")
+
+
+def test_a_jpeg_and_a_png_of_any_size_are_image_documents():
+    photos = pa.table({"id": ["p1", "p2"], "image": pa.array(
+        [jpeg(100, 75), png(60, 96, 10)], pa.binary())})
+    assert_transcript(_transcript(
+        "SELECT p.id FROM photos p "
+        "WHERE AI.IF(PROMPT('Is this a lease? {0}', p.image))",
+        tables={"photos": photos}), """\
+--- SELECT p.id FROM photos p WHERE AI.IF(PROMPT('Is this a lease? {0}', p.image)) ---
+plan
+  __quail_answer_1 = ai_filter('Is this a lease? {0}', p.image), filter:
+      __quail_answer_1, returns: []
+asked 2 of 2
+  'Is this a lease? {0}': p1 TRUE, p2 FALSE
+rows 1
+  p1
 """)

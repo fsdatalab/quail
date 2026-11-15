@@ -40,15 +40,15 @@ class ImagePrompts:
             image = self.images.image_of(token)
             if token == image.first:
                 ids.append(self.pad_id)
-                pictures.append(_picture(image.png))
+                pictures.append(_picture(image.encoded))
         if not pictures:
             return prompt
         return {**prompt, "prompt_token_ids": ids,
                 "multi_modal_data": {"image": pictures}}
 
 
-def _picture(png: bytes):
+def _picture(encoded: bytes):
     from PIL import Image
 
-    with Image.open(io.BytesIO(png)) as opened:
+    with Image.open(io.BytesIO(encoded)) as opened:
         return opened.convert("RGB")

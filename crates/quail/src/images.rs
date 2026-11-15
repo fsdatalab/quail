@@ -1,7 +1,9 @@
-//! Image documents: a binary column of PNG images, such as the pages
-//! `AI.PDF_PAGES` renders, as the tokens of a token store.
+//! Image documents: a binary column of PNG or JPEG images, such as the
+//! pages `AI.PDF_PAGES` renders, as the tokens of a token store.
 //!
-//! An image of `w` by `h` pixels is `(w / 32) * (h / 32)` image tokens
+//! The model reads an image at the size [`image_size`] gives, as Qwen's
+//! image processor resizes it. An image of `w` by `h` pixels at that
+//! size is `(w / 32) * (h / 32)` image tokens
 //! between the model's vision start and end tokens. Each image token's
 //! id is [`IMAGE_TOKEN_BASE`] or more, unique to the image's bytes, so
 //! the planner counts, shares, and deduplicates image documents as it
@@ -20,6 +22,13 @@ use quail_planner::error::CompileError;
 use quail_planner::inputs::HfTokenizer;
 
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+const JPEG_SIGNATURE: &[u8] = b"\xff\xd8\xff";
+/// The most pixels Qwen3.5's image processor reads an image at
+/// (`longest_edge` in its preprocessor_config.json).
+const MAX_PIXELS: f64 = 16_777_216.0;
+/// The longest an image's longer side may be, as a multiple of its
+/// shorter side, as Qwen's image processor allows.
+const MAX_ASPECT: u32 = 200;
 /// The field of a page struct that holds its PNG, as AI.PDF_PAGES names it.
 const PAGE_IMAGE: &str = "image";
 
@@ -42,13 +51,86 @@ pub(crate) fn holds_images(data_type: &DataType) -> bool {
 }
 
 /// The width and height a PNG's header gives, or None for other bytes.
-pub(crate) fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
+fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
     if bytes.len() < 24 || !bytes.starts_with(PNG_SIGNATURE) || &bytes[12..16] != b"IHDR" {
         return None;
     }
     let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
     let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
     Some((width, height))
+}
+
+/// The width and height a JPEG's frame header gives, or None for other
+/// bytes.
+fn jpeg_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    if !bytes.starts_with(JPEG_SIGNATURE) {
+        return None;
+    }
+    let mut at = 2;
+    while at + 4 <= bytes.len() {
+        if bytes[at] != 0xff {
+            return None;
+        }
+        let marker = bytes[at + 1];
+        // fill bytes before a marker
+        if marker == 0xff {
+            at += 1;
+            continue;
+        }
+        // markers with no length: restarts, and the start of the image
+        if (0xd0..=0xd8).contains(&marker) || marker == 0x01 {
+            at += 2;
+            continue;
+        }
+        let length = usize::from(u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]));
+        // a start-of-frame marker; 0xc4, 0xc8, and 0xcc are other tables
+        if (0xc0..=0xcf).contains(&marker) && ![0xc4, 0xc8, 0xcc].contains(&marker) {
+            let frame = bytes.get(at + 5..at + 9)?;
+            let height = u32::from(u16::from_be_bytes([frame[0], frame[1]]));
+            let width = u32::from(u16::from_be_bytes([frame[2], frame[3]]));
+            return Some((width, height));
+        }
+        at += 2 + length;
+    }
+    None
+}
+
+/// The width and height the model reads an image at: each side a
+/// multiple of 32 pixels and the area at most [`MAX_PIXELS`], as Qwen's
+/// `smart_resize` gives them. Unlike `smart_resize`, a small image stays
+/// small rather than growing to 65,536 pixels.
+///
+/// # Errors
+///
+/// The bytes are not a PNG or a JPEG, or the image has no pixels or is
+/// over 200 times as long as it is wide.
+pub fn image_size(bytes: &[u8]) -> Result<(u32, u32), CompileError> {
+    let Some((width, height)) = png_size(bytes).or_else(|| jpeg_size(bytes)) else {
+        return Err(CompileError::new(
+            "an image document must be a PNG or a JPEG, such as a page AI.PDF_PAGES renders",
+        ));
+    };
+    if width == 0 || height == 0 || width.max(height) > MAX_ASPECT * width.min(height) {
+        return Err(CompileError::new(format!(
+            "an image document must have a side at most {MAX_ASPECT} times its other \
+             side; one is {width} by {height}"
+        )));
+    }
+    let factor = f64::from(IMAGE_TOKEN_PIXELS);
+    let (width, height) = (f64::from(width), f64::from(height));
+    // Python's round(), which rounds a half to the even multiple
+    let mut sides =
+        [height, width].map(|side| factor.max((side / factor).round_ties_even() * factor));
+    if sides[0] * sides[1] > MAX_PIXELS {
+        let beta = (height * width / MAX_PIXELS).sqrt();
+        sides = [height, width].map(|side| factor.max((side / beta / factor).floor() * factor));
+    }
+    Ok((sides[1] as u32, sides[0] as u32))
+}
+
+/// Whether a document part's bytes are an image rather than text.
+fn is_image(bytes: &[u8]) -> bool {
+    bytes.starts_with(PNG_SIGNATURE) || bytes.starts_with(JPEG_SIGNATURE)
 }
 
 /// The first token id of each image a planner has seen, by its bytes.
@@ -88,8 +170,8 @@ impl ImageIds {
 ///
 /// # Errors
 ///
-/// The model has no vision tokens, or a value is not a PNG whose sides
-/// are each a multiple of 32 pixels.
+/// The model has no vision tokens, or a value is not an image
+/// [`image_size`] reads.
 pub(crate) fn image_token_lists(
     values: &ArrayRef,
     tokenizer: &HfTokenizer,
@@ -105,11 +187,11 @@ pub(crate) fn image_token_lists(
     let start = special("<|vision_start|>")? as i32;
     let end = special("<|vision_end|>")? as i32;
     let mut lists = LargeListBuilder::new(Int32Builder::new());
-    // one part's tokens: a PNG's image tokens, or else its UTF-8 text's
+    // one part's tokens: an image's tokens, or else its UTF-8 text's
     let mut part = |bytes: &[u8], tokens: &mut Int32Builder, text: bool| {
-        if text && !bytes.starts_with(PNG_SIGNATURE) {
+        if text && !is_image(bytes) {
             let text = std::str::from_utf8(bytes).map_err(|_| {
-                CompileError::new("a document part is neither a PNG nor UTF-8 text")
+                CompileError::new("a document part is neither an image nor UTF-8 text")
             })?;
             let found = tokenizer.encode(text).map_err(|error| {
                 CompileError::new(format!("a document part does not tokenize: {error}"))
@@ -190,23 +272,10 @@ pub(crate) fn image_token_lists(
     Ok(lists.finish())
 }
 
-/// The image tokens of a PNG: one per 32 by 32 pixels.
+/// The image tokens of an image: one per 32 by 32 pixels of the size
+/// the model reads it at.
 fn image_tokens(bytes: &[u8]) -> Result<i64, CompileError> {
-    let Some((width, height)) = png_size(bytes) else {
-        return Err(CompileError::new(
-            "an image document must be a PNG, such as a page AI.PDF_PAGES renders",
-        ));
-    };
-    if width == 0
-        || height == 0
-        || width % IMAGE_TOKEN_PIXELS != 0
-        || height % IMAGE_TOKEN_PIXELS != 0
-    {
-        return Err(CompileError::new(format!(
-            "an image document's sides must each be a multiple of {IMAGE_TOKEN_PIXELS} \
-             pixels, as AI.PDF_PAGES renders them; one is {width} by {height}"
-        )));
-    }
+    let (width, height) = image_size(bytes)?;
     Ok(i64::from(width / IMAGE_TOKEN_PIXELS) * i64::from(height / IMAGE_TOKEN_PIXELS))
 }
 
@@ -223,11 +292,37 @@ mod tests {
         bytes
     }
 
+    /// A JPEG's start, an APP0 segment, and a baseline frame header.
+    fn jpeg(width: u16, height: u16) -> Vec<u8> {
+        let mut bytes = vec![0xff, 0xd8, 0xff, 0xe0, 0x00, 0x04, 0x4a, 0x46];
+        bytes.extend_from_slice(&[0xff, 0xc0, 0x00, 0x11, 0x08]);
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes
+    }
+
     #[test]
     fn an_image_is_one_token_per_32_pixels_square() {
-        assert_eq!(image_tokens(&png(64, 96)).unwrap(), 6);
-        assert!(image_tokens(&png(60, 96)).is_err());
-        assert!(image_tokens(b"not a png at all, longer than 24").is_err());
+        assert_eq!(image_tokens(&png(320, 256)).unwrap(), 80);
+        assert_eq!(image_tokens(&jpeg(320, 256)).unwrap(), 80);
+        assert!(image_tokens(b"not an image at all, longer than 24").is_err());
+        assert!(image_tokens(&png(64, 64 * 201)).is_err());
+    }
+
+    #[test]
+    fn an_image_is_resized_as_qwens_image_processor_resizes_it() {
+        // expected sizes from Hugging Face's smart_resize with Qwen3.5's
+        // preprocessor_config.json, but for 60 by 96, which stays small
+        for ((width, height), resized) in [
+            ((1184, 1536), (1184, 1536)),
+            ((1000, 750), (992, 736)),
+            ((60, 96), (64, 96)),
+            ((20000, 15000), (4704, 3520)),
+            ((1040, 1040), (1024, 1024)),
+        ] {
+            assert_eq!(image_size(&png(width, height)).unwrap(), resized);
+        }
+        assert_eq!(image_size(&jpeg(1000, 750)).unwrap(), (992, 736));
     }
 
     #[test]

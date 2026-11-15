@@ -1,6 +1,11 @@
 ---
-title: Querying PDFs
+title: Querying images and PDFs
 ---
+
+Quail reads PNG and JPEG images as documents. A model needs a vision
+tower to read pixels. The models with a vision tower are
+`qwen3.5-4b-bf16`, `qwen3.5-4b-fp8`, `qwen3.5-27b-fp8`,
+`qwen3.8-27b-fp8`, and `qwen3.6-35b-a3b-fp8`.
 
 Quail offers two functions for PDFs. `AI.PDF_PAGES` turns each page into
 an image. `AI.PARSE_DOCUMENT` returns the text a PDF stores.
@@ -9,9 +14,10 @@ Quail doesn't yet support a text parser, such as OCR. You can still get
 pretty far without one, as modern open-source LLMs can answer questions
 from the page images directly.
 
-## Load PDFs
+## Ask questions about images
 
-Store each PDF's bytes in a `BINARY` column:
+Store each image's bytes in a `BINARY` column, and pass the column to an
+AI function:
 
 ```python
 from pathlib import Path
@@ -19,13 +25,35 @@ from pathlib import Path
 import pyarrow as pa
 import quail
 
+paths = sorted(Path("receipts").glob("*.jpg"))
+photos = pa.table({
+    "path": [path.name for path in paths],
+    "image": pa.array([path.read_bytes() for path in paths], pa.binary()),
+})
+config = quail.EngineConfig(model="qwen3.5-4b-bf16", device="h100-sxm")
+session = quail.Session(config=config)
+session.register("photos", quail.DocumentProvider.from_table(photos, id_col="path"))
+print(session.sql("""
+    SELECT p.path FROM photos p
+    WHERE AI.IF(PROMPT('Is this receipt over $100? {0}', p.image))
+""").run().collect())
+```
+
+Quail resizes each image as Qwen's image processor does. Each side
+becomes a multiple of 32 pixels, and the model reads one token per 32 by
+32 pixels. A 1,000 by 750 photo becomes 992 by 736 pixels, or 713
+tokens.
+
+## Load PDFs
+
+Store each PDF's bytes in a `BINARY` column:
+
+```python
 paths = sorted(Path("contracts").glob("*.pdf"))
 files = pa.table({
     "path": [path.name for path in paths],
     "pdf": pa.array([path.read_bytes() for path in paths], pa.binary()),
 })
-config = quail.EngineConfig(model="qwen3.5-4b-bf16", device="h100-sxm")
-session = quail.Session(config=config)
 session.register("files", quail.DocumentProvider.from_table(files, id_col="path"))
 ```
 
@@ -55,17 +83,11 @@ SELECT f.path,
 FROM files f;
 ```
 
-## Choose a model
+## Choose a page size
 
-A model needs a vision tower to read pixels. The models with a vision
-tower are `qwen3.5-4b-bf16`, `qwen3.5-4b-fp8`, `qwen3.5-27b-fp8`,
-`qwen3.8-27b-fp8`, and `qwen3.6-35b-a3b-fp8`.
-
-## Choose an image size
-
-The second argument of `AI.PDF_PAGES` sets the longest side of each
-image, in pixels. The default is 1,536. A model reads one token per 32
-by 32 pixels. A US Letter page at 1,024 pixels is 800 tokens.
+The second argument of `AI.PDF_PAGES` sets the longest side of each page
+image, in pixels. The default is 1,536. A US Letter page at 1,024 pixels
+is 800 tokens.
 
 ## Parse to text
 

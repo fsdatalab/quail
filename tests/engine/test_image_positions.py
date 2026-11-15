@@ -11,9 +11,9 @@ import numpy as np
 import pyarrow as pa
 import torch
 from _quail_native import IMAGE_TOKEN_BASE
-from helpers.images import png
+from helpers.images import jpeg, png
 
-from quail.backends.quail.executor.images import RegionImages
+from quail.backends.quail.executor.images import RegionImages, decode_image
 
 FIRST = IMAGE_TOKEN_BASE
 START, END = 3060, 3061
@@ -115,3 +115,13 @@ def test_a_document_of_two_images_shifts_each_row_by_the_images_before_it():
                                   9, 9, 9, 9, 11, 12]
     assert rotary[1, 12:16].tolist() == [9, 9, 10, 10]
     assert rotary[2, 12:16].tolist() == [9, 10, 9, 10]
+
+
+def test_an_image_decodes_at_the_size_the_planner_counts():
+    for image, (rows, columns) in [(png(60, 96), (3, 2)), (jpeg(1000, 750), (23, 31))]:
+        tokens = rows * columns
+        document = [START, *range(FIRST, FIRST + tokens), END]
+        found = RegionImages({"pages": [document]}, {"pages": pa.table(
+            {"image": pa.array([image], pa.binary())})}).images[FIRST]
+        assert (found.rows, found.columns) == (rows, columns)
+        assert decode_image(found).shape == (32 * rows, 32 * columns, 3)

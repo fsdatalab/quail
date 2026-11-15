@@ -1,5 +1,6 @@
-"""Small PNG images written in a test."""
+"""Small PNG and JPEG images written in a test."""
 
+import io
 import struct
 import zlib
 
@@ -22,3 +23,18 @@ def png(width: int, height: int, shade: int = 255) -> bytes:
             + _chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
             + _chunk(b"IDAT", zlib.compress(row * height))
             + _chunk(b"IEND", b""))
+
+
+def jpeg(width: int, height: int, shade: int = 255) -> bytes:
+    """Return a JPEG of one gray shade.
+
+    Args:
+        width: The width in pixels.
+        height: The height in pixels.
+        shade: Each pixel's red, green, and blue value.
+    """
+    from PIL import Image
+
+    out = io.BytesIO()
+    Image.new("RGB", (width, height), (shade,) * 3).save(out, format="JPEG")
+    return out.getvalue()

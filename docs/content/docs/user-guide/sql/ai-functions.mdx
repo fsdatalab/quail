@@ -338,17 +338,19 @@ Result: `(2)`.
 - A comparison drops `NULL` answers. Use `IS NULL` to keep them.
 - `LIMIT` stops the model once enough rows pass.
 
-## Page images
+## Images
 
 A model with a vision tower, such as `qwen3.5-4b-fp8`, reads a `BINARY`
-column of PNG images as a document, in place of text. Each image's
-sides must be multiples of 32 pixels, because the model reads one image
-token per 32 by 32 pixels. `AI.PDF_PAGES` draws every page to such
-sides. [Querying PDFs](/docs/user-guide/pdfs) says when to read page
-images and when to read text.
+column of PNG or JPEG images as a document, in place of text. The model
+reads one image token per 32 by 32 pixels. Quail resizes each image as
+Qwen's image processor does: each side becomes a multiple of 32 pixels,
+and an image over 16,777,216 pixels shrinks to fit. `AI.PDF_PAGES`
+draws every page at a size Quail does not change.
+[Querying images and PDFs](/docs/user-guide/images-and-pdfs) says when
+to read page images and when to read text.
 
-A document may also be several pages: the list `AI.PDF_PAGES` returns,
-or a list of `BINARY` parts, each a PNG or UTF-8 text. The query below
+A document may also be several images: the list `AI.PDF_PAGES` returns,
+or a list of `BINARY` parts, each a PNG, a JPEG, or UTF-8 text. The query below
 classifies each PDF from its first three pages:
 
 ```sql
