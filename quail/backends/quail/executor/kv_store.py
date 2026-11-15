@@ -21,7 +21,9 @@ segments. When the store is full and a save needs room, the prefix with
 the lowest credit leaves (GreedyDual-Size): a prefix's credit is the
 forward-pass seconds it saves per byte, so a long document outlasts
 short ones, plus a clock that rises with each eviction, so a prefix no
-query reads ages out.
+query reads ages out. A prefix the current query saved or restored
+stays: a dataset larger than the store fills it once and is not churned
+through it.
 
 Saves and restores are queued and run by flush, which the loop calls
 before it admits documents and before a forward pass writes the arena.
@@ -110,6 +112,7 @@ class _Saved:
     pieces: list = field(default_factory=list)
     queued: int = 0    # queued restores that read the pieces
     credit: float = 0.0    # the eviction order: the lowest leaves first
+    query: int = 0     # the query that last saved or restored it
 
     @property
     def stored_bytes(self) -> int:
@@ -284,6 +287,8 @@ class KVStore:
         self._credits = []     # heap of (credit, content id), stale ones too
         self._clock = 0.0      # the credit of the last prefix dropped
         self._saves = {}       # content id -> pool rows, freed since the flush
+        self._query = 0        # counts reset_stats calls: one per query
+        self._full = -1        # the query in which the store had nothing to drop
         self._restores = []    # (_Saved, pool rows) to write into the pool
         self.reset_stats()
         self._closed = False
@@ -310,7 +315,8 @@ class KVStore:
             self._thread = None
 
     def reset_stats(self) -> None:
-        """Zero the counters a query's report reads."""
+        """Zero the counters a query's report reads; a new query begins."""
+        self._query += 1
         self.saved_tokens = 0
         self.restored_tokens = 0
         self.dropped_tokens = 0
@@ -381,19 +387,22 @@ class KVStore:
 
     def _credit(self, content: bytes, saved) -> None:
         """Set a prefix's credit on a save or a restore."""
+        saved.query = self._query
         saved.credit = self._clock + (
             self.prefill_seconds(saved.tokens) / max(1, saved.stored_bytes))
         heapq.heappush(self._credits, (saved.credit, content))
 
     def _drop_lowest(self) -> bool:
-        """Free the prefix with the lowest credit that no queued restore reads."""
+        """Free the prefix with the lowest credit that this query has not used."""
+        if self._full == self._query:
+            return False
         queued, dropped = [], False
         while self._credits and not dropped:
             credit, content = heapq.heappop(self._credits)
             saved = self.saved.get(content)
             if saved is None or saved.credit != credit:
                 continue        # dropped, or credited again since
-            if saved.queued:
+            if saved.queued or saved.query == self._query:
                 queued.append((credit, content))
                 continue
             del self.saved[content]
@@ -404,6 +413,9 @@ class KVStore:
             dropped = True
         for entry in queued:
             heapq.heappush(self._credits, entry)
+        if not dropped:
+            # every prefix left is in use: the rest of the query skips
+            self._full = self._query
         return dropped
 
     # ---- queueing, called by the arena ----------------------------------

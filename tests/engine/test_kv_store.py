@@ -66,6 +66,7 @@ def _full_store(pool):
 def test_a_full_store_drops_short_prefixes_before_a_long_one():
     pool = _pool(rows=4096)
     store = _full_store(pool)
+    store.reset_stats()        # a later query
     store.save(b"new", torch.arange(600))
     store.flush(pool)
     # the long prefix saves the most seconds per byte, so both short ones left
@@ -73,11 +74,21 @@ def test_a_full_store_drops_short_prefixes_before_a_long_one():
     assert store.stats()["dropped_tokens"] == 1024
 
 
+def test_a_full_store_keeps_what_the_current_query_saved():
+    pool = _pool(rows=4096)
+    store = _full_store(pool)
+    store.save(b"new", torch.arange(600))
+    store.flush(pool)
+    assert set(store.saved) == {b"long", b"short", b"other"}
+    assert store.stats()["skipped_tokens"] == 600
+
+
 def test_a_long_prefix_no_query_reads_leaves_after_short_ones_in_use():
     pool = _pool(rows=8192)
     store = _full_store(pool)
     # each eviction raises the clock under the prefixes restored after it
     for step in range(8):
+        store.reset_stats()        # each filler comes from a later query
         name = b"filler %d" % step
         store.save(name, torch.arange(512))
         store.flush(pool)
