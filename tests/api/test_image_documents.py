@@ -98,6 +98,15 @@ def test_a_model_without_a_vision_tower_refuses_an_image():
                     "WHERE AI.IF(PROMPT('Is this page a lease? {0}', p.image))")
 
 
+def test_a_model_that_loads_part_of_its_checkpoint_refuses_an_image():
+    # the SAE spec loads 12 of its checkpoint's 24 layers and no vision tower
+    sae = EngineConfig(model="qwen3.5-2b-sae-bf16", device="h100-sxm")
+    session, context = _context(sae, PAGES)
+    with session, pytest.raises(RuntimeError, match="reads no images"):
+        context.sql("SELECT p.id FROM pages p "
+                    "WHERE AI.IF(PROMPT('Is this page a lease? {0}', p.image))")
+
+
 def test_an_extraction_from_an_image_is_refused():
     session, context = _context(VISION, PAGES)
     with session, pytest.raises(RuntimeError, match="an image has none"):

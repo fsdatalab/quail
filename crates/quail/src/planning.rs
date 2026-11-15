@@ -203,7 +203,10 @@ impl Planner {
             let rows = tables
                 .get(&scan.provider)
                 .ok_or_else(|| CompileError::new(format!("no rows for table {}", scan.provider)))?;
-            let reads_images = settings.model["vision_tower"].as_bool().unwrap_or(false);
+            // a spec that loads only some of its checkpoint's layers loads no
+            // vision encoder
+            let reads_images = settings.model["vision_tower"].as_bool().unwrap_or(false)
+                && settings.model["checkpoint_layers"].as_i64().unwrap_or(0) == 0;
             let store =
                 self.token_store(scan, rows, extracted.contains(&scan.alias), reads_images)?;
             let mut names = scan.columns.clone();
@@ -411,7 +414,7 @@ impl Planner {
                 if !reads_images {
                     return Err(CompileError::new(
                         "the model reads no images; an image document needs a model \
-                         with a vision tower, such as qwen3.5-4b-fp8",
+                         that loads its vision tower, such as qwen3.5-4b-fp8",
                     ));
                 }
                 if with_offsets {

@@ -75,7 +75,8 @@ class LoadedGpu:
                                 max_batched_tokens=budget,
                                 moe_backend=spec.moe_backend,
                                 text_only=spec.vision_tower,
-                                images=spec.vision_tower,
+                                images=(spec.vision_tower
+                                        and not spec.checkpoint_layers),
                                 num_layers=(spec.layers if spec.checkpoint_layers
                                             else None),
                                 quantize_fp8=(spec.arch == "lfm3"
