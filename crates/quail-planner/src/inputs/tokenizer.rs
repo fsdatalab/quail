@@ -11,10 +11,6 @@ use arrow::error::ArrowError;
 pub struct HfTokenizer {
     inner: tokenizers::pipeline::PipelineTokenizer,
     options: tokenizers::pipeline::EncodeOptions,
-    /// The pre-tokenizer split Quail runs itself, for a pattern the
-    /// tokenizers release does not, and the tokenizer of its pieces; None
-    /// when the release runs the pattern.
-    split: Option<(Splitter, tokenizers::pipeline::PipelineTokenizer)>,
     /// Each token id's bytes, None for an id the vocabulary does not hold.
     token_bytes: Vec<Option<Vec<u8>>>,
     /// The end-of-text token the model's `tokenizer_config.json` names.
@@ -51,31 +47,9 @@ impl HfTokenizer {
         let text = std::fs::read_to_string(&file)?;
         // a model's file is in the 0.x format, which 1.0 reads once converted
         let converted = tokenizers::canonicalize_str(&text).map_err(external)?;
-        let options = tokenizers::pipeline::EncodeOptions::no_specials();
-        let mut inner = tokenizers::from_json(&converted).map_err(external)?;
-        let mut split = None;
-        if inner.encode("a b", &options).wait().is_err()
-            && let Some((without, mut splitter)) = Splitter::taken_from(&converted)?
-        {
-            let pieces = tokenizers::from_json(&without).map_err(external)?;
-            // a text without combining marks splits the same under the
-            // pattern without them, which the release runs natively
-            match Splitter::markless(&converted)
-                .and_then(|json| tokenizers::from_json(&json).ok())
-                .filter(|found| found.encode("a b", &options).wait().is_ok())
-            {
-                Some(markless) => inner = markless,
-                None => {
-                    splitter.marks = None;
-                    inner = tokenizers::from_json(&without).map_err(external)?;
-                }
-            }
-            split = Some((splitter, pieces));
-        }
         let mut tokenizer = Self {
-            inner,
-            options,
-            split,
+            inner: tokenizers::from_json(&converted).map_err(external)?,
+            options: tokenizers::pipeline::EncodeOptions::no_specials(),
             token_bytes: Vec::new(),
             eos_token_id: None,
         };
@@ -107,48 +81,15 @@ impl HfTokenizer {
     ///
     /// The tokenizer fails on the text.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>, ArrowError> {
-        Ok(self.encode_texts(&[text])?.pop().unwrap_or_default())
-    }
-
-    /// The token ids of each text, without special tokens.
-    fn encode_texts(&self, texts: &[&str]) -> Result<Vec<Vec<u32>>, ArrowError> {
-        let ids = |found: &tokenizers::pipeline::Encoding| {
-            tokenizers::pipeline::PipelineToken::cast_slice(found.ids()).to_vec()
-        };
-        let native = |texts: Vec<&str>| -> Result<Vec<Vec<u32>>, ArrowError> {
-            let encodings = (self.inner.encode(texts, &self.options).wait()).map_err(external)?;
-            Ok(encodings.iter().map(ids).collect())
-        };
-        let Some((split, tokenizer)) = &self.split else {
-            return native(texts.to_vec());
-        };
-        let (marked, plain): (Vec<usize>, Vec<usize>) =
-            (0..texts.len()).partition(|&index| split.needs(texts[index]));
-        let mut found = vec![Vec::new(); texts.len()];
-        for (index, ids) in plain
-            .iter()
-            .zip(native(plain.iter().map(|&i| texts[i]).collect())?)
-        {
-            found[*index] = ids;
-        }
-        if marked.is_empty() {
-            return Ok(found);
-        }
-        // BPE merges no tokens across pre-tokens, so each piece encodes alone
-        let mut pieces: Vec<String> = Vec::new();
-        let mut ends = Vec::with_capacity(marked.len());
-        for &index in &marked {
-            split.pieces(texts[index], &mut pieces).map_err(external)?;
-            ends.push(pieces.len());
-        }
-        let inputs: Vec<&str> = pieces.iter().map(String::as_str).collect();
-        let encodings = (tokenizer.encode(inputs, &self.options).wait()).map_err(external)?;
-        let mut start = 0;
-        for (&index, end) in marked.iter().zip(ends) {
-            found[index] = encodings[start..end].iter().flat_map(ids).collect();
-            start = end;
-        }
-        Ok(found)
+        let encodings = self
+            .inner
+            .encode(text, &self.options)
+            .wait()
+            .map_err(external)?;
+        Ok(encodings
+            .first()
+            .map(|found| tokenizers::pipeline::PipelineToken::cast_slice(found.ids()).to_vec())
+            .unwrap_or_default())
     }
 
     /// The tokens of each text, as a large list array of int32 ids; a
@@ -159,12 +100,16 @@ impl HfTokenizer {
     /// The tokenizer fails on a text.
     pub fn encode_batch(&self, texts: &StringArray) -> Result<LargeListArray, ArrowError> {
         let inputs: Vec<&str> = texts.iter().map(|text| text.unwrap_or("")).collect();
-        let encodings = self.encode_texts(&inputs)?;
-        let total = encodings.iter().map(Vec::len).sum();
+        let encodings = self
+            .inner
+            .encode(inputs, &self.options)
+            .wait()
+            .map_err(external)?;
+        let total = encodings.iter().map(|found| found.len()).sum();
         let mut builder =
             LargeListBuilder::with_capacity(Int32Builder::with_capacity(total), encodings.len());
         for encoding in &encodings {
-            for &id in encoding {
+            for &id in tokenizers::pipeline::PipelineToken::cast_slice(encoding.ids()) {
                 builder.values().append_value(id as i32);
             }
             builder.append(true);
@@ -181,13 +126,17 @@ impl HfTokenizer {
     /// The tokenizer fails on a text, or a text's tokens' bytes do not
     /// spell it, so no range could be read.
     pub fn encode_with_offsets(&self, texts: &[&str]) -> Result<Encoded, ArrowError> {
-        let encodings = self.encode_texts(texts)?;
+        let encodings = self
+            .inner
+            .encode(texts.to_vec(), &self.options)
+            .wait()
+            .map_err(external)?;
         let mut found = Encoded {
             boundaries: vec![0],
             ..Encoded::default()
         };
-        for (text, ids) in texts.iter().zip(&encodings) {
-            let ids = ids.as_slice();
+        for (text, encoding) in texts.iter().zip(&encodings) {
+            let ids = tokenizers::pipeline::PipelineToken::cast_slice(encoding.ids());
             let ranges = self.character_ranges(text, ids).ok_or_else(|| {
                 external("AI.EXTRACT requires token bytes that preserve the source text")
             })?;
@@ -345,8 +294,8 @@ impl HfTokenizer {
         let mut texts: Vec<Option<(bool, String)>> = Vec::new();
         let (mut id, mut misses) = (0u32, 0u32);
         while misses < MISSES {
-            let found = match added.simple_id_to_token(id) {
-                Some(text) => Some((true, text)),
+            let found = match added.id_to_token_bytes(id) {
+                Some((bytes, _)) => Some((true, String::from_utf8_lossy(bytes).into_owned())),
                 None => model.id_to_token(id).map(|text| (false, text)),
             };
             misses = if found.is_some() { 0 } else { misses + 1 };
@@ -508,197 +457,35 @@ mod offset_tests {
     }
 }
 
-/// A `tokenizer.json`'s regex pre-tokenizer split, run ahead of the
-/// tokenizer: added tokens first, as Hugging Face matches them before it
-/// normalizes, then NFC, then the pattern, keeping the text between
-/// matches as pieces too (`Isolated`).
-struct Splitter {
-    pattern: fancy_regex::Regex,
-    added: Option<regex::Regex>,
-    nfc: bool,
-    /// A combining mark, the one class the native pattern leaves out;
-    /// None when every text takes the split.
-    marks: Option<regex::Regex>,
-}
-
-impl Splitter {
-    /// The tokenizer JSON without its regex `Split`, and that split; None
-    /// when the JSON has no regex `Split` in a form Quail runs.
-    fn taken_from(json: &str) -> Result<Option<(String, Self)>, ArrowError> {
-        let mut value: serde_json::Value = serde_json::from_str(json).map_err(external)?;
-        let is_split = |step: &serde_json::Value| {
-            step["type"] == "Split"
-                && step["pattern"]["Regex"].is_string()
-                && step["invert"] != true
-                && step["behavior"].as_str().unwrap_or("Isolated") == "Isolated"
-        };
-        let pattern = match value["pre_tokenizer"]["type"].as_str() {
-            Some("Sequence") => {
-                let Some(steps) = value["pre_tokenizer"]["pretokenizers"].as_array_mut() else {
-                    return Ok(None);
-                };
-                let splits: Vec<usize> =
-                    (0..steps.len()).filter(|&i| is_split(&steps[i])).collect();
-                let [index] = splits.as_slice() else {
-                    return Ok(None);
-                };
-                steps.remove(*index)["pattern"]["Regex"]
-                    .as_str()
-                    .map(str::to_string)
-            }
-            Some("Split") if is_split(&value["pre_tokenizer"]) => {
-                let pattern = value["pre_tokenizer"]["pattern"]["Regex"]
-                    .as_str()
-                    .map(str::to_string);
-                value["pre_tokenizer"] = serde_json::Value::Null;
-                pattern
-            }
-            _ => None,
-        };
-        let Some(pattern) = pattern else {
-            return Ok(None);
-        };
-        let mut contents: Vec<String> = value["added_tokens"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|token| token["content"].as_str().map(str::to_string))
-            .collect();
-        // the longest of two overlapping tokens matches, as Hugging Face's trie does
-        contents.sort_by_key(|content| std::cmp::Reverse(content.len()));
-        let added = (!contents.is_empty())
-            .then(|| {
-                let escaped: Vec<String> = contents.iter().map(|c| regex::escape(c)).collect();
-                regex::Regex::new(&escaped.join("|"))
-            })
-            .transpose()
-            .map_err(external)?;
-        let nfc = value["normalizer"]["type"] == "NFC";
-        let splitter = Self {
-            pattern: fancy_regex::Regex::new(&pattern).map_err(external)?,
-            added,
-            nfc,
-            marks: Some(regex::Regex::new(r"\p{M}").map_err(external)?),
-        };
-        Ok(Some((value.to_string(), splitter)))
-    }
-
-    /// The tokenizer JSON with combining marks taken out of its `Split`
-    /// pattern, such as Qwen3.5's pattern made Qwen2's, or None.
-    fn markless(json: &str) -> Option<String> {
-        let mut value: serde_json::Value = serde_json::from_str(json).ok()?;
-        let mut changed = false;
-        let mut rewrite = |step: &mut serde_json::Value| {
-            if let Some(pattern) = step["pattern"]["Regex"].as_str()
-                && pattern.contains(r"\p{M}")
-            {
-                let markless = pattern
-                    .replace(r"[\p{L}\p{M}]", r"\p{L}")
-                    .replace(r"\p{M}", "");
-                step["pattern"]["Regex"] = serde_json::Value::String(markless);
-                changed = true;
-            }
-        };
-        match value["pre_tokenizer"]["type"].as_str() {
-            Some("Sequence") => value["pre_tokenizer"]["pretokenizers"]
-                .as_array_mut()?
-                .iter_mut()
-                .for_each(&mut rewrite),
-            Some("Split") => rewrite(&mut value["pre_tokenizer"]),
-            _ => {}
-        }
-        changed.then(|| value.to_string())
-    }
-
-    /// Whether a text takes the split: it holds a combining mark, or the
-    /// native pattern is unavailable.
-    fn needs(&self, text: &str) -> bool {
-        self.marks.as_ref().is_none_or(|marks| marks.is_match(text))
-    }
-
-    /// Append a text's pieces, in order, to `out`.
-    fn pieces(&self, text: &str, out: &mut Vec<String>) -> Result<(), fancy_regex::Error> {
-        let mut at = 0;
-        if let Some(added) = &self.added {
-            for found in added.find_iter(text) {
-                self.split(&text[at..found.start()], out)?;
-                out.push(found.as_str().to_string());
-                at = found.end();
-            }
-        }
-        self.split(&text[at..], out)
-    }
-
-    fn split(&self, text: &str, out: &mut Vec<String>) -> Result<(), fancy_regex::Error> {
-        use unicode_normalization::UnicodeNormalization;
-        if text.is_empty() {
-            return Ok(());
-        }
-        let normal: String = if self.nfc {
-            text.nfc().collect()
-        } else {
-            text.to_string()
-        };
-        let mut at = 0;
-        for found in self.pattern.find_iter(&normal) {
-            let found = found?;
-            if found.start() > at {
-                out.push(normal[at..found.start()].to_string());
-            }
-            if found.end() > found.start() {
-                out.push(found.as_str().to_string());
-            }
-            at = found.end();
-        }
-        if at < normal.len() {
-            out.push(normal[at..].to_string());
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod split_tests {
-    use super::*;
-
-    /// Qwen3.5's pre-tokenizer pattern, which the tokenizers release
-    /// does not run.
-    const QWEN3_5: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+    use super::HfTokenizer;
 
     #[test]
-    fn a_split_keeps_added_tokens_whole_and_letters_with_their_marks() {
-        let json = serde_json::json!({
-            "normalizer": {"type": "NFC"},
-            "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
-                {"type": "Split", "pattern": {"Regex": QWEN3_5}, "behavior": "Isolated",
-                 "invert": false},
-                {"type": "ByteLevel", "add_prefix_space": false, "use_regex": false}]},
-            "added_tokens": [{"content": "<|im_end|>"}],
+    fn a_split_regex_with_lookahead_tokenizes() {
+        // Qwen3.5's pre-tokenizer: a regex the native splitter does not cover
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tokenizer/tokenizer.json");
+        let mut config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("the fixture"))
+                .expect("JSON");
+        let byte_level = config["pre_tokenizer"].take();
+        config["pre_tokenizer"] = serde_json::json!({
+            "type": "Sequence",
+            "pretokenizers": [
+                {"type": "Split", "behavior": "Isolated", "invert": false, "pattern": {"Regex":
+                    "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"}},
+                byte_level,
+            ],
         });
-        let (without, splitter) = Splitter::taken_from(&json.to_string()).unwrap().unwrap();
-        let mut pieces = Vec::new();
-        // a decomposed é composes before the split
-        splitter
-            .pieces("Cafe\u{301} it's<|im_end|>  12", &mut pieces)
-            .unwrap();
-        assert_eq!(
-            pieces,
-            ["Café", " it", "'s", "<|im_end|>", " ", " ", "1", "2"]
-        );
-        assert!(!without.contains("Split"));
-        assert!(!splitter.needs("Café"));
-        assert!(splitter.needs("Cafe\u{301}"));
-    }
-
-    #[test]
-    fn qwen3_5s_pattern_without_combining_marks_is_qwen2s() {
-        let json = serde_json::json!({"pre_tokenizer": {"type": "Split",
-            "pattern": {"Regex": QWEN3_5}}});
-        let markless: serde_json::Value =
-            serde_json::from_str(&Splitter::markless(&json.to_string()).unwrap()).unwrap();
-        assert_eq!(
-            markless["pre_tokenizer"]["pattern"]["Regex"],
-            r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
-        );
+        let directory = std::env::temp_dir().join(format!("quail-split-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("a folder");
+        let file = directory.join("tokenizer.json");
+        std::fs::write(&file, config.to_string()).expect("written");
+        let tokenizer = HfTokenizer::from_file(&file).expect("the tokenizer");
+        std::fs::remove_dir_all(&directory).expect("removed");
+        let text = "It's a café,  ok\n\nyes";
+        let ids = tokenizer.encode(text).expect("encoded");
+        assert_eq!(tokenizer.decode_bytes(&ids), text.as_bytes());
     }
 }
