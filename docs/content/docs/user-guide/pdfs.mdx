@@ -28,8 +28,9 @@ session.register("files", quail.DocumentProvider.from_table(files, id_col="path"
 
 ## Ask questions about pages
 
-`AI.PDF_PAGES` returns each page as a PNG image. `UNNEST` returns one row
-per page. The query below returns each page that caps liability:
+`AI.PDF_PAGES` returns a list of a PDF's pages, each a PNG image. The
+`UNNEST` function turns the list into one row per page. The query below
+returns each page that caps liability:
 
 ```sql
 SELECT p.path, p.u['page'] AS page
@@ -40,8 +41,9 @@ WHERE AI.IF(PROMPT('Does this page cap either party''s liability? {0}',
 
 ## Ask questions about a whole PDF
 
-Pass the pages without `UNNEST`. A page range sets the pages Quail
-reads. The query below classifies each PDF from its first three pages:
+An AI function reads the list from `AI.PDF_PAGES` as one document. The
+third and fourth arguments of `AI.PDF_PAGES` set the first and last
+pages. The query below classifies each PDF from its first three pages:
 
 ```sql
 SELECT f.path,
