@@ -189,8 +189,7 @@ class Qwen35Pipeline(ModelPipeline):
         if self.images:
             import torch
 
-            hidden = self.images.embed(torch, self.visual, chunk.input_ids,
-                                       self.embed)
+            hidden = self.images.embed(torch, self.visual, chunk, self.embed)
         else:
             hidden = self.embed(chunk.input_ids)
         rotary = getattr(chunk, "rotary", None)

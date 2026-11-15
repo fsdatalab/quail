@@ -54,6 +54,9 @@ class Chunk:
         rotary: Each row's rotary position where it is not its
             position: (3, rows) for a chunk with image tokens, or
             (rows,) for rows after an image; None otherwise.
+        host_ids: The token ids on the host, when the packer kept them;
+            decode rows hold placeholders.
+        host_positions: The positions on the host, likewise.
     """
 
     input_ids: Any
@@ -69,6 +72,8 @@ class Chunk:
     rows_per_answer: np.ndarray | None = None
     decode_rows: Any = None
     rotary: Any = None
+    host_ids: np.ndarray | None = None
+    host_positions: np.ndarray | None = None
 
 
 @dataclass
@@ -363,9 +368,7 @@ def _staged_token_parts(torch, sequences, total, pinned=True, staging=None):
     """
     host = (torch.empty(total, dtype=torch.int64, pin_memory=pinned)
             if staging is None else staging.host("tokens", total, torch.int64))
-    arrays = [_int64(part) for sequence in sequences
-              for part in _token_parts(sequence) if len(part)]
-    ids = np.concatenate(arrays) if arrays else np.empty(0, dtype=np.int64)
+    ids = joined_ids(sequences)
     if len(ids) != total:
         raise AssertionError(
             f"packed {len(ids)} token ids into a {total}-token chunk")
@@ -373,6 +376,13 @@ def _staged_token_parts(torch, sequences, total, pinned=True, staging=None):
     if staging is not None:
         return staging.upload("tokens", total)
     return host.to("cuda", non_blocking=pinned)
+
+
+def joined_ids(sequences) -> np.ndarray:
+    """A chunk's token parts as one int64 array on the host."""
+    arrays = [_int64(part) for sequence in sequences
+              for part in _token_parts(sequence) if len(part)]
+    return np.concatenate(arrays) if arrays else np.empty(0, dtype=np.int64)
 
 
 # ------------------------------------------------------- chunk packing
@@ -1073,10 +1083,13 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         unified=unified, canvas=canvas_meta, gdn=gdn, shared=shared,
         cu_a=stage("cu_a", cu_a, torch.int32), passes=tuple(passes),
         max_a=int(np.diff(cu_a).max()) if len(cu_a) > 1 else 0)
+    positions = position.joined()
     out = Chunk(
         input_ids=_staged_token_parts(
             torch, id_parts, num_tokens, pinned, staging),
-        positions=stage("positions", position.joined(), torch.int64),
+        positions=stage("positions", positions, torch.int64),
+        host_ids=joined_ids(id_parts),
+        host_positions=np.asarray(positions, dtype=np.int64),
         final_indices=stage("finals", finals.joined(), torch.int64),
         meta=meta, attention_mode=attention_mode, tokens=num_tokens,
         layout=layout, row_spans=tuple(row_spans),

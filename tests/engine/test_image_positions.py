@@ -29,7 +29,8 @@ def _images():
 
 def _chunk(ids, positions, row_spans, decode=None):
     return SimpleNamespace(input_ids=torch.tensor(ids), row_spans=row_spans,
-                           positions=torch.tensor(positions), decode_rows=decode)
+                           positions=torch.tensor(positions), decode_rows=decode,
+                           host_ids=None, host_positions=None)
 
 
 def test_an_image_token_takes_its_grid_position_and_later_rows_follow_the_grid():
@@ -94,6 +95,7 @@ def test_each_image_token_takes_its_own_embedding_and_text_takes_the_vocabulary(
         # the image's last three tokens, then text, then its first three
         ids = torch.tensor([FIRST + 3, FIRST + 4, FIRST + 5, 7, FIRST, FIRST + 1,
                             FIRST + 2])
-        hidden = images.embed(torch, visual, ids, text)
+        hidden = images.embed(torch, visual, SimpleNamespace(
+            input_ids=ids, host_ids=ids.numpy()), text)
     assert hidden[:, 0].tolist() == [3, 4, 5, -1, 0, 1, 2]
     assert visual.calls == 1

@@ -193,38 +193,44 @@ class RegionImages:
 
     # ---- embeddings ---------------------------------------------------
 
-    def embed(self, torch, visual, ids, text_embed):
+    def embed(self, torch, visual, chunk, text_embed):
         """The input embeddings of a chunk's token ids.
+
+        The rows are found from the host's copy of the ids, so the GPU
+        loop does not wait for the device.
 
         Args:
             torch: The torch module.
             visual: The model's vision encoder.
-            ids: The chunk's token ids on the GPU.
+            chunk: The packed chunk.
             text_embed: The model's token embedding module.
         """
-        image_rows = ids >= IMAGE_TOKEN_BASE
-        hidden = text_embed(ids.masked_fill(image_rows, 0))
-        if not bool(image_rows.any()):
-            return hidden
-        tokens = ids[image_rows]
-        found = np.unique(tokens.cpu().numpy())
-        firsts = sorted({self.image_of(int(token)).first for token in found})
+        ids = chunk.input_ids
+        host = _host(chunk.host_ids, ids)
+        image_rows = np.flatnonzero(host >= IMAGE_TOKEN_BASE)
+        if not len(image_rows):
+            return text_embed(ids)
+        tokens = host[image_rows]
+        hidden = text_embed(ids.masked_fill(ids >= IMAGE_TOKEN_BASE, 0))
+        starts = self._sorted[np.searchsorted(self._sorted, tokens, side="right") - 1]
+        firsts = np.unique(starts).tolist()
         self._encode(torch, visual, [first for first in firsts
                                      if first not in self._embeddings],
                      hidden.dtype)
-        rows = torch.empty(len(tokens), hidden.shape[1], dtype=hidden.dtype,
-                           device=hidden.device)
-        last = int(found.max())
+        # each image's embeddings stacked, and each row's index into them
+        stacked = torch.cat([self._embeddings[first] for first in firsts])
+        offsets = dict(zip(firsts, np.cumsum([0] + [self.images[first].tokens
+                                                     for first in firsts])))
+        index = tokens - starts + np.array([offsets[first] for first in starts])
+        device = hidden.device
+        hidden[_upload(torch, image_rows, device)] = stacked[
+            _upload(torch, index, device)]
+        # an image's KV holds it once its last token is written; a
+        # document recomputed after eviction encodes it again
+        written = set(tokens.tolist())
         for first in firsts:
-            image = self.images[first]
-            mine = (tokens >= first) & (tokens < first + image.tokens)
-            rows[mine] = self._embeddings[first][tokens[mine] - first]
-            # an image's KV holds it once its last token is written; a
-            # document recomputed after eviction encodes it again
-            if first + image.tokens - 1 <= last and (
-                    first + image.tokens - 1) in found:
+            if first + self.images[first].tokens - 1 in written:
                 self._embeddings.pop(first, None)
-        hidden[image_rows] = rows
         return hidden
 
     def _encode(self, torch, visual, firsts, dtype):
@@ -274,8 +280,8 @@ class RegionImages:
             chunk: The packed chunk.
             answer_keys: The arena's answer slot keys, for decode rows.
         """
-        ids = chunk.input_ids.cpu().numpy()
-        positions = chunk.positions.cpu().numpy().astype(np.int64)
+        ids = _host(chunk.host_ids, chunk.input_ids)
+        positions = _host(chunk.host_positions, chunk.positions)
         rotary = np.broadcast_to(positions, (3, len(positions))).copy()
         changed = False
         for key, row0, _, end in chunk.row_spans:
@@ -320,8 +326,22 @@ class RegionImages:
 
         if (rotary[1:] == rotary[0]).all():
             rotary = rotary[0]
-        return torch.from_numpy(np.ascontiguousarray(rotary)).to(
-            chunk.positions.device)
+        return _upload(torch, rotary, chunk.positions.device)
+
+
+def _upload(torch, values: np.ndarray, device):
+    """A host array on the device, copied from pinned memory without waiting."""
+    found = torch.from_numpy(np.ascontiguousarray(values, dtype=np.int64))
+    if device.type != "cuda":
+        return found
+    return found.pin_memory().to(device, non_blocking=True)
+
+
+def _host(values, device_values) -> np.ndarray:
+    """A chunk's host copy of a tensor, or the tensor copied to the host."""
+    if values is not None:
+        return np.asarray(values, dtype=np.int64)
+    return device_values.cpu().numpy().astype(np.int64)
 
 
 def _token_at(tokens, index):
