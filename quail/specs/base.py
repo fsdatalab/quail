@@ -195,6 +195,10 @@ class ModelSpec:
     #                               or video, or it builds an image
     #                               processor that cannot copy Quail's
     #                               tokenizer
+    vision_mem_bytes: float = 0.0    # bytes the vision tower takes beside
+    #                                  the text weights: its weights, its
+    #                                  encoder calls' activations, and a
+    #                                  chunk's image embeddings
     max_num_seqs: int = 0    # sequences vLLM may run at once; 0 keeps the
     #                          engine setting. A hybrid model holds one
     #                          recurrent-state block per running sequence,

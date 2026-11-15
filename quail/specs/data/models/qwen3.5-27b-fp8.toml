@@ -49,6 +49,10 @@ max_num_seqs = 768  # started at 640 and 768; 896 raised
                     # /results/ablations/
                     # qwen3.5-27b-fp8-vllm-limits-<setting>.json
 vision_tower = true
+# the vision tower's bf16 weights (0.92 GB, from its config),
+# 1 GiB for an encoder call of 32,768 patches, and a full chunk's
+# image embeddings; an estimate, not a measurement
+vision_mem_bytes = 3_200_000_000
 attn_output_gate = true
 gdn_key_heads = 16
 gdn_value_heads = 48

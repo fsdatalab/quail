@@ -82,6 +82,8 @@ class LoadedGpu:
                                               and spec.weight_precision == "fp8"))
         self.load_model_s = time.perf_counter() - t0
         self.weights_bytes = int(torch.cuda.memory_allocated())
+        say(f"loaded {self.weights_bytes / 2**30:.2f} GiB of weights in "
+            f"{self.load_model_s:.1f} s")
 
         # cuBLAS allocates its handle outside PyTorch's caching allocator.
         # At the warm-up peak the allocator holds every free byte, so

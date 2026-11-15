@@ -176,6 +176,10 @@ pub struct ModelSpec {
     pub layer_kinds: Vec<String>,
     #[serde(default)]
     pub vision_tower: bool,
+    /// Bytes the vision tower takes beside the text weights: its weights,
+    /// its encoder calls' activations, and a chunk's image embeddings.
+    #[serde(default)]
+    pub vision_mem_bytes: f64,
     #[serde(default)]
     pub max_num_seqs: i64,
     #[serde(default)]
@@ -387,7 +391,7 @@ impl ModelSpec {
     /// Model weight bytes resident on the GPU.
     #[allow(non_snake_case)]
     pub fn W_resident(&self) -> f64 {
-        self.W_mem()
+        self.W_mem() + self.vision_mem_bytes
     }
 
     /// Reserved activation bytes per batched token.

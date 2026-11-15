@@ -33,6 +33,9 @@ TEMPORAL_PATCH = 2
 MERGE = IMAGE_TOKEN_PIXELS // PATCH_PIXELS
 # threads that decode a region's PNGs ahead of the vision encoder
 DECODE_THREADS = 8
+# the most patches one vision encoder call reads, which bounds its
+# activations; a model spec's vision_mem_bytes reserves them
+ENCODER_PATCHES = 32_768
 
 
 @dataclass(frozen=True)
@@ -234,7 +237,24 @@ class RegionImages:
         return hidden
 
     def _encode(self, torch, visual, firsts, dtype):
-        """Run the vision encoder on images, keeping their embeddings."""
+        """Run the vision encoder on images, keeping their embeddings.
+
+        Images go in calls of at most ENCODER_PATCHES patches, and an
+        image larger than that alone.
+        """
+        batch, patches = [], 0
+        for first in firsts:
+            size = MERGE * MERGE * self.images[first].tokens
+            if batch and patches + size > ENCODER_PATCHES:
+                self._encode_batch(torch, visual, batch, dtype)
+                batch, patches = [], 0
+            batch.append(first)
+            patches += size
+        if batch:
+            self._encode_batch(torch, visual, batch, dtype)
+
+    def _encode_batch(self, torch, visual, firsts, dtype):
+        """Run the vision encoder on one call's images."""
         if not firsts:
             return
         import time

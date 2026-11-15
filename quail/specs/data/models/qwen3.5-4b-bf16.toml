@@ -37,6 +37,10 @@ layer_kinds = [
 max_num_seqs = 3_000  # vLLM 0.26 on an H100 at 0.91 memory holds 3,052
                       # state blocks; 4,096 sequences raised ValueError
 vision_tower = true
+# the vision tower's bf16 weights (0.67 GB, from its config),
+# 1 GiB for an encoder call of 32,768 patches, and a full chunk's
+# image embeddings; an estimate, not a measurement
+vision_mem_bytes = 2_350_000_000
 attn_output_gate = true
 gdn_key_heads = 16
 gdn_value_heads = 32
