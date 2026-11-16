@@ -442,7 +442,8 @@ pub fn run(
         "Quail Server: {} on {}, at {listen}",
         config.model, config.device
     );
-    tokio::runtime::Runtime::new()?.block_on(
+    // the server plans each query on a blocking thread of this runtime
+    quail::runtime()?.block_on(
         tonic::transport::Server::builder()
             .add_service(tonic::service::interceptor::InterceptedService::new(
                 arrow_flight::flight_service_server::FlightServiceServer::new(service)
