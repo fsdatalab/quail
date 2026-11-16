@@ -545,12 +545,14 @@ def run(sample_path: str, run_id: str, read_edge: int) -> dict:
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=2 * 3600,
               volumes=volumes)
-def compare_sizes(sample_path: str, edges: list[int], run_id: str) -> dict:
+def compare_sizes(sample_path: str, edges: list[int], num_pages: int,
+                  run_id: str) -> dict:
     """Ask the page questions at each image size; save the records to the volume.
 
     Args:
         sample_path: The page sample's parquet file on the volume.
         edges: The longest sides to shrink the pages to; 0 reads them as stored.
+        num_pages: The sample's first pages to ask about, or 0 for all.
         run_id: The run's folder on the volume.
     """
     import pyarrow.parquet as pq
@@ -558,6 +560,8 @@ def compare_sizes(sample_path: str, edges: list[int], run_id: str) -> dict:
     import quail
 
     sample = pq.read_table(sample_path)
+    if num_pages:
+        sample = sample.slice(0, num_pages)
     record = {"model": MODEL, "sample": sample_path, "sizes": {}}
     with quail.Session(quail.EngineConfig(model=MODEL, device="h100-sxm")) as session:
         for edge in edges:
@@ -571,10 +575,12 @@ def compare_sizes(sample_path: str, edges: list[int], run_id: str) -> dict:
 
 
 @app.local_entrypoint()
-def sizes(sample: str = "sample_2000_1024.parquet", edges: str = "512"):
+def sizes(sample: str = "sample_2000_1024.parquet", edges: str = "512",
+          num_pages: int = 0):
     run_id = time.strftime("%Y%m%d-%H%M%S") + f"-{MODEL}-sizes"
     call = compare_sizes.spawn(f"{ROOT}/{sample}",
-                               [int(edge) for edge in edges.split(",")], run_id)
+                               [int(edge) for edge in edges.split(",")], num_pages,
+                               run_id)
     print(f"function call id: {call.object_id}", flush=True)
     record = call.get()
     print(f"saved to quail-results:/nypl_menus/runs/{run_id}/sizes.json", flush=True)
