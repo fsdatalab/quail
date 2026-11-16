@@ -4,7 +4,10 @@
 import numpy as np
 
 from quail.backends.quail.executor.extract.stages import ExtractionInputs
-from quail.backends.quail.executor.model_operator import prior_inputs, shared_prefix_tree
+from quail.backends.quail.executor.model_operator import (
+    prior_inputs,
+    shared_prefix_tree,
+)
 from quail.backends.quail.executor.operators.map import MapOperator
 from quail.execution.rows import extraction_rows
 from quail.physical import AiExtract
@@ -27,7 +30,8 @@ class ExtractOperator(MapOperator):
         if region.one_family:
             return cls(region.query, nodes, region.document_ids(),
                        {"documents": documents, "texts": texts})
-        priors, prior_tables = prior_inputs(nodes[0], chain, region.node_inputs(nodes[0]))
+        priors, prior_tables = prior_inputs(
+            nodes[0], chain, region.node_inputs(nodes[0]))
         operator = cls(region.query, nodes, region.document_ids(), {
             "documents": documents, "texts": texts,
             "pipeline_head": (chain[0].node if chain else nodes[0]).document_head},
