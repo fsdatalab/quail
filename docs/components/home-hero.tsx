@@ -4,6 +4,7 @@ import type { ReactNode } from 'react';
 import type { LucideIcon } from 'lucide-react';
 import {
   ArrowRight,
+  Check,
   Cpu,
   FileSearch,
   FileText,
@@ -18,9 +19,16 @@ import {
   Terminal,
   TextCursor,
   Wrench,
+  X,
 } from 'lucide-react';
 import quailLogo from '@/assets/quail-logo.svg';
 import { gitConfig } from '@/lib/shared';
+
+const reviews = [
+  { id: 'r1', body: 'The ending was perfect and the cast was great.', kept: true },
+  { id: 'r2', body: 'Too long, and the ending made no sense.', kept: true },
+  { id: 'r3', body: 'Great music, but I want my money back.', kept: false },
+];
 
 /** Shows the lab, the logo, a summary, and an example query on the home page. */
 export function HomeHero() {
@@ -36,11 +44,7 @@ export function HomeHero() {
           Quail
         </h1>
         <p className="quail-hero-lead">
-          Quail runs SQL with AI functions on your GPUs. An AI function, such
-          as <code>AI.IF</code>, sends a row&apos;s text to a model and returns
-          the model&apos;s answer.{' '}
-          <a href="https://datafusion.apache.org/">Apache DataFusion</a> runs
-          the rest of the SQL.
+          Quail runs SQL with AI functions on your GPUs.
         </p>
         <div className="quail-hero-actions">
           <Link className="quail-hero-primary" href="/docs/user-guide/quickstart">
@@ -55,32 +59,21 @@ export function HomeHero() {
         </div>
       </div>
       <figure className="quail-hero-query">
-        <figcaption>Label the reviews that discuss the ending</figcaption>
         <pre>
-          <span className="k">SELECT</span> r.id,{'\n'}
-          {'  '}<span className="f">AI.CLASSIFY</span>(r.body,{'\n'}
-          {'    '}[<span className="s">&apos;praise&apos;</span>, <span className="s">&apos;complaint&apos;</span>]) <span className="k">AS</span> kind{'\n'}
-          <span className="k">FROM</span> reviews r{'\n'}
+          <span className="k">SELECT</span> r.id <span className="k">FROM</span> reviews r{'\n'}
           <span className="k">WHERE</span> <span className="f">AI.IF</span>(<span className="f">PROMPT</span>({'\n'}
           {'  '}<span className="s">&apos;Does the review discuss the ending? {'{0}'}&apos;</span>,{'\n'}
           {'  '}r.body))
         </pre>
         <table>
-          <thead>
-            <tr>
-              <th>id</th>
-              <th>kind</th>
-            </tr>
-          </thead>
           <tbody>
-            <tr>
-              <td>r1</td>
-              <td>praise</td>
-            </tr>
-            <tr>
-              <td>r2</td>
-              <td>complaint</td>
-            </tr>
+            {reviews.map(({ id, body, kept }) => (
+              <tr key={id} className={kept ? undefined : 'quail-hero-dropped'}>
+                <td>{id}</td>
+                <td>{body}</td>
+                <td>{kept ? <Check size={16} aria-label="kept" /> : <X size={16} aria-label="dropped" />}</td>
+              </tr>
+            ))}
           </tbody>
         </table>
       </figure>

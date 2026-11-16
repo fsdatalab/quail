@@ -666,9 +666,9 @@ html > body[data-scroll-locked] {
 }
 
 .quail-hero-lead {
-  margin: 1.5rem 0 0;
+  margin: 1.25rem 0 0;
   color: var(--color-fd-muted-foreground);
-  font-size: 1.125rem;
+  font-size: 1.25rem;
   line-height: 1.6;
 }
 
@@ -780,6 +780,24 @@ html > body[data-scroll-locked] {
 
 .quail-hero-query td:first-child {
   font-family: var(--font-quail-mono), monospace;
+}
+
+.quail-hero-query td:last-child {
+  width: 2.5rem;
+  color: var(--color-fd-primary);
+}
+
+.quail-hero-query tr:first-child td {
+  border-top: 0;
+}
+
+.quail-hero-dropped td,
+.quail-hero-dropped td:last-child {
+  color: var(--color-fd-muted-foreground);
+}
+
+.quail-hero-dropped td:nth-child(2) {
+  text-decoration: line-through;
 }
 
 .quail-guides {
