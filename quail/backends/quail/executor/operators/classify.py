@@ -7,8 +7,6 @@ from quail.backends.quail.executor.label_stages import ClassifyStages, JoinPartn
 from quail.backends.quail.executor.model_operator import (
     ColumnOperator,
     SingleNodeOperator,
-    join_prior_rows,
-    prior_inputs,
 )
 from quail.backends.quail.reranker import (
     classify_outputs,
@@ -30,9 +28,7 @@ class ClassifyOperator(ColumnOperator, SingleNodeOperator):
         node: The AiClassify.
         ids: The document ids it reads.
         plan: Its ClassifyStages.
-        priors: (operator, source port) of each rows input from the chain.
         kept: KeptPairs, for the pairs a join kept.
-        prior_tables: The rows inputs from outside the chain.
     """
 
     @classmethod
@@ -46,8 +42,7 @@ class ClassifyOperator(ColumnOperator, SingleNodeOperator):
             plan = ClassifyStages(region.query, spec, len(ids),
                                   lambda key: position[key[1]])
             plan.seeds = ids
-            priors, prior_tables = prior_inputs(node, chain, region.node_inputs(node))
-            return cls(node, ids, plan, priors, prior_tables=prior_tables)
+            return cls(node, ids, plan)
         join = next(operator for operator in reversed(chain)
                     if isinstance(operator, JoinOperator))
         stage = next(stage for stage in join.nodes
@@ -68,14 +63,11 @@ class ClassifyOperator(ColumnOperator, SingleNodeOperator):
         join.add_reader(kept)
         return cls(node, ids, plan, kept=kept)
 
-    def __init__(self, node, ids, plan: ClassifyStages, priors=(), kept=None,
-                 prior_tables=()):
+    def __init__(self, node, ids, plan: ClassifyStages, kept=None):
         self.node = node
         self.ids = ids
         self.plan = plan
         self.stages = plan.stages
-        self.priors = priors
-        self.prior_tables = prior_tables
         self.kept = kept
         self.finished = []      # documents settled since the last take
         self.sent = set()       # documents whose labels went to the sink
