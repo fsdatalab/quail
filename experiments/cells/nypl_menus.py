@@ -107,6 +107,32 @@ DISH_QUESTIONS = {
 DISH_SQL = ("SELECT d.id FROM dishes d WHERE {condition}AI.IF(PROMPT('{question} "
             "Answer yes or no.\n\nDish: {{0}}', d.name))")
 
+ORGAN_QUESTION = ("Is this dish made from organ meat, such as sweetbreads, "
+                  "kidneys, liver, tripe, tongue, or brains?")
+# the share of each decade's common dishes that are organ meat; the model
+# reads only the dishes on 10 or more menus, and many name the organ in
+# French (ris de veau, rognons, cervelle), which no one ILIKE pattern finds
+ORGAN_SQL = f"""
+WITH dishes_asked AS (
+  SELECT d.id, AI.IF(PROMPT('{ORGAN_QUESTION} {{0}}', d.name)) AS organ
+  FROM dishes d WHERE d.times_appeared >= 10)
+SELECT CAST(SUBSTR(m.date, 1, 4) AS INT) / 10 * 10 AS decade,
+       ROUND(AVG(CASE WHEN a.organ THEN 1.0 ELSE 0.0 END), 4) AS share,
+       COUNT(*) AS items
+FROM dishes_asked a
+JOIN items i ON i.dish_id = a.id
+JOIN pages p ON i.menu_page_id = p.id
+JOIN menus m ON p.menu_id = m.id
+WHERE TRY_CAST(SUBSTR(m.date, 1, 4) AS INT) BETWEEN 1850 AND 2019
+GROUP BY 1 ORDER BY 1
+"""
+# the organ meat dishes, to read what the model counts
+ORGAN_DISHES_SQL = f"""
+SELECT d.name, d.times_appeared FROM dishes d
+WHERE d.times_appeared >= 10 AND AI.IF(PROMPT('{ORGAN_QUESTION} {{0}}', d.name))
+ORDER BY d.times_appeared DESC
+"""
+
 CURRENCIES = ["dollars", "francs", "marks", "pounds", "other currency", "no prices"]
 # the volunteers' currency names, by the label that names the same money
 CURRENCY_NAMES = {"Dollars": "dollars", "Francs": "francs",
@@ -123,10 +149,9 @@ PRICE_INSTRUCTION = ("What does the menu charge for the dish named above? Answer
                      "or 1.25 for a dollar and a quarter.")
 # the yes-or-no questions asked of each page image, answered per year
 PAGE_QUESTIONS = {
-    "alcohol": "Does this menu offer beer, wine, or liquor?",
+    "alcohol": "Does this menu sell beer, wine, or liquor to drink? Dishes "
+               "cooked with wine or liqueur do not count.",
     "war": "Does this menu mention a war, rationing, or a meatless or wheatless day?",
-    "handwritten price": "Has someone crossed out a printed price on this menu "
-                         "and written a new price by hand?",
     "vegetarian": "Does this menu offer a vegetarian main course, with no meat, "
                   "poultry, or fish?",
 }
@@ -145,10 +170,16 @@ PAGE_CALLS = {
                  f"{LANGUAGES!r})"),
     "most expensive dish": (f"AI.MAP(s.image, '{EXPENSIVE_INSTRUCTION}', 32)"),
 }
-PAGES_SQL = ("SELECT s.page_id, "
-             + ", ".join(f"{call} AS answer_{index}"
-                         for index, call in enumerate(PAGE_CALLS.values()))
-             + " FROM sample s")
+
+
+def _pages_sql(keys: list[str], table: str) -> str:
+    """One query asking each named page question of every page in the table."""
+    return ("SELECT s.page_id, "
+            + ", ".join(f"{PAGE_CALLS[key]} AS answer_{index}"
+                        for index, key in enumerate(keys))
+            + f" FROM {table} s")
+
+
 PRICE_SQL = (f"SELECT s.page_id, AI.MAP(s.parts, '{PRICE_INSTRUCTION}', 8) AS answer "
              "FROM dollar_sample s")
 SHRINK_SQL = "SELECT s.page_id, AI.IMAGE(s.image, {edge}) AS image FROM pages s"
@@ -396,7 +427,8 @@ def dish_queries(session, dishes) -> dict:
     return found
 
 
-def page_queries(session, sample, edge: int | None = None) -> dict:
+def page_queries(session, sample, edge: int | None = None,
+                 keys: list[str] | None = None) -> dict:
     """Ask every page question in one query, then read one price per dollar menu.
 
     Args:
@@ -404,6 +436,8 @@ def page_queries(session, sample, edge: int | None = None) -> dict:
         sample: The page sample: one row per menu with its page image.
         edge: The longest side to shrink each image to with AI.IMAGE, or
             None to read the images as stored.
+        keys: The page questions to ask, or None for every question and
+            the price query.
 
     Returns:
         The shrinking, the page query, and the price query, each with its
@@ -439,29 +473,32 @@ def page_queries(session, sample, edge: int | None = None) -> dict:
         return 2 + (width // 32) * (height // 32)
 
     by_page = {row["page_id"]: row for row in rows}
-    prompts = [_prompt_tokens(session, re.search(r"PROMPT\('((?:[^']|'')*)'", call)
-                              .group(1)) if "PROMPT(" in call else
-               _prompt_tokens(session, EXPENSIVE_INSTRUCTION)
-               for call in PAGE_CALLS.values()]
-    table, query_s = _timed(session, PAGES_SQL.replace("FROM sample s",
-                                                       f"FROM {alias} s"))
-    input_tokens = sum(len(PAGE_CALLS) * tokens(page) + sum(prompts)
-                       for page in shrunk)
-    answers = {key: {} for key in PAGE_CALLS}
+    asked = keys or list(PAGE_CALLS)
+    prompts = [_prompt_tokens(session, re.search(
+        r"PROMPT\('((?:[^']|'')*)'", PAGE_CALLS[key]).group(1))
+        if "PROMPT(" in PAGE_CALLS[key] else
+        _prompt_tokens(session, EXPENSIVE_INSTRUCTION) for key in asked]
+    table, query_s = _timed(session, _pages_sql(asked, alias))
+    input_tokens = sum(len(asked) * tokens(page) + sum(prompts) for page in shrunk)
+    answers = {key: {} for key in asked}
     for row in _rows(table):
-        for index, key in enumerate(PAGE_CALLS):
+        for index, key in enumerate(asked):
             answers[key][row["page_id"]] = row[f"answer_{index}"]
     found["pages"] = {**_measured(query_s, input_tokens), "pages": len(shrunk),
+                      "questions": asked, "sql": _pages_sql(asked, alias),
                       "image_tokens": sum(tokens(page) for page in shrunk),
                       "answers": answers}
-    known = {page: CURRENCY_NAMES[row["currency"]] for page, row in by_page.items()
-             if row["currency"] in CURRENCY_NAMES}
-    found["pages"]["currency_accuracy"] = _share(answers["currency"], known)
-    found["pages"]["years"] = {
-        key: _shares_by_year(answers[key], by_page) for key in PAGE_QUESTIONS}
+    if "currency" in answers:
+        known = {page: CURRENCY_NAMES[row["currency"]]
+                 for page, row in by_page.items() if row["currency"] in CURRENCY_NAMES}
+        found["pages"]["currency_accuracy"] = _share(answers["currency"], known)
+    found["pages"]["years"] = {key: _shares_by_year(answers[key], by_page)
+                               for key in PAGE_QUESTIONS if key in answers}
     print(f"pages at {edge or 'stored size'}: {query_s:.1f} s, "
           f"{found['pages']['input_tokens_per_second']:,} input tok/s, "
-          f"currency {found['pages']['currency_accuracy']}", flush=True)
+          f"currency {found['pages'].get('currency_accuracy')}", flush=True)
+    if keys:
+        return found
 
     dollar_rows = [row for row in rows if row["currency"] == "Dollars"
                    and row["dish"] and row["page_id"] in shrunk]
@@ -568,13 +605,15 @@ def run(sample_path: str, run_id: str, read_edge: int) -> dict:
 @app.function(image=image, gpu="H100!", memory=98304, timeout=2 * 3600,
               volumes=volumes)
 def compare_sizes(sample_path: str, edges: list[int], num_pages: int,
-                  run_id: str) -> dict:
+                  keys: list[str] | None, run_id: str) -> dict:
     """Ask the page questions at each image size; save the records to the volume.
 
     Args:
         sample_path: The page sample's parquet file on the volume.
         edges: The longest sides to shrink the pages to; 0 reads them as stored.
         num_pages: The sample's first pages to ask about, or 0 for all.
+        keys: The page questions to ask, or None for every question and
+            the price query.
         run_id: The run's folder on the volume.
     """
     import pyarrow.parquet as pq
@@ -587,7 +626,8 @@ def compare_sizes(sample_path: str, edges: list[int], num_pages: int,
     record = {"model": MODEL, "sample": sample_path, "sizes": {}}
     with quail.Session(quail.EngineConfig(model=MODEL, device="h100-sxm")) as session:
         for edge in edges:
-            record["sizes"][str(edge)] = page_queries(session, sample, edge or None)
+            record["sizes"][str(edge)] = page_queries(session, sample, edge or None,
+                                                      keys)
     directory = f"{ROOT}/runs/{run_id}"
     os.makedirs(directory, exist_ok=True)
     with open(f"{directory}/sizes.json", "w") as out:
@@ -596,13 +636,71 @@ def compare_sizes(sample_path: str, edges: list[int], num_pages: int,
     return record
 
 
+@app.function(image=image, gpu="H100!", memory=98304, timeout=3600, volumes=volumes)
+def organ_query(run_id: str) -> dict:
+    """Find the common organ meat dishes and their share of each decade's dishes.
+
+    Args:
+        run_id: The run's folder on the volume.
+
+    Returns:
+        The trend query's measurements and rows, and the dishes it counts.
+    """
+    import pyarrow.parquet as pq
+
+    import quail
+
+    tables = {name: pq.read_table(f"{ROOT}/tables/{name}.parquet")
+              for name in TABLES}
+    with quail.Session(quail.EngineConfig(model=MODEL, device="h100-sxm")) as session:
+        for name, table in tables.items():
+            session.register(name, quail.DocumentProvider.from_table(
+                table, id_col="id"))
+        common = [name or "" for name, times in zip(
+            tables["dishes"].column("name").to_pylist(),
+            tables["dishes"].column("times_appeared").to_pylist(), strict=True)
+                  if (times or 0) >= 10]
+        prompt_tokens = _prompt_tokens(session, f"{ORGAN_QUESTION} {{0}}")
+        input_tokens = sum(len(session.tokenizer(name)) + prompt_tokens
+                           for name in common)
+        table, query_s = _timed(session, ORGAN_SQL)
+        dishes, dishes_s = _timed(session, ORGAN_DISHES_SQL)
+    record = {"model": MODEL, "sql": ORGAN_SQL, "dishes": len(common),
+              **_measured(query_s, input_tokens), "rows": _rows(table),
+              "organ_dishes": _rows(dishes)[:200],
+              "organ_dishes_s": round(dishes_s, 2)}
+    directory = f"{ROOT}/runs/{run_id}"
+    os.makedirs(directory, exist_ok=True)
+    with open(f"{directory}/organ.json", "w") as out:
+        json.dump(record, out)
+    volumes[RESULTS].commit()
+    return record
+
+
+@app.local_entrypoint()
+def organ():
+    run_id = time.strftime("%Y%m%d-%H%M%S") + f"-{MODEL}-organ"
+    call = organ_query.spawn(run_id)
+    print(f"function call id: {call.object_id}", flush=True)
+    record = call.get()
+    print(f"saved to quail-results:/nypl_menus/runs/{run_id}/organ.json", flush=True)
+    print(f"{record['dishes']} dishes, {record['query_s']} s, "
+          f"{record['input_tokens_per_second']:,} input tok/s, "
+          f"${record['usd_per_query']}/query; dish list {record['organ_dishes_s']} s",
+          flush=True)
+    for row in record["rows"]:
+        print(f"  {row['decade']}  {row['items']:>7}  {100 * row['share']:4.1f}%")
+    print("  " + "; ".join(f"{row['name']} ({row['times_appeared']})"
+                           for row in record["organ_dishes"][:40]))
+
+
 @app.local_entrypoint()
 def sizes(sample: str = "sample_2000_1024.parquet", edges: str = "512",
-          num_pages: int = 0):
+          num_pages: int = 0, questions: str = ""):
     run_id = time.strftime("%Y%m%d-%H%M%S") + f"-{MODEL}-sizes"
     call = compare_sizes.spawn(f"{ROOT}/{sample}",
                                [int(edge) for edge in edges.split(",")], num_pages,
-                               run_id)
+                               questions.split(",") if questions else None, run_id)
     print(f"function call id: {call.object_id}", flush=True)
     record = call.get()
     print(f"saved to quail-results:/nypl_menus/runs/{run_id}/sizes.json", flush=True)
@@ -648,11 +746,17 @@ def summarize(record: dict) -> None:
 
 def _summarize_pages(edge, found: dict) -> None:
     """Print the page query's and the price query's measurements at one size."""
-    pages, price = found["pages"], found["price"]
+    pages, price = found["pages"], found.get("price")
     print(f"\npages at {edge or 'stored size'}: {pages['pages']} pages, "
           f"{pages['image_tokens']:,} image tokens, shrink {found.get('shrink_s')} s")
-    for name, measured in [("every question", pages), ("price", price)]:
-        print(f"  {name:15} {measured['query_s']:7.1f} s "
-              f"{measured['input_tokens_per_second']:>9,} input tok/s "
-              f"${measured['usd_per_query']:.4f}/query")
-    print(f"  currency {pages['currency_accuracy']}, price {price['accuracy']}")
+    for name, measured in [("page questions", pages), ("price", price)]:
+        if measured:
+            print(f"  {name:15} {measured['query_s']:7.1f} s "
+                  f"{measured['input_tokens_per_second']:>9,} input tok/s "
+                  f"${measured['usd_per_query']:.4f}/query")
+    print(f"  currency {pages.get('currency_accuracy')}, "
+          f"price {price['accuracy'] if price else None}")
+    for key, years in pages["years"].items():
+        print(f"  {key}: " + ", ".join(f"{year} {100 * found['share']:.0f}% "
+                                      f"of {found['menus']}"
+                                      for year, found in years.items()))
