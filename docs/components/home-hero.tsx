@@ -44,7 +44,7 @@ export function HomeHero() {
           Quail
         </h1>
         <p className="quail-hero-lead">
-          Quail runs SQL with AI functions.
+          A fast engine for AI functions in SQL.
         </p>
         <div className="quail-hero-actions">
           <Link className="quail-hero-primary" href="/docs/user-guide/quickstart">

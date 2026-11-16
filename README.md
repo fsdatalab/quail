@@ -5,7 +5,7 @@
 <h1 align="center">Quail</h1>
 
 <p align="center">
-  <b>SQL with AI functions</b><br>
+  <b>A fast engine for AI functions in SQL</b><br>
   from the <a href="https://fsdatalab.github.io/">Full Stack Data Lab</a> at CMU
 </p>
 
