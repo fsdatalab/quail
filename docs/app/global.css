@@ -636,7 +636,6 @@ html > body[data-scroll-locked] {
 
 .quail-hero img {
   border-radius: 1.25rem;
-  box-shadow: 0 8px 24px color-mix(in srgb, var(--color-fd-primary) 22%, transparent);
 }
 
 .quail-hero-lab {

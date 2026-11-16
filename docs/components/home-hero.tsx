@@ -9,9 +9,8 @@ export function HomeHero() {
     <header className="quail-hero">
       <Image src={quailLogo} alt="Quail logo" width={88} height={88} priority />
       <p className="quail-hero-lab">
-        <a href="https://fsdatalab.github.io/">Full Stack Data Lab</a>
-        <span aria-hidden="true"> · </span>
-        Carnegie Mellon University
+        <a href="https://fsdatalab.github.io/">Full Stack Data Lab</a>, Carnegie
+        Mellon University
       </p>
       <h1 className="quail-hero-title">Quail</h1>
       <p className="quail-hero-tagline">SQL with AI functions on your GPUs</p>
