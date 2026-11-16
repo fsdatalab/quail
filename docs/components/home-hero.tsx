@@ -4,7 +4,6 @@ import type { ReactNode } from 'react';
 import type { LucideIcon } from 'lucide-react';
 import {
   ArrowRight,
-  Check,
   Cpu,
   FileSearch,
   FileText,
@@ -19,7 +18,6 @@ import {
   Terminal,
   TextCursor,
   Wrench,
-  X,
 } from 'lucide-react';
 import quailLogo from '@/assets/quail-logo.svg';
 import { gitConfig } from '@/lib/shared';
@@ -59,6 +57,14 @@ export function HomeHero() {
         </div>
       </div>
       <figure className="quail-hero-query">
+        <figcaption>
+          <span className="quail-hero-dots" aria-hidden>
+            <span />
+            <span />
+            <span />
+          </span>
+          query.sql
+        </figcaption>
         <pre>
           <span className="k">SELECT</span> r.id <span className="k">FROM</span> reviews r{'\n'}
           <span className="k">WHERE</span> <span className="f">AI.IF</span>(<span className="f">PROMPT</span>({'\n'}
@@ -66,12 +72,23 @@ export function HomeHero() {
           {'  '}r.body))
         </pre>
         <table>
+          <thead>
+            <tr>
+              <th>id</th>
+              <th>body</th>
+              <th>AI.IF</th>
+            </tr>
+          </thead>
           <tbody>
             {reviews.map(({ id, body, kept }) => (
               <tr key={id} className={kept ? undefined : 'quail-hero-dropped'}>
                 <td>{id}</td>
                 <td>{body}</td>
-                <td>{kept ? <Check size={16} aria-label="kept" /> : <X size={16} aria-label="dropped" />}</td>
+                <td>
+                  <span className={kept ? 'quail-hero-true' : 'quail-hero-false'}>
+                    {kept ? 'true' : 'false'}
+                  </span>
+                </td>
               </tr>
             ))}
           </tbody>
