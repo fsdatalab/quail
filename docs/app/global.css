@@ -654,11 +654,12 @@ html > body[data-scroll-locked] {
   align-items: center;
   gap: 1rem;
   margin: 1rem 0 0;
-  font-family: var(--font-quail-sans), sans-serif;
-  font-size: 3.5rem;
+  color: var(--color-fd-primary);
+  font-family: var(--font-quail-serif), Georgia, serif;
+  font-size: 4rem;
   font-weight: 600;
   line-height: 1;
-  letter-spacing: -0.04em;
+  letter-spacing: -0.06em;
 }
 
 .quail-hero-title img {
@@ -670,6 +671,7 @@ html > body[data-scroll-locked] {
   color: var(--color-fd-muted-foreground);
   font-size: 1.25rem;
   line-height: 1.6;
+  text-wrap: balance;
 }
 
 .quail-hero-lead a {
