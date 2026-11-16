@@ -4,7 +4,7 @@
 import numpy as np
 
 from quail.backends.quail.executor.extract.stages import ExtractionInputs
-from quail.backends.quail.executor.model_operator import shared_prefix_tree
+from quail.backends.quail.executor.model_operator import prior_inputs, shared_prefix_tree
 from quail.backends.quail.executor.operators.map import MapOperator
 from quail.execution.rows import extraction_rows
 from quail.physical import AiExtract
@@ -27,10 +27,12 @@ class ExtractOperator(MapOperator):
         if region.one_family:
             return cls(region.query, nodes, region.document_ids(),
                        {"documents": documents, "texts": texts})
+        priors, prior_tables = prior_inputs(nodes[0], chain, region.node_inputs(nodes[0]))
         operator = cls(region.query, nodes, region.document_ids(), {
             "documents": documents, "texts": texts,
             "pipeline_head": (chain[0].node if chain else nodes[0]).document_head},
-            first=sum(len(operator.answer_limits) for operator in chain))
+            first=sum(len(operator.answer_limits) for operator in chain),
+            priors=priors, prior_tables=prior_tables)
         alias = operator.node.spec.alias
         if any(document.key != (alias, document_id) for document, document_id
                in zip(operator.extraction.documents, operator.ids)):
@@ -56,14 +58,14 @@ class ExtractOperator(MapOperator):
             spec.alias, spec.name, spec.span_name, self.ids[positions], values, spans
         ).values.columns)
 
-    def __init__(self, state, nodes, ids, inputs, first=0):
+    def __init__(self, state, nodes, ids, inputs, first=0, priors=(), prior_tables=()):
         if any(not isinstance(node, AiExtract) for node in nodes):
             raise TypeError("an extraction pipeline holds AiExtract nodes only")
         alias = nodes[0].spec.alias
         texts = inputs.get("texts", {}).get(alias)
         if texts is None:
             raise ValueError(f"AI.EXTRACT needs the text of {alias!r}")
-        super().__init__(state, nodes, ids, first)
+        super().__init__(state, nodes, ids, first, priors, prior_tables)
         self.extraction = ExtractionInputs(
             state, [node.spec for node in nodes], state.loaded_model.vocabulary,
             self.ids,
