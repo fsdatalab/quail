@@ -158,6 +158,22 @@ PRICE_SQL = (f"SELECT s.page_id, AI.MAP(s.parts, '{PRICE_INSTRUCTION}', 8) AS an
              "FROM dollar_sample s")
 SHRINK_SQL = "SELECT s.page_id, AI.IMAGE(s.image, {edge}) AS image FROM pages s"
 
+# the query the docs page "A century of menus" shows: the share of each
+# year's menus that sell drinks and that mention a war
+MENU_HISTORY_SQL = f"""
+WITH answers AS (
+  SELECT p.menu_id,
+         AI.IF(PROMPT('{_ask(PAGE_QUESTIONS["alcohol"])}', p.image)) AS sells_drinks,
+         AI.IF(PROMPT('{_ask(PAGE_QUESTIONS["war"])}', p.image)) AS mentions_war
+  FROM pages p)
+SELECT m.year, COUNT(*) AS menus,
+       ROUND(AVG(CASE WHEN a.sells_drinks THEN 1.0 ELSE 0.0 END), 3) AS drinks,
+       ROUND(AVG(CASE WHEN a.mentions_war THEN 1.0 ELSE 0.0 END), 3) AS war
+FROM answers a JOIN menus m ON a.menu_id = m.id
+GROUP BY m.year HAVING COUNT(*) >= 20
+ORDER BY m.year
+"""
+
 
 @app.function(image=image, cpu=8, memory=32768, timeout=3 * 3600, volumes=volumes)
 def prepare(num_menus: int, edge: int, seed: int, years: tuple[int, int] | None,
@@ -608,6 +624,67 @@ def compare_sizes(sample_path: str, edges: list[int], num_pages: int,
         json.dump(record, out)
     volumes[RESULTS].commit()
     return record
+
+
+@app.function(image=image, gpu="H100!", memory=98304, timeout=3600, volumes=volumes)
+def history_query(sample_path: str, run_id: str) -> dict:
+    """Run the docs page's query over the sample's pages; save its rows.
+
+    Args:
+        sample_path: The page sample's parquet file on the volume.
+        run_id: The run's folder on the volume.
+
+    Returns:
+        The query's measurements and its rows.
+    """
+    import io
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from PIL import Image
+
+    import quail
+
+    sample = pq.read_table(sample_path)
+    menus = sample.select(["menu_id", "year"]).rename_columns(["id", "year"])
+    pages = sample.select(["page_id", "menu_id", "image"]).rename_columns(
+        ["id", "menu_id", "image"])
+    with quail.Session(quail.EngineConfig(model=MODEL, device="h100-sxm")) as session:
+        session.register("menus", quail.DocumentProvider.from_table(
+            pa.table(menus), id_col="id"))
+        session.register("pages", quail.DocumentProvider.from_table(
+            pages, id_col="id"))
+        prompts = sum(_prompt_tokens(session, prompt) for prompt in re.findall(
+            r"PROMPT\('((?:[^']|'')*)'", MENU_HISTORY_SQL))
+        input_tokens = 0
+        for image in pages.column("image").to_pylist():
+            width, height = Image.open(io.BytesIO(image)).size
+            input_tokens += 2 * (2 + (width // 32) * (height // 32)) + prompts
+        table, query_s = _timed(session, MENU_HISTORY_SQL)
+    record = {"model": MODEL, "sample": sample_path, "sql": MENU_HISTORY_SQL,
+              "pages": pages.num_rows, **_measured(query_s, input_tokens),
+              "rows": _rows(table)}
+    directory = f"{ROOT}/runs/{run_id}"
+    os.makedirs(directory, exist_ok=True)
+    with open(f"{directory}/history.json", "w") as out:
+        json.dump(record, out)
+    volumes[RESULTS].commit()
+    return record
+
+
+@app.local_entrypoint()
+def history(sample: str = "pages_all_1914-1937_100_per_year_1024.parquet"):
+    run_id = time.strftime("%Y%m%d-%H%M%S") + f"-{MODEL}-history"
+    call = history_query.spawn(f"{ROOT}/{sample}", run_id)
+    print(f"function call id: {call.object_id}", flush=True)
+    record = call.get()
+    print(f"saved to quail-results:/nypl_menus/runs/{run_id}/history.json", flush=True)
+    print(f"{record['pages']} pages, {record['query_s']} s, "
+          f"{record['input_tokens_per_second']:,} input tok/s, "
+          f"${record['usd_per_query']}/query", flush=True)
+    for row in record["rows"]:
+        print(f"  {row['year']}  {row['menus']:>4}  "
+              f"drinks {100 * row['drinks']:4.1f}%  war {100 * row['war']:4.1f}%")
 
 
 @app.local_entrypoint()
