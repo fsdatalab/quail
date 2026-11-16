@@ -6,7 +6,9 @@ question:
 
 1. ClickHouse's demo queries, which read only the typed-in prices and
    find a dish with ILIKE on its name;
-2. the same questions answered by meaning, with AI.IF on each dish name;
+2. questions ILIKE answers badly: AI.IF checks the dishes ILIKE matches
+   for vodka and caviar, and reads every dish name for a vegetarian main
+   course, which no pattern finds;
 3. questions about the scanned pages: each menu's currency and language,
    and a dish's price, read from the page image and checked against the
    volunteers' price.
@@ -92,16 +94,20 @@ WHERE {currency} AND decade > 0 AND decade < 2022 {dish}
 GROUP BY decade ORDER BY decade
 """
 
-# each ILIKE pattern, and the question AI.IF asks of each dish name
+# each question's ILIKE pattern and the question AI.IF asks of a dish
+# name. ILIKE alone answers a burger, as in ClickHouse's demo. For vodka
+# and caviar, the model checks only the names ILIKE matches; no pattern
+# finds a vegetarian main course, so the model reads every name.
 DISH_QUESTIONS = {
-    "burger": ("%burger%", "Is this dish a hamburger or another kind of burger?"),
     "vodka": ("%vodka%", "Is this drink vodka, or a drink made with vodka?"),
     "caviar": ("%caviar%", "Is this dish caviar, or served with caviar?"),
     "vegetarian": ("%vegetarian%", "Is this a vegetarian main course, with no "
                                    "meat, poultry, or fish?"),
 }
-DISH_TAG_SQL = ("SELECT d.id, AI.IF(PROMPT('{question} Answer yes or no.\n\n"
-                "Dish: {{0}}', d.name)) AS hit FROM dishes d")
+# the questions whose ILIKE runs before the model, to check its matches
+CHECKED_MATCHES = {"vodka", "caviar"}
+DISH_SQL = ("SELECT d.id FROM dishes d WHERE {condition}AI.IF(PROMPT('{question} "
+            "Answer yes or no.\n\nDish: {{0}}', d.name))")
 
 CURRENCIES = ["dollars", "francs", "marks", "pounds", "other currency", "no prices"]
 # the volunteers' currency names, by the label that names the same money
@@ -287,7 +293,7 @@ def clickhouse_queries(session) -> dict:
 
 
 def dish_queries(session, dishes) -> dict:
-    """Ask each dish question of every dish name; compare with ILIKE.
+    """Ask each dish question with AI.IF; compare its dishes with ILIKE's.
 
     Returns:
         For each question: the query's measurements, the dishes ILIKE and
@@ -301,21 +307,25 @@ def dish_queries(session, dishes) -> dict:
                      dishes.column("name").to_pylist(), strict=True))
     times = dict(zip(dishes.column("id").to_pylist(),
                      dishes.column("times_appeared").to_pylist(), strict=True))
-    name_tokens = sum(len(session.tokenizer(name)) for name in names.values())
+
+    def top(ids):
+        return [names[dish] for dish in sorted(
+            ids, key=lambda dish: -(times[dish] or 0))[:25]]
+
     found = {}
     for key, (pattern, question) in DISH_QUESTIONS.items():
-        sql = DISH_TAG_SQL.format(question=question.replace("'", "''"))
+        checked = key in CHECKED_MATCHES
+        sql = DISH_SQL.format(
+            condition=f"d.name ILIKE '{pattern}' AND " if checked else "",
+            question=question.replace("'", "''"))
         prompt = re.search(r"PROMPT\('((?:[^']|'')*)'", sql).group(1)
         table, query_s = _timed(session, sql)
-        hits = {row["id"] for row in _rows(table) if row["hit"]}
+        hits = {row["id"] for row in _rows(table)}
         needle = pattern.strip("%").lower()
         matched = {dish for dish, name in names.items() if needle in name.lower()}
-        input_tokens = name_tokens + len(names) * _prompt_tokens(session, prompt)
-
-        def top(ids):
-            return [names[dish] for dish in sorted(
-                ids, key=lambda dish: -(times[dish] or 0))[:25]]
-
+        asked = matched if checked else set(names)
+        input_tokens = sum(len(session.tokenizer(names[dish])) for dish in asked) + (
+            len(asked) * _prompt_tokens(session, prompt))
         alias = f"hits_{key}"
         session.register(alias, quail.DocumentProvider.from_table(
             pa.table({"id": sorted(hits)}), id_col="id"))
@@ -326,13 +336,13 @@ def dish_queries(session, dishes) -> dict:
             decades[method] = _rows(session.sql(DECADE_SQL.format(
                 price="price", currency="menu_currency IN ('Dollars', '')",
                 dish=f"AND {condition} AND price > 0")).collect())
-        found[key] = {**_measured(query_s, input_tokens), "question": question,
-                      "dishes": len(names), "ilike": len(matched),
+        found[key] = {**_measured(query_s, input_tokens), "sql": sql,
+                      "asked": len(asked), "ilike": len(matched),
                       "ai": len(hits), "both": len(matched & hits),
                       "ai_only": top(hits - matched),
                       "ilike_only": top(matched - hits), "decades": decades}
-        print(f"dish {key}: ILIKE {len(matched)}, AI.IF {len(hits)}, "
-              f"{query_s:.1f} s", flush=True)
+        print(f"dish {key}: asked {len(asked)}, ILIKE {len(matched)}, "
+              f"AI.IF {len(hits)}, {query_s:.1f} s", flush=True)
     return found
 
 
@@ -477,7 +487,8 @@ def summarize(record: dict) -> None:
         for row in found["rows"]:
             print(f"  {row['decade']}  {row['items']:>7}  ${row['average_price']}")
     for key, found in record["dishes"].items():
-        print(f"\n{key}: ILIKE finds {found['ilike']} dishes, AI.IF {found['ai']}, "
+        print(f"\n{key}: asked {found['asked']} dishes; ILIKE finds {found['ilike']}, "
+              f"AI.IF {found['ai']}, "
               f"both {found['both']}; {found['query_s']} s, "
               f"{found['input_tokens_per_second']:,} input tok/s, "
               f"${found['usd_per_query']}/query")
