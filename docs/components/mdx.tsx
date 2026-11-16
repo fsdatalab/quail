@@ -13,6 +13,7 @@ import {
 import { PlanningFigure } from './planning-figure';
 import { QueryOutput } from './query-output';
 import { CodeExample } from './code-example';
+import { HomeFunctions, HomeGuides, HomeHero, HomeSection } from './home-hero';
 
 export function getMDXComponents(components?: MDXComponents) {
   return {
@@ -22,6 +23,10 @@ export function getMDXComponents(components?: MDXComponents) {
     ApiMethod,
     Callout,
     DeriveFigure,
+    HomeFunctions,
+    HomeGuides,
+    HomeHero,
+    HomeSection,
     PlannerAlgorithm,
     PlanStagesFigure,
     PlanningFigure,

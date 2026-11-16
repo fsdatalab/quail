@@ -28,6 +28,7 @@ export default async function Page(props: PageProps<'/docs/[[...slug]]'>) {
       breadcrumb={{ className: 'quail-breadcrumb' }}
       footer={{ className: 'quail-page-footer' }}
     >
+      {page.slugs.length > 0 && (
       <header className="quail-page-header">
         <div className="quail-title-row">
           <DocsTitle>{page.data.title}</DocsTitle>
@@ -41,6 +42,7 @@ export default async function Page(props: PageProps<'/docs/[[...slug]]'>) {
         </div>
         <DocsDescription>{page.data.description}</DocsDescription>
       </header>
+      )}
       <DocsBody className="quail-prose">
         <MDX
           components={getMDXComponents({

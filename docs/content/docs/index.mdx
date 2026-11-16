@@ -1,51 +1,30 @@
 ---
 title: Introduction
+full: true
 ---
 
-Quail runs SQL with AI functions: SQL functions answered by a language
-model on a GPU.
+<HomeHero />
 
-The query below returns the IDs of reviews discussing a movie's ending.
-The `reviews` table has an `id` column and review text in `body`:
+<HomeGuides />
 
-```sql
-SELECT r.id
-FROM reviews r
-WHERE AI.IF(PROMPT('Does this review discuss the ending? {0}', r.body));
-```
+<HomeSection
+  title="AI functions"
+  description="Each AI function returns one answer per row. SQL uses the answer like any other value."
+>
+  <HomeFunctions />
+</HomeSection>
 
-`AI.IF` keeps a row when the model answers yes. Other
-[AI functions](/docs/user-guide/sql/ai-functions) return scores or labels,
-copy answers from documents, or write text.
-
-Quail runs the AI functions on the GPU, and
-[Apache DataFusion](https://datafusion.apache.org/) runs the rest of
-the SQL.
-
-## Requirements
-
-- Quail needs Python 3.12.
-- Quail needs a [supported model and CUDA GPU](/docs/user-guide/models).
-  Each GPU holds one complete copy of the model.
-- Use [Modal](/docs/user-guide/models#no-local-gpu-use-modal) or connect
-  to [Quail Server](/docs/user-guide/server) when you have no local GPU.
-
-## Get started
-
-Install [quail-engine](https://pypi.org/project/quail-engine/):
+<HomeSection
+  title="Install"
+  description="Quail needs Python 3.12 and a supported CUDA GPU."
+>
 
 ```bash
 uv pip install quail-engine
 ```
 
-<Cards>
-  <Card title="Quickstart" href="/docs/user-guide/quickstart"
-        description="Filter movie reviews from Python or Rust." />
-  <Card title="SQL reference" href="/docs/user-guide/sql"
-        description="AI functions in DataFusion SQL." />
-  <Card title="Models and GPUs" href="/docs/user-guide/models"
-        description="Choose a model and GPU, or run on Modal." />
-</Cards>
+The package is `quail-engine`, and you import it as `quail`. With no
+local GPU, run Quail on [Modal](/docs/user-guide/models#no-local-gpu-use-modal)
+or connect to [Quail Server](/docs/user-guide/server).
 
-Quail is open source. The
-[Full Stack Data Lab](https://fsdatalab.github.io/) at CMU develops it.
+</HomeSection>

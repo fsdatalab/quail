@@ -5,7 +5,7 @@
 <h1 align="center">Quail</h1>
 
 <p align="center">
-  <b>SQL with AI functions on your GPUs</b><br>
+  <b>A fast engine for AI functions in SQL</b><br>
   from the <a href="https://fsdatalab.github.io/">Full Stack Data Lab</a> at CMU
 </p>
 
@@ -15,7 +15,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License: MIT"></a>
 </p>
 
-Quail runs SQL with AI functions on your GPUs. An AI function, such as
+Quail runs SQL with AI functions. An AI function, such as
 `AI.IF`, sends a row's text to a model and returns the model's answer.
 Quail is an [Apache DataFusion](https://datafusion.apache.org) extension:
 we use DataFusion to parse, plan, and run the rest of the SQL.
