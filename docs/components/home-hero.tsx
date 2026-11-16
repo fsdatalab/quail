@@ -22,7 +22,7 @@ import {
 import quailLogo from '@/assets/quail-logo.svg';
 import { gitConfig } from '@/lib/shared';
 
-/** Shows the lab, the logo, the pitch, and an example query on the home page. */
+/** Shows the lab, the logo, a summary, and an example query on the home page. */
 export function HomeHero() {
   return (
     <header className="quail-hero not-prose">
@@ -36,8 +36,9 @@ export function HomeHero() {
           Quail
         </h1>
         <p className="quail-hero-lead">
-          Quail runs SQL with AI functions: SQL functions answered by a
-          language model on your GPUs.{' '}
+          Quail runs SQL with AI functions on your GPUs. An AI function, such
+          as <code>AI.IF</code>, sends a row&apos;s text to a model and returns
+          the model&apos;s answer.{' '}
           <a href="https://datafusion.apache.org/">Apache DataFusion</a> runs
           the rest of the SQL.
         </p>
@@ -52,33 +53,33 @@ export function HomeHero() {
             GitHub
           </a>
         </div>
-        <code className="quail-hero-install">uv pip install quail-engine</code>
       </div>
       <figure className="quail-hero-query">
-        <figcaption>Reviews that discuss the ending</figcaption>
+        <figcaption>Label the reviews that discuss the ending</figcaption>
         <pre>
-          <span className="k">SELECT</span> r.id{'\n'}
+          <span className="k">SELECT</span> r.id,{'\n'}
+          {'  '}<span className="f">AI.CLASSIFY</span>(r.body,{'\n'}
+          {'    '}[<span className="s">&apos;praise&apos;</span>, <span className="s">&apos;complaint&apos;</span>]) <span className="k">AS</span> kind{'\n'}
           <span className="k">FROM</span> reviews r{'\n'}
-          <span className="k">WHERE</span> <span className="f">AI.IF</span>(
-          <span className="f">PROMPT</span>({'\n'}
-          {'  '}<span className="s">&apos;Does this review discuss{'\n'}
-          {'   '}the ending? {'{0}'}&apos;</span>, r.body));
+          <span className="k">WHERE</span> <span className="f">AI.IF</span>(<span className="f">PROMPT</span>({'\n'}
+          {'  '}<span className="s">&apos;Does the review discuss the ending? {'{0}'}&apos;</span>,{'\n'}
+          {'  '}r.body))
         </pre>
         <table>
           <thead>
             <tr>
               <th>id</th>
-              <th>body</th>
+              <th>kind</th>
             </tr>
           </thead>
           <tbody>
             <tr>
-              <td>r2</td>
-              <td>The twist in the last scene…</td>
+              <td>r1</td>
+              <td>praise</td>
             </tr>
             <tr>
-              <td>r5</td>
-              <td>I saw the finale coming…</td>
+              <td>r2</td>
+              <td>complaint</td>
             </tr>
           </tbody>
         </table>
@@ -94,37 +95,37 @@ const guides: Guide[] = [
     title: 'Quickstart',
     href: '/docs/user-guide/quickstart',
     icon: Rocket,
-    description: 'Filter movie reviews from Python or Rust.',
+    description: 'Run your first query.',
   },
   {
     title: 'Running queries',
     href: '/docs/user-guide/sessions',
     icon: Terminal,
-    description: 'Open a session, register tables, and run SQL.',
+    description: 'Choose a model, register tables, and run SQL.',
   },
   {
     title: 'SQL reference',
     href: '/docs/user-guide/sql',
     icon: ListTree,
-    description: 'Every AI function, option, and supported SQL form.',
+    description: 'Every AI function and option.',
   },
   {
     title: 'Multimodal data',
     href: '/docs/user-guide/multimodal-data',
     icon: Images,
-    description: 'Query images, PDFs, and parsed documents.',
+    description: 'Query images and PDFs.',
   },
   {
     title: 'Models and GPUs',
     href: '/docs/user-guide/models',
     icon: Cpu,
-    description: 'Choose a model and GPU, or run on Modal.',
+    description: 'Supported models and GPUs, and Modal.',
   },
   {
     title: 'Quail Server',
     href: '/docs/user-guide/server',
     icon: Server,
-    description: 'Run queries on a GPU machine from another computer.',
+    description: 'Run queries on a remote GPU machine.',
   },
 ];
 
@@ -146,14 +147,14 @@ export function HomeGuides() {
 const functionsPage = '/docs/user-guide/sql/ai-functions';
 
 const functions: Guide[] = [
-  { title: 'AI.IF', href: '#aiifprompt-options', icon: Filter, description: 'Keep rows the model says yes to' },
-  { title: 'AI.SCORE', href: '#aiscoreprompt-options', icon: Gauge, description: 'Score each row from 0 to 1' },
-  { title: 'AI.CLASSIFY', href: '#aiclassifyinput-categories-options', icon: Tags, description: 'Pick one label per row' },
-  { title: 'AI.EXTRACT', href: '#aiextractinput-questions', icon: FileSearch, description: 'Answer questions about a document' },
-  { title: 'AI.EXTRACT_SPAN', href: '#aiextract_spaninput-questions', icon: TextCursor, description: 'Copy answers from the text' },
-  { title: 'AI.MAP', href: '#aimapinput-instruction-max_tokens', icon: PenLine, description: 'Write open-ended text' },
-  { title: 'AI.PARSE_DOCUMENT', href: '#aiparse_documentdocument', icon: FileText, description: 'Read the text a PDF stores' },
-  { title: 'AI.SAE_FEATURES', href: '#aisae_featuresprompt-options', icon: Wrench, description: 'List sparse autoencoder features' },
+  { title: 'AI.IF', href: '#aiifprompt-options', icon: Filter, description: 'Yes or no' },
+  { title: 'AI.SCORE', href: '#aiscoreprompt-options', icon: Gauge, description: 'A score from 0 to 1' },
+  { title: 'AI.CLASSIFY', href: '#aiclassifyinput-categories-options', icon: Tags, description: 'One label from a list' },
+  { title: 'AI.EXTRACT', href: '#aiextractinput-questions', icon: FileSearch, description: 'Answers to questions' },
+  { title: 'AI.EXTRACT_SPAN', href: '#aiextract_spaninput-questions', icon: TextCursor, description: 'Answers copied from the text' },
+  { title: 'AI.MAP', href: '#aimapinput-instruction-max_tokens', icon: PenLine, description: 'Open-ended text' },
+  { title: 'AI.PARSE_DOCUMENT', href: '#aiparse_documentdocument', icon: FileText, description: 'The text of a PDF' },
+  { title: 'AI.SAE_FEATURES', href: '#aisae_featuresprompt-options', icon: Wrench, description: 'Sparse autoencoder features' },
 ];
 
 /** Lists the AI functions with links to their reference entries. */

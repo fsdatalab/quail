@@ -9,20 +9,22 @@ full: true
 
 <HomeSection
   title="AI functions"
-  description="Each AI function asks the model about one row, and returns an answer that SQL can filter, sort, join, or group on."
+  description="Each AI function returns one answer per row. SQL uses the answer like any other value."
 >
   <HomeFunctions />
 </HomeSection>
 
 <HomeSection
-  title="Requirements"
-  description="Quail runs where your model and GPU run."
+  title="Install"
+  description="Quail needs Python 3.12 and a supported CUDA GPU."
 >
 
-- Quail needs Python 3.12.
-- Quail needs a [supported model and CUDA GPU](/docs/user-guide/models).
-  Each GPU holds one complete copy of the model.
-- Use [Modal](/docs/user-guide/models#no-local-gpu-use-modal) or connect
-  to [Quail Server](/docs/user-guide/server) when you have no local GPU.
+```bash
+uv pip install quail-engine
+```
+
+The package is `quail-engine`, and you import it as `quail`. With no
+local GPU, run Quail on [Modal](/docs/user-guide/models#no-local-gpu-use-modal)
+or connect to [Quail Server](/docs/user-guide/server).
 
 </HomeSection>
