@@ -1,29 +1,40 @@
 // The share of menus that sell drinks and that mention a war, by year.
-// The rows are the query's result in "A century of menus"; the SVG is
-// static, so the page prerenders it.
+// The rows are the query's result in content/docs/cookbook/menus.mdx; the
+// SVG is static, so the page prerenders it.
 
 const ROWS = [
   // year, menus, drinks, war
-  [1914, 99, 0.293, 0.01],
-  [1915, 100, 0.22, 0.03],
-  [1916, 99, 0.111, 0.01],
-  [1917, 100, 0.12, 0.21],
-  [1918, 100, 0.1, 0.57],
-  [1919, 99, 0.04, 0.051],
-  [1920, 96, 0.063, 0.042],
-  [1921, 100, 0.04, 0.02],
+  [1914, 59, 0.356, 0.017],
+  [1915, 59, 0.186, 0.034],
+  [1916, 60, 0.15, 0],
+  [1917, 60, 0.067, 0.117],
+  [1918, 60, 0.133, 0.567],
+  [1919, 59, 0.034, 0.051],
+  [1920, 59, 0.085, 0.034],
+  [1921, 60, 0.033, 0.017],
   [1926, 30, 0.033, 0],
   [1928, 49, 0.143, 0],
   [1931, 23, 0.043, 0],
   [1932, 53, 0.057, 0],
-  [1933, 100, 0.36, 0],
+  [1933, 60, 0.3, 0],
   [1934, 36, 0.111, 0],
-  [1935, 74, 0.216, 0.014],
-  [1937, 93, 0.215, 0],
+  [1935, 57, 0.211, 0.018],
+  [1937, 56, 0.214, 0],
+  [1938, 55, 0.091, 0.018],
+  [1939, 54, 0.222, 0],
+  [1940, 53, 0.321, 0.038],
+  [1941, 44, 0.25, 0.023],
+  [1943, 56, 0.179, 0.179],
+  [1944, 56, 0.268, 0.179],
+  [1945, 60, 0.433, 0.383],
+  [1946, 59, 0.153, 0.237],
+  [1947, 43, 0.233, 0.023],
+  [1948, 58, 0.224, 0.017],
+  [1949, 59, 0.271, 0.017],
 ] as const;
 
 const FIRST_YEAR = 1914;
-const LAST_YEAR = 1937;
+const LAST_YEAR = 1949;
 const LEFT = 48;
 const RIGHT = 640;
 const TOP = 34;
@@ -57,13 +68,17 @@ const GRID = [0, 0.2, 0.4, 0.6].map((share) =>
   `<line x1="${LEFT}" y1="${y(share)}" x2="${RIGHT}" y2="${y(share)}" class="grid"/>
 <text x="${LEFT - 8}" y="${y(share) + 4}" text-anchor="end" class="tick">${share * 100}%</text>`).join('');
 
-const YEARS = [1915, 1920, 1925, 1930, 1935].map((year) =>
+const YEARS = [1915, 1920, 1925, 1930, 1935, 1940, 1945].map((year) =>
   `<text x="${x(year)}" y="${BOTTOM + 20}" text-anchor="middle" class="tick">${year}</text>`).join('');
 
-const SVG = `<rect x="${x(1920)}" y="${TOP}" width="${x(1933.95) - x(1920)}" height="${BOTTOM - TOP}" class="band"/>
-<text x="${(x(1920) + x(1933.95)) / 2}" y="${TOP - 10}" text-anchor="middle" class="band-label">Prohibition, 1920–1933</text>
-<rect x="${x(1917.3)}" y="${TOP}" width="${x(1918.9) - x(1917.3)}" height="${BOTTOM - TOP}" class="band"/>
-<text x="${(x(1917.3) + x(1918.9)) / 2}" y="${TOP - 10}" text-anchor="middle" class="band-label">US at war</text>
+function band(start: number, end: number, label: string) {
+  return `<rect x="${x(start)}" y="${TOP}" width="${x(end) - x(start)}" height="${BOTTOM - TOP}" class="band"/>
+<text x="${(x(start) + x(end)) / 2}" y="${TOP - 10}" text-anchor="middle" class="band-label">${label}</text>`;
+}
+
+const SVG = `${band(1917.3, 1918.9, 'World War I')}
+${band(1920, 1933.95, 'Prohibition')}
+${band(1941.95, 1945.7, 'World War II')}
 ${GRID}
 <line x1="${LEFT}" y1="${BOTTOM}" x2="${RIGHT}" y2="${BOTTOM}" class="axis"/>
 ${YEARS}
@@ -71,8 +86,8 @@ ${YEARS}
 <path d="${path(3)}" class="line war"/>
 ${points(2, 'drinks', 'sell drinks')}
 ${points(3, 'war', 'mention a war')}
-<text x="${x(1933) + 8}" y="${y(0.36) - 6}" class="label drinks-label">sell drinks</text>
-<text x="${x(1918) + 8}" y="${y(0.57) + 4}" class="label war-label">mention a war</text>`;
+<text x="${x(1940) - 8}" y="${y(0.321) - 8}" text-anchor="end" class="label">sell drinks</text>
+<text x="${x(1918) + 8}" y="${y(0.567) + 4}" class="label">mention a war</text>`;
 
 export function MenuHistoryChart() {
   return (
@@ -80,13 +95,13 @@ export function MenuHistoryChart() {
       <figcaption>Share of menus, by year</figcaption>
       <div className="legend" aria-hidden="true">
         <span><i className="drinks" />sell beer, wine, or liquor</span>
-        <span><i className="war" />mention a war, rationing, or a meatless day</span>
+        <span><i className="war" />mention a war, rationing, or a meatless or wheatless day</span>
       </div>
       <div className="plot">
         <svg
           viewBox="0 0 660 280"
           role="img"
-          aria-label="Line chart: menus selling drinks fall from 29% in 1914 to 4–6% from 1919 to 1932, then rise to 36% in 1933; menus mentioning a war rise to 21% in 1917 and 57% in 1918."
+          aria-label="Line chart, 1914 to 1949: menus selling drinks fall from 36% in 1914 to 3–9% from 1919 to 1932, then return to 20–43%; menus mentioning a war rise to 57% in 1918 and to 18–38% from 1943 to 1946."
           dangerouslySetInnerHTML={{ __html: SVG }}
         />
       </div>

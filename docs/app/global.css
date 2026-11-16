@@ -1061,3 +1061,34 @@ html > body[data-scroll-locked] {
 .menu-history circle.drinks { fill: var(--drinks); }
 .menu-history circle.war { fill: var(--war); }
 .menu-history .label { font-size: 12px; font-weight: 600; fill: var(--color-fd-foreground); }
+
+.menu-scans {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1.25rem;
+  align-items: start;
+  margin: 1.5rem 0;
+}
+
+.menu-scans figure {
+  margin: 0;
+}
+
+.menu-scans img {
+  width: 100%;
+  height: auto;
+  margin: 0;
+  border-radius: 0.5rem;
+}
+
+.menu-scans figcaption {
+  margin-top: 0.5rem;
+  color: var(--color-fd-muted-foreground);
+  font-size: 0.8125rem;
+}
+
+@media (max-width: 639px) {
+  .menu-scans {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

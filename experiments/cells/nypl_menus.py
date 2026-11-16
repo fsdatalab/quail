@@ -158,7 +158,7 @@ PRICE_SQL = (f"SELECT s.page_id, AI.MAP(s.parts, '{PRICE_INSTRUCTION}', 8) AS an
              "FROM dollar_sample s")
 SHRINK_SQL = "SELECT s.page_id, AI.IMAGE(s.image, {edge}) AS image FROM pages s"
 
-# the query the docs page "A century of menus" shows: the share of each
+# the query docs/content/docs/cookbook/menus.mdx shows: the share of each
 # year's menus that sell drinks and that mention a war
 MENU_HISTORY_SQL = f"""
 WITH answers AS (
