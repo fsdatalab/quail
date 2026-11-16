@@ -107,32 +107,6 @@ DISH_QUESTIONS = {
 DISH_SQL = ("SELECT d.id FROM dishes d WHERE {condition}AI.IF(PROMPT('{question} "
             "Answer yes or no.\n\nDish: {{0}}', d.name))")
 
-ORGAN_QUESTION = ("Is this dish made from organ meat, such as sweetbreads, "
-                  "kidneys, liver, tripe, tongue, or brains?")
-# the share of each decade's common dishes that are organ meat; the model
-# reads only the dishes on 10 or more menus, and many name the organ in
-# French (ris de veau, rognons, cervelle), which no one ILIKE pattern finds
-ORGAN_SQL = f"""
-WITH dishes_asked AS (
-  SELECT d.id, AI.IF(PROMPT('{ORGAN_QUESTION} {{0}}', d.name)) AS organ
-  FROM dishes d WHERE d.times_appeared >= 10)
-SELECT CAST(SUBSTR(m.date, 1, 4) AS INT) / 10 * 10 AS decade,
-       ROUND(AVG(CASE WHEN a.organ THEN 1.0 ELSE 0.0 END), 4) AS share,
-       COUNT(*) AS items
-FROM dishes_asked a
-JOIN items i ON i.dish_id = a.id
-JOIN pages p ON i.menu_page_id = p.id
-JOIN menus m ON p.menu_id = m.id
-WHERE TRY_CAST(SUBSTR(m.date, 1, 4) AS INT) BETWEEN 1850 AND 2019
-GROUP BY 1 ORDER BY 1
-"""
-# the organ meat dishes, to read what the model counts
-ORGAN_DISHES_SQL = f"""
-SELECT d.name, d.times_appeared FROM dishes d
-WHERE d.times_appeared >= 10 AND AI.IF(PROMPT('{ORGAN_QUESTION} {{0}}', d.name))
-ORDER BY d.times_appeared DESC
-"""
-
 CURRENCIES = ["dollars", "francs", "marks", "pounds", "other currency", "no prices"]
 # the volunteers' currency names, by the label that names the same money
 CURRENCY_NAMES = {"Dollars": "dollars", "Francs": "francs",
@@ -634,64 +608,6 @@ def compare_sizes(sample_path: str, edges: list[int], num_pages: int,
         json.dump(record, out)
     volumes[RESULTS].commit()
     return record
-
-
-@app.function(image=image, gpu="H100!", memory=98304, timeout=3600, volumes=volumes)
-def organ_query(run_id: str) -> dict:
-    """Find the common organ meat dishes and their share of each decade's dishes.
-
-    Args:
-        run_id: The run's folder on the volume.
-
-    Returns:
-        The trend query's measurements and rows, and the dishes it counts.
-    """
-    import pyarrow.parquet as pq
-
-    import quail
-
-    tables = {name: pq.read_table(f"{ROOT}/tables/{name}.parquet")
-              for name in TABLES}
-    with quail.Session(quail.EngineConfig(model=MODEL, device="h100-sxm")) as session:
-        for name, table in tables.items():
-            session.register(name, quail.DocumentProvider.from_table(
-                table, id_col="id"))
-        common = [name or "" for name, times in zip(
-            tables["dishes"].column("name").to_pylist(),
-            tables["dishes"].column("times_appeared").to_pylist(), strict=True)
-                  if (times or 0) >= 10]
-        prompt_tokens = _prompt_tokens(session, f"{ORGAN_QUESTION} {{0}}")
-        input_tokens = sum(len(session.tokenizer(name)) + prompt_tokens
-                           for name in common)
-        table, query_s = _timed(session, ORGAN_SQL)
-        dishes, dishes_s = _timed(session, ORGAN_DISHES_SQL)
-    record = {"model": MODEL, "sql": ORGAN_SQL, "dishes": len(common),
-              **_measured(query_s, input_tokens), "rows": _rows(table),
-              "organ_dishes": _rows(dishes)[:200],
-              "organ_dishes_s": round(dishes_s, 2)}
-    directory = f"{ROOT}/runs/{run_id}"
-    os.makedirs(directory, exist_ok=True)
-    with open(f"{directory}/organ.json", "w") as out:
-        json.dump(record, out)
-    volumes[RESULTS].commit()
-    return record
-
-
-@app.local_entrypoint()
-def organ():
-    run_id = time.strftime("%Y%m%d-%H%M%S") + f"-{MODEL}-organ"
-    call = organ_query.spawn(run_id)
-    print(f"function call id: {call.object_id}", flush=True)
-    record = call.get()
-    print(f"saved to quail-results:/nypl_menus/runs/{run_id}/organ.json", flush=True)
-    print(f"{record['dishes']} dishes, {record['query_s']} s, "
-          f"{record['input_tokens_per_second']:,} input tok/s, "
-          f"${record['usd_per_query']}/query; dish list {record['organ_dishes_s']} s",
-          flush=True)
-    for row in record["rows"]:
-        print(f"  {row['decade']}  {row['items']:>7}  {100 * row['share']:4.1f}%")
-    print("  " + "; ".join(f"{row['name']} ({row['times_appeared']})"
-                           for row in record["organ_dishes"][:40]))
 
 
 @app.local_entrypoint()
