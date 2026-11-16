@@ -11,7 +11,7 @@ import {
   PlanStagesFigure,
 } from './planning-details';
 import { PlanningFigure } from './planning-figure';
-import { MenuHistoryChart } from './menu-history-chart';
+import { MenuHistoryChart, MenuHistoryTable } from './menu-history';
 import { QueryOutput } from './query-output';
 import { CodeExample } from './code-example';
 import { HomeFunctions, HomeGuides, HomeHero, HomeSection } from './home-hero';
@@ -29,6 +29,7 @@ export function getMDXComponents(components?: MDXComponents) {
     HomeHero,
     HomeSection,
     MenuHistoryChart,
+    MenuHistoryTable,
     PlannerAlgorithm,
     PlanStagesFigure,
     PlanningFigure,

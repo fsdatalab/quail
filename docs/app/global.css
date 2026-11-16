@@ -1021,10 +1021,18 @@ html > body[data-scroll-locked] {
   font-size: 0.8125rem;
 }
 
-.menu-history .legend span {
+.menu-history .legend button {
   display: inline-flex;
   align-items: center;
   gap: 0.4rem;
+  padding: 0.125rem 0;
+  color: inherit;
+  cursor: pointer;
+}
+
+.menu-history .legend button[aria-pressed='false'] {
+  opacity: 0.4;
+  text-decoration: line-through;
 }
 
 .menu-history .legend i {
@@ -1033,10 +1041,11 @@ html > body[data-scroll-locked] {
   border-radius: 999px;
 }
 
-.menu-history .legend i.drinks { background: var(--drinks); }
-.menu-history .legend i.war { background: var(--war); }
+.menu-history i.drinks { background: var(--drinks); }
+.menu-history i.war { background: var(--war); }
 
 .menu-history .plot {
+  position: relative;
   overflow-x: auto;
 }
 
@@ -1060,7 +1069,86 @@ html > body[data-scroll-locked] {
 .menu-history circle { stroke: var(--color-fd-background); stroke-width: 2; }
 .menu-history circle.drinks { fill: var(--drinks); }
 .menu-history circle.war { fill: var(--war); }
-.menu-history .label { font-size: 12px; font-weight: 600; fill: var(--color-fd-foreground); }
+.menu-history .label { font-size: 12px; font-weight: 600; fill: var(--color-fd-foreground); pointer-events: none; }
+.menu-history svg { touch-action: pan-y; }
+.menu-history .crosshair { stroke: var(--color-fd-muted-foreground); stroke-width: 1; stroke-dasharray: 3 3; }
+
+.menu-history .tooltip {
+  position: absolute;
+  top: 2.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.125rem;
+  min-width: 9.5rem;
+  padding: 0.5rem 0.625rem;
+  border: 1px solid var(--color-fd-border);
+  border-radius: 0.5rem;
+  background: var(--color-fd-popover);
+  color: var(--color-fd-popover-foreground);
+  font-size: 0.75rem;
+  pointer-events: none;
+  transform: translateX(0.75rem);
+}
+
+.menu-history .tooltip[data-side='left'] {
+  transform: translateX(calc(-100% - 0.75rem));
+}
+
+.menu-history .tooltip span {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+}
+
+.menu-history .tooltip i {
+  width: 0.625rem;
+  height: 0.1875rem;
+  border-radius: 999px;
+}
+
+.menu-history .tooltip .muted {
+  color: var(--color-fd-muted-foreground);
+}
+
+.menu-history .tooltip b {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+
+.menu-table {
+  max-height: 22rem;
+  margin: 1.5rem 0;
+  overflow-y: auto;
+  border: 1px solid var(--color-fd-border);
+  border-radius: 0.625rem;
+}
+
+.menu-table table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.menu-table th {
+  position: sticky;
+  top: 0;
+  background: var(--color-fd-muted);
+  font-family: var(--font-quail-mono), monospace;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  text-align: left;
+}
+
+.menu-table th,
+.menu-table td {
+  padding: 0.5rem 1rem;
+  border-bottom: 1px solid var(--color-fd-border);
+}
+
+.menu-table tbody tr:hover {
+  background: var(--color-fd-accent);
+}
 
 .menu-scans {
   display: grid;
