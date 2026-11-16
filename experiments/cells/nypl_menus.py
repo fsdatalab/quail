@@ -155,7 +155,8 @@ SHRINK_SQL = "SELECT s.page_id, AI.IMAGE(s.image, {edge}) AS image FROM pages s"
 
 
 @app.function(image=image, cpu=8, memory=32768, timeout=3 * 3600, volumes=volumes)
-def prepare(num_menus: int, edge: int, seed: int) -> dict:
+def prepare(num_menus: int, edge: int, seed: int, years: tuple[int, int] | None,
+            per_year: int) -> dict:
     """Write the tables and one page image per menu to the volume.
 
     Each menu gives its page with the most typed-in dishes, or its first
@@ -167,6 +168,8 @@ def prepare(num_menus: int, edge: int, seed: int) -> dict:
         num_menus: The menus in the sample, or 0 for every dated menu.
         edge: The page images' longest side, in pixels.
         seed: The sample's random seed.
+        years: The first and last year of the menus to keep, or None for all.
+        per_year: The most menus to keep from each year, or 0 for all.
 
     Returns:
         The tables' row counts and the sample's size.
@@ -235,9 +238,19 @@ def prepare(num_menus: int, edge: int, seed: int) -> dict:
     untyped = [menu for menu in candidates if not menus[menu]["currency"]
                and not by_page.get(densest[menu]["id"])]
     chooser = random.Random(seed)
+    if years:
+        candidates = [menu for menu in candidates
+                      if years[0] <= year(menus[menu]) <= years[1]]
+    if per_year:
+        by_year: dict[int, list[str]] = {}
+        for menu in candidates:
+            by_year.setdefault(year(menus[menu]), []).append(menu)
+        candidates = [menu for found in by_year.values()
+                      for menu in chooser.sample(found, min(per_year, len(found)))]
     chosen = (chooser.sample(typed, num_menus // 2)
               + chooser.sample(untyped, num_menus - num_menus // 2)
               if num_menus else candidates)
+    print(f"fetching {len(chosen)} pages", flush=True)
 
     def fetch(menu: str) -> dict:
         page = densest[menu]
@@ -262,19 +275,28 @@ def prepare(num_menus: int, edge: int, seed: int) -> dict:
                 "price": price}
 
     started = time.perf_counter()
+    rows = []
     with ThreadPoolExecutor(FETCH_THREADS) as pool:
-        rows = [row for row in pool.map(fetch, chosen) if row]
+        for index, row in enumerate(pool.map(fetch, chosen), start=1):
+            if row:
+                rows.append(row)
+            if index % 200 == 0:
+                print(f"fetched {index} of {len(chosen)} pages, {len(rows)} kept, "
+                      f"{time.perf_counter() - started:.0f} s", flush=True)
     fetch_s = time.perf_counter() - started
     sample = pa.Table.from_pylist(rows)
-    path = f"{ROOT}/{_sample_name(num_menus, edge)}"
+    path = f"{ROOT}/{_sample_name(num_menus, edge, years, per_year)}"
     pq.write_table(sample, path)
     volumes[RESULTS].commit()
     return {"tables": counts, "menus": len(chosen), "sample": sample.num_rows,
             "fetch_s": round(fetch_s), "path": path}
 
 
-def _sample_name(num_menus: int, edge: int) -> str:
-    return f"pages_{num_menus or 'all'}_{edge}.parquet"
+def _sample_name(num_menus: int, edge: int, years: tuple[int, int] | None = None,
+                 per_year: int = 0) -> str:
+    span = f"_{years[0]}-{years[1]}" if years else ""
+    cap = f"_{per_year}_per_year" if per_year else ""
+    return f"pages_{num_menus or 'all'}{span}{cap}_{edge}.parquet"
 
 
 def _prompt_tokens(session, prompt: str) -> int:
@@ -589,8 +611,10 @@ def sizes(sample: str = "sample_2000_1024.parquet", edges: str = "512",
 
 
 @app.local_entrypoint()
-def prepare_data(num_menus: int = 0, edge: int = 1024, seed: int = 0):
-    call = prepare.spawn(num_menus, edge, seed)
+def prepare_data(num_menus: int = 0, edge: int = 1024, seed: int = 0,
+                 years: str = "", per_year: int = 0):
+    span = tuple(int(year) for year in years.split("-")) if years else None
+    call = prepare.spawn(num_menus, edge, seed, span, per_year)
     print(f"function call id: {call.object_id}", flush=True)
     print(json.dumps(call.get()), flush=True)
 
