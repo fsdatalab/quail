@@ -191,7 +191,6 @@ class SaeFeaturesOperator(ColumnOperator, SingleNodeOperator):
         (alias,) = spec.aliases
         listed = Rows({alias: rows[:, 0]}, pa.table({
             spec.name: values}))
-        listed = join_prior_rows(listed, alias, self.priors, self.prior_tables)
         return NodeResult(classify_outputs(self.node, listed), NodeMetrics(
             input_rows=self.reached, output_rows=len(answered),
             evaluated_documents=self.reached, fresh_tokens=tokens,

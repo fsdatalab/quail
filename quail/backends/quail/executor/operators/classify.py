@@ -184,8 +184,7 @@ class ClassifyOperator(ColumnOperator, SingleNodeOperator):
         # a document whose answer named no label has no row
         labeled = [index for index, label in enumerate(plan.labels)
                    if label is not None]
-        scored = join_prior_rows(self._label_rows(labeled), spec.aliases[0],
-                                 self.priors, self.prior_tables)
+        scored = self._label_rows(labeled)
         return NodeResult(classify_outputs(self.node, scored), NodeMetrics(
             input_rows=self.reached, output_rows=len(labeled),
             evaluated_documents=self.reached, fresh_tokens=tokens,

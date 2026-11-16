@@ -664,12 +664,10 @@ def test_a_filter_on_answers_drops_documents_before_the_next_question(
     assert first["ends"] == ["March 3, 2027", "five years", None]
     kept = outputs[PortRef("filter:c:0", "rows:c")].to_pydict()
     assert kept["c"] == [0] and kept["ends"] == ["March 3, 2027"]
-    # the second question was asked of the survivor only; its rows
-    # carry the first answer
+    # the second question was asked of the survivor only
     second = outputs[PortRef("ai-extract:starts", "rows:c")].to_pydict()
     assert second == {"c": [0], "starts": ["March 3, 2027"],
-                      "starts_span": [first["ends_span"][0]],
-                      "ends": ["March 3, 2027"], "ends_span": [first["ends_span"][0]]}
+                      "starts_span": [first["ends_span"][0]]}
     assert first["ends_span"][0] == {"start": 37, "end": 50}
     assert outputs[PortRef("filter:c:1", "rows:c")].to_pydict()["c"] == [0]
     assert outputs[PortRef("filter:c:1", "rows:c")].column("c").to_pylist() == [0]

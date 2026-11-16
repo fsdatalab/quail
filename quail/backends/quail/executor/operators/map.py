@@ -227,8 +227,7 @@ class MapOperator(ColumnOperator, ModelOperator):
             spec = node.spec
             asked = self.answered_positions(q)
             lengths = self.decoder.lengths[self.first + q][self._slots(q, asked)]
-            rows = join_prior_rows(self.answer_rows(q, asked), spec.aliases[0],
-                                   self.priors, self.prior_tables)
+            rows = self.answer_rows(q, asked)
             selected = stage_spans(spans, offset, offset + 1)
             fresh_tokens = fresh - sum(own[1:]) if q == 0 else own[q]
             tail = len(spec.prompt_token_parts[1])

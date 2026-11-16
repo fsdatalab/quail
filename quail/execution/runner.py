@@ -11,6 +11,7 @@ from quail.execution.deduplicate import MODEL_NODES, deduplicate
 from quail.execution.finished import held, report_outputs
 from quail.execution.guard import guarded, present_join_inputs, reads_null_documents
 from quail.execution.metrics import NodeMetrics, NodeResult, RunResult
+from quail.execution.rows import Rows
 from quail.physical import (
     AiFilter,
     ExecutionLocation,
@@ -68,6 +69,20 @@ def _check_ports(node, result) -> None:
             f"runtime {node.runtime_key!r} returned wrong ports "
             f"for {node.node_id!r}; "
             f"missing={sorted(missing)}, extra={sorted(extra)}")
+
+
+def _answers(values: Mapping[tuple[str, str], Any]) -> dict[str, Rows]:
+    """Return the rows that hold each value column of the outputs so far.
+
+    A guard reads an earlier node's answer from those rows, by document
+    id, instead of from a copy every node between them carries.
+    """
+    found = {}
+    for value in values.values():
+        if isinstance(value, Rows):
+            for name in value.column_names:
+                found[name] = value
+    return found
 
 
 class GenericRunner:
@@ -141,7 +156,7 @@ class GenericRunner:
                         member, inputs[member.node_id], context)
                 # a guarded node runs in a pipeline of its own
                 guard = guarded(node, inputs[node.node_id], context,
-                                runtime_answers=True)
+                                runtime_answers=True, answers=_answers(values))
                 if guard is not None:
                     inputs[node.node_id] = guard.inputs(inputs[node.node_id])
                 deduplicated = deduplicate(graph, pipeline, inputs, context)
@@ -184,7 +199,7 @@ class GenericRunner:
                     for input_port in node.inputs
                 }
                 inputs = present_join_inputs(node, inputs, context)
-                guard = guarded(node, inputs, context)
+                guard = guarded(node, inputs, context, answers=_answers(values))
                 if guard is not None:
                     inputs = guard.inputs(inputs)
                 deduplicated = deduplicate(
