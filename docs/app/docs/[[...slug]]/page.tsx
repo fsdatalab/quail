@@ -9,7 +9,6 @@ import {
 } from 'fumadocs-ui/layouts/docs/page';
 import { notFound } from 'next/navigation';
 import { getMDXComponents } from '@/components/mdx';
-import { HomeHero } from '@/components/home-hero';
 import type { Metadata } from 'next';
 import { createRelativeLink } from 'fumadocs-ui/mdx';
 import { gitConfig } from '@/lib/shared';
@@ -29,9 +28,7 @@ export default async function Page(props: PageProps<'/docs/[[...slug]]'>) {
       breadcrumb={{ className: 'quail-breadcrumb' }}
       footer={{ className: 'quail-page-footer' }}
     >
-      {page.slugs.length === 0 ? (
-        <HomeHero />
-      ) : (
+      {page.slugs.length > 0 && (
       <header className="quail-page-header">
         <div className="quail-title-row">
           <DocsTitle>{page.data.title}</DocsTitle>
