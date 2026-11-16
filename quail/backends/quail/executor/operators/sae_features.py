@@ -8,8 +8,6 @@ import pyarrow as pa
 from quail.backends.quail.executor.model_operator import (
     ColumnOperator,
     SingleNodeOperator,
-    join_prior_rows,
-    prior_inputs,
 )
 from quail.backends.quail.executor.sae import (
     SaeFeaturesReadout,
@@ -52,10 +50,8 @@ class SaeFeaturesOperator(ColumnOperator, SingleNodeOperator):
             (operator.accumulator for operator in chain
              if isinstance(operator, SaeFeaturesOperator)
              and operator.accumulator is not None), None)
-        priors, prior_tables = prior_inputs(node, chain, region.node_inputs(node))
         return cls(region.query, node, region.document_ids(), region.documents,
-                   accumulator=accumulator, priors=priors,
-                   prior_tables=prior_tables)
+                   accumulator=accumulator)
 
     @staticmethod
     def prepare_group(operators):
@@ -80,8 +76,7 @@ class SaeFeaturesOperator(ColumnOperator, SingleNodeOperator):
         finally:
             self._pipeline.forward_hook = previous
 
-    def __init__(self, state, node, ids, documents, *, accumulator=None,
-                 priors=(), prior_tables=()):
+    def __init__(self, state, node, ids, documents, *, accumulator=None):
         spec = node.spec
         (alias,) = spec.aliases
         head, tail = spec.prompt_token_parts
@@ -90,8 +85,6 @@ class SaeFeaturesOperator(ColumnOperator, SingleNodeOperator):
                 "AI.SAE_FEATURES needs a question after the document")
         self.node = node
         self.ids = list(ids)
-        self.priors = priors
-        self.prior_tables = prior_tables
         self.values = [None] * len(self.ids)
         self.pending = {}        # anchor -> settled handle not yet read
         self.harvested = []      # (anchors, feature-list array)
@@ -191,7 +184,6 @@ class SaeFeaturesOperator(ColumnOperator, SingleNodeOperator):
         (alias,) = spec.aliases
         listed = Rows({alias: rows[:, 0]}, pa.table({
             spec.name: values}))
-        listed = join_prior_rows(listed, alias, self.priors, self.prior_tables)
         return NodeResult(classify_outputs(self.node, listed), NodeMetrics(
             input_rows=self.reached, output_rows=len(answered),
             evaluated_documents=self.reached, fresh_tokens=tokens,

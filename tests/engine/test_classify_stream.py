@@ -245,9 +245,7 @@ def test_streamed_classification_labels_survivors_with_their_kv_resident(
         == accepted
     assert metrics["label:again"]["input_rows"] == len(accepted)
     later = outputs[PortRef("classify:kind", "rows:r")]
-    assert later.to_pydict() == {
-        "r": accepted, "kind": ["b"] * len(accepted),
-        "topic": ["a"] * len(accepted)}
+    assert later.to_pydict() == {"r": accepted, "kind": ["b"] * len(accepted)}
     prefill = sum(len(documents["r"][d]) for d in range(num_documents))
     if classify_only:
         assert metrics["classify:r"]["fresh_tokens"] == prefill + 2 * num_documents
@@ -611,7 +609,7 @@ RECORDED_CHUNKS = {
                 "cc574da4ec685bd89fe4b37a4ce345cc9bc94cbe69fae515053c64900202c3d5"),
     "fused": (8, "5569260ca2d19dc490f28f284efb652ce7037c2d98d196cfc0d246df7837e58c",
               {"classify:kind": 8, "classify:r": 18, "filter:r": 336, "group:0": 92},
-              "d1a18ac0ec0b19778fd2714f6c9224c8ac60ce742537066800ac1a4e1e4b3051"),
+              "0b4e92e6901e5b15a86f70230317ecbd8beace97430f64e39f8aaf1c62cb54c3"),
     "joined": (12, "55f1c193ef72a23fbfc8dc00d047765ea31d1de12af325e43122dae6e6a66abd",
                {"classify:rp": 171, "group:0": 644, "group:1": 42},
                "fd3e330ee7483b08ce830d7f9c3f4311ec75f5fc84baa60c26f5b8d2586f8653"),
@@ -806,8 +804,10 @@ def test_classifications_alone_skip_the_documents_the_hint_drops(monkeypatch):
     # a chain of classifications skips them too
     with reporting(None, EvenDocuments(), {"r": "reviews"}):
         result, _ = _run_recorded_region(monkeypatch, "classifies")
-    labeled = result["_outputs"][PortRef("classify:kind", "rows:r")].to_pydict()
-    assert labeled["r"] == list(range(0, 14, 2))
+    outputs = result["_outputs"]
+    topics = outputs[PortRef("classify:r", "rows:r")].to_pydict()
+    kinds = outputs[PortRef("classify:kind", "rows:r")].to_pydict()
+    assert topics["r"] == kinds["r"] == list(range(0, 14, 2))
     # the second classification names the labels the other way round
-    assert labeled["topic"] == ["a"] * 7
-    assert labeled["kind"] == ["b"] * 7
+    assert topics["topic"] == ["a"] * 7
+    assert kinds["kind"] == ["b"] * 7

@@ -144,6 +144,32 @@ rows 6
 """)
 
 
+def test_an_extraction_guarded_by_an_ai_filter_runs_beside_an_unguarded_extraction():
+    assert_transcript(_transcript(
+        f"SELECT r.id, {EXTRACT} AS e, CASE WHEN {KIND} "
+        "THEN AI.EXTRACT(r.body, {'v': 'Which verb?'}) END AS g FROM reviews r"), """\
+--- SELECT r.id, AI.EXTRACT(r.body, {'w': 'Which word?'}) AS e, CASE WHEN
+    AI_FILTER(PROMPT('kind: {0}', r.body)) THEN AI.EXTRACT(r.body, {'v': 'Which verb?'})
+    END AS g FROM reviews r ---
+plan
+  __quail_call_2 = ai_extract(r.body, named_struct('v', 'Which verb?')), guard:
+      __quail_call_1 IS TRUE, returns: [__quail_call_2]
+  e = ai_extract(r.body, named_struct('w', 'Which word?')), returns: [e]
+  __quail_call_1 = ai_filter('kind: {0}', r.body)
+asked 15 of 18
+  'kind: {0}': r0 TRUE, r1 FALSE, r2 TRUE, r3 FALSE, r4 TRUE, r5 FALSE
+  'Which word?': r0 'b0', r1 'b1', r2 'b2', r3 'b3', r4 'b4', r5 'b5'
+  'Which verb?': r0 'b0', r2 'b2', r4 'b4'
+rows 6
+  r0, {'w': 'b0'}, {'v': 'b0'}
+  r1, {'w': 'b1'}, NULL
+  r2, {'w': 'b2'}, {'v': 'b2'}
+  r3, {'w': 'b3'}, NULL
+  r4, {'w': 'b4'}, {'v': 'b4'}
+  r5, {'w': 'b5'}, NULL
+""")
+
+
 def test_a_case_with_an_else_guards_its_call_by_the_condition():
     assert_transcript(_transcript(
         f"SELECT r.id, CASE WHEN r.long THEN {TONE} ELSE 'none' END AS t "

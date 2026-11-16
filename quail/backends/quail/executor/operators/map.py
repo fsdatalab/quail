@@ -16,9 +16,7 @@ from quail.backends.quail.executor.model_operator import (
     ColumnOperator,
     ModelOperator,
     gpu_seconds,
-    join_prior_rows,
     operator_label,
-    prior_inputs,
     stage_spans,
 )
 from quail.backends.quail.executor.stages import Stage, StageRequests
@@ -54,26 +52,21 @@ class MapOperator(ColumnOperator, ModelOperator):
 
     @classmethod
     def build(cls, region, nodes, chain):
-        """Build the maps; maps alone return their answers without input columns."""
-        priors, prior_tables = ((), ()) if region.one_family else prior_inputs(
-            nodes[0], chain, region.node_inputs(nodes[0]))
+        """Build the maps; each map's rows hold its own answers alone."""
         first = sum(len(operator.answer_limits) for operator in chain)
-        return cls(region.query, nodes, region.document_ids(), first, priors,
-                   prior_tables)
+        return cls(region.query, nodes, region.document_ids(), first)
 
     @classmethod
     def alone(cls, region, operators, table, settings):
         nodes = [node for operator in operators for node in operator.nodes]
         return replace(settings, label=operator_label(cls.word, nodes))
 
-    def __init__(self, state, nodes, ids, first, priors=(), prior_tables=()):
+    def __init__(self, state, nodes, ids, first):
         self.state = state
         self.nodes = list(nodes)
         self.node = self.nodes[0]
         self.ids = np.asarray(ids, dtype=np.int64)
         self.first = first          # the chain's index of the first map
-        self.priors = priors
-        self.prior_tables = prior_tables
         self._decoder = None
         self.asked = [np.zeros(len(self.ids), dtype=bool) for _ in self.nodes]
         self.slots = np.arange(len(self.ids), dtype=np.int64)[None, :]
@@ -227,8 +220,7 @@ class MapOperator(ColumnOperator, ModelOperator):
             spec = node.spec
             asked = self.answered_positions(q)
             lengths = self.decoder.lengths[self.first + q][self._slots(q, asked)]
-            rows = join_prior_rows(self.answer_rows(q, asked), spec.aliases[0],
-                                   self.priors, self.prior_tables)
+            rows = self.answer_rows(q, asked)
             selected = stage_spans(spans, offset, offset + 1)
             fresh_tokens = fresh - sum(own[1:]) if q == 0 else own[q]
             tail = len(spec.prompt_token_parts[1])

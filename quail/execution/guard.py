@@ -19,6 +19,7 @@ is asked about the pairs of two documents and answers NULL for the rest.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -276,8 +277,8 @@ def present_join_inputs(node, inputs: dict, context) -> dict:
     return found
 
 
-def guarded(node, inputs: dict, context, *,
-            runtime_answers: bool = False) -> Guarded | NullPairs | None:
+def guarded(node, inputs: dict, context, *, runtime_answers: bool = False,
+            answers: Mapping[str, Rows] | None = None) -> Guarded | NullPairs | None:
     """Evaluate a column node's guard over the rows it reads.
 
     Args:
@@ -288,6 +289,8 @@ def guarded(node, inputs: dict, context, *,
         runtime_answers: Whether the runtime writes an AI filter's answer
             column itself, keeping every row it reads, as Quail's GPU
             executor does.
+        answers: The rows that hold each answer column the query's
+            nodes have returned so far, by column name.
 
     Returns:
         The rows and which of them the model is asked about, or None for
@@ -308,7 +311,8 @@ def guarded(node, inputs: dict, context, *,
     alias = node.alias if isinstance(node, AiFilter) else node.spec.aliases[0]
     rows = rows_of(inputs[port], alias)
     read = _read(node, rows, alias, context, [
-        condition for condition in (guard, alternative) if condition is not None])
+        condition for condition in (guard, alternative) if condition is not None],
+        answers or {})
     everyone = pa.array([True] * rows.num_rows, pa.bool_())
     asked = everyone if guard is None else accepts(guard, read)
     passes = (pc.invert(everyone) if alternative is None
@@ -325,21 +329,30 @@ def guarded(node, inputs: dict, context, *,
     return Guarded(node, port, rows, asked, passes)
 
 
-def _read(node, rows: Rows, alias: str, context, conditions) -> pa.Table:
+def _read(node, rows: Rows, alias: str, context, conditions,
+          answers: Mapping[str, Rows]) -> pa.Table:
     """Return the columns the conditions read, one row per row read.
 
-    A column is a value the rows carry, or a column of the alias's table.
+    A column is a value the rows carry, an answer an earlier node
+    returned for the same documents, or a column of the alias's table.
     """
     names = {ref.column for condition in conditions
              for ref in condition.references}
-    carried = [name for name in rows.column_names if name in names]
-    read = rows.values.select(carried)
-    if names <= set(carried):
-        return read if carried else pa.table({"_": pa.nulls(rows.num_rows)})
+    read = rows.values.select([name for name in rows.column_names if name in names])
+    for name in sorted(names - set(read.column_names)):
+        answered = answers.get(name)
+        if answered is None or alias not in answered.aliases:
+            continue
+        # the answering node asked about every row this node reads, or
+        # answered NULL where it did not
+        positions = pc.index_in(rows.ids[alias], value_set=answered.ids[alias])
+        read = read.append_column(name, pc.take(answered.column(name), positions))
+    if names <= set(read.column_names):
+        return read if read.column_names else pa.table({"_": pa.nulls(rows.num_rows)})
     columns = context.sources.get(columns_key(alias))
     if columns is None:
         raise KeyError(f"{node.node_id!r} reads its guard from {alias!r}'s columns")
     taken = columns.take(rows.ids[alias])
-    for name in carried:
+    for name in read.column_names:
         taken = taken.append_column(name, read.column(name))
     return taken
