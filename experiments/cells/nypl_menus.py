@@ -6,12 +6,12 @@ question:
 
 1. ClickHouse's demo queries, which read only the typed-in prices and
    find a dish with ILIKE on its name;
-2. questions ILIKE answers badly: AI.IF checks the dishes ILIKE matches
-   for vodka and caviar, and reads every dish name for a vegetarian main
-   course, which no pattern finds;
-3. questions about the scanned pages: each menu's currency and language,
-   whether it offers a vegetarian main course, and a dish's price, read
-   from the page image; the price is checked against the volunteers'.
+2. AI.IF on the dish names ILIKE matches for vodka and caviar, to check
+   ILIKE's matches;
+3. questions about one scanned page per menu: its currency and language;
+   whether it offers alcohol, mentions a war, shows a price changed by
+   hand, or offers a vegetarian main course; its most expensive dish; and
+   a dish's price, checked against the volunteers' price.
 
     uv run modal run --detach -m experiments.cells.nypl_menus::prepare_data \
       2>&1 | tee "$run_log"
@@ -32,7 +32,6 @@ import time
 
 import modal
 
-from quail.backends.quail.executor.images import png_size
 from quail.deploy.images import gpu_image
 
 app = modal.App("quail-milestone1")
@@ -51,7 +50,11 @@ MODEL = "qwen3.5-4b-bf16"
 # the export ClickHouse's demo uses; its MD5 is db6126724de939a5481e3160a2d67d15
 DATA_URL = ("https://s3.amazonaws.com/menusdata.nypl.org/gzips/"
             "2021_08_01_07_01_17_data.tgz")
-PAGE_URL = "https://iiif.nypl.org/iiif/2/{image_id}/full/!{edge},{edge}/0/default.png"
+PAGE_URL = "https://iiif.nypl.org/iiif/2/{image_id}/full/!{edge},{edge}/0/default.jpg"
+# NYPL's image server answers in about a second but can hang a request
+FETCH_TIMEOUT_S = 15
+FETCH_ATTEMPTS = 6
+FETCH_THREADS = 64
 TABLES = {"menus": "Menu.csv", "pages": "MenuPage.csv", "items": "MenuItem.csv",
           "dishes": "Dish.csv"}
 # the columns each table keeps, and which hold another table's id
@@ -95,18 +98,12 @@ WHERE {currency} AND decade > 0 AND decade < 2022 {dish}
 GROUP BY decade ORDER BY decade
 """
 
-# each question's ILIKE pattern and the question AI.IF asks of a dish
-# name. ILIKE alone answers a burger, as in ClickHouse's demo. For vodka
-# and caviar, the model checks only the names ILIKE matches; no pattern
-# finds a vegetarian main course, so the model reads every name.
+# each question's ILIKE pattern and the question AI.IF asks of each dish
+# name ILIKE matches. ILIKE alone answers a burger, as in ClickHouse's demo.
 DISH_QUESTIONS = {
     "vodka": ("%vodka%", "Is this drink vodka, or a drink made with vodka?"),
     "caviar": ("%caviar%", "Is this dish caviar, or served with caviar?"),
-    "vegetarian": ("%vegetarian%", "Is this a vegetarian main course, with no "
-                                   "meat, poultry, or fish?"),
 }
-# the questions whose ILIKE runs before the model, to check its matches
-CHECKED_MATCHES = {"vodka", "caviar"}
 DISH_SQL = ("SELECT d.id FROM dishes d WHERE {condition}AI.IF(PROMPT('{question} "
             "Answer yes or no.\n\nDish: {{0}}', d.name))")
 
@@ -116,7 +113,19 @@ CURRENCY_NAMES = {"Dollars": "dollars", "Francs": "francs",
                   "Deutsche Marks": "marks", "Pounds": "pounds",
                   "UK Pounds": "pounds"}
 LANGUAGES = ["English", "French", "German", "Italian", "other"]
+# the yes-or-no questions asked of each page image, answered per year
+PAGE_QUESTIONS = {
+    "alcohol": "Does this menu offer beer, wine, or liquor?",
+    "war": "Does this menu mention a war, rationing, or a meatless or wheatless day?",
+    "handwritten price": "Has someone crossed out a printed price on this menu "
+                         "and written a new price by hand?",
+    "vegetarian": "Does this menu offer a vegetarian main course, with no meat, "
+                  "poultry, or fish?",
+}
 PAGE_QUERIES = {
+    **{key: ("SELECT s.page_id, AI.IF(PROMPT('" + question.replace("'", "''")
+             + " {0}', s.image)) AS answer FROM sample s")
+       for key, question in PAGE_QUESTIONS.items()},
     "currency": (
         "SELECT s.page_id, AI.CLASSIFY(PROMPT('Which currency are the prices on "
         f"this menu in? {{0}}', s.image), {CURRENCIES!r}) AS answer FROM sample s"),
@@ -124,27 +133,28 @@ PAGE_QUERIES = {
         "SELECT s.page_id, AI.CLASSIFY(PROMPT('Which language are the dishes on "
         f"this menu written in? {{0}}', s.image), {LANGUAGES!r}) AS answer "
         "FROM sample s"),
-    "vegetarian": (
-        "SELECT s.page_id, AI.IF(PROMPT('Does this menu offer a vegetarian main "
-        "course, with no meat, poultry, or fish? {0}', s.image)) AS answer "
-        "FROM sample s"),
     "price": (
         "SELECT s.page_id, AI.MAP(s.parts, 'What does the menu charge for the "
         "dish named above? Answer in dollars, as a number only: 45 cents is "
         "0.45.', 8) AS answer FROM dollar_sample s"),
+    "most expensive dish": (
+        "SELECT s.page_id, AI.MAP(s.image, 'Name the most expensive dish on this "
+        "menu and its price, as: dish | price. Write none if the menu shows no "
+        "prices.', 32) AS answer FROM sample s"),
 }
 
 
 @app.function(image=image, cpu=8, memory=32768, timeout=3 * 3600, volumes=volumes)
 def prepare(num_menus: int, edge: int, seed: int) -> dict:
-    """Write the tables and a sample of page images to the volume.
+    """Write the tables and one page image per menu to the volume.
 
-    The sample holds each sampled menu's page with the most typed-in
-    dishes. Half the menus have a typed-in currency and prices, and each
-    keeps one priced dish from the page; half have neither.
+    Each menu gives its page with the most typed-in dishes, or its first
+    page when it has none, and one priced dish from that page when it has
+    prices. With num_menus, half the menus have a typed-in currency and
+    prices and half have neither; without it, every dated menu is kept.
 
     Args:
-        num_menus: The menus in the sample.
+        num_menus: The menus in the sample, or 0 for every dated menu.
         edge: The page images' longest side, in pixels.
         seed: The sample's random seed.
 
@@ -198,7 +208,9 @@ def prepare(num_menus: int, edge: int, seed: int) -> dict:
     densest: dict[str, dict] = {}
     for row in tables["pages"].to_pylist():
         best = densest.get(row["menu_id"])
-        if listed.get(row["id"], 0) > (listed.get(best["id"], 0) if best else 0):
+        key = (listed.get(row["id"], 0), -(row["page_number"] or 0))
+        if best is None or key > (listed.get(best["id"], 0),
+                                  -(best["page_number"] or 0)):
             densest[row["menu_id"]] = row
 
     def year(menu: dict) -> int | None:
@@ -214,37 +226,45 @@ def prepare(num_menus: int, edge: int, seed: int) -> dict:
                and not by_page.get(densest[menu]["id"])]
     chooser = random.Random(seed)
     chosen = (chooser.sample(typed, num_menus // 2)
-              + chooser.sample(untyped, num_menus - num_menus // 2))
+              + chooser.sample(untyped, num_menus - num_menus // 2)
+              if num_menus else candidates)
 
     def fetch(menu: str) -> dict:
         page = densest[menu]
         url = PAGE_URL.format(image_id=page["image_id"], edge=edge)
-        for attempt in range(4):
+        for attempt in range(FETCH_ATTEMPTS):
             try:
-                with urllib.request.urlopen(url, timeout=60) as response:
+                with urllib.request.urlopen(url, timeout=FETCH_TIMEOUT_S) as response:
                     found = response.read()
+                width, height = Image.open(io.BytesIO(found)).size
                 break
             except OSError:
-                time.sleep(2 ** attempt)
+                time.sleep(min(2 ** attempt, 8))
         else:
             return {}
-        picture = Image.open(io.BytesIO(found)).convert("RGB")
-        out = io.BytesIO()
-        picture.save(out, format="PNG")
         dish, price = (random.Random(f"{seed}/{menu}").choice(by_page[page["id"]])
                        if page["id"] in by_page else (None, None))
         return {"page_id": page["id"], "menu_id": menu,
                 "year": year(menus[menu]), "currency": menus[menu]["currency"],
-                "sponsor": menus[menu]["sponsor"], "image": out.getvalue(),
-                "dish": dish_names.get(dish) or "", "price": price}
+                "sponsor": menus[menu]["sponsor"], "event": menus[menu]["event"],
+                "place": menus[menu]["place"], "image": found, "width": width,
+                "height": height, "dish": dish_names.get(dish) or "",
+                "price": price}
 
-    with ThreadPoolExecutor(16) as pool:
+    started = time.perf_counter()
+    with ThreadPoolExecutor(FETCH_THREADS) as pool:
         rows = [row for row in pool.map(fetch, chosen) if row]
+    fetch_s = time.perf_counter() - started
     sample = pa.Table.from_pylist(rows)
-    path = f"{ROOT}/sample_{num_menus}_{edge}.parquet"
+    path = f"{ROOT}/{_sample_name(num_menus, edge)}"
     pq.write_table(sample, path)
     volumes[RESULTS].commit()
-    return {"tables": counts, "sample": sample.num_rows, "path": path}
+    return {"tables": counts, "menus": len(chosen), "sample": sample.num_rows,
+            "fetch_s": round(fetch_s), "path": path}
+
+
+def _sample_name(num_menus: int, edge: int) -> str:
+    return f"pages_{num_menus or 'all'}_{edge}.parquet"
 
 
 def _prompt_tokens(session, prompt: str) -> int:
@@ -254,9 +274,8 @@ def _prompt_tokens(session, prompt: str) -> int:
     return len(session.tokenizer(prefix + template + suffix))
 
 
-def _image_tokens(image: bytes) -> int:
-    width, height = png_size(image)
-    return 2 + (width // 32) * (height // 32)
+def _image_tokens(row: dict) -> int:
+    return 2 + (row["width"] // 32) * (row["height"] // 32)
 
 
 def _timed(session, sql: str):
@@ -319,16 +338,14 @@ def dish_queries(session, dishes) -> dict:
 
     found = {}
     for key, (pattern, question) in DISH_QUESTIONS.items():
-        checked = key in CHECKED_MATCHES
-        sql = DISH_SQL.format(
-            condition=f"d.name ILIKE '{pattern}' AND " if checked else "",
-            question=question.replace("'", "''"))
+        sql = DISH_SQL.format(condition=f"d.name ILIKE '{pattern}' AND ",
+                              question=question.replace("'", "''"))
         prompt = re.search(r"PROMPT\('((?:[^']|'')*)'", sql).group(1)
         table, query_s = _timed(session, sql)
         hits = {row["id"] for row in _rows(table)}
         needle = pattern.strip("%").lower()
         matched = {dish for dish, name in names.items() if needle in name.lower()}
-        asked = matched if checked else set(names)
+        asked = matched
         input_tokens = sum(len(session.tokenizer(names[dish])) for dish in asked) + (
             len(asked) * _prompt_tokens(session, prompt))
         alias = f"hits_{key}"
@@ -366,16 +383,20 @@ def page_queries(session, sample) -> dict:
         "parts": pa.array([[row["image"], f"\n\nDish: {row['dish']}".encode()]
                            for row in dollar_rows], pa.list_(pa.binary())),
     }), id_col="page_id"))
-    image_tokens = sum(_image_tokens(row["image"]) for row in rows)
+    image_tokens = sum(_image_tokens(row) for row in rows)
     by_page = {row["page_id"]: row for row in rows}
     found = {}
     for key, sql in PAGE_QUERIES.items():
         table, query_s = _timed(session, sql)
         answers = {row["page_id"]: row["answer"] for row in _rows(table)}
-        if key == "price":
+        if key == "most expensive dish":
+            instruction = re.search(r"AI.MAP\(s.image, '((?:[^']|'')*)'", sql).group(1)
+            input_tokens = image_tokens + len(rows) * _prompt_tokens(
+                session, instruction)
+        elif key == "price":
             instruction = re.search(r"AI.MAP\(s.parts, '((?:[^']|'')*)'", sql).group(1)
             input_tokens = sum(
-                _image_tokens(row["image"])
+                _image_tokens(row)
                 + len(session.tokenizer(f"\n\nDish: {row['dish']}"))
                 for row in dollar_rows) + len(dollar_rows) * _prompt_tokens(
                     session, instruction)
@@ -393,15 +414,14 @@ def page_queries(session, sample) -> dict:
             untyped = [answers.get(page) for page, row in by_page.items()
                        if not row["currency"]]
             record["untyped"] = {label: untyped.count(label) for label in CURRENCIES}
-        elif key == "vegetarian":
-            # the share of menus with a vegetarian main course, by decade
-            decades: dict[int, list[bool]] = {}
+        elif key in PAGE_QUESTIONS:
+            # the share of menus answering yes, by year
+            years: dict[int, list[bool]] = {}
             for page, row in by_page.items():
-                decades.setdefault(row["year"] // 10 * 10, []).append(
-                    bool(answers.get(page)))
-            record["decades"] = {decade: {"menus": len(found),
-                                          "share": round(sum(found) / len(found), 3)}
-                                 for decade, found in sorted(decades.items())}
+                years.setdefault(row["year"], []).append(bool(answers.get(page)))
+            record["years"] = {year: {"menus": len(said),
+                                      "share": round(sum(said) / len(said), 3)}
+                               for year, said in sorted(years.items())}
         elif key == "price":
             known = {page: row["price"] for page, row in by_page.items()
                      if row["currency"] == "Dollars"}
@@ -478,16 +498,16 @@ def run(sample_path: str, run_id: str) -> dict:
 
 
 @app.local_entrypoint()
-def prepare_data(num_menus: int = 2000, edge: int = 1024, seed: int = 0):
+def prepare_data(num_menus: int = 0, edge: int = 1024, seed: int = 0):
     call = prepare.spawn(num_menus, edge, seed)
     print(f"function call id: {call.object_id}", flush=True)
     print(json.dumps(call.get()), flush=True)
 
 
 @app.local_entrypoint()
-def main(num_menus: int = 2000, edge: int = 1024):
-    run_id = time.strftime("%Y%m%d-%H%M%S") + f"-{MODEL}-{num_menus}"
-    call = run.spawn(f"{ROOT}/sample_{num_menus}_{edge}.parquet", run_id)
+def main(num_menus: int = 0, edge: int = 1024):
+    run_id = time.strftime("%Y%m%d-%H%M%S") + f"-{MODEL}-{num_menus or 'all'}"
+    call = run.spawn(f"{ROOT}/{_sample_name(num_menus, edge)}", run_id)
     print(f"function call id: {call.object_id}", flush=True)
     record = call.get()
     print(f"saved to quail-results:/nypl_menus/runs/{run_id}/record.json", flush=True)
@@ -512,6 +532,6 @@ def summarize(record: dict) -> None:
         print(f"\npage {key}: {found['pages']} pages, {found['query_s']} s, "
               f"{found['input_tokens_per_second']:,} input tok/s, "
               f"${found['usd_per_query']}/query, {found.get('accuracy')}")
-        for name in ("untyped", "decades"):
+        for name in ("untyped",):
             if name in found:
                 print(f"  {name}: {found[name]}")
