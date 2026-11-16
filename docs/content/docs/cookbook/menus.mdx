@@ -2,26 +2,68 @@
 title: Reading history from old restaurant menus
 ---
 
-Between 1914 and 1949, the United States fought two world wars and banned
-alcohol for 14 years. Restaurant menus from the period recorded both: menus
-urged diners to buy war stamps, and drink lists vanished during Prohibition.
-We'll use Quail to find both events in 1,446 scanned menus, with one SQL
-query that runs in 34 seconds on one H100.
+Restaurant menus record history. Menus from 1914 to 1949 urged diners to
+buy war stamps during two world wars, and dropped their drink lists during
+Prohibition, the US ban on alcohol from 1920 to 1933. We use Quail to find
+both events in 1,446 scanned menus. One SQL query reads every menu in 34
+seconds on one H100.
 
 ## The dataset
 
 The New York Public Library's
 [What's on the menu?](https://www.nypl.org/research/support/whats-on-the-menu)
-project has scanned 17,547 restaurant menus, most of them from 1900 to 1960.
-Volunteers transcribed the dishes and prices on each menu into CSV files,
-but nothing else. A note about war stamps or a list of wines appears only in
-the scans, so we'll have the model read the scans.
+project has scanned 17,547 restaurant menus, most from 1900 to 1960.
+Volunteers transcribed each menu's dishes and prices into CSV files. The
+volunteers skipped everything else on the page, such as a note about war
+stamps or a list of wines. The model reads the rest from the scans.
+
+The menus range from hotel dining rooms to a banquet on an ocean liner.
+Click a menu to open the full scan:
+
+<div className="menu-gallery">
+  <figure>
+
+[![A bill of fare from Fraunces' Tavern, July 3, 1914](./menus/gallery-fraunces-1914.jpg)](https://iiif.nypl.org/iiif/2/4066748/full/!2400,2400/0/default.jpg)
+
+    <figcaption>Fraunces' Tavern, New York, July 1914</figcaption>
+  </figure>
+  <figure>
+
+[![A dinner menu from Healy's 42nd St. Grill, April 2, 1918](./menus/gallery-healys-1918-page.jpg)](https://iiif.nypl.org/iiif/2/4049267/full/!2400,2400/0/default.jpg)
+
+    <figcaption>Healy's 42nd St. Grill, New York, April 1918: "Buy war saving stamps"</figcaption>
+  </figure>
+  <figure>
+
+[![The cover of a dinner menu on board the R.M.S. Berengaria, November 22, 1926](./menus/gallery-berengaria-1926-cover.jpg)](https://iiif.nypl.org/iiif/2/4021318/full/!2400,2400/0/default.jpg)
+
+    <figcaption>R.M.S. Berengaria, November 1926: a dinner on board the Cunard liner</figcaption>
+  </figure>
+  <figure>
+
+[![The menu of the same dinner, ending with Canada Dry, White Rock, and Poland Water](./menus/gallery-berengaria-1926-menu.jpg)](https://iiif.nypl.org/iiif/2/4021321/full/!2400,2400/0/default.jpg)
+
+    <figcaption>The same dinner's menu: Canada Dry and White Rock, but no liquor</figcaption>
+  </figure>
+  <figure>
+
+[![A menu from the Commodore Hotel, May 17, 1933](./menus/gallery-commodore-1933-page.jpg)](https://iiif.nypl.org/iiif/2/4016351/full/!2400,2400/0/default.jpg)
+
+    <figcaption>The Commodore Hotel, New York, May 1933: "Beer per glass 10c"</figcaption>
+  </figure>
+  <figure>
+
+[![A menu from the Terrace Room at the Hotel New Yorker, December 7, 1945](./menus/gallery-terrace-room-1945.jpg)](https://iiif.nypl.org/iiif/2/3990440/full/!2400,2400/0/default.jpg)
+
+    <figcaption>The Hotel New Yorker, December 1945: a Victory Loan ad beside the cocktails</figcaption>
+  </figure>
+</div>
 
 ## Loading the tables
 
-First, we download the volunteers' CSV files and keep the menus from 1914 to
-1949. We also count the dishes transcribed on each page, which we'll use in
-a moment to pick one page from each menu.
+We start with the volunteers' CSV files. The code below downloads the files,
+keeps the menus from 1914 to 1949, and counts the dishes transcribed on each
+page.
 
 ```python
 import io
@@ -53,10 +95,9 @@ dishes = dict(zip(counts["menu_page_id"].to_pylist(), counts["id_count"].to_pyli
 
 ## Picking one page per menu
 
-Most menus have several pages, and the first page is often just a cover. So
-for each menu, we take the page with the most transcribed dishes. Some years
-have hundreds of menus and others only a few, so we also keep at most 60
-menus per year.
+Most menus have several pages, and the first page is often a cover. We take
+each menu's page with the most transcribed dishes. Some years have hundreds
+of menus and others have few, so we keep at most 60 menus per year.
 
 ```python
 best = {}
@@ -73,10 +114,9 @@ chosen = [page for found in by_year.values()
           for page in chooser.sample(found, min(60, len(found)))]
 ```
 
-Next, we fetch the page images. The library's image server resizes each
-scan on request, and we ask for 1,024 pixels on the long side. At 512 or 768
-pixels, the model misread more of the small print, and larger images cost
-more tokens.
+The library's image server resizes each scan on request. We ask for 1,024
+pixels on the long side. The model misread more small print at 512 or 768
+pixels, and larger images cost more tokens.
 
 ```python
 def fetch(page):
@@ -93,15 +133,15 @@ with ThreadPoolExecutor(64) as pool:
                if image]
 ```
 
-About 1 request in 9 times out, so we end up with 1,446 of the 1,637 pages.
-Here's the top of one of them, from the Commodore Hotel in May 1933:
+One request in 9 times out, so 1,446 of the 1,637 pages arrive. The image
+below shows the top of page `62899`, from the Commodore Hotel in May 1933:
 
 ![The top of a menu from the Commodore Hotel, May 17, 1933, with the line "Beer per glass 10c"](./menus/commodore-1933.jpg)
 
 ## Registering the tables
 
-Now we can hand the data to Quail. We register two tables: `menus`, with one
-row per menu, and `pages`, with the image we fetched for each menu.
+Quail reads two tables. `menus` holds one row per menu, and `pages` holds
+the image we fetched for each menu:
 
 | Table | Column | Type | Example |
 | --- | --- | --- | --- |
@@ -130,10 +170,10 @@ session.register("pages", quail.DocumentProvider.from_table(pages, id_col="id"))
 
 ## Asking the questions
 
-Let's ask our two questions: does a menu sell alcohol, and does it mention a
-war? `AI.IF` asks the model a yes-or-no question about each page image and
-returns `TRUE` or `FALSE`. We then count the yes answers per year with an
-ordinary `GROUP BY`:
+We ask each page two questions: does the menu sell alcohol, and does the
+menu mention a war? `AI.IF` asks the model a yes-or-no question about each
+image and returns `TRUE` or `FALSE`. An ordinary `GROUP BY` counts the yes
+answers per year:
 
 ```python
 QUERY = """
@@ -153,34 +193,35 @@ print(session.sql(QUERY).collect())
 session.close()
 ```
 
-Two details in the query are worth a closer look. First, the alcohol
-question says "to drink". Without the phrase, the model counted desserts
-made with port or kirsch as alcohol. Second, both questions read the same
-image, so Quail reads each image only once. The second `AI.IF` reuses the
-model's KV, its saved state for the image, from the first `AI.IF`, and pays
-only for the few tokens of its own question.
+The alcohol question says "to drink" on purpose. The model counted desserts
+made with port or kirsch as alcohol without the phrase.
+
+Quail reads each image only once, though both questions read the image. The
+second `AI.IF` reuses the KV, the model's saved state for the image, from
+the first `AI.IF`, and pays only for its own question.
 
 ## Results
 
 The query read 1,446 pages in 34 seconds on one H100 with
 `qwen3.5-4b-bf16`. The model read 2.1 million input tokens, and the query
-cost $0.04. It returns one row for each year with at least 20 menus:
+cost $0.04. The query returns one row for each year with at least 20 menus:
 
 <MenuHistoryTable />
 
-Plotting both shares by year makes the history easy to see. Hover over the
-chart to read a year's numbers, or click a legend entry to hide its line:
+The chart plots both shares by year. Hover over the chart to read a year's
+numbers, or click a legend entry to hide a line:
 
 <MenuHistoryChart />
 
 War mentions jump from almost none to 57% of menus in 1918, the final year
 of World War I, and rise again from 1943 to 1946. Alcohol drops from 36% of
-menus in 1914 to under 10% for most of Prohibition, then climbs back to 30%
-in 1933, the year beer became legal again. Maybe surprisingly, a few menus
-still listed drinks during the ban, and some of them came from foreign ocean
-liners such as the Cunard liner *Berengaria*.
+menus in 1914 to under 10% for most of Prohibition. Alcohol returns on 30%
+of menus in 1933, the year beer became legal again.
 
-Looking at the pages themselves, the war notes are easy to spot:
+Some menus still list drinks during the ban. The model got at least one of
+them wrong: the 1926 Berengaria menu in the gallery lists only mixers.
+
+The war notes stand out on the pages themselves:
 
 <div className="menu-scans">
   <figure>
@@ -199,8 +240,7 @@ Looking at the pages themselves, the war notes are easy to spot:
 
 ## A note on accuracy
 
-A 4-billion-parameter model handles broad questions like ours well, but it
-misreads small print. On 900 menus where volunteers had typed in prices, the
-model read a dish's price correctly only 67% of the time. A few misread
-pages barely move a share across many menus, but for any single detail,
-check the scan.
+A 4-billion-parameter model handles broad questions like ours well, but
+misreads small print. The model read a dish's price right on only 67% of
+900 menus with typed-in prices. A few misread pages barely move a share
+across many menus. Check the scan before you trust any single answer.

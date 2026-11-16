@@ -1180,3 +1180,52 @@ html > body[data-scroll-locked] {
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+.menu-gallery {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1rem;
+  margin: 1.5rem 0;
+}
+
+.menu-gallery figure {
+  margin: 0;
+}
+
+.menu-gallery a {
+  display: block;
+  overflow: hidden;
+  border: 1px solid var(--color-fd-border);
+  border-radius: 0.5rem;
+  background: var(--color-fd-muted);
+}
+
+.menu-gallery img {
+  display: block;
+  width: 100%;
+  height: 16rem;
+  margin: 0;
+  object-fit: contain;
+  transition: transform 150ms;
+}
+
+.menu-gallery a:hover img {
+  transform: scale(1.03);
+}
+
+.menu-gallery figcaption {
+  margin-top: 0.5rem;
+  color: var(--color-fd-muted-foreground);
+  font-size: 0.8125rem;
+  line-height: 1.4;
+}
+
+@media (max-width: 639px) {
+  .menu-gallery {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .menu-gallery img {
+    height: 12rem;
+  }
+}
