@@ -624,3 +624,103 @@ html > body[data-scroll-locked] {
     text-align: center;
   }
 }
+
+.quail-hero {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  margin-bottom: 2.5rem;
+  padding-bottom: 2rem;
+  border-bottom: 1px solid var(--color-fd-border);
+}
+
+.quail-hero img {
+  border-radius: 1.25rem;
+  box-shadow: 0 8px 24px color-mix(in srgb, var(--color-fd-primary) 22%, transparent);
+}
+
+.quail-hero-lab {
+  margin: 1.5rem 0 0;
+  color: var(--color-fd-muted-foreground);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.quail-hero-lab a {
+  color: var(--color-fd-primary);
+}
+
+.quail-hero-lab a:hover {
+  text-decoration: underline;
+}
+
+.quail-hero-title {
+  margin: 0.25rem 0 0;
+  color: var(--color-fd-foreground);
+  font-size: 3.25rem;
+  font-weight: 600;
+  line-height: 1.1;
+  letter-spacing: -0.05em;
+}
+
+.quail-hero-tagline {
+  margin: 0.5rem 0 0;
+  color: var(--color-fd-muted-foreground);
+  font-size: 1.25rem;
+}
+
+.quail-hero-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 1.75rem;
+}
+
+.quail-hero-primary,
+.quail-hero-secondary {
+  padding: 0.5rem 1.125rem;
+  border: 1px solid var(--color-fd-primary);
+  border-radius: 0.5rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+}
+
+.quail-hero-primary {
+  background: var(--color-fd-primary);
+  color: var(--color-fd-primary-foreground);
+}
+
+.quail-hero-primary:hover {
+  filter: brightness(1.08);
+}
+
+.quail-hero-secondary {
+  border-color: var(--color-fd-border);
+  color: var(--color-fd-foreground);
+}
+
+.quail-hero-secondary:hover {
+  background: var(--color-fd-accent);
+}
+
+.quail-hero-install {
+  padding: 0.5rem 0.875rem;
+  border: 1px solid var(--color-fd-border);
+  border-radius: 0.5rem;
+  background: var(--color-fd-muted);
+  font-size: 0.8125rem;
+}
+
+.quail-hero-install::before {
+  content: '$ ';
+  color: var(--color-fd-muted-foreground);
+}
+
+@media (min-width: 640px) {
+  .quail-prose .quail-home-cards {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
