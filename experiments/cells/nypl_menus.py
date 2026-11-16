@@ -10,12 +10,13 @@ question:
    for vodka and caviar, and reads every dish name for a vegetarian main
    course, which no pattern finds;
 3. questions about the scanned pages: each menu's currency and language,
-   and a dish's price, read from the page image and checked against the
-   volunteers' price.
+   whether it offers a vegetarian main course, and a dish's price, read
+   from the page image; the price is checked against the volunteers'.
 
     uv run modal run --detach -m experiments.cells.nypl_menus::prepare_data \
       2>&1 | tee "$run_log"
-    uv run modal run --detach -m experiments.cells.nypl_menus 2>&1 | tee "$run_log"
+    uv run modal run --detach -m experiments.cells.nypl_menus::main \
+      2>&1 | tee "$run_log"
 
 prepare_data writes the tables and the page sample to the quail-results
 volume under /nypl_menus/; the run saves its record under
@@ -122,6 +123,10 @@ PAGE_QUERIES = {
     "language": (
         "SELECT s.page_id, AI.CLASSIFY(PROMPT('Which language are the dishes on "
         f"this menu written in? {{0}}', s.image), {LANGUAGES!r}) AS answer "
+        "FROM sample s"),
+    "vegetarian": (
+        "SELECT s.page_id, AI.IF(PROMPT('Does this menu offer a vegetarian main "
+        "course, with no meat, poultry, or fish? {0}', s.image)) AS answer "
         "FROM sample s"),
     "price": (
         "SELECT s.page_id, AI.MAP(s.parts, 'What does the menu charge for the "
@@ -388,6 +393,15 @@ def page_queries(session, sample) -> dict:
             untyped = [answers.get(page) for page, row in by_page.items()
                        if not row["currency"]]
             record["untyped"] = {label: untyped.count(label) for label in CURRENCIES}
+        elif key == "vegetarian":
+            # the share of menus with a vegetarian main course, by decade
+            decades: dict[int, list[bool]] = {}
+            for page, row in by_page.items():
+                decades.setdefault(row["year"] // 10 * 10, []).append(
+                    bool(answers.get(page)))
+            record["decades"] = {decade: {"menus": len(found),
+                                          "share": round(sum(found) / len(found), 3)}
+                                 for decade, found in sorted(decades.items())}
         elif key == "price":
             known = {page: row["price"] for page, row in by_page.items()
                      if row["currency"] == "Dollars"}
@@ -498,3 +512,6 @@ def summarize(record: dict) -> None:
         print(f"\npage {key}: {found['pages']} pages, {found['query_s']} s, "
               f"{found['input_tokens_per_second']:,} input tok/s, "
               f"${found['usd_per_query']}/query, {found.get('accuracy')}")
+        for name in ("untyped", "decades"):
+            if name in found:
+                print(f"  {name}: {found[name]}")
