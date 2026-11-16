@@ -229,3 +229,39 @@ async fn a_host_with_its_own_function_and_rule_runs_ai_functions_beside_them() -
     assert!(!rows.contains("r2"), "{rows}");
     Ok(())
 }
+
+/// Plans `query` on a thread with `stack_bytes` of stack, as Quail Server
+/// plans each query on a blocking thread.
+fn plan_on_a_thread(query: String, stack_bytes: usize) -> Result<()> {
+    std::thread::Builder::new()
+        .stack_size(stack_bytes)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+            runtime.block_on(async move {
+                let state = SessionStateBuilder::new().with_default_features().build();
+                let state = QuailExtension::new(Arc::new(KeepsFirstReview)).register(state)?;
+                let context = SessionContext::new_with_state(state);
+                context.register_table("reviews", Arc::new(reviews()?))?;
+                context.sql(&query).await?.create_physical_plan().await?;
+                Ok(())
+            })
+        })
+        .expect("a planning thread")
+        .join()
+        .expect("planning finishes")
+}
+
+#[test]
+fn a_query_with_two_hundred_ai_calls_plans_on_a_planning_thread() -> Result<()> {
+    let columns = (0..100)
+        .map(|i| {
+            format!(
+                "CASE WHEN AI.IF(PROMPT('Does the review mention point {i}? {{0}}', r.body)) \
+                 THEN AI.MAP(r.body, 'Quote point {i}.', 16) END AS c{i}"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!("SELECT r.id, {columns} FROM reviews r");
+    plan_on_a_thread(query, quail_datafusion::PLANNING_STACK_BYTES)
+}

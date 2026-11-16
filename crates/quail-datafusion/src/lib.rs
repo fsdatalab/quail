@@ -50,6 +50,11 @@ pub use functions::regexps::SnowflakeRegexpLike;
 pub use functions::{AI_FUNCTION_NAMES, is_ai_call, quail_functions};
 pub use quail_planner::constants::SPAN_SUFFIX;
 
+/// The stack size of a thread that plans a query: DataFusion's planner
+/// recurses through the plan, and a query with about 80 AI calls overflows
+/// Rust's default 2 MiB.
+pub const PLANNING_STACK_BYTES: usize = 64 << 20;
+
 /// Quail's own error as a DataFusion error a host can downcast.
 pub fn external(error: quail_planner::error::CompileError) -> datafusion::error::DataFusionError {
     datafusion::error::DataFusionError::External(Box::new(error))

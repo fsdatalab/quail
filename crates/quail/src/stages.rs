@@ -388,16 +388,18 @@ pub fn run_stages(
     // block: the stages run on a thread of their own
     let thread = {
         let staged = Arc::clone(&staged);
-        std::thread::spawn(move || {
-            let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(async move {
-                let runs = (0..staged.stages.len()).flat_map(|stage| {
-                    (0..staged.partitions()).map(move |partition| (stage, partition))
-                });
-                let runs = runs.map(|(stage, partition)| staged.run(stage, partition));
-                try_join_all(runs).await.map(|_| ()).map_err(failure)
-            })
-        })
+        std::thread::Builder::new()
+            .stack_size(quail_datafusion::PLANNING_STACK_BYTES)
+            .spawn(move || {
+                let runtime = crate::runtime()?;
+                runtime.block_on(async move {
+                    let runs = (0..staged.stages.len()).flat_map(|stage| {
+                        (0..staged.partitions()).map(move |partition| (stage, partition))
+                    });
+                    let runs = runs.map(|(stage, partition)| staged.run(stage, partition));
+                    try_join_all(runs).await.map(|_| ()).map_err(failure)
+                })
+            })?
     };
     thread
         .join()

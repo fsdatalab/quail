@@ -58,6 +58,19 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::executor::RegionCall;
+
+/// A multi-threaded tokio runtime whose threads, blocking ones included,
+/// have the stack a query's planning needs.
+///
+/// # Errors
+///
+/// The runtime cannot start.
+pub fn runtime() -> std::io::Result<Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(quail_datafusion::PLANNING_STACK_BYTES)
+        .build()
+}
 /// Quail's DataFusion extension: the AI functions, the optimizer rules,
 /// and model regions, for a program with its own DataFusion session.
 pub use quail_datafusion as extension;
@@ -146,7 +159,7 @@ impl Session {
         )?;
         Ok(Self {
             context,
-            runtime: Some(Runtime::new()?),
+            runtime: Some(runtime()?),
             runner: executor,
         })
     }
