@@ -13,38 +13,33 @@ lists the supported values.
 
 ## Register tables
 
-Register each data source before you use it in SQL. `DocumentProvider`
-connects Quail to the supported sources:
+Register each table before you use it in SQL. `session.register` takes a
+PyArrow table, dataset, or record batch reader:
 
-| Method | Source |
-| --- | --- |
-| `DocumentProvider.from_table(table, id_col)` | In-memory [PyArrow table](https://arrow.apache.org/docs/python/generated/pyarrow.Table.html) |
-| `DocumentProvider.from_parquet(path, id_col)` | Parquet file or directory |
-| `DocumentProvider.from_ipc(path, id_col)` | Arrow IPC file |
-| `DocumentProvider.from_dataset(dataset, id_col)` | [PyArrow dataset](https://arrow.apache.org/docs/python/dataset.html) |
-| `DocumentProvider.from_hf(dataset, id_col)` | Hugging Face repository name; optional `split`, `config`, and `revision` |
+```python
+session.register("reviews", reviews, id_col="id")
+```
 
-Each method returns a `TableProvider`. A table provider supplies table
-columns and rows to Quail. `session.register(name, provider)` makes the
-provider available in SQL under `name`.
+`id_col` names the column that identifies each row. Quail numbers the rows
+when you leave out `id_col`.
 
-Each table provider needs an `id_col`. The `id_col` value names the column
-used to identify each row. Implement `quail.TableProvider` to read another
-data source.
+To register files, give their path:
 
-`session.register` also takes a PyArrow table, dataset, or reader, and a
-table from another DataFusion library, such as a Delta Lake or Iceberg
-table. Pass `id_col` to name its id column; without one, Quail numbers the
-rows. To register files that DataFusion reads, call
-`session.register_parquet(name, path)`, `register_json`, or `register_csv`.
+```python
+session.register_parquet("reviews", "data/reviews/")
+```
 
-DataFusion reads each table in Rust. It holds an in-memory table without a
-copy, and reads the local files of `from_parquet` and `from_ipc` in
-parallel. It streams the batches of any other provider, and asks only for
-the columns a query reads.
+`register_json` reads newline-delimited JSON, and `register_csv` reads CSV
+files whose first line names the columns. To give Parquet files an id
+column, register `quail.DocumentProvider.from_parquet(path, id_col)`.
 
-A table or setting that SQL creates, such as with `CREATE VIEW` or `SET`,
-lasts for the session.
+`session.register` also takes a table from another library built on Apache
+DataFusion, such as a Delta Lake or Iceberg table, and a
+`quail.TableProvider`, a class you write to read any other source.
+`DocumentProvider.from_hf(dataset, id_col)` reads a Hugging Face dataset.
+
+A table that SQL creates, such as with `CREATE VIEW`, stays until the
+session closes.
 
 ## Run a query
 
@@ -61,8 +56,7 @@ reviews = pa.table({
 })
 config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
 with quail.Session(config=config) as session:
-    provider = quail.DocumentProvider.from_table(reviews, id_col="id")
-    session.register("reviews", provider)
+    session.register("reviews", reviews, id_col="id")
     query = session.sql("""
         SELECT r.id
         FROM reviews r
