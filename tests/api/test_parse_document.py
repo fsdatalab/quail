@@ -13,6 +13,7 @@ from helpers.sessions import CONFIG, TOKENIZER
 from helpers.transcript import Transcripts, assert_transcript
 
 import quail
+from quail.api.context import SessionContext
 
 FILES = pa.table({
     "id": ["f1", "f2", "f3"],
@@ -155,7 +156,7 @@ def context():
     with quail.Session(CONFIG, tokenizer=TOKENIZER) as session:
         oracle = Oracle()
         oracle.catalog = session.catalog
-        context = quail.SessionContext(
+        context = SessionContext(
             session, physical_executor=oracle_executor(oracle))
         context.register(
             "files", quail.DocumentProvider.from_table(FILES, id_col="id"))

@@ -8,6 +8,7 @@ from helpers.sessions import CONFIG, TOKENIZER
 from test_session_context import ASPECTS, REVIEWS, _same_rows
 
 import quail
+from quail.api.context import SessionContext
 from quail.api.engine import Engine, engine_description
 
 QUERIES = [
@@ -46,7 +47,7 @@ def test_rust_runs_each_region_on_workers_and_returns_the_engines_rows():
                 args=(_oracle(), str(workers.paths[0]),
                       engine_description(Engine(session)))).start()
             workers.connect()
-            context = quail.SessionContext(session, workers=workers)
+            context = SessionContext(session, workers=workers)
             found = context.sql(text)
         assert _same_rows(found, expected, ordered=False), text
         assert found.num_rows > 0, text
@@ -56,7 +57,7 @@ def test_rust_explains_a_region_as_the_python_query_does():
     for text in QUERIES:
         with _session() as session:
             expected = session.sql(text).explain()
-            (found,) = quail.SessionContext(session)._native.explain_regions(text)
+            (found,) = SessionContext(session)._native.explain_regions(text)
         assert found == expected, text
 
 
@@ -69,7 +70,7 @@ def test_rust_explain_analyze_shows_measured_rows_beside_the_estimates():
             args=(_oracle(), str(workers.paths[0]),
                   engine_description(Engine(session)))).start()
         workers.connect()
-        context = quail.SessionContext(session, workers=workers)
+        context = SessionContext(session, workers=workers)
         table, (explained,) = context._native.explain_analyze(text)
     assert table.num_rows == 2
     lines = explained.splitlines()

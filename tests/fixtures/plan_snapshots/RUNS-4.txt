@@ -10,7 +10,8 @@ SortPreservingMergeExec: [test_steps@1 DESC NULLS LAST, trace_id@0 ASC NULLS LAS
                 ModelRegionExec: calls=[ai_filter], tables=[issue_messages@m]
                   CoalescePartitionsExec
                     FilterExec: role@1 = assistant, projection=[trace_id@0, content@2, id@3]
-                      DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
+                      RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+                        DataSourceExec: file_groups={1 group: [[<data>/issue_messages.parquet]]}, projection=[trace_id, role, content, id], file_type=parquet, predicate=role@3 = assistant, pruning_predicate=role_null_count@2 != row_count@3 AND role_min@0 <= assistant AND assistant <= role_max@1, required_guarantees=[role in (assistant)]
 
 model region:
 logical:
@@ -20,7 +21,7 @@ logical:
         TableScan: issue_messages@m
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
-  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
+  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 

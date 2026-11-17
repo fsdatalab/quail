@@ -240,20 +240,10 @@ impl FlightService for QuailService {
             "upload:{name}:{}",
             self.num_uploads.fetch_add(1, Ordering::Relaxed)
         );
-        let rows = Arc::new(batches);
-        let scanned = Arc::clone(&schema);
-        let scan: quail::Scan = Arc::new(move |columns: Vec<String>| {
-            let indices = columns
-                .iter()
-                .map(|column| scanned.index_of(column))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(rows
-                .iter()
-                .map(|batch| batch.project(&indices))
-                .collect::<Result<Vec<_>, _>>()?)
-        });
+        let table = datafusion::datasource::MemTable::try_new(schema, vec![batches])
+            .map_err(query_status)?;
         self.session
-            .register_scanned_table(&name, schema, scan, id_column.as_deref(), &identity)
+            .register_scanned_table(&name, Arc::new(table), id_column.as_deref(), &identity)
             .map_err(query_status)?;
         Ok(Response::new(
             stream::once(async { Ok(PutResult::default()) }).boxed(),

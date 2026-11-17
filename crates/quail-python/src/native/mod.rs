@@ -22,6 +22,179 @@ fn python_error(error: DataFusionError) -> PyErr {
     PyRuntimeError::new_err(error.to_string())
 }
 
+/// A DataFusion context without Quail, which holds a Python session's
+/// tables and settings for its whole life. Each query's
+/// `NativeSession` runs over it.
+#[pyclass(name = "DataFusionContext", module = "_quail_native")]
+struct DataFusionContext {
+    context: datafusion::prelude::SessionContext,
+    /// The context, which each FFI codec handed to a foreign table
+    /// refers to weakly.
+    tasks: std::sync::Arc<datafusion::prelude::SessionContext>,
+}
+
+#[pymethods]
+impl DataFusionContext {
+    /// A context that reads SQL as Quail's sessions read it.
+    #[new]
+    fn new() -> PyResult<Self> {
+        let state = quail_datafusion::base_state().map_err(python_error)?;
+        let context = datafusion::prelude::SessionContext::new_with_state(state);
+        Ok(Self {
+            tasks: std::sync::Arc::new(context.clone()),
+            context,
+        })
+    }
+
+    /// Register a table by its schema, given as the IPC stream bytes of
+    /// an empty table, and a function `scan(columns)` that returns
+    /// those columns' rows as an Arrow stream, such as a pyarrow
+    /// RecordBatchReader. `id_column` names the
+    /// column whose values are unique, and `identity` the rows.
+    #[pyo3(signature = (name, schema, scan, id_column=None, identity=""))]
+    fn register(
+        &self,
+        name: &str,
+        schema: &[u8],
+        scan: Py<PyAny>,
+        id_column: Option<&str>,
+        identity: &str,
+    ) -> PyResult<()> {
+        let reader = StreamReader::try_new(Cursor::new(schema), None)
+            .map_err(|error| python_error(error.into()))?;
+        crate::register_python_table(
+            &self.context,
+            name,
+            reader.schema(),
+            scan,
+            id_column,
+            identity,
+        )
+        .map_err(python_error)
+    }
+
+    /// Register the rows of `data`, a Python object with an Arrow
+    /// stream such as a pyarrow Table, without copying them.
+    /// `id_column` and `identity` are as [`Self::register`] has them.
+    #[pyo3(signature = (name, data, id_column=None, identity=""))]
+    fn register_batches(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        data: &Bound<'_, PyAny>,
+        id_column: Option<&str>,
+        identity: &str,
+    ) -> PyResult<()> {
+        let reader = crate::pyarrow::stream_from_pyarrow(data)?;
+        let schema = datafusion::arrow::record_batch::RecordBatchReader::schema(&reader);
+        let batches = reader
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| python_error(error.into()))?;
+        py.detach(|| {
+            crate::register_batches(&self.context, name, schema, batches, id_column, identity)
+        })
+        .map_err(python_error)
+    }
+
+    /// Register local files of one `format` ("parquet", "arrow",
+    /// "json", or "csv"), read by DataFusion in the order of `paths`.
+    /// `schema` is the IPC stream bytes of an empty table; `id_column`
+    /// and `identity` are as [`Self::register`] has them.
+    #[pyo3(signature = (name, format, paths, schema, id_column=None, identity=""))]
+    #[allow(clippy::too_many_arguments)]
+    fn register_files(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        format: &str,
+        paths: Vec<String>,
+        schema: &[u8],
+        id_column: Option<&str>,
+        identity: &str,
+    ) -> PyResult<()> {
+        let reader = StreamReader::try_new(Cursor::new(schema), None)
+            .map_err(|error| python_error(error.into()))?;
+        let schema = reader.schema();
+        py.detach(|| {
+            crate::register_files(
+                &self.context,
+                name,
+                format,
+                &paths,
+                schema,
+                id_column,
+                identity,
+            )
+        })
+        .map_err(python_error)
+    }
+
+    /// Register `table`, a Python object with
+    /// `__datafusion_table_provider__`, such as a datafusion-python
+    /// table, read through DataFusion's FFI.
+    fn register_foreign(
+        slf: &Bound<'_, Self>,
+        name: &str,
+        table: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        use datafusion_ffi::table_provider::FFI_TableProvider;
+
+        let method = table.getattr("__datafusion_table_provider__")?;
+        // datafusion-python 52 and later pass a session that holds a codec
+        let capsule = match method.call1((slf,)) {
+            Ok(capsule) => capsule,
+            Err(error) if error.is_instance_of::<pyo3::exceptions::PyTypeError>(slf.py()) => {
+                method.call0()?
+            }
+            Err(error) => return Err(error),
+        };
+        let capsule = capsule.cast::<pyo3::types::PyCapsule>()?;
+        let pointer = capsule.pointer_checked(Some(c"datafusion_table_provider"))?;
+        // the capsule owns the provider; the table takes a clone
+        let provider = unsafe { &*pointer.as_ptr().cast::<FFI_TableProvider>() };
+        let (theirs, ours) = (unsafe { (provider.version)() }, datafusion_ffi::version());
+        if theirs != ours {
+            return Err(PyValueError::new_err(format!(
+                "table {name:?} was built with DataFusion {theirs}, and Quail uses \
+                 DataFusion {ours}; install a version of its library built with \
+                 DataFusion {ours}"
+            )));
+        }
+        let table: std::sync::Arc<dyn datafusion::catalog::TableProvider> = provider.into();
+        quail::register_table(&slf.borrow().context, name, table).map_err(python_error)
+    }
+
+    /// Every row of the table `name`, as a pyarrow Table.
+    fn read<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyAny>> {
+        let (schema, batches) = py
+            .detach(|| {
+                let runtime = quail::runtime()?;
+                runtime.block_on(async {
+                    let frame = self.context.table(name).await?;
+                    let schema = std::sync::Arc::new(frame.schema().as_arrow().clone());
+                    Ok::<_, DataFusionError>((schema, frame.collect().await?))
+                })
+            })
+            .map_err(python_error)?;
+        to_pyarrow(py, schema, batches)
+    }
+
+    /// The logical extension codec a foreign table encodes expressions
+    /// with, as a PyCapsule, which datafusion-python's protocol asks for.
+    fn __datafusion_logical_extension_codec__<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyCapsule>> {
+        let tasks: std::sync::Arc<dyn datafusion::execution::TaskContextProvider> =
+            self.tasks.clone();
+        let codec =
+            datafusion_ffi::proto::logical_extension_codec::FFI_LogicalExtensionCodec::new_default(
+                &tasks,
+            );
+        pyo3::types::PyCapsule::new_with_value(py, codec, c"datafusion_logical_extension_codec")
+    }
+}
+
 /// Quail's Rust `Session`: DataFusion with Quail's AI functions, whose
 /// model regions run on a Python engine.
 #[pyclass(name = "NativeSession", module = "_quail_native")]
@@ -34,11 +207,16 @@ impl NativeSession {
     /// Create a session whose model regions run on `engine`, planned by
     /// `planner` when given, as `crate::session_with_planner` describes.
     #[new]
-    #[pyo3(signature = (engine, planner=None))]
-    fn new(engine: Py<PyAny>, planner: Option<PyRef<'_, NativePlanner>>) -> PyResult<Self> {
+    #[pyo3(signature = (engine, planner=None, base=None))]
+    fn new(
+        engine: Py<PyAny>,
+        planner: Option<PyRef<'_, NativePlanner>>,
+        base: Option<PyRef<'_, DataFusionContext>>,
+    ) -> PyResult<Self> {
         let planner = planner.map(|found| std::sync::Arc::clone(&found.planner));
+        let base = base.map(|found| found.context.clone());
         Ok(Self {
-            session: crate::session_with_planner(engine, planner).map_err(python_error)?,
+            session: crate::session_with_planner(engine, planner, base).map_err(python_error)?,
         })
     }
 
@@ -47,21 +225,30 @@ impl NativeSession {
     /// a region. `description` is what a worker describes of the
     /// session's configuration, as JSON.
     #[staticmethod]
-    #[pyo3(signature = (workers, description, planner=None))]
+    #[pyo3(signature = (workers, description, planner=None, base=None))]
     fn on_workers(
         py: Python<'_>,
         workers: &workers::Workers,
         description: &str,
         planner: Option<PyRef<'_, NativePlanner>>,
+        base: Option<PyRef<'_, DataFusionContext>>,
     ) -> PyResult<Self> {
+        let base = base.map(|found| found.context.clone());
         // the session's planner keeps the tables it tokenized
         let planner = planner.map(|found| std::sync::Arc::clone(&found.planner));
         let workers = workers.shared()?;
         let description: serde_json::Value = from_json(description)?;
         let session = py
             .detach(|| {
-                let executor = crate::Executor::described(workers, &description, planner)?;
-                crate::Session::with_executor(std::sync::Arc::new(executor))
+                let executor = std::sync::Arc::new(crate::Executor::described(
+                    workers,
+                    &description,
+                    planner,
+                )?);
+                match base {
+                    Some(base) => crate::Session::with_executor_on(executor, base),
+                    None => crate::Session::with_executor(executor),
+                }
             })
             .map_err(python_error)?;
         Ok(Self { session })
@@ -169,32 +356,6 @@ impl NativeSession {
             )?);
         }
         Ok(regions)
-    }
-
-    /// Register a table by its schema, given as the IPC stream bytes of
-    /// an empty table, and a function `scan(columns)` that returns
-    /// those columns' rows as a pyarrow Table. `id_column` names the
-    /// column whose values are unique, and `identity` the rows.
-    #[pyo3(signature = (name, schema, scan, id_column=None, identity=""))]
-    fn register(
-        &self,
-        name: &str,
-        schema: &[u8],
-        scan: Py<PyAny>,
-        id_column: Option<&str>,
-        identity: &str,
-    ) -> PyResult<()> {
-        let reader = StreamReader::try_new(Cursor::new(schema), None)
-            .map_err(|error| python_error(error.into()))?;
-        crate::register_python_table(
-            &self.session,
-            name,
-            reader.schema(),
-            scan,
-            id_column,
-            identity,
-        )
-        .map_err(python_error)
     }
 
     /// Run a query, read in `dialect` ("Snowflake" by default), and
@@ -1233,6 +1394,7 @@ pub fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
         quail_planner::physical_rules::PHYSICAL_RULES.to_vec(),
     )?;
     module.add_class::<NativeSession>()?;
+    module.add_class::<DataFusionContext>()?;
     module.add_class::<Tokenizer>()?;
     module.add_class::<PrefixIndex>()?;
     module.add_class::<NativePlanner>()?;

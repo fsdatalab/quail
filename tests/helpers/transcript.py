@@ -33,6 +33,7 @@ import pyarrow as pa
 import quail
 from helpers.oracle import Oracle, oracle_executor
 from helpers.sessions import CONFIG, TOKENIZER
+from quail.api.context import SessionContext
 from quail.builtins import LOGICAL_RULES, PHYSICAL_RULES, built_in_registry
 
 # Quail's logical rewrites, and the executor's ways to ask fewer rows
@@ -186,7 +187,7 @@ class Transcripts:
         oracle.catalog = session.catalog
         if self._written:
             oracle._written = self._stopped
-        context = quail.SessionContext(
+        context = SessionContext(
             session, physical_executor=oracle_executor(oracle))
         self._oracles[id(context)] = oracle
         for name, (table, id_column) in tables.items():

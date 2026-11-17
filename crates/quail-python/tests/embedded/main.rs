@@ -5,6 +5,7 @@
 use quail_dylib as _;
 
 mod caller_routing;
+mod foreign_table;
 mod optional_attributes;
 mod session;
 

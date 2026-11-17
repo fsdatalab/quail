@@ -133,6 +133,14 @@ def test_a_session_with_an_endpoint_uploads_its_tables_and_runs_its_queries(
             failed.result(wait_s=0.05)
 
 
+def test_a_session_with_an_endpoint_uploads_a_table_without_an_id_column(tmp_path):
+    with serving(tmp_path) as client, quail.Session(
+            CONFIG, endpoint=client.endpoint) as session:
+        session.register("notes", REVIEWS)
+        query = session.sql(QUERY.replace("reviews", "notes"))
+        assert query.collect().to_pydict() == {"r.id": ["r0", "r2", "r4"]}
+
+
 def test_a_session_uploads_a_batch_larger_than_grpcs_default_message_limit(
         tmp_path):
     long = pa.table({"id": ["n0", "n1"], "body": ["long " * 1_200_000, "short"]})

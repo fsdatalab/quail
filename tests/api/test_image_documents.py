@@ -17,6 +17,7 @@ from PIL import Image as PILImage
 
 import quail
 from quail.api.config import EngineConfig
+from quail.api.context import SessionContext
 
 VISION = EngineConfig(model="qwen3.5-4b-fp8", device="h100-sxm")
 # p1 and p3 hold the same image
@@ -77,7 +78,7 @@ def _context(config, table):
     session = quail.Session(config, tokenizer=TOKENIZER)
     oracle = Oracle()
     oracle.catalog = session.catalog
-    context = quail.SessionContext(session, physical_executor=oracle_executor(oracle))
+    context = SessionContext(session, physical_executor=oracle_executor(oracle))
     context.register("pages", quail.DocumentProvider.from_table(table, id_col="id"))
     return session, context
 

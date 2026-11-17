@@ -12,6 +12,7 @@ from helpers.oracle import Oracle, oracle_executor
 from helpers.sessions import CONFIG, TOKENIZER
 
 import quail
+from quail.api.context import SessionContext
 from quail.builtins import LOGICAL_RULES, PHYSICAL_RULES, built_in_registry
 
 pytest.importorskip("_quail_native")
@@ -33,7 +34,7 @@ def _context(seed, optimized):
     session = quail.Session(CONFIG, tokenizer=TOKENIZER, registry=registry)
     oracle = Oracle(truth=truth)
     oracle.catalog = session.catalog
-    context = quail.SessionContext(
+    context = SessionContext(
         session, physical_executor=oracle_executor(oracle))
     for name, table in tables(seed).items():
         context.register(name, quail.DocumentProvider.from_table(table, id_col="id"))

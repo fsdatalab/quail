@@ -3,7 +3,8 @@ CooperativeExec
   ModelRegionExec: calls=[ai_filter], tables=[agent_traces@t]
     CoalescePartitionsExec
       FilterExec: turn_index@2 >= 10 AND token_count@3 <= 6000, projection=[id@0, trace@1]
-        DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
+        RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+          DataSourceExec: file_groups={1 group: [[<data>/agent_traces.parquet]]}, projection=[id, trace, turn_index, token_count], file_type=parquet, predicate=turn_index@3 >= 10 AND token_count@4 <= 6000, pruning_predicate=turn_index_null_count@1 != row_count@2 AND turn_index_max@0 >= 10 AND token_count_null_count@4 != row_count@2 AND token_count_min@3 <= 6000, required_guarantees=[]
 
 model region:
 logical:
@@ -13,7 +14,7 @@ logical:
         TableScan: agent_traces@t
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
-  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
+  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 

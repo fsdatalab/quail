@@ -8,6 +8,7 @@ from helpers.inputs import CountingProvider, RecordingRegions, snapshot_inputs
 from helpers.sessions import CONFIG, TOKENIZER, encoder
 
 import quail
+from quail.api.context import SessionContext
 
 REVIEWS = pa.table({
     # Put unused columns before required ones to exercise projected hint indices.
@@ -23,7 +24,7 @@ REVIEWS = pa.table({
 def input_context():
     session = quail.Session(CONFIG, tokenizer=TOKENIZER)
     recorder = RecordingRegions()
-    context = quail.SessionContext(session, run_query=recorder)
+    context = SessionContext(session, run_query=recorder)
     provider = CountingProvider(quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
     context.register("reviews", provider)
     try:
@@ -42,13 +43,13 @@ def test_custom_engine_inspection_does_not_materialize_named_tables():
 
     engine = SimpleNamespace(turn=tuple(QWEN3_4B_FP8.turn),
                              layout=QWEN3_4B_FP8.prompt_layout, rules=None)
-    context = _quail_native.NativeSession(engine)
-
     def forbidden(_columns):
         pytest.fail("inspection without a native planner read a named table")
 
-    context.register("reviews", ipc_bytes(REVIEWS.schema.empty_table()),
-                     forbidden, "id", "reviews")
+    tables = _quail_native.DataFusionContext()
+    tables.register("reviews", ipc_bytes(REVIEWS.schema.empty_table()),
+                    forbidden, "id", "reviews")
+    context = _quail_native.NativeSession(engine, base=tables)
     (_, planned), = context.plans(document_query("r.body"))
     assert planned is None
 

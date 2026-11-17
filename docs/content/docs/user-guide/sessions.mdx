@@ -13,24 +13,38 @@ lists the supported values.
 
 ## Register tables
 
-Register each data source before you use it in SQL. `DocumentProvider`
-connects Quail to the supported sources:
+Register each table before you use it in SQL. `session.register` takes a
+PyArrow table, dataset, or record batch reader:
 
-| Method | Source |
-| --- | --- |
-| `DocumentProvider.from_table(table, id_col)` | In-memory [PyArrow table](https://arrow.apache.org/docs/python/generated/pyarrow.Table.html) |
-| `DocumentProvider.from_parquet(path, id_col)` | Parquet file or directory |
-| `DocumentProvider.from_ipc(path, id_col)` | Arrow IPC file |
-| `DocumentProvider.from_dataset(dataset, id_col)` | [PyArrow dataset](https://arrow.apache.org/docs/python/dataset.html) |
-| `DocumentProvider.from_hf(dataset, id_col)` | Hugging Face repository name; optional `split`, `config`, and `revision` |
+```python
+session.register("reviews", reviews, id_col="id")
+```
 
-Each method returns a `TableProvider`. A table provider supplies table
-columns and rows to Quail. `session.register(name, provider)` makes the
-provider available in SQL under `name`.
+`id_col` names the column that identifies each row. Quail numbers the rows
+when you leave out `id_col`.
 
-Each table provider needs an `id_col`. The `id_col` value names the column
-used to identify each row. Implement `quail.TableProvider` to read another
-data source.
+To register files, give their path:
+
+```python
+session.register_parquet("reviews", "data/reviews/", id_col="id")
+```
+
+`register_json` reads newline-delimited JSON, and `register_csv` reads CSV
+files whose first line names the columns.
+
+`session.register` also takes a table from another library built on Apache
+DataFusion, such as a Delta Lake or Iceberg table, and a
+`quail.TableProvider`, a class you write to read any other source.
+`DocumentProvider.from_hf(dataset, id_col)` reads a Hugging Face dataset.
+
+SQL can also create a table. The table stays until the session closes, so
+a later query can read it:
+
+```python
+session.sql("CREATE VIEW long_reviews AS "
+            "SELECT * FROM reviews WHERE length(body) > 500").run()
+session.sql("SELECT COUNT(*) FROM long_reviews").run()
+```
 
 ## Run a query
 
@@ -47,8 +61,7 @@ reviews = pa.table({
 })
 config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
 with quail.Session(config=config) as session:
-    provider = quail.DocumentProvider.from_table(reviews, id_col="id")
-    session.register("reviews", provider)
+    session.register("reviews", reviews, id_col="id")
     query = session.sql("""
         SELECT r.id
         FROM reviews r

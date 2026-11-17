@@ -101,14 +101,24 @@ pub fn session_state_with_rules(
     runner: Arc<dyn RegionRunner>,
     rules: Vec<String>,
 ) -> Result<SessionState> {
-    let config = SessionConfig::from_env()?.set_str("datafusion.sql_parser.dialect", "Snowflake");
-    let state = SessionStateBuilder::new()
-        .with_config(config)
-        .with_default_features()
-        .build();
     QuailExtension::new(runner)
         .with_logical_rules(rules)?
-        .register(state)
+        .register(base_state()?)
+}
+
+/// Build a DataFusion session state without Quail, configured as
+/// [`session_state`] configures it: SQL in the Snowflake dialect, and
+/// DataFusion's `DATAFUSION_*` environment variables.
+///
+/// # Errors
+///
+/// An environment variable holds a value its option does not take.
+pub fn base_state() -> Result<SessionState> {
+    let config = SessionConfig::from_env()?.set_str("datafusion.sql_parser.dialect", "Snowflake");
+    Ok(SessionStateBuilder::new()
+        .with_config(config)
+        .with_default_features()
+        .build())
 }
 
 /// Build a DataFusion session context with Quail registered.

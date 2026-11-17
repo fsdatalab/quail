@@ -5,12 +5,29 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::catalog::TableProvider;
 use datafusion::common::{DataFusionError, Result};
+use datafusion::datasource::file_format::FileFormat;
+use datafusion::datasource::file_format::arrow::ArrowFormat;
+use datafusion::datasource::file_format::csv::CsvFormat;
+use datafusion::datasource::file_format::json::JsonFormat;
+use datafusion::datasource::file_format::parquet::ParquetFormat;
+use datafusion::datasource::listing::{
+    ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+};
+use datafusion::datasource::{MemTable, TableType};
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::logical_expr::Expr;
+use datafusion::physical_expr::LexOrdering;
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
+use datafusion::prelude::SessionContext;
 use pyo3::exceptions::{PyAttributeError, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::IntoPyDict;
 use quail::planning::{Planner, ScanInputs, Settings};
-use quail::{EngineRegion, Executor, RegionEngine, Session};
+use quail::{EngineRegion, Executor, RegionEngine};
 
 use crate::pyarrow::{from_pyarrow, stream_from_pyarrow, to_pyarrow};
 use crate::python_failure;
@@ -241,27 +258,162 @@ pub fn scans_to_pyarrow<'py>(
 }
 
 /// Register a table whose rows the Python function `scan(columns)`
-/// returns as a pyarrow Table, the same rows whenever it is scanned,
-/// which `identity` names. `id_column` names the column whose values
-/// are unique.
+/// returns as an Arrow stream, such as a pyarrow RecordBatchReader, the
+/// same rows whenever it is scanned, which `identity` names.
+/// `id_column` names the column whose values are unique.
+///
+/// DataFusion reads the stream batch by batch, and asks only for the
+/// columns a query reads.
 ///
 /// # Errors
 ///
 /// DataFusion refuses the name.
 pub fn register_python_table(
-    session: &Session,
+    context: &SessionContext,
     name: &str,
     schema: SchemaRef,
     scan: Py<PyAny>,
     id_column: Option<&str>,
     identity: &str,
 ) -> Result<()> {
-    let rows = move |columns: Vec<String>| {
-        Python::attach(|py| {
-            let answer = scan.call1(py, (columns,))?;
-            from_pyarrow(answer.bind(py))
-        })
-        .map_err(python_failure)
+    let table = PythonTable {
+        schema,
+        scan: Arc::new(scan),
     };
-    session.register_scanned_table(name, schema, Arc::new(rows), id_column, identity)
+    quail::register_scanned_table(context, name, Arc::new(table), id_column, identity)
+}
+
+/// A table whose rows a Python function streams.
+#[derive(Debug)]
+struct PythonTable {
+    schema: SchemaRef,
+    scan: Arc<Py<PyAny>>,
+}
+
+#[async_trait::async_trait]
+impl TableProvider for PythonTable {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn datafusion::catalog::Session,
+        projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let schema = match projection {
+            Some(indices) => Arc::new(self.schema.project(indices)?),
+            None => Arc::clone(&self.schema),
+        };
+        let partition = PythonScan {
+            schema: Arc::clone(&schema),
+            scan: Arc::clone(&self.scan),
+        };
+        Ok(Arc::new(StreamingTableExec::try_new(
+            schema,
+            vec![Arc::new(partition)],
+            None,
+            Vec::<LexOrdering>::new(),
+            false,
+            limit,
+        )?))
+    }
+}
+
+/// One scan of a [`PythonTable`]: the Python function's stream of the
+/// projected columns.
+#[derive(Debug)]
+struct PythonScan {
+    schema: SchemaRef,
+    scan: Arc<Py<PyAny>>,
+}
+
+impl PartitionStream for PythonScan {
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    fn execute(&self, _context: Arc<TaskContext>) -> SendableRecordBatchStream {
+        let columns: Vec<String> = self
+            .schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        let reader = Python::attach(|py| {
+            let answer = self.scan.call1(py, (columns,))?;
+            stream_from_pyarrow(answer.bind(py))
+        })
+        .map_err(python_failure);
+        // pyarrow takes the GIL itself when its stream calls Python
+        let batches: Box<dyn Iterator<Item = Result<RecordBatch>> + Send> = match reader {
+            Ok(reader) => Box::new(reader.map(|batch| batch.map_err(DataFusionError::from))),
+            Err(error) => Box::new(std::iter::once(Err(error))),
+        };
+        Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&self.schema),
+            futures::stream::iter(batches),
+        ))
+    }
+}
+
+/// Register the batches of a Python Arrow stream, such as a pyarrow
+/// Table's, without copying them. `id_column` and `identity` are as
+/// [`register_python_table`] has them.
+///
+/// # Errors
+///
+/// A batch does not read, or DataFusion refuses the name.
+pub fn register_batches(
+    context: &SessionContext,
+    name: &str,
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+    id_column: Option<&str>,
+    identity: &str,
+) -> Result<()> {
+    let table = MemTable::try_new(schema, vec![batches])?;
+    quail::register_scanned_table(context, name, Arc::new(table), id_column, identity)
+}
+
+/// Register local files of one `format` ("parquet", "arrow", "json", or
+/// "csv"), read in the order of `paths`, with `schema`. `id_column`
+/// and `identity` are as [`register_python_table`] has them.
+///
+/// # Errors
+///
+/// A path is not a URL DataFusion reads, the format is unknown, or
+/// DataFusion refuses the name.
+pub fn register_files(
+    context: &SessionContext,
+    name: &str,
+    format: &str,
+    paths: &[String],
+    schema: SchemaRef,
+    id_column: Option<&str>,
+    identity: &str,
+) -> Result<()> {
+    let format: Arc<dyn FileFormat> = match format {
+        "parquet" => Arc::new(ParquetFormat::default()),
+        "arrow" => Arc::new(ArrowFormat),
+        "json" => Arc::new(JsonFormat::default()),
+        "csv" => Arc::new(CsvFormat::default()),
+        other => return datafusion::common::plan_err!("Quail reads no file format {other:?}"),
+    };
+    let urls = paths
+        .iter()
+        .map(ListingTableUrl::parse)
+        .collect::<Result<Vec<_>>>()?;
+    let options = ListingOptions::new(format).with_file_extension("");
+    let config = ListingTableConfig::new_with_multi_paths(urls)
+        .with_listing_options(options)
+        .with_schema(schema);
+    let table = ListingTable::try_new(config)?;
+    quail::register_scanned_table(context, name, Arc::new(table), id_column, identity)
 }
