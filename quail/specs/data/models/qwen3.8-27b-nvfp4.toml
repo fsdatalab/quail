@@ -7,7 +7,8 @@ name = "qwen3.8-27b-nvfp4"
 hf_name = "nvidia/Qwen3.8-27B-NVFP4"
 revision = "9340e99f9c8a7f2c2d7df7b7e0dbd3af3fb6a038"
 mlp_weight_precision = "fp4"
-# an estimate, not a measurement: the FP8 spec's measured 29,638,887,936
-# bytes less 7,486,832,640 for its 17,112,760,320 MLP weights at 0.5625
-# bytes (a 4-bit value and one fp8 scale per 16) instead of 1
-w_mem_bytes = 22_152_055_296
+# the checkpoint's 20,150,569,096 bytes of text tensors, from its
+# safetensors headers, with the 715,161,608-byte NVFP4 lm_head replaced
+# by the 2,542,796,800-byte bf16 head Quail keeps; not yet measured on
+# a load
+w_mem_bytes = 21_978_204_288
