@@ -49,7 +49,7 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::TableProvider;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{Constraint, Constraints, DataFusionError, Result};
-use datafusion::logical_expr::LogicalPlan;
+use datafusion::logical_expr::{LogicalPlan, Statement};
 use datafusion::prelude::SessionContext;
 use quail_datafusion::{
     IdentifiedTable, InputRows, ModelRegion, RegionRunner, SharedInput, quail_schema,
@@ -118,6 +118,9 @@ impl EngineConfig {
 /// thread that called `sql`.
 pub struct Session {
     context: SessionContext,
+    /// The context whose catalog `context` shares, which keeps each
+    /// `SET` after the session drops; None when `context` is its own.
+    base: Option<SessionContext>,
     /// Taken when the session drops, to shut down without blocking.
     runtime: Option<Runtime>,
     runner: Arc<Executor>,
@@ -127,6 +130,69 @@ impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Session").finish_non_exhaustive()
     }
+}
+
+/// Register `table` under `name` in `context`.
+///
+/// # Errors
+///
+/// DataFusion refuses the name, or it has
+/// `quail_planner::operators::INPUT_SEPARATOR` in it.
+pub fn register_table(
+    context: &SessionContext,
+    name: &str,
+    table: Arc<dyn TableProvider>,
+) -> Result<()> {
+    let separator = quail_planner::operators::INPUT_SEPARATOR;
+    if name.contains(separator) {
+        return datafusion::common::plan_err!(
+            "table name {name:?} has {separator:?}, which Quail keeps for the \
+             inputs of model regions"
+        );
+    }
+    context.register_table(name, table)?;
+    Ok(())
+}
+
+/// Register `table` in `context`, whose rows are the same whenever it
+/// is scanned, which `identity` names. `id_column` names the column
+/// whose values are unique. Model regions read the table through the
+/// planner, which keeps its token counts under `identity`.
+///
+/// # Errors
+///
+/// DataFusion refuses the name.
+pub fn register_scanned_table(
+    context: &SessionContext,
+    name: &str,
+    table: Arc<dyn TableProvider>,
+    id_column: Option<&str>,
+    identity: &str,
+) -> Result<()> {
+    let schema = table.schema();
+    let keys: Vec<usize> = id_column
+        .and_then(|column| schema.index_of(column).ok())
+        .into_iter()
+        .collect();
+    let constraints = if keys.is_empty() {
+        Constraints::default()
+    } else {
+        Constraints::new_unverified(vec![Constraint::PrimaryKey(keys)])
+    };
+    // the context's configuration and object stores, without its
+    // catalog, which will hold the table
+    let state = context.state();
+    let state = datafusion::execution::SessionStateBuilder::new()
+        .with_config(state.config().clone())
+        .with_runtime_env(Arc::clone(state.runtime_env()))
+        .with_default_features()
+        .build();
+    let table = ScannedTable::new(table, state, constraints);
+    register_table(
+        context,
+        name,
+        Arc::new(IdentifiedTable::new(Arc::new(table), identity)),
+    )
 }
 
 impl Session {
@@ -159,6 +225,30 @@ impl Session {
         )?;
         Ok(Self {
             context,
+            base: None,
+            runtime: Some(runtime()?),
+            runner: executor,
+        })
+    }
+
+    /// A session that runs each model region on `executor`, over the
+    /// tables and settings of `base`, a context without Quail such as
+    /// [`quail_datafusion::base_state`] builds.
+    ///
+    /// The session shares `base`'s catalog, so a table one creates
+    /// stays in the other. A `SET` the session runs changes `base` too.
+    ///
+    /// # Errors
+    ///
+    /// A rule name is unknown.
+    pub fn with_executor_on(executor: Arc<Executor>, base: SessionContext) -> Result<Self> {
+        let state =
+            quail_datafusion::QuailExtension::new(Arc::clone(&executor) as Arc<dyn RegionRunner>)
+                .with_logical_rules(executor.rules.clone())?
+                .register(base.state())?;
+        Ok(Self {
+            context: SessionContext::new_with_state(state),
+            base: Some(base),
             runtime: Some(runtime()?),
             runner: executor,
         })
@@ -207,20 +297,10 @@ impl Session {
     /// DataFusion refuses the name, or it has
     /// `quail_planner::operators::INPUT_SEPARATOR` in it.
     pub fn register_table(&self, name: &str, table: Arc<dyn TableProvider>) -> Result<()> {
-        let separator = quail_planner::operators::INPUT_SEPARATOR;
-        if name.contains(separator) {
-            return datafusion::common::plan_err!(
-                "table name {name:?} has {separator:?}, which Quail keeps for the \
-                 inputs of model regions"
-            );
-        }
-        self.context.register_table(name, table)?;
-        Ok(())
+        register_table(&self.context, name, table)
     }
 
-    /// Register `table`, whose rows are the same whenever it is
-    /// scanned, which `identity` names. `id_column` names the column
-    /// whose values are unique.
+    /// Register `table` as [`register_scanned_table`] does.
     ///
     /// # Errors
     ///
@@ -232,29 +312,7 @@ impl Session {
         id_column: Option<&str>,
         identity: &str,
     ) -> Result<()> {
-        let schema = table.schema();
-        let keys: Vec<usize> = id_column
-            .and_then(|column| schema.index_of(column).ok())
-            .into_iter()
-            .collect();
-        let constraints = if keys.is_empty() {
-            Constraints::default()
-        } else {
-            Constraints::new_unverified(vec![Constraint::PrimaryKey(keys)])
-        };
-        // the context's configuration and object stores, without its
-        // catalog, which will hold the table
-        let state = self.context.state();
-        let state = datafusion::execution::SessionStateBuilder::new()
-            .with_config(state.config().clone())
-            .with_runtime_env(Arc::clone(state.runtime_env()))
-            .with_default_features()
-            .build();
-        let table = ScannedTable::new(table, state, constraints);
-        self.register_table(
-            name,
-            Arc::new(IdentifiedTable::new(Arc::new(table), identity)),
-        )
+        register_scanned_table(&self.context, name, table, id_column, identity)
     }
 
     /// Run a query and return its rows, with each column named as
@@ -287,7 +345,7 @@ impl Session {
         // so waiting callers do not occupy a runtime worker.
         let _caller = runner.enter(sender)?;
         self.runtime().block_on(async {
-            let context = self.context.clone();
+            let (context, base) = (self.context.clone(), self.base.clone());
             let (query, dialect) = (query.to_string(), dialect.map(str::to_string));
             // a worker runs the query, so the operators above a region
             // read its rows while this thread runs the region
@@ -297,7 +355,20 @@ impl Session {
                 let frame = match plan {
                     // SET, PREPARE, and related statements update this session,
                     // not a temporary copy of its state.
-                    LogicalPlan::Statement(_) => context.execute_logical_plan(plan).await?,
+                    LogicalPlan::Statement(statement) => {
+                        if let Some(base) = &base
+                            && matches!(
+                                statement,
+                                Statement::SetVariable(_) | Statement::ResetVariable(_)
+                            )
+                        {
+                            base.execute_logical_plan(LogicalPlan::Statement(statement.clone()))
+                                .await?;
+                        }
+                        context
+                            .execute_logical_plan(LogicalPlan::Statement(statement))
+                            .await?
+                    }
                     // DDL needs DataFusion's execution dispatcher: collecting a
                     // DataFrame containing CreateMemoryTable does not create it.
                     // The per-query state preserves dialect settings and shares

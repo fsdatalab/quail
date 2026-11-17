@@ -34,6 +34,8 @@ dev = [
     "modal[api-proxy-support]==1.5.4",
     # uploads a finished labeling pass to the public bucket
     "boto3==1.43.89",
+    # a datafusion-python table, which Session.register reads through FFI
+    "datafusion==55.0.0",
     "matplotlib==3.11.1",
     "pytest==9.1.1",
     # the quail-b benchmark; bench/ is its runner for Quail

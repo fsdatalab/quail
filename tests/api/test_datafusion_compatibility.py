@@ -14,6 +14,7 @@ from helpers.oracle import Oracle, oracle_executor
 from helpers.sessions import CONFIG, TOKENIZER
 
 import quail
+from quail.api.context import SessionContext
 
 pytest.importorskip("_quail_native")
 
@@ -187,7 +188,7 @@ def constant_models():
                 scores=lambda *_: 0.5,
             )
             oracle.catalog = session.catalog
-            context = quail.SessionContext(
+            context = SessionContext(
                 session, physical_executor=oracle_executor(oracle))
             context.register("r", quail.DocumentProvider.from_table(R, id_col="id"))
             context.register("u", quail.DocumentProvider.from_table(U, id_col="id"))
@@ -199,7 +200,7 @@ def planted_filters(oracle, *tables):
     """Yield a session and a context over `tables`, answered by `oracle`."""
     with quail.Session(CONFIG, tokenizer=TOKENIZER) as session:
         oracle.catalog = session.catalog
-        context = quail.SessionContext(
+        context = SessionContext(
             session, physical_executor=oracle_executor(oracle))
         for name, table in zip("ru", tables):
             context.register(
@@ -553,7 +554,7 @@ def test_datafusion_computes_the_length_of_a_model_feature_list():
 
     oracle.features = features
     oracle.catalog = session.catalog
-    context = quail.SessionContext(session, physical_executor=oracle_executor(oracle))
+    context = SessionContext(session, physical_executor=oracle_executor(oracle))
     context.register("r", quail.DocumentProvider.from_table(R, id_col="id"))
     try:
         table = context.sql(

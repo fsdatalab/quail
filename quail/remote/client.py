@@ -115,7 +115,8 @@ class ServerClient:
     def upload(self, name: str, reader: pa.RecordBatchReader,
                id_col: str) -> None:
         """Register ``reader``'s rows on the server as the table ``name``."""
-        descriptor = flight.FlightDescriptor.for_path(name, id_col)
+        path = (name, id_col) if id_col else (name,)
+        descriptor = flight.FlightDescriptor.for_path(*path)
         writer, _ = self._flight.do_put(
             descriptor, reader.schema, self._options)
         try:

@@ -24,6 +24,7 @@ import quail
 from helpers.generated import NAMES, PAIR_TEXT, tables, truth
 from helpers.oracle import Oracle, oracle_executor
 from helpers.sessions import CONFIG, TOKENIZER
+from quail.api.context import SessionContext
 from quail.builtins import LOGICAL_RULES, PHYSICAL_RULES, built_in_registry
 
 # Quail's logical rewrites, and the executor's ways to ask fewer rows
@@ -133,7 +134,7 @@ class NeededAnswers:
         self._sessions.append(session)
         oracle = Oracle(truth=self._answer)
         oracle.catalog = session.catalog
-        context = quail.SessionContext(
+        context = SessionContext(
             session, physical_executor=oracle_executor(oracle))
         for name, table in tables(seed).items():
             context.register(

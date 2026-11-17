@@ -32,10 +32,19 @@ Each table provider needs an `id_col`. The `id_col` value names the column
 used to identify each row. Implement `quail.TableProvider` to read another
 data source.
 
+`session.register` also takes a PyArrow table, dataset, or reader, and a
+table from another DataFusion library, such as a Delta Lake or Iceberg
+table. Pass `id_col` to name its id column; without one, Quail numbers the
+rows. To register files that DataFusion reads, call
+`session.register_parquet(name, path)`, `register_json`, or `register_csv`.
+
 DataFusion reads each table in Rust. It holds an in-memory table without a
 copy, and reads the local files of `from_parquet` and `from_ipc` in
 parallel. It streams the batches of any other provider, and asks only for
 the columns a query reads.
+
+A table or setting that SQL creates, such as with `CREATE VIEW` or `SET`,
+lasts for the session.
 
 ## Run a query
 

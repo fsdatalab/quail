@@ -24,12 +24,9 @@ def test_reentrant_query_is_rejected_and_outer_route_survives():
             return None
 
     engine = Engine()
-    session = _quail_native.NativeSession(engine)
-    table = pa.table({"id": [0], "body": ["review"]})
-    schema = pa.BufferOutputStream()
-    with pa.ipc.new_stream(schema, table.schema):
-        pass
-    session.register("reviews", schema.getvalue().to_pybytes(), table.select)
+    tables = _quail_native.DataFusionContext()
+    tables.register_batches("reviews", pa.table({"id": [0], "body": ["review"]}))
+    session = _quail_native.NativeSession(engine, base=tables)
     caller = threading.get_ident()
     query = "SELECT r.id FROM reviews r WHERE AI.IF(PROMPT('q: {0}', r.body))"
     session.sql(query)

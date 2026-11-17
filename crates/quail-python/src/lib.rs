@@ -99,7 +99,9 @@ pub fn session_with_engine(engine: Py<PyAny>) -> Result<Session> {
 
 /// A session as [`session_with_engine`] describes, whose regions
 /// `planner` plans in Rust when the engine has a `settings` attribute;
-/// without a planner every region goes to `run_region`.
+/// without a planner every region goes to `run_region`. With `base`,
+/// the session runs over `base`'s tables and settings, as
+/// [`Session::with_executor_on`] describes.
 ///
 /// # Errors
 ///
@@ -107,6 +109,11 @@ pub fn session_with_engine(engine: Py<PyAny>) -> Result<Session> {
 pub fn session_with_planner(
     engine: Py<PyAny>,
     planner: Option<Arc<planning::Planner>>,
+    base: Option<datafusion::prelude::SessionContext>,
 ) -> Result<Session> {
-    Session::with_executor(Arc::new(executor_with_planner(engine, planner)?))
+    let executor = Arc::new(executor_with_planner(engine, planner)?);
+    match base {
+        Some(base) => Session::with_executor_on(executor, base),
+        None => Session::with_executor(executor),
+    }
 }

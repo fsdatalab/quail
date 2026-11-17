@@ -6,6 +6,7 @@ from helpers.sessions import CONFIG, TOKENIZER
 
 import quail
 from quail.api.compile import compile_message
+from quail.api.context import SessionContext
 from quail.common.expressions import CompileError
 
 WRAPPERS = [
@@ -64,7 +65,7 @@ def test_rule_wrappers_are_removed_and_the_reason_or_its_explanation_is_kept():
 
 def test_a_session_reports_an_invalid_query_in_one_plain_sentence():
     with quail.Session(CONFIG, tokenizer=TOKENIZER) as session:
-        context = quail.SessionContext(session)
+        context = SessionContext(session)
         context.register("reviews", quail.DocumentProvider.from_table(
             pa.table({"id": ["r0"], "body": ["text"]}), id_col="id"))
         for predicate, expected in INVALID_ARGUMENTS:

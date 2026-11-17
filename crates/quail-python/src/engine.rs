@@ -22,11 +22,12 @@ use datafusion::physical_expr::LexOrdering;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
+use datafusion::prelude::SessionContext;
 use pyo3::exceptions::{PyAttributeError, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::IntoPyDict;
 use quail::planning::{Planner, ScanInputs, Settings};
-use quail::{EngineRegion, Executor, RegionEngine, Session};
+use quail::{EngineRegion, Executor, RegionEngine};
 
 use crate::pyarrow::{from_pyarrow, stream_from_pyarrow, to_pyarrow};
 use crate::python_failure;
@@ -268,7 +269,7 @@ pub fn scans_to_pyarrow<'py>(
 ///
 /// DataFusion refuses the name.
 pub fn register_python_table(
-    session: &Session,
+    context: &SessionContext,
     name: &str,
     schema: SchemaRef,
     scan: Py<PyAny>,
@@ -279,7 +280,7 @@ pub fn register_python_table(
         schema,
         scan: Arc::new(scan),
     };
-    session.register_scanned_table(name, Arc::new(table), id_column, identity)
+    quail::register_scanned_table(context, name, Arc::new(table), id_column, identity)
 }
 
 /// A table whose rows a Python function streams.
@@ -370,7 +371,7 @@ impl PartitionStream for PythonScan {
 ///
 /// A batch does not read, or DataFusion refuses the name.
 pub fn register_batches(
-    session: &Session,
+    context: &SessionContext,
     name: &str,
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
@@ -378,7 +379,7 @@ pub fn register_batches(
     identity: &str,
 ) -> Result<()> {
     let table = MemTable::try_new(schema, vec![batches])?;
-    session.register_scanned_table(name, Arc::new(table), id_column, identity)
+    quail::register_scanned_table(context, name, Arc::new(table), id_column, identity)
 }
 
 /// Register local files of one `format` ("parquet", "arrow", "json", or
@@ -390,7 +391,7 @@ pub fn register_batches(
 /// A path is not a URL DataFusion reads, the format is unknown, or
 /// DataFusion refuses the name.
 pub fn register_files(
-    session: &Session,
+    context: &SessionContext,
     name: &str,
     format: &str,
     paths: &[String],
@@ -414,5 +415,5 @@ pub fn register_files(
         .with_listing_options(options)
         .with_schema(schema);
     let table = ListingTable::try_new(config)?;
-    session.register_scanned_table(name, Arc::new(table), id_column, identity)
+    quail::register_scanned_table(context, name, Arc::new(table), id_column, identity)
 }

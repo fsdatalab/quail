@@ -152,13 +152,14 @@ def compile_sql(sql, catalog, dialect="snowflake", model=QWEN3_4B_FP8):
     def refuse(_columns):
         raise RuntimeError("compiling a query scans no table")
 
-    native = _quail_native.NativeSession(_CompilingEngine(model))
+    tables = _quail_native.DataFusionContext()
     for name, provider in catalog.providers.items():
         sink = pa.BufferOutputStream()
         with pa.ipc.new_stream(sink, provider.schema()):
             pass
-        native.register(name, sink.getvalue().to_pybytes(), refuse,
+        tables.register(name, sink.getvalue().to_pybytes(), refuse,
                         getattr(provider, "id_col", None) or None)
+    native = _quail_native.NativeSession(_CompilingEngine(model), base=tables)
     (region,), _ = native.region_plans(sql, tuple(model.turn), model.prompt_layout,
                                        DATAFUSION_DIALECTS[dialect])
     found, message, _ = region

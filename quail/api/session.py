@@ -8,9 +8,10 @@ import _quail_native
 
 from quail.api.compile import SQLDialect
 from quail.api.config import EngineConfig, resolve_model
+from quail.api.context import as_provider, register_provider
 from quail.api.query import QueryLike
 from quail.builtins import built_in_registry
-from quail.catalog import Catalog, TableProvider
+from quail.catalog import Catalog
 from quail.common.tokens import Tokenizer
 from quail.extensions import ExtensionRegistry
 from quail.physical.plan import Refusal, RefusalError
@@ -62,11 +63,14 @@ class Session:
         self._tokenizer_directory = tokenizer
         self._tokenizer = None
         self._remote = None
+        # the session's tables and settings, which each local query runs over
+        self.datafusion = None
         if endpoint is not None:
             from quail.remote.client import RemoteConnection
 
             self._remote = RemoteConnection(endpoint)
         else:
+            self.datafusion = _quail_native.DataFusionContext()
             _ = self.tokenizer
 
     @property
@@ -89,18 +93,72 @@ class Session:
     def __exit__(self, *_exc):
         self.close()
 
-    def register(self, name: str, provider: TableProvider) -> None:
+    def register(self, name: str, table, id_col: str = "") -> None:
         """Register a table under ``name``.
 
-        A remote session uploads the provider's rows to the server.
+        Args:
+            name: The table's name in SQL.
+            table: A ``TableProvider``, such as ``DocumentProvider``
+                returns; a pyarrow Table, Dataset, or RecordBatchReader;
+                any object with ``__arrow_c_stream__``; or a
+                datafusion-python table, any object with
+                ``__datafusion_table_provider__``.
+            id_col: The column that identifies each row of a table that
+                is not a ``TableProvider``; Quail numbers the rows
+                without one.
+
+        A remote session uploads the table's rows to the server.
         """
+        if hasattr(table, "__datafusion_table_provider__"):
+            if self._remote is None:
+                self.datafusion.register_foreign(name, table)
+                return
+            # this process reads the table, and the server gets its rows
+            reader = _quail_native.DataFusionContext()
+            reader.register_foreign(name, table)
+            table = reader.read(name)
+        provider = as_provider(table, id_col)
         self.catalog.register(name, provider)
-        if self._remote is not None:
-            try:
+        try:
+            if self._remote is not None:
                 self._remote.register(name, provider)
-            except Exception:
-                del self.catalog.providers[name]
-                raise
+            else:
+                register_provider(self.datafusion, name, provider)
+        except Exception:
+            del self.catalog.providers[name]
+            raise
+
+    def register_parquet(self, name: str, path: str) -> None:
+        """Register the Parquet file or folder at ``path``, which DataFusion reads.
+
+        A remote session's server reads ``path``.
+        """
+        self._register_files(name, path, "PARQUET")
+
+    def register_json(self, name: str, path: str) -> None:
+        """Register the newline-delimited JSON file or folder at ``path``.
+
+        A remote session's server reads ``path``.
+        """
+        self._register_files(name, path, "JSON")
+
+    def register_csv(self, name: str, path: str) -> None:
+        """Register the CSV file or folder at ``path``.
+
+        The first line of each file names its columns.
+
+        A remote session's server reads ``path``.
+        """
+        self._register_files(name, path, "CSV")
+
+    def _register_files(self, name: str, path: str, file_format: str) -> None:
+        location = os.fspath(path).replace("'", "''")
+        query = self.sql(f"CREATE EXTERNAL TABLE {name} STORED AS {file_format} "
+                         f"LOCATION '{location}'")
+        if self._remote is None:
+            query.run()
+        else:
+            query.submit().result()
 
     def sql(self, text: str, order: str | None = None,
             dialect: SQLDialect | str = SQLDialect.SNOWFLAKE) -> QueryLike:

@@ -6,6 +6,7 @@ from helpers.oracle import Oracle, oracle_executor
 from helpers.sessions import CONFIG, TOKENIZER
 
 import quail
+from quail.api.context import SessionContext
 
 
 @pytest.fixture()
@@ -13,7 +14,7 @@ def context():
     session = quail.Session(CONFIG, tokenizer=TOKENIZER)
     oracle = Oracle(filters={"r": {"q1:": [1, 0, 1, 1]}})
     oracle.catalog = session.catalog
-    context = quail.SessionContext(session, physical_executor=oracle_executor(oracle))
+    context = SessionContext(session, physical_executor=oracle_executor(oracle))
     context.register("reviews", quail.DocumentProvider.from_table(pa.table({
         "id": ["r0", "r1", "r2", "r3"],
         "body": ["good ending", "slow pacing", "great cast", "weak ending"],
@@ -72,3 +73,17 @@ def test_create_external_table_reads_parquet_files(context, tmp_path):
                 f"LOCATION '{tmp_path}/'")
     result = context.sql("SELECT id FROM ratings WHERE stars > 3")
     assert result.column(0).to_pylist() == ["p0"]
+
+
+def test_a_table_and_a_setting_last_from_one_session_sql_to_the_next():
+    with quail.Session(CONFIG, tokenizer=TOKENIZER) as session:
+        session.register("reviews", pa.table({"id": ["r0", "r1"]}))
+        session.sql("CREATE VIEW first_review AS SELECT id FROM reviews "
+                    "WHERE id = 'r0'").run()
+        session.sql("SET datafusion.catalog.information_schema = true").run()
+        assert session.sql("SELECT id FROM first_review").run().collect() \
+            .column(0).to_pylist() == ["r0"]
+        # the setting holds: DataFusion lists the session's tables
+        tables = session.sql("SELECT table_name FROM information_schema.tables "
+                             "WHERE table_name = 'first_review'").run()
+        assert tables.collect().num_rows == 1

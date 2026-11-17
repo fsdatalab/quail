@@ -9,12 +9,14 @@ Rust derives each region's operators from DataFusion's plan of it, as
 runs every operator outside the regions. A region whose shape Quail's
 operators do not read reaches Quail as SQL text.
 
-For example, imagine a ``reviews`` table with review text in ``body``:
+``Session.sql`` runs each query through a ``SessionContext``, which
+runs over the session's ``DataFusionContext``: the session's tables
+and settings, kept for the session's whole life. For example, imagine
+a ``reviews`` table with review text in ``body``:
 
-    context = quail.SessionContext(session)
-    context.register("reviews", quail.DocumentProvider.from_table(
+    session.register("reviews", quail.DocumentProvider.from_table(
         reviews, id_col="id"))
-    table = context.sql(
+    table = SessionContext(session).sql(
         "SELECT r.id FROM reviews r "
         "WHERE AI_FILTER(PROMPT('Does the review discuss the ending? {0}', "
         "r.body))")
@@ -34,7 +36,13 @@ import pyarrow as pa
 
 from quail.api.compile import DATAFUSION_DIALECTS, compile_message
 from quail.api.engine import Engine, engine_description
-from quail.catalog import MemoryTableProvider, ScanRequest, TableProvider
+from quail.catalog import (
+    ArrowDatasetProvider,
+    MemoryTableProvider,
+    ScanRequest,
+    TableProvider,
+)
+from quail.common.expressions import CompileError
 
 
 def ipc_bytes(table: pa.Table) -> bytes:
@@ -59,6 +67,62 @@ def local_files(provider: TableProvider) -> list[str] | None:
         return None
     files = [os.path.abspath(path) for path in dataset.files]
     return files if files == sorted(files) else None
+
+
+def as_provider(table, id_col: str = "") -> TableProvider:
+    """Return ``table`` as a ``TableProvider``.
+
+    Args:
+        table: A ``TableProvider``; a pyarrow Table, Dataset, or
+            RecordBatchReader; or any object with ``__arrow_c_stream__``.
+        id_col: The column that identifies each row, or "" for none.
+
+    Raises:
+        TypeError: ``table`` is none of these.
+    """
+    import pyarrow.dataset as ds
+
+    if hasattr(table, "scan") and hasattr(table, "content_identity"):
+        return table
+    if isinstance(table, ds.Dataset):
+        return ArrowDatasetProvider(table, id_col)
+    if not isinstance(table, pa.Table) and hasattr(table, "__arrow_c_stream__"):
+        table = pa.table(table)
+    if isinstance(table, pa.Table):
+        if id_col and id_col not in table.column_names:
+            raise CompileError(
+                f"id column {id_col!r} not in table schema {tuple(table.column_names)}")
+        return MemoryTableProvider(table, id_col)
+    raise TypeError(
+        "register takes a TableProvider, a pyarrow Table, Dataset, or "
+        "RecordBatchReader, an object with __arrow_c_stream__, or a "
+        f"datafusion-python table; got {type(table).__name__}")
+
+
+def register_provider(datafusion, name: str, provider: TableProvider) -> None:
+    """Register a provider's table with a session's ``DataFusionContext``.
+
+    DataFusion holds an in-memory table's batches without a copy, and
+    reads the local files of ``DocumentProvider.from_parquet`` and
+    ``from_ipc`` itself. It streams any other provider's batches,
+    asking only for the columns a query reads.
+    """
+    id_column = getattr(provider, "id_col", None) or None
+    identity = provider.content_identity()
+    schema = ipc_bytes(provider.schema().empty_table())
+    if isinstance(provider, MemoryTableProvider):
+        datafusion.register_batches(name, provider.table, id_column, identity)
+        return
+    files = local_files(provider)
+    if files is not None:
+        datafusion.register_files(name, provider.file_format, files, schema,
+                                  id_column, identity)
+        return
+
+    def scan(columns: list[str]) -> pa.RecordBatchReader:
+        return provider.scan(ScanRequest(columns=tuple(columns)))
+
+    datafusion.register(name, schema, scan, id_column, identity)
 
 
 class SessionContext:
@@ -86,43 +150,15 @@ class SessionContext:
         if workers is None:
             engine = Engine(session, physical_executor, order=order,
                             run_query=run_query)
-            self._native = NativeSession(engine, session.planner)
+            self._native = NativeSession(engine, session.planner, session.datafusion)
         else:
             description = engine_description(Engine(session, order=order))
             self._native = NativeSession.on_workers(
-                workers, json.dumps(description), session.planner)
-        for name, provider in session.catalog.providers.items():
-            self._register_table(name, provider)
+                workers, json.dumps(description), session.planner, session.datafusion)
 
-    def register(self, name: str, provider: TableProvider) -> None:
-        """Register a table with the session and with DataFusion.
-
-        DataFusion holds an in-memory table's batches without a copy, and
-        reads the local files of ``DocumentProvider.from_parquet`` and
-        ``from_ipc`` itself. It streams any other provider's batches,
-        asking only for the columns a query reads.
-        """
-        self.session.register(name, provider)
-        self._register_table(name, provider)
-
-    def _register_table(self, name: str, provider: TableProvider) -> None:
-        id_column = getattr(provider, "id_col", None) or None
-        identity = provider.content_identity()
-        if isinstance(provider, MemoryTableProvider):
-            self._native.register_batches(name, provider.table, id_column, identity)
-            return
-        files = local_files(provider)
-        if files is not None:
-            self._native.register_files(
-                name, provider.file_format, files,
-                ipc_bytes(provider.schema().empty_table()), id_column, identity)
-            return
-
-        def scan(columns: list[str]) -> pa.RecordBatchReader:
-            return provider.scan(ScanRequest(columns=tuple(columns)))
-
-        self._native.register(name, ipc_bytes(provider.schema().empty_table()), scan,
-                              id_column, identity)
+    def register(self, name: str, table, id_col: str = "") -> None:
+        """Register a table with the session, as ``Session.register`` does."""
+        self.session.register(name, table, id_col)
 
     def sql(self, text: str, dialect: str = "snowflake") -> pa.Table:
         """Run a query and return its rows."""

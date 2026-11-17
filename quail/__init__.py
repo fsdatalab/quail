@@ -2,7 +2,7 @@
 
 import _quail_native
 
-from quail.api import Query, RefusalError, Session, SessionContext
+from quail.api import Query, RefusalError, Session
 from quail.api.compile import SQLDialect
 from quail.api.config import EngineConfig
 from quail.api.prompts import bind_join_prompt, bind_prompt
@@ -35,7 +35,6 @@ __all__ = [
     "RefusalError",
     "ScanRequest",
     "Session",
-    "SessionContext",
     "SpeedOfLightEstimate",
     "SQLDialect",
     "TableProvider",

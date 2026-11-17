@@ -1,4 +1,4 @@
-"""quail.SessionContext: DataFusion binds the query, Quail runs each model region.
+"""SessionContext: DataFusion binds the query, Quail runs each model region.
 
 Each transcript test's transcript shows the plan, the
 questions the model answered, and the rows (helpers/transcript.py).
@@ -13,6 +13,7 @@ from helpers.sessions import CONFIG, TOKENIZER, check_table
 from helpers.transcript import Transcripts, assert_transcript
 
 import quail
+from quail.api.context import SessionContext
 from quail.api.engine import Engine
 
 pytest.importorskip("_quail_native")
@@ -83,7 +84,7 @@ QUERIES = {
 def context():
     session = quail.Session(CONFIG, tokenizer=TOKENIZER)
     ORACLE.catalog = session.catalog
-    value = quail.SessionContext(session, physical_executor=oracle_executor(ORACLE))
+    value = SessionContext(session, physical_executor=oracle_executor(ORACLE))
     value.register("reviews", quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
     value.register("aspects", quail.DocumentProvider.from_table(ASPECTS, id_col="id"))
     value.register("contracts",
@@ -140,7 +141,7 @@ def test_every_check_query_derives_one_region_as_session_sql_compiles_it():
 
     for entry in check_query_entries():
         session = quail.Session(CONFIG, tokenizer=TOKENIZER)
-        context = quail.SessionContext(session)
+        context = SessionContext(session)
         for name, columns in entry["tables"].items():
             context.register(name, quail.DocumentProvider.from_table(
                 check_table(columns), id_col="id"))
@@ -212,7 +213,7 @@ def _check_first_rows_precede_the_last_answer(family, text, truth):
         events.append("finished")
         return response
 
-    context = quail.SessionContext(session, physical_executor=run)
+    context = SessionContext(session, physical_executor=run)
     # the model writes a map's or an extraction's answer over several
     # passes: with a few more rows, the first rows' answers go on while
     # it has later rows still to read
@@ -258,7 +259,7 @@ def test_a_region_plans_and_runs_once_over_its_whole_input(monkeypatch):
         calls.append(request)
         return executor(request)
 
-    context = quail.SessionContext(session, physical_executor=run)
+    context = SessionContext(session, physical_executor=run)
     context.register("reviews", quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
     text = ("SELECT r.id, AI.CLASSIFY(PROMPT('q5: {0}', r.body), "
             "['positive', 'negative', 'mixed']) AS sentiment "
@@ -275,7 +276,7 @@ def test_a_failure_inside_a_region_names_its_line_in_the_error():
     def run(request):
         raise ValueError("the executor failed")
 
-    context = quail.SessionContext(session, physical_executor=run)
+    context = SessionContext(session, physical_executor=run)
     context.register("reviews", quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
     with pytest.raises(RuntimeError) as failure:
         context.sql("SELECT r.id FROM reviews r "
@@ -292,7 +293,7 @@ def test_a_failure_inside_a_region_names_its_line_in_the_error():
 def _reviews_context(oracle, rows: int):
     """A context over `rows` reviews r00, r01, ..., answered by `oracle`."""
     session = quail.Session(CONFIG, tokenizer=TOKENIZER)
-    context = quail.SessionContext(session, physical_executor=oracle_executor(oracle))
+    context = SessionContext(session, physical_executor=oracle_executor(oracle))
     reviews = pa.table({
         "id": [f"r{index:02d}" for index in range(rows)],
         "body": [f"review number {index} " * 4 for index in range(rows)],
@@ -515,7 +516,7 @@ rows 2
 def test_a_table_name_with_an_at_sign_is_refused():
     session = quail.Session(CONFIG, tokenizer=TOKENIZER)
     try:
-        context = quail.SessionContext(session)
+        context = SessionContext(session)
         with pytest.raises(quail.common.expressions.CompileError, match="'@'"):
             context.register("reviews@r",
                              quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
@@ -769,7 +770,7 @@ def _filtered_ids(provider) -> list[str]:
     session = quail.Session(CONFIG, tokenizer=TOKENIZER)
     try:
         ORACLE.catalog = session.catalog
-        context = quail.SessionContext(
+        context = SessionContext(
             session, physical_executor=oracle_executor(ORACLE))
         context.register("reviews", provider)
         return context.sql(
@@ -817,7 +818,7 @@ def test_a_python_provider_streams_only_the_columns_a_query_reads():
     assert _filtered_ids(provider) == ["r0", "r2", "r3"]
     session = quail.Session(CONFIG, tokenizer=TOKENIZER)
     try:
-        context = quail.SessionContext(session)
+        context = SessionContext(session)
         context.register("reviews", provider)
         provider.asked.clear()
         table = context.sql(
