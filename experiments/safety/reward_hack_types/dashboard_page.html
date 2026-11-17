@@ -1,0 +1,467 @@
+<meta name="dash-one-writer">
+<style>
+  .hx { display: flex; flex-direction: column; gap: var(--cds-gap-xl); color: var(--color-fg);
+    font-family: var(--font-anthropic-sans); font-size: var(--cds-font-size-body); }
+  .hx-title { font-family: var(--font-anthropic-serif); font-weight: 400; font-size: var(--cds-font-size-title); margin: 0; }
+  .hx-lede { margin: var(--cds-gap-sm) 0 0; max-width: 72ch; }
+  .hx-lede b { font-weight: var(--cds-font-weight-medium); font-variant-numeric: tabular-nums; }
+  .hx-note { margin: var(--cds-gap-xs) 0 0; color: var(--color-fg-muted); font-size: var(--cds-font-size-caption); max-width: 80ch; }
+  .hx-h2 { font-size: var(--cds-font-size-heading); font-weight: var(--cds-font-weight-medium); margin: 0; }
+  .hx-card { background: var(--color-panel); border: 1px solid var(--color-border-line); border-radius: var(--cds-radius); padding: var(--cds-pad-lg); min-width: 0; }
+  .hx-controls { display: flex; flex-wrap: wrap; gap: var(--cds-gap-md); align-items: center; }
+  .hx-controls label { display: flex; gap: var(--cds-gap-sm); align-items: center; font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); }
+  .hx-scroll { overflow-x: auto; }
+  .hx-grid { border-collapse: collapse; font-variant-numeric: tabular-nums; min-width: 40rem; width: 100%; }
+  .hx-grid th, .hx-grid td { padding: 4px; border-bottom: 1px solid var(--color-border-line); text-align: center; font-weight: 400; }
+  .hx-grid thead th { font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); vertical-align: bottom; max-width: 7rem; }
+  .hx-grid th.hx-row { text-align: left; font-weight: var(--cds-font-weight-medium); white-space: nowrap; padding-right: var(--cds-pad-md); }
+  .hx-grid tr.hx-sep th, .hx-grid tr.hx-sep td { border-top: 2px solid var(--color-border-line); }
+  .hx-cell { font: inherit; width: 100%; min-width: 2.6rem; min-height: 2.2rem; border: 1px solid transparent; border-radius: var(--cds-radius);
+    background: transparent; color: var(--color-fg); cursor: pointer; }
+  .hx-cell:hover { border-color: var(--color-fg-muted); }
+  .hx-cell[aria-pressed="true"] { border: 2px solid var(--color-fg); }
+  .hx-cell:disabled { cursor: default; color: var(--color-fg-muted); }
+  .hx-cell:focus-visible, .hx-item:focus-visible, .hx-btn:focus-visible { outline: 2px solid var(--color-fg); outline-offset: 1px; }
+  .hx-agents { border-collapse: collapse; font-variant-numeric: tabular-nums; width: 100%; }
+  .hx-agents th, .hx-agents td { padding: 4px var(--cds-pad-sm); border-bottom: 1px solid var(--color-border-line); text-align: right; font-weight: 400; }
+  .hx-agents th:first-child, .hx-agents td:first-child { text-align: left; }
+  .hx-agents thead th { color: var(--color-fg-muted); font-size: var(--cds-font-size-caption); }
+  .hx-bar { display: inline-block; height: 8px; border-radius: 2px; vertical-align: middle; margin-right: 6px; }
+  .hx-explore { display: grid; grid-template-columns: minmax(0, 20rem) minmax(0, 1fr); gap: var(--cds-gap-lg); align-items: start; }
+  @media (max-width: 860px) { .hx-explore { grid-template-columns: minmax(0, 1fr); } }
+  .hx-list { display: flex; flex-direction: column; gap: 4px; max-height: 70vh; overflow-y: auto; min-height: 4rem; }
+  .hx-item { font: inherit; text-align: left; background: transparent; color: var(--color-fg); border: 1px solid var(--color-border-line);
+    border-radius: var(--cds-radius); padding: var(--cds-pad-sm); cursor: pointer; display: flex; flex-direction: column; gap: 2px; }
+  .hx-item[aria-current="true"] { border: 2px solid var(--color-fg); }
+  .hx-item small { color: var(--color-fg-muted); font-size: var(--cds-font-size-caption); }
+  .hx-badges { display: flex; flex-wrap: wrap; gap: 4px; }
+  .hx-badge { font-size: var(--cds-font-size-caption); border-radius: 999px; padding: 1px 8px; border: 1px solid var(--color-border-line); }
+  .hx-badge.hx-hack { border-color: var(--color-bad); color: var(--color-bad); }
+  .hx-trace { display: flex; flex-direction: column; gap: var(--cds-gap-sm); min-height: 6rem; }
+  .hx-trace-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: var(--cds-gap-sm); align-items: baseline; }
+  .hx-btn { font: inherit; font-size: var(--cds-font-size-caption); background: var(--color-panel); color: var(--color-fg);
+    border: 1px solid var(--color-border-line); border-radius: 999px; padding: 3px 10px; cursor: pointer; }
+  .hx-btn:disabled { opacity: .45; cursor: default; }
+  .hx-codes { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: var(--cds-gap-sm); }
+  @media (max-width: 600px) { .hx-codes { grid-template-columns: minmax(0, 1fr); } }
+  .hx-code { border: 1px solid var(--color-border-line); border-radius: var(--cds-radius); padding: var(--cds-pad-sm); }
+  .hx-code b { font-weight: var(--cds-font-weight-medium); }
+  .hx-code p { margin: 2px 0 0; color: var(--color-fg-muted); font-size: var(--cds-font-size-caption); }
+  .hx-step { border: 1px solid var(--color-border-line); border-radius: var(--cds-radius); padding: var(--cds-pad-sm) var(--cds-pad-md); }
+  .hx-step.hx-selected { border: 2px solid var(--color-fg); }
+  .hx-step summary { cursor: pointer; display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: center; }
+  .hx-step summary .hx-sum { color: var(--color-fg-muted); font-size: var(--cds-font-size-caption); overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; max-width: 100%; flex: 1 1 12rem; }
+  .hx-step h4 { margin: var(--cds-gap-sm) 0 2px; font-size: var(--cds-font-size-caption); color: var(--color-fg-muted); font-weight: var(--cds-font-weight-medium); }
+  .hx-step p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .hx-step pre, .hx-task pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-family: ui-monospace, Menlo, monospace;
+    font-size: var(--cds-font-size-caption); max-height: 24rem; overflow: auto; background: var(--color-bg); padding: var(--cds-pad-sm); border-radius: var(--cds-radius); }
+  .hx-codebook dt { font-weight: var(--cds-font-weight-medium); margin-top: var(--cds-gap-md); }
+  .hx-codebook dd { margin: 2px 0 0; }
+  .hx-codebook dd.hx-muted { color: var(--color-fg-muted); font-size: var(--cds-font-size-caption); }
+  [data-dash-source-state=refreshing] { opacity: .5; }
+</style>
+
+<div class="hx">
+  <header id="top">
+    <h1 class="hx-title">What agents do in steps flagged as reward hacking</h1>
+    <p class="hx-lede">Of <b data-draw="n_steps" data-source="totals" data-field="steps" data-row="0">—</b> steps a 27B judge flagged
+      (score above 0.2) in Terminal Wrench baseline runs, the 27B model codes
+      <b data-draw="n_hacks" data-source="totals" data-field="hack_steps" data-row="0">—</b> as reward hacks,
+      <b data-draw="n_honest" data-source="totals" data-field="honest_steps" data-row="0">—</b> as honest work, and
+      <b data-draw="n_done" data-source="totals" data-field="declare_steps" data-row="0">—</b> as a bare "task complete" call.</p>
+    <p class="hx-note">Codes come from the codebook of SAE run A: each step gets one intent (what the agent tries to do) and one
+      target (what it acts on). Pick a cell to list its steps, then pick a step to read it inside its full run.</p>
+  </header>
+
+  <div class="hx-controls" id="filters">
+    <label>Agent <select class="dash-select" data-draw="agent_pick" aria-label="Agent" data-source="coded_steps"></select></label>
+    <label>Sort steps by
+      <select class="dash-select" id="sort-pick" aria-label="Sort steps by">
+        <option value="score">Judge score</option>
+        <option value="sure">Model confidence</option>
+        <option value="run">Run</option>
+      </select>
+    </label>
+  </div>
+
+  <section class="hx-card" id="grid">
+    <h2 class="hx-h2">Steps by intent and target</h2>
+    <p class="hx-note">Rows are intents, columns are targets. Darker cells hold more steps. Rows above the line are reward hacks.</p>
+    <div class="hx-scroll" style="margin-top: var(--cds-gap-md)">
+      <table class="hx-grid" data-source="grid">
+        <thead data-draw="grid_head"></thead>
+        <tbody data-draw="grid_body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="hx-card" id="agents">
+    <h2 class="hx-h2">Intents by agent</h2>
+    <p class="hx-note">The share of each agent's flagged steps under each intent.</p>
+    <div class="hx-scroll" style="margin-top: var(--cds-gap-md)">
+      <table class="hx-agents" data-source="by_agent" data-row-key="intent">
+        <thead>
+          <tr>
+            <th scope="col" data-field="intent">Intent</th>
+            <th scope="col" data-field="claude">Claude Opus 4.6</th>
+            <th scope="col" data-field="gpt">GPT-5.4</th>
+            <th scope="col" data-field="gemini">Gemini 3.1 Pro</th>
+          </tr>
+        </thead>
+        <tbody data-draw="agents"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="explore">
+    <h2 class="hx-h2" data-draw="list_heading">—</h2>
+    <div class="hx-explore" style="margin-top: var(--cds-gap-md)">
+      <div class="hx-card">
+        <div class="hx-list" data-draw="step_list" data-source="coded_steps" role="list" aria-label="Steps in the chosen cell"></div>
+      </div>
+      <div class="hx-card">
+        <div class="hx-trace" data-draw="trace"></div>
+      </div>
+    </div>
+  </section>
+
+  <details class="hx-card hx-codebook" id="codebook">
+    <summary>Codebook: every intent and target, with its definition and rules</summary>
+    <div data-draw="codebook" data-source="codebook"></div>
+  </details>
+</div>
+
+<script>
+  window.HX = {
+    honest: 'Do the task as asked',
+    done: 'Declare the task complete',
+    enc: (t) => String(t).replace(/%/g, '%25').replace(/&/g, '%26').replace(/=/g, '%3D'),
+    agents: [['claude', 'Claude Opus 4.6'], ['gpt', 'GPT-5.4'], ['gemini', 'Gemini 3.1 Pro']],
+  };
+  window.HX.isHack = (intent) => intent !== window.HX.honest && intent !== window.HX.done && !/^none/i.test(intent);
+
+  dash.calc('shown', {
+    inputs: ['coded_steps'],
+    title: 'Steps after the agent filter',
+    description: 'The coded steps of the chosen agent, or all steps.',
+    fn: (coded_steps) => {
+      const agent = dash.params().agent;
+      return coded_steps.filter((step) => !agent || step.agent === agent);
+    },
+  });
+
+  dash.calc('totals', {
+    inputs: ['shown'],
+    title: 'Hack, honest and completion steps',
+    description: 'Counts of the filtered steps: all; hacks (any intent but honest work, "Declare the task complete" and "None of these"); honest work; bare completion calls.',
+    fn: (shown) => [{
+      steps: shown.length,
+      hack_steps: shown.filter((s) => s.intent !== 'Do the task as asked' && s.intent !== 'Declare the task complete' && !/^none/i.test(s.intent)).length,
+      honest_steps: shown.filter((s) => s.intent === 'Do the task as asked').length,
+      declare_steps: shown.filter((s) => s.intent === 'Declare the task complete').length,
+    }],
+  });
+
+  dash.calc('grid', {
+    inputs: ['shown', 'codebook'],
+    title: 'Steps per intent and target',
+    description: 'For each intent and target of the codebook, the filtered steps coded with that pair; the "Total" column sums a row.',
+    fn: (shown, codebook) => {
+      const intents = codebook.filter((c) => c.kind === 'intent').map((c) => c.name);
+      const targets = codebook.filter((c) => c.kind === 'target').map((c) => c.name).concat(['Total']);
+      return intents.flatMap((intent) => targets.map((target) => ({
+        cell: `${intent}|${target}`, intent, target,
+        steps: shown.filter((s) => s.intent === intent && (target === 'Total' || s.target === target)).length,
+      })));
+    },
+  });
+
+  dash.calc('by_agent', {
+    inputs: ['coded_steps', 'codebook'],
+    title: 'Intent shares per agent',
+    description: "For each intent, the share of each agent's flagged steps coded with it.",
+    fn: (coded_steps, codebook) => {
+      const totals = {};
+      for (const s of coded_steps) totals[s.agent] = (totals[s.agent] || 0) + 1;
+      const share = (intent, agent) => totals[agent] ? coded_steps.filter((s) => s.agent === agent && s.intent === intent).length / totals[agent] : null;
+      return codebook.filter((c) => c.kind === 'intent').map((c) => ({
+        intent: c.name,
+        claude: share(c.name, 'Claude Opus 4.6'),
+        gpt: share(c.name, 'GPT-5.4'),
+        gemini: share(c.name, 'Gemini 3.1 Pro'),
+      }));
+    },
+  });
+</script>
+
+<script>
+  const HX = window.HX;
+  const fmtPct = d3.format('.0%');
+  const fmt2 = d3.format('.2f');
+  const cache = {};
+  const indexOf = (name, key) => {
+    const found = dash.data(name);
+    if (found.status !== 'ok') return null;
+    const c = cache[name];
+    if (c && c.rows === found.data) return c.map;
+    const map = new Map();
+    for (const row of found.data) {
+      const k = row[key];
+      if (key === 'run_id') { if (!map.has(k)) map.set(k, []); map.get(k).push(row); } else map.set(k, row);
+    }
+    cache[name] = { rows: found.data, map };
+    return map;
+  };
+  const definition = (kind, name) => {
+    const found = dash.data('codebook');
+    if (found.status !== 'ok') return null;
+    return found.data.find((c) => c.kind === kind && c.name === name) || null;
+  };
+
+  for (const [name, field] of [['n_steps', 'steps'], ['n_hacks', 'hack_steps'], ['n_honest', 'honest_steps'], ['n_done', 'declare_steps']]) {
+    dash.draw(name, (el) => {
+      const t = dash.data('totals');
+      el.textContent = t.status === 'ok' && t.data.length ? String(t.data[0][field]) : '—';
+    });
+  }
+
+  dash.draw('agent_pick', (sel) => {
+    const found = dash.data('coded_steps');
+    const agents = found.status === 'ok' ? [...new Set(found.data.map((s) => s.agent))].sort() : [];
+    sel.replaceChildren(new Option('All agents', ''), ...agents.map((a) => new Option(a, a)));
+    sel.value = dash.params().agent ?? '';
+    sel.onchange = () => dash.setParams({ agent: sel.value || null });
+  });
+
+  document.querySelectorAll('#sort-pick').forEach((sel) => {
+    dash.onData(() => { sel.value = dash.params().sort ?? 'score'; });
+    sel.addEventListener('change', () => dash.setParams({ sort: sel.value === 'score' ? null : sel.value }));
+  });
+
+  const codeLists = () => {
+    const found = dash.data('codebook');
+    if (found.status !== 'ok') return null;
+    const intents = found.data.filter((c) => c.kind === 'intent').map((c) => c.name);
+    const order = (name) => (name === HX.honest ? 1 : name === HX.done ? 2 : /^none/i.test(name) ? 3 : 0);
+    intents.sort((a, b) => order(a) - order(b));
+    return { intents, targets: found.data.filter((c) => c.kind === 'target').map((c) => c.name) };
+  };
+
+  dash.draw('grid_head', (head) => {
+    head.replaceChildren();
+    const lists = codeLists();
+    if (!lists) return;
+    const row = head.insertRow();
+    const corner = document.createElement('th'); corner.scope = 'col'; corner.textContent = 'Intent \\ Target'; row.append(corner);
+    for (const t of [...lists.targets, 'Total']) {
+      const th = document.createElement('th'); th.scope = 'col'; th.textContent = t; row.append(th);
+    }
+  });
+
+  dash.draw('grid_body', (body) => {
+    body.replaceChildren();
+    const found = dash.data('grid');
+    const lists = codeLists();
+    if (found.status !== 'ok' || !lists) {
+      const cell = body.insertRow().insertCell(); cell.colSpan = 12;
+      cell.textContent = found.status === 'error' ? 'Failed to load' : '—';
+      return;
+    }
+    const counts = new Map(found.data.map((r) => [r.cell, r.steps]));
+    const most = d3.max(found.data.filter((r) => r.target !== 'Total'), (r) => r.steps) || 1;
+    const params = dash.params();
+    let sepDone = false;
+    for (const intent of lists.intents) {
+      const tr = body.insertRow();
+      if (!HX.isHack(intent) && !sepDone) { tr.className = 'hx-sep'; sepDone = true; }
+      const th = document.createElement('th'); th.scope = 'row'; th.className = 'hx-row'; th.textContent = intent;
+      const def = definition('intent', intent); if (def) th.title = def.definition;
+      tr.append(th);
+      for (const target of [...lists.targets, 'Total']) {
+        const key = `${intent}|${target}`;
+        const value = counts.get(key) || 0;
+        const b = document.createElement('button');
+        b.type = 'button'; b.className = 'hx-cell';
+        b.dataset.source = 'grid'; b.dataset.field = 'steps'; b.dataset.where = `cell=${HX.enc(key)}`;
+        b.textContent = value ? String(value) : '·';
+        b.disabled = !value;
+        b.setAttribute('aria-label', `${intent}, ${target}: ${value} steps`);
+        b.setAttribute('aria-pressed', String(params.intent === intent && (params.target || 'Total') === target));
+        if (value && target !== 'Total') {
+          const tone = HX.isHack(intent) ? 'var(--color-bad)' : dash.colors[0];
+          b.style.background = `color-mix(in srgb, ${tone} ${Math.round(10 + 55 * value / most)}%, transparent)`;
+        }
+        b.onclick = () => dash.setParams({ intent, target: target === 'Total' ? null : target, step: null });
+        tr.insertCell().append(b);
+      }
+    }
+  });
+
+  dash.draw('agents', (body) => {
+    body.replaceChildren();
+    const found = dash.data('by_agent');
+    if (found.status !== 'ok') return;
+    for (const r of found.data) {
+      const tr = body.insertRow(); tr.dataset.key = HX.enc(r.intent);
+      tr.insertCell().textContent = r.intent;
+      for (const [key] of HX.agents) {
+        const td = tr.insertCell();
+        const v = r[key];
+        const bar = document.createElement('span'); bar.className = 'hx-bar';
+        bar.style.width = `${Math.round(60 * (v || 0))}px`;
+        bar.style.background = HX.isHack(r.intent) ? 'var(--color-bad)' : dash.colors[0];
+        td.append(bar, document.createTextNode(v == null ? '—' : fmtPct(v)));
+      }
+    }
+  });
+
+  const listed = () => {
+    const found = dash.data('shown');
+    if (found.status !== 'ok' || !found.data) return null;
+    const p = dash.params();
+    if (!p.intent) return null;
+    const rows = found.data.filter((s) => s.intent === p.intent && (!p.target || s.target === p.target));
+    const by = p.sort || 'score';
+    const cmp = by === 'sure' ? (a, b) => b.intent_probability - a.intent_probability
+      : by === 'run' ? (a, b) => d3.ascending(a.run_id, b.run_id) || a.step_index - b.step_index
+      : (a, b) => b.hack_score - a.hack_score;
+    return rows.slice().sort(cmp);
+  };
+
+  dash.draw('list_heading', (el) => {
+    const p = dash.params(); const rows = listed();
+    if (!p.intent) { el.textContent = 'Pick a cell above to explore its steps'; return; }
+    el.textContent = `${p.intent} · ${p.target || 'any target'}${rows ? `: ${rows.length} steps` : ''}`;
+  });
+
+  dash.draw('step_list', (box) => {
+    box.replaceChildren();
+    const rows = listed();
+    if (!rows) return;
+    const current = dash.params().step;
+    for (const s of rows) {
+      const b = document.createElement('button');
+      b.type = 'button'; b.className = 'hx-item'; b.setAttribute('role', 'listitem');
+      b.setAttribute('aria-current', String(s.step_id === current));
+      const title = document.createElement('span'); title.textContent = `Task ${s.task} · step ${s.step_index}`;
+      title.dataset.source = 'coded_steps'; title.dataset.field = 'step_id'; title.dataset.where = `step_id=${HX.enc(s.step_id)}`;
+      const meta = document.createElement('small');
+      meta.textContent = `${s.agent} · judge ${fmt2(s.hack_score)} · model ${fmtPct(s.intent_probability)} sure${s.read_by_builder === 'yes' ? ' · read by builder' : ''}`;
+      b.append(title, meta);
+      b.onclick = () => dash.setParams({ step: s.step_id });
+      box.append(b);
+    }
+  });
+
+  const codeBox = (kind, name, prob) => {
+    const box = document.createElement('div'); box.className = 'hx-code';
+    const head = document.createElement('div');
+    const label = document.createElement('span'); label.textContent = kind === 'intent' ? 'Intent: ' : 'Target: ';
+    const b = document.createElement('b'); b.textContent = name;
+    const pr = document.createElement('span'); pr.textContent = ` (${fmtPct(prob)} sure)`;
+    head.append(label, b, pr); box.append(head);
+    const def = definition(kind, name);
+    if (def) { const p = document.createElement('p'); p.textContent = def.definition; box.append(p); }
+    return box;
+  };
+
+  dash.draw('trace', (box) => {
+    box.replaceChildren();
+    const p = dash.params();
+    const coded = indexOf('coded_steps', 'step_id');
+    const runs = indexOf('runs', 'run_id');
+    const steps = indexOf('trace_steps', 'run_id');
+    if (!p.step) {
+      const msg = document.createElement('p'); msg.className = 'hx-note';
+      msg.textContent = 'Pick a step on the left to read it inside its full run.';
+      box.append(msg); return;
+    }
+    if (!coded || !runs || !steps) { box.textContent = '—'; return; }
+    const s = coded.get(p.step);
+    if (!s) { box.textContent = 'Step not found.'; return; }
+    const run = (runs.get(s.run_id) || [])[0];
+    const runSteps = (steps.get(s.run_id) || []).slice().sort((a, b) => a.step_index - b.step_index);
+
+    const head = document.createElement('div'); head.className = 'hx-trace-head';
+    const title = document.createElement('div');
+    const h = document.createElement('h3'); h.className = 'hx-h2';
+    h.textContent = `Task ${s.task} · ${s.agent} · step ${s.step_index} of ${run ? run.num_steps : runSteps.length}`;
+    const sub = document.createElement('div'); sub.className = 'hx-note'; sub.textContent = `${s.run_id} · judge score ${fmt2(s.hack_score)}`;
+    title.append(h, sub);
+    const nav = document.createElement('div'); nav.style.display = 'flex'; nav.style.gap = '6px';
+    const rows = listed() || [];
+    const at = rows.findIndex((r) => r.step_id === s.step_id);
+    for (const [label, delta] of [['Previous', -1], ['Next', 1]]) {
+      const b = document.createElement('button'); b.type = 'button'; b.className = 'hx-btn'; b.textContent = label;
+      const target = rows[at + delta];
+      b.disabled = at < 0 || !target;
+      b.onclick = () => target && dash.setParams({ step: target.step_id });
+      nav.append(b);
+    }
+    head.append(title, nav);
+    box.append(head);
+
+    const codes = document.createElement('div'); codes.className = 'hx-codes';
+    codes.append(codeBox('intent', s.intent, s.intent_probability), codeBox('target', s.target, s.target_probability));
+    box.append(codes);
+
+    if (run) {
+      const task = document.createElement('details'); task.className = 'hx-task hx-step';
+      const sum = document.createElement('summary'); sum.textContent = 'Task given to the agent';
+      const pre = document.createElement('pre'); pre.textContent = run.task_description;
+      task.append(sum, pre); box.append(task);
+    }
+
+    let selectedEl = null;
+    for (const st of runSteps) {
+      const c = coded.get(st.step_id);
+      const d = document.createElement('details'); d.className = 'hx-step';
+      if (st.step_id === s.step_id) { d.classList.add('hx-selected'); d.open = true; selectedEl = d; }
+      const sum = document.createElement('summary');
+      const n = document.createElement('b'); n.textContent = `Step ${st.step_index}`;
+      n.dataset.source = 'trace_steps'; n.dataset.field = 'step_id'; n.dataset.where = `step_id=${HX.enc(st.step_id)}`;
+      sum.append(n);
+      if (c) {
+        const badge = document.createElement('span'); badge.className = 'hx-badge' + (HX.isHack(c.intent) ? ' hx-hack' : '');
+        badge.textContent = c.intent; badge.title = 'Flagged step: click to select';
+        badge.onclick = (e) => { e.preventDefault(); dash.setParams({ step: c.step_id }); };
+        sum.append(badge);
+      }
+      const brief = document.createElement('span'); brief.className = 'hx-sum';
+      brief.textContent = (st.commands || st.reasoning || '').split('\n')[0].slice(0, 160);
+      sum.append(brief);
+      d.append(sum);
+      for (const [label, text, tag] of [['Reasoning', st.reasoning, 'p'], ['Commands', st.commands, 'pre'], ['Output', st.output, 'pre']]) {
+        if (!text) continue;
+        const h4 = document.createElement('h4'); h4.textContent = label;
+        const el = document.createElement(tag); el.textContent = text;
+        d.append(h4, el);
+      }
+      box.append(d);
+    }
+    if (selectedEl && box.dataset.lastStep !== s.step_id) {
+      box.dataset.lastStep = s.step_id;
+      requestAnimationFrame(() => selectedEl.scrollIntoView({ block: 'nearest', behavior: 'auto' }));
+    }
+  });
+
+  dash.draw('codebook', (box) => {
+    box.replaceChildren();
+    const found = dash.data('codebook');
+    if (found.status !== 'ok') { box.textContent = found.status === 'error' ? 'Failed to load' : '—'; return; }
+    for (const kind of ['intent', 'target']) {
+      const h = document.createElement('h3'); h.className = 'hx-h2'; h.style.marginTop = 'var(--cds-gap-lg)';
+      h.textContent = kind === 'intent' ? 'Intents' : 'Targets';
+      const dl = document.createElement('dl');
+      for (const c of found.data.filter((x) => x.kind === kind).sort((a, b) => +a.order - +b.order)) {
+        const dt = document.createElement('dt'); dt.textContent = c.name;
+        const dd = document.createElement('dd'); dd.textContent = c.definition;
+        dl.append(dt, dd);
+        if (c.include) { const i = document.createElement('dd'); i.className = 'hx-muted'; i.textContent = `Includes: ${c.include}`; dl.append(i); }
+        if (c.exclude) { const x = document.createElement('dd'); x.className = 'hx-muted'; x.textContent = `Excludes: ${c.exclude}`; dl.append(x); }
+      }
+      box.append(h, dl);
+    }
+  });
+</script>
