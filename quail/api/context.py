@@ -27,13 +27,14 @@ model regions call ``quail.api.engine.Engine``.
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable
 
 import pyarrow as pa
 
 from quail.api.compile import DATAFUSION_DIALECTS, compile_message
 from quail.api.engine import Engine, engine_description
-from quail.catalog import ScanRequest, TableProvider
+from quail.catalog import MemoryTableProvider, ScanRequest, TableProvider
 
 
 def ipc_bytes(table: pa.Table) -> bytes:
@@ -42,6 +43,22 @@ def ipc_bytes(table: pa.Table) -> bytes:
     with pa.ipc.new_stream(sink, table.schema) as writer:
         writer.write_table(table)
     return sink.getvalue().to_pybytes()
+
+
+def local_files(provider: TableProvider) -> list[str] | None:
+    """Return the local files DataFusion reads in a provider's row order, or None.
+
+    A provider qualifies when its dataset reads every row of its files,
+    on the local file system, in sorted path order, as DataFusion reads
+    them.
+    """
+    if not getattr(provider, "file_format", ""):
+        return None
+    dataset = provider.dataset
+    if dataset.filesystem.type_name != "local":
+        return None
+    files = [os.path.abspath(path) for path in dataset.files]
+    return files if files == sorted(files) else None
 
 
 class SessionContext:
@@ -80,20 +97,32 @@ class SessionContext:
     def register(self, name: str, provider: TableProvider) -> None:
         """Register a table with the session and with DataFusion.
 
-        DataFusion keeps the table's schema only. It scans the provider
-        when an operator outside every model region reads the table.
+        DataFusion holds an in-memory table's batches without a copy, and
+        reads the local files of ``DocumentProvider.from_parquet`` and
+        ``from_ipc`` itself. It streams any other provider's batches,
+        asking only for the columns a query reads.
         """
         self.session.register(name, provider)
         self._register_table(name, provider)
 
     def _register_table(self, name: str, provider: TableProvider) -> None:
-        def scan(columns: list[str]) -> pa.Table:
-            reader = provider.scan(ScanRequest(columns=tuple(columns)))
-            return reader.read_all()
+        id_column = getattr(provider, "id_col", None) or None
+        identity = provider.content_identity()
+        if isinstance(provider, MemoryTableProvider):
+            self._native.register_batches(name, provider.table, id_column, identity)
+            return
+        files = local_files(provider)
+        if files is not None:
+            self._native.register_files(
+                name, provider.file_format, files,
+                ipc_bytes(provider.schema().empty_table()), id_column, identity)
+            return
+
+        def scan(columns: list[str]) -> pa.RecordBatchReader:
+            return provider.scan(ScanRequest(columns=tuple(columns)))
 
         self._native.register(name, ipc_bytes(provider.schema().empty_table()), scan,
-                              getattr(provider, "id_col", None) or None,
-                              provider.content_identity())
+                              id_column, identity)
 
     def sql(self, text: str, dialect: str = "snowflake") -> pa.Table:
         """Run a query and return its rows."""

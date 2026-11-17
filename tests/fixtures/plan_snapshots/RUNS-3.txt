@@ -3,10 +3,12 @@ CooperativeExec
   ModelRegionExec: calls=[ai_filter], tables=[issue_runs@s, issue_runs@f]
     CoalescePartitionsExec
       FilterExec: resolved@3 = 1, projection=[id@0, patch@1, instance_id@2]
-        DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
+        RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+          DataSourceExec: file_groups={1 group: [[<data>/issue_runs.parquet]]}, projection=[id, patch, instance_id, resolved], file_type=parquet, predicate=resolved@7 = 1, pruning_predicate=resolved_null_count@2 != row_count@3 AND resolved_min@0 <= 1 AND 1 <= resolved_max@1, required_guarantees=[resolved in (1)]
     CoalescePartitionsExec
       FilterExec: resolved@3 = 0, projection=[id@0, patch@1, instance_id@2]
-        DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
+        RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+          DataSourceExec: file_groups={1 group: [[<data>/issue_runs.parquet]]}, projection=[id, patch, instance_id, resolved], file_type=parquet, predicate=resolved@7 = 0, pruning_predicate=resolved_null_count@2 != row_count@3 AND resolved_min@0 <= 0 AND 0 <= resolved_max@1, required_guarantees=[resolved in (0)]
 
 model region:
 logical:
@@ -19,7 +21,7 @@ logical:
           TableScan: issue_runs@f
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
-  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
+  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 

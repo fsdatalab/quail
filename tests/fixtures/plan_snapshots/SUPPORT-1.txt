@@ -3,7 +3,8 @@ CooperativeExec
   ModelRegionExec: calls=[ai_filter], tables=[support_messages@u]
     CoalescePartitionsExec
       FilterExec: role@1 = user, projection=[id@0, content@2]
-        DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
+        RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+          DataSourceExec: file_groups={1 group: [[<data>/support_messages.parquet]]}, projection=[id, role, content], file_type=parquet, predicate=role@3 = user, pruning_predicate=role_null_count@2 != row_count@3 AND role_min@0 <= user AND user <= role_max@1, required_guarantees=[role in (user)]
 
 model region:
 logical:
@@ -13,7 +14,7 @@ logical:
         TableScan: support_messages@u
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
-  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
+  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 

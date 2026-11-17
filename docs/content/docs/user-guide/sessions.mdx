@@ -32,6 +32,11 @@ Each table provider needs an `id_col`. The `id_col` value names the column
 used to identify each row. Implement `quail.TableProvider` to read another
 data source.
 
+DataFusion reads each table in Rust. It holds an in-memory table without a
+copy, and reads the local files of `from_parquet` and `from_ipc` in
+parallel. It streams the batches of any other provider, and asks only for
+the columns a query reads.
+
 ## Run a query
 
 For example, the program below registers two reviews and returns each

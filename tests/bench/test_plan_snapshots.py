@@ -48,7 +48,8 @@ def test_every_quailb_query_plans_as_its_snapshot(tmp_path):
             # a plan made before the tokens are counted uses a sample's
             # estimate; waiting re-plans it on the exact counts
             query.plan()
-            text = query.explain() + "\n"
+            # the data's folder differs on each run
+            text = query.explain().replace(str(tmp_path).lstrip("/"), "<data>") + "\n"
             path = SNAPSHOTS / f"{query_id}.txt"
             if update:
                 path.parent.mkdir(parents=True, exist_ok=True)

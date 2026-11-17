@@ -4,7 +4,8 @@ SortExec: TopK(fetch=25), expr=[commit_score@1 DESC NULLS LAST, id@0 ASC NULLS L
     ModelRegionExec: hint=[DynamicFilter [ empty ]], calls=[ai_score], tables=[sales_calls@c]
       CoalescePartitionsExec
         FilterExec: deal_stage@1 = Negotiation, projection=[id@0, transcript@2]
-          DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
+          RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+            DataSourceExec: file_groups={1 group: [[<data>/sales_calls.parquet]]}, projection=[id, deal_stage, transcript], file_type=parquet, predicate=deal_stage@5 = Negotiation, pruning_predicate=deal_stage_null_count@2 != row_count@3 AND deal_stage_min@0 <= Negotiation AND Negotiation <= deal_stage_max@1, required_guarantees=[deal_stage in (Negotiation)]
 
 model region:
 logical:
@@ -14,7 +15,7 @@ logical:
         TableScan: sales_calls@c
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
-  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
+  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 

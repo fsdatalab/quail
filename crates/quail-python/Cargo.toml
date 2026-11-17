@@ -14,7 +14,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 async-trait = "0.1"
 futures = "0.3"
-datafusion = { version = "55.2.0", default-features = false, features = ["sql", "nested_expressions"] }
+datafusion = { version = "55.2.0", default-features = false, features = ["sql", "nested_expressions", "parquet"] }
 # the Arrow C stream interface, to share buffers with pyarrow
 arrow = { version = "59.3.2", default-features = false, features = ["ffi", "ipc"] }
 # a Rust program links libpython and starts the interpreter; maturin sets

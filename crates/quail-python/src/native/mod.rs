@@ -173,7 +173,8 @@ impl NativeSession {
 
     /// Register a table by its schema, given as the IPC stream bytes of
     /// an empty table, and a function `scan(columns)` that returns
-    /// those columns' rows as a pyarrow Table. `id_column` names the
+    /// those columns' rows as an Arrow stream, such as a pyarrow
+    /// RecordBatchReader. `id_column` names the
     /// column whose values are unique, and `identity` the rows.
     #[pyo3(signature = (name, schema, scan, id_column=None, identity=""))]
     fn register(
@@ -194,6 +195,62 @@ impl NativeSession {
             id_column,
             identity,
         )
+        .map_err(python_error)
+    }
+
+    /// Register the rows of `data`, a Python object with an Arrow
+    /// stream such as a pyarrow Table, without copying them.
+    /// `id_column` and `identity` are as [`Self::register`] has them.
+    #[pyo3(signature = (name, data, id_column=None, identity=""))]
+    fn register_batches(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        data: &Bound<'_, PyAny>,
+        id_column: Option<&str>,
+        identity: &str,
+    ) -> PyResult<()> {
+        let reader = crate::pyarrow::stream_from_pyarrow(data)?;
+        let schema = datafusion::arrow::record_batch::RecordBatchReader::schema(&reader);
+        let batches = reader
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| python_error(error.into()))?;
+        py.detach(|| {
+            crate::register_batches(&self.session, name, schema, batches, id_column, identity)
+        })
+        .map_err(python_error)
+    }
+
+    /// Register local files of one `format` ("parquet", "arrow",
+    /// "json", or "csv"), read by DataFusion in the order of `paths`.
+    /// `schema` is the IPC stream bytes of an empty table; `id_column`
+    /// and `identity` are as [`Self::register`] has them.
+    #[pyo3(signature = (name, format, paths, schema, id_column=None, identity=""))]
+    #[allow(clippy::too_many_arguments)]
+    fn register_files(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        format: &str,
+        paths: Vec<String>,
+        schema: &[u8],
+        id_column: Option<&str>,
+        identity: &str,
+    ) -> PyResult<()> {
+        let reader = StreamReader::try_new(Cursor::new(schema), None)
+            .map_err(|error| python_error(error.into()))?;
+        let schema = reader.schema();
+        py.detach(|| {
+            crate::register_files(
+                &self.session,
+                name,
+                format,
+                &paths,
+                schema,
+                id_column,
+                identity,
+            )
+        })
         .map_err(python_error)
     }
 

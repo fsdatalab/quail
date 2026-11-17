@@ -61,3 +61,14 @@ def test_create_view_and_set_use_the_same_session(context):
     value = context.sql("SHOW datafusion.execution.target_partitions")
     assert value.column(1).to_pylist() == ["1"]
     context.sql("DROP VIEW all_reviews")
+
+
+def test_create_external_table_reads_parquet_files(context, tmp_path):
+    import pyarrow.parquet as pq
+
+    pq.write_table(pa.table({"id": ["p0", "p1"], "stars": [5, 2]}),
+                   tmp_path / "ratings.parquet")
+    context.sql(f"CREATE EXTERNAL TABLE ratings STORED AS PARQUET "
+                f"LOCATION '{tmp_path}/'")
+    result = context.sql("SELECT id FROM ratings WHERE stars > 3")
+    assert result.column(0).to_pylist() == ["p0"]

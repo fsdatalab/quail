@@ -29,7 +29,8 @@ pub use quail::{
 };
 
 pub use crate::engine::{
-    executor_with_engine, executor_with_planner, register_python_table, scans_to_pyarrow,
+    executor_with_engine, executor_with_planner, register_batches, register_files,
+    register_python_table, scans_to_pyarrow,
 };
 
 /// A Python exception as a DataFusion error with its traceback and

@@ -17,8 +17,8 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{Constraints, DataFusionError, Result};
 use datafusion::datasource::TableType;
-use datafusion::datasource::memory::MemorySourceConfig;
-use datafusion::logical_expr::{Expr, LogicalPlan};
+use datafusion::execution::SessionState;
+use datafusion::logical_expr::{Expr, LogicalPlan, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use std::collections::{BTreeMap, HashMap};
 
@@ -1524,17 +1524,17 @@ fn conform(batch: RecordBatch, names: &[String], schema: &SchemaRef) -> Result<R
     Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
 }
 
-/// Returns the named columns of a table's rows.
-pub type Scan = Arc<dyn Fn(Vec<String>) -> Result<Vec<RecordBatch>> + Send + Sync>;
-
-/// A table whose rows a function returns on each scan.
+/// A table whose rows `inner` holds, which DataFusion and model regions
+/// both read.
 ///
 /// Model regions read it through the planner, which keeps its token
-/// counts, so DataFusion scans it only for operators outside every
-/// region.
+/// counts. Every scan returns the rows in the same order, because a
+/// region finds each row by its position.
 pub struct ScannedTable {
     pub(crate) schema: SchemaRef,
-    pub(crate) scan: Scan,
+    pub(crate) inner: Arc<dyn TableProvider>,
+    /// The session state a model region scans `inner` with.
+    pub(crate) state: SessionState,
     /// The id column as a primary key, which DataFusion's rules read.
     pub(crate) constraints: Constraints,
 }
@@ -1548,13 +1548,55 @@ impl std::fmt::Debug for ScannedTable {
 }
 
 impl ScannedTable {
+    /// A table whose rows `inner` holds, scanned with `state`, keyed by
+    /// `constraints`.
+    pub fn new(
+        inner: Arc<dyn TableProvider>,
+        state: SessionState,
+        constraints: Constraints,
+    ) -> Self {
+        Self {
+            schema: inner.schema(),
+            inner,
+            state,
+            constraints,
+        }
+    }
+
     /// One column of the table's rows.
     fn column_rows(&self, name: &str) -> Result<Vec<RecordBatch>> {
         self.scan_columns(vec![name.to_string()])
     }
 
+    /// The named columns of every row, partition by partition, in order.
     fn scan_columns(&self, columns: Vec<String>) -> Result<Vec<RecordBatch>> {
-        (self.scan)(columns)
+        let projection = columns
+            .iter()
+            .map(|column| self.schema.index_of(column))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let read = async {
+            let plan = self
+                .inner
+                .scan(&self.state, Some(&projection), &[], None)
+                .await?;
+            let context = self.state.task_ctx();
+            let mut batches = Vec::new();
+            let num_partitions = plan.properties().output_partitioning().partition_count();
+            for partition in 0..num_partitions {
+                let stream = plan.execute(partition, Arc::clone(&context))?;
+                batches.extend(datafusion::physical_plan::common::collect(stream).await?);
+            }
+            Ok(batches)
+        };
+        // a region plans on a blocking thread of the session's runtime, or
+        // on the caller's thread with no runtime
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => tokio::task::block_in_place(|| runtime.block_on(read)),
+            Err(_) => tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(read),
+        }
     }
 }
 
@@ -1572,35 +1614,21 @@ impl TableProvider for ScannedTable {
         Some(&self.constraints)
     }
 
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>> {
+        self.inner.supports_filters_pushdown(filters)
+    }
+
     async fn scan(
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        _limit: Option<usize>,
+        filters: &[Expr],
+        limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let schema = match projection {
-            Some(indices) => Arc::new(self.schema.project(indices)?),
-            None => Arc::clone(&self.schema),
-        };
-        let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
-        let batches = self.scan_columns(columns)?;
-        // one partition per thread DataFusion runs, each a slice of the
-        // rows, so the operators above read the table in parallel
-        let num_partitions = state.config().target_partitions().max(1);
-        let mut partitions: Vec<Vec<RecordBatch>> = vec![Vec::new(); num_partitions];
-        for batch in batches {
-            let size = batch.num_rows().div_ceil(num_partitions).max(1);
-            let mut offset = 0;
-            let mut index = 0;
-            while offset < batch.num_rows() {
-                let length = size.min(batch.num_rows() - offset);
-                partitions[index % num_partitions].push(batch.slice(offset, length));
-                offset += length;
-                index += 1;
-            }
-        }
-        Ok(MemorySourceConfig::try_new_exec(&partitions, schema, None)?)
+        self.inner.scan(state, projection, filters, limit).await
     }
 }
 

@@ -9,7 +9,8 @@ SortPreservingMergeExec: [flagged@1 DESC NULLS LAST, model@0 ASC NULLS LAST]
               ModelRegionExec: calls=[ai_filter], tables=[wrench_runs@w]
                 CoalescePartitionsExec
                   FilterExec: mode@1 = baseline, projection=[model@0, transcript@2, id@3]
-                    DataSourceExec: partitions=4, partition_sizes=[1, 1, 1, 0]
+                    RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+                      DataSourceExec: file_groups={1 group: [[<data>/wrench_runs.parquet]]}, projection=[model, mode, transcript, id], file_type=parquet, predicate=mode@3 = baseline, pruning_predicate=mode_null_count@2 != row_count@3 AND mode_min@0 <= baseline AND baseline <= mode_max@1, required_guarantees=[mode in (baseline)]
 
 model region:
 logical:
@@ -19,7 +20,7 @@ logical:
         TableScan: wrench_runs@w
 
 physical: backend=quail, model=qwen3-4b-fp8, gpus=1
-  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
+  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
   architecture=qwen3 (36 layers), weights=fp8
   kernels: linear layers: fp8 GEMM (DeepGEMM)
 

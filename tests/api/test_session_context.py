@@ -762,3 +762,67 @@ rows 2
   v0, 'a'
   v1, NULL
 """)
+
+
+def _filtered_ids(provider) -> list[str]:
+    """The ids ORACLE's first filter keeps of the reviews ``provider`` holds."""
+    session = quail.Session(CONFIG, tokenizer=TOKENIZER)
+    try:
+        ORACLE.catalog = session.catalog
+        context = quail.SessionContext(
+            session, physical_executor=oracle_executor(ORACLE))
+        context.register("reviews", provider)
+        return context.sql(
+            "SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) "
+            "ORDER BY r.id").column(0).to_pylist()
+    finally:
+        session.close()
+
+
+def test_a_parquet_table_of_several_files_answers_each_row(tmp_path):
+    import pyarrow.parquet as pq
+
+    pq.write_table(REVIEWS.slice(0, 2), tmp_path / "a.parquet", row_group_size=1)
+    pq.write_table(REVIEWS.slice(2), tmp_path / "b.parquet", row_group_size=1)
+    provider = quail.DocumentProvider.from_parquet(str(tmp_path), id_col="id")
+    assert _filtered_ids(provider) == ["r0", "r2", "r3"]
+
+
+class _AskedColumns:
+    """REVIEWS as a provider of its own, which records the columns each scan asks."""
+
+    id_col = "id"
+    columns = tuple(REVIEWS.column_names)
+
+    def __init__(self):
+        self.asked = []
+        self._rows = quail.DocumentProvider.from_table(REVIEWS, id_col="id")
+
+    def schema(self):
+        return REVIEWS.schema
+
+    def content_identity(self):
+        return "asked-columns"
+
+    def statistics(self):
+        return self._rows.statistics()
+
+    def scan(self, request):
+        self.asked.append(request.columns)
+        return self._rows.scan(request)
+
+
+def test_a_python_provider_streams_only_the_columns_a_query_reads():
+    provider = _AskedColumns()
+    assert _filtered_ids(provider) == ["r0", "r2", "r3"]
+    session = quail.Session(CONFIG, tokenizer=TOKENIZER)
+    try:
+        context = quail.SessionContext(session)
+        context.register("reviews", provider)
+        provider.asked.clear()
+        table = context.sql(
+            "SELECT r.id FROM reviews r WHERE r.stars > 3 ORDER BY r.id")
+    finally:
+        session.close()
+    assert table.column(0).to_pylist() == ["r0", "r2"]
+    assert provider.asked == [("id", "stars")]

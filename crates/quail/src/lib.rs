@@ -81,7 +81,7 @@ pub use crate::images::{ImageSizing, image_size};
 
 pub use crate::executor::{
     EngineRegion, Executor, InputHint, Observer, RegionEngine, RegionEvent, RegionRan, RegionSink,
-    Scan, ScannedTable, region_json,
+    ScannedTable, region_json,
 };
 
 /// The model and hardware a [`Session`] runs on.
@@ -218,9 +218,9 @@ impl Session {
         Ok(())
     }
 
-    /// Register a table whose rows `scan(columns)` returns, the same
-    /// rows whenever it is scanned, which `identity` names. `id_column`
-    /// names the column whose values are unique.
+    /// Register `table`, whose rows are the same whenever it is
+    /// scanned, which `identity` names. `id_column` names the column
+    /// whose values are unique.
     ///
     /// # Errors
     ///
@@ -228,11 +228,11 @@ impl Session {
     pub fn register_scanned_table(
         &self,
         name: &str,
-        schema: SchemaRef,
-        scan: Scan,
+        table: Arc<dyn TableProvider>,
         id_column: Option<&str>,
         identity: &str,
     ) -> Result<()> {
+        let schema = table.schema();
         let keys: Vec<usize> = id_column
             .and_then(|column| schema.index_of(column).ok())
             .into_iter()
@@ -242,11 +242,15 @@ impl Session {
         } else {
             Constraints::new_unverified(vec![Constraint::PrimaryKey(keys)])
         };
-        let table = ScannedTable {
-            schema,
-            scan,
-            constraints,
-        };
+        // the context's configuration and object stores, without its
+        // catalog, which will hold the table
+        let state = self.context.state();
+        let state = datafusion::execution::SessionStateBuilder::new()
+            .with_config(state.config().clone())
+            .with_runtime_env(Arc::clone(state.runtime_env()))
+            .with_default_features()
+            .build();
+        let table = ScannedTable::new(table, state, constraints);
         self.register_table(
             name,
             Arc::new(IdentifiedTable::new(Arc::new(table), identity)),
