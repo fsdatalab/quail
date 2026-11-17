@@ -37,8 +37,14 @@ DataFusion, such as a Delta Lake or Iceberg table, and a
 `quail.TableProvider`, a class you write to read any other source.
 `DocumentProvider.from_hf(dataset, id_col)` reads a Hugging Face dataset.
 
-A table that SQL creates, such as with `CREATE VIEW`, stays until the
-session closes.
+SQL can also create a table. The table stays until the session closes, so
+a later query can read it:
+
+```python
+session.sql("CREATE VIEW long_reviews AS "
+            "SELECT * FROM reviews WHERE length(body) > 500").run()
+session.sql("SELECT COUNT(*) FROM long_reviews").run()
+```
 
 ## Run a query
 
