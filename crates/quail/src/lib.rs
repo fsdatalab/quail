@@ -132,6 +132,10 @@ impl std::fmt::Debug for Session {
     }
 }
 
+/// The rows of each batch a model region reads from a registered table,
+/// as Python's `ScanRequest.batch_rows` has them.
+pub const SCAN_BATCH_ROWS: usize = 65_536;
+
 /// Register `table` under `name` in `context`.
 ///
 /// # Errors
@@ -180,10 +184,11 @@ pub fn register_scanned_table(
         Constraints::new_unverified(vec![Constraint::PrimaryKey(keys)])
     };
     // the context's configuration and object stores, without its
-    // catalog, which will hold the table
+    // catalog, which will hold the table; the planner reads rows in
+    // batches of SCAN_BATCH_ROWS
     let state = context.state();
     let state = datafusion::execution::SessionStateBuilder::new()
-        .with_config(state.config().clone())
+        .with_config(state.config().clone().with_batch_size(SCAN_BATCH_ROWS))
         .with_runtime_env(Arc::clone(state.runtime_env()))
         .with_default_features()
         .build();

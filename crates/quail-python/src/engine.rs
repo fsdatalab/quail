@@ -378,6 +378,20 @@ pub fn register_batches(
     id_column: Option<&str>,
     identity: &str,
 ) -> Result<()> {
+    // slices over the same buffers, in the batches the planner reads
+    let batches = batches
+        .iter()
+        .flat_map(|batch| {
+            (0..batch.num_rows())
+                .step_by(quail::SCAN_BATCH_ROWS)
+                .map(|offset| {
+                    batch.slice(
+                        offset,
+                        quail::SCAN_BATCH_ROWS.min(batch.num_rows() - offset),
+                    )
+                })
+        })
+        .collect();
     let table = MemTable::try_new(schema, vec![batches])?;
     quail::register_scanned_table(context, name, Arc::new(table), id_column, identity)
 }

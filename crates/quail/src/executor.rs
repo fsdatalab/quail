@@ -1580,11 +1580,23 @@ impl ScannedTable {
                 .scan(&self.state, Some(&projection), &[], None)
                 .await?;
             let context = self.state.task_ctx();
-            let mut batches = Vec::new();
             let num_partitions = plan.properties().output_partitioning().partition_count();
-            for partition in 0..num_partitions {
-                let stream = plan.execute(partition, Arc::clone(&context))?;
-                batches.extend(datafusion::physical_plan::common::collect(stream).await?);
+            // each partition decodes on its own thread; the rows keep
+            // partition order
+            let tasks = (0..num_partitions)
+                .map(|partition| {
+                    let stream = plan.execute(partition, Arc::clone(&context))?;
+                    Ok(tokio::spawn(datafusion::physical_plan::common::collect(
+                        stream,
+                    )))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut batches = Vec::new();
+            for task in tasks {
+                batches.extend(
+                    task.await
+                        .map_err(|error| DataFusionError::External(Box::new(error)))??,
+                );
             }
             Ok(batches)
         };
@@ -1592,12 +1604,19 @@ impl ScannedTable {
         // on the caller's thread with no runtime
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => tokio::task::block_in_place(|| runtime.block_on(read)),
-            Err(_) => tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?
-                .block_on(read),
+            Err(_) => scan_runtime()?.block_on(read),
         }
     }
+}
+
+/// The runtime a [`ScannedTable`] scans on when its caller has none.
+fn scan_runtime() -> Result<&'static tokio::runtime::Runtime> {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    if let Some(runtime) = RUNTIME.get() {
+        return Ok(runtime);
+    }
+    let runtime = crate::runtime()?;
+    Ok(RUNTIME.get_or_init(|| runtime))
 }
 
 #[async_trait]
