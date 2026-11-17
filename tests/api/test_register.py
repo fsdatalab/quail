@@ -55,9 +55,10 @@ def test_register_refuses_an_id_column_the_table_lacks(session):
         session.register("reviews", REVIEWS, id_col="key")
 
 
+@pytest.mark.parametrize("id_col", ["id", ""], ids=["keyed", "unkeyed"])
 @pytest.mark.parametrize("file_format", ["parquet", "json", "csv"])
 def test_a_file_loader_registers_files_that_datafusion_reads(session, tmp_path,
-                                                             file_format):
+                                                             file_format, id_col):
     path = tmp_path / f"reviews.{file_format}"
     if file_format == "parquet":
         pq.write_table(REVIEWS, path)
@@ -67,5 +68,11 @@ def test_a_file_loader_registers_files_that_datafusion_reads(session, tmp_path,
     else:
         path.write_text("id,body\n" + "".join(f"{row['id']},{row['body']}\n"
                                               for row in REVIEWS.to_pylist()))
-    getattr(session, f"register_{file_format}")("reviews", str(path))
+    getattr(session, f"register_{file_format}")("reviews", str(path), id_col=id_col)
     assert _kept(session) == ["r0", "r2", "r3"]
+
+
+def test_a_file_loader_refuses_an_id_column_the_files_lack(session, tmp_path):
+    pq.write_table(REVIEWS, tmp_path / "reviews.parquet")
+    with pytest.raises(CompileError, match="'key' not in"):
+        session.register_parquet("reviews", str(tmp_path), id_col="key")

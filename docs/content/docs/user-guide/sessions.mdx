@@ -26,12 +26,11 @@ when you leave out `id_col`.
 To register files, give their path:
 
 ```python
-session.register_parquet("reviews", "data/reviews/")
+session.register_parquet("reviews", "data/reviews/", id_col="id")
 ```
 
 `register_json` reads newline-delimited JSON, and `register_csv` reads CSV
-files whose first line names the columns. To give Parquet files an id
-column, register `quail.DocumentProvider.from_parquet(path, id_col)`.
+files whose first line names the columns.
 
 `session.register` also takes a table from another library built on Apache
 DataFusion, such as a Delta Lake or Iceberg table, and a

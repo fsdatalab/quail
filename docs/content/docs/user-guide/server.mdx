@@ -40,8 +40,7 @@ Later queries reuse the loaded model.
 
 Pass the server address as `endpoint`. The client uploads each registered
 table and sends SQL to the server over Arrow Flight, a gRPC protocol for
-moving Arrow tables between processes. The server reads the path of
-`register_parquet`, `register_json`, or `register_csv`.
+moving Arrow tables between processes.
 
 ```python
 import pyarrow as pa

@@ -79,9 +79,9 @@ def _table_reader(table: pa.Table, batch_rows: int) -> pa.RecordBatchReader:
 class ArrowDatasetProvider:
     """Table provider backed by a PyArrow dataset.
 
-    ``file_format`` is "parquet" or "arrow" when the dataset reads every
-    row of its files and nothing else, so DataFusion can read the files
-    itself; empty otherwise.
+    ``file_format`` is "parquet", "arrow", "json", or "csv" when the
+    dataset reads every row of its files and nothing else, so DataFusion
+    can read the files itself; empty otherwise.
     """
 
     dataset: Any

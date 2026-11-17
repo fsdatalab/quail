@@ -11,7 +11,8 @@ from quail.api.config import EngineConfig, resolve_model
 from quail.api.context import as_provider, register_provider
 from quail.api.query import QueryLike
 from quail.builtins import built_in_registry
-from quail.catalog import Catalog
+from quail.catalog import ArrowDatasetProvider, Catalog
+from quail.common.expressions import CompileError
 from quail.common.tokens import Tokenizer
 from quail.extensions import ExtensionRegistry
 from quail.physical.plan import Refusal, RefusalError
@@ -128,37 +129,39 @@ class Session:
             del self.catalog.providers[name]
             raise
 
-    def register_parquet(self, name: str, path: str) -> None:
-        """Register the Parquet file or folder at ``path``, which DataFusion reads.
+    def register_parquet(self, name: str, path: str, id_col: str = "") -> None:
+        """Register the Parquet file or folder at ``path``.
 
-        A remote session's server reads ``path``.
+        ``id_col`` is as ``register`` has it. DataFusion reads local
+        files itself; a remote session uploads the rows.
         """
-        self._register_files(name, path, "PARQUET")
+        self._register_files(name, path, "parquet", id_col)
 
-    def register_json(self, name: str, path: str) -> None:
+    def register_json(self, name: str, path: str, id_col: str = "") -> None:
         """Register the newline-delimited JSON file or folder at ``path``.
 
-        A remote session's server reads ``path``.
+        ``id_col`` is as ``register`` has it.
         """
-        self._register_files(name, path, "JSON")
+        self._register_files(name, path, "json", id_col)
 
-    def register_csv(self, name: str, path: str) -> None:
+    def register_csv(self, name: str, path: str, id_col: str = "") -> None:
         """Register the CSV file or folder at ``path``.
 
-        The first line of each file names its columns.
-
-        A remote session's server reads ``path``.
+        The first line of each file names its columns. ``id_col`` is as
+        ``register`` has it.
         """
-        self._register_files(name, path, "CSV")
+        self._register_files(name, path, "csv", id_col)
 
-    def _register_files(self, name: str, path: str, file_format: str) -> None:
-        location = os.fspath(path).replace("'", "''")
-        query = self.sql(f"CREATE EXTERNAL TABLE {name} STORED AS {file_format} "
-                         f"LOCATION '{location}'")
-        if self._remote is None:
-            query.run()
-        else:
-            query.submit().result()
+    def _register_files(self, name: str, path: str, file_format: str,
+                        id_col: str) -> None:
+        import pyarrow.dataset as ds
+
+        dataset = ds.dataset(os.fspath(path), format=file_format)
+        if id_col and id_col not in dataset.schema.names:
+            raise CompileError(
+                f"id column {id_col!r} not in {path!r}, whose columns are "
+                f"{tuple(dataset.schema.names)}")
+        self.register(name, ArrowDatasetProvider(dataset, id_col, file_format))
 
     def sql(self, text: str, order: str | None = None,
             dialect: SQLDialect | str = SQLDialect.SNOWFLAKE) -> QueryLike:
