@@ -88,6 +88,13 @@ pub fn attention_pair_flops(model: &ModelSpec) -> (i64, i64) {
     (full, sliding_flops)
 }
 
+/// Weight bytes per MLP parameter: its own precision's, or the model's.
+fn mlp_weight_bytes(model: &ModelSpec) -> f64 {
+    model
+        .mlp_weight_precision
+        .map_or(model.w_bytes, Precision::bytes)
+}
+
 /// The modeled decoder components, with a readout when the work has answer rows.
 ///
 /// # Panics
@@ -117,8 +124,10 @@ pub fn dense_decoder_components(work: &Work, model: &ModelSpec, passes: f64) -> 
         CostComponent {
             name: "mlp",
             flops: (2.0 * mlp as f64) * &work.tokens,
-            bytes_moved: Quantity::Scalar(mlp_weight_params(model) as f64 * model.w_bytes * passes),
-            precision: model.weight_precision,
+            bytes_moved: Quantity::Scalar(
+                mlp_weight_params(model) as f64 * mlp_weight_bytes(model) * passes,
+            ),
+            precision: model.mlp_weight_precision.unwrap_or(model.weight_precision),
             gemm: true,
         },
         CostComponent {
@@ -147,7 +156,7 @@ pub fn dense_decoder_components(work: &Work, model: &ModelSpec, passes: f64) -> 
         components.push(CostComponent {
             name: "gdn_proj",
             flops: (2.0 * separate_gdn as f64) * &work.tokens,
-            bytes_moved: Quantity::Scalar((separate_gdn * precision.bytes()) as f64 * passes),
+            bytes_moved: Quantity::Scalar(separate_gdn as f64 * precision.bytes() * passes),
             precision,
             gemm: true,
         });

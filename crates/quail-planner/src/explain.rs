@@ -1941,6 +1941,12 @@ fn architecture_lines(spec: Option<&Value>) -> Vec<String> {
         {
             gemm += &format!(" (recurrent projections {})", py_str(recurrent));
         }
+        if let Some(mlp) = spec
+            .get("mlp_weight_precision")
+            .filter(|value| !value.is_null())
+        {
+            gemm += &format!(" (MLP projections {})", py_str(mlp));
+        }
     }
     let mut paths = vec![format!("linear layers: {gemm}")];
     if spec["attention_mask"].as_str() == Some("set") {

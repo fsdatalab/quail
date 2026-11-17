@@ -33,6 +33,10 @@ class QuailBackend:
             return SupportResult.reject(
                 f"Quail does not support model {model.name!r}: "
                 f"no forward pass for architecture {model.arch!r}")
+        if model.mlp_weight_precision == "fp4" and not device.fp4_flops:
+            return SupportResult.reject(
+                f"{model.name!r} runs FP4 GEMMs, and device {device.name!r} "
+                f"has no FP4 tensor cores; use a Blackwell GPU such as b200")
         if gpus not in {1, 2, 4, 8}:
             return SupportResult.reject(
                 "Quail requires 1, 2, 4, or 8 GPUs")

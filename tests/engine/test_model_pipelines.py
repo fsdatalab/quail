@@ -9,6 +9,7 @@ from quail.backends.quail.backend import QuailBackend
 from quail.backends.quail.executor.models import build_pipeline, supported_archs
 from quail.baselines.request import RequestBackend
 from quail.specs import (
+    B200,
     H100_SXM,
     LFM2_2_6B_BF16,
     MODELS,
@@ -21,7 +22,8 @@ from quail.specs import (
 def test_backends_support_registered_generative_models_and_refuse_others():
     for model in MODELS.values():
         assert model.arch in supported_archs()
-        assert QuailBackend().supports(model, H100_SXM, 1).supported
+        device = B200 if model.mlp_weight_precision == "fp4" else H100_SXM
+        assert QuailBackend().supports(model, device, 1).supported
 
     assert QuailBackend().supports(QWEN3_5_4B_BF16, H100_SXM, 1).supported
     assert QuailBackend().supports(LFM2_2_6B_BF16, H100_SXM, 1).supported

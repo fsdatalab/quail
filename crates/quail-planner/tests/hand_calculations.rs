@@ -6,8 +6,9 @@ use std::path::Path;
 
 use quail_planner::cost::dense_decoder_cost::{dense_decoder_components, dense_params};
 use quail_planner::cost::quantity::Quantity;
+use quail_planner::cost::roofline::CostComponent;
 use quail_planner::cost::sol::speed_of_light;
-use quail_planner::cost::specs::{DeviceSpec, ModelSpec, read_devices, read_models};
+use quail_planner::cost::specs::{DeviceSpec, ModelSpec, Precision, read_devices, read_models};
 use quail_planner::cost::work::{Work, ask, scan, stream};
 
 fn data() -> &'static Path {
@@ -23,6 +24,10 @@ fn models() -> BTreeMap<String, ModelSpec> {
 
 fn h100() -> DeviceSpec {
     read_devices(&data().join("devices")).expect("device specs")["h100-sxm"].clone()
+}
+
+fn b200() -> DeviceSpec {
+    read_devices(&data().join("devices")).expect("device specs")["b200"].clone()
 }
 
 fn value(quantity: &Quantity) -> f64 {
@@ -118,6 +123,42 @@ fn qwen3_4b_reads_each_dense_weight_once_per_pass() {
     larger_copy.w_mem_bytes = 150e9;
     let larger = speed_of_light(&work, &larger_copy, &h100(), 110_376, 0);
     assert!((larger.seconds() - result.seconds()).abs() <= 1e-12 * result.seconds());
+}
+
+#[test]
+fn qwen3_8_nvfp4_runs_its_mlp_at_fp4_and_its_other_projections_at_fp8() {
+    let models = models();
+    let (fp8, nvfp4) = (&models["qwen3.8-27b-fp8"], &models["qwen3.8-27b-nvfp4"]);
+    let work = &ask(&q(400.0), &q(50.0), 0) * 1000.0;
+    let fp8_parts = dense_decoder_components(&work, fp8, 1.0);
+    let nvfp4_parts = dense_decoder_components(&work, nvfp4, 1.0);
+    let part = |parts: &[CostComponent], name: &str| {
+        parts
+            .iter()
+            .find(|component| component.name == name)
+            .expect(name)
+            .clone()
+    };
+    let (fp8_mlp, nvfp4_mlp) = (part(&fp8_parts, "mlp"), part(&nvfp4_parts, "mlp"));
+    assert_eq!(
+        (fp8_mlp.precision, nvfp4_mlp.precision),
+        (Precision::Fp8, Precision::Fp4)
+    );
+    assert_eq!(value(&nvfp4_mlp.flops), value(&fp8_mlp.flops));
+    assert_eq!(
+        value(&nvfp4_mlp.bytes_moved),
+        0.5625 * value(&fp8_mlp.bytes_moved)
+    );
+    assert_eq!(
+        part(&nvfp4_parts, "attn_proj"),
+        part(&fp8_parts, "attn_proj")
+    );
+    let fp8_seconds = speed_of_light(&work, fp8, &b200(), 110_376, 0).seconds();
+    let nvfp4_seconds = speed_of_light(&work, nvfp4, &b200(), 110_376, 0).seconds();
+    assert!(
+        nvfp4_seconds < fp8_seconds,
+        "{nvfp4_seconds} >= {fp8_seconds}"
+    );
 }
 
 #[test]

@@ -463,6 +463,7 @@ fn projection_shapes(model: &ModelSpec) -> Vec<(i64, i64, i64, Precision)> {
     let qkv_out = (query_width * model.num_q_heads + 2 * model.num_kv_heads) * model.d_head;
     let attention = model.attention_layers().len() as i64;
     let precision = model.weight_precision;
+    let mlp_precision = model.mlp_weight_precision.unwrap_or(precision);
     let mut shapes = vec![
         (model.hidden, qkv_out, attention, precision),
         (
@@ -471,8 +472,13 @@ fn projection_shapes(model: &ModelSpec) -> Vec<(i64, i64, i64, Precision)> {
             attention,
             precision,
         ),
-        (model.hidden, model.ffn_width, model.layers, precision),
-        (model.intermediate(), model.hidden, model.layers, precision),
+        (model.hidden, model.ffn_width, model.layers, mlp_precision),
+        (
+            model.intermediate(),
+            model.hidden,
+            model.layers,
+            mlp_precision,
+        ),
     ];
     let gdn = model.gdn_layers().len() as i64;
     if gdn != 0 {
@@ -506,7 +512,7 @@ pub fn compute_knee(model: &ModelSpec, device: &DeviceSpec) -> Result<f64, Strin
         let share = layers as f64 / model.layers as f64;
         let params = share * din as f64 * dout as f64;
         compute_seconds += 2.0 * params / device.gemm_flops(precision);
-        weight_bytes += params * precision.bytes() as f64;
+        weight_bytes += params * precision.bytes();
         activation_bytes += share * (din + dout) as f64 * ACT_BYTES as f64;
     }
     let denominator = compute_seconds * device.hbm_bw - activation_bytes;

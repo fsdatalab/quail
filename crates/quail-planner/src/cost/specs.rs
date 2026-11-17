@@ -41,6 +41,7 @@ pub struct SaeSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Precision {
+    Fp4,
     Fp8,
     Bf16,
     Fp32,
@@ -48,11 +49,13 @@ pub enum Precision {
 
 impl Precision {
     /// Bytes per element at this precision.
-    pub fn bytes(self) -> i64 {
+    pub fn bytes(self) -> f64 {
         match self {
-            Self::Fp8 => 1,
-            Self::Bf16 => 2,
-            Self::Fp32 => 4,
+            // NVFP4: a 4-bit value and one fp8 scale per 16 values
+            Self::Fp4 => 0.5625,
+            Self::Fp8 => 1.0,
+            Self::Bf16 => 2.0,
+            Self::Fp32 => 4.0,
         }
     }
 }
@@ -207,6 +210,8 @@ pub struct ModelSpec {
     pub gdn_value_dim: i64,
     #[serde(default)]
     pub gdn_weight_precision: Option<Precision>,
+    #[serde(default)]
+    pub mlp_weight_precision: Option<Precision>,
     #[serde(default)]
     pub conv_width: i64,
     #[serde(default)]
@@ -436,6 +441,8 @@ pub struct DeviceSpec {
     pub bf16_flops: f64,
     pub fp32_flops: f64,
     #[serde(default)]
+    pub fp4_flops: f64,
+    #[serde(default)]
     pub usd_per_hour: f64,
     #[serde(default)]
     pub price_source: String,
@@ -455,6 +462,7 @@ impl DeviceSpec {
     /// Arithmetic throughput for one component precision.
     pub fn arithmetic_bandwidth(&self, precision: Precision) -> f64 {
         match precision {
+            Precision::Fp4 => self.fp4_flops,
             Precision::Fp8 => self.fp8_flops,
             Precision::Bf16 => self.bf16_flops,
             Precision::Fp32 => self.fp32_flops,
@@ -466,7 +474,7 @@ impl DeviceSpec {
         let measured = match precision {
             Precision::Fp8 => self.mamf_fp8_flops,
             Precision::Bf16 => self.mamf_bf16_flops,
-            Precision::Fp32 => 0.0,
+            Precision::Fp4 | Precision::Fp32 => 0.0,
         };
         if measured != 0.0 {
             measured

@@ -53,7 +53,7 @@ mod tests {
     fn every_built_in_spec_reads() {
         let models = read_models(&data("models")).unwrap();
         let devices = read_devices(&data("devices")).unwrap();
-        assert_eq!(models.len(), 15);
+        assert_eq!(models.len(), 16);
         assert_eq!(devices.len(), 4);
         for model in models.values() {
             let json = serde_json::to_value(model).unwrap();
@@ -77,6 +77,7 @@ mod tests {
             "weight_precision",
             "attention_precision",
             "gdn_weight_precision",
+            "mlp_weight_precision",
         ] {
             for malformed in ["\"fp16\"", "\"FP8\"", "\"\"", "8"] {
                 let invalid = format!("{source}\n{field} = {malformed}\n");
@@ -96,9 +97,10 @@ mod tests {
     fn precision_wire_strings_and_device_rates_are_preserved() {
         let devices = read_devices(&data("devices")).unwrap();
         for (precision, wire, bytes) in [
-            (Precision::Fp8, "fp8", 1),
-            (Precision::Bf16, "bf16", 2),
-            (Precision::Fp32, "fp32", 4),
+            (Precision::Fp4, "fp4", 0.5625),
+            (Precision::Fp8, "fp8", 1.0),
+            (Precision::Bf16, "bf16", 2.0),
+            (Precision::Fp32, "fp32", 4.0),
         ] {
             assert_eq!(serde_json::to_value(precision).unwrap(), wire);
             assert_eq!(
@@ -108,6 +110,7 @@ mod tests {
             assert_eq!(precision.bytes(), bytes);
             for device in devices.values() {
                 let (peak, measured) = match precision {
+                    Precision::Fp4 => (device.fp4_flops, 0.0),
                     Precision::Fp8 => (device.fp8_flops, device.mamf_fp8_flops),
                     Precision::Bf16 => (device.bf16_flops, device.mamf_bf16_flops),
                     Precision::Fp32 => (device.fp32_flops, 0.0),
