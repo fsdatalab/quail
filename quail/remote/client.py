@@ -7,6 +7,7 @@ the session has an endpoint.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from collections.abc import Iterator
@@ -16,7 +17,7 @@ import pyarrow as pa
 import pyarrow.flight as flight
 
 from quail.catalog.providers import ScanRequest
-from quail.execution.result import QueryResult
+from quail.execution.result import QueryResult, limited_batches
 
 DEFAULT_WAIT_S = 1.0
 TOKEN_VARIABLE = "QUAIL_SERVER_TOKEN"
@@ -191,6 +192,16 @@ class ServerClient:
         ticket = flight.Ticket(json.dumps({"query_id": query_id}).encode())
         return self._flight.do_get(ticket, self._options).to_reader()
 
+    def stream_batches(self, query_id: str) -> pa.RecordBatchReader:
+        """Return a submission's rows as the server's query produces them.
+
+        The reader waits while the submission waits its turn, and raises
+        an error if the submission fails or is cancelled.
+        """
+        ticket = flight.Ticket(json.dumps({
+            "query_id": query_id, "stream": True}).encode())
+        return self._flight.do_get(ticket, self._options).to_reader()
+
 
 class QueryRun:
     """One query the server took: its status, and its rows once it succeeds."""
@@ -320,10 +331,35 @@ class RemoteQuery:
         """Run the query and return its rows."""
         return self.run().collect(limit=limit, batch_rows=batch_rows)
 
-    def execute_stream(self, batch_rows: int = 65_536,
-                       limit: int | None = None) -> pa.RecordBatchReader:
-        """Run the query and stream its rows."""
-        return self.run().execute_stream(batch_rows=batch_rows, limit=limit)
+    def execute_stream(self, batch_rows: int = 65_536, limit: int | None = None,
+                       *, timeout_s: float | None = None) -> pa.RecordBatchReader:
+        """Submit the query and stream its rows as the server produces them.
+
+        The rows an AI filter keeps arrive while the model still answers
+        about the others; an aggregate or a sort above a model region
+        holds its rows until the region ends.
+
+        Args:
+            batch_rows: The most rows of each batch.
+            limit: The most rows to return, or None for every row.
+            timeout_s: The most seconds the query may run.
+
+        Raises:
+            ValueError: ``batch_rows`` is not positive, or ``limit`` is
+                negative.
+        """
+        if batch_rows <= 0:
+            raise ValueError("batch_rows must be positive")
+        if limit is not None and limit < 0:
+            raise ValueError("limit must be nonnegative")
+        run = self.submit(timeout_s=timeout_s)
+        reader = run._client.stream_batches(run.id)
+
+        def batches():
+            with contextlib.closing(reader):
+                yield from limited_batches(reader, batch_rows, limit)
+
+        return pa.RecordBatchReader.from_batches(reader.schema, batches())
 
     def explain(self, **_options) -> str:
         """Return the server's plan, each model region as one operator."""

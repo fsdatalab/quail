@@ -1,13 +1,16 @@
 """Run a query in the current process."""
 
 import atexit
+import contextlib
 import json
 import os
 import time
 
+import pyarrow as pa
+
 from quail.backends import BackendExecutionContext
 from quail.execution.finished import first_rows, reporting
-from quail.execution.result import QueryResult
+from quail.execution.result import QueryResult, limited_batches
 from quail.execution.types import PhysicalRequest, PhysicalResponse
 from quail.physical import ExecutionLocation, Scan
 from quail.physical.plan import Refusal, RefusalError, graph_from_envelope
@@ -140,18 +143,10 @@ def _execute_in_datafusion(query, physical_executor, on_backend_ready,
     results, region_tables, region_s = [], [], []
     region_results = {}
     started = time.perf_counter()
-    from quail.api.query import backend_refusal
-
-    session = query.session
     # Rust runs the regions of Quail's own backend on GPU workers
     # itself. A request backend, and a callable that stands in for one,
     # go through the Python engine.
-    workers_of = getattr(physical_executor, "start_workers", None)
-    rust_runs = (
-        query.num_regions > 0
-        and session.config.backend == "quail" and backend_refusal(session) is None
-        and (physical_executor is None or workers_of is not None))
-    if rust_runs:
+    if streams(query, physical_executor):
         def ready():
             for called in (on_backend_ready, on_execution_ready):
                 if called is not None:
@@ -212,21 +207,8 @@ def _run_in_rust(query, source, ready, results, region_tables, region_s,
     session = query.session
     config, registry = session.config, session.registry
     backend = registry.backend(config.backend)
-    # the GPU check imports torch, which is startup as well
     startup_started = time.perf_counter()
-    if source is None:
-        problem = gpu_problem()
-        if problem is not None:
-            raise RuntimeError(
-                f"cannot run the model on this machine: {problem}. "
-                "Run your Session on a machine with a CUDA GPU "
-                "and the backend installed.")
-    if source is None:
-        workers = backend.workers(config)
-    else:
-        workers = source.start_workers(config.gpus)["workers"]
-    # loading the tokenizer into the planner is startup as well
-    _ = session.planner
+    workers = _start_workers(session, source)
     startup_s = time.perf_counter() - startup_started
     try:
         context = SessionContext(session, order=query.order, workers=workers)
@@ -261,6 +243,97 @@ def _run_in_rust(query, source, ready, results, region_tables, region_s,
         region_s.append(total_s)
         region_results[region.region_id] = result
     return table, context, startup_s
+
+
+def _start_workers(session, source):
+    """Start the GPU workers, with the model loaded, and the session's planner.
+
+    Args:
+        session: The Session whose configuration the workers run.
+        source: None for the GPUs' workers, or a test's stand-in with
+            ``start_workers(gpus)``.
+
+    Raises:
+        RuntimeError: This machine has no GPU to run the model.
+    """
+    config = session.config
+    if source is None:
+        problem = gpu_problem()
+        if problem is not None:
+            raise RuntimeError(
+                f"cannot run the model on this machine: {problem}. "
+                "Run your Session on a machine with a CUDA GPU "
+                "and the backend installed.")
+        workers = session.registry.backend(config.backend).workers(config)
+    else:
+        workers = source.start_workers(config.gpus)["workers"]
+    # loading the tokenizer into the planner is startup as well
+    _ = session.planner
+    return workers
+
+
+def streams(query, physical_executor=None) -> bool:
+    """Whether Rust runs the query's regions on GPU workers.
+
+    Rust runs them for the ``quail`` backend, or a test's stand-in with
+    ``start_workers``, and then streams each region's rows as they
+    finish (``stream_query``).
+    """
+    from quail.api.query import backend_refusal
+
+    session = query.session
+    return (query.num_regions > 0 and session.config.backend == "quail"
+            and backend_refusal(session) is None
+            and (physical_executor is None
+                 or hasattr(physical_executor, "start_workers")))
+
+
+def stream_query(query, physical_executor=None, batch_rows: int = 65_536,
+                 limit: int | None = None):
+    """Run a query and return its rows as DataFusion produces them.
+
+    A model region sends each row once the model has answered every
+    question about it, so the reader receives the rows of an AI filter
+    while the region still runs. An operator that reads every row
+    first, such as an aggregate, a sort, or a join's build side, holds
+    its rows until the regions below it end.
+
+    Args:
+        query: The Query; ``streams(query)`` must be true.
+        physical_executor: None for the GPUs' workers, or a test's
+            stand-in with ``start_workers(gpus)`` and ``close()``.
+        batch_rows: The most rows of each batch.
+        limit: The most rows to return, or None for every row.
+
+    Returns:
+        A pyarrow RecordBatchReader. Closing it early stops reading; a
+        running region still runs to its end.
+    """
+    from quail.api.compile import DATAFUSION_DIALECTS, compile_message
+    from quail.api.context import SessionContext
+
+    session = query.session
+    workers = _start_workers(session, physical_executor)
+    with contextlib.ExitStack() as stack:
+        if physical_executor is not None:
+            stack.callback(physical_executor.close)
+        context = SessionContext(session, order=query.order, workers=workers)
+        try:
+            rows = context._native.sql_stream(
+                query.text, DATAFUSION_DIALECTS[query.dialect])
+        except RuntimeError as error:
+            raise RuntimeError(compile_message(error, query.text)) from None
+        schema = rows.schema
+        closing = stack.pop_all()
+
+    def batches():
+        # the workers run the query until the stream ends
+        with closing:
+            yield from limited_batches(
+                (batch for table in rows for batch in table.to_batches()),
+                batch_rows, limit)
+
+    return pa.RecordBatchReader.from_batches(schema, batches())
 
 
 def _query_result(query, context, table, whole, started, results, region_tables,

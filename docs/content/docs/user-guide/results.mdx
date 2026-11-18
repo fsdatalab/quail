@@ -107,6 +107,22 @@ with result.execute_stream(batch_rows=1024) as reader:
 {'r.id': ['r1', 'r2']}
 ```
 
+`execute_stream()` returns rows while the model runs. A query with an AI
+filter returns each row it keeps as soon as the model answers for that
+row, on a local session or a remote one:
+
+```python
+query = session.sql(
+    "SELECT r.id FROM reviews r "
+    "WHERE AI.IF(PROMPT('Is the review positive? {0}', r.body))")
+for batch in query.execute_stream():
+    print(batch.to_pydict())
+```
+
+Rows wait for the model to finish when the query sorts, aggregates, or
+joins after the AI call. The stream returns the query's own columns only,
+without the extra columns `collect()` adds, such as label probabilities.
+
 ## Inspect the measured plan
 
 `result.explain()` returns the measured plan without running the model

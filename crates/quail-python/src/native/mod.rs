@@ -373,6 +373,27 @@ impl NativeSession {
         to_pyarrow(py, schema, batches)
     }
 
+    /// Run a query, read in `dialect` ("Snowflake" by default), and
+    /// return a `RowStream` of its rows as DataFusion produces them.
+    #[pyo3(signature = (query, dialect=None))]
+    fn sql_stream(
+        slf: Py<Self>,
+        py: Python<'_>,
+        query: &str,
+        dialect: Option<String>,
+    ) -> PyResult<RowStream> {
+        let session = slf.borrow(py);
+        let inner = &session.session;
+        let rows = py
+            .detach(|| inner.sql_stream(query, dialect.as_deref()))
+            .map_err(python_error)?;
+        drop(session);
+        Ok(RowStream {
+            rows: std::sync::Mutex::new(rows),
+            _session: slf,
+        })
+    }
+
     /// Derive each model region of a query's operators from its plan.
     ///
     /// Returns one (the region as JSON, None, false) or (None, CompileError
@@ -469,6 +490,41 @@ impl NativeSession {
     fn explain(&self, py: Python<'_>, query: &str, dialect: Option<String>) -> PyResult<String> {
         py.detach(|| self.session.explain(query, dialect.as_deref()))
             .map_err(python_error)
+    }
+}
+
+/// A query's rows as DataFusion produces them, as [`quail::RowStream`]:
+/// an iterator of pyarrow Tables, one per batch.
+#[pyclass(name = "RowStream", module = "_quail_native", frozen)]
+struct RowStream {
+    rows: std::sync::Mutex<quail::RowStream>,
+    /// The session whose runtime runs the query while the stream reads it.
+    _session: Py<NativeSession>,
+}
+
+#[pymethods]
+impl RowStream {
+    /// The schema of every batch, as a pyarrow Schema.
+    #[getter]
+    fn schema<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let schema = self.rows.lock().expect("the stream lock").schema();
+        to_pyarrow(py, schema, Vec::new())?.getattr("schema")
+    }
+
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// The next batch as a pyarrow Table, waiting for it without the GIL.
+    fn __next__<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let (schema, found) = py.detach(|| {
+            let mut rows = self.rows.lock().expect("the stream lock");
+            (rows.schema(), rows.next())
+        });
+        match found {
+            None => Ok(None),
+            Some(batch) => to_pyarrow(py, schema, vec![batch.map_err(python_error)?]).map(Some),
+        }
     }
 }
 
@@ -1394,6 +1450,7 @@ pub fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
         quail_planner::physical_rules::PHYSICAL_RULES.to_vec(),
     )?;
     module.add_class::<NativeSession>()?;
+    module.add_class::<RowStream>()?;
     module.add_class::<DataFusionContext>()?;
     module.add_class::<Tokenizer>()?;
     module.add_class::<PrefixIndex>()?;

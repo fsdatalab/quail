@@ -4,7 +4,8 @@ Quail starts it in place of ``python -m quail.worker``, with a socket
 and a GPU index: ``python oracle_worker.py <socket> <gpu index>``. It
 keeps every document whose position is even, and labels and joins by
 the sum of the documents' positions. ``QUAIL_ORACLE_DELAY`` makes each
-filter answer take that many seconds.
+filter answer take that many seconds, and ``QUAIL_ORACLE_CHUNK_TOKENS``
+sets the forward pass size in place of the plan's.
 """
 
 import os
@@ -30,7 +31,8 @@ if __name__ == "__main__":
     oracle = Oracle(
         filters=_keeps,
         joins=lambda node, assignment: sum(assignment.values()) % 2 == 0,
-        labels=lambda spec, ids: spec.labels[sum(ids) % len(spec.labels)])
+        labels=lambda spec, ids: spec.labels[sum(ids) % len(spec.labels)],
+        chunk_tokens=int(os.environ.get("QUAIL_ORACLE_CHUNK_TOKENS", "0")) or None)
     with quail.Session(CONFIG, tokenizer=TOKENIZER) as session:
         description = engine_description(Engine(session))
     _serve(oracle, sys.argv[1], description)

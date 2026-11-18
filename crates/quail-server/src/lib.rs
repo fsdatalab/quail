@@ -6,7 +6,7 @@
 //!   registers the uploaded rows as a table. The id column's values are
 //!   unique; Quail names each row a model region returns by it.
 //! - `DoGet` with a ticket that is a SQL query runs it and returns its
-//!   rows.
+//!   rows as the query produces them.
 //! - `DoAction` `submit` queues a query and returns its status at once.
 //!   Its body is JSON: `sql`, and optionally `dialect`, a DataFusion
 //!   dialect name ("Snowflake" by default), `id`, which names the
@@ -27,6 +27,8 @@
 //! - `DoGet` with the ticket `{"query_id": id}` returns the rows of a
 //!   submission that succeeded. With `"table": n` as well, it returns
 //!   the rows of the operator port the status lists at `n` of `tables`.
+//!   With `"stream": true` instead, it waits for a queued or running
+//!   submission and returns its rows as the query produces them.
 //!
 //! A server started with a token refuses every call whose
 //! `authorization` header is not `Bearer <token>` ([`check_token`]).
@@ -34,8 +36,10 @@
 //!   `dialect`, returns DataFusion's plan, with each model region as
 //!   one operator.
 //!
-//! One query runs at a time; another waits its turn. The server sends a
-//! query's rows once the query has finished. A submission's status and
+//! One query runs at a time; another waits its turn. A model region's
+//! rows reach a streaming reader as the workers finish them; an
+//! aggregate or a sort above a region holds its rows until the region
+//! ends. A submission's status and
 //! rows are files in the server's data directory ([`queue`]), so a
 //! server started on the same directory still has them.
 
@@ -88,6 +92,80 @@ impl QuailService {
             .map_err(|error| Status::internal(error.to_string()))?
             .map_err(query_status)
     }
+}
+
+impl QuailService {
+    /// The schema and the rows of submission `id`, as it produces them.
+    ///
+    /// # Errors
+    ///
+    /// The id is unknown, or the submission fails or is cancelled
+    /// before it plans.
+    async fn streamed_submission(
+        &self,
+        id: String,
+    ) -> Result<(arrow::datatypes::SchemaRef, Rows), Status> {
+        if self.queue.status(&id).is_none() {
+            return Err(Status::not_found(format!("no submission {id}")));
+        }
+        let queue = Arc::clone(&self.queue);
+        let asked = id.clone();
+        // a submission that waits its turn has no schema yet
+        let schema = tokio::task::spawn_blocking(move || {
+            loop {
+                if let (Some(schema), _, _) = queue.rows_after(&asked, 0, STREAM_WAIT)? {
+                    return Ok::<_, String>(schema);
+                }
+            }
+        })
+        .await
+        .map_err(|error| Status::internal(error.to_string()))?
+        .map_err(Status::aborted)?;
+        let queue = Arc::clone(&self.queue);
+        let rows = produced(move |send| {
+            let mut sent = 0;
+            loop {
+                let (batches, done) = match queue.rows_after(&id, sent, STREAM_WAIT) {
+                    Ok((_, batches, done)) => (batches, done),
+                    Err(error) => {
+                        send(Err(FlightError::ExternalError(error.into())));
+                        return;
+                    }
+                };
+                for batch in batches {
+                    sent += batch.num_rows();
+                    if !send(Ok(batch)) {
+                        return;
+                    }
+                }
+                if done {
+                    return;
+                }
+            }
+        });
+        Ok((schema, rows))
+    }
+}
+
+/// A stream of rows, as the Flight encoder reads them.
+type Rows = BoxStream<'static, Result<RecordBatch, FlightError>>;
+
+/// The longest a streaming reader's thread waits for rows before it
+/// checks whether the reader is still there.
+const STREAM_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The rows `produce` hands its `send` on a thread that may block, as a
+/// stream; `send` returns false once the reader is gone.
+fn produced(
+    produce: impl FnOnce(&mut dyn FnMut(Result<RecordBatch, FlightError>) -> bool) + Send + 'static,
+) -> Rows {
+    let (mut sender, received) = futures::channel::mpsc::channel(2);
+    tokio::task::spawn_blocking(move || {
+        produce(&mut |batch| {
+            futures::executor::block_on(futures::SinkExt::send(&mut sender, batch)).is_ok()
+        });
+    });
+    received.boxed()
 }
 
 /// A query's failure as a Flight status: the query's own fault is an
@@ -179,21 +257,41 @@ impl FlightService for QuailService {
             .ok()
             .and_then(|ticket| {
                 let id = ticket["query_id"].as_str()?.to_string();
-                Some((id, ticket["table"].as_u64()))
+                let streams = ticket["stream"].as_bool() == Some(true);
+                Some((id, ticket["table"].as_u64(), streams))
             });
         let (schema, batches) = match submitted {
-            Some((id, None)) => self.queue.rows(&id).map_err(Status::not_found)?,
-            Some((id, Some(index))) => (self.queue)
-                .table(&id, index as usize)
-                .map_err(Status::not_found)?,
+            Some((id, _, true)) => self.streamed_submission(id).await?,
+            Some((id, None, false)) => {
+                let (schema, batches) = self.queue.rows(&id).map_err(Status::not_found)?;
+                (schema, stream::iter(batches.into_iter().map(Ok)).boxed())
+            }
+            Some((id, Some(index), false)) => {
+                let (schema, batches) = (self.queue)
+                    .table(&id, index as usize)
+                    .map_err(Status::not_found)?;
+                (schema, stream::iter(batches.into_iter().map(Ok)).boxed())
+            }
             None => {
-                self.blocking(move |session| session.sql_in_dialect(&query, None))
-                    .await?
+                let rows = self
+                    .blocking(move |session| session.sql_stream(&query, None))
+                    .await?;
+                let schema = rows.schema();
+                let batches = produced(move |send| {
+                    for batch in rows {
+                        let batch =
+                            batch.map_err(|error| FlightError::ExternalError(Box::new(error)));
+                        if !send(batch) {
+                            return;
+                        }
+                    }
+                });
+                (schema, batches)
             }
         };
         let rows = FlightDataEncoderBuilder::new()
             .with_schema(schema)
-            .build(stream::iter(batches.into_iter().map(Ok)))
+            .build(batches)
             .map_err(Status::from);
         Ok(Response::new(rows.boxed()))
     }
