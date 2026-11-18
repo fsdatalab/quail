@@ -18,6 +18,7 @@ pub(crate) mod lift;
 mod lowering;
 pub mod region_hint;
 pub(crate) mod shared;
+pub(crate) mod stream_filters;
 mod unread;
 
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};

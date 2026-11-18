@@ -239,6 +239,14 @@ class Transcripts:
         rows = list(zip(*(column.to_pylist() for column in table.columns)))
         return (rows if ordered else sorted(rows, key=repr)), self._asked
 
+    def _holders(self, text: str) -> set:
+        """The rows that hold a document's text, or each of its parts' texts."""
+        parts = (re.split(PAIR_LAYOUT.format(r"\d+"), text)[1:]
+                 if text.startswith(PAIR_LAYOUT.format(0)) else [text])
+        held = [set(self._ids[part].split("/")) for part in parts
+                if part in self._ids]
+        return set.intersection(*held) if held else set()
+
     def query(self, sql: str, dialect: str = "snowflake",
               ordered: bool = False, columns: bool = False) -> str:
         """Run a query and return its transcript.
@@ -309,13 +317,20 @@ class Transcripts:
         received, lock = set(), threading.Condition()
 
         def wait_for(alias, documents):
-            names = {self._ids[oracle._texts([alias], [document])[0]]
-                     for document in documents}
+            # a text several rows hold names them all; one received row
+            # of it is enough
+            names = [self._holders(oracle._texts([alias], [document])[0])
+                     for document in documents]
+
+            def missing():
+                return sorted("/".join(sorted(name)) for name in names
+                              if not name & received)
+
             with lock:
-                if not lock.wait_for(lambda: names <= received,
+                if not lock.wait_for(lambda: not missing(),
                                      timeout=HINT_WAIT_SECONDS):
                     raise AssertionError(
-                        f"the reader did not receive {sorted(names - received)} "
+                        f"the reader did not receive {missing()} "
                         "while the region ran")
 
         self._asked, events, rows = [], [], []

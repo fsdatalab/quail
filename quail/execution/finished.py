@@ -29,6 +29,9 @@ from quail.execution.types import output_table
 class _Region(threading.local):
     rows = None
     held = False
+    # callable(table) -> the table over the region's rows, or None to
+    # hold it back, while a node runs over renumbered rows
+    translate = None
     hint = None
     # alias -> the table the hint holds rows of
     tables = {}
@@ -80,18 +83,42 @@ def reporting(rows, hint=None, tables: dict | None = None,
 
 
 @contextlib.contextmanager
-def held():
-    """Hold back operators' reports while the block runs.
+def renumbered(translate=None):
+    """Report operators' rows through translate while the block runs.
 
-    A node run over renumbered inputs, deduplicated or guarded, reports
-    ids that are not the region's; its rows go once its whole result is
-    expanded.
+    A node run over renumbered inputs, such as deduplicated ones,
+    reports ids that are not the region's. Each table it reports goes
+    through translate to the region's rows; a table translate gives
+    None for goes once the node's whole result is expanded.
+
+    Args:
+        translate: Callable(table) -> the table over the region's rows,
+            or None; None holds back every report.
     """
-    previous, _REGION.held = _REGION.held, True
+    region = _REGION
+    previous = (region.held, region.translate)
+    if translate is None:
+        region.held = True
+    else:
+        region.translate = _composed(region.translate, translate)
     try:
         yield
     finally:
-        _REGION.held = previous
+        region.held, region.translate = previous
+
+
+def _composed(outer, inner):
+    """Translate by inner, then by the translation already in place."""
+    if outer is None:
+        return inner
+    return lambda table: (None if (found := inner(table)) is None
+                          else outer(found))
+
+
+def _translated(table: pa.Table) -> pa.Table | None:
+    """A reported table over the region's rows, or None to hold it back."""
+    translate = _REGION.translate
+    return table if translate is None else translate(table)
 
 
 def report(tables: Iterable[pa.Table]) -> None:
@@ -100,7 +127,9 @@ def report(tables: Iterable[pa.Table]) -> None:
     if rows is None:
         return
     for table in tables:
-        rows.report(table)
+        table = _translated(table)
+        if table is not None:
+            rows.report(table)
 
 
 def report_outputs(node, result) -> None:
@@ -115,8 +144,10 @@ def report_outputs(node, result) -> None:
     ports = {port.name: port for port in node.outputs}
     for name, value in result.outputs.items():
         if rows.wants(node.node_id, name):
-            rows.report(finished_table(
+            table = _translated(finished_table(
                 node.node_id, name, output_table(node, ports[name], value)))
+            if table is not None:
+                rows.report(table)
 
 
 def finished_table(node_id: str, port: str, table: pa.Table) -> pa.Table:

@@ -110,6 +110,52 @@ class Deduplicated:
             expanded[node.node_id] = NodeResult(outputs, metrics)
         return expanded
 
+    def reported(self, table: pa.Table) -> pa.Table | None:
+        """Give a table an operator reports over key documents to every copy.
+
+        Each row of a key document becomes one row per copy the group
+        read, with the same values.
+
+        Args:
+            table: A table of finished rows, its id columns tagged with
+                their alias.
+
+        Returns:
+            The table over the region's rows, or None when only the
+            expanded result gives its rows: a group that reads pairs or
+            joins, which name a document beside its partner, or a group
+            with a stop key, which keeps some copies only.
+        """
+        if self.pairs or any(
+                isinstance(node, AiJoin)
+                or (isinstance(node, AiFilter) and node.stop_key)
+                for node in self.nodes):
+            return None
+        aliases = [field.name for field in table.schema
+                   if field.metadata and b"quail.alias" in field.metadata]
+        if not any(alias in self.keys for alias in aliases):
+            return table
+        if len(aliases) != 1:
+            return None
+        (alias,) = aliases
+        every = np.asarray(self.every[alias], dtype=np.int64)
+        keys = self.keys[alias][every]
+        order = np.argsort(keys, kind="stable")
+        sorted_keys = keys[order]
+        reported = table.column(alias).to_numpy().astype(np.int64)
+        starts = np.searchsorted(sorted_keys, reported, side="left")
+        ends = np.searchsorted(sorted_keys, reported, side="right")
+        counts = ends - starts
+        rows = np.repeat(np.arange(table.num_rows), counts)
+        copies = order[np.concatenate(
+            [np.arange(start, end) for start, end in zip(starts, ends)]
+            or [np.zeros(0, dtype=np.int64)])]
+        index = table.schema.get_field_index(alias)
+        expanded = table.take(pa.array(rows, pa.int64()))
+        return expanded.set_column(
+            index, table.schema.field(index),
+            pa.array(every[copies], table.schema.field(index).type))
+
     def _keys(self, aliases, pairs) -> dict:
         """Each alias's key documents; a table without copies is its own key."""
         keys = {}

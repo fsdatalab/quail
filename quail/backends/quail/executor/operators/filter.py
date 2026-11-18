@@ -72,7 +72,8 @@ class FilterOperator(SingleNodeOperator):
             async_answers)
         self._keep_answer()
         self.answers = {}
-        self.finished = []      # (document, passed) settled since the last take
+        # (document, passed, answer) settled since the last take
+        self.finished = []
         self.priors, self.prior_tables = [], []
 
     @staticmethod
@@ -97,7 +98,7 @@ class FilterOperator(SingleNodeOperator):
             self.stages[0].decide = lambda _, row: not any(row)
 
     def settle(self, document, survived, row):
-        self.finished.append((document, survived))
+        self.finished.append((document, survived, bool(row[0]) if len(row) else None))
 
     def take_finished(self):
         """Report the settled documents to the answer sink; return the passed.
@@ -105,21 +106,42 @@ class FilterOperator(SingleNodeOperator):
         The sink receives ``{"kind": "filter", "node", "alias", "stages",
         "documents"}``, where ``documents`` lists ``[document id, stage,
         passed]`` per document. The documents that passed are the rows
-        of the filter's rows port.
+        of the filter's rows port. A filter that returns its answer keeps
+        every document, with its answer.
         """
         finished, self.finished = self.finished, []
-        # a filter's answer column is whole only once every document settled
         if getattr(self.node, "answer", None) is not None:
-            return []
+            return self._answered_rows(finished)
         sink = answer_sink()
         if sink is not None and finished:
             sink({"kind": "filter", "node": self.node.node_id,
                   "alias": self.node.alias, "stages": 1,
                   "documents": [[int(self.ids[document]), 0, passed]
-                                for document, passed in finished]})
-        passed = [document for document, survived in finished if survived]
+                                for document, passed, _ in finished]})
+        passed = [document for document, survived, _ in finished if survived]
         return passed_rows(self.node, self.node.alias,
                            [self.ids[document] for document in passed])
+
+    def _answered_rows(self, finished) -> list:
+        """The finished rows of settled documents, with the filter's answer.
+
+        Each row carries the columns of the rows the filter reads. A
+        filter whose rows carry the columns of an operator before it in
+        the chain reports its rows with its result instead.
+        """
+        answered = [(document, answer) for document, _, answer in finished
+                    if answer is not None]
+        if not answered or self.priors or finished_rows() is None:
+            return []
+        positions = np.asarray([self.ids[document] for document, _ in answered],
+                               dtype=np.int64)
+        order = np.argsort(positions, kind="stable")
+        values = pa.array([answered[index][1] for index in order], pa.bool_())
+        alias = self.node.alias
+        rows = Rows({alias: arrow_ids(positions[order])}).with_column(
+            self.node.answer, values)
+        rows = join_prior_rows(rows, alias, (), self.prior_tables)
+        return [finished_table(self.node.node_id, f"rows:{alias}", rows.table())]
 
     def read_answers(self, every) -> int | None:
         """Record filter answers and leave token accounting to the region."""

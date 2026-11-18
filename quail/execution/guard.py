@@ -71,6 +71,24 @@ class Guarded:
             return {**inputs, self.port: asked.ids[asked.aliases[0]]}
         return {**inputs, self.port: asked}
 
+    def reports_as_run(self) -> bool:
+        """Whether each row the node reports as it runs is a row of its result.
+
+        True for a column node, an AI filter that closes its OR, and an
+        AI filter outside an OR that returns its answer: each row the
+        node reports stays in the result, which only adds rows, with a
+        NULL answer where the model was not asked. An AI filter that
+        leaves its OR undecided gives every row a column only its whole
+        result has. A join reports pairs, which go with its whole result.
+        """
+        if isinstance(self.node, AiJoin):
+            return False
+        if not isinstance(self.node, AiFilter):
+            return True
+        if self.node.answer is not None:
+            return self.node.disjunction is None
+        return self.node.disjunction is None or self.node.closes_disjunction
+
     def expanded(self, result: NodeResult) -> NodeResult:
         """Give every row the node read its answer, or NULL where not asked.
 
@@ -175,6 +193,13 @@ class NullPairs:
     def inputs(self, inputs: dict) -> dict:
         """Return the node's inputs with only the rows that have a document."""
         return {**inputs, **self.present}
+
+    def reports_as_run(self) -> bool:
+        """Whether each row the node reports as it runs is a row of its result.
+
+        Always: the result adds the unasked pairs to the asked ones.
+        """
+        return True
 
     def expanded(self, result: NodeResult) -> NodeResult:
         """Add the unasked pairs to the node's rows, with NULL answers."""
