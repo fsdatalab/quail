@@ -163,7 +163,7 @@ class CapturedPieces:
     """A bucket's boundary buffers and ordered graphs between token mixers."""
 
     buffers: PiecewiseBuffers
-    graphs: list
+    graphs: list | None
     tail_graphs: list | None = None
 
     def forward(self, pipeline, chunk):
@@ -212,6 +212,10 @@ class PiecewiseGraphs:
         self.passes = 0
         self.capture_s = 0.0
         self.captured_bytes = 0
+        self.buffer_bytes = 0
+        self.growth_bytes = 0
+        self.token_bytes = 0.0
+        self.pool = None
 
     @classmethod
     def for_specs(cls, pipeline, model, device):
@@ -226,69 +230,124 @@ class PiecewiseGraphs:
         """Release captures before replacing the KV allocation they write."""
         self.graphs.clear()
         self.storage = None
+        self.pool = None
 
     def prepare(self):
-        """Capture dense pieces after kernel warmup, once per KV allocation."""
+        """Build every bucket's buffers and capture the largest bucket.
+
+        Each smaller bucket is captured on the first pass that needs it,
+        so a new KV allocation costs one bucket's capture, not every
+        bucket's. A bucket captured later grows the shared pool by its
+        own blocks, so later captures stop before the pool outgrows its
+        reserve, and the remaining buckets run eagerly.
+
+        Returns:
+            Whether this call built new graphs for the current KV allocation.
+
+        Raises:
+            RuntimeError: The largest bucket alone exceeds the reserve.
+        """
         engine = self.pipeline.engine
         if not self.enabled or (self.graphs and self.storage is engine.arena.k):
             return False
         self.invalidate()
         torch = engine.torch
-        started = time.perf_counter()
+        self.capture_s = 0.0
         before = torch.cuda.memory_allocated()
-        pool = torch.cuda.graph_pool_handle()
+        self.pool = torch.cuda.graph_pool_handle()
+        storage = None
+        for num_tokens in reversed(self.token_buckets):
+            buffers = PiecewiseBuffers(self.pipeline, num_tokens, storage=storage)
+            storage = storage or buffers
+            self.graphs.append(CapturedPieces(buffers, None))
+        self.graphs.reverse()
+        self.buffer_bytes = torch.cuda.memory_allocated() - before
+        self.storage = engine.arena.k
+        self.capture(self.graphs[-1])
+        if self.captured_bytes > self.memory_bytes:
+            self.invalidate()
+            raise RuntimeError(
+                f"graphs allocated {self.captured_bytes} bytes, "
+                f"exceeding their {self.memory_bytes}-byte reserve")
+        self.token_bytes = ((self.captured_bytes - self.buffer_bytes)
+                            / self.token_buckets[-1])
+        self.growth_bytes = (self.memory_bytes - self.captured_bytes) // 4
+        return True
+
+    def capture_within_reserve(self, captured):
+        """Capture a smaller bucket if the pool has room for its growth.
+
+        A bucket grows the pool by its tokens' share of the largest
+        bucket's blocks, plus a fixed part: the largest such part seen,
+        and at first a quarter of the room the largest bucket left.
+
+        Returns:
+            Whether the bucket now has graphs.
+        """
+        scaled = captured.buffers.num_tokens * self.token_bytes
+        if self.captured_bytes + scaled + self.growth_bytes > self.memory_bytes:
+            return False
+        before = self.captured_bytes
+        self.capture(captured)
+        self.growth_bytes = max(self.growth_bytes,
+                                self.captured_bytes - before - scaled)
+        if self.captured_bytes > self.memory_bytes:
+            logger.warning("CUDA graphs: %.0f MiB exceeds the %.0f MiB reserve; "
+                           "smaller buckets run eagerly",
+                           self.captured_bytes / 2**20, self.memory_bytes / 2**20)
+        return True
+
+    def capture(self, captured):
+        """Capture one bucket's pieces, both tail-copy variants, into the pool.
+
+        Each piece runs once eagerly before its capture, so the KV write
+        mappings are masked first; they may still hold a real pass's pages.
+        """
+        engine = self.pipeline.engine
+        torch = engine.torch
+        buffers = captured.buffers
+        started = time.perf_counter()
         stream = torch.cuda.Stream()
         current = torch.cuda.current_stream()
         stream.wait_stream(current)
         try:
+            buffers.writes.copy(None)
+            if buffers.sliding_writes is not None:
+                buffers.sliding_writes.copy(None)
             with torch.cuda.stream(stream), torch.inference_mode():
-                # Larger captures establish the shared pool's high watermark.
-                storage = None
-                for num_tokens in reversed(self.token_buckets):
-                    buffers = PiecewiseBuffers(self.pipeline, num_tokens,
-                                               storage=storage)
-                    storage = storage or buffers
-                    variants = []
-                    for copy_tail in (False, True):
-                        graphs = []
-                        for index in range(len(self.pipeline.layers) + 1):
-                            piece = partial(buffers.piece, self.pipeline, index,
-                                            copy_tail=copy_tail)
-                            with self.pipeline.forward_context(num_tokens):
+                variants = []
+                for copy_tail in (False, True):
+                    graphs = []
+                    for index in range(len(self.pipeline.layers) + 1):
+                        piece = partial(buffers.piece, self.pipeline, index,
+                                        copy_tail=copy_tail)
+                        with self.pipeline.forward_context(buffers.num_tokens):
+                            piece()
+                            stream.synchronize()
+                            graph = torch.cuda.CUDAGraph()
+                            with torch.cuda.graph(graph, pool=self.pool,
+                                                  stream=stream):
                                 piece()
-                                stream.synchronize()
-                                graph = torch.cuda.CUDAGraph()
-                                with torch.cuda.graph(graph, pool=pool,
-                                                      stream=stream):
-                                    piece()
-                            graphs.append(graph)
-                        variants.append(graphs)
-                    self.graphs.append(CapturedPieces(buffers, *variants))
+                        graphs.append(graph)
+                    variants.append(graphs)
             current.wait_stream(stream)
             stream.synchronize()
-            self.graphs.reverse()
-            # Inactive blocks in a graph pool remain reserved until its
-            # graphs die; memory_allocated alone omits those blocks.
-            private_unused = sum(
-                segment["total_size"] - segment["allocated_size"]
+            # The pool's segments stay reserved until its graphs die. A
+            # query's own tensors live outside the pool, so a capture
+            # during a query counts only the pool and the buffers.
+            self.captured_bytes = self.buffer_bytes + sum(
+                segment["total_size"]
                 for segment in torch.cuda.memory_snapshot()
-                if tuple(segment["segment_pool_id"]) == pool)
-            self.captured_bytes = (
-                torch.cuda.memory_allocated() - before + private_unused)
-            if self.captured_bytes > self.memory_bytes:
-                raise RuntimeError(
-                    f"graphs allocated {self.captured_bytes} bytes, "
-                    f"exceeding their {self.memory_bytes}-byte reserve")
+                if tuple(segment["segment_pool_id"]) == self.pool)
         except Exception:
             self.invalidate()
             raise
-        self.storage = engine.arena.k
-        self.capture_s = time.perf_counter() - started
-        logger.info("CUDA graphs: captured %d batch sizes in %.1f s, using "
-                    "%.0f of %.0f MiB",
-                    len(self.graphs), self.capture_s, self.captured_bytes / 2**20,
-                    self.memory_bytes / 2**20)
-        return True
+        captured.graphs, captured.tail_graphs = variants
+        seconds = time.perf_counter() - started
+        self.capture_s += seconds
+        logger.info("CUDA graphs: captured %d tokens in %.1f s, using "
+                    "%.0f of %.0f MiB", buffers.num_tokens, seconds,
+                    self.captured_bytes / 2**20, self.memory_bytes / 2**20)
 
     def supports(self, chunk):
         """Whether a chunk fits capture without a model-specific forward hook."""
@@ -307,6 +366,9 @@ class PiecewiseGraphs:
         if self.supports(chunk):
             for captured in self.graphs:
                 if captured.buffers.num_tokens >= chunk.tokens:
+                    if (captured.graphs is None
+                            and not self.capture_within_reserve(captured)):
+                        break
                     self.replays += 1
                     return captured.forward(self.pipeline, chunk)
         return self.pipeline.forward_chunk(chunk)
