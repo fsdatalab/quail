@@ -10,7 +10,7 @@ import pyarrow as pa
 
 from quail.backends import BackendExecutionContext
 from quail.execution.finished import first_rows, reporting
-from quail.execution.result import QueryResult
+from quail.execution.result import QueryResult, limited_batches
 from quail.execution.types import PhysicalRequest, PhysicalResponse
 from quail.physical import ExecutionLocation, Scan
 from quail.physical.plan import Refusal, RefusalError, graph_from_envelope
@@ -327,18 +327,11 @@ def stream_query(query, physical_executor=None, batch_rows: int = 65_536,
         closing = stack.pop_all()
 
     def batches():
-        # the context runs the query until the stream ends
+        # the workers run the query until the stream ends
         with closing:
-            left = limit
-            for table in rows:
-                for batch in table.to_batches(max_chunksize=batch_rows):
-                    if left is not None:
-                        batch = batch.slice(0, left)
-                        left -= batch.num_rows
-                    if batch.num_rows:
-                        yield batch
-                    if left == 0:
-                        return
+            yield from limited_batches(
+                (batch for table in rows for batch in table.to_batches()),
+                batch_rows, limit)
 
     return pa.RecordBatchReader.from_batches(schema, batches())
 

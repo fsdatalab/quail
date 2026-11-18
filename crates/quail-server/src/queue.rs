@@ -7,7 +7,9 @@
 //! rows of each operator port, as `status.json` lists them), and
 //! `answers.json` (the answer events of its run). A server that starts
 //! on the same directory lists the earlier submissions, and marks one
-//! that had not finished as failed.
+//! that had not finished as failed. While a submission runs, the queue
+//! holds the rows it has returned so far, which a reader reads with
+//! [`Queue::rows_after`].
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -16,6 +18,7 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use arrow::array::RecordBatch;
 use quail::shared::{Table, read_table, write_table};
 use quail::{Observer, RegionEvent, Session};
 use serde::{Deserialize, Serialize};
@@ -101,6 +104,8 @@ struct State {
     running: Option<(String, Option<String>)>,
     /// The answer events of the submissions run since the server started.
     answers: BTreeMap<String, Arc<Vec<Value>>>,
+    /// The rows the running submission has returned so far, by id.
+    streaming: BTreeMap<String, Table>,
     closed: bool,
 }
 
@@ -432,6 +437,80 @@ impl Queue {
         read_table(&path, false).map_err(|error| error.to_string())
     }
 
+    /// The rows of submission `id` after its first `after` rows, waiting
+    /// up to `wait` for more while it waits its turn or runs.
+    ///
+    /// Returns the schema once the query has planned, the rows, and
+    /// whether the submission succeeded, so that no more rows come.
+    ///
+    /// # Errors
+    ///
+    /// The id is unknown, or the submission failed or was cancelled.
+    pub fn rows_after(
+        &self,
+        id: &str,
+        after: usize,
+        wait: Duration,
+    ) -> Result<(Option<arrow::datatypes::SchemaRef>, Vec<RecordBatch>, bool), String> {
+        let deadline = std::time::Instant::now() + wait;
+        let mut state = self.state.lock().expect("the queue lock");
+        loop {
+            let found = (state.submissions.get(id)).ok_or_else(|| format!("no submission {id}"))?;
+            if let Some((schema, batches)) = state.streaming.get(id) {
+                let rows = rows_past(batches, after);
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if !rows.is_empty() || left.is_zero() {
+                    return Ok((Some(Arc::clone(schema)), rows, false));
+                }
+            } else if found.state == "succeeded" {
+                break;
+            } else if found.finished() {
+                let error = found.error.clone().unwrap_or_default();
+                return Err(format!("the submission {id} is {}: {error}", found.state));
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Ok((None, Vec::new(), false));
+            }
+            state = (self.changed.wait_timeout(state, left))
+                .expect("the queue lock")
+                .0;
+        }
+        drop(state);
+        let (schema, batches) = self.rows(id)?;
+        Ok((Some(schema), rows_past(&batches, after), true))
+    }
+
+    /// Run the submission `id`, holding its rows as they arrive for
+    /// [`Queue::rows_after`]; returns them all.
+    fn run_rows(
+        &self,
+        id: &str,
+        sql: &str,
+        dialect: Option<&str>,
+    ) -> datafusion::common::Result<Table> {
+        let rows = self.session.sql_stream(sql, dialect)?;
+        let mut state = self.state.lock().expect("the queue lock");
+        state
+            .streaming
+            .insert(id.to_string(), (rows.schema(), Vec::new()));
+        drop(state);
+        self.changed.notify_all();
+        for batch in rows {
+            let batch = batch?;
+            let mut state = self.state.lock().expect("the queue lock");
+            if let Some((_, batches)) = state.streaming.get_mut(id) {
+                batches.push(batch);
+            }
+            drop(state);
+            self.changed.notify_all();
+        }
+        let state = self.state.lock().expect("the queue lock");
+        (state.streaming.get(id).cloned()).ok_or_else(|| {
+            datafusion::common::DataFusionError::Internal(format!("no rows of {id}"))
+        })
+    }
+
     /// Stop running submissions, and wait for the thread that runs
     /// them: the running one is stopped, and fails.
     pub fn close(&self) {
@@ -490,16 +569,15 @@ impl Queue {
                 Arc::new(move |event| queue.observed(&id, event))
             };
             self.session.observe(Some(observer), true);
-            let ran = (self
-                .session
-                .sql_in_dialect(&found.sql, found.dialect.as_deref()))
-            .and_then(|table| {
-                let rows: usize = table.1.iter().map(|batch| batch.num_rows()).sum();
-                let path = self.directory.join(&found.id).join("result.arrow");
-                let _ = std::fs::remove_file(&path);
-                write_table(&path, &table)?;
-                Ok((rows, self.save_regions(&found.id)?))
-            });
+            let ran = (self.run_rows(&found.id, &found.sql, found.dialect.as_deref())).and_then(
+                |table| {
+                    let rows: usize = table.1.iter().map(|batch| batch.num_rows()).sum();
+                    let path = self.directory.join(&found.id).join("result.arrow");
+                    let _ = std::fs::remove_file(&path);
+                    write_table(&path, &table)?;
+                    Ok((rows, self.save_regions(&found.id)?))
+                },
+            );
             self.session.observe(None, false);
             // a query that failed leaves its regions behind
             drop(self.session.take_regions());
@@ -509,6 +587,8 @@ impl Queue {
             }
             let mut state = self.state.lock().expect("the queue lock");
             let stopped = state.running.take().and_then(|(_, stopped)| stopped);
+            // a reader reads the saved rows from here on
+            state.streaming.remove(&found.id);
             // under the lock, so no stop for this query comes after
             self.session.resume();
             let found = state
@@ -539,6 +619,20 @@ impl Queue {
             self.changed.notify_all();
         }
     }
+}
+
+/// The rows of `batches` after the first `after` rows.
+fn rows_past(batches: &[RecordBatch], after: usize) -> Vec<RecordBatch> {
+    let mut skipped = 0;
+    let mut rows = Vec::new();
+    for batch in batches {
+        let start = after.saturating_sub(skipped).min(batch.num_rows());
+        skipped += batch.num_rows();
+        if start < batch.num_rows() {
+            rows.push(batch.slice(start, batch.num_rows() - start));
+        }
+    }
+    rows
 }
 
 /// Write a submission's status, whole or not at all, as a new revision.
