@@ -2,21 +2,22 @@
 title: Querying multimodal data
 ---
 
-`AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, and `AI.MAP` read PNG and JPEG images
-stored in a `BINARY` column, just as they read text columns. `AI.PDF_PAGES`
-renders each page of a PDF as a PNG image so a vision model, a language model
-able to read images, can read page layouts and scanned pages.
-`AI.PARSE_DOCUMENT` reads the text stored inside a PDF instead, without optical
-character recognition (OCR), which reads text from pictures. Use `AI.PDF_PAGES`
-for most PDF queries, and use `AI.PARSE_DOCUMENT` when a text-only model runs
-the query or when `AI.EXTRACT` copies answers from stored text.
+You can query images and PDFs in Quail alongside text columns. Pass PNG and JPEG
+images stored in a `BINARY` column directly to `AI.IF`, `AI.SCORE`,
+`AI.CLASSIFY`, or `AI.MAP`. `AI.PDF_PAGES` turns each page of a PDF into a PNG
+image so a vision model, a language model able to read images, can answer
+questions from page layouts and scans. `AI.PARSE_DOCUMENT` instead reads the
+text stored in a PDF, without optical character recognition (OCR), which reads
+text from pictures. Use `AI.PDF_PAGES` for most PDF queries, and use
+`AI.PARSE_DOCUMENT` when a text-only model runs the query or when `AI.EXTRACT`
+copies answers from stored text.
 
-## Vision models
+## Choose a model
 
 Configure the session with a vision model when your query reads images or
 `AI.PDF_PAGES` output:
 
-- `qwen3.5-4b-fp8` or `qwen3.5-4b-bf16`
+- `qwen3.5-4b-bf16` or `qwen3.5-4b-fp8`
 - `qwen3.5-27b-fp8`
 - `qwen3.6-35b-a3b-fp8`
 - `qwen3.8-27b-fp8`
@@ -27,13 +28,12 @@ model.
 
 ## Images
 
-Store PNG or JPEG bytes in a `BINARY` column to query images. You can test
-image queries on
-[CORD](https://huggingface.co/datasets/naver-clova-ix/cord-v2), a dataset of
+Store images in a `BINARY` column before querying them. You can check expenses
+in [CORD](https://huggingface.co/datasets/naver-clova-ix/cord-v2), a dataset of
 1,000 receipt photos from Indonesian restaurants priced in rupiah.
 
-Download the CORD Parquet files and store each photo's bytes in a `BINARY`
-column:
+Download CORD's Parquet files from Hugging Face and put each photo's bytes in a
+`BINARY` column, with an id for each receipt:
 
 ```python
 import pyarrow as pa
@@ -53,7 +53,7 @@ receipts = pa.table({
 })
 ```
 
-Register `receipts` in a session configured with a vision model:
+Register the table in a session so SQL can read the rows:
 
 ```python
 import quail
@@ -63,9 +63,8 @@ session = quail.Session(config=config)
 session.register("receipts", receipts, id_col="id")
 ```
 
-Pass `r.image` to an AI function in SQL. `AI.IF` keeps each receipt with a
-total over 100,000 rupiah, and `AI.CLASSIFY` labels what each kept receipt
-paid for:
+Pass the image column to an AI function. `AI.IF` finds each receipt over 100,000
+rupiah, and `AI.CLASSIFY` labels what each receipt over the limit paid for:
 
 ```sql
 SELECT r.id,
@@ -78,16 +77,16 @@ WHERE AI.IF(PROMPT('Is this receipt''s total over 100,000 rupiah? {0}', r.image)
 | --- | --- | --- |
 | 174,600: returned, `meal` | 230,000: returned, `bakery or snacks` | 91,000: filtered out |
 
-You pay to encode each receipt once because `AI.CLASSIFY` reuses KV, the
-model's cached attention state, from `AI.IF` on each passing receipt. You get
-answers for all 1,000 receipts in 92 seconds ($0.10) on one H100 with
-`qwen3.5-4b-bf16`, matching 96.8% of the 972 receipts with a labeled total.
+You get answers for all 1,000 receipts in 92 seconds on one H100 with
+`qwen3.5-4b-bf16`, for $0.10. The filter matches 96.8% of the 972 receipts with
+a labeled total. The query runs fast because `AI.CLASSIFY` reuses KV, the
+model's saved state for each receipt, from `AI.IF`.
 
 ### Shrink large images
 
-Vision models read one token per 32 by 32 pixels, so large photos cost
-thousands of tokens. `AI.IMAGE(image, longest_edge)` shrinks an image on the
-CPU so its longer side is at most `longest_edge` pixels:
+Vision models read one token per 32 by 32 pixels, so large photos cost thousands
+of tokens. Shrink each photo on the CPU with `AI.IMAGE`, where the second
+argument sets the longest side in pixels:
 
 ```sql
 SELECT r.id,
@@ -98,13 +97,13 @@ WHERE AI.IF(PROMPT('Is this receipt''s total over 100,000 rupiah? {0}',
                    AI.IMAGE(r.image, 1024)));
 ```
 
-`AI.IMAGE(r.image, 1024)` runs the CORD query 4 times faster and lowers filter
+`AI.IMAGE(r.image, 1024)` runs 4 times faster on CORD's photos and lowers
 accuracy by 0.1 percentage points.
 
 ## PDFs
 
-Store PDF bytes in a `BINARY` column to query PDFs from a folder such as
-`contracts`:
+Store PDFs in a `BINARY` column too. Load legal contracts, such as leases and
+service agreements, from a folder named `contracts`:
 
 ```python
 from pathlib import Path
@@ -117,26 +116,27 @@ files = pa.table({
 session.register("files", files, id_col="path")
 ```
 
-### Query individual pages
+### Ask about each page
 
-`AI.PDF_PAGES(pdf[, longest_edge[, first[, last]]])` renders each page as a
-struct with `page`, the page number starting at 1, and `image`, a PNG image.
-`UNNEST` expands the list of structs into one row per page. Filter the unnested
-pages with `AI.IF` to find each contract page containing a liability cap, a
-clause limiting how much one party can owe:
+Turn each PDF into one row per page when asking about individual pages.
+`AI.PDF_PAGES` returns a list of structs, each holding `page` (the page number
+from 1) and `image` (a PNG image). `UNNEST` turns the list into rows so `AI.IF`
+can find each contract page with a liability cap, a clause limiting how much one
+party can owe the other:
 
 ```sql
 SELECT p.path, p.u['page'] AS page
 FROM (SELECT f.path, UNNEST(AI.PDF_PAGES(f.pdf, 1024)) AS u FROM files f) p
-WHERE AI.IF(PROMPT('Does the page cap either party''s liability? {0}',
+WHERE AI.IF(PROMPT('Does this page cap either party''s liability? {0}',
                    p.u['image']));
 ```
 
-### Query a whole PDF
+### Ask about a whole PDF
 
-Pass the list from `AI.PDF_PAGES` directly to an AI function when a question
-spans several pages. The AI function reads the rendered pages together as one
-document. Pass `first` and `last` to render only a range of pages on long PDFs:
+Pass the list from `AI.PDF_PAGES` directly to an AI function to ask about a
+whole PDF. The AI function reads the pages together as one document. Set the
+first and last pages with the third and fourth arguments of `AI.PDF_PAGES` to
+skip later pages on a long PDF:
 
 ```sql
 SELECT f.path,
@@ -145,15 +145,18 @@ SELECT f.path,
 FROM files f;
 ```
 
-Set `longest_edge` to balance small-print accuracy against token count.
-`longest_edge` defaults to 1,536 pixels, and a US Letter page at 1,024 pixels
-uses 800 tokens.
+### Choose a page size
 
-### Read stored PDF text
+Set the second argument of `AI.PDF_PAGES`, the longest side of each page image
+in pixels, to trade small-print accuracy against token count. The default is
+1,536 pixels, and a US Letter page at 1,024 pixels costs 800 tokens.
 
-`AI.PARSE_DOCUMENT(pdf)` reads the text stored inside a PDF on the CPU and
-separates pages with a form feed character (`'\f'`). Use `AI.PARSE_DOCUMENT`
-with `AI.EXTRACT`, which copies exact spans from text and rejects images:
+### Parse to text
+
+`AI.PARSE_DOCUMENT` reads the text stored in a PDF on the CPU with the Rust
+crate [pdf-extract](https://crates.io/crates/pdf-extract) and puts a form feed
+(`'\f'`) between pages. Pass the parsed text to `AI.EXTRACT`, which copies
+answers from text and rejects images:
 
 ```sql
 SELECT f.path,
@@ -162,11 +165,11 @@ SELECT f.path,
 FROM files f;
 ```
 
-`AI.PARSE_DOCUMENT` returns an empty string for a scanned page because a scan
-stores page pictures rather than text, and returns `NULL` when a PDF is `NULL`
-or unreadable.
+`AI.PARSE_DOCUMENT` returns an empty string for a scanned page because a scanned
+PDF holds pictures of pages rather than text, and returns `NULL` for a malformed
+PDF.
 
 [AI functions](/docs/user-guide/sql/ai-functions) describes every argument of
 `AI.PDF_PAGES`, `AI.PARSE_DOCUMENT`, and `AI.IMAGE`. CORD (Park et al., 2019)
-provides the receipt photos under
+provides the receipts under
 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).

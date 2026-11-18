@@ -1,29 +1,32 @@
 ---
-title: Querying scanned restaurant menus
+title: Reading history from old restaurant menus
 ---
 
-Here's a demo of how you can query images and tables together in Quail. In this
-demo, we'll use the New York Public Library's
+You can query images and tables together in Quail. We'll use the New York Public
+Library's
 [What's on the menu?](https://www.nypl.org/research/support/whats-on-the-menu)
-dataset of 17,547 scanned restaurant menus.
+dataset of scanned restaurant menus for the demo.
 
-Volunteers transcribed each menu's dish names and prices into CSV files, but
-skipped everything else on the page, such as wartime notes and drink lists.
-We'll join the CSV dates with 1,446 menu images from 1914 to 1949 and run one
-SQL query with two `AI.IF` calls per image: does the menu sell alcohol, and
-does the menu mention a war? Together, the two questions trace World War I,
-Prohibition (the US ban on alcohol from 1920 to 1933), and World War II.
+We'll join the menu dates with 1,446 menu scans from 1914 to 1949 and run one
+SQL query with two `AI.IF` calls per scan: does the menu sell alcohol, and does
+the menu mention a war? The two questions trace World War I, Prohibition (the US
+ban on alcohol from 1920 to 1933), and World War II.
 
-`qwen3.5-4b-bf16` processes all 1,446 images (2.1 million input tokens) in 34
-seconds on one H100, or $0.04 at Modal's H100 rate. Quail encodes each image
-once and reuses KV, the model's cached attention state, across both questions.
-See [Querying multimodal data](/docs/user-guide/multimodal-data) for all image
-and PDF functions.
+One SQL query reads every menu (2.1 million input tokens) in 34 seconds on one
+H100 with `qwen3.5-4b-bf16`, for $0.04. Quail reads each image once and reuses
+KV, the model's saved state for the image, across both questions. See
+[Querying multimodal data](/docs/user-guide/multimodal-data) for all image and
+PDF functions.
 
-## Browse the menus
+## The dataset
 
-The menus range from hotel dining rooms to ocean-liner dinners. Click any menu
-to open the full scan:
+The dataset is composed of 17,547 scanned restaurant menus, most from 1900 to
+1960, and CSV files of each menu's dates, dishes, and prices. The CSV files list
+only dishes and prices, so everything else on the page, such as a note about war
+stamps or a list of wines, appears only in the scans.
+
+The menus range from hotel dining rooms to a banquet on an ocean liner. Click a
+menu to open the full scan:
 
 <div className="menu-gallery">
   <figure>
@@ -42,13 +45,13 @@ to open the full scan:
 
 [![The cover of a dinner menu on board the R.M.S. Berengaria, November 22, 1926](./menus/gallery-berengaria-1926-cover.jpg)](https://iiif.nypl.org/iiif/2/4021318/full/!2400,2400/0/default.jpg)
 
-    <figcaption>R.M.S. Berengaria, November 1926: dinner cover</figcaption>
+    <figcaption>R.M.S. Berengaria, November 1926: a dinner on board the Cunard liner</figcaption>
   </figure>
   <figure>
 
 [![The menu of the same dinner, ending with Canada Dry, White Rock, and Poland Water](./menus/gallery-berengaria-1926-menu.jpg)](https://iiif.nypl.org/iiif/2/4021321/full/!2400,2400/0/default.jpg)
 
-    <figcaption>R.M.S. Berengaria, November 1926: mixers only, no liquor</figcaption>
+    <figcaption>The same dinner's menu: Canada Dry and White Rock, but no liquor</figcaption>
   </figure>
   <figure>
 
@@ -60,14 +63,14 @@ to open the full scan:
 
 [![A menu from the Terrace Room at the Hotel New Yorker, December 7, 1945](./menus/gallery-terrace-room-1945.jpg)](https://iiif.nypl.org/iiif/2/3990440/full/!2400,2400/0/default.jpg)
 
-    <figcaption>The Hotel New Yorker, December 1945: Victory Loan notice beside cocktails</figcaption>
+    <figcaption>The Hotel New Yorker, December 1945: a Victory Loan ad beside the cocktails</figcaption>
   </figure>
 </div>
 
-## Load the menu metadata
+## Loading the tables
 
-Download the NYPL CSV archive, filter `Menu.csv` to menus from 1914 to 1949,
-and count the transcribed dishes per page from `MenuItem.csv`:
+We'll start with the CSV files. Download the archive, keep the menus from 1914
+to 1949, and count the dishes transcribed on each page:
 
 ```python
 import io
@@ -97,12 +100,11 @@ counts = read("MenuItem.csv").group_by("menu_page_id").aggregate([("id", "count"
 dishes = dict(zip(counts["menu_page_id"].to_pylist(), counts["id_count"].to_pylist()))
 ```
 
-## Fetch one image per menu
+## Picking one page per menu
 
-Most menus have several pages, and the first page is often a decorative cover.
-Pick each menu's page with the most transcribed dishes to skip covers, and
-sample at most 60 menus per year so years with hundreds of menus do not
-outweigh years with few:
+Most menus have several pages, and the first page is often a cover. We'll take
+each menu's page with the most transcribed dishes. Some years have hundreds of
+menus and others have few, so we'll keep at most 60 menus per year:
 
 ```python
 best = {}
@@ -119,9 +121,9 @@ chosen = [page for found in by_year.values()
           for page in chooser.sample(found, min(60, len(found)))]
 ```
 
-Download each sampled page from the library's image server resized to at most
-1,024 pixels on its longer side. Smaller images (512 or 768 pixels) blur small
-print, while larger images cost more tokens without changing the answers:
+The library's image server resizes each scan on request. We'll ask for 1,024
+pixels on the long side: the model misreads more small print at 512 or 768
+pixels, and larger images cost more tokens:
 
 ```python
 def fetch(page):
@@ -138,14 +140,15 @@ with ThreadPoolExecutor(64) as pool:
                if image]
 ```
 
-Roughly one request in nine times out, leaving about 1,450 images. Page `62899`
-shows a May 1933 Commodore Hotel menu at 1,024 pixels:
+One request in 9 times out, so 1,446 of the 1,637 pages arrive. The image below
+shows the top of page `62899`, from the Commodore Hotel in May 1933:
 
 ![The top of a menu from the Commodore Hotel, May 17, 1933, with the line "Beer per glass 10c"](./menus/commodore-1933.jpg)
 
-## Register the tables
+## Registering the tables
 
-Put the menu metadata and JPEG bytes into two PyArrow tables:
+Quail reads two tables. `menus` holds one row per menu, and `pages` holds the
+JPEG bytes fetched for each menu in a `BINARY` column:
 
 | Table | Column | Type | Example |
 | --- | --- | --- | --- |
@@ -154,10 +157,10 @@ Put the menu metadata and JPEG bytes into two PyArrow tables:
 | | `year` | `INT64` | 1933 |
 | `pages` | `id` | `STRING` | `62899` |
 | | `menu_id` | `STRING` | `31142` |
-| | `image` | `BINARY` | JPEG bytes |
+| | `image` | `BINARY` | the JPEG shown above |
 
-Register both tables in a Quail session configured with `qwen3.5-4b-bf16`, a
-vision model (a language model able to read images):
+Register both tables in a session with `qwen3.5-4b-bf16`, a vision model (a
+language model able to read images):
 
 ```python
 import quail
@@ -175,10 +178,12 @@ session.register("menus", menus, id_col="id")
 session.register("pages", pages, id_col="id")
 ```
 
-## Ask both questions in one query
+## Asking the questions
 
-Run both yes-or-no questions with `AI.IF` inside a common table expression
-(CTE), a named subquery, then join the answers with `menus` and group by year:
+We'll ask each page two questions: does the menu sell alcohol, and does the menu
+mention a war? `AI.IF` asks the model a yes-or-no question about each image and
+returns `TRUE` or `FALSE`. A common table expression (CTE), a named subquery,
+computes both answers before `GROUP BY` averages the yes answers per year:
 
 ```python
 QUERY = """
@@ -198,30 +203,32 @@ print(session.sql(QUERY).collect())
 session.close()
 ```
 
-The first prompt excludes dishes cooked with wine or liqueur; otherwise the
-model flags desserts made with port or kirsch as alcoholic drinks. Both `AI.IF`
-calls read `p.image` in the same model region, so the second call reuses KV
-from the first call and evaluates only its own question tokens.
+The alcohol question says "to drink" on purpose, because the model counts
+desserts made with port or kirsch as alcohol without the phrase. Quail reads
+each image only once: the second `AI.IF` reuses KV from the first `AI.IF` and
+pays only for its own question.
 
-## Inspect the results
+## Results
 
-`HAVING COUNT(*) >= 20` keeps every year with at least 20 menus:
+The query returns one row for each year with at least 20 menus:
 
 <MenuHistoryTable />
 
-Hover over the chart to read a year's numbers, or click a legend entry to show
-or hide a line:
+The chart plots both shares by year. Hover over the chart to read a year's
+numbers, or click a legend entry to hide a line:
 
 <MenuHistoryChart />
 
-War mentions jump from 2% in 1914 to 57% in 1918 during World War I, then climb
-again to 38% in 1945 during World War II. Drink lists drop from 36% in 1914 to
-under 10% throughout Prohibition and rebound to 30% in 1933, the year beer
-became legal again. A few Prohibition menus still match: ocean-liner menus
-legally serve liquor outside US waters, while the 1926 Berengaria menu lists
-only mixers and is a false positive.
+War mentions jump from almost none to 57% of menus in 1918, the final year of
+World War I, and rise again from 1943 to 1946. Alcohol drops from 36% of menus
+in 1914 to under 10% for most of Prohibition, then returns on 30% of menus in
+1933, the year beer became legal again.
 
-Two menus from the wartime peaks show the notices on the page:
+Some menus still list drinks during the ban, such as ocean-liner menus outside
+US waters, and the model gets at least one menu wrong: the 1926 Berengaria menu
+in the gallery lists only mixers.
+
+The war notes stand out on the pages themselves:
 
 <div className="menu-scans">
   <figure>
