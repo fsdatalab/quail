@@ -6,7 +6,7 @@ from typing import Literal, get_args
 
 import _quail_native
 
-Precision = Literal["fp8", "bf16", "fp32"]
+Precision = Literal["fp4", "fp8", "bf16", "fp32"]
 # What a model answers with: a generative model scores TRUE against
 # FALSE for AI_FILTER and AI_JOIN; a reranker scores yes against no
 # for AI.SCORE; a decision model scores its yes and no options with
@@ -222,6 +222,8 @@ class ModelSpec:
     gdn_key_dim: int = 0
     gdn_value_dim: int = 0
     gdn_weight_precision: Precision | None = None
+    # the MLP projections' precision, when it differs from weight_precision
+    mlp_weight_precision: Precision | None = None
     conv_width: int = 0
     checkpoint_layers: int = 0    # layers in the checkpoint; when larger
     #                               than layers, the loader keeps the first
@@ -396,15 +398,19 @@ class DeviceSpec:
     page_tokens: int = 16    # tokens per KV page required by the attention kernel
     mamf_fp8_flops: float = 0.0    # 0 uses the specification rate
     mamf_bf16_flops: float = 0.0
+    fp4_flops: float = 0.0    # dense FP4 tensor-core FLOP/s, without
+    #                           sparsity; 0 means no FP4 tensor cores
 
     def __post_init__(self):
         for precision in get_args(Precision):
-            if not self.arithmetic_bandwidth(precision) > 0:
+            if precision != "fp4" and not self.arithmetic_bandwidth(precision) > 0:
                 raise ValueError(
                     f"{self.name}: {precision}_flops must be positive")
 
     def arithmetic_bandwidth(self, precision: Precision) -> float:
         """Return arithmetic throughput for one component precision."""
+        if precision == "fp4":
+            return self.fp4_flops
         if precision == "fp8":
             return self.fp8_flops
         if precision == "bf16":

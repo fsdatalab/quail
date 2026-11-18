@@ -134,8 +134,16 @@ def _install_single_rank_groups(torch):
     ps._NODE_COUNT = 1
 
 
-def retain_answer_head(torch, model, token_ids):
-    """Keep the TRUE/FALSE answer rows and the full output head in bf16."""
+def retain_answer_head(torch, model, token_ids, head=None):
+    """Keep the TRUE/FALSE answer rows and the full output head in bf16.
+
+    Args:
+        torch: The torch module.
+        model: The loaded model.
+        token_ids: The answer token ids whose rows to keep.
+        head: The output head's weights, for a head the loaded module
+            stores packed; None reads the module's weight.
+    """
     allowed = tuple(sorted(set(token_ids)))
     if not allowed:
         raise ValueError("TRUE/FALSE token ids must not be empty")
@@ -144,7 +152,7 @@ def retain_answer_head(torch, model, token_ids):
         return
     # a checkpoint with a vision tower keeps its head in the language model
     owner = model if hasattr(model, "lm_head") else model.language_model
-    weight = owner.lm_head.weight
+    weight = owner.lm_head.weight if head is None else head
     indices = torch.tensor(allowed, device=weight.device, dtype=torch.long)
     weights = weight.detach().index_select(0, indices).to(dtype=torch.bfloat16)
     model.register_buffer("quail_answer_weights", weights, persistent=False)
@@ -155,6 +163,68 @@ def retain_answer_head(torch, model, token_ids):
     model.quail_full_head = weight.detach().to(dtype=torch.bfloat16)
     # lm_head can be the same module as embed_tokens; drop only this reference.
     owner.lm_head = None
+
+
+# the 16 FP4 E2M1 values, by their 4-bit code: sign bit, then magnitude
+E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+               -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
+NVFP4_GROUP = 16
+
+
+def dequantize_nvfp4(torch, packed, scale, global_scale, rows_per_step=8192):
+    """Return NVFP4 weights in bf16.
+
+    Args:
+        torch: The torch module.
+        packed: The (rows, columns / 2) uint8 weights, two E2M1 codes
+            per byte, the even column in the low four bits.
+        scale: The (rows, columns / 16) fp8 scale of each 16 columns.
+        global_scale: The weight's float32 scale.
+        rows_per_step: Rows dequantized at once, which bounds the
+            float32 scratch.
+    """
+    rows = packed.shape[0]
+    columns = 2 * packed.shape[1]
+    values = torch.tensor(E2M1_VALUES, dtype=torch.float32, device=packed.device)
+    weights = torch.empty(rows, columns, dtype=torch.bfloat16, device=packed.device)
+    global_scale = global_scale.to(device=packed.device, dtype=torch.float32)
+    for start in range(0, rows, rows_per_step):
+        block = packed[start:start + rows_per_step]
+        codes = torch.stack((block & 0xF, block >> 4), dim=-1).reshape(len(block), -1)
+        scales = scale[start:start + rows_per_step].float() * global_scale
+        weights[start:start + len(block)] = (
+            values[codes.long()].view(len(block), -1, NVFP4_GROUP)
+            * scales.unsqueeze(-1)).view(len(block), columns)
+    return weights
+
+
+def nvfp4_output_head(torch, model_path, device="cuda"):
+    """Return a ModelOpt checkpoint's NVFP4 output head in bf16.
+
+    Args:
+        torch: The torch module.
+        model_path: The local checkpoint directory.
+        device: The device to read and dequantize the head on.
+
+    Returns:
+        The (vocab, hidden) head, or None when the checkpoint does not
+        store its head in NVFP4.
+    """
+    from safetensors import safe_open
+
+    model_path = Path(model_path)
+    config = json.loads((model_path / "config.json").read_text())
+    layers = (config.get("quantization_config") or {}).get("quantized_layers", {})
+    if layers.get("lm_head", {}).get("quant_algo", "").upper() != "NVFP4":
+        return None
+    index = model_path / "model.safetensors.index.json"
+    files = json.loads(index.read_text())["weight_map"] if index.is_file() else {}
+    tensors = []
+    for name in ("lm_head.weight", "lm_head.weight_scale", "lm_head.weight_scale_2"):
+        file = model_path / files.get(name, "model.safetensors")
+        with safe_open(file, framework="pt", device=device) as checkpoint:
+            tensors.append(checkpoint.get_tensor(name))
+    return dequantize_nvfp4(torch, *tensors)
 
 
 def full_output_head(model):
@@ -241,7 +311,8 @@ def load_model(model_name: str, revision: str | None = None, *,
                                  text_only, images)
     if num_layers is not None:
         keep_layers(torch, model, num_layers)
-    retain_answer_head(torch, model, answer_token_ids)
+    retain_answer_head(torch, model, answer_token_ids,
+                       head=nvfp4_output_head(torch, model_path))
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
     return model

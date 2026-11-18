@@ -8,6 +8,26 @@ description: Write efficient Quail queries over agent traces. Use when modeling 
 A query costs the tokens the model processes. Every rule below cuts tokens:
 fewer rows reach the model, each row is shorter, and the model writes less.
 
+## Choose a model and a GPU
+
+Use the model the user names. Otherwise start with Qwen3.8 27B, the most
+accurate model Quail runs, in the version that fits the GPU:
+
+| GPU | `device` | `model` |
+| --- | --- | --- |
+| B200 | `b200` | `qwen3.8-27b-nvfp4`: NVFP4 runs on the B200's FP4 tensor cores |
+| H100 | `h100-sxm` | `qwen3.8-27b-fp8` |
+| RTX PRO 6000 Blackwell | `rtx-pro-6000-blackwell-server` | `qwen3.8-27b-fp8` |
+| L40S | `l40s` | `qwen3-32b-fp8`: the L40S cannot run Qwen3.8 |
+
+```python
+config = quail.EngineConfig(model="qwen3.8-27b-nvfp4", device="b200")
+```
+
+For an easy task, such as a clear yes-or-no question over short messages, a
+smaller model like `qwen3-4b-fp8` costs less. Check its answers against labels
+(section 9) before you trust it.
+
 ## 1. Store messages and tool calls in separate tables
 
 - `messages`: one row per user prompt or agent reply, with `session_id`, `turn_number`, `speaker`, `content`.

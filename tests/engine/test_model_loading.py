@@ -10,7 +10,10 @@ import pytest
 
 from quail.backends.quail.executor import model_loading
 from quail.backends.quail.executor.model_loading import (
+    E2M1_VALUES,
     answer_weights,
+    dequantize_nvfp4,
+    nvfp4_output_head,
     retain_answer_head,
 )
 from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers, AsyncScores
@@ -76,6 +79,54 @@ def test_retained_answer_weights_ownership_and_answer_rows(torch):
     assert first(hidden) == second(hidden) == expected
     assert AsyncAnswers.dtype is None
     assert AsyncScores.dtype is np.float32
+
+
+def _nvfp4(torch, codes, scales, global_scale):
+    """Pack E2M1 codes two per byte, the even column low, with their scales."""
+    codes = torch.tensor(codes, dtype=torch.uint8)
+    packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
+    return (packed, torch.tensor(scales).to(torch.float8_e4m3fn),
+            torch.tensor(global_scale, dtype=torch.float32))
+
+
+def test_nvfp4_weights_dequantize_to_their_codes_times_both_scales(torch):
+    codes = [list(range(16)) + list(range(15, -1, -1)),
+             [7] * 16 + [9] * 16]
+    scales = [[2.0, 0.5], [1.0, 4.0]]
+    packed, scale, global_scale = _nvfp4(torch, codes, scales, 0.25)
+
+    weights = dequantize_nvfp4(torch, packed, scale, global_scale, rows_per_step=1)
+
+    expected = [[E2M1_VALUES[code] * scales[row][column // 16] * 0.25
+                 for column, code in enumerate(codes[row])] for row in range(2)]
+    assert weights.dtype == torch.bfloat16
+    assert weights.float().tolist() == expected
+
+
+def test_an_nvfp4_head_is_read_from_the_checkpoint_and_kept_in_bf16(
+        torch, tmp_path):
+    safetensors = pytest.importorskip("safetensors.torch")
+    packed, scale, global_scale = _nvfp4(torch, [[1, 2] * 8, [3, 4] * 8],
+                                         [[1.0], [2.0]], 1.0)
+    safetensors.save_file({"lm_head.weight": packed,
+                           "lm_head.weight_scale": scale,
+                           "lm_head.weight_scale_2": global_scale},
+                          tmp_path / "model.safetensors")
+    layers = {"lm_head": {"quant_algo": "NVFP4", "group_size": 16}}
+    (tmp_path / "config.json").write_text(json.dumps(
+        {"quantization_config": {"quant_algo": "MIXED_PRECISION",
+                                 "quantized_layers": layers}}))
+    model = _model(torch)
+    model.lm_head = torch.nn.Linear(8, 2, bias=False)
+
+    head = nvfp4_output_head(torch, tmp_path, device="cpu")
+    retain_answer_head(torch, model, [0, 1], head=head)
+
+    assert model.quail_full_head.float().tolist() == [[0.5, 1.0] * 8, [3.0, 4.0] * 8]
+    assert model.quail_answer_weights.dtype == torch.bfloat16
+    (tmp_path / "config.json").write_text(json.dumps(
+        {"quantization_config": {"quant_method": "fp8"}}))
+    assert nvfp4_output_head(torch, tmp_path, device="cpu") is None
 
 
 @pytest.fixture
