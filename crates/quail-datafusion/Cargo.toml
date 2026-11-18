@@ -12,6 +12,8 @@ datafusion = { version = "55.2.0", default-features = false, features = ["sql", 
 base64 = "0.23"
 # a region's expressions cross to the executor as datafusion-proto bytes
 datafusion-proto = { version = "55.2.0", default-features = false }
+# json_get, json_get_str, ->, ->> and the other JSON functions
+datafusion-functions-json = "0.55.6"
 futures = "0.3"
 # the text a PDF stores, for AI.PARSE_DOCUMENT
 pdf-extract = "0.12.1"

@@ -913,8 +913,12 @@ pub fn bind_map_prompt(
     if args.len() != 1 {
         return compile_error("AI.MAP reads one document column");
     }
-    if instruction.trim().is_empty() || instruction.contains('{') || instruction.contains('}') {
-        return compile_error("AI.MAP needs an instruction with at least one word and no braces");
+    // a {N} would read as a document placeholder; other braces, as in a
+    // JSON example, stay in the prompt as written
+    if instruction.trim().is_empty() || !placeholders(instruction).is_empty() {
+        return compile_error(
+            "AI.MAP needs an instruction with at least one word and no {N} placeholder",
+        );
     }
     let cue = if turn.1.is_empty() {
         "\n"

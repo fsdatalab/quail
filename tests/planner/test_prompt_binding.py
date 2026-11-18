@@ -41,7 +41,7 @@ REFUSED = {
     "a stray brace": ("filter", "a {b} {0}", (REVIEW,), {}),
     "a join over one table": ("join", "{0} {1}", (REVIEW, REVIEW), {}),
     "an empty question": ("extract", "  ", (REVIEW,), {}),
-    "a map instruction with a brace": ("map", "Use {x}", (REVIEW,), {}),
+    "a map instruction with a placeholder": ("map", "Compare with {0}", (REVIEW,), {}),
 }
 
 def _bind(model, kind, template, args, *, labels=(), descriptions=(),

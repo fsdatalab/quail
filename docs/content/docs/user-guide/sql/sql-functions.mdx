@@ -94,6 +94,31 @@ Quail also registers three text functions for dialect compatibility:
 | `REGEXP_LIKE(value, pattern)` | BigQuery syntax matches anywhere; Snowflake syntax matches the whole value. |
 | `RLIKE(value, pattern)` | Snowflake alias for `REGEXP_LIKE`. |
 
+## Read JSON
+
+You can read fields of a JSON string with the functions of
+[datafusion-functions-json](https://github.com/datafusion-contrib/datafusion-functions-json).
+They help when `AI.MAP` writes JSON. The query below asks the model for a
+page's title and years as JSON, then reads both fields:
+
+```sql
+SELECT p.id,
+       json_get_str(p.reply, 'title') AS title,
+       json_length(p.reply, 'years') AS num_years
+FROM (SELECT d.id, AI.MAP(d.image, 'Reply with JSON like {"title": "", "years": []}.', 200) AS reply
+      FROM documents d) p;
+```
+
+| Function | Returns |
+| --- | --- |
+| `json_get_str(json, key, ...)` | The string at the path of keys and array indexes. |
+| `json_get_int`, `json_get_float`, `json_get_bool` | The number or boolean at the path. |
+| `json_get_json(json, key, ...)` | The JSON at the path, as a string. |
+| `json_length(json, key, ...)` | The length of the array or object at the path. |
+| `json ->> 'key'` | The value at the key, as text. |
+
+You get `NULL` when the path does not exist or the JSON does not parse.
+
 Use a DataFusion scalar function inside an AI prompt when the model should
 read the transformed value. For example,
 `PROMPT('Review: {0}', LOWER(TRIM(r.body)))` removes surrounding spaces and

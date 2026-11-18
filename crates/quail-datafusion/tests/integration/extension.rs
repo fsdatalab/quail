@@ -144,7 +144,14 @@ fn adding_quail_keeps_the_hosts_session_id_and_function_rewrites() -> Result<()>
         .iter()
         .map(|rewrite| rewrite.name())
         .collect();
-    assert_eq!(rewrites, ["host_rewrite", "snowflake_regexp_like"]);
+    assert_eq!(
+        rewrites,
+        [
+            "host_rewrite",
+            "snowflake_regexp_like",
+            "JsonFunctionRewriter"
+        ]
+    );
     Ok(())
 }
 
@@ -159,6 +166,72 @@ async fn a_host_with_its_own_query_planner_claims_regions_and_adds_quails_planne
         .build();
     let state = quail.register_rules(state)?;
     assert_eq!(count(&SessionContext::new_with_state(state)).await?, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_host_session_with_quail_reads_json_fields() -> Result<()> {
+    let state = SessionStateBuilder::new().with_default_features().build();
+    let state = QuailExtension::new(Arc::new(KeepsFirstReview)).register(state)?;
+    let context = SessionContext::new_with_state(state);
+    let reply = r#"'{"title": "Receipts, 1928", "years": [1926, 1927, 1928]}'"#;
+    let query = format!(
+        "SELECT json_get_str({reply}, 'title') AS title, \
+         json_get_int({reply}, 'years', 2) AS last_year, \
+         json_length({reply}, 'years') AS num_years, \
+         {reply} ->> 'title' AS by_operator"
+    );
+    let batches = context.sql(&query).await?.collect().await?;
+    let row = batches[0]
+        .columns()
+        .iter()
+        .map(|column| {
+            let text = datafusion::arrow::compute::cast(column, &DataType::Utf8)?;
+            let text = text.as_any().downcast_ref::<StringArray>().expect("text");
+            Ok(text.value(0).to_string())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(row, ["Receipts, 1928", "1928", "3", "Receipts, 1928"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_host_with_its_own_json_function_keeps_it_and_gets_none_of_quails() -> Result<()> {
+    use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+    let host_json = create_udf(
+        "json_get_str",
+        vec![DataType::Utf8, DataType::Utf8],
+        DataType::Utf8,
+        Volatility::Immutable,
+        Arc::new(|_args: &[ColumnarValue]| {
+            Ok(ColumnarValue::Scalar(
+                datafusion::common::ScalarValue::Utf8(Some("the host's".to_string())),
+            ))
+        }),
+    );
+    let mut host = SessionStateBuilder::new().with_default_features().build();
+    datafusion::execution::FunctionRegistry::register_udf(&mut host, Arc::new(host_json))?;
+    let state = QuailExtension::new(Arc::new(KeepsFirstReview)).register(host)?;
+    assert!(!state.scalar_functions().contains_key("json_length"));
+    assert!(
+        state
+            .analyzer()
+            .function_rewrites
+            .iter()
+            .all(|rewrite| rewrite.name() != "JsonFunctionRewriter")
+    );
+    let context = SessionContext::new_with_state(state);
+    let batches = context
+        .sql(r#"SELECT json_get_str('{"title": "Receipts"}', 'title') AS title"#)
+        .await?
+        .collect()
+        .await?;
+    let titles = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("text");
+    assert_eq!(titles.value(0), "the host's");
     Ok(())
 }
 
