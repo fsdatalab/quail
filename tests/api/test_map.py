@@ -121,6 +121,15 @@ def test_a_map_writes_up_to_its_answer_token_limit_after_the_document(session):
     assert node.spec.max_answer_tokens == 256
 
 
+def test_a_map_instruction_keeps_the_braces_of_a_json_example(session):
+    instruction = 'Reply with JSON like {"title": "", "years": []}.'
+    query = session.sql(
+        f"SELECT r.id, AI.MAP(r.body, '{instruction}', 32) AS reply FROM reviews r")
+    (node,) = _maps(query.plan())
+    _, tail = node.spec.prompt_token_parts
+    assert question_text(tail).endswith(instruction + session.model.turn[1] + "ANSWER:")
+
+
 def test_a_map_writes_only_the_documents_the_filter_before_it_keeps():
     assert_transcript(_transcript(
         f"SELECT r.id, AI.MAP(r.body, '{SUMMARY}', 64) AS summary FROM reviews r "
@@ -169,6 +178,9 @@ def test_a_malformed_map_is_refused(session):
              "not supported"),
             (f"SELECT r.id, AI.MAP(r.body, '{SUMMARY}', 0) AS s FROM reviews r",
              "an integer from 1 to 32768"),
+            # a {N} in the instruction would read as a document placeholder
+            ("SELECT r.id, AI.MAP(r.body, 'Compare with {0}.') AS s FROM reviews r",
+             "no {N} placeholder"),
             # a limit the planner would size its answer rows by
             (f"SELECT r.id, AI.MAP(r.body, '{SUMMARY}', 4294967296) AS s "
              "FROM reviews r", "an integer from 1 to 32768")):

@@ -154,6 +154,7 @@ impl QuailExtension {
         if first {
             state.register_expr_planner(Arc::new(StructFieldAccess))?;
             state.register_function_rewrite(Arc::new(SnowflakeRegexpLike))?;
+            datafusion_functions_json::register_all(&mut state)?;
         }
         Ok(state)
     }
