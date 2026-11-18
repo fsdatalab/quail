@@ -309,13 +309,20 @@ class Transcripts:
         received, lock = set(), threading.Condition()
 
         def wait_for(alias, documents):
+            # a text several rows hold names them all; one received row
+            # of it is enough
             names = {self._ids[oracle._texts([alias], [document])[0]]
                      for document in documents}
+
+            def missing():
+                return sorted(name for name in names
+                              if not set(name.split("/")) & received)
+
             with lock:
-                if not lock.wait_for(lambda: names <= received,
+                if not lock.wait_for(lambda: not missing(),
                                      timeout=HINT_WAIT_SECONDS):
                     raise AssertionError(
-                        f"the reader did not receive {sorted(names - received)} "
+                        f"the reader did not receive {missing()} "
                         "while the region ran")
 
         self._asked, events, rows = [], [], []

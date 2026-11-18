@@ -8,7 +8,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping, Protocol
 
 from quail.execution.deduplicate import MODEL_NODES, deduplicate
-from quail.execution.finished import held, report_outputs
+from quail.execution.finished import renumbered, report_outputs
 from quail.execution.guard import guarded, present_join_inputs, reads_null_documents
 from quail.execution.metrics import NodeMetrics, NodeResult, RunResult
 from quail.execution.rows import Rows
@@ -247,12 +247,18 @@ def _without_early_stops(ordered, pipelines) -> dict:
 
 
 def _renumbered(guard, deduplicated):
-    """Hold back operators' reports while a node runs over renumbered rows.
+    """Report a node's rows over the region's rows while it runs.
 
-    A guard or deduplication renumbers the rows an operator reports, so
-    its rows go once its result is expanded.
+    A guard keeps the region's ids, so the rows a node finishes go on at
+    once, unless its result adds rows the node never reported. A
+    deduplicated node's rows go to every copy of their key documents.
+    Any other report waits for the node's expanded result.
     """
-    return held() if guard is not None or deduplicated is not None else nullcontext()
+    if guard is not None and not guard.reports_as_run():
+        return renumbered()
+    if deduplicated is not None:
+        return renumbered(deduplicated.reported)
+    return nullcontext()
 
 
 def compute_subgraph(graph: PhysicalGraph) -> PhysicalGraph:
