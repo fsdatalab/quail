@@ -154,7 +154,12 @@ impl QuailExtension {
         if first {
             state.register_expr_planner(Arc::new(StructFieldAccess))?;
             state.register_function_rewrite(Arc::new(SnowflakeRegexpLike))?;
-            datafusion_functions_json::register_all(&mut state)?;
+            // the crate's rewriter matches calls by name and its planner
+            // reads -> and ->>, so a host's own JSON functions keep the
+            // session and Quail adds none
+            if !hosts_json_functions(&state)? {
+                datafusion_functions_json::register_all(&mut state)?;
+            }
         }
         Ok(state)
     }
@@ -164,6 +169,18 @@ impl QuailExtension {
     pub fn extension_planner(&self) -> Arc<dyn ExtensionPlanner + Send + Sync> {
         Arc::new(ModelRegionPlanner::new(Arc::clone(&self.runner)))
     }
+}
+
+/// Whether the session already has a function under a name that
+/// datafusion-functions-json registers.
+fn hosts_json_functions(state: &SessionState) -> Result<bool> {
+    // the crate's names, read from a session that has nothing else
+    let mut names = SessionStateBuilder::new().build();
+    datafusion_functions_json::register_all(&mut names)?;
+    Ok(names
+        .scalar_functions()
+        .keys()
+        .any(|name| state.scalar_functions().contains_key(name)))
 }
 
 /// `plan`'s operator over other inputs, its expressions as they are.

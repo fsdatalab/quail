@@ -153,6 +153,12 @@ let context = SessionContext::new_with_state(state);
 The `runner` runs the model. Use
 `Arc::new(quail::Executor::open(&config)?)` to run it on your GPUs.
 
+`register` also adds the JSON functions of
+[datafusion-functions-json](https://github.com/datafusion-contrib/datafusion-functions-json),
+unless your session already has a function under one of their names, such as
+`json_get_str`. Your session then keeps your JSON functions, and Quail adds
+none of them.
+
 Call `register_rules` when you need to keep your own query planner. Your
 planner must call `quail::extension::claim_model_regions` on the optimized
 plan and add `QuailExtension::extension_planner()` to its extension planners.
