@@ -2,18 +2,19 @@
 title: Querying scanned restaurant menus
 ---
 
-Join a metadata table with a column of page images to measure signals missing
-from structured columns. Volunteers transcribed dish names and prices from
-17,547 scanned menus in the New York Public Library
+Join a CSV table with a column of page images to query details missing from
+structured columns. Volunteers transcribed dish names and prices from 17,547
+scanned menus in the New York Public Library
 [What's on the menu?](https://www.nypl.org/research/support/whats-on-the-menu)
-archive into CSV files, yet omitted war-bond notes and drink lists. You will
-join the CSV metadata with 1,446 menu scans in Quail, ask two `AI.IF` questions
-per scan in one SQL query, and group the answers by year from 1914 to 1949.
+archive into CSV files, yet left out war-bond notes and drink lists. Load the
+CSV metadata, fetch one scan per menu from 1914 to 1949, ask two `AI.IF`
+questions per scan in one SQL query, and group the answers by year.
 
 ## Explore the scans
 
 Menus from 1914 to 1949 span World War I, Prohibition (the US ban on alcohol
-from 1920 to 1933), and World War II. Click any scan to open the full image:
+from 1920 to 1933), and World War II. Click any scan to inspect the full page
+image before writing the query:
 
 <div className="menu-gallery">
   <figure>
@@ -56,8 +57,8 @@ from 1920 to 1933), and World War II. Click any scan to open the full image:
 
 ## Load the menu metadata
 
-Download the CSV archive, keep menus dated between 1914 and 1949, and count the
-transcribed dishes per page:
+Download the CSV archive, keep menus dated from 1914 to 1949, and count the
+transcribed dishes on each page:
 
 ```python
 import io
@@ -89,9 +90,9 @@ dishes = dict(zip(counts["menu_page_id"].to_pylist(), counts["id_count"].to_pyli
 
 ## Fetch one scan per menu
 
-Multi-page menus often begin with a decorative cover. Pick each menu's page
-with the most transcribed dishes to skip blank covers, and sample at most 60
-menus per year so busy years do not dominate the run:
+Pick each menu's page with the most transcribed dishes so you skip decorative
+front covers. Sample at most 60 menus per year so years with hundreds of menus
+do not dominate your averages:
 
 ```python
 best = {}
@@ -108,9 +109,9 @@ chosen = [page for found in by_year.values()
           for page in chooser.sample(found, min(60, len(found)))]
 ```
 
-Fetch each chosen page from the library image server with its longer side
-resized to 1,024 pixels. Smaller images blurred small print at 512 or 768
-pixels, and larger images added tokens without improving answers:
+Request each chosen scan from the library image server with its longer side
+resized to 1,024 pixels. Smaller scans blur small print at 512 or 768 pixels,
+and larger scans add image tokens without improving accuracy:
 
 ```python
 def fetch(page):
@@ -127,18 +128,16 @@ with ThreadPoolExecutor(64) as pool:
                if image]
 ```
 
-The recorded run fetched 1,446 of the 1,637 pages before the remaining requests
-timed out. Page `62899` shows the detail kept at 1,024 pixels on a May 1933
-Commodore Hotel menu:
+You receive roughly 1,450 of the 1,637 scans because some requests time out.
+Inspect one fetched scan, page `62899` from the Commodore Hotel in May 1933, to
+see the print detail at 1,024 pixels:
 
 ![The top of a menu from the Commodore Hotel, May 17, 1933, with the line "Beer per glass 10c"](./menus/commodore-1933.jpg)
 
 ## Register the tables
 
-Build two Arrow tables and register both tables in a session configured with a
-vision model, a language model able to read images. `menus` stores one row per
-menu, and `pages` stores the JPEG bytes for each fetched scan in a `BINARY`
-column:
+Put the menu metadata into `menus` and the JPEG bytes into a `BINARY` column of
+`pages`:
 
 | Table | Column | Type | Example |
 | --- | --- | --- | --- |
@@ -148,6 +147,9 @@ column:
 | `pages` | `id` | `STRING` | `62899` |
 | | `menu_id` | `STRING` | `31142` |
 | | `image` | `BINARY` | JPEG bytes |
+
+Register both Arrow tables in a session configured with a vision model, a
+language model able to read images:
 
 ```python
 import quail
@@ -167,8 +169,8 @@ session.register("pages", pages, id_col="id")
 
 ## Run one query for both questions
 
-Ask two `AI.IF` questions per scan inside one common table expression (CTE),
-join the answers to `menus`, and average both flags per year:
+Ask both `AI.IF` questions per scan inside one common table expression (CTE),
+join the answers to `menus`, and average both flags by year:
 
 ```python
 QUERY = """
@@ -188,32 +190,32 @@ print(session.sql(QUERY).collect())
 session.close()
 ```
 
-The drink prompt excludes dishes cooked with wine or liqueur so desserts made
-with port or kirsch do not count as beverages. Quail encodes each `p.image`
-once and reuses KV, the model's cached attention state, so the second `AI.IF`
-computes only its own question tokens.
+Exclude dishes cooked with wine or liqueur in the drink prompt so desserts made
+with port or kirsch do not count as drinks. You pay to encode each scan only
+once because Quail reuses KV, the model's cached attention state, when the
+second `AI.IF` runs.
 
 ## Inspect the results
 
-One H100 ran the query over all 1,446 pages (2.1 million input tokens) in 34
-seconds ($0.04) with `qwen3.5-4b-bf16`. `HAVING COUNT(*) >= 20` keeps each year
-with at least 20 sampled menus:
+You get one row per year with at least 20 sampled menus, and running the query
+over 1,446 scans (2.1 million input tokens) takes 34 seconds ($0.04) on one
+H100 with `qwen3.5-4b-bf16`:
 
 <MenuHistoryTable />
 
-The chart plots both yearly shares. Hover over a year to read its counts, or
-click a legend label to hide a series:
+Hover over a year on the chart to read its shares, or click a legend label to
+hide a line:
 
 <MenuHistoryChart />
 
-War mentions jump from 2% in 1914 to 57% in 1918, the final year of World War
-I, and climb again to 38% in 1945. Drink lists fall from 36% in 1914 to below
-10% across most of Prohibition, then rebound to 30% in 1933 when the US
-legalized beer again. Positive answers during Prohibition come from ocean-liner
-menus outside US law and occasional model errors, such as the 1926 Berengaria
-scan listing only mixers.
+You see war mentions jump from 2% in 1914 to 57% in 1918 during World War I,
+then climb again to 38% in 1945 during World War II. You see drink lists drop
+from 36% in 1914 to below 10% across most of Prohibition, then rebound to 30%
+in 1933 when beer became legal again. Check individual scans from Prohibition
+years to separate true exceptions, such as ocean-liner menus outside US law,
+from model errors such as the 1926 Berengaria scan listing only mixers.
 
-Two wartime scans show the notices matched by `mentions_war`:
+Compare the wartime spikes against two scans matched by `mentions_war`:
 
 <div className="menu-scans">
   <figure>

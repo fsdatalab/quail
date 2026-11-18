@@ -27,10 +27,10 @@ model.
 
 ## Images
 
-Store PNG or JPEG bytes in a `BINARY` column to query images. The example
-checks expenses in
+Store PNG or JPEG bytes in a `BINARY` column to query images. You can test
+image queries on
 [CORD](https://huggingface.co/datasets/naver-clova-ix/cord-v2), a dataset of
-1,000 receipt photos from Indonesian restaurants, priced in rupiah.
+1,000 receipt photos from Indonesian restaurants priced in rupiah.
 
 Download the CORD Parquet files and store each photo's bytes in a `BINARY`
 column:
@@ -78,10 +78,10 @@ WHERE AI.IF(PROMPT('Is this receipt''s total over 100,000 rupiah? {0}', r.image)
 | --- | --- | --- |
 | 174,600: returned, `meal` | 230,000: returned, `bakery or snacks` | 91,000: filtered out |
 
-`AI.CLASSIFY` reuses KV, the model's cached attention state, from `AI.IF`
-instead of reading each passing receipt again. Reuse helped one H100 run the
-query over all 1,000 receipts in 92 seconds ($0.10) with `qwen3.5-4b-bf16`, and
-`AI.IF` matched 96.8% of the 972 receipts with a labeled total.
+You pay to encode each receipt once because `AI.CLASSIFY` reuses KV, the
+model's cached attention state, from `AI.IF` on each passing receipt. You get
+answers for all 1,000 receipts in 92 seconds ($0.10) on one H100 with
+`qwen3.5-4b-bf16`, matching 96.8% of the 972 receipts with a labeled total.
 
 ### Shrink large images
 
@@ -98,13 +98,13 @@ WHERE AI.IF(PROMPT('Is this receipt''s total over 100,000 rupiah? {0}',
                    AI.IMAGE(r.image, 1024)));
 ```
 
-`AI.IMAGE(r.image, 1024)` ran the CORD query 4 times faster and lowered filter
+`AI.IMAGE(r.image, 1024)` runs the CORD query 4 times faster and lowers filter
 accuracy by 0.1 percentage points.
 
 ## PDFs
 
-Store PDF bytes in a `BINARY` column to query PDFs. The example loads PDF
-contracts from a folder named `contracts`:
+Store PDF bytes in a `BINARY` column to query PDFs from a folder such as
+`contracts`:
 
 ```python
 from pathlib import Path
@@ -121,9 +121,9 @@ session.register("files", files, id_col="path")
 
 `AI.PDF_PAGES(pdf[, longest_edge[, first[, last]]])` renders each page as a
 struct with `page`, the page number starting at 1, and `image`, a PNG image.
-`UNNEST` expands the list of structs into one row per page. The query finds
-each contract page containing a liability cap, a clause limiting how much one
-party can owe:
+`UNNEST` expands the list of structs into one row per page. Filter the unnested
+pages with `AI.IF` to find each contract page containing a liability cap, a
+clause limiting how much one party can owe:
 
 ```sql
 SELECT p.path, p.u['page'] AS page
