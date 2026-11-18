@@ -47,6 +47,7 @@ it), `last_replies` (each session's last agent message), and `test_replies`
 ## 4. Filter with SQL before every AI call
 
 - Filter on columns: dates, agent, outcome, speaker, tool name, `length(content)`.
+- Match text with a regex before the model reads it: `regexp_like(right(output, 300), '(--- FAIL|FAILED|Traceback| [1-9][0-9]* failed)')` keeps only failing test runs, and `regexp_like(content, '(?i)(revert|undo|that''s wrong)')` finds likely corrections for the model to confirm.
 - Remove duplicates with `GROUP BY` before the AI call.
 - Sample by id when a rate is enough: `right(session_id, 1) IN ('0', '8')` keeps 1 in 8 sessions, because ids end in one of 16 hex digits.
 - Cut text in SQL: `left(content, 4000)` for messages, `right(output, 2000)` for logs, where errors appear.
