@@ -93,11 +93,17 @@ class Oracle:
             region reports one of them, the worker waits until the
             region's hint tightens, so a test decides when the operator
             above the region tightens its test.
+        reader: A callable(alias, documents) the worker calls after it
+            sends a batch of a model operator's finished rows, with the
+            batch's documents of its first alias; the worker goes on once
+            it returns, so a test sees what reached the query's reader
+            while the region ran.
     """
 
     def __init__(self, filters=None, joins=None, labels=None, scores=None,
                  answers=None, features=None, maps=None, *, truth=None,
-                 join_metrics=None, chunk_tokens=None, tightens_after=()):
+                 join_metrics=None, chunk_tokens=None, tightens_after=(),
+                 reader=None):
         self.filters = filters or {}
         self.joins = joins or {}
         self.labels = labels
@@ -118,6 +124,7 @@ class Oracle:
         self.join_metrics = join_metrics
         self.chunk_tokens = chunk_tokens
         self.tightens_after = frozenset(tightens_after)
+        self.reader = reader
         self.texts = {}
         self.documents = {}
         # by alias, each document's row in the registered table, which the
@@ -249,25 +256,30 @@ class OracleEnd:
     def finished(self, table) -> None:
         """Send finished rows; after a row in tightens_after, wait for the hint.
 
+        Then hand the oracle's reader the rows sent.
+
         Raises:
             AssertionError: The hint did not tighten within
                 HINT_WAIT_SECONDS.
         """
         oracle, hint = self.oracle, region_hint()
         metadata = table.schema.metadata
-        rows = set()
+        rows, alias, documents = set(), None, []
         # a model node's rows port completes its rows; a join reports
         # its answers before it
-        if (hint is not None and metadata[b"quail.port"].startswith(b"rows")
+        if (metadata[b"quail.port"].startswith(b"rows")
                 and metadata[b"quail.node"].decode() in self.model.asking):
             alias = next(name for name in table.column_names
                          if name in oracle.documents)
-            rows = {oracle._source(alias, document)
-                    for document in table.column(alias).to_pylist()}
+            documents = table.column(alias).to_pylist()
+        if hint is not None:
+            rows = {oracle._source(alias, document) for document in documents}
         rows = (rows & oracle.tightens_after) - self.waited
         self.waited |= rows
         before = hint.generation() if rows else None
         self.end.finished(table)
+        if oracle.reader is not None and documents:
+            oracle.reader(alias, documents)
         deadline = time.monotonic() + HINT_WAIT_SECONDS
         while rows and hint.generation() == before:
             if time.monotonic() > deadline:

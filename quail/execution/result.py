@@ -14,6 +14,28 @@ from pyarrow import compute as pc
 DEFAULT_BATCH_ROWS = 65_536
 
 
+def limited_batches(batches: Iterable[pa.RecordBatch], batch_rows: int,
+                    limit: int | None):
+    """Yield the rows of ``batches`` in batches of at most ``batch_rows``.
+
+    Args:
+        batches: The rows, as record batches.
+        batch_rows: The most rows of each yielded batch.
+        limit: The most rows to yield, or None for every row.
+    """
+    left = limit
+    for found in batches:
+        for batch in pa.Table.from_batches([found]).to_batches(
+                max_chunksize=batch_rows):
+            if left is not None:
+                batch = batch.slice(0, left)
+                left -= batch.num_rows
+            if batch.num_rows:
+                yield batch
+            if left == 0:
+                return
+
+
 def document_index_schema(aliases: Iterable[str], kind: str) -> pa.Schema:
     """Return the shared schema for document-index relations."""
     fields = [

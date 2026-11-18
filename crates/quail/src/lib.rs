@@ -51,6 +51,7 @@ use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{Constraint, Constraints, DataFusionError, Result};
 use datafusion::logical_expr::{LogicalPlan, Statement};
 use datafusion::prelude::SessionContext;
+use futures::StreamExt;
 use quail_datafusion::{
     IdentifiedTable, InputRows, ModelRegion, RegionRunner, SharedInput, quail_schema,
 };
@@ -338,72 +339,73 @@ impl Session {
         query: &str,
         dialect: Option<&str>,
     ) -> Result<(SchemaRef, Vec<RecordBatch>)> {
-        let runner = Arc::clone(&self.runner);
-        let (sender, mut calls) = unbounded_channel::<RegionCall>();
-        // An executor can be shared by sessions, but its workers and
-        // caller route belong to one query at a time. Acquire before block_on
-        // so waiting callers do not occupy a runtime worker.
-        let _caller = runner.enter(sender)?;
-        self.runtime().block_on(async {
-            let (context, base) = (self.context.clone(), self.base.clone());
-            let (query, dialect) = (query.to_string(), dialect.map(str::to_string));
-            // a worker runs the query, so the operators above a region
-            // read its rows while this thread runs the region
-            let query = self.runtime().spawn(async move {
-                let frame = frame(&context, &query, dialect.as_deref()).await?;
-                let (state, plan) = frame.into_parts();
-                let frame = match plan {
-                    // SET, PREPARE, and related statements update this session,
-                    // not a temporary copy of its state.
-                    LogicalPlan::Statement(statement) => {
-                        if let Some(base) = &base
-                            && matches!(
-                                statement,
-                                Statement::SetVariable(_) | Statement::ResetVariable(_)
-                            )
-                        {
-                            base.execute_logical_plan(LogicalPlan::Statement(statement.clone()))
-                                .await?;
-                        }
-                        context
-                            .execute_logical_plan(LogicalPlan::Statement(statement))
-                            .await?
-                    }
-                    // DDL needs DataFusion's execution dispatcher: collecting a
-                    // DataFrame containing CreateMemoryTable does not create it.
-                    // The per-query state preserves dialect settings and shares
-                    // the session's catalog, where created tables and views live.
-                    LogicalPlan::Ddl(_) => {
-                        SessionContext::new_with_state(state)
-                            .execute_logical_plan(plan)
-                            .await?
-                    }
-                    _ => datafusion::dataframe::DataFrame::new(state, plan),
-                };
-                let schema = quail_schema(frame.logical_plan());
-                // renaming the columns keeps each column's buffers
-                let batches = frame
-                    .collect()
-                    .await?
-                    .into_iter()
-                    .map(|batch| {
-                        RecordBatch::try_new(Arc::clone(&schema), batch.columns().to_vec())
-                    })
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                Ok::<_, DataFusionError>((schema, batches))
-            });
-            tokio::pin!(query);
-            // DataFusion's workers run the operators; this thread runs
-            // each model region they hand it
-            loop {
-                tokio::select! {
-                    done = &mut query => break done
-                        .map_err(|error| DataFusionError::External(Box::new(error)))
-                        .and_then(|done| done),
-                    Some(call) = calls.recv() => runner.serve(call),
-                }
+        let (sender, received) = std::sync::mpsc::channel();
+        self.query_run()
+            .run(query.to_string(), dialect.map(str::to_string), &sender)?;
+        drop(sender);
+        let mut schema = None;
+        let mut batches = Vec::new();
+        for streamed in received {
+            match streamed {
+                Streamed::Schema(found) => schema = Some(found),
+                Streamed::Batch(batch) => batches.push(batch),
+                Streamed::Failed(error) => return Err(error),
+                Streamed::Done => {}
             }
-        })
+        }
+        let schema = schema
+            .ok_or_else(|| DataFusionError::Execution("the query returned no schema".into()))?;
+        Ok((schema, batches))
+    }
+
+    /// Run a query read in `dialect`, as [`Session::sql_in_dialect`]
+    /// does, and return its rows as DataFusion produces them.
+    ///
+    /// The query runs on a thread of its own, which runs each model
+    /// region, so a region's rows reach the stream as the workers finish
+    /// them. An operator that reads every row first, such as an
+    /// aggregate or a sort, sends its rows once the regions below it end.
+    /// The stream reads rows while the session lives: dropping the
+    /// session stops the query. Dropping the stream stops reading; a
+    /// running region still runs to its end.
+    ///
+    /// # Errors
+    ///
+    /// The query does not plan, or the thread does not start. A region
+    /// or operator that fails later ends the stream with its error.
+    pub fn sql_stream(&self, query: &str, dialect: Option<&str>) -> Result<RowStream> {
+        let (sender, received) = std::sync::mpsc::channel();
+        let run = self.query_run();
+        let (query, dialect) = (query.to_string(), dialect.map(str::to_string));
+        std::thread::Builder::new()
+            .name("quail-query".into())
+            .stack_size(quail_datafusion::PLANNING_STACK_BYTES)
+            .spawn(move || {
+                if let Err(error) = run.run(query, dialect, &sender) {
+                    let _ = sender.send(Streamed::Failed(error));
+                }
+            })?;
+        match received.recv() {
+            Ok(Streamed::Schema(schema)) => Ok(RowStream {
+                schema,
+                received,
+                ended: false,
+            }),
+            Ok(Streamed::Failed(error)) => Err(error),
+            _ => Err(DataFusionError::Execution(
+                "the query ended before its schema".into(),
+            )),
+        }
+    }
+
+    /// What a query's run needs of the session, apart from the session.
+    fn query_run(&self) -> QueryRun {
+        QueryRun {
+            context: self.context.clone(),
+            base: self.base.clone(),
+            runtime: self.runtime().handle().clone(),
+            runner: Arc::clone(&self.runner),
+        }
     }
 
     /// Return DataFusion's physical plan for a query, with each model
@@ -638,6 +640,163 @@ impl Drop for Session {
         if let Some(runtime) = self.runtime.take() {
             runtime.shutdown_background();
         }
+    }
+}
+
+/// One message of a query's run: its schema, a batch of its rows, its
+/// failure, or its end.
+enum Streamed {
+    Schema(SchemaRef),
+    Batch(RecordBatch),
+    Failed(DataFusionError),
+    Done,
+}
+
+/// A query's rows as DataFusion produces them; see [`Session::sql_stream`].
+///
+/// Each read blocks until the next batch arrives.
+pub struct RowStream {
+    schema: SchemaRef,
+    received: std::sync::mpsc::Receiver<Streamed>,
+    ended: bool,
+}
+
+impl std::fmt::Debug for RowStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RowStream").finish_non_exhaustive()
+    }
+}
+
+impl RowStream {
+    /// The schema of every batch, with each column named as Quail names it.
+    pub fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+}
+
+impl Iterator for RowStream {
+    type Item = Result<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.ended {
+            return None;
+        }
+        let found = match self.received.recv() {
+            Ok(Streamed::Batch(batch)) => return Some(Ok(batch)),
+            Ok(Streamed::Failed(error)) => Some(Err(error)),
+            Ok(Streamed::Done) => None,
+            Ok(Streamed::Schema(_)) => Some(Err(DataFusionError::Internal(
+                "a query sent its schema twice".into(),
+            ))),
+            // the query's thread panicked
+            Err(_) => Some(Err(DataFusionError::Execution(
+                "the query stopped before its end".into(),
+            ))),
+        };
+        self.ended = true;
+        found
+    }
+}
+
+/// A session's context, runtime, and executor, which run one query.
+struct QueryRun {
+    context: SessionContext,
+    base: Option<SessionContext>,
+    runtime: tokio::runtime::Handle,
+    runner: Arc<Executor>,
+}
+
+impl QueryRun {
+    /// Run `query` and send `sent` its schema, each batch of its rows as
+    /// DataFusion produces it, and its end. This thread runs each model
+    /// region of the query.
+    ///
+    /// # Errors
+    ///
+    /// The query does not plan, a region or operator fails, or the caller
+    /// tries to run nested SQL on the same executor.
+    fn run(
+        self,
+        query: String,
+        dialect: Option<String>,
+        sent: &std::sync::mpsc::Sender<Streamed>,
+    ) -> Result<()> {
+        let Self {
+            context,
+            base,
+            runtime,
+            runner,
+        } = self;
+        let (sender, mut calls) = unbounded_channel::<RegionCall>();
+        // An executor can be shared by sessions, but its workers and
+        // caller route belong to one query at a time. Acquire before block_on
+        // so waiting callers do not occupy a runtime worker.
+        let _caller = runner.enter(sender)?;
+        let out = sent.clone();
+        runtime.block_on(async {
+            // a worker runs the query, so the operators above a region
+            // read its rows while this thread runs the region
+            let query = runtime.spawn(async move {
+                let frame = frame(&context, &query, dialect.as_deref()).await?;
+                let (state, plan) = frame.into_parts();
+                let frame = match plan {
+                    // SET, PREPARE, and related statements update this session,
+                    // not a temporary copy of its state.
+                    LogicalPlan::Statement(statement) => {
+                        if let Some(base) = &base
+                            && matches!(
+                                statement,
+                                Statement::SetVariable(_) | Statement::ResetVariable(_)
+                            )
+                        {
+                            base.execute_logical_plan(LogicalPlan::Statement(statement.clone()))
+                                .await?;
+                        }
+                        context
+                            .execute_logical_plan(LogicalPlan::Statement(statement))
+                            .await?
+                    }
+                    // DDL needs DataFusion's execution dispatcher: collecting a
+                    // DataFrame containing CreateMemoryTable does not create it.
+                    // The per-query state preserves dialect settings and shares
+                    // the session's catalog, where created tables and views live.
+                    LogicalPlan::Ddl(_) => {
+                        SessionContext::new_with_state(state)
+                            .execute_logical_plan(plan)
+                            .await?
+                    }
+                    _ => datafusion::dataframe::DataFrame::new(state, plan),
+                };
+                let schema = quail_schema(frame.logical_plan());
+                let mut batches = frame.execute_stream().await?;
+                // the reader is gone once it stops reading
+                if out.send(Streamed::Schema(Arc::clone(&schema))).is_err() {
+                    return Ok(());
+                }
+                while let Some(batch) = batches.next().await {
+                    // renaming the columns keeps each column's buffers
+                    let batch =
+                        RecordBatch::try_new(Arc::clone(&schema), batch?.columns().to_vec())?;
+                    if out.send(Streamed::Batch(batch)).is_err() {
+                        return Ok(());
+                    }
+                }
+                Ok::<_, DataFusionError>(())
+            });
+            tokio::pin!(query);
+            // DataFusion's workers run the operators; this thread runs
+            // each model region they hand it
+            loop {
+                tokio::select! {
+                    done = &mut query => break done
+                        .map_err(|error| DataFusionError::External(Box::new(error)))
+                        .and_then(|done| done),
+                    Some(call) = calls.recv() => runner.serve(call),
+                }
+            }
+        })?;
+        let _ = sent.send(Streamed::Done);
+        Ok(())
     }
 }
 

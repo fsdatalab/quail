@@ -42,13 +42,14 @@ class _Client(flight.FlightClient):
 
 
 @contextlib.contextmanager
-def serving(data, delay=0.0, token=""):
+def serving(data, delay=0.0, token="", chunk_tokens=0):
     """A Flight client of a server on `data` whose workers answer from an oracle.
 
     Args:
         data: The server's data directory.
         delay: Seconds each filter answer takes.
         token: The server's token; without one it takes every call.
+        chunk_tokens: The workers' forward pass size; the plan's when 0.
     """
     options = flight.FlightCallOptions(headers=[] if not token else [
         (b"authorization", f"Bearer {token}".encode())])
@@ -60,6 +61,7 @@ def serving(data, delay=0.0, token=""):
          "--listen", f"127.0.0.1:{port}", "--data", str(data)],
         env={**os.environ, "QUAIL_WORKER": f"{sys.executable} {WORKER}",
              "QUAIL_ORACLE_DELAY": str(delay),
+             "QUAIL_ORACLE_CHUNK_TOKENS": str(chunk_tokens),
              "QUAIL_SERVER_TOKEN": token})
     try:
         client = _Client(f"grpc://127.0.0.1:{port}")
@@ -233,3 +235,24 @@ def test_a_timeout_or_a_cancel_stops_a_query_and_the_next_one_runs(tmp_path):
         assert waiting["state"] == "queued" and running["state"] == "queued"
         last = _act(client, "submit", {"sql": "SELECT count(*) AS n FROM reviews"})
         assert _finished(client, last["id"])["num_rows"] == 1
+
+
+def test_a_remote_stream_hands_out_kept_rows_while_the_query_runs(tmp_path):
+    # one review per forward pass, and 0.5 s per answer: about 3 s in all
+    with serving(tmp_path, delay=0.5, chunk_tokens=128) as client, quail.Session(
+            CONFIG, endpoint=client.endpoint) as session:
+        session.register("notes", quail.DocumentProvider.from_table(
+            REVIEWS, id_col="id"))
+        query = session.sql("SELECT r.id FROM notes r "
+                            "WHERE AI_FILTER(PROMPT('q1: {0}', r.body))")
+        reader = query.execute_stream()
+        first = reader.read_next_batch()
+        (run,) = [found for found in _act(client, "list", "")
+                  if found["state"] == "running"]
+        assert first.to_pydict() == {"r.id": ["r0"]}
+        rest = reader.read_all().to_pydict()["r.id"]
+        assert ["r0", *rest] == ["r0", "r2", "r4"]
+        assert _finished(client, run["id"])["state"] == "succeeded"
+        # a stream of a query that fails raises its error
+        with pytest.raises(pa.ArrowException, match="missing"):
+            session.sql("SELECT * FROM missing").execute_stream().read_all()
