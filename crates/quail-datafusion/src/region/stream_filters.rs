@@ -16,6 +16,10 @@
 //! - a round-robin `RepartitionExec` goes: it only spreads the region's
 //!   few rows over threads, and a repartition sizes its batches by the
 //!   session alone.
+//!
+//! The same holds between two regions, where one reads the other's
+//! rows: the region above numbers its input's rows as they arrive, so
+//! it reads them in the order the region below sent them.
 
 use std::sync::Arc;
 
@@ -56,13 +60,10 @@ impl PhysicalOptimizerRule for StreamRegionRows {
 /// The plan with the operators above each region passing rows on, and
 /// whether the plan reads a region.
 fn streamed(plan: Arc<dyn ExecutionPlan>) -> Result<(Arc<dyn ExecutionPlan>, bool)> {
-    // the operators below a region feed its input, not a reader
-    if plan.downcast_ref::<ModelRegionExec>().is_some() {
-        return Ok((plan, true));
-    }
+    let region = plan.downcast_ref::<ModelRegionExec>().is_some();
     let children: Vec<Arc<dyn ExecutionPlan>> = plan.children().into_iter().cloned().collect();
     if children.is_empty() {
-        return Ok((plan, false));
+        return Ok((plan, region));
     }
     let mut reads_region = false;
     let mut changed = false;
@@ -82,6 +83,9 @@ fn streamed(plan: Arc<dyn ExecutionPlan>) -> Result<(Arc<dyn ExecutionPlan>, boo
     } else {
         plan
     };
+    if region {
+        return Ok((plan, true));
+    }
     if !reads_region {
         return Ok((plan, false));
     }
