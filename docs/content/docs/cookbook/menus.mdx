@@ -2,12 +2,12 @@
 title: Querying scanned restaurant menus
 ---
 
-Real datasets often split information between structured tables and raw page
-scans. Your database holds dates and IDs, while key details sit unindexed on
-the images. You can join both sources in Quail and query the images directly in
-SQL with a vision model, a language model able to read images. See
-[Querying multimodal data](/docs/user-guide/multimodal-data) for an overview of
-image and PDF functions.
+Many datasets pair structured tables with images or PDFs. Your tables hold dates
+and IDs, while the text you care about only appears in the images. Quail lets
+you join your tables with the images and query everything in SQL using a vision
+model, a language model able to read images. See
+[Querying multimodal data](/docs/user-guide/multimodal-data) for all image and
+PDF functions.
 
 The sample dataset comes from the New York Public Library
 [What's on the menu?](https://www.nypl.org/research/support/whats-on-the-menu)
@@ -22,10 +22,10 @@ and World War II.
 seconds on one H100, or $0.04 at Modal's H100 rate. Quail encodes each scan
 once and reuses KV, the model's cached attention state, across both questions.
 
-## Browse the scans
+## Browse the menus
 
-The scans range from tavern bills of fare to ocean-liner banquets. Click any
-scan to open the full image:
+The menus range from hotel dining rooms to ocean-liner dinners. Click any menu
+to open the full image:
 
 <div className="menu-gallery">
   <figure>
@@ -103,8 +103,8 @@ dishes = dict(zip(counts["menu_page_id"].to_pylist(), counts["id_count"].to_pyli
 ## Fetch one scan per menu
 
 Pick each menu's page with the most transcribed dishes to skip decorative front
-covers. Cap each year at 60 randomly sampled menus so dense years do not skew
-the sample:
+covers. Cap each year at 60 randomly sampled menus so years with hundreds of
+menus do not outweigh years with few:
 
 ```python
 best = {}
@@ -122,8 +122,8 @@ chosen = [page for found in by_year.values()
 ```
 
 Download each sampled page as a JPEG resized to at most 1,024 pixels on its
-longer side. Smaller sizes (512 or 768 pixels) blur fine print, while larger
-sizes spend extra tokens without changing the answers:
+longer side. Smaller sizes (512 or 768 pixels) blur small print, while larger
+sizes cost more tokens without changing the answers:
 
 ```python
 def fetch(page):
@@ -176,7 +176,7 @@ session.register("menus", menus, id_col="id")
 session.register("pages", pages, id_col="id")
 ```
 
-## Query both signals in one pass
+## Ask both questions in one query
 
 Ask both yes-or-no questions with `AI.IF` inside a common table expression
 (CTE), a named subquery, then join with `menus` and group by year:
@@ -206,21 +206,21 @@ from the first call and evaluates only its own question tokens.
 
 ## Inspect the results
 
-`HAVING COUNT(*) >= 20` keeps every year with at least 20 fetched scans:
+`HAVING COUNT(*) >= 20` keeps every year with at least 20 menus:
 
 <MenuHistoryTable />
 
-Hover over the chart to inspect a single year, or click a legend entry to
-toggle a series:
+Hover over the chart to inspect a single year, or click a legend entry to show
+or hide a line:
 
 <MenuHistoryChart />
 
 War mentions jump from 2% in 1914 to 57% in 1918 during World War I, then climb
 again to 38% in 1945 during World War II. Drink lists drop from 36% in 1914 to
 under 10% throughout Prohibition and rebound to 30% in 1933, the year beer
-became legal again. A few Prohibition menus still score positive: ocean-liner
-menus legally serve liquor outside US waters, whereas the 1926 Berengaria scan
-lists only mixers and is a false positive.
+became legal again. A few Prohibition menus still match: ocean-liner menus
+legally serve liquor outside US waters, while the 1926 Berengaria menu lists
+only mixers and is a false positive.
 
 Two scans from the wartime peaks show the notices on the page:
 
