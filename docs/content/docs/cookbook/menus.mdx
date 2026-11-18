@@ -2,30 +2,28 @@
 title: Querying scanned restaurant menus
 ---
 
-Many datasets pair structured tables with images or PDFs. Your tables hold dates
-and IDs, while the text you care about only appears in the images. Quail lets
-you join your tables with the images and query everything in SQL using a vision
-model, a language model able to read images. See
-[Querying multimodal data](/docs/user-guide/multimodal-data) for all image and
-PDF functions.
-
-The sample dataset comes from the New York Public Library
+Here's a demo of how you can query images and tables together in Quail. In this
+demo, we'll use the New York Public Library's
 [What's on the menu?](https://www.nypl.org/research/support/whats-on-the-menu)
-archive of 17,547 scanned restaurant menus. Volunteers transcribed dish names
-and prices into CSV files, yet skipped everything else on the page: wartime
-slogans, rationing rules, and drink lists. One SQL query joins the CSV dates
-with 1,446 menu scans from 1914 to 1949 and asks two `AI.IF` questions per scan
-to track World War I, Prohibition (the US ban on alcohol from 1920 to 1933),
-and World War II.
+dataset of 17,547 scanned restaurant menus.
 
-`qwen3.5-4b-bf16` processes all 1,446 scans (2.1 million input tokens) in 34
-seconds on one H100, or $0.04 at Modal's H100 rate. Quail encodes each scan
+Volunteers transcribed each menu's dish names and prices into CSV files, but
+skipped everything else on the page, such as wartime notes and drink lists.
+We'll join the CSV dates with 1,446 menu images from 1914 to 1949 and run one
+SQL query with two `AI.IF` calls per image: does the menu sell alcohol, and
+does the menu mention a war? Together, the two questions trace World War I,
+Prohibition (the US ban on alcohol from 1920 to 1933), and World War II.
+
+`qwen3.5-4b-bf16` processes all 1,446 images (2.1 million input tokens) in 34
+seconds on one H100, or $0.04 at Modal's H100 rate. Quail encodes each image
 once and reuses KV, the model's cached attention state, across both questions.
+See [Querying multimodal data](/docs/user-guide/multimodal-data) for all image
+and PDF functions.
 
 ## Browse the menus
 
 The menus range from hotel dining rooms to ocean-liner dinners. Click any menu
-to open the full image:
+to open the full scan:
 
 <div className="menu-gallery">
   <figure>
@@ -68,9 +66,8 @@ to open the full image:
 
 ## Load the menu metadata
 
-Start by downloading the NYPL CSV archive. Filter `Menu.csv` to menus dated
-between 1914 and 1949, then count the transcribed dishes per page from
-`MenuItem.csv`:
+Download the NYPL CSV archive, filter `Menu.csv` to menus from 1914 to 1949,
+and count the transcribed dishes per page from `MenuItem.csv`:
 
 ```python
 import io
@@ -100,11 +97,12 @@ counts = read("MenuItem.csv").group_by("menu_page_id").aggregate([("id", "count"
 dishes = dict(zip(counts["menu_page_id"].to_pylist(), counts["id_count"].to_pylist()))
 ```
 
-## Fetch one scan per menu
+## Fetch one image per menu
 
-Pick each menu's page with the most transcribed dishes to skip decorative front
-covers. Cap each year at 60 randomly sampled menus so years with hundreds of
-menus do not outweigh years with few:
+Most menus have several pages, and the first page is often a decorative cover.
+Pick each menu's page with the most transcribed dishes to skip covers, and
+sample at most 60 menus per year so years with hundreds of menus do not
+outweigh years with few:
 
 ```python
 best = {}
@@ -121,9 +119,9 @@ chosen = [page for found in by_year.values()
           for page in chooser.sample(found, min(60, len(found)))]
 ```
 
-Download each sampled page as a JPEG resized to at most 1,024 pixels on its
-longer side. Smaller sizes (512 or 768 pixels) blur small print, while larger
-sizes cost more tokens without changing the answers:
+Download each sampled page from the library's image server resized to at most
+1,024 pixels on its longer side. Smaller images (512 or 768 pixels) blur small
+print, while larger images cost more tokens without changing the answers:
 
 ```python
 def fetch(page):
@@ -140,14 +138,14 @@ with ThreadPoolExecutor(64) as pool:
                if image]
 ```
 
-Roughly one request in nine times out, leaving about 1,450 scans. Page `62899`
-shows a May 1933 Commodore Hotel scan at 1,024 pixels:
+Roughly one request in nine times out, leaving about 1,450 images. Page `62899`
+shows a May 1933 Commodore Hotel menu at 1,024 pixels:
 
 ![The top of a menu from the Commodore Hotel, May 17, 1933, with the line "Beer per glass 10c"](./menus/commodore-1933.jpg)
 
 ## Register the tables
 
-Build two PyArrow tables from the downloaded records and JPEG bytes:
+Put the menu metadata and JPEG bytes into two PyArrow tables:
 
 | Table | Column | Type | Example |
 | --- | --- | --- | --- |
@@ -158,7 +156,8 @@ Build two PyArrow tables from the downloaded records and JPEG bytes:
 | | `menu_id` | `STRING` | `31142` |
 | | `image` | `BINARY` | JPEG bytes |
 
-Register both tables in a Quail session configured with `qwen3.5-4b-bf16`:
+Register both tables in a Quail session configured with `qwen3.5-4b-bf16`, a
+vision model (a language model able to read images):
 
 ```python
 import quail
@@ -178,8 +177,8 @@ session.register("pages", pages, id_col="id")
 
 ## Ask both questions in one query
 
-Ask both yes-or-no questions with `AI.IF` inside a common table expression
-(CTE), a named subquery, then join with `menus` and group by year:
+Run both yes-or-no questions with `AI.IF` inside a common table expression
+(CTE), a named subquery, then join the answers with `menus` and group by year:
 
 ```python
 QUERY = """
@@ -210,7 +209,7 @@ from the first call and evaluates only its own question tokens.
 
 <MenuHistoryTable />
 
-Hover over the chart to inspect a single year, or click a legend entry to show
+Hover over the chart to read a year's numbers, or click a legend entry to show
 or hide a line:
 
 <MenuHistoryChart />
@@ -222,7 +221,7 @@ became legal again. A few Prohibition menus still match: ocean-liner menus
 legally serve liquor outside US waters, while the 1926 Berengaria menu lists
 only mixers and is a false positive.
 
-Two scans from the wartime peaks show the notices on the page:
+Two menus from the wartime peaks show the notices on the page:
 
 <div className="menu-scans">
   <figure>
