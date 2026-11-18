@@ -39,6 +39,8 @@ requests.
 - `crates/quail-dylib`: a shared library that only test programs link.
 - `bench/` runs quail-b, `experiments/` holds GPU cells, and `docs/` is
   the docs site.
+- `skills/`: agent skills for writing Quail queries, such as
+  `skills/quail-trace-queries` for agent traces.
 
 # Checks
 
