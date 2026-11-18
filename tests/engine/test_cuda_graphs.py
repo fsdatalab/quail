@@ -213,3 +213,31 @@ def test_graphs_replay_supported_batches_and_fall_back_on_the_rest():
     buffers.output.zero_()
     assert actual.equal(expected)
     assert graphs.replays == graphs.passes == 1
+
+
+def test_a_pass_captures_its_own_bucket_once_and_runs_eagerly_past_the_reserve():
+    model = pipeline()
+    model.engine.attention = lambda q, k, v, chunk, **kw: None
+    graphs = PiecewiseGraphs(model, token_buckets=(1, 2, 4, 8), memory_bytes=1000)
+    graphs.storage = model.engine.arena.k
+    large = PiecewiseBuffers(model, 8, device="cpu")
+    graphs.graphs = [CapturedPieces(PiecewiseBuffers(
+        model, n, device="cpu", storage=large), None) for n in (1, 2, 4)]
+    graphs.graphs.append(CapturedPieces(large, [SimpleNamespace(replay=lambda: None)]))
+    # the largest bucket used 600 bytes; a later capture needs 10 per token
+    # plus a fixed 200
+    graphs.captured_bytes, graphs.growth_bytes, graphs.token_bytes = 600, 200, 10.0
+    captured = []
+
+    def capture(pieces):
+        captured.append(pieces.buffers.num_tokens)
+        pieces.graphs = [SimpleNamespace(replay=lambda: None)]
+        graphs.captured_bytes += 300
+
+    graphs.capture = capture
+    for num_tokens in (3, 3, 2, 1):
+        graphs.forward(chunk(num_tokens))
+    # 600 + 300 leaves no room for another fixed growth of 260
+    assert captured == [4]
+    assert graphs.replays == 2
+    assert graphs.passes == 4
