@@ -95,9 +95,9 @@ class Oracle:
             above the region tightens its test.
         reader: A callable(alias, documents) the worker calls after it
             sends a batch of a model operator's finished rows, with the
-            batch's documents of its first alias; the worker goes on once
-            it returns, so a test sees what reached the query's reader
-            while the region ran.
+            batch's documents of its first alias whose boolean columns
+            are all TRUE; the worker goes on once it returns, so a test
+            sees what reached the query's reader while the region ran.
     """
 
     def __init__(self, filters=None, joins=None, labels=None, scores=None,
@@ -271,7 +271,13 @@ class OracleEnd:
                 and metadata[b"quail.node"].decode() in self.model.asking):
             alias = next(name for name in table.column_names
                          if name in oracle.documents)
-            documents = table.column(alias).to_pylist()
+            # a filter that returns its answer reports the rows it
+            # rejects too, which the query drops above the region
+            kept = [all(value is True for value in values) for values in zip(
+                *(table.column(field.name).to_pylist() for field in table.schema
+                  if pa.types.is_boolean(field.type)))] or None
+            documents = [document for index, document in enumerate(
+                table.column(alias).to_pylist()) if kept is None or kept[index]]
         if hint is not None:
             rows = {oracle._source(alias, document) for document in documents}
         rows = (rows & oracle.tightens_after) - self.waited

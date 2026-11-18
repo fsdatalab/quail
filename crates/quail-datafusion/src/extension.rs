@@ -29,6 +29,7 @@ use datafusion::physical_planner::ExtensionPlanner;
 use crate::functions::{QuailFunction, quail_functions};
 use crate::region::exec::{ModelRegionPlanner, QuailQueryPlanner, RegionRunner};
 use crate::region::filter_guard::{BEFORE_RULE, GuardRegionFilters};
+use crate::region::stream_filters::StreamRegionRows;
 use crate::rules::{logical_rules, with_quail_rules};
 use crate::{LowerAiCalls, SnowflakeRegexpLike, StructFieldAccess};
 
@@ -138,6 +139,10 @@ impl QuailExtension {
                 .position(|rule| rule.name() == BEFORE_RULE)
                 .unwrap_or(physical.len());
             physical.insert(position, guard);
+            // last, so no later rule rebuilds a filter with its own batch size
+            let stream = Arc::new(StreamRegionRows);
+            physical.retain(|rule| rule.name() != stream.name());
+            physical.push(stream);
         }
         if planner {
             builder = builder
