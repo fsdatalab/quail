@@ -25,13 +25,14 @@ import inspect
 import os
 import re
 import textwrap
+import threading
 from pathlib import Path
 from typing import NamedTuple
 
 import pyarrow as pa
 
 import quail
-from helpers.oracle import Oracle, oracle_executor
+from helpers.oracle import HINT_WAIT_SECONDS, Oracle, oracle_executor
 from helpers.sessions import CONFIG, TOKENIZER
 from quail.api.context import SessionContext
 from quail.builtins import LOGICAL_RULES, PHYSICAL_RULES, built_in_registry
@@ -282,6 +283,65 @@ class Transcripts:
         lines += ["  " + ", ".join(
             value if isinstance(value, str) and value in self._rows
             else _shown(value) for value in row) for row in rows]
+        return "\n".join(_wrapped(line) for line in lines) + "\n"
+
+    def stream(self, sql: str, dialect: str = "snowflake") -> str:
+        """Stream a query's rows and return the transcript of when each arrived.
+
+        The worker waits after it sends each batch of a model operator's
+        finished rows until the reader has received those rows, so the
+        transcript shows each batch the reader received, named by its
+        first column, between the questions the model answered before and
+        after it. The streamed rows must be the rows the query collects.
+
+        Args:
+            sql: The query; its first column names each row.
+            dialect: The SQL dialect it is written in.
+
+        Raises:
+            AssertionError: A batch did not reach the reader within
+                HINT_WAIT_SECONDS of the worker sending it, or the
+                streamed rows differ from the collected ones.
+        """
+        self._prompts = re.findall(r"'((?:[^']|'')*)'", sql)
+        collected, _ = self._run(self._optimized, sql, dialect, ordered=False)
+        oracle = self._oracles[id(self._optimized)]
+        received, lock = set(), threading.Condition()
+
+        def wait_for(alias, documents):
+            names = {self._ids[oracle._texts([alias], [document])[0]]
+                     for document in documents}
+            with lock:
+                if not lock.wait_for(lambda: names <= received,
+                                     timeout=HINT_WAIT_SECONDS):
+                    raise AssertionError(
+                        f"the reader did not receive {sorted(names - received)} "
+                        "while the region ran")
+
+        self._asked, events, rows = [], [], []
+        oracle.reader = wait_for
+        try:
+            query = self.session.sql(sql, dialect=dialect)
+            reader = query.execute_stream(physical_executor=oracle_executor(oracle))
+            for batch in reader:
+                found = list(zip(*(column.to_pylist() for column in batch.columns)))
+                with lock:
+                    events.append((len(self._asked), [row[0] for row in found]))
+                    received.update(row[0] for row in found)
+                    lock.notify_all()
+                rows += found
+        finally:
+            oracle.reader = None
+        assert sorted(rows, key=repr) == collected, (sql, rows, collected)
+        lines = [f"--- {sql} ---", "streamed"]
+        shown = 0
+        for asked, names in [*events, (len(self._asked), None)]:
+            lines += [f"  asked '{prompt}': {'+'.join(ids)} {_shown(answer)}"
+                      for prompt, ids, answer in self._asked[shown:asked]]
+            shown = asked
+            if names is not None:
+                lines.append(f"  received {', '.join(map(str, names))}")
+        lines.append(f"rows {len(rows)}")
         return "\n".join(_wrapped(line) for line in lines) + "\n"
 
 

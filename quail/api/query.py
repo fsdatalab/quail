@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 import _quail_native
 import pyarrow as pa
 
-from quail.api.execute import execute_query
+from quail.api.execute import execute_query, stream_query, streams
 from quail.api.region_inputs import input_scans
 from quail.common.expressions import CompileError, SimilarCallWarning
 from quail.common.pairs import columns_key
@@ -294,10 +294,36 @@ class Query:
             "submit() needs a Session with an endpoint; this session runs "
             "queries in the current process, so call run() or collect()")
 
-    def execute_stream(self, batch_rows: int = 65_536,
-                       limit: int | None = None) -> pa.RecordBatchReader:
-        """Execute the query and stream Arrow record batches."""
-        return self.run().execute_stream(batch_rows=batch_rows, limit=limit)
+    def execute_stream(self, batch_rows: int = 65_536, limit: int | None = None,
+                       *, physical_executor=None) -> pa.RecordBatchReader:
+        """Execute the query and stream its rows as Arrow record batches.
+
+        On Quail's backend, the rows arrive as DataFusion produces them:
+        the rows an AI filter keeps arrive while the model still answers
+        about the others. An aggregate, a sort, or a join above a model
+        region holds its rows until the region ends. Another backend runs
+        the whole query first. Unlike ``collect()``, a stream holds only
+        the query's SQL columns, without the columns Quail adds to a
+        whole-query region's rows, such as a label's probabilities.
+
+        Args:
+            batch_rows: The most rows of each batch.
+            limit: The most rows to return, or None for every row.
+            physical_executor: Optional stand-in for the GPU workers,
+                for tests, as ``run`` takes it.
+
+        Returns:
+            A reader to exhaust or close. Closing it early stops reading;
+            a running model region still runs to its end.
+        """
+        if batch_rows <= 0:
+            raise ValueError("batch_rows must be positive")
+        if limit is not None and limit < 0:
+            raise ValueError("limit must be nonnegative")
+        if not streams(self, physical_executor):
+            return self.run(physical_executor=physical_executor).execute_stream(
+                batch_rows=batch_rows, limit=limit)
+        return stream_query(self, physical_executor, batch_rows, limit)
 
     def collect(self, limit: int | None = None,
                 batch_rows: int = 65_536) -> pa.Table:
