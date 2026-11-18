@@ -7,14 +7,10 @@ Library's
 [What's on the menu?](https://www.nypl.org/research/support/whats-on-the-menu)
 dataset of scanned restaurant menus for the demo.
 
-We'll join the menu dates with 1,446 menu scans from 1914 to 1949 and run one
-SQL query with two `AI.IF` calls per scan: does the menu sell alcohol, and does
-the menu mention a war? The two questions trace World War I, Prohibition (the US
-ban on alcohol from 1920 to 1933), and World War II.
-
-One SQL query reads every menu (2.1 million input tokens) in 34 seconds on one
-H100 with `qwen3.5-4b-bf16`, for $0.04. Quail reads each image once and reuses
-KV, the model's saved state for the image, across both questions. See
+We'll join the menu dates with menu scans from 1914 to 1949 and run one SQL
+query with two `AI.IF` calls per scan: does the menu sell alcohol, and does the
+menu mention a war? The two questions trace World War I, Prohibition (the US ban
+on alcohol from 1920 to 1933), and World War II. See
 [Querying multimodal data](/docs/user-guide/multimodal-data) for all image and
 PDF functions.
 
@@ -205,12 +201,14 @@ session.close()
 
 The alcohol question says "to drink" on purpose, because the model counts
 desserts made with port or kirsch as alcohol without the phrase. Quail reads
-each image only once: the second `AI.IF` reuses KV from the first `AI.IF` and
-pays only for its own question.
+each image only once: the second `AI.IF` reuses KV, the model's saved state for
+the image, from the first `AI.IF` and pays only for its own question.
 
 ## Results
 
-The query returns one row for each year with at least 20 menus:
+The query reads 1,446 pages (2.1 million input tokens) in 34 seconds on one H100
+with `qwen3.5-4b-bf16`, for $0.04, and returns one row for each year with at
+least 20 menus:
 
 <MenuHistoryTable />
 
