@@ -71,7 +71,7 @@ FROM agent_replies WHERE turn_id IN ('…', '…');
 ## 6. Judge one message, with its context
 
 - Give the model one message, not a whole session.
-- Pass the context as a second argument: `AI.IF(PROMPT('Agent: {0} User: {1} Is the user frustrated?', previous_message, content))`.
+- Fill the prompt's placeholders with the message and its context. `PROMPT` puts the first column after the template into `{0}`, the next into `{1}`: `AI.IF(PROMPT('Agent: {0} User: {1} Is the user frustrated?', previous_message, content))`.
 - Put the fixed instruction and few-shot examples before the row's text. Every row then starts with the same tokens, and Quail's prefix sharing reads them once.
 
 ## 7. Ask questions a model can answer
