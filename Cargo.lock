@@ -3522,7 +3522,7 @@ dependencies = [
 
 [[package]]
 name = "quail-datafusion"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -3544,14 +3544,14 @@ dependencies = [
 
 [[package]]
 name = "quail-dylib"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "quail-engine",
 ]
 
 [[package]]
 name = "quail-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3568,7 +3568,7 @@ dependencies = [
 
 [[package]]
 name = "quail-planner"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -3582,7 +3582,7 @@ dependencies = [
 
 [[package]]
 name = "quail-python"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3603,7 +3603,7 @@ dependencies = [
 
 [[package]]
 name = "quail-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arrow",
  "arrow-flight",
