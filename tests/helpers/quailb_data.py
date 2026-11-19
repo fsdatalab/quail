@@ -66,6 +66,8 @@ def standin_sets(tmp_path):
                 columns[field.name] = [f"{name} {field.name} {i}" for i in six]
             elif pa.types.is_floating(field.type):
                 columns[field.name] = [float(i) for i in six]
+            elif pa.types.is_boolean(field.type):
+                columns[field.name] = [i % 2 == 1 for i in six]
             else:
                 columns[field.name] = [i % 2 for i in six]
         pq.write_table(pa.table(columns, schema=schema),
