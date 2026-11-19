@@ -325,8 +325,9 @@ class InputStaging:
     passes back, which has landed unless the host is that far ahead.
     """
 
-    def __init__(self, torch):
+    def __init__(self, torch, device="cuda"):
         self.torch = torch
+        self.device = device
         self.buffers = {}     # name -> the buffer in use: host, device, event
         self.rings = {}       # name -> (next slot, list of buffers or None)
 
@@ -340,7 +341,7 @@ class InputStaging:
             event.synchronize()
         if previous is None or host.numel() < count or host.dtype != dtype:
             host = torch.empty(count, dtype=dtype, pin_memory=True)
-            device = torch.empty(count, dtype=dtype, device="cuda")
+            device = torch.empty(count, dtype=dtype, device=self.device)
             event = torch.cuda.Event()
         ring[slot] = self.buffers[name] = host, device, event
         self.rings[name] = (slot + 1) % STAGING_DEPTH, ring

@@ -78,7 +78,7 @@ def _warm_recurrent(torch, arena, pipeline):
     from types import SimpleNamespace
 
     from quail.backends.quail.executor.gdn import GdnPhase, _decode_conv_kernel
-    from quail.backends.quail.executor.models.qwen3_5_kernels import (
+    from quail.backends.quail.executor.gdn_kernels import (
         copy_slots,
         gdn_decode_step,
     )
@@ -121,10 +121,16 @@ def _warm_short_attention(torch, arena, pipeline):
     Single-split (one page) and multi-split (two pages) cover every batch
     size, query length, and alignment.
     """
+    from quail.backends.quail.executor.decode_attention import (
+        supports_splitkv_decode,
+    )
+
     engine = getattr(pipeline, "engine", None)
     attn = getattr(getattr(pipeline, "attention_layer", None), "self_attn", None)
-    if (engine is None or attn is None or engine.fa_version != 4
-            or attn.head_dim != 256):
+    if (engine is None or attn is None
+            or not supports_splitkv_decode(
+                engine.fa_version, attn.head_dim, arena.page_tokens,
+                attn.num_heads, attn.num_kv_heads, causal=True, max_q=1)):
         return
     device = arena.conv_state.device if arena.conv_state is not None else "cuda"
     pages = torch.zeros((2, arena.page_tokens, attn.num_kv_heads, attn.head_dim),

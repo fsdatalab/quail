@@ -322,11 +322,15 @@ def _plan_phases(arena, groups, stage, undo):
         first = int(segments[0][0])
         cursor = first
         for part in segments:
-            if not len(part) or int(part[0]) != cursor:
+            length = len(part)
+            if not length or int(part[0]) != cursor:
                 return None
-            if len(part) > 1 and int(part[-1]) != cursor + len(part) - 1:
+            if length > 1 and (int(part[-1]) != cursor + length - 1
+                               or not np.array_equal(
+                                   part, np.arange(cursor, cursor + length,
+                                                   dtype=np.int64))):
                 return None
-            cursor += len(part)
+            cursor += length
         return (first, cursor) if cursor > first else None
 
     def build(name, rows, lengths, reads, writes, output=True):
@@ -444,7 +448,9 @@ def gdn_prefill_backend():
     if capability == (9, 0) or (capability[0] == 10 and cuda_major >= 13):
         return "flashinfer"
     if requested == "flashinfer":
-        raise ValueError("FlashInfer GDN prefill needs a Hopper or Blackwell GPU")
+        raise ValueError(
+            "FlashInfer GDN prefill needs a Hopper GPU or a Blackwell GPU "
+            "with CUDA 13 or newer")
     return "triton"
 
 
@@ -674,9 +680,7 @@ def _move_states(arena, phase, layer_slot):
     if phase.copy_reads is None:
         return
     if phase.moves_in_place and arena.gdn_state.is_cuda:
-        from quail.backends.quail.executor.models.qwen3_5_kernels import (
-            copy_slots,
-        )
+        from quail.backends.quail.executor.gdn_kernels import copy_slots
 
         copy_slots(arena.gdn_state[:, layer_slot], phase.copy_reads,
                    phase.copy_writes)
@@ -741,7 +745,7 @@ def gdn_core(geometry, tensors, phases, arena, layer_slot, *, output=None):
     import torch
     from vllm.third_party.flash_linear_attention.ops import fused_post_conv_prep
 
-    from quail.backends.quail.executor.models.qwen3_5_kernels import (
+    from quail.backends.quail.executor.gdn_kernels import (
         gather_gdn_inputs,
         gdn_decode_step,
         scatter_gdn_rows,

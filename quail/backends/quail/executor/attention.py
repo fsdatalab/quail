@@ -24,13 +24,16 @@ rotary, as Qwen3 and Gemma 4 have; qkv_norm_rope_heads is its form
 for any head geometry, with Gemma's weightless per-head V norm.
 """
 
+from quail.backends.quail.executor.decode_attention import (
+    TRITON_DECODE_MAX_Q,
+    supports_splitkv_decode,
+    triton_splitkv_decode,
+)
+
 GROUP = 128            # fp8 quant group size, matches the engine
 # FlashAttention 3's widest head; wider heads run FlashAttention 4,
 # whose Hopper build takes heads up to 512, over arena pages.
 FA_MAX_HEAD_DIM = 256
-# A causal paged call of at most TRITON_DECODE_MAX_Q rows per sequence runs
-# the Triton split-KV decode kernel instead of head-256 FA4.
-TRITON_DECODE_MAX_Q = 16
 
 # The two attention paths a chunk can run. "unified" is one causal
 # paged call in which every row reads the KV its own document needs.
@@ -1023,10 +1026,6 @@ class Engine:
         splitting saturates all SMs across batch sizes without mid-query
         Triton compilations.
         """
-        from quail.backends.quail.executor.models.qwen3_5_kernels import (
-            triton_splitkv_decode,
-        )
-
         workspace = getattr(self, "_triton_segments", None)
         if workspace is None:
             workspace = self._triton_segments = {}
@@ -1047,8 +1046,10 @@ class Engine:
             return self._flashinfer_paged(
                 q3, kp, vp, metadata, causal=causal,
                 softmax_scale=softmax_scale, window=window, output=output)
-        if (self.fa_version == 4 and q3.shape[-1] == 256 and causal
-                and max_q <= TRITON_DECODE_MAX_Q):
+        if supports_splitkv_decode(
+                self.fa_version, q3.shape[-1], kp.shape[1], q3.shape[1],
+                kp.shape[2], causal=causal, max_q=max_q,
+                dtype=getattr(q3, "dtype", None)):
             return self.triton_paged(
                 q3, kp, vp, cu_q, max_q, seqused_k, max_seqused_k, block_table,
                 softmax_scale=softmax_scale, window=window, output=output)
@@ -1201,9 +1202,11 @@ class Engine:
         self.write_kv(k3, v3, meta)
         kp, vp = self.arena.paged_kv(layer)
         prefill_seqs = unified.get("prefill_seqs", 0)
-        if (self.fa_version == 4 and q3.shape[-1] == 256 and prefill_seqs
-                and unified["prefill_max_q"] > 16
-                and 0 < unified["decode_max_q"] <= 16):
+        if (prefill_seqs and unified["prefill_max_q"] > TRITON_DECODE_MAX_Q
+                and supports_splitkv_decode(
+                    self.fa_version, q3.shape[-1], kp.shape[1], q3.shape[1],
+                    kp.shape[2], causal=True, max_q=unified["decode_max_q"],
+                    dtype=getattr(q3, "dtype", None))):
             out = output if output is not None else self.torch.empty_like(q3)
             r0 = unified["decode_row0"]
             self._paged(

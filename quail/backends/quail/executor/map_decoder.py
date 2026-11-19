@@ -63,12 +63,15 @@ class MapDecoder:
     def __init__(self, torch, head, num_documents: int, limits, stop_ids,
                  page_tokens: int, expected_tokens=None, *, workspace_bytes=0,
                  row_budget=None, in_flight: int = IN_FLIGHT):
+        if in_flight < 0:
+            raise ValueError(f"in_flight must be nonnegative, got {in_flight}")
         self.workspace_bytes = workspace_bytes
         self.row_budget = row_budget
         self.in_flight = in_flight
         self.torch = torch
         self.head = head
-        self._staging = InputStaging(torch) if head.is_cuda else None
+        self._staging = (InputStaging(torch, head.device)
+                         if head.is_cuda else None)
         self._host_pool = []
         self.limits = np.asarray(limits, dtype=np.int64)
         self.expected_tokens = (np.minimum(64, self.limits) if expected_tokens is None
@@ -725,7 +728,16 @@ class MapDecoder:
             self.copy_pending[slots] = ~ready
         if self.answer_stops:
             self._stop_decided(np.unique(documents))
-        self._host_pool.append(copy.buffer)
+        self._release_host(copy.buffer)
+
+    def _release_host(self, buf) -> None:
+        """Return a pinned host buffer to the bounded pool."""
+        cap = self.in_flight + 2
+        self._host_pool.append(buf)
+        if len(self._host_pool) > cap:
+            smallest = min(range(len(self._host_pool)),
+                           key=lambda index: self._host_pool[index].numel())
+            self._host_pool.pop(smallest)
 
     def _stop_decided(self, slots) -> None:
         """End each answer whose tests are decided on its tokens so far."""
