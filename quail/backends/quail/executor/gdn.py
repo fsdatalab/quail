@@ -475,7 +475,7 @@ def _flashinfer_delta_rule(q, k, v, g, beta, state, cu_seqlens,
         q=q.contiguous(), k=k.contiguous(),
         v=v.contiguous(), g=decay,
         beta=beta.float().contiguous(), initial_state=initial,
-        output_final_state=output_final_state, cu_seqlens=cu_seqlens,
+        output_final_state=output_final_state, cu_seqlens=cu_seqlens.long(),
         **kwargs)
     return result if output_final_state else (result, None)
 
