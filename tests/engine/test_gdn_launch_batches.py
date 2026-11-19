@@ -70,6 +70,7 @@ def test_launches_cap_the_sequences_and_match_one_pass(monkeypatch):
         monkeypatch.setattr(gdn, "gdn_prefill_backend", lambda: backend)
 
         def fused(*, output_final_state, **kwargs):
+            assert kwargs["cu_seqlens"].dtype == torch.int64
             torch.testing.assert_close(
                 kwargs["q"], q if backend == "flashinfer" else q[None])
             torch.testing.assert_close(
