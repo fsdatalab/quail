@@ -108,6 +108,7 @@ impl<'w, 'a> Assembly<'w, 'a> {
             label_tests,
             mut conditions,
             equalities,
+            join_filters,
             tables,
             ..
         } = relation;
@@ -116,7 +117,7 @@ impl<'w, 'a> Assembly<'w, 'a> {
             .filter_map(|column| Some((aliased_call(column, &[])?, column_name(column, true))))
             .collect();
         let specs: Vec<&JoinSpec> = joins.values().collect();
-        check_joins(&equalities, &tables, &specs, &projected)?;
+        check_joins(&equalities, &join_filters, &tables, &specs, &projected)?;
         check_calls(&filters, &specs, &projected)?;
         // the columns each table's column operators add
         let mut names: Vec<(ModelCall, String)> = Vec::new();

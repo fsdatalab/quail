@@ -5,7 +5,7 @@ from __future__ import annotations
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from quail.common.pairs import columns_key, pair_table
+from quail.common.pairs import columns_key, filter_columns, join_pairs
 from quail.execution.ids import document_ids
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import joined_survivors, true_answer_rows
@@ -61,12 +61,12 @@ class ModelNodeRuntime:
 
 
 class HashJoinRuntime:
-    """Pair the rows of two tables whose key columns are equal."""
+    """Pair the rows of two tables whose keys are equal and pass the filter."""
 
     def execute(self, node, inputs, context) -> NodeResult:
         if not isinstance(node, HashJoin):
             raise TypeError(type(node).__name__)
-        sides = {}
+        sides, values = {}, {}
         for alias, keys in ((node.left, [left for left, _ in node.on]),
                             (node.right, [right for _, right in node.on])):
             port = next(port for port in node.inputs
@@ -76,8 +76,11 @@ class HashJoinRuntime:
             # a key column may carry the alias's name: the ids stay apart
             sides[alias] = (ids, [relation_values(columns, key).take(ids)
                                   for key in keys])
-        positions = pair_table(node.left, sides[node.left][1],
-                               node.right, sides[node.right][1])
+            if node.filter is not None:
+                values[alias] = filter_columns(node.filter, alias, columns).take(ids)
+        positions = join_pairs(node.left, sides[node.left][1],
+                               node.right, sides[node.right][1],
+                               join_filter=node.filter, values=values)
         # pair_table pairs row positions; map them back to the ids read
         pairs = pa.table({
             alias: pc.take(sides[alias][0], positions.column(alias))

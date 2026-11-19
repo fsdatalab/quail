@@ -24,7 +24,7 @@ pub struct PlanningContext<'a> {
     /// An attention path forced for every operator, "tree" or "unified".
     pub attention: Option<String>,
     /// join written position -> the fraction of the cross product its
-    /// equality conditions keep.
+    /// equality conditions and filter keep.
     pub pair_fractions: BTreeMap<usize, f64>,
     /// alias -> the fraction of its documents the regular predicates keep.
     pub scan_fractions: BTreeMap<String, f64>,

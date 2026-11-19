@@ -39,7 +39,7 @@ import _quail_native
 import numpy as np
 
 from quail.common import budgets
-from quail.common.pairs import pair_table, partner_map
+from quail.common.pairs import filter_columns, join_pairs, partner_map
 from quail.common.tokens import prefix_tree
 from quail.common.work import Work
 from quail.physical import decode_plan_value
@@ -345,11 +345,17 @@ def _estimate_inputs(query, stores, chunk: int, credit: bool) -> dict:
         conditions = [(decode_plan_value(json.dumps(left)),
                        decode_plan_value(json.dumps(right)))
                       for left, right in join["pairs"]]
-        pairs = pair_table(
+        join_filter = (None if join["filter"] is None
+                       else decode_plan_value(json.dumps(join["filter"])))
+        values = None if join_filter is None else {
+            alias: filter_columns(join_filter, alias, stores[alias])
+            for alias in (left_alias, right_alias)}
+        pairs = join_pairs(
             left_alias, [left.evaluate(stores[left_alias])
                          for left, _ in conditions],
             right_alias, [right.evaluate(stores[right_alias])
-                          for _, right in conditions])
+                          for _, right in conditions],
+            join_filter=join_filter, values=values)
         allowed_pairs[str(position)] = {
             alias: [[int(key), [int(row) for row in groups.rows[
                 groups.offsets[index]:groups.offsets[index + 1]]]]

@@ -657,7 +657,17 @@ fn claim_run(
         };
         let (bound, inputs) = split_inputs(selected)?;
         let numbered_inputs = numbered(&bound);
-        let (bound, above) = lift_relational(bound)?;
+        // an AI join keeps its join's filter when the binder can read it
+        // there; DataFusion otherwise tests the joined rows above
+        let kept = lift_relational(bound.clone(), true)?;
+        let lifted = lift_relational(bound, false)?;
+        let (bound, above) = if kept.0 != lifted.0
+            && derive_error(&kept.0).is_none_or(|error| !error.is_unsupported())
+        {
+            kept
+        } else {
+            lifted
+        };
         Ok::<_, datafusion::common::DataFusionError>((bound, inputs, numbered_inputs, above))
     })();
     let (bound, inputs, numbered_inputs, above) = match shaped {

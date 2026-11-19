@@ -7,14 +7,16 @@
 //!
 //! - each test of the result rows: a test of more than one table's
 //!   columns, or of more than one model call's answers, which needs
-//!   every model call's answer first;
+//!   every model call's answer first, other than an inner join's
+//!   filter, which the region's AI join applies to its pairs;
 //! - the SELECT list's expressions, other than its columns and model
 //!   calls.
 //!
 //! For example, `SELECT r.id, UPPER(p.name) AS name ... WHERE r.stars <
-//! p.stars` over an AI join leaves the SELECT list `r.id`, `p.name`,
-//! `r.stars`, and `p.stars` below the operators above; DataFusion keeps
-//! the rows with `r.stars < p.stars` and computes `name`.
+//! p.stars` over an AI join keeps `r.stars < p.stars` as the join's
+//! filter, so the model is asked only about the pairs it passes, and
+//! leaves the SELECT list `r.id` and `p.name` below the operators above;
+//! DataFusion computes `name`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -60,19 +62,27 @@ impl Above {
 
 /// Split a part whose root is its SELECT list into the region and the
 /// operators DataFusion runs above it, as the module explains. The
-/// operators above return the part's columns.
+/// operators above return the part's columns. With `join_filters`, an
+/// inner join keeps each term [`is_join_filter`] accepts.
 ///
 /// # Errors
 ///
 /// A rebuilt operator does not plan.
-pub(crate) fn lift_relational(plan: LogicalPlan) -> Result<(LogicalPlan, Above)> {
+pub(crate) fn lift_relational(
+    plan: LogicalPlan,
+    join_filters: bool,
+) -> Result<(LogicalPlan, Above)> {
     let plan = inline_computed_columns(plan)?;
     let LogicalPlan::Projection(root) = &plan else {
         return Ok((plan, Above::default()));
     };
     let answers = answer_tables(&root.input);
     let mut lifted: Vec<Expr> = Vec::new();
-    let relation = take_row_tests(root.input.as_ref().clone(), &answers, false, &mut lifted)?;
+    let tests = RowTests {
+        answers: &answers,
+        join_filters,
+    };
+    let relation = tests.take(root.input.as_ref().clone(), false, &mut lifted)?;
     let tests = lifted;
     // a test moves above the region only when the region's rows have
     // every column it reads; a SELECT list below a join can hide one,
@@ -295,6 +305,47 @@ fn is_row_test(term: &Expr, answers: &Answers, join_key: bool) -> bool {
     tables.len() > 1 || calls.len() > 1
 }
 
+/// Whether an inner join keeps a term of its condition as its filter: a
+/// test of exactly two tables' own columns that calls no model and has
+/// no subquery. The model is then asked only about the pairs it passes.
+///
+/// An equality of one table's value with the other's is not a filter:
+/// DataFusion computes each side before the region, and the join pairs
+/// the rows by the computed keys.
+pub(crate) fn is_join_filter(term: &Expr) -> bool {
+    let tables_of = |expr: &Expr| -> BTreeSet<String> {
+        expr.column_refs()
+            .into_iter()
+            .filter_map(|column| column.relation.as_ref().map(ToString::to_string))
+            .collect()
+    };
+    if let Expr::BinaryExpr(binary) = term
+        && binary.op == datafusion::logical_expr::Operator::Eq
+    {
+        let (left, right) = (tables_of(&binary.left), tables_of(&binary.right));
+        if left.len() == 1 && right.len() == 1 && left != right {
+            return false;
+        }
+    }
+    let special = term
+        .exists(|inner| {
+            Ok(is_quail_call(inner)
+                || matches!(
+                    inner,
+                    Expr::Exists(_) | Expr::InSubquery(_) | Expr::ScalarSubquery(_)
+                ))
+        })
+        .unwrap_or(true);
+    let mut tables: BTreeSet<String> = BTreeSet::new();
+    for column in term.column_refs() {
+        match &column.relation {
+            Some(table) => tables.insert(table.to_string()),
+            None => return false,
+        };
+    }
+    !special && tables.len() == 2
+}
+
 /// Whether a term is `a.x = b.y`, an equality of two tables' columns.
 fn is_column_equality(term: &Expr) -> bool {
     matches!(term, Expr::BinaryExpr(binary)
@@ -303,84 +354,92 @@ fn is_column_equality(term: &Expr) -> bool {
                 (Expr::Column(left), Expr::Column(right)) if left.relation != right.relation))
 }
 
-/// `plan` without its row tests, which are added to `lifted` in plan
-/// order, children first.
-///
-/// `fixed` says an operator above limits or gates the rows, so a test of
-/// several tables below it stays.
-fn take_row_tests(
-    plan: LogicalPlan,
-    answers: &Answers,
-    fixed: bool,
-    lifted: &mut Vec<Expr>,
-) -> Result<LogicalPlan> {
-    let lifts = |term: &Expr, join_key: bool| !fixed && is_row_test(term, answers, join_key);
-    // the operator's own tests come after the ones below it
-    let split = |predicate: &Expr, join_key: bool| -> (Vec<Expr>, Vec<Expr>) {
-        split_conjunction(predicate)
-            .into_iter()
-            .cloned()
-            .partition(|term| lifts(term, join_key))
-    };
-    match plan {
-        LogicalPlan::Filter(filter) => {
-            let input = take_row_tests(filter.input.as_ref().clone(), answers, fixed, lifted)?;
-            let (moved, kept) = split(&filter.predicate, false);
-            lifted.extend(moved);
-            match conjunction(kept) {
-                Some(predicate) => Ok(LogicalPlan::Filter(
-                    datafusion::logical_expr::Filter::try_new(predicate, Arc::new(input))?,
-                )),
-                None => Ok(input),
-            }
-        }
-        LogicalPlan::Join(join) if join.join_type == JoinType::Inner => {
-            let left = take_row_tests(join.left.as_ref().clone(), answers, fixed, lifted)?;
-            let right = take_row_tests(join.right.as_ref().clone(), answers, fixed, lifted)?;
-            let mut join = join.clone();
-            if let Some(filter) = join.filter.take() {
-                let (moved, kept) = split(&filter, true);
-                lifted.extend(moved);
-                join.filter = conjunction(kept);
-            }
-            join.left = Arc::new(left);
-            join.right = Arc::new(right);
-            Ok(LogicalPlan::Join(join))
-        }
-        LogicalPlan::Extension(_) if let Some(node) = as_node::<AiNode>(&plan) => {
-            let node = node.clone();
-            let rows = node.semantics == Semantics::Rows;
-            let below_fixed = fixed || node.fetch.is_some() || !rows;
-            let input = take_row_tests(node.input.as_ref().clone(), answers, below_fixed, lifted)?;
-            let mut node = node.with_input(input)?;
-            if rows
-                && !node.is_predicate()
-                && let Some(filter) = node.filter.take()
-            {
-                let (moved, kept) = split(&filter, false);
-                if !moved.is_empty() && node.fetch.is_some() {
-                    // a fetch counts the rows that pass the whole filter
-                    node.filter = Some(filter);
-                } else {
-                    node.tests.retain(|test| {
-                        !split_conjunction(&test.test)
-                            .iter()
-                            .any(|term| moved.contains(term))
-                    });
-                    lifted.extend(moved);
-                    node.filter = conjunction(kept);
-                }
-            }
-            Ok(extension_node(node.checked()?))
-        }
-        other => {
-            let inputs = other
-                .inputs()
+/// The row tests of a plan, and whether its joins keep their filters.
+struct RowTests<'a> {
+    answers: &'a Answers,
+    join_filters: bool,
+}
+
+impl RowTests<'_> {
+    /// `plan` without its row tests, which are added to `lifted` in plan
+    /// order, children first.
+    ///
+    /// `fixed` says an operator above limits or gates the rows, so a test
+    /// of several tables below it stays.
+    fn take(&self, plan: LogicalPlan, fixed: bool, lifted: &mut Vec<Expr>) -> Result<LogicalPlan> {
+        let answers = self.answers;
+        let lifts = |term: &Expr, join_key: bool| {
+            !fixed
+                && is_row_test(term, answers, join_key)
+                && !(join_key && self.join_filters && is_join_filter(term))
+        };
+        // the operator's own tests come after the ones below it
+        let split = |predicate: &Expr, join_key: bool| -> (Vec<Expr>, Vec<Expr>) {
+            split_conjunction(predicate)
                 .into_iter()
                 .cloned()
-                .map(|input| take_row_tests(input, answers, fixed, lifted))
-                .collect::<Result<Vec<_>>>()?;
-            crate::extension::with_inputs(&other, inputs)
+                .partition(|term| lifts(term, join_key))
+        };
+        match plan {
+            LogicalPlan::Filter(filter) => {
+                let input = self.take(filter.input.as_ref().clone(), fixed, lifted)?;
+                let (moved, kept) = split(&filter.predicate, false);
+                lifted.extend(moved);
+                match conjunction(kept) {
+                    Some(predicate) => Ok(LogicalPlan::Filter(
+                        datafusion::logical_expr::Filter::try_new(predicate, Arc::new(input))?,
+                    )),
+                    None => Ok(input),
+                }
+            }
+            LogicalPlan::Join(join) if join.join_type == JoinType::Inner => {
+                let left = self.take(join.left.as_ref().clone(), fixed, lifted)?;
+                let right = self.take(join.right.as_ref().clone(), fixed, lifted)?;
+                let mut join = join.clone();
+                if let Some(filter) = join.filter.take() {
+                    let (moved, kept) = split(&filter, true);
+                    lifted.extend(moved);
+                    join.filter = conjunction(kept);
+                }
+                join.left = Arc::new(left);
+                join.right = Arc::new(right);
+                Ok(LogicalPlan::Join(join))
+            }
+            LogicalPlan::Extension(_) if let Some(node) = as_node::<AiNode>(&plan) => {
+                let node = node.clone();
+                let rows = node.semantics == Semantics::Rows;
+                let below_fixed = fixed || node.fetch.is_some() || !rows;
+                let input = self.take(node.input.as_ref().clone(), below_fixed, lifted)?;
+                let mut node = node.with_input(input)?;
+                if rows
+                    && !node.is_predicate()
+                    && let Some(filter) = node.filter.take()
+                {
+                    let (moved, kept) = split(&filter, false);
+                    if !moved.is_empty() && node.fetch.is_some() {
+                        // a fetch counts the rows that pass the whole filter
+                        node.filter = Some(filter);
+                    } else {
+                        node.tests.retain(|test| {
+                            !split_conjunction(&test.test)
+                                .iter()
+                                .any(|term| moved.contains(term))
+                        });
+                        lifted.extend(moved);
+                        node.filter = conjunction(kept);
+                    }
+                }
+                Ok(extension_node(node.checked()?))
+            }
+            other => {
+                let inputs = other
+                    .inputs()
+                    .into_iter()
+                    .cloned()
+                    .map(|input| self.take(input, fixed, lifted))
+                    .collect::<Result<Vec<_>>>()?;
+                crate::extension::with_inputs(&other, inputs)
+            }
         }
     }
 }

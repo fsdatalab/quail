@@ -17,14 +17,14 @@ use crate::plan_statistics::plan_prompts;
 ///   name without the alias, value columns, and the column names of
 ///   its table's schema;
 /// - `value_columns`: alias -> the columns the executor reads by
-///   document id: join equalities, regular predicates, tests of labels
+///   document id: join equalities and filters, regular predicates, tests of labels
 ///   and answers on the table's own columns, DISTINCT stop keys, and
 ///   the guards of column operators and AI filters and the
 ///   alternatives of AI filters;
 /// - `stop_keys`: alias -> its DISTINCT stop key;
-/// - `join_conditions`: for each join with equalities, its written
-///   position, its two aliases, and each equality's sides in that
-///   alias order;
+/// - `join_conditions`: for each join with equalities or a filter, its
+///   written position, its two aliases, each equality's sides in that
+///   alias order, and its filter;
 /// - `prompts`: each table's AI.IF prompts in written order, each
 ///   join's prompt by written position, and each classification's
 ///   prompt and aliases by its output name.
@@ -44,6 +44,9 @@ pub fn region_facts(found: &Operators) -> Result<Value, crate::error::CompileErr
             {
                 add(&reference.alias, &reference.column);
             }
+        }
+        for reference in join.filter.iter().flat_map(column_references) {
+            add(&reference.alias, &reference.column);
         }
     }
     let schemas: BTreeMap<&str, Vec<String>> = found
@@ -122,11 +125,9 @@ pub fn region_facts(found: &Operators) -> Result<Value, crate::error::CompileErr
     let mut oriented = Vec::new();
     for (position, join) in found.joins.iter().enumerate() {
         let conditions = &join.on;
-        let Some(first) = conditions.first() else {
+        let Some((left_alias, right_alias)) = join.pair_aliases() else {
             continue;
         };
-        let left_alias = argument_alias(&first.left);
-        let right_alias = argument_alias(&first.right);
         let pairs: Vec<Value> = conditions
             .iter()
             .map(|condition| {
@@ -139,7 +140,7 @@ pub fn region_facts(found: &Operators) -> Result<Value, crate::error::CompileErr
             .collect();
         oriented.push(json!({
             "position": position, "left_alias": left_alias,
-            "right_alias": right_alias, "pairs": pairs,
+            "right_alias": right_alias, "pairs": pairs, "filter": join.filter,
         }));
     }
     let filters: BTreeMap<&str, Vec<Value>> = found

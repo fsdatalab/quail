@@ -383,9 +383,9 @@ def test_a_where_test_over_two_tables_keeps_the_pairs_it_passes():
 plan
   __quail_answer_1 = ai_filter('x {0} {1}', r.review, p.description), filter:
       __quail_answer_1, returns: []
-asked 12 of 8
-  'x {0} {1}': p0+r0 TRUE, p0+r1 TRUE, p0+r2 TRUE, p0+r3 TRUE, p0+r4 TRUE, p0+r5 TRUE,
-      p1+r0 TRUE, p1+r1 TRUE, p1+r2 TRUE, p1+r3 TRUE, p1+r4 TRUE, p1+r5 TRUE
+asked 8 of 8
+  'x {0} {1}': p0+r0 TRUE, p0+r5 TRUE, p1+r0 TRUE, p1+r1 TRUE, p1+r2 TRUE, p1+r3 TRUE,
+      p1+r4 TRUE, p1+r5 TRUE
 rows 8
   r0, p0
   r0, p1
@@ -401,9 +401,8 @@ rows 8
 plan
   __quail_answer_1 = ai_filter('x {0} {1}', r.review, p.description), filter:
       __quail_answer_1, returns: []
-asked 12 of 5
-  'x {0} {1}': p0+r0 TRUE, p0+r1 TRUE, p0+r2 TRUE, p0+r3 TRUE, p0+r4 TRUE, p0+r5 TRUE,
-      p1+r0 TRUE, p1+r1 TRUE, p1+r2 TRUE, p1+r3 TRUE, p1+r4 TRUE, p1+r5 TRUE
+asked 5 of 5
+  'x {0} {1}': p0+r0 TRUE, p0+r2 TRUE, p0+r5 TRUE, p1+r0 TRUE, p1+r5 TRUE
 rows 5
   r0, p0
   r0, p1
@@ -443,6 +442,79 @@ rows 3
   r0, p0
   r1, p1
   r5, p0
+""")
+
+
+PAIRED = {"r": pa.table({"id": ["r0", "r1", "r2"], "body": ["b0", "b1", "b2"],
+                         "n": [1, 2, 3]}),
+          "t": pa.table({"id": ["t0", "t1", "t2"], "topic": ["c0", "c1", "c2"],
+                         "n": [1, 2, 3]})}
+PAIRED_JOIN = "AI.IF(PROMPT('{0} vs {1}', r.body, t.topic))"
+
+
+def test_an_ai_join_asks_only_the_pairs_its_joins_filter_passes():
+    self_join = "AI.IF(PROMPT('{0} vs {1}', a.body, b.body))"
+    with Transcripts(PAIRED, lambda *_: True) as runs:
+        transcript = "\n".join(runs.query(sql) for sql in (
+            f"SELECT r.id, t.id FROM r JOIN t ON {PAIRED_JOIN} AND r.n < t.n",
+            f"SELECT r.id, t.id FROM r JOIN t ON {PAIRED_JOIN} AND r.n <> t.n",
+            f"SELECT r.id, t.id FROM r JOIN t ON {PAIRED_JOIN} WHERE r.n + t.n > 4",
+            f"SELECT a.id, b.id FROM r a JOIN r b ON {self_join} WHERE a.id < b.id"))
+        explain = runs.session.sql(
+            f"SELECT r.id, t.id FROM r JOIN t ON {PAIRED_JOIN} AND r.n < t.n").explain()
+    assert ("HashJoin: r x t\n      filter: r.n < t.n\n"
+            "      pairs kept: 0.3333 of the cross product") in explain
+    assert_transcript(transcript, """\
+--- SELECT r.id, t.id FROM r JOIN t ON AI.IF(PROMPT('{0} vs {1}', r.body, t.topic)) AND
+    r.n < t.n ---
+plan
+  __quail_answer_1 = ai_filter('{0} vs {1}', r.body, t.topic), filter: __quail_answer_1,
+      returns: []
+asked 3 of 3
+  '{0} vs {1}': r0+t1 TRUE, r0+t2 TRUE, r1+t2 TRUE
+rows 3
+  r0, t1
+  r0, t2
+  r1, t2
+
+--- SELECT r.id, t.id FROM r JOIN t ON AI.IF(PROMPT('{0} vs {1}', r.body, t.topic)) AND
+    r.n <> t.n ---
+plan
+  __quail_answer_1 = ai_filter('{0} vs {1}', r.body, t.topic), filter: __quail_answer_1,
+      returns: []
+asked 6 of 6
+  '{0} vs {1}': r0+t1 TRUE, r0+t2 TRUE, r1+t0 TRUE, r1+t2 TRUE, r2+t0 TRUE, r2+t1 TRUE
+rows 6
+  r0, t1
+  r0, t2
+  r1, t0
+  r1, t2
+  r2, t0
+  r2, t1
+
+--- SELECT r.id, t.id FROM r JOIN t ON AI.IF(PROMPT('{0} vs {1}', r.body, t.topic))
+    WHERE r.n + t.n > 4 ---
+plan
+  __quail_answer_1 = ai_filter('{0} vs {1}', r.body, t.topic), filter: __quail_answer_1,
+      returns: []
+asked 3 of 3
+  '{0} vs {1}': r1+t2 TRUE, r2+t1 TRUE, r2+t2 TRUE
+rows 3
+  r1, t2
+  r2, t1
+  r2, t2
+
+--- SELECT a.id, b.id FROM r a JOIN r b ON AI.IF(PROMPT('{0} vs {1}', a.body, b.body))
+    WHERE a.id < b.id ---
+plan
+  __quail_answer_1 = ai_filter('{0} vs {1}', a.body, b.body), filter: __quail_answer_1,
+      returns: []
+asked 3 of 3
+  '{0} vs {1}': r0+r1 TRUE, r0+r2 TRUE, r1+r2 TRUE
+rows 3
+  r0, r1
+  r0, r2
+  r1, r2
 """)
 
 
@@ -583,17 +655,18 @@ def test_datafusion_runs_plain_tests_and_join_keys_outside_the_region(session):
         (scan,) = operators_of(session.sql(
             f"SELECT r.id {PAIRS_FIRST} AND ({test})")).scans
         assert scan.predicates == (), test
-    # a test of two tables runs on the region's rows; the result returns
+    # a test of two tables is the AI join's filter; the result returns
     # only the selected columns
     join = "AI_FILTER(PROMPT('x {0} {1}', r.review, p.description))"
     query = session.sql(f"SELECT r.id, p.asin FROM reviews r JOIN products p "
                         f"ON {join} WHERE r.stars > 4 OR p.price > 15")
-    assert row_tests(query) == ["stars > 4 OR price > 15"]
+    assert row_tests(query) == []
+    assert str(operators_of(query).joins[0].filter) == "r.stars > 4 OR p.price > 15"
     assert _run(query, make_executor(TRUTH, lambda *_: True)).collect(
         ).column_names == ["r.id", "p.asin"]
     query = session.sql(f"SELECT r.id, p.asin FROM reviews r JOIN items p "
                         f"ON {join} WHERE r.stars > p.price")
-    assert row_tests(query) == ["stars > price"]
+    assert str(operators_of(query).joins[0].filter) == "r.stars > p.price"
     # an equality of two tables in WHERE is the AI join's key
     query = session.sql(f"SELECT r.id, p.asin FROM reviews r, products p "
                         f"WHERE r.stars = p.stars AND {join}")

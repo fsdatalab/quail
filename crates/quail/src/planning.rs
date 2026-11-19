@@ -10,6 +10,10 @@
 //! tokenizer.
 
 use quail_planner::constants::{NULL_DOCUMENT, SAMPLE_ROWS};
+
+/// The rows of each side whose pairs estimate a join filter's
+/// selectivity: 64 x 64 pairs.
+const FILTER_SAMPLE_ROWS: usize = 64;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -578,20 +582,39 @@ fn document_values(
     Ok(values)
 }
 
-/// The fraction of each join's cross product its equalities keep,
-/// estimated from the first rows of each side, by join position.
+/// The fraction of each join's cross product its equalities and filter
+/// keep, estimated from the first rows of each side, by join position.
+/// The two estimates multiply, as if independent.
 fn pair_fractions(
     found: &Operators,
     scans: &[Scan],
     tables: &HashMap<String, TableRows>,
 ) -> Result<BTreeMap<usize, f64>, CompileError> {
+    let sample_of = |alias: &str| -> Result<RecordBatch, CompileError> {
+        let scan = scans
+            .iter()
+            .find(|scan| scan.alias == alias)
+            .ok_or_else(|| CompileError::new(format!("no scan {alias}")))?;
+        first_rows(&tables[&scan.provider])
+    };
     let mut fractions = BTreeMap::new();
     for (position, join) in found.joins.iter().enumerate() {
-        let conditions = &join.on;
-        let Some(first) = conditions.first() else {
+        let Some((left_alias, right_alias)) = join.pair_aliases() else {
             continue;
         };
-        let left_alias = quail_planner::expressions::argument_alias(&first.left);
+        let kept = match &join.filter {
+            Some(filter) => filter_fraction(
+                filter,
+                (&left_alias, &sample_of(&left_alias)?),
+                (&right_alias, &sample_of(&right_alias)?),
+            )?,
+            None => 1.0,
+        };
+        let conditions = &join.on;
+        if conditions.is_empty() {
+            fractions.insert(position, kept);
+            continue;
+        }
         let (mut left, mut right) = (Vec::new(), Vec::new());
         for condition in conditions {
             let (a, b) =
@@ -604,23 +627,82 @@ fn pair_fractions(
             right.push(b.clone());
         }
         let sample = |side: &[ValueExpression]| -> Result<Vec<ArrayRef>, CompileError> {
-            let alias = quail_planner::expressions::argument_alias(&side[0]);
-            let scan = scans
-                .iter()
-                .find(|scan| scan.alias == alias)
-                .ok_or_else(|| CompileError::new(format!("no scan {alias}")))?;
-            let rows = &tables[&scan.provider];
-            let batch = first_rows(rows)?;
+            let batch = sample_of(&quail_planner::expressions::argument_alias(&side[0]))?;
             side.iter()
                 .map(|key| PhysicalValue::new(key)?.evaluate(&batch, false))
                 .collect()
         };
         fractions.insert(
             position,
-            estimate_pair_fraction(&sample(&left)?, &sample(&right)?)?,
+            estimate_pair_fraction(&sample(&left)?, &sample(&right)?)? * kept,
         );
     }
     Ok(fractions)
+}
+
+/// The fraction of the pairs of two samples, each up to
+/// `FILTER_SAMPLE_ROWS` rows, where a join's filter is TRUE; samples
+/// where it passes no pair still give one pair, and an empty sample
+/// gives the default selectivity.
+fn filter_fraction(
+    filter: &ValueExpression,
+    left: (&str, &RecordBatch),
+    right: (&str, &RecordBatch),
+) -> Result<f64, CompileError> {
+    let rows = |batch: &RecordBatch| batch.num_rows().min(FILTER_SAMPLE_ROWS);
+    let (num_left, num_right) = (rows(left.1), rows(right.1));
+    if num_left == 0 || num_right == 0 {
+        return Ok(quail_planner::constants::DEFAULT_SELECTIVITY);
+    }
+    let num_pairs = num_left * num_right;
+    let built = PhysicalValue::new(filter)?;
+    let mut fields = Vec::new();
+    let mut columns: Vec<ArrayRef> = Vec::new();
+    for column in built.columns() {
+        let name = column.name(true);
+        if fields
+            .iter()
+            .any(|field: &arrow::datatypes::Field| *field.name() == name)
+        {
+            continue;
+        }
+        // the left sample's row of each pair, then the right's
+        let (batch, index): (&RecordBatch, fn(usize, usize) -> usize) = if column.alias == left.0 {
+            (left.1, |pair, width| pair / width)
+        } else if column.alias == right.0 {
+            (right.1, |pair, width| pair % width)
+        } else {
+            return Err(CompileError::new(format!(
+                "a join filter reads {name}, which neither side holds"
+            )));
+        };
+        let values = batch
+            .column_by_name(&column.column)
+            .ok_or_else(|| CompileError::new(format!("no column {}", column.column)))?;
+        let positions = arrow::array::UInt32Array::from_iter_values(
+            (0..num_pairs).map(|pair| index(pair, num_right) as u32),
+        );
+        let taken = arrow::compute::take(values, &positions, None).map_err(arrow_error)?;
+        fields.push(arrow::datatypes::Field::new(
+            name,
+            taken.data_type().clone(),
+            true,
+        ));
+        columns.push(taken);
+    }
+    let options = arrow::array::RecordBatchOptions::new().with_row_count(Some(num_pairs));
+    let batch = RecordBatch::try_new_with_options(
+        Arc::new(arrow::datatypes::Schema::new(fields)),
+        columns,
+        &options,
+    )
+    .map_err(arrow_error)?;
+    let mask = built.evaluate(&batch, true)?;
+    let kept = mask
+        .as_boolean_opt()
+        .ok_or_else(|| CompileError::new("a join filter is not a condition"))?
+        .true_count();
+    Ok(kept.max(1) as f64 / num_pairs as f64)
 }
 
 fn first_rows(rows: &TableRows) -> Result<RecordBatch, CompileError> {

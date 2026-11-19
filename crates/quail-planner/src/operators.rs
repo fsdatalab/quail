@@ -175,8 +175,31 @@ pub struct SemanticJoin {
     pub anchor: Option<String>,
     /// The equality conditions of the joins below it, in written order.
     pub on: Vec<Equality>,
+    /// The joins' other conditions, an `Expression` over the two tables'
+    /// columns that asks no model, as DataFusion's `HashJoinExec` keeps
+    /// `filter` beside `on`: the model is asked only about the pairs
+    /// where it is TRUE.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<ValueExpression>,
     /// The aliases of the rows it extends: everything below its new tables.
     pub outer_aliases: Vec<String>,
+}
+
+impl SemanticJoin {
+    /// The (left, right) aliases of the pairs a HashJoin builds for it:
+    /// its first equality's sides, or its call's two tables when it has
+    /// only a filter; None when it has neither.
+    pub fn pair_aliases(&self) -> Option<(String, String)> {
+        use crate::expressions::{argument_alias, asked_call};
+        if let Some(first) = self.on.first() {
+            return Some((argument_alias(&first.left), argument_alias(&first.right)));
+        }
+        self.filter.as_ref()?;
+        match call_aliases(asked_call(&self.predicate)).as_slice() {
+            [left, right] => Some((left.clone(), right.clone())),
+            _ => None,
+        }
+    }
 }
 
 /// The columns a region returns.
