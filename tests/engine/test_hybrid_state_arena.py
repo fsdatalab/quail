@@ -45,20 +45,29 @@ def test_row_class_warmup_fits_an_arena_with_few_checkpoint_slots(monkeypatch):
     pytest.importorskip("torch")
     from quail.backends.quail.executor import chunk, stage_executor, warmup
 
-    resident = set()
+    resident, slots = set(), set()
+
+    def free_key(key):
+        resident.discard(key)
+        slots.difference_update({("checkpoint", key), ("extension", key)})
+
     arena = SimpleNamespace(
         num_state_slots=10,
         activate=lambda key, *_, **__: resident.add(key),
         is_resident=lambda key: key in resident,
-        free_key=resident.discard)
-    chunks = []
+        free_key=free_key)
+    held = []
 
     def pack_chunk(torch, arena, groups, attention_mode):
-        if len(groups) > arena.num_state_slots:
-            raise chunk.ArenaFullError("no free checkpoint slot")
-        chunks.append(len(groups))
+        for group in groups:
+            slots.add(("checkpoint", group["key"]))
+            if group.get("write_suffix_tokens"):
+                slots.add(("extension", group["key"]))
+            if len(slots) > arena.num_state_slots:
+                raise chunk.ArenaFullError("no free checkpoint slot")
+        held.append(len(slots))
 
     monkeypatch.setattr(chunk, "pack_chunk", pack_chunk)
     monkeypatch.setattr(stage_executor, "forward_chunk", lambda *_: None)
     warmup._warm_row_classes(None, arena, None, "tree")
-    assert max(chunks) == 10 and not resident
+    assert max(held) == 9 and not resident and not slots
