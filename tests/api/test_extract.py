@@ -582,3 +582,26 @@ def test_tests_of_answers_follow_the_extraction_they_read(session):
     ).plan().nodes if isinstance(node, Filter)]
     assert [port.source.node_id for port in test.inputs] == [
         "ai-extract:1", "ai-extract:0"]
+
+
+def test_an_extraction_of_a_computed_document_asks_about_the_computed_text():
+    table = pa.table({"id": ["c1", "c2"], "text": ["Lease ends in March.", "Deed."]})
+
+    def answer(kind, prompt, rows):
+        return "MARCH" if "LEASE" in rows[0] else None
+
+    with Transcripts({"contracts": table}, answer) as runs:
+        assert_transcript(runs.query(
+            "SELECT c.id, AI.EXTRACT(upper(c.text), {'month': 'Which month?'})"
+            "['month'] AS month FROM contracts c"), """\
+--- SELECT c.id, AI.EXTRACT(upper(c.text), {'month': 'Which month?'})['month'] AS month
+    FROM contracts c ---
+plan
+  __quail_call_1 = ai_extract(c.__quail_expr_0, named_struct('month', 'Which month?')),
+      returns: [__quail_call_1]
+asked 2 of 2
+  'Which month?': 'DEED.' NULL, 'LEASE ENDS IN MARCH.' 'MARCH'
+rows 2
+  c1, 'MARCH'
+  c2, NULL
+""")

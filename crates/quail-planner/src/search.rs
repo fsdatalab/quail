@@ -85,6 +85,8 @@ pub struct TableStep {
     pub later: StepCost,
     pub reuse_key: Option<Prompt>,
     pub document_head: Vec<i64>,
+    /// The columns its guard reads, which may hold another step's answers.
+    pub reads: Vec<String>,
 }
 
 impl TableStep {
@@ -188,6 +190,7 @@ pub fn table_steps(
             later: cost.later,
             reuse_key: cost.reuse_key,
             document_head: head(prompt)?,
+            reads: Vec::new(),
         });
     }
     let mut tests: Vec<(String, Vec<f64>)> = Vec::new();
@@ -261,6 +264,10 @@ pub fn table_steps(
             later,
             reuse_key: None,
             document_head: head(&call.prompt)?,
+            reads: (column.guard.iter())
+                .flat_map(crate::expressions::column_references)
+                .map(|reference| reference.column)
+                .collect(),
         });
     }
     Ok(steps)
@@ -351,12 +358,54 @@ struct Reached {
 /// (Hellerstein and Stonebraker, 1993). The terms of an OR run in the
 /// order of their own rank, seconds over the fraction of rows a term
 /// passes, and the OR ranks as one filter that passes the rows any
-/// term passes. Each step is priced at the rows that reach it.
+/// term passes. Each step is priced at the rows that reach it. A step
+/// whose guard reads another step's answers then moves after it.
 ///
 /// # Errors
 ///
 /// A step's cost fails.
 pub fn order_steps(
+    steps: &[TableStep],
+    rule: &str,
+    count: f64,
+    chunk: i64,
+    context: &PlanningContext,
+) -> Result<Vec<usize>, CompileError> {
+    let ordered = searched_order(steps, rule, count, chunk, context)?;
+    Ok(after_the_answers_read(steps, ordered))
+}
+
+/// `ordered` with each step moved after the steps whose answers its
+/// guard reads, the others kept in order.
+fn after_the_answers_read(steps: &[TableStep], ordered: Vec<usize>) -> Vec<usize> {
+    let answers = |step: &TableStep, read: &str| match &step.key {
+        StepKey::Name(name) => read
+            .strip_prefix(name.as_str())
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.')),
+        StepKey::Position(_) => false,
+    };
+    let mut placed: Vec<usize> = Vec::with_capacity(ordered.len());
+    let mut waiting: Vec<usize> = Vec::new();
+    let ready = |index: usize, placed: &[usize]| {
+        steps[index].reads.iter().all(|read| {
+            (0..steps.len())
+                .filter(|other| *other != index && answers(&steps[*other], read))
+                .all(|other| placed.contains(&other))
+        })
+    };
+    for index in ordered {
+        waiting.push(index);
+        // place every waiting step whose reads are answered, in order
+        while let Some(position) = waiting.iter().position(|found| ready(*found, &placed)) {
+            placed.push(waiting.remove(position));
+        }
+    }
+    // a cycle of reads keeps the order it had
+    placed.extend(waiting);
+    placed
+}
+
+fn searched_order(
     steps: &[TableStep],
     rule: &str,
     count: f64,

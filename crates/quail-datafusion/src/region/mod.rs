@@ -63,6 +63,16 @@ impl ModelRegion {
 }
 
 impl ModelRegion {
+    /// Whether an input of the region is sorted: the region then returns
+    /// its rows in its input's order, as DataFusion reads them.
+    pub fn has_sorted_input(&self) -> bool {
+        self.inputs.iter().any(|input| {
+            input
+                .exists(|node| Ok(matches!(node, LogicalPlan::Sort(_))))
+                .unwrap_or(true)
+        })
+    }
+
     /// The region's AI calls and the tables it reads, for EXPLAIN:
     /// `calls=[ai_filter], tables=[reviews]`.
     pub fn summary(&self) -> String {

@@ -985,14 +985,18 @@ class StageExecutor:
         if entry.at == len(entry.groups):
             self.outstanding.pop(0)
 
-    def _release_skipped(self):
+    def _release_skipped(self) -> bool:
         """Let go of what the documents a stop key skipped would have used.
 
         A skipped document never packs, so its parent's hold for it is
         released, or not counted when the parent is still queued, and
         its own borrowers pack their whole prefix.
+
+        Returns:
+            Whether any document was skipped since the last call.
         """
-        for a in self.sched.take_skipped():
+        skipped = self.sched.take_skipped()
+        for a in skipped:
             self.borrowing.skip(a)
             parent = (self.borrowing.tree_parent[a]
                       if a < len(self.borrowing.tree_parent) else None)
@@ -1003,6 +1007,7 @@ class StageExecutor:
                     self.borrowers[parent] -= 1
             if self.arena.is_resident(self.keys[a]):
                 self.arena.free_key(self.keys[a])
+        return bool(skipped)
 
     def _log_memory_event(self, kind, **detail):
         log = getattr(self.arena, "log_event", None)
@@ -1212,6 +1217,9 @@ class StageExecutor:
             if not groups:
                 if self.sched.done():
                     # every document left was skipped as it was admitted
+                    continue
+                if self._release_skipped():
+                    # borrowers of a skipped document pack their whole prefix
                     continue
                 if self.outstanding:
                     self._report_next(partial=True)
