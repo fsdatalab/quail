@@ -224,7 +224,9 @@ def _warm_row_classes(torch, arena, pipeline, attention_mode):
 
     Each chunk holds m one-token rows that read a cached document and
     keep their token's KV, as greedy decode rounds do, and one fresh
-    filler document that brings the chunk to n rows.
+    filler document that brings the chunk to n rows. On an arena with
+    checkpoint slots, m is at most one fewer than the slots, the most
+    documents a chunk can hold.
 
     Args:
         torch: The torch module.
@@ -237,6 +239,11 @@ def _warm_row_classes(torch, arena, pipeline, attention_mode):
 
     cached = ROW_CLASS_CACHED
     readers = max(m for _, m in ROW_CLASSES)
+    slots = getattr(arena, "num_state_slots", 0)
+    if slots:
+        # each document of a chunk, the filler too, takes a checkpoint slot
+        readers = max(1, min(readers, slots - 1))
+    classes = list(dict.fromkeys((n, min(m, readers)) for n, m in ROW_CLASSES))
     keys = [("warm-rows", index) for index in range(readers)]
     prefix = list(range(10, 10 + cached))
     for key in keys:
@@ -249,7 +256,7 @@ def _warm_row_classes(torch, arena, pipeline, attention_mode):
         forward_chunk(pipeline, arena, pack_chunk(
             torch, arena, [dict(key=key, prefix=prefix, f=cached, suffixes=[[11]])
                            for key in keys], attention_mode=attention_mode))
-        for n, m in ROW_CLASSES:
+        for n, m in classes:
             groups = [dict(key=key, prefix=None, f=cached, suffixes=[[11]],
                            write_suffix_tokens=1, single=True)
                       for key in keys[:m]]

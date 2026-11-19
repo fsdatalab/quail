@@ -1,6 +1,8 @@
 """Checkpoint allocation, retention, and memory accounting."""
 
 
+from types import SimpleNamespace
+
 from helpers.fakes import bare_arena
 
 from quail.backends.quail.executor.arena import KVArena, PageArena
@@ -36,3 +38,27 @@ def test_a_full_pool_evicts_the_lowest_priority_document_with_its_slot():
     assert arena.is_resident(("a", 1))
     assert arena.evicted_keys == 1
     assert arena.num_state_slots == 2
+
+
+def test_row_class_warmup_fits_an_arena_with_few_checkpoint_slots(monkeypatch):
+    import pytest
+    pytest.importorskip("torch")
+    from quail.backends.quail.executor import chunk, stage_executor, warmup
+
+    resident = set()
+    arena = SimpleNamespace(
+        num_state_slots=10,
+        activate=lambda key, *_, **__: resident.add(key),
+        is_resident=lambda key: key in resident,
+        free_key=resident.discard)
+    chunks = []
+
+    def pack_chunk(torch, arena, groups, attention_mode):
+        if len(groups) > arena.num_state_slots:
+            raise chunk.ArenaFullError("no free checkpoint slot")
+        chunks.append(len(groups))
+
+    monkeypatch.setattr(chunk, "pack_chunk", pack_chunk)
+    monkeypatch.setattr(stage_executor, "forward_chunk", lambda *_: None)
+    warmup._warm_row_classes(None, arena, None, "tree")
+    assert max(chunks) == 10 and not resident
