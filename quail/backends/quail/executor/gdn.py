@@ -59,6 +59,7 @@ class GdnPhase:
     copy_reads: object = None
     copy_writes: object = None
     contiguous_from_zero: bool = False
+    contiguous_span: tuple | None = None
     read_slots_i32: object = None
     write_slots_i32: object = None
     unique_writes: bool = False
@@ -315,15 +316,18 @@ def _plan_phases(arena, groups, stage, undo):
             add("suffix", np.arange(begin, end, dtype=np.int64), source)
             suffix_slots.add(source)
 
-    def _is_contiguous_from_zero(segments):
-        cursor = 0
+    def _contiguous_span(segments):
+        if not segments or not len(segments[0]):
+            return None
+        first = int(segments[0][0])
+        cursor = first
         for part in segments:
             if not len(part) or int(part[0]) != cursor:
-                return False
+                return None
             if len(part) > 1 and int(part[-1]) != cursor + len(part) - 1:
-                return False
+                return None
             cursor += len(part)
-        return cursor > 0
+        return (first, cursor) if cursor > first else None
 
     def build(name, rows, lengths, reads, writes, output=True):
         cu = np.concatenate([[0], np.cumsum(lengths)])
@@ -341,6 +345,7 @@ def _plan_phases(arena, groups, stage, undo):
             if all(owner.get(int(slot), index) == index
                    for index, slot in enumerate(reads_arr)):
                 moved = reads_arr != writes_arr
+        span = _contiguous_span(rows)
         phase = GdnPhase(
             rows=stage(f"gdn_{name}_rows", np.concatenate(rows), torch.int64),
             cu_seqlens=stage(f"gdn_{name}_cu", cu, torch.int32),
@@ -350,7 +355,8 @@ def _plan_phases(arena, groups, stage, undo):
             write_slots=(None if writes_arr is None else
                          stage(f"gdn_{name}_write", writes_arr, torch.int64)),
             output=output,
-            contiguous_from_zero=_is_contiguous_from_zero(rows),
+            contiguous_from_zero=span is not None and span[0] == 0,
+            contiguous_span=span,
             read_slots_i32=(None if reads_arr is None else stage(
                 f"gdn_{name}_read32", reads_arr.astype(np.int32), torch.int32)),
             write_slots_i32=(None if writes_arr is None else stage(
@@ -765,9 +771,14 @@ def gdn_core(geometry, tensors, phases, arena, layer_slot, *, output=None):
                 and spec.gdn_key_dim == 128
                 and torch.cuda.get_device_capability(qkv.device)[0] == 10)
     for phase in active_phases:
+        span = getattr(phase, "contiguous_span", None)
         if single_identity:
             mixed_in = qkv
             a_in, b_in = tensors["a"], tensors["b"]
+        elif span is not None:
+            mixed_in = qkv[span[0]:span[1]]
+            a_in = tensors["a"][span[0]:span[1]]
+            b_in = tensors["b"][span[0]:span[1]]
         elif qkv.is_cuda:
             mixed_in, a_in, b_in = gather_gdn_inputs(
                 qkv, tensors["a"], tensors["b"], phase.rows)
@@ -791,17 +802,22 @@ def gdn_core(geometry, tensors, phases, arena, layer_slot, *, output=None):
                 out = torch.empty(
                     (rows, spec.gdn_value_heads, spec.gdn_value_dim),
                     dtype=qkv.dtype, device=qkv.device)
-            target = out
-            if not (single_identity or phase.output):
+            if single_identity:
+                target, out_rows = out, None
+            elif not phase.output:
                 target = torch.empty(
                     (len(phase.lengths), spec.gdn_value_heads,
                      spec.gdn_value_dim), dtype=qkv.dtype, device=qkv.device)
+                out_rows = None
+            elif span is not None:
+                target, out_rows = out[span[0]:span[1]], None
+            else:
+                target, out_rows = out, phase.rows
             gdn_decode_step(
                 mixed, a_in, b_in, tensors["A_log"], tensors["dt_bias"],
                 arena.gdn_state_rows[:, layer_slot], phase.state_rows, target,
                 num_key_heads=spec.gdn_key_heads, scale=scale,
-                out_rows=phase.rows if target is out and not single_identity
-                else None)
+                out_rows=out_rows)
             if single_identity:
                 return out
             continue
@@ -825,12 +841,15 @@ def gdn_core(geometry, tensors, phases, arena, layer_slot, *, output=None):
             output_g_exp=g_exp)
         pool_ok = is_sm100 and (phase.write_slots is None or in_place)
         if pool_ok:
+            direct_out = (out if single_identity
+                          else out[span[0]:span[1]]
+                          if phase.output and span is not None else None)
             core = _sm100_pool_delta_rule(
                 spec, q, k, v, g, b, arena, phase, layer_slot,
-                output=out if single_identity else None)
+                output=direct_out)
             if single_identity:
                 return core
-            if phase.output:
+            if phase.output and direct_out is None:
                 if out.is_cuda:
                     scatter_gdn_rows(core, phase.rows, out)
                 else:

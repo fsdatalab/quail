@@ -21,7 +21,7 @@ from quail.progress import Progress, logger, quiet
 # Bump when either pass covers a different set of shapes. A bumped
 # version invalidates every marker, so the next boot re-runs the
 # compile pass.
-WARMUP_VERSION = 15
+WARMUP_VERSION = 16
 
 # Triton compiles one copy of a kernel for each class of its integer
 # arguments: equal to 1, a multiple of 16, or neither. Quail's row
@@ -116,31 +116,30 @@ def _warm_recurrent(torch, arena, pipeline):
 
 
 def _warm_short_attention(torch, arena, pipeline):
-    """Compile each launch form of the Triton attention that short queries run.
+    """Compile both split regimes of the Triton short-query attention kernel.
 
-    One-token rows of few sequences, of many sequences, and rows of
-    several tokens each launch a different kernel; each reads one page.
+    Single-split (one page) and multi-split (two pages) cover every batch
+    size, query length, and alignment.
     """
-    from quail.backends.quail.executor.attention import TRITON_GRID_ROWS
-
     engine = getattr(pipeline, "engine", None)
     attn = getattr(getattr(pipeline, "attention_layer", None), "self_attn", None)
     if (engine is None or attn is None or engine.fa_version != 4
             or attn.head_dim != 256):
         return
     device = arena.conv_state.device if arena.conv_state is not None else "cuda"
-    page = torch.zeros((1, arena.page_tokens, attn.num_kv_heads, attn.head_dim),
-                       dtype=torch.bfloat16, device=device)
-    for seqs, q_len in ((1, 1), (TRITON_GRID_ROWS // attn.num_kv_heads + 1, 1),
-                        (2, 2)):
-        q = torch.zeros((seqs * q_len, attn.num_heads, attn.head_dim),
+    pages = torch.zeros((2, arena.page_tokens, attn.num_kv_heads, attn.head_dim),
                         dtype=torch.bfloat16, device=device)
+    q = torch.zeros((1, attn.num_heads, attn.head_dim),
+                    dtype=torch.bfloat16, device=device)
+    cu = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    for num_pages in (1, 2):
+        used_tokens = num_pages * arena.page_tokens
+        table = torch.arange(num_pages, dtype=torch.int32, device=device).view(
+            1, num_pages)
         engine.triton_paged(
-            q, page, page,
-            torch.arange(0, seqs * q_len + 1, q_len, dtype=torch.int32,
-                         device=device),
-            q_len, torch.full((seqs,), q_len, dtype=torch.int32, device=device),
-            q_len, torch.zeros((seqs, 1), dtype=torch.int32, device=device))
+            q, pages, pages, cu, 1,
+            torch.tensor([used_tokens], dtype=torch.int32, device=device),
+            used_tokens, table)
 
 
 def _warm_run(*args, **kwargs):

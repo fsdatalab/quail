@@ -68,23 +68,28 @@ class AsyncAnswers:
     def __init__(self, torch, rows):
         self.torch = torch
         self.rows = rows
+        self.available = []
 
     def submit(self, normed):
         torch = self.torch
         t, f = self.rows.logits(normed)
         bits = (t > f).to(torch.uint8)
-        host = torch.empty(bits.shape[0], dtype=torch.uint8,
-                           pin_memory=True)
-        host.copy_(bits, non_blocking=True)
+        count = bits.shape[0]
+        host = self.available.pop() if self.available else None
+        if host is None or host.shape[0] < count:
+            host = torch.empty(max(count, 64), dtype=torch.uint8,
+                               pin_memory=bits.is_cuda)
+        host[:count].copy_(bits, non_blocking=True)
         event = torch.cuda.Event()
         event.record()
-        return event, host
+        return event, host, count
 
-    @staticmethod
-    def result(handle):
-        event, host = handle
+    def result(self, handle):
+        event, host, count = handle
         event.synchronize()
-        return [int(b) for b in host.tolist()]
+        values = [int(b) for b in host[:count].tolist()]
+        self.available.append(host)
+        return values
 
 
 def answer_rows(rows_per_answer) -> tuple[np.ndarray, np.ndarray]:

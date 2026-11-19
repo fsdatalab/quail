@@ -29,12 +29,8 @@ GROUP = 128            # fp8 quant group size, matches the engine
 # whose Hopper build takes heads up to 512, over arena pages.
 FA_MAX_HEAD_DIM = 256
 # A causal paged call of at most TRITON_DECODE_MAX_Q rows per sequence runs
-# vLLM's Triton kernel instead of head-256 FA4. For up to
-# TRITON_GRID_ROWS // KV heads one-token sequences, the kernel splits each
-# sequence's KV over TRITON_SEGMENTS.
+# the Triton split-KV decode kernel instead of head-256 FA4.
 TRITON_DECODE_MAX_Q = 16
-TRITON_GRID_ROWS = 128
-TRITON_SEGMENTS = 16
 
 # The two attention paths a chunk can run. "unified" is one causal
 # paged call in which every row reads the KV its own document needs.
@@ -1020,39 +1016,24 @@ class Engine:
     def triton_paged(self, q3, kp, vp, cu_q, max_q, seqused_k, max_seqused_k,
                       block_table, *, softmax_scale=None, window=None,
                       output=None):
-        """Causal paged attention for short queries through vLLM's Triton kernel.
+        """Causal paged attention for short queries via Triton split-KV.
 
         Blackwell's head-256 FA4 kernel splits neither the KV nor the query
-        heads that share a KV head, so it runs one-token rows 3-5x slower.
-        A batch of few sequences splits each one's KV over segments.
+        heads that share a KV head, so one-token rows run 3-5x slower. Dynamic
+        splitting saturates all SMs across batch sizes without mid-query
+        Triton compilations.
         """
-        from vllm.v1.attention.ops.triton_unified_attention import (
-            unified_attention,
+        from quail.backends.quail.executor.models.qwen3_5_kernels import (
+            triton_splitkv_decode,
         )
 
-        torch = self.torch
-        heads, dim = q3.shape[1], q3.shape[2]
-        threshold = TRITON_GRID_ROWS // kp.shape[2]
-        key = (heads, dim)
-        segments = getattr(self, "_triton_segments", {}).get(key)
-        if segments is None:
-            self._triton_segments = getattr(self, "_triton_segments", {})
-            maxima = torch.empty((threshold, heads, TRITON_SEGMENTS),
-                                 dtype=torch.float32, device=q3.device)
-            segments = self._triton_segments[key] = (
-                torch.empty((threshold, heads, TRITON_SEGMENTS, dim),
-                            dtype=torch.float32, device=q3.device),
-                maxima, torch.empty_like(maxima))
-        out = output if output is not None else torch.empty_like(q3)
-        unified_attention(
-            q3, kp, vp, out, cu_q, max_q, seqused_k, max_seqused_k,
-            dim ** -0.5 if softmax_scale is None else softmax_scale, True,
-            (-1, -1) if window is None else tuple(window), block_table, 0.0,
-            None, None, None, seq_threshold_3D=threshold,
-            num_par_softmax_segments=TRITON_SEGMENTS,
-            softmax_segm_output=segments[0], softmax_segm_max=segments[1],
-            softmax_segm_expsum=segments[2])
-        return out
+        workspace = getattr(self, "_triton_segments", None)
+        if workspace is None:
+            workspace = self._triton_segments = {}
+        return triton_splitkv_decode(
+            q3, kp, vp, cu_q, max_q, seqused_k, max_seqused_k, block_table,
+            softmax_scale=softmax_scale, window=window, output=output,
+            workspace=workspace)
 
     def _paged(self, q3, kp, vp, cu_q, max_q, seqused_k, max_seqused_k, block_table, *,
                causal, softmax_scale=None, window=None, metadata=None, output=None):

@@ -16,12 +16,12 @@ from types import SimpleNamespace
 import numpy as np
 
 from quail.backends.quail.executor.answer_curves import AnswerCurves
-from quail.backends.quail.executor.chunk import DecodeRows
+from quail.backends.quail.executor.chunk import DecodeRows, InputStaging
 from quail.backends.quail.executor.groups import FullAttentionGroup
 
 # copies of chosen tokens kept in flight before the host waits on the
-# oldest; two lets the host read a pass's tokens while the next runs
-IN_FLIGHT = 2
+# oldest; three lets the host keep two passes queued ahead of the GPU
+IN_FLIGHT = 3
 # per extraction field: rounds that fed a draft, and of them the rounds
 # with several live positions; draft rows fed and written; rounds whose
 # draft the model left for another position, the draft rows unread after
@@ -37,6 +37,7 @@ class _Copy:
 
     event: object
     host: object
+    buffer: object          # owning pinned buffer returned to the pool after read
     documents: np.ndarray
     indices: np.ndarray     # each token's position in its answer
     maps: np.ndarray        # each token's map, when it was chosen
@@ -61,11 +62,14 @@ class MapDecoder:
 
     def __init__(self, torch, head, num_documents: int, limits, stop_ids,
                  page_tokens: int, expected_tokens=None, *, workspace_bytes=0,
-                 row_budget=None):
+                 row_budget=None, in_flight: int = IN_FLIGHT):
         self.workspace_bytes = workspace_bytes
         self.row_budget = row_budget
+        self.in_flight = in_flight
         self.torch = torch
         self.head = head
+        self._staging = InputStaging(torch) if head.is_cuda else None
+        self._host_pool = []
         self.limits = np.asarray(limits, dtype=np.int64)
         self.expected_tokens = (np.minimum(64, self.limits) if expected_tokens is None
                                 else np.asarray(expected_tokens, dtype=np.float64))
@@ -414,13 +418,30 @@ class MapDecoder:
         rows.advance = ~self.constrained[self.map[running]]
         return rows
 
+    def _stage_i64(self, name: str, values):
+        """Copy an int64 index array to the device through pinned staging."""
+        if self._staging is not None:
+            return self._staging.copy(name, values, self.torch.int64)
+        return self.torch.as_tensor(values, dtype=self.torch.int64,
+                                    device=self.device)
+
+    def _acquire_host(self, shape):
+        """Return a reusable pinned host buffer at least as large as shape."""
+        rows, width = shape
+        for index, buf in enumerate(self._host_pool):
+            if buf.shape[0] >= rows and buf.shape[1] >= width:
+                self._host_pool.pop(index)
+                return buf, buf[:rows, :width]
+        buf = self.torch.empty((max(rows, 64), width), dtype=self.torch.int64,
+                               pin_memory=self.head.is_cuda)
+        return buf, buf[:rows, :width]
+
     def feed(self, chunk) -> None:
         """Copy each decode row's input token from the token buffer."""
         rows = chunk.decode_rows
         if rows is None:
             return
-        torch = self.torch
-        slots = torch.from_numpy(rows.slots).to(self.device, non_blocking=True)
+        slots = self._stage_i64("decode_feed_slots", rows.slots)
         start = chunk.tokens - len(rows)
         inputs = self.next_token.index_select(0, slots)
         for group in self.copy_groups:
@@ -478,9 +499,9 @@ class MapDecoder:
             rows.positions - self.origin[rows.slots] + 1])
         selected = []
         if len(first_rows):
-            index = torch.from_numpy(np.asarray(first_rows, dtype=np.int64))
-            selected.append(normed.index_select(0, index.to(normed.device,
-                                                             non_blocking=True)))
+            index = self._stage_i64(
+                "decode_first_rows", np.asarray(first_rows, dtype=np.int64))
+            selected.append(normed.index_select(0, index))
         if count:
             selected.append(normed[normed.shape[0] - count:])
         hidden = selected[0] if len(selected) == 1 else torch.cat(selected)
@@ -490,10 +511,9 @@ class MapDecoder:
         chosen, projections = self._project(hidden, documents)
         plain = np.flatnonzero(~self.constrained[self.map[documents]])
         if len(plain):
-            index = torch.from_numpy(plain).to(self.device, non_blocking=True)
+            index = self._stage_i64("decode_plain_index", plain)
             values[index, 0] = chosen[index]
-            slots = torch.from_numpy(documents[plain]).to(self.device,
-                                                         non_blocking=True)
+            slots = self._stage_i64("decode_plain_slots", documents[plain])
             self.next_token.index_copy_(0, slots, chosen[index])
         for group in self.copy_groups:
             mine = np.flatnonzero(np.isin(self.map[documents], group.questions))
@@ -502,8 +522,7 @@ class MapDecoder:
             self._constrain(
                 group, projections[group.key], documents[mine], indices[mine],
                 out=values, output_rows=mine)
-        host = torch.empty(values.shape, dtype=torch.int64,
-                           pin_memory=self.head.is_cuda)
+        host_buf, host = self._acquire_host(values.shape)
         host.copy_(values, non_blocking=True)
         event = torch.cuda.Event()
         event.record()
@@ -518,10 +537,10 @@ class MapDecoder:
                 lookahead.append((group, (
                     slots, self.copy_document[slots], group.masks[group.index[slots]],
                     indices[mine][first])))
-        self.copies.append(_Copy(event, host, documents, indices,
+        self.copies.append(_Copy(event, host, host_buf, documents, indices,
                                  self.map[documents].copy(), lookahead))
         np.add.at(self.inflight, documents, 1)
-        while len(self.copies) > IN_FLIGHT:
+        while len(self.copies) > self.in_flight:
             self._read(self.copies.popleft())
 
     def _project(self, hidden, documents):
@@ -542,7 +561,7 @@ class MapDecoder:
                 mine = np.flatnonzero(np.isin(maps[start:end], questions))
                 if not len(mine):
                     continue
-                index = torch.from_numpy(mine).to(self.device, non_blocking=True)
+                index = self._stage_i64("decode_proj_mine", mine)
                 projections[key][start + index] = readout.from_logits(logits[index])
         return chosen, projections
 
@@ -706,6 +725,7 @@ class MapDecoder:
             self.copy_pending[slots] = ~ready
         if self.answer_stops:
             self._stop_decided(np.unique(documents))
+        self._host_pool.append(copy.buffer)
 
     def _stop_decided(self, slots) -> None:
         """End each answer whose tests are decided on its tokens so far."""
