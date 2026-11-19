@@ -133,16 +133,27 @@ class JoinOperator(ModelOperator):
         join's answers, and its anchor survives a join that keeps
         matched anchors.
         """
-        node = self.nodes[stage]
         anchor_id = int(self.inputs["anchor_keys"][anchor][1])
+        matched = self._partner_tuples(
+            anchor_id, stage,
+            [start + position for position, answer in enumerate(answers) if answer])
+        self.finished.extend(settled_pairs(self.nodes[stage], anchor_id, matched))
+        return bool(matched)
+
+    def traced_ids(self, anchor, stage, start, end):
+        """Return the node id, anchor ids, and first partner ids of traced answers."""
+        anchor_id = int(self.inputs["anchor_keys"][anchor][1])
+        partners = [int(found[0]) for found in
+                    self._partner_tuples(anchor_id, stage, range(start, end))]
+        return self.nodes[stage].node_id, [anchor_id] * len(partners), partners
+
+    def _partner_tuples(self, anchor_id, stage, positions) -> list:
+        """Return the partner ids of an anchor's requests at a stage, by position."""
         lists_for = self.inputs.get("anchor_partners")
         members = None if lists_for is None else lists_for(anchor_id, stage)
-        tuples = self.inputs["partner_indices"][node.written_position]
-        matched = [tuples[start + position if members is None
-                          else int(members[start + position])]
-                   for position, answer in enumerate(answers) if answer]
-        self.finished.extend(settled_pairs(node, anchor_id, matched))
-        return bool(matched)
+        tuples = self.inputs["partner_indices"][self.nodes[stage].written_position]
+        return [tuples[position if members is None else int(members[position])]
+                for position in positions]
 
     def take_finished(self):
         finished, self.finished = self.finished, []

@@ -18,6 +18,7 @@ from typing import Any
 import _quail_native
 
 from quail.backends.base import GpuContext
+from quail.backends.quail.executor.answer_trace import answer_trace_dir
 from quail.backends.quail.executor.arena import KVArena
 from quail.backends.quail.executor.cuda_graphs import PiecewiseGraphs
 from quail.backends.quail.executor.model_loading import load_model
@@ -176,7 +177,8 @@ class LoadedGpu:
             async_scores = AsyncDecisionScores(
                 self.torch, self.decision_head, self.decision_offsets)
         else:
-            self.async_ans = AsyncAnswers(self.torch, rows)
+            self.async_ans = AsyncAnswers(self.torch, rows,
+                                          trace=answer_trace_dir() is not None)
         self.chunk_tokens = chunk_tokens
         self.execution.bind_query(
             torch=self.torch,

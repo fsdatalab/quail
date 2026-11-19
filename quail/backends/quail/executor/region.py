@@ -15,13 +15,15 @@ node shows them with, keyed by (alias, document id), with one prefix
 tree over them.
 """
 
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 from dataclasses import dataclass
+from functools import partial
 from itertools import groupby
 from typing import Any
 
 import numpy as np
 
+from quail.backends.quail.executor.answer_trace import AnswerTrace, answer_trace_dir
 from quail.backends.quail.executor.map_decoder import map_decoder
 from quail.backends.quail.executor.model_operator import (
     close_operators,
@@ -302,6 +304,11 @@ class RegionExecution:
         with ExitStack() as resources:
             for operator in operators:
                 resources.enter_context(operator.execution_context())
+            trace_dir = answer_trace_dir()
+            on_trace = None
+            if trace_dir is not None:
+                trace = resources.enter_context(closing(AnswerTrace(trace_dir)))
+                on_trace = partial(self._on_trace, trace)
             self.executor = StageExecutor(
                 state.torch, state.loaded_model.arena, pipeline, stages, prefixes,
                 state.chunk_tokens, anchor_keys=keys, on_settled=settled,
@@ -312,6 +319,7 @@ class RegionExecution:
                 survival=survival(operators),
                 paged=paged, label=settings.label, on_chunk=self._on_chunk,
                 on_answers=(None if finished_rows() is None else self._on_answers),
+                on_trace=on_trace,
                 stop_groups=settings.stop_groups,
                 appended_tokens=max(operator.appended_tokens
                                     for operator in operators) or None,
@@ -365,6 +373,18 @@ class RegionExecution:
         if operator.answered(anchor, stage - routes.slices[index][0], start, end,
                              answers) and operator not in self._answered:
             self._answered.append(operator)
+
+    def _on_trace(self, trace, anchor, stage, start, end, margins, states) -> None:
+        """Record traced answers under the ids of the operator that asked."""
+        routes = self._routes
+        index = routes.owner[stage]
+        operator = routes.operators[index]
+        traced_ids = getattr(operator, "traced_ids", None)
+        if traced_ids is None:
+            return
+        local = stage - routes.slices[index][0]
+        node, documents, partners = traced_ids(anchor, local, start, end)
+        trace.add(node, local, documents, partners, margins, states)
 
     def _on_chunk(self, transitions) -> None:
         """Settle documents in the operators they left; send finished rows.

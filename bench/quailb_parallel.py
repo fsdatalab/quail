@@ -97,14 +97,18 @@ def _methods(csv: str) -> list[str]:
 def _run_family(process_groups, result_name, model, scale_factor, query_ids_csv,
                 run_dir, ground_truth_collection, root=None,
                 attention=None, gpu_timing=False,
-                canvas_draws=None, device="h100-sxm", gpus=1) -> str:
+                canvas_draws=None, device="h100-sxm", gpus=1,
+                answer_trace=False) -> str:
     """Run one query family's methods, one child process per group.
 
     Every group runs on this container's GPUs, in a fresh process.
     The family's result, without the per-method suites, is saved
-    under `families/` in the run directory.
+    under `families/` in the run directory. With answer_trace, Quail
+    saves each filter and join answer's margin and answer-row state
+    under `answer_trace/<family>/<query id>/`.
     """
     from bench.process_isolation import run_backend_group_in_fresh_process
+    from quail.backends.quail.executor.answer_trace import ANSWER_TRACE_ENV
     from quail_b.queries import query_family_name
 
     query_ids = tuple(
@@ -113,6 +117,9 @@ def _run_family(process_groups, result_name, model, scale_factor, query_ids_csv,
     family = query_family_name(query_ids)
     # every engine line names the family, as the families' logs interleave
     os.environ[LOG_TAG_ENV] = family
+    if answer_trace:
+        os.environ[ANSWER_TRACE_ENV] = str(
+            Path(run_dir) / "answer_trace" / f"{family}{result_name}")
     process_results = []
     suites = {}
     for methods in process_groups:
@@ -187,6 +194,7 @@ def run_query_family(
     canvas_draws: str = "",
     device: str = "h100-sxm",
     gpus: int = 1,
+    answer_trace: bool = False,
 ) -> str:
     """Run one query family through the selected benchmark methods.
 
@@ -208,6 +216,8 @@ def run_query_family(
             keeps the default; multiple counts create separate Quail runs.
         device: Registered device name. Defaults to ``h100-sxm``.
         gpus: Model copies, one per GPU. Defaults to 1.
+        answer_trace: Whether Quail saves each filter and join answer's
+            margin and answer-row state to the run directory.
 
     Returns:
         Path to the saved family result on the results volume.
@@ -232,6 +242,7 @@ def run_query_family(
             canvas_draws=canvas_draws or None,
             device=device,
             gpus=gpus,
+            answer_trace=answer_trace,
         )
     finally:
         results_vol.commit()
@@ -312,6 +323,7 @@ def run_all(
     device: str = "h100-sxm",
     gpus: int = 1,
     timeout_s: int = 43200,
+    answer_trace: bool = False,
 ):
     from quail_b import select_queries
 
@@ -374,6 +386,7 @@ def run_all(
                     canvas_draws=canvas_draws,
                     device=device,
                     gpus=gpus,
+                    answer_trace=answer_trace,
                 )
                 family_calls.append((group, family_call))
                 call_ids[f"{group}:quail_vllm"] = family_call.object_id
@@ -506,6 +519,7 @@ def main(
     device: str = "h100-sxm",
     gpus: int = 1,
     timeout_s: int = 43200,
+    answer_trace: bool = False,
 ):
     if timeout_s < 1 or timeout_s > 86400:
         raise ValueError("timeout_s must be from 1 to 86400 seconds")
@@ -538,6 +552,7 @@ def main(
         device=device,
         gpus=gpus,
         timeout_s=timeout_s,
+        answer_trace=answer_trace,
     )
     print(f"function call id: {call.object_id} (all families)", flush=True)
     print(call.get(), flush=True)

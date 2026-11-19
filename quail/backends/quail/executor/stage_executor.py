@@ -175,6 +175,10 @@ class StageExecutor:
             rows) run as each chunk's answers are read, with the
             document's answer rows for its requests start to end at
             the stage.
+        on_trace: Optional callable(document index, stage, start, end,
+            margins, states) run beside on_answers with those requests'
+            TRUE minus FALSE logits and answer-row states, for the
+            stages whose readout traces them.
         appended_tokens: The most tokens the append stages leave after
             a document's frame, when stages discard tokens earlier ones
             added; None sums every append stage's longest suffix.
@@ -204,7 +208,7 @@ class StageExecutor:
                  attention_mode=None, prefix_tree=None, stats=None, limit=None,
                  paged=True, unit="documents", count_answers=False, label=None,
                  default_attention="tree", on_chunk=None, on_answers=None,
-                 stop_groups=None, skip=None, appended_tokens=None,
+                 on_trace=None, stop_groups=None, skip=None, appended_tokens=None,
                  gpu_timing=False, survival=None, decoder=None, dependencies=None,
                  knee_rows=0, decode_cost=None, summary=True, num_key_survivors=1,
                  start_stages=None, retains_kv=None):
@@ -224,6 +228,7 @@ class StageExecutor:
         self.paged = paged
         self.on_chunk = on_chunk
         self.on_answers = on_answers
+        self.on_trace = on_trace
         self.label = label
         self.summary = summary
         self.gpu_timing = gpu_timing
@@ -907,6 +912,8 @@ class StageExecutor:
         if entry.values is None:
             entry.values = self.readouts.results(entry.handles)
             entry.positions = np.zeros(len(self.readouts), dtype=np.int64)
+            if self.on_trace is not None:
+                entry.traced = self.readouts.traced(entry.handles)
         groups = entry.groups[entry.at:entry.at + entry.step]
         values, position = entry.values, entry.positions
         transitions = []
@@ -915,8 +922,13 @@ class StageExecutor:
             if self.writes[j] and start == 0 and not self._merged(j, start, end):
                 position[key] += 1        # the frame entry's answer means nothing
             count = end - start
-            rows = values[key][position[key]:position[key] + count]
+            first = position[key]
+            rows = values[key][first:first + count]
             position[key] += count
+            if entry.traced is not None and entry.traced[key] is not None:
+                margins, states = entry.traced[key]
+                self.on_trace(a, j, start, end, margins[first:first + count],
+                              states[first:first + count])
             if j in self.answer_maps:
                 # the row stands until the decoder ends the answer
                 self.deferred[a] = (j, start, end, rows)

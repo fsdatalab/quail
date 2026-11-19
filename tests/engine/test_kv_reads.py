@@ -198,3 +198,41 @@ def test_an_unpaged_filter_writes_a_long_document_in_pages_over_passes(
         for d, document in enumerate(documents)}
     assert tokens == 100 + 20 + 2 * len(question)
     assert not run.arena.accounting.owned
+
+
+def test_traced_join_answers_carry_the_margins_of_their_own_partners(monkeypatch):
+    """Each traced margin lines up with its anchor's partner answer.
+
+    A join's frame entry reads a row whose answer means nothing; the
+    traced margins skip it as the answers do.
+    """
+    import numpy as np
+    from helpers.fakes import fake_readout
+    from helpers.kv_checker import Run, _join_answers, chain
+
+    from quail.backends.quail.executor.stage_executor import StageExecutor
+    from quail.backends.quail.executor.stages import Stage
+
+    cpu_staging(monkeypatch)
+    rng = random.Random(3)
+    anchors = corpus(rng, 12, (0, 5, 16), (1, 7, 16))
+    frame, partners = join_parts()
+    answers = _join_answers(anchors, frame, partners, [])
+    run = Run(Setup(path="tree", pages=400, budget=60), answers)
+    readout = fake_readout(traced=lambda value: (
+        np.asarray(value, dtype=np.float32), np.asarray(value)[:, None]))
+    traced = {}
+
+    def on_trace(a, j, start, end, margins, states):
+        for position, margin in zip(range(start, end), margins, strict=True):
+            traced[a, position] = float(margin)
+
+    StageExecutor(
+        run.torch, run.arena, run.pipeline,
+        [Stage(suffixes=partners, readout=readout, frame=frame)],
+        anchors, 60, anchor_keys=[("a", a) for a in range(len(anchors))],
+        attention_mode="tree", prefix_tree=run.tree(anchors),
+        on_trace=on_trace).run()
+    assert traced == {
+        (a, p): float(answers[chain(anchor + frame + partner)])
+        for a, anchor in enumerate(anchors) for p, partner in enumerate(partners)}

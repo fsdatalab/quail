@@ -41,6 +41,15 @@ class ReadoutGroups:
             values[key] = self.readout_of[key].result(handle)
         return values
 
+    def traced(self, handles) -> list:
+        """Per group, a traced readout's (margins, states), or None."""
+        values = [None] * len(self.readout_of)
+        for key, handle in handles:
+            traced = getattr(self.readout_of[key], "traced", None)
+            if traced is not None:
+                values[key] = traced(handle)
+        return values
+
     def _select_rows(self, normed, spans_j):
         index = np.concatenate([np.arange(start, end, dtype=np.int64)
                                 for start, end in spans_j])

@@ -100,6 +100,11 @@ class FilterOperator(SingleNodeOperator):
     def settle(self, document, survived, row):
         self.finished.append((document, survived, bool(row[0]) if len(row) else None))
 
+    def traced_ids(self, document, stage, start, end):
+        """Return the node id, document ids, and partner ids of traced answers."""
+        count = end - start
+        return (self.node.node_id, [int(self.ids[document])] * count, [-1] * count)
+
     def take_finished(self):
         """Report the settled documents to the answer sink; return the passed.
 

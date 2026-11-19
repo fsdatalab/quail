@@ -58,6 +58,12 @@ class AsyncAnswers:
 
     submit() returns an event and pinned host buffer; result() waits on
     the event and reads the answers without stalling the GPU stream.
+
+    Args:
+        torch: The torch module.
+        rows: The AnswerRows the answers are read against.
+        trace: Whether submit() also copies each row's TRUE minus FALSE
+            logit and its fp16 state, for traced().
     """
 
     dtype = None    # answers arrive as Python lists of bits
@@ -65,9 +71,10 @@ class AsyncAnswers:
     trailing_rows = 1
     normalize = False
 
-    def __init__(self, torch, rows):
+    def __init__(self, torch, rows, trace=False):
         self.torch = torch
         self.rows = rows
+        self.trace = trace
 
     def submit(self, normed):
         torch = self.torch
@@ -76,15 +83,33 @@ class AsyncAnswers:
         host = torch.empty(bits.shape[0], dtype=torch.uint8,
                            pin_memory=True)
         host.copy_(bits, non_blocking=True)
+        traced = ()
+        if self.trace:
+            margins = torch.empty(bits.shape[0], dtype=torch.float32,
+                                  pin_memory=True)
+            margins.copy_((t - f).float(), non_blocking=True)
+            states = torch.empty(normed.shape, dtype=torch.float16,
+                                 pin_memory=True)
+            states.copy_(normed.to(torch.float16), non_blocking=True)
+            traced = (margins, states)
         event = torch.cuda.Event()
         event.record()
-        return event, host
+        return (event, host, *traced)
 
     @staticmethod
     def result(handle):
-        event, host = handle
+        event, host = handle[:2]
         event.synchronize()
         return [int(b) for b in host.tolist()]
+
+    @staticmethod
+    def traced(handle):
+        """Return a traced submission's (margins, states), or None."""
+        if len(handle) < 4:
+            return None
+        event, _, margins, states = handle
+        event.synchronize()
+        return margins.numpy(), states.numpy()
 
 
 def answer_rows(rows_per_answer) -> tuple[np.ndarray, np.ndarray]:

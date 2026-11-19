@@ -272,6 +272,7 @@ class PendingAnswers:
     groups: list
     handles: list
     values: list | None = None
+    traced: list | None = None
     positions: np.ndarray | None = None
     at: int = 0
     step: int = 0

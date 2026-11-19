@@ -29,6 +29,7 @@ import quail_b as benchmark
 from bench import substrait
 from bench.results import write_json
 from quail.api.prompts import bind_classify_prompt, bind_extract_prompt
+from quail.backends.quail.executor.answer_trace import answer_trace_dir
 from quail.execution.result import answer_values
 from quail.physical import (
     AiClassify,
@@ -487,6 +488,22 @@ def kernel_cache_files() -> dict[str, int]:
     }
 
 
+def file_answer_trace(query_id: str) -> None:
+    """Move the answer trace files a query's regions wrote into its folder.
+
+    The GPU workers write each region's trace files at the trace root;
+    queries run one at a time, so the files there are this query's.
+    """
+    root = answer_trace_dir()
+    if root is None or not root.is_dir():
+        return
+    folder = root / query_id
+    folder.mkdir(exist_ok=True)
+    for path in root.iterdir():
+        if path.is_file():
+            path.rename(folder / path.name)
+
+
 def run_query(session, spec: QuerySpec, tables) -> RunOutput:
     """Execute one query and return benchmark ids, answers, and measurements."""
     cache_before = kernel_cache_files()     # before the timed window
@@ -499,6 +516,7 @@ def run_query(session, spec: QuerySpec, tables) -> RunOutput:
     query = _build(session, info)
     frontend_s = time.perf_counter() - submitted
     result = query.run()
+    file_answer_trace(spec.id)
     answer_started = time.perf_counter()
     output = run_output(result, info, tables)
     answer_prepare_s = time.perf_counter() - answer_started
