@@ -216,6 +216,7 @@ class PiecewiseGraphs:
         self.growth_bytes = 0
         self.token_bytes = 0.0
         self.pool = None
+        self.stream = None
 
     @classmethod
     def for_specs(cls, pipeline, model, device):
@@ -231,6 +232,7 @@ class PiecewiseGraphs:
         self.graphs.clear()
         self.storage = None
         self.pool = None
+        self.stream = None
 
     def prepare(self):
         """Build every bucket's buffers and capture the largest bucket.
@@ -255,6 +257,7 @@ class PiecewiseGraphs:
         self.capture_s = 0.0
         before = torch.cuda.memory_allocated()
         self.pool = torch.cuda.graph_pool_handle()
+        self.stream = torch.cuda.Stream()
         storage = None
         for num_tokens in reversed(self.token_buckets):
             buffers = PiecewiseBuffers(self.pipeline, num_tokens, storage=storage)
@@ -307,7 +310,9 @@ class PiecewiseGraphs:
         torch = engine.torch
         buffers = captured.buffers
         started = time.perf_counter()
-        stream = torch.cuda.Stream()
+        # The allocator reuses a pool's freed blocks only on the stream
+        # that freed them, so every capture shares one stream.
+        stream = self.stream
         current = torch.cuda.current_stream()
         stream.wait_stream(current)
         try:
