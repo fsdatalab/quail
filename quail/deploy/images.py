@@ -31,6 +31,8 @@ CACHE_ENV = {
     "DG_JIT_CACHE_DIR": "/root/.cache/kernels/deep_gemm",
     "TRITON_CACHE_DIR": "/root/.cache/kernels/triton",
     "TORCHINDUCTOR_CACHE_DIR": "/root/.cache/kernels/torchinductor",
+    "CUDA_CACHE_PATH": "/root/.cache/kernels/cuda",
+    "CUDA_CACHE_MAXSIZE": "4294967296",
     # FlashAttention 4 (heads wider than 256) keeps compiled kernels in
     # memory only unless its disk cache is on
     "FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED": "1",

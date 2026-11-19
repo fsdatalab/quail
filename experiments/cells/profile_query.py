@@ -41,6 +41,7 @@ from bench.quailb_parallel import (
     results_vol,
 )
 from quail.deploy.images import gpu_image
+from quail.specs import modal_gpu_type
 
 PROFILE_DIR = "/results/ablations/profiles"
 # Perfetto traces, served by experiments/cells/trace_server.py
@@ -53,12 +54,13 @@ TRACE_WINDOW_S = 5.0
 ALLOCATOR_COUNTS = ("num_alloc_retries", "num_sync_all_streams",
                     "num_device_alloc", "num_device_free")
 NODE_FIELDS = ("wall_s", "gpu_s", "chunks", "pack_s", "fresh_tokens",
-               "suffix_tokens")
+               "suffix_tokens", "admission_s", "pass_sol_s", "pass_passes",
+               "pass_decode_rows", "pass_prefill_tokens")
 BEFORE_REMOTE = "/root/before"
 BEFORE_LOCAL = os.environ.get("QUAIL_BEFORE_SOURCE", "")
 image = gpu_image(*([(BEFORE_LOCAL, BEFORE_REMOTE)]
                     if modal.is_local() and BEFORE_LOCAL else []))
-image = image.add_local_python_source("experiments.cells.piecewise_probe")
+image = image.add_local_python_source("experiments")
 
 
 def _answer_rows(output) -> dict:
@@ -466,7 +468,7 @@ class Sampler:
         leaf, inclusive, total = {}, {}, 0.0
         for stack, count in self.stacks.items():
             inside = [index for index, frame in enumerate(stack)
-                      if frame.startswith("run (profile_query.py")]
+                      if frame.startswith(("run (", "serve_region ("))]
             if not inside:
                 continue
             frames = stack[inside[0] + 1:]
@@ -565,20 +567,223 @@ def _watch_compiles(window):
     delta_rule_sm90.cached_compile = cached_compile
 
 
-def child(arguments: str) -> None:
-    """Run one query several times in a fresh session; print a RESULT line per run.
+_WORKER_INSTALLED = False
 
-    Args:
-        arguments: JSON of query_id, sf, collection_id, model, modes
-            (one per run: plain, cprofile, sample, trace, or timeline),
-            top, and stats_prefix.
-    """
+
+def _describe_loaded_gpu(gpu) -> dict:
+    """Return weight memory and module types of a loaded GPU pipeline."""
+    import inspect
+
+    pipeline = gpu.pipeline
+    info = {"weights_bytes": gpu.weights_bytes, "pool_bytes": gpu.pool_bytes}
+    attn_layer = getattr(pipeline, "attention_layer", None)
+    gdn_layer = getattr(pipeline, "gdn_layer", None)
+    if attn_layer is not None:
+        attn = attn_layer.self_attn
+        mlp = attn_layer.mlp
+        info["attn"] = {
+            "qkv_quant": type(attn.qkv_proj.quant_method).__name__,
+            "o_quant": type(attn.o_proj.quant_method).__name__,
+            "q_norm": type(attn.q_norm).__name__,
+            "rotary": type(attn.rotary_emb).__name__,
+            "rotary_dim": getattr(attn.rotary_emb, "rotary_dim", None),
+            "mlp_gate_up_quant": type(mlp.gate_up_proj.quant_method).__name__,
+            "mlp_down_quant": type(mlp.down_proj.quant_method).__name__,
+            "mlp_act": type(mlp.act_fn).__name__,
+            "input_norm": type(attn_layer.input_layernorm).__name__,
+            "qkv_apply_src": inspect.getsource(attn.qkv_proj.quant_method.apply),
+            "mlp_apply_src": inspect.getsource(mlp.gate_up_proj.quant_method.apply),
+        }
+        for label, module in (("qkv_proj", attn.qkv_proj),
+                              ("gate_up_proj", mlp.gate_up_proj),
+                              ("down_proj", mlp.down_proj)):
+            info[label] = {
+                key: (list(val.shape), str(val.dtype))
+                for key, val in module.named_parameters(recurse=False)
+            } | {
+                key: (list(val.shape), str(val.dtype))
+                for key, val in module.named_buffers(recurse=False)
+            }
+    if gdn_layer is not None:
+        mixer = gdn_layer.linear_attn
+        info["gdn"] = {
+            "in_qkvz_quant": type(mixer.in_proj_qkvz.quant_method).__name__,
+            "in_ba_quant": type(mixer.in_proj_ba.quant_method).__name__,
+            "out_quant": type(mixer.out_proj.quant_method).__name__,
+            "norm": type(mixer.norm).__name__,
+            "norm_src": inspect.getsource(type(mixer.norm).forward),
+        }
+    try:
+        from vllm import _custom_ops as ops
+        info["vllm_ops"] = [
+            name for name in dir(ops)
+            if any(tag in name.lower() for tag in ("fp4", "fp8", "norm", "silu", "gdn"))
+        ]
+    except Exception:
+        pass
+    try:
+        import flashinfer
+        tags = ("fp4", "fp8", "norm", "silu", "gdn", "mm")
+        info["flashinfer_ops"] = [
+            name for name in dir(flashinfer)
+            if any(tag in name.lower() for tag in tags)
+        ]
+    except Exception:
+        pass
+    return info
+
+
+def register_quail_extension(registry) -> None:
+    """Install profiling hooks inside the GPU worker process when active."""
+    del registry
+    global _WORKER_INSTALLED
+    command_path = os.environ.get("QUAIL_PROFILE_CMD")
+    output_path = os.environ.get("QUAIL_PROFILE_OUT")
+    if _WORKER_INSTALLED or not command_path or not output_path:
+        return
+    _WORKER_INSTALLED = True
     import cProfile
     import io
     import pstats
 
-    import quail
     import quail.backends.quail.graph as graph_module
+    from experiments.cells.piecewise_probe import PiecewiseProbe
+    from quail.backends.quail.executor import cuda_graphs, stage_executor
+
+    _apply_overrides(os.environ.get("QUAIL_OVERRIDES", ""))
+    window = {}
+    _watch_compiles(window)
+    probe = PiecewiseProbe()
+    _trace_calls(stage_executor, "forward_chunk", window)
+    boundary = next((name for name in ("mixer", "attention")
+                     if hasattr(getattr(cuda_graphs, "PiecewiseBuffers", None), name)),
+                    None)
+    if boundary is not None:
+        _trace_calls(cuda_graphs.PiecewiseBuffers, boundary, window)
+    original_serve_stages = graph_module.serve_stages
+    original_stage_run = stage_executor.StageExecutor.run
+
+    def tracked_stage_run(self):
+        try:
+            return original_stage_run(self)
+        finally:
+            if "stage_work" in window:
+                window["stage_work"].append({
+                    "label": self.label,
+                    "pack_s": round(self.pack_s, 4),
+                    "admission_s": round(self.admission_s, 4),
+                    **dict(self.pass_work),
+                })
+
+    stage_executor.StageExecutor.run = tracked_stage_run
+
+    def profiled_serve_stages(end, context, subgraph, stages, wanted,
+                              hinted=None, first_rows=None):
+        if not Path(command_path).is_file():
+            return original_serve_stages(
+                end, context, subgraph, stages, wanted, hinted, first_rows)
+        spec = json.loads(Path(command_path).read_text())
+        mode = spec["mode"]
+        run = spec["run"]
+        top = spec["top"]
+        stats_prefix = spec["stats_prefix"]
+        query_id = spec["query_id"]
+        import torch
+
+        profiler = cProfile.Profile() if mode == "cprofile" else None
+        window["profiler"] = profiler
+        window["trace"] = None
+        window["timeline"] = None
+        window["sampler"] = Sampler() if mode == "sample" else None
+        if mode == "timeline":
+            if "recorder" not in window:
+                window["recorder"] = Timeline(torch)
+            window["timeline"] = window["recorder"]
+        if mode == "trace":
+            window["trace"] = torch.profiler.profile(activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA])
+        probe.start(verify=mode == "verify", eager=mode == "eager",
+                    work=mode == "work")
+        window["compiles"] = []
+        window["stage_work"] = []
+        window["start"] = time.perf_counter()
+        if window["sampler"] is not None:
+            window["sampler"].start()
+        before = torch.cuda.memory_stats()
+        free_before = torch.cuda.mem_get_info()[0]
+        if window["timeline"] is not None:
+            window["timeline"].start()
+        if window["trace"] is not None:
+            window["trace"].__enter__()
+        if profiler is not None:
+            profiler.enable()
+        try:
+            return original_serve_stages(
+                end, context, subgraph, stages, wanted, hinted, first_rows)
+        finally:
+            torch.cuda.synchronize()
+            piecewise = probe.summary()
+            if profiler is not None:
+                profiler.disable()
+            if window["trace"] is not None:
+                window["trace"].__exit__(None, None, None)
+            if window["timeline"] is not None:
+                window["timeline"].stop()
+            if window["sampler"] is not None:
+                window["sampler"].stop()
+            window.pop("start", None)
+            after = torch.cuda.memory_stats()
+            allocator = {
+                name: after.get(name, 0) - before.get(name, 0)
+                for name in ALLOCATOR_COUNTS}
+            allocator["free_gib_before"] = round(free_before / 2**30, 2)
+            allocator["reserved_gib_before"] = round(
+                before.get("reserved_bytes.all.current", 0) / 2**30, 2)
+            out = {
+                "allocator": allocator,
+                "piecewise": piecewise,
+                "compiles": window["compiles"],
+                "stage_work": window.pop("stage_work", []),
+            }
+            if run == 0:
+                out["loaded_gpu"] = _describe_loaded_gpu(context.state["gpu"])
+            if window["trace"] is not None:
+                out["gpu_window"] = _gpu_gaps(window["trace"], top)
+                prefix = Path(stats_prefix).name
+                out["perfetto"] = _save_trace(
+                    window["trace"], Path(TRACE_DIR) / f"{prefix}-run{run}.json.gz")
+            if window["timeline"] is not None:
+                out["timeline"] = window["timeline"].summary(top)
+            if window["sampler"] is not None:
+                out["samples"] = window["sampler"].summary(top)
+            if profiler is not None:
+                path = f"{stats_prefix}-run{run}.prof"
+                profiler.dump_stats(path)
+                text = io.StringIO()
+                stats = pstats.Stats(profiler, stream=text)
+                for order in ("tottime", "cumulative"):
+                    text.write(f"\n== {query_id} run {run}: top {top} by {order}"
+                               f" (stats at {path})\n")
+                    stats.sort_stats(order).print_stats(top)
+                out["cprofile_text"] = text.getvalue()
+            with open(output_path, "a") as handle:
+                handle.write(json.dumps(out, default=str) + "\n")
+
+    graph_module.serve_stages = profiled_serve_stages
+
+
+def child(arguments: str) -> None:
+    """Run one query several times in a fresh session; print a RESULT line per run.
+
+    Args:
+        arguments: JSON of query_id, scale_factor, collection_id, model,
+            device, modes (one per run: plain, cprofile, sample, trace,
+            or timeline), top, and stats_prefix.
+    """
+    import tempfile
+
+    import quail
     from bench.quailb import run_query
     from quail_b.benchmark import load_benchmark
     from quail_b.scoring import evaluate
@@ -589,63 +794,8 @@ def child(arguments: str) -> None:
         _eager_vllm()
     query_id, scale_factor = args["query_id"], args["scale_factor"]
     modes, top = args["modes"], args["top"]
+    device = args.get("device", "h100-sxm")
     print(f"quail from {quail.__file__}", flush=True)
-    window = {}
-    _watch_compiles(window)
-    from experiments.cells.piecewise_probe import PiecewiseProbe
-    probe = PiecewiseProbe()
-    from quail.backends.quail.executor import cuda_graphs, stage_executor
-    _trace_calls(stage_executor, "forward_chunk", window)
-    # the eager boundary between pieces; "attention" before token mixers
-    boundary = next((name for name in ("mixer", "attention")
-                     if hasattr(getattr(cuda_graphs, "PiecewiseBuffers", None), name)),
-                    None)
-    if boundary is not None:
-        _trace_calls(cuda_graphs.PiecewiseBuffers, boundary, window)
-
-    class ProfiledRunner(graph_module.GenericRunner):
-        def run(self, *args, **kwargs):
-            profiler = window.get("profiler")
-            traced = window.get("trace")
-            timeline = window.get("timeline")
-            sampler = window.get("sampler")
-            probe.start(verify=window.get("verify", False),
-                        eager=window.get("eager", False),
-                        work=window.get("work", False))
-            if sampler is not None:
-                sampler.start()
-            import torch
-            before = torch.cuda.memory_stats()
-            free_before = torch.cuda.mem_get_info()[0]
-            if timeline is not None:
-                timeline.start()
-            if traced is not None:
-                traced.__enter__()
-            if profiler is not None:
-                profiler.enable()
-            try:
-                return super().run(*args, **kwargs)
-            finally:
-                window["piecewise"] = probe.summary()
-                if profiler is not None:
-                    profiler.disable()
-                if traced is not None:
-                    torch.cuda.synchronize()
-                    traced.__exit__(None, None, None)
-                if timeline is not None:
-                    timeline.stop()
-                if sampler is not None:
-                    sampler.stop()
-                after = torch.cuda.memory_stats()
-                window["allocator"] = {
-                    name: after.get(name, 0) - before.get(name, 0)
-                    for name in ALLOCATOR_COUNTS}
-                window["allocator"]["free_gib_before"] = round(
-                    free_before / 2**30, 2)
-                window["allocator"]["reserved_gib_before"] = round(
-                    before.get("reserved_bytes.all.current", 0) / 2**30, 2)
-
-    graph_module.GenericRunner = ProfiledRunner
     suite = load_benchmark([query_id], scale_factor=scale_factor,
                            data_dir=Path(DATA_DIR) / f"sf{scale_factor}",
                            collection_id=args["collection_id"] or None)
@@ -654,90 +804,80 @@ def child(arguments: str) -> None:
     tables = {relation.table: (suite.tables[relation.table].slice(0, sample_rows)
                               if sample_rows else suite.tables[relation.table])
               for relation in spec.info.relations}
-    config = quail.EngineConfig(gpus=1, model=args["model"],
-                                backend=args.get("backend", "quail"),
-                                device="h100-sxm", gpu_timing=True)
-    with quail.Session(config) as session:
-        for run, mode in enumerate(modes):
-            profiler = cProfile.Profile() if mode == "cprofile" else None
-            window["profiler"] = profiler
-            window["trace"] = None
-            window["timeline"] = None
-            window["sampler"] = Sampler() if mode == "sample" else None
-            if mode == "timeline":
-                import torch
-                if "recorder" not in window:
-                    window["recorder"] = Timeline(torch)
-                window["timeline"] = window["recorder"]
-            if mode == "trace":
-                import torch
-                window["trace"] = torch.profiler.profile(activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                    torch.profiler.ProfilerActivity.CUDA])
-            window["verify"] = mode == "verify"
-            window["eager"] = mode == "eager"
-            window["work"] = mode == "work"
-            window["compiles"] = []
-            window["start"] = time.perf_counter()
-            output = run_query(session, spec, tables)
-            del window["start"]
-            answer_rows = _answer_rows(output)
-            answers_path = f"{args['stats_prefix']}-run{run}-answers.json"
-            Path(answers_path).write_text(json.dumps(answer_rows))
-            piecewise = window.get("piecewise")
-            measures = output.measurements
-            input_tokens = measures.get("input_tokens")
-            wall_s = measures.get("wall_s")
-            nodes = {key: {name: value[name] for name in NODE_FIELDS
-                           if name in value}
-                     for key, value in measures["node_metrics"].items()}
-            record = {
-                "query": query_id, "run": run, "mode": mode,
-                "backend": config.backend,
-                "input_tokens": input_tokens,
-                "input_tokens_per_second": (
-                    input_tokens / wall_s
-                    if input_tokens is not None and wall_s else None),
-                "cost_usd": (wall_s / 3600 * config.gpus
-                             * session.device.usd_per_hour
-                             if wall_s is not None else None),
-                "sample_rows": sample_rows,
-                "input_rows": {name: len(table) for name, table in tables.items()},
-                "quail": quail.__file__,
-                "digest": _digest(answer_rows),
-                "answers_path": answers_path,
-                **{name: measures.get(name) for name in (
-                    "wall_s", "model_wall_s", "gpu_s", "chunks", "frontend_s",
-                    "planning_s", "input_ready_s", "physical_prepare_s",
-                    "finish_s", "answer_prepare_s", "collection_s",
-                    "fresh_tokens", "coordinator_wall_s", "worker_total_s",
-                    "kernel_cache_files")},
-                "nodes": nodes,
-                "allocator": window.get("allocator"),
-                "piecewise": piecewise,
-                "compiles": window["compiles"],
-                "accuracy": evaluate(spec, output, suite.ground_truth, tables),
-            }
-            if window["trace"] is not None:
-                record["gpu_window"] = _gpu_gaps(window["trace"], top)
-                prefix = Path(args["stats_prefix"]).name
-                record["perfetto"] = _save_trace(
-                    window["trace"], Path(TRACE_DIR) / f"{prefix}-run{run}.json.gz")
-            if window["timeline"] is not None:
-                record["timeline"] = window["timeline"].summary(top)
-            if window["sampler"] is not None:
-                record["samples"] = window["sampler"].summary(top)
-            print("RESULT " + json.dumps(record, default=str), flush=True)
-            if profiler is not None:
-                path = f"{args['stats_prefix']}-run{run}.prof"
-                profiler.dump_stats(path)
-                text = io.StringIO()
-                stats = pstats.Stats(profiler, stream=text)
-                for order in ("tottime", "cumulative"):
-                    text.write(f"\n== {query_id} run {run}: top {top} by {order}"
-                               f" (stats at {path})\n")
-                    stats.sort_stats(order).print_stats(top)
-                print(text.getvalue(), flush=True)
+    with tempfile.TemporaryDirectory() as ipc_dir:
+        command_path = Path(ipc_dir) / "command.json"
+        output_path = Path(ipc_dir) / "output.jsonl"
+        (Path(ipc_dir) / "sitecustomize.py").write_text(
+            "from experiments.cells import profile_query\n"
+            "profile_query.register_quail_extension(None)\n"
+        )
+        os.environ["QUAIL_PROFILE_CMD"] = str(command_path)
+        os.environ["QUAIL_PROFILE_OUT"] = str(output_path)
+        os.environ["PYTHONPATH"] = (
+            f"{ipc_dir}:" + os.environ.get("PYTHONPATH", "")
+        )
+        config = quail.EngineConfig(gpus=1, model=args["model"],
+                                    backend=args.get("backend", "quail"),
+                                    device=device, gpu_timing=True)
+        with quail.Session(config) as session:
+            for run, mode in enumerate(modes):
+                output_path.unlink(missing_ok=True)
+                command_path.write_text(json.dumps({
+                    "run": run, "mode": mode, "top": top,
+                    "stats_prefix": args["stats_prefix"], "query_id": query_id,
+                }))
+                output = run_query(session, spec, tables)
+                worker_records = ([json.loads(line)
+                                   for line in output_path.read_text().splitlines()
+                                   if line.strip()]
+                                  if output_path.is_file() else [])
+                worker = worker_records[-1] if worker_records else {}
+                answer_rows = _answer_rows(output)
+                answers_path = f"{args['stats_prefix']}-run{run}-answers.json"
+                Path(answers_path).write_text(json.dumps(answer_rows))
+                measures = output.measurements
+                input_tokens = measures.get("input_tokens")
+                wall_s = measures.get("wall_s")
+                nodes = {key: {name: value[name] for name in NODE_FIELDS
+                               if name in value}
+                         for key, value in measures["node_metrics"].items()}
+                record = {
+                    "query": query_id, "run": run, "mode": mode,
+                    "backend": config.backend, "device": device,
+                    "input_tokens": input_tokens,
+                    "input_tokens_per_second": (
+                        input_tokens / wall_s
+                        if input_tokens is not None and wall_s else None),
+                    "cost_usd": (wall_s / 3600 * config.gpus
+                                 * session.device.usd_per_hour
+                                 if wall_s is not None else None),
+                    "sample_rows": sample_rows,
+                    "input_rows": {name: len(table) for name, table in tables.items()},
+                    "quail": quail.__file__,
+                    "digest": _digest(answer_rows),
+                    "answers_path": answers_path,
+                    **{name: measures.get(name) for name in (
+                        "wall_s", "model_wall_s", "gpu_s", "chunks", "frontend_s",
+                        "planning_s", "input_ready_s", "physical_prepare_s",
+                        "finish_s", "answer_prepare_s", "collection_s",
+                        "fresh_tokens", "coordinator_wall_s", "worker_total_s",
+                        "kernel_cache_files")},
+                    "nodes": nodes,
+                    "allocator": worker.get("allocator"),
+                    "piecewise": worker.get("piecewise"),
+                    "compiles": worker.get("compiles", []),
+                    "accuracy": evaluate(spec, output, suite.ground_truth, tables),
+                }
+                for extra_key in ("loaded_gpu", "gpu_window", "perfetto",
+                                  "timeline", "samples", "stage_work"):
+                    if extra_key in worker:
+                        record[extra_key] = worker[extra_key]
+                if len(worker_records) > 1:
+                    record["regions"] = len(worker_records)
+                print("RESULT " + json.dumps(record, default=str), flush=True)
+                for region_record in worker_records:
+                    if "cprofile_text" in region_record:
+                        print(region_record["cprofile_text"], flush=True)
 
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=6 * 3600,
@@ -745,7 +885,7 @@ def child(arguments: str) -> None:
 def profile_query(query_ids: list[str], scale_factor: float, collection_id: str,
                   model: str, modes: list[str], top: int, repeats: int,
                   tag: str, env: str = "", sample_rows: int = 0,
-                  backend: str = "quail") -> str:
+                  backend: str = "quail", device: str = "h100-sxm") -> str:
     """Profile each query in fresh processes and return its RESULT lines.
 
     Args:
@@ -760,6 +900,7 @@ def profile_query(query_ids: list[str], scale_factor: float, collection_id: str,
         env: Comma-separated KEY=VALUE variables for child processes.
         sample_rows: Keep the first rows of each input table; zero keeps all rows.
         backend: Engine backend, such as quail or stock_vllm.
+        device: Registered device name. Defaults to ``h100-sxm``.
 
     Returns:
         Collected RESULT lines from all query processes.
@@ -789,6 +930,7 @@ def profile_query(query_ids: list[str], scale_factor: float, collection_id: str,
                         scale_factor=scale_factor,
                         collection_id=collection_id,
                         model=model,
+                        device=device,
                         backend=backend,
                         modes=modes,
                         top=top,
@@ -797,7 +939,7 @@ def profile_query(query_ids: list[str], scale_factor: float, collection_id: str,
                     )
                 )
                 command = [sys.executable, "-c",
-                           "import sys, profile_query; "
+                           "import sys; from experiments.cells import profile_query; "
                            "profile_query.child(sys.argv[1])", arguments]
                 child_env = {**os.environ,
                        **dict(item.split("=", 1) for item in env_items), **extra,
@@ -827,18 +969,19 @@ def profile_query(query_ids: list[str], scale_factor: float, collection_id: str,
 
 @app.local_entrypoint()
 def profile(queries: str = "BIO-5,FEV-11", scale_factor: float = 0.1,
-            model: str = "qwen3-4b-fp8", modes: str = "plain,cprofile",
-            top: int = 30, repeats: int = 1, tag: str = "window",
-            env: str = "", sample_rows: int = 0, backend: str = "quail"):
+            model: str = "qwen3-4b-fp8", device: str = "h100-sxm",
+            modes: str = "plain,cprofile", top: int = 30, repeats: int = 1,
+            tag: str = "window", env: str = "", sample_rows: int = 0,
+            backend: str = "quail"):
     if sample_rows < 0:
         raise ValueError("sample_rows must be nonnegative")
     query_ids = [query.strip() for query in queries.split(",") if query.strip()]
     data = ensure_data.spawn(scale_factor, query_ids, "")
     print(f"function call id: {data.object_id} (data)", flush=True)
     collection = data.get()
-    call = profile_query.spawn(query_ids, scale_factor, collection, model,
-                               modes.split(","), top, repeats, tag, env, sample_rows,
-                               backend)
+    call = profile_query.with_options(gpu=modal_gpu_type(device)).spawn(
+        query_ids, scale_factor, collection, model, modes.split(","), top,
+        repeats, tag, env, sample_rows, backend, device)
     print(f"function call id: {call.object_id} (profile {queries})", flush=True)
     for line in call.get().splitlines():
         print("SUMMARY " + line, flush=True)

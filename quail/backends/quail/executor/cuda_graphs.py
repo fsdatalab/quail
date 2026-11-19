@@ -8,7 +8,6 @@ the same ops.
 
 import time
 from dataclasses import dataclass
-from functools import partial
 
 from quail.common.budgets import graph_memory_bytes, graph_token_buckets
 from quail.progress import logger
@@ -32,6 +31,8 @@ class KVWriteBuffers:
     def __init__(self, torch, num_tokens, page_tokens, *, device, storage=None):
         self.meta = {}
         self.has_tails = False
+        self._state = (storage._state if storage is not None
+                       else {"src": 0, "dst": 0, "tail_src": 0, "tail_dst": 0})
         for name in ("src", "dst", "tail_src", "tail_dst"):
             count = num_tokens * (page_tokens if name.startswith("tail_") else 1)
             if storage is not None:
@@ -48,14 +49,21 @@ class KVWriteBuffers:
             for name, target in self.meta.items())
 
     def copy(self, writes):
-        """Stage mappings and mask unused fresh and partial-page destinations."""
+        """Stage mappings and mask only previously written unused entries."""
         self.has_tails = (writes is not None and writes["tail_src"] is not None
                           and writes["tail_src"].numel() > 0)
         for name, target in self.meta.items():
-            target.fill_(-1 if name.endswith("dst") else 0)
+            if (name.startswith("tail_") and not self.has_tails
+                    and not self._state[name]):
+                continue
             source = writes[name] if writes is not None else None
-            if source is not None:
-                target[:source.numel()].copy_(source)
+            count = 0 if source is None else source.numel()
+            previous = min(self._state[name], target.numel())
+            if count:
+                target[:count].copy_(source)
+            if previous > count:
+                target[count:previous].fill_(-1 if name.endswith("dst") else 0)
+            self._state[name] = count
 
 
 class PiecewiseBuffers:
@@ -188,6 +196,11 @@ class CapturedPieces:
                 chunk.meta["kv_written"] = previous
 
 
+_PRECAPTURE_BUCKETS = (4096, 2048, 1024, 512, 256, 192, 128, 64, 16)
+_TILE_ROUND_MAX_TOKENS = 256
+_TILE_ROUND_STEP = 64
+
+
 class PiecewiseGraphs:
     """Capture and replay the pieces of a model pipeline on the current stream.
 
@@ -274,24 +287,33 @@ class PiecewiseGraphs:
                 f"exceeding their {self.memory_bytes}-byte reserve")
         self.token_bytes = ((self.captured_bytes - self.buffer_bytes)
                             / self.token_buckets[-1])
-        self.growth_bytes = (self.memory_bytes - self.captured_bytes) // 4
+        self.growth_bytes = (self.memory_bytes - self.captured_bytes) // 8
+        by_tokens = {item.buffers.num_tokens: item for item in self.graphs}
+        for size in _PRECAPTURE_BUCKETS:
+            target = by_tokens.get(size)
+            if target is not None and target.graphs is None:
+                if not self.capture_within_reserve(target):
+                    break
         return True
 
-    def capture_within_reserve(self, captured):
-        """Capture a smaller bucket if the pool has room for its growth.
+    def capture_within_reserve(self, captured, *, copy_tail=False):
+        """Capture a smaller bucket or tail variant if the pool has room.
 
         A bucket grows the pool by its tokens' share of the largest
         bucket's blocks, plus a fixed part: the largest such part seen,
-        and at first a quarter of the room the largest bucket left.
+        and at first an eighth of the room the largest bucket left.
 
         Returns:
-            Whether the bucket now has graphs.
+            Whether the requested graphs are now captured.
         """
         scaled = captured.buffers.num_tokens * self.token_bytes
         if self.captured_bytes + scaled + self.growth_bytes > self.memory_bytes:
             return False
         before = self.captured_bytes
-        self.capture(captured)
+        if copy_tail:
+            self.capture(captured, copy_tail=True)
+        else:
+            self.capture(captured)
         self.growth_bytes = max(self.growth_bytes,
                                 self.captured_bytes - before - scaled)
         if self.captured_bytes > self.memory_bytes:
@@ -300,11 +322,13 @@ class PiecewiseGraphs:
                            self.captured_bytes / 2**20, self.memory_bytes / 2**20)
         return True
 
-    def capture(self, captured):
-        """Capture one bucket's pieces, both tail-copy variants, into the pool.
+    def capture(self, captured, *, copy_tail=False):
+        """Capture one bucket's pieces into the shared pool.
 
         Each piece runs once eagerly before its capture, so the KV write
-        mappings are masked first; they may still hold a real pass's pages.
+        mappings are masked first; they may still hold a real pass's
+        pages. The partial-page tail variant is captured only when a
+        pass needs it.
         """
         engine = self.pipeline.engine
         torch = engine.torch
@@ -319,22 +343,17 @@ class PiecewiseGraphs:
             buffers.writes.copy(None)
             if buffers.sliding_writes is not None:
                 buffers.sliding_writes.copy(None)
-            with torch.cuda.stream(stream), torch.inference_mode():
-                variants = []
-                for copy_tail in (False, True):
-                    graphs = []
-                    for index in range(len(self.pipeline.layers) + 1):
-                        piece = partial(buffers.piece, self.pipeline, index,
-                                        copy_tail=copy_tail)
-                        with self.pipeline.forward_context(buffers.num_tokens):
-                            piece()
-                            stream.synchronize()
-                            graph = torch.cuda.CUDAGraph()
-                            with torch.cuda.graph(graph, pool=self.pool,
-                                                  stream=stream):
-                                piece()
-                        graphs.append(graph)
-                    variants.append(graphs)
+            num_pieces = len(self.pipeline.layers) + 1
+            with (torch.cuda.stream(stream), torch.inference_mode(),
+                  self.pipeline.forward_context(buffers.num_tokens)):
+                for index in range(num_pieces):
+                    buffers.piece(self.pipeline, index, copy_tail=copy_tail)
+                graphs = []
+                for index in range(num_pieces):
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph, pool=self.pool, stream=stream):
+                        buffers.piece(self.pipeline, index, copy_tail=copy_tail)
+                    graphs.append(graph)
             current.wait_stream(stream)
             stream.synchronize()
             # The pool's segments stay reserved until its graphs die. A
@@ -347,11 +366,15 @@ class PiecewiseGraphs:
         except Exception:
             self.invalidate()
             raise
-        captured.graphs, captured.tail_graphs = variants
+        if copy_tail:
+            captured.tail_graphs = graphs
+        else:
+            captured.graphs = graphs
         seconds = time.perf_counter() - started
         self.capture_s += seconds
-        logger.info("CUDA graphs: captured %d tokens in %.1f s, using "
-                    "%.0f of %.0f MiB", buffers.num_tokens, seconds,
+        logger.info("CUDA graphs: captured %d tokens%s in %.1f s, using "
+                    "%.0f of %.0f MiB", buffers.num_tokens,
+                    " (tails)" if copy_tail else "", seconds,
                     self.captured_bytes / 2**20, self.memory_bytes / 2**20)
 
     def supports(self, chunk):
@@ -365,15 +388,42 @@ class PiecewiseGraphs:
         return next(c.buffers for c in self.graphs
                     if c.buffers.num_tokens >= chunk.tokens).supports(chunk)
 
+    def _select_bucket(self, chunk):
+        """Return the bucket to replay for chunk, reusing a tile-aligned capture."""
+        first = next(c for c in self.graphs
+                     if c.buffers.num_tokens >= chunk.tokens)
+        if first.graphs is not None:
+            return first
+        if len(self.graphs) > 16 and chunk.tokens <= _TILE_ROUND_MAX_TOKENS:
+            ceiling = max(16, ((chunk.tokens + _TILE_ROUND_STEP - 1)
+                               // _TILE_ROUND_STEP) * _TILE_ROUND_STEP)
+            ready = next((c for c in self.graphs
+                          if chunk.tokens <= c.buffers.num_tokens <= ceiling
+                          and c.graphs is not None
+                          and c.buffers.supports(chunk)), None)
+            if ready is not None:
+                return ready
+        return first
+
     def forward(self, chunk):
         """Replay dense pieces or run a larger chunk eagerly."""
         self.passes += 1
         if self.supports(chunk):
-            for captured in self.graphs:
-                if captured.buffers.num_tokens >= chunk.tokens:
-                    if (captured.graphs is None
-                            and not self.capture_within_reserve(captured)):
-                        break
+            captured = self._select_bucket(chunk)
+            if (captured.graphs is not None
+                    or self.capture_within_reserve(captured)):
+                writes = chunk_writes(chunk)
+                needs_tails = (
+                    writes is not None and (
+                        (writes["tail_src"] is not None
+                         and writes["tail_src"].numel() > 0)
+                        or (writes.get("sliding") is not None
+                            and writes["sliding"]["tail_src"] is not None
+                            and writes["sliding"]["tail_src"].numel() > 0)
+                    )
+                )
+                if (not needs_tails or captured.tail_graphs is not None
+                        or self.capture_within_reserve(captured, copy_tail=True)):
                     self.replays += 1
                     return captured.forward(self.pipeline, chunk)
         return self.pipeline.forward_chunk(chunk)

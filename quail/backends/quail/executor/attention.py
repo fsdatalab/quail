@@ -28,6 +28,13 @@ GROUP = 128            # fp8 quant group size, matches the engine
 # FlashAttention 3's widest head; wider heads run FlashAttention 4,
 # whose Hopper build takes heads up to 512, over arena pages.
 FA_MAX_HEAD_DIM = 256
+# A causal paged call of at most TRITON_DECODE_MAX_Q rows per sequence runs
+# vLLM's Triton kernel instead of head-256 FA4. For up to
+# TRITON_GRID_ROWS // KV heads one-token sequences, the kernel splits each
+# sequence's KV over TRITON_SEGMENTS.
+TRITON_DECODE_MAX_Q = 16
+TRITON_GRID_ROWS = 128
+TRITON_SEGMENTS = 16
 
 # The two attention paths a chunk can run. "unified" is one causal
 # paged call in which every row reads the KV its own document needs.
@@ -1010,6 +1017,43 @@ class Engine:
             self._flashinfer_plans[key] = metadata, wrapper, uploaded
         return wrapper.run(q3, (kp, vp), out=output)
 
+    def triton_paged(self, q3, kp, vp, cu_q, max_q, seqused_k, max_seqused_k,
+                      block_table, *, softmax_scale=None, window=None,
+                      output=None):
+        """Causal paged attention for short queries through vLLM's Triton kernel.
+
+        Blackwell's head-256 FA4 kernel splits neither the KV nor the query
+        heads that share a KV head, so it runs one-token rows 3-5x slower.
+        A batch of few sequences splits each one's KV over segments.
+        """
+        from vllm.v1.attention.ops.triton_unified_attention import (
+            unified_attention,
+        )
+
+        torch = self.torch
+        heads, dim = q3.shape[1], q3.shape[2]
+        threshold = TRITON_GRID_ROWS // kp.shape[2]
+        key = (heads, dim)
+        segments = getattr(self, "_triton_segments", {}).get(key)
+        if segments is None:
+            self._triton_segments = getattr(self, "_triton_segments", {})
+            maxima = torch.empty((threshold, heads, TRITON_SEGMENTS),
+                                 dtype=torch.float32, device=q3.device)
+            segments = self._triton_segments[key] = (
+                torch.empty((threshold, heads, TRITON_SEGMENTS, dim),
+                            dtype=torch.float32, device=q3.device),
+                maxima, torch.empty_like(maxima))
+        out = output if output is not None else torch.empty_like(q3)
+        unified_attention(
+            q3, kp, vp, out, cu_q, max_q, seqused_k, max_seqused_k,
+            dim ** -0.5 if softmax_scale is None else softmax_scale, True,
+            (-1, -1) if window is None else tuple(window), block_table, 0.0,
+            None, None, None, seq_threshold_3D=threshold,
+            num_par_softmax_segments=TRITON_SEGMENTS,
+            softmax_segm_output=segments[0], softmax_segm_max=segments[1],
+            softmax_segm_expsum=segments[2])
+        return out
+
     def _paged(self, q3, kp, vp, cu_q, max_q, seqused_k, max_seqused_k, block_table, *,
                causal, softmax_scale=None, window=None, metadata=None, output=None):
         """One paged attention call.
@@ -1021,6 +1065,11 @@ class Engine:
         if self.fa_version == 4 and q3.shape[-1] == 512:
             return self._flashinfer_paged(
                 q3, kp, vp, metadata, causal=causal,
+                softmax_scale=softmax_scale, window=window, output=output)
+        if (self.fa_version == 4 and q3.shape[-1] == 256 and causal
+                and max_q <= TRITON_DECODE_MAX_Q):
+            return self.triton_paged(
+                q3, kp, vp, cu_q, max_q, seqused_k, max_seqused_k, block_table,
                 softmax_scale=softmax_scale, window=window, output=output)
         wide = q3.shape[-1] > FA_MAX_HEAD_DIM
         out, _ = self._fa(
@@ -1170,10 +1219,31 @@ class Engine:
             return out.view(n, -1)
         self.write_kv(k3, v3, meta)
         kp, vp = self.arena.paged_kv(layer)
-        out = self._paged(
-            q3, kp, vp, unified["cu_q"], unified["max_q"], pool["used"],
-            pool["max_used"], pool["table"], causal=True,
-            softmax_scale=softmax_scale, window=behind, metadata=pool, output=output)
+        prefill_seqs = unified.get("prefill_seqs", 0)
+        if (self.fa_version == 4 and q3.shape[-1] == 256 and prefill_seqs
+                and unified["prefill_max_q"] > 16
+                and 0 < unified["decode_max_q"] <= 16):
+            out = output if output is not None else self.torch.empty_like(q3)
+            r0 = unified["decode_row0"]
+            self._paged(
+                q3[:r0], kp, vp, unified["cu_q"][:prefill_seqs + 1],
+                unified["prefill_max_q"], pool["used"][:prefill_seqs],
+                pool["max_used"], pool["table"][:prefill_seqs], causal=True,
+                softmax_scale=softmax_scale, window=behind, output=out[:r0])
+            self._paged(
+                q3[r0:], kp, vp, unified["decode_cu_q"],
+                unified["decode_max_q"],
+                pool.get("decode_used", pool["used"][prefill_seqs:]),
+                pool["max_used"],
+                pool.get("decode_table", pool["table"][prefill_seqs:]),
+                causal=True, softmax_scale=softmax_scale, window=behind,
+                output=out[r0:])
+        else:
+            out = self._paged(
+                q3, kp, vp, unified["cu_q"], unified["max_q"], pool["used"],
+                pool["max_used"], pool["table"], causal=True,
+                softmax_scale=softmax_scale, window=behind, metadata=pool,
+                output=output)
         if canvas is not None:
             q_c = q3.index_select(0, canvas["rows"])
             out_c = self._paged(
