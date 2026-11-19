@@ -476,7 +476,19 @@ class _PoolBuilder:
                 row += len(table)
             table = stage(f"block_table{tag}", block_table, torch.int32).view(
                 len(lengths), width)
+        decode = {}
+        if self.page_rows and self.blocks:
+            # Triton specializes pointers on 16-byte alignment, which a
+            # slice at the first decode row would vary pass to pass
+            first = len(self.page_rows)
+            decode = dict(
+                decode_used=stage(f"unified_decode_lengths{tag}",
+                                  lengths[first:].astype(np.int32), torch.int32),
+                decode_table=stage(f"block_table_decode{tag}",
+                                   block_table[first:], torch.int32).view(
+                    len(lengths) - first, width))
         return dict(
+            **decode,
             src=stage(f"unified_src{tag}", _concatenate(self.src), torch.int64),
             dst=stage(f"unified_dst{tag}", _concatenate(self.dst), torch.int64),
             tail_src=(stage(f"tail_src{tag}", _concatenate(self.tail_src),
@@ -810,7 +822,8 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     keeps=bool(g.get("write_suffix_tokens")),
                     kept=int(g.get("write_suffix_tokens") or 0),
                     borrow_key=g.get("borrow_key"),
-                    share_points=g.get("share_points", ())))
+                    share_points=g.get("share_points", ()),
+                    transient_state=bool(g.get("transient_state"))))
             elif not fresh:
                 raise ValueError(
                     "unified attention requires pages for a kept "
@@ -979,18 +992,33 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     if spec["canvas"]:
                         canvas_seq.append(len(cu_q) - 2)
 
+            prefill_seqs = len(cu_q) - 1
+            prefill_max_q = max((b - a for a, b in zip(cu_q, cu_q[1:])),
+                                default=0)
+            decode_max_q = 0
+            decode_cu_q = None
             if decode is not None:
                 pools[0].add_block(decode, decode_row0)
                 if sliding:
                     pools[1].add_block(arena.sliding_group.decode(decode), decode_row0)
                 cu_q.extend((cu_q[-1] + decode_offsets[1:]).tolist())
+                if prefill_seqs:
+                    decode_max_q = int(np.diff(decode_offsets).max())
+                    decode_cu_q = stage(
+                        "unified_decode_cu_q",
+                        decode_offsets.astype(np.int32), torch.int32)
             built = [pool.build(arena, stage, torch, staging, index)
                      for index, pool in enumerate(pools)]
             unified = dict(
                 built[0],
                 cu_q=stage("unified_cu_q", cu_q, torch.int32),
                 cu_q_host=cu_q,
-                max_q=max(b - a for a, b in zip(cu_q, cu_q[1:])))
+                max_q=max(b - a for a, b in zip(cu_q, cu_q[1:])),
+                prefill_seqs=prefill_seqs if decode is not None else 0,
+                prefill_max_q=prefill_max_q,
+                decode_row0=decode_row0,
+                decode_max_q=decode_max_q,
+                decode_cu_q=decode_cu_q)
             if sliding:
                 unified["sliding"] = built[1]
         except Exception:

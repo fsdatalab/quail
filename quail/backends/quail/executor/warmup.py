@@ -21,7 +21,7 @@ from quail.progress import Progress, logger, quiet
 # Bump when either pass covers a different set of shapes. A bumped
 # version invalidates every marker, so the next boot re-runs the
 # compile pass.
-WARMUP_VERSION = 12
+WARMUP_VERSION = 15
 
 # Triton compiles one copy of a kernel for each class of its integer
 # arguments: equal to 1, a multiple of 16, or neither. Quail's row
@@ -70,30 +70,77 @@ def _warm_convolutions(torch, pipeline, budget):
 
 
 def _warm_recurrent(torch, arena, pipeline):
-    """Compile the recurrent decode kernel on the arena's state rows.
+    """Compile the recurrent decode kernels on the arena's state rows.
 
-    The one sequence names row 0, which the kernel reads as no state,
-    so the launch leaves every checkpoint as it was.
+    The one sequence names state row 0, which holds no checkpoint, so the
+    launch leaves every checkpoint as it was.
     """
-    from quail.backends.quail.executor.gdn import GdnPhase, _recurrent_decode
+    from types import SimpleNamespace
+
+    from quail.backends.quail.executor.gdn import GdnPhase, _decode_conv_kernel
+    from quail.backends.quail.executor.models.qwen3_5_kernels import (
+        copy_slots,
+        gdn_decode_step,
+    )
 
     spec = getattr(pipeline, "spec", None)
     if (getattr(arena, "gdn_state_rows", None) is None
             or not getattr(spec, "gdn_value_heads", 0)):
         return
     device = arena.gdn_state_rows.device
-    q = torch.zeros((1, spec.gdn_key_heads, spec.gdn_key_dim),
-                    dtype=torch.bfloat16, device=device)
-    v = torch.zeros((1, spec.gdn_value_heads, spec.gdn_value_dim),
-                    dtype=torch.bfloat16, device=device)
-    gate = torch.zeros((1, spec.gdn_value_heads), dtype=torch.float32,
-                       device=device)
+    heads, dim = spec.gdn_key_heads, spec.gdn_key_dim
+    value_heads, value_dim = spec.gdn_value_heads, spec.gdn_value_dim
+    conv_out = torch.zeros((1, 2 * heads * dim + value_heads * value_dim),
+                           dtype=torch.bfloat16, device=device)
+    gate = torch.zeros((1, value_heads), dtype=torch.bfloat16, device=device)
+    params = torch.zeros(value_heads, dtype=torch.float32, device=device)
+    row = torch.zeros(1, dtype=torch.int64, device=device)
+    gdn_decode_step(
+        conv_out, gate, gate, params, params, arena.gdn_state_rows[:, 0], row,
+        torch.empty((1, value_heads, value_dim), dtype=torch.bfloat16,
+                    device=device),
+        num_key_heads=heads, scale=dim ** -0.5)
+    copy_slots(arena.gdn_state_rows[:, 0], row, row)
+    copy_slots(arena.conv_state[:, 0], row, row)
     phase = GdnPhase(
         rows=None, lengths=(1,),
         cu_seqlens=torch.tensor([0, 1], dtype=torch.int32, device=device),
-        state_rows=torch.zeros(1, dtype=torch.int64, device=device))
-    _recurrent_decode(arena, phase, 0, q, q, v, gate, gate,
-                      spec.gdn_key_dim ** -0.5)
+        state_rows=row,
+        write_slots_i32=torch.zeros(1, dtype=torch.int32, device=device))
+    for weight, bias, _ in pipeline.convolutions():
+        channels, width = weight.shape
+        scratch = SimpleNamespace(
+            conv_state=weight.new_zeros((1, 1, width - 1, channels)))
+        _decode_conv_kernel(weight.new_zeros((1, channels)), weight, bias,
+                            scratch, phase, 0)
+
+
+def _warm_short_attention(torch, arena, pipeline):
+    """Compile each launch form of the Triton attention that short queries run.
+
+    One-token rows of few sequences, of many sequences, and rows of
+    several tokens each launch a different kernel; each reads one page.
+    """
+    from quail.backends.quail.executor.attention import TRITON_GRID_ROWS
+
+    engine = getattr(pipeline, "engine", None)
+    attn = getattr(getattr(pipeline, "attention_layer", None), "self_attn", None)
+    if (engine is None or attn is None or engine.fa_version != 4
+            or attn.head_dim != 256):
+        return
+    device = arena.conv_state.device if arena.conv_state is not None else "cuda"
+    page = torch.zeros((1, arena.page_tokens, attn.num_kv_heads, attn.head_dim),
+                       dtype=torch.bfloat16, device=device)
+    for seqs, q_len in ((1, 1), (TRITON_GRID_ROWS // attn.num_kv_heads + 1, 1),
+                        (2, 2)):
+        q = torch.zeros((seqs * q_len, attn.num_heads, attn.head_dim),
+                        dtype=torch.bfloat16, device=device)
+        engine.triton_paged(
+            q, page, page,
+            torch.arange(0, seqs * q_len + 1, q_len, dtype=torch.int32,
+                         device=device),
+            q_len, torch.full((seqs,), q_len, dtype=torch.int32, device=device),
+            q_len, torch.zeros((seqs, 1), dtype=torch.int32, device=device))
 
 
 def _warm_run(*args, **kwargs):
@@ -111,6 +158,7 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
     """
     _warm_convolutions(torch, pipeline, budget)
     _warm_recurrent(torch, arena, pipeline)
+    _warm_short_attention(torch, arena, pipeline)
     # a readout of several trailing rows needs a question that long
     trailing = 1 if async_ans is None else async_ans.trailing_rows
     warm_documents, question, document = _warm_inputs(budget, max(16, trailing))

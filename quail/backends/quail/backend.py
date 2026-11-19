@@ -47,11 +47,11 @@ class QuailBackend:
                 f"or auto")
         if (prefill == "flashinfer"
                 and "gated_delta_net" in model.layer_kinds
-                and device.name != "h100-sxm"):
+                and device.name not in ("h100-sxm", "b200")):
             return SupportResult.reject(
-                f"QUAIL_GDN_PREFILL=flashinfer needs a Hopper GPU, and "
-                f"device {device.name!r} is not one; use triton or auto "
-                f"for {model.name!r}")
+                f"QUAIL_GDN_PREFILL=flashinfer needs a Hopper or Blackwell "
+                f"GPU, and device {device.name!r} is neither; use triton or "
+                f"auto for {model.name!r}")
         return SupportResult.accept()
 
     def start(self, context: GpuContext) -> QuailModelExecution:

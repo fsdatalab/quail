@@ -207,7 +207,7 @@ class StageExecutor:
                  stop_groups=None, skip=None, appended_tokens=None,
                  gpu_timing=False, survival=None, decoder=None, dependencies=None,
                  knee_rows=0, decode_cost=None, summary=True, num_key_survivors=1,
-                 start_stages=None):
+                 start_stages=None, retains_kv=None):
         from quail.backends.quail.executor.chunk import Suffixes
 
         paged = (paged or pipeline.needs_pages) and not pipeline.whole_sequences
@@ -217,6 +217,8 @@ class StageExecutor:
         self.pipeline = pipeline
         self.stages = stages
         self.on_settled = on_settled
+        self.retains_kv = (on_settled is not None if retains_kv is None
+                           else bool(retains_kv))
         self.staging = staging
         self.stats = stats
         self.paged = paged
@@ -773,6 +775,13 @@ class StageExecutor:
             kept = int(sufs.lengths.sum()) if append else 0
             if request is not None and request.write_suffix_tokens is not None:
                 kept = request.write_suffix_tokens
+            if (prefix is not None and not shared and not kept
+                    and not self.retains_kv and not self.writes[j]
+                    and j + 1 == len(self.stages) and j not in self.answer_maps
+                    and len(sufs) == 1 and start == 0
+                    and end == self.sched.num_partners(a, j) == 1
+                    and not self.borrowers[a] and not self.share_points[a]):
+                carry["transient_state"] = True
             if append or (rewinds and start == 0):
                 appended[a] = path + kept
             if self.writes[j] and start == 0 and self._merged(j, start, end):

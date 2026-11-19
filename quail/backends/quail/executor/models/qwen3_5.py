@@ -18,6 +18,17 @@ from functools import partial
 from quail.backends.quail.executor.attention import Engine
 from quail.backends.quail.executor.gdn import gdn_core
 from quail.backends.quail.executor.models.base import ModelPipeline, overlaid_rows
+from quail.backends.quail.executor.models.qwen3_5_kernels import (
+    fp8_linear,
+    gdn_gated_norm,
+    gemma_add_norm,
+    inv_input_scale,
+    is_nvfp4,
+    is_static_fp8,
+    nvfp4_mlp,
+    qkv_gemma_norm_rope_gate,
+    sigmoid_gate,
+)
 from quail.backends.quail.executor.moe import init_moe_workspace
 from quail.common.budgets import kernel_index_cap
 
@@ -29,7 +40,7 @@ class Qwen35Pipeline(ModelPipeline):
     # its documents from checkpoints, which the unified path plans
     needs_pages = True
     tree_attention = False
-    warm_row_classes = False
+    warm_row_classes = True
     warm_joins = False
     gemm_warmup = False
     # the vision encoder, and the images the running region's documents
@@ -78,11 +89,23 @@ class Qwen35Pipeline(ModelPipeline):
 
     def _linear(self, x, module):
         """Apply the projection using its loaded quantization method."""
-        return module.quant_method.apply(module, x, getattr(module, "bias", None))
+        bias = getattr(module, "bias", None)
+        if x.is_cuda and is_static_fp8(module) and x.dtype != module.weight.dtype:
+            # Unfused callers still benefit from the fast SM100 FP8 GEMM.
+            from vllm._custom_ops import scaled_fp8_quant
 
-    def _gdn_inputs(self, mixer, x):
+            x_fp8, _ = scaled_fp8_quant(x, module.input_scale)
+            return fp8_linear(x_fp8, module, bias)
+        return module.quant_method.apply(module, x, bias)
+
+    def _gdn_inputs(self, mixer, x, *, x_fp8=None):
         """Project rows to the convolution input, the gate z, and b and a."""
-        mixed = self._linear(x, mixer.in_proj_qkvz)
+        if x_fp8 is not None:
+            mixed = fp8_linear(
+                x_fp8, mixer.in_proj_qkvz,
+                getattr(mixer.in_proj_qkvz, "bias", None))
+        else:
+            mixed = self._linear(x, mixer.in_proj_qkvz)
         beta_alpha = self._linear(x, mixer.in_proj_ba)
         qkv, z = mixed.split([mixer.conv_dim, mixer.value_dim], dim=-1)
         b, a = beta_alpha.chunk(2, dim=-1)
@@ -103,13 +126,35 @@ class Qwen35Pipeline(ModelPipeline):
 
     def _gdn_output(self, mixer, core, z):
         """Norm the recurrence output gated by z, then project it out."""
+        if core.is_cuda and hasattr(mixer.norm, "weight"):
+            out_proj = mixer.out_proj
+            activation = getattr(mixer.norm, "activation", "silu")
+            if is_static_fp8(out_proj):
+                gated_fp8 = gdn_gated_norm(
+                    core, z, mixer.norm.weight, mixer.norm.eps,
+                    inv_scale=inv_input_scale(out_proj), activation=activation)
+                return fp8_linear(
+                    gated_fp8, out_proj, getattr(out_proj, "bias", None))
+            gated = gdn_gated_norm(
+                core, z, mixer.norm.weight, mixer.norm.eps,
+                activation=activation)
+            return self._linear(gated, out_proj)
         rows, heads, width = core.shape
         gated = mixer.norm(core.reshape(-1, width), z.reshape(-1, width))
         return self._linear(gated.reshape(rows, heads * width), mixer.out_proj)
 
-    def _attention_inputs(self, attn, x, positions):
+    def _attention_inputs(self, attn, x, positions, *, x_fp8=None, targets=None):
         """Project rows to normed, rotated q and k, v, and the output gate."""
-        qkv = self._linear(x, attn.qkv_proj)
+        if x_fp8 is not None:
+            qkv = fp8_linear(
+                x_fp8, attn.qkv_proj, getattr(attn.qkv_proj, "bias", None))
+        else:
+            qkv = self._linear(x, attn.qkv_proj)
+        if (qkv.is_cuda and hasattr(attn.rotary_emb, "cos_sin_cache")
+                and getattr(attn.rotary_emb, "is_neox_style", True)):
+            q, k, v, gate = qkv_gemma_norm_rope_gate(
+                qkv, positions, attn, **(targets or {}))
+            return dict(q=q, k=k, v=v, gate=gate)
         rows = qkv.shape[0]
         q_gate, k, v = qkv.split(
             [attn.q_size * 2, attn.kv_size, attn.kv_size], dim=-1)
@@ -133,28 +178,74 @@ class Qwen35Pipeline(ModelPipeline):
 
     def _attention_output(self, attn, out, gate):
         """Scale attention by sigmoid of its gate, then project it out."""
+        if out.is_cuda:
+            o_proj = attn.o_proj
+            if is_static_fp8(o_proj):
+                gated_fp8 = sigmoid_gate(
+                    out, gate, inv_scale=inv_input_scale(o_proj))
+                return fp8_linear(
+                    gated_fp8, o_proj, getattr(o_proj, "bias", None))
+            return self._linear(sigmoid_gate(out.contiguous(), gate), o_proj)
         import torch
 
         return self._linear(out * torch.sigmoid(gate), attn.o_proj)
+
+    def _norm_and_inputs(self, layer, hidden, residual, positions, targets=None):
+        """Normalize hidden into residual and project the layer's mixer inputs."""
+        norm = layer.input_layernorm
+        if hasattr(layer, "linear_attn"):
+            mixer = layer.linear_attn
+            if hidden.is_cuda and is_static_fp8(mixer.in_proj_qkvz):
+                x_fp8, x, residual = gemma_add_norm(
+                    hidden, residual, norm.weight, norm.variance_epsilon,
+                    inv_scale=inv_input_scale(mixer.in_proj_qkvz),
+                    write_bf16=True)
+                return self._gdn_inputs(mixer, x, x_fp8=x_fp8), residual
+            x, residual = self._norm(norm, hidden, residual)
+            return self._gdn_inputs(mixer, x), residual
+        attn = layer.self_attn
+        if hidden.is_cuda and is_static_fp8(attn.qkv_proj):
+            x_fp8, _, residual = gemma_add_norm(
+                hidden, residual, norm.weight, norm.variance_epsilon,
+                inv_scale=inv_input_scale(attn.qkv_proj), write_bf16=False)
+            return self._attention_inputs(
+                attn, None, positions, x_fp8=x_fp8, targets=targets), residual
+        x, residual = self._norm(norm, hidden, residual)
+        return self._attention_inputs(
+            attn, x, positions, targets=targets), residual
+
+    def _mixer_from_inputs(self, index, inputs, chunk):
+        """Run one layer's token mixer and output projection from its inputs."""
+        layer = self.layers[index]
+        if hasattr(layer, "linear_attn"):
+            core = self._gdn_core(layer.linear_attn, inputs, chunk.meta["gdn"],
+                                  self.gdn_slots[index])
+            return self._gdn_output(layer.linear_attn, core, inputs["z"])
+        out = self._attention_core(layer.self_attn, inputs, chunk.meta)
+        return self._attention_output(layer.self_attn, out, inputs["gate"])
 
     def _mixer(self, index, x, positions, chunk):
         """One layer's token mixer over the rows, eagerly."""
         layer = self.layers[index]
         if hasattr(layer, "linear_attn"):
             inputs = self._gdn_inputs(layer.linear_attn, x)
-            core = self._gdn_core(layer.linear_attn, inputs, chunk.meta["gdn"],
-                                  self.gdn_slots[index])
-            return self._gdn_output(layer.linear_attn, core, inputs["z"])
-        inputs = self._attention_inputs(layer.self_attn, x, positions)
-        out = self._attention_core(layer.self_attn, inputs, chunk.meta)
-        return self._attention_output(layer.self_attn, out, inputs["gate"])
+        else:
+            inputs = self._attention_inputs(layer.self_attn, x, positions)
+        return self._mixer_from_inputs(index, inputs, chunk)
 
     def _mlp(self, mlp, x):
+        if x.is_cuda and is_nvfp4(mlp.gate_up_proj) and is_nvfp4(mlp.down_proj):
+            return nvfp4_mlp(x, mlp.gate_up_proj, mlp.down_proj)
         gate_up = self._linear(x, mlp.gate_up_proj)
         return self._linear(mlp.act_fn(gate_up), mlp.down_proj)
 
-    def _norm(self, norm, x, residual):
+    def _norm(self, norm, x, residual, *, inplace_x=False):
         """One Gemma-style norm with the residual add, as (normed, residual)."""
+        if x.is_cuda:
+            _, normed, residual = gemma_add_norm(
+                x, residual, norm.weight, norm.variance_epsilon,
+                inplace_x=inplace_x)
+            return normed, residual
         return self.engine.gemma_add_rms_norm(
             x, residual, norm.weight, norm.variance_epsilon)
 
@@ -196,12 +287,13 @@ class Qwen35Pipeline(ModelPipeline):
         positions = chunk.positions if rotary is None else rotary
         residual = None
         for index, layer in enumerate(self.layers):
-            x, residual = self._norm(layer.input_layernorm, hidden, residual)
+            inputs, residual = self._norm_and_inputs(
+                layer, hidden, residual, positions)
             # arena layers are indexed by model layer
             chunk.meta["layer"] = index
-            x = self._mixer(index, x, positions, chunk)
+            x = self._mixer_from_inputs(index, inputs, chunk)
             x, residual = self._norm(layer.post_attention_layernorm, x,
-                                     residual)
+                                     residual, inplace_x=True)
             hidden = self.feed_forwards[index](x)
         final = chunk.final_indices
         if self.spec.sae is not None:
@@ -262,21 +354,24 @@ class Qwen35Pipeline(ModelPipeline):
                 x = self._attention_output(
                     layer.self_attn, buffers.attention, buffers.gate)
             x, residual = self._norm(layer.post_attention_layernorm, x,
-                                     buffers.residual)
+                                     buffers.residual, inplace_x=True)
             hidden = self.feed_forwards[index - 1](x)
         if index == len(self.layers):
             normed, _ = self._norm(self.final_norm, hidden, residual)
             buffers.output.copy_(normed)
             return
         layer = self.layers[index]
-        x, residual = self._norm(layer.input_layernorm, hidden, residual)
-        buffers.residual.copy_(residual)
-        if hasattr(layer, "linear_attn"):
-            inputs = self._gdn_inputs(layer.linear_attn, x)
-        else:
-            inputs = self._attention_inputs(layer.self_attn, x, buffers.positions)
+        targets = (None if hasattr(layer, "linear_attn") else dict(
+            q_out=buffers.q, k_out=buffers.k, v_out=buffers.v,
+            gate_out=buffers.gate))
+        inputs, residual = self._norm_and_inputs(
+            layer, hidden, residual, buffers.positions, targets=targets)
+        if residual is not buffers.residual:
+            buffers.residual.copy_(residual)
         for name, tensor in inputs.items():
-            getattr(buffers, name).copy_(tensor)
+            target = getattr(buffers, name)
+            if target is not tensor:
+                target.copy_(tensor)
         if not hasattr(layer, "linear_attn"):
             buffers.write_kv(self.engine, buffers.k, buffers.v, index)
 

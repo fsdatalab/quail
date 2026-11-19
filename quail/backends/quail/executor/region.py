@@ -319,7 +319,8 @@ class RegionExecution:
                 dependencies=dependencies,
                 knee_rows=getattr(state, "knee_rows", 0),
                 decode_cost=getattr(state, "decode_cost", None),
-                num_key_survivors=settings.num_key_survivors, skip=skip)
+                num_key_survivors=settings.num_key_survivors, skip=skip,
+                retains_kv=keep_kv or owner is not None)
             operators[0].push(np.arange(len(table.prefixes)))
             operators[0].finish_input()
             every, spans, tokens = self.executor.run()
