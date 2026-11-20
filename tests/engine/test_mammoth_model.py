@@ -1,6 +1,8 @@
 """Base Labs mammoth-1 and elephant-1: prompt layout, mask, readout, and loading."""
 
 import json
+from dataclasses import replace
+from types import SimpleNamespace
 
 import pyarrow as pa
 import pytest
@@ -10,6 +12,7 @@ import quail
 from quail.api.config import EngineConfig
 from quail.api.prompts import bind_classify_prompt, bind_prompt
 from quail.backends.quail.executor import model_loading
+from quail.backends.quail.executor.models import PIPELINES, build_pipeline
 from quail.backends.quail.executor.models.base import pipeline_mask
 from quail.backends.quail.executor.readout import DecisionRows, LetterReadout
 from quail.baselines.vllm import stock_vllm_backend
@@ -18,7 +21,7 @@ from quail.common.expressions import ColumnRef, CompileError
 from quail.common.tokens import close_documents
 from quail.physical import AiClassify, AiFilter, decode_plan_value
 from quail.physical.plan import Refusal
-from quail.specs import H100_SXM, MODELS
+from quail.specs import H100_SXM, MODELS, QWEN3_4B_FP8
 
 MAMMOTH = MODELS["mammoth-1-bf16"]
 ELEPHANT = MODELS["elephant-1-bf16"]
@@ -83,6 +86,17 @@ def test_elephant_runs_mammoths_prompt_mask_and_readout_on_the_9b():
     assert (ELEPHANT.layers, ELEPHANT.hidden) == (base.layers, base.hidden)
     assert pipeline_mask(MAMMOTH) == pipeline_mask(ELEPHANT) == "document_isolated"
     assert pipeline_mask(base) == "causal"
+
+
+def test_a_causal_forward_pass_refuses_a_bidirectional_model(monkeypatch):
+    def causal(model, arena, spec, **kwargs):
+        return SimpleNamespace(mask="causal")
+
+    monkeypatch.setitem(PIPELINES, "qwen3", causal)
+    spec = replace(QWEN3_4B_FP8, attention_mask="document_isolated")
+    with pytest.raises(ValueError, match="runs the causal mask"):
+        build_pipeline(spec, model=None, arena=None)
+    assert build_pipeline(QWEN3_4B_FP8, model=None, arena=None).mask == "causal"
 
 
 def test_each_document_ends_with_the_close_tokens():
