@@ -36,8 +36,9 @@ class FilterOperator(SingleNodeOperator):
         """Build one filter over the chain's documents."""
         query = region.query
         node = nodes[0]
+        pipeline = query.loaded_model.pipeline
         found = cls(node, region.document_ids(), query.async_answers,
-                    len(query.loaded_model.pipeline.canvas_ids))
+                    len(pipeline.canvas_ids), frames=pipeline.mask == "causal")
         if getattr(node, "answer", None) is not None:
             # a filter that keeps every row carries the columns before it
             found.priors, found.prior_tables = prior_inputs(
@@ -63,13 +64,14 @@ class FilterOperator(SingleNodeOperator):
                 pipeline_rows(node, region.inputs)),
             num_key_survivors=node.num_key_survivors)
 
-    def __init__(self, node, ids, async_answers, canvas_tokens=0):
+    def __init__(self, node, ids, async_answers, canvas_tokens=0, frames=True):
         self.node = node
         self.ids = ids
         self.canvas_tokens = canvas_tokens
+        self.frames = frames
         self.stages = filter_stages(
             [list(node.question_token_ids)],
-            async_answers)
+            async_answers, frames)
         self._keep_answer()
         self.answers = {}
         # (document, passed, answer) settled since the last take
@@ -81,7 +83,7 @@ class FilterOperator(SingleNodeOperator):
         """Retain the common question preamble across consecutive filters."""
         stages = filter_stages(
             [operator.node.question_token_ids for operator in operators],
-            operators[0].stages[0].readout)
+            operators[0].stages[0].readout, operators[0].frames)
         for operator, stage in zip(operators, stages):
             operator.stages = [stage]
             operator._keep_answer()

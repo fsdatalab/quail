@@ -17,7 +17,11 @@ from functools import partial
 
 from quail.backends.quail.executor.attention import Engine
 from quail.backends.quail.executor.gdn import gdn_core
-from quail.backends.quail.executor.models.base import ModelPipeline, overlaid_rows
+from quail.backends.quail.executor.models.base import (
+    ModelPipeline,
+    overlaid_rows,
+    pipeline_mask,
+)
 from quail.backends.quail.executor.models.qwen3_5_kernels import (
     fp8_linear,
     gdn_gated_norm,
@@ -50,6 +54,7 @@ class Qwen35Pipeline(ModelPipeline):
 
     def __init__(self, model, arena, *, spec, kernels="quail",
                  engine_class=Engine):
+        self.mask = pipeline_mask(spec)
         text = getattr(model, "language_model", model)
         self.spec = spec
         self.visual = getattr(model, "visual", None)

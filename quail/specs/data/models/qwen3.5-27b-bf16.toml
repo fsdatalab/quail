@@ -1,0 +1,14 @@
+# The same shapes as qwen3.5-27b-fp8 with bf16 weights, the precision
+# mammoth-1 ships in.
+base = "qwen3.5-27b-fp8"
+name = "qwen3.5-27b-bf16"
+hf_name = "Qwen/Qwen3.5-27B"
+revision = "fc05daec18b0a78c049392ed2e771dde82bdf654"
+w_bytes = 2.0
+weight_precision = "bf16"
+w_mem_bytes = 53_926_300_160  # vLLM's model memory after loading;
+                              # /results/ablations/
+                              # qwen3.5-27b-bf16-vllm-limits-256.json
+max_num_seqs = 256  # started at 128 and 256; 384 raised ValueError,
+                    # 313 Mamba cache blocks at 0.91 memory; 512 ran
+                    # out of memory

@@ -332,6 +332,36 @@ class DocumentPrefixes(Sequence):
         )
 
 
+class ClosedDocuments(Sequence):
+    """Each document's tokens followed by the layout's document_close tokens."""
+
+    def __init__(self, documents, close):
+        self._documents = documents
+        self._close = tuple(close)
+
+    def __len__(self):
+        return len(self._documents)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[i] for i in range(*index.indices(len(self)))]
+        return concat_tokens(self._documents[index], self._close)
+
+
+def close_documents(documents: dict, close) -> dict:
+    """Append the document_close tokens to every table's documents.
+
+    Args:
+        documents: Per table alias, its documents' tokens.
+        close: The plan's document_close token ids; empty returns the
+            documents unchanged.
+    """
+    if not close:
+        return documents
+    return {alias: ClosedDocuments(values, close)
+            for alias, values in documents.items()}
+
+
 class DocumentKeys(Sequence):
     """Build stable arena keys when a document is accessed."""
 

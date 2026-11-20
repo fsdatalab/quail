@@ -4,7 +4,7 @@ ModelSpec.arch names the file; build_pipeline picks it. Adding an
 architecture is adding a file here and a registry line.
 """
 
-from quail.backends.quail.executor.models.base import ModelPipeline
+from quail.backends.quail.executor.models.base import ModelPipeline, pipeline_mask
 from quail.backends.quail.executor.models.diffusion_gemma import (
     DiffusionGemmaPipeline,
 )
@@ -32,7 +32,12 @@ def build_pipeline(spec, model, arena, **kwargs) -> ModelPipeline:
         raise ValueError(
             f"no forward pass for architecture {spec.arch!r}; "
             f"known: {sorted(PIPELINES)}") from None
-    return cls(model, arena, spec=spec, **kwargs)
+    pipeline = cls(model, arena, spec=spec, **kwargs)
+    if pipeline.mask != pipeline_mask(spec):
+        raise ValueError(f"the {spec.arch} forward pass runs the "
+                         f"{pipeline.mask} mask, not {spec.name}'s "
+                         f"{pipeline_mask(spec)}")
+    return pipeline
 
 
 __all__ = ["ModelPipeline", "PIPELINES", "build_pipeline", "supported_archs"]

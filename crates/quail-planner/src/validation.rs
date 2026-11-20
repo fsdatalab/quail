@@ -12,6 +12,7 @@ use crate::error::{CompileError, Refusal};
 use crate::expressions::asked_call;
 use crate::expressions::{aliased_call, call_aliases, repr_str};
 use crate::operators::Operators;
+use crate::plan_statistics::plan_prompts;
 use crate::prompts::prompt_layout;
 use crate::scores::prompt_aliases;
 use crate::search::label_calls;
@@ -245,6 +246,84 @@ fn attention_device_refusal(model: &ModelSpec, device: &DeviceSpec) -> Option<Re
     ))
 }
 
+/// A refusal for what a bidirectional model cannot run yet.
+///
+/// Its prompts read one document each: a join or any prompt over two
+/// tables is laid out in a format the model was not trained on. Its
+/// non-causal attention is checked on H100 only.
+fn bidirectional_refusal(
+    found: &Operators,
+    context: &PlanningContext,
+) -> Result<Option<Refusal>, CompileError> {
+    let (model, device) = (&context.model, &context.device);
+    if !model.bidirectional() {
+        return Ok(None);
+    }
+    // every prompt a query asks, and its semantic columns
+    let two_tables = !found.joins.is_empty()
+        || plan_prompts(found)
+            .iter()
+            .any(|prompt| prompt_aliases(prompt).len() > 1)
+        || found
+            .columns()
+            .any(|column| call_aliases(&column.call).len() > 1);
+    if two_tables {
+        return Ok(Some(Refusal::new(
+            format!(
+                "{} reads one document per prompt; joins and prompts over two tables are not \
+                 supported",
+                model.name
+            ),
+            "unsupported_bidirectional_query",
+            1.0,
+            2.0,
+            "documents per prompt",
+        )));
+    }
+    if device.name != "h100-sxm" {
+        return Ok(Some(Refusal::new(
+            format!(
+                "{} runs on h100-sxm only; its non-causal attention is not checked on {}",
+                model.name, device.name
+            ),
+            "bidirectional_device_unchecked",
+            1.0,
+            0.0,
+            "checked devices",
+        )));
+    }
+    // a document's block is computed in one pass: its rows read every
+    // later row of it, so it cannot be split across chunks
+    let Some(prompt) = plan_prompts(found).into_iter().find(|p| p.kind != "score") else {
+        return Ok(None);
+    };
+    let close = prompt_layout(&model.prompt_layout)?.document_close;
+    let block = (context.lowered(&prompt)?.preamble_token_ids.len()
+        + (context.tokenizer)(close)?.len()) as i64
+        + context
+            .document_tokens
+            .values()
+            .flatten()
+            .copied()
+            .max()
+            .unwrap_or(0);
+    let chunk = chunk_budget(model, device);
+    if block > chunk {
+        return Ok(Some(Refusal::new(
+            format!(
+                "{} computes each document in one pass, but a document's block is {block} \
+                 tokens, more than the {chunk}-token chunk",
+                model.name
+            ),
+            "bidirectional_document_exceeds_chunk",
+            block as f64,
+            chunk as f64,
+            "tokens",
+        )));
+    }
+    Ok(None)
+}
+
 /// A refusal for unsupported inference or hardware, as `validate_query`.
 ///
 /// # Errors
@@ -255,6 +334,9 @@ pub fn validate_query(
     context: &PlanningContext,
 ) -> Result<Option<Refusal>, CompileError> {
     let (model, device) = (&context.model, &context.device);
+    if let Some(refused) = bidirectional_refusal(found, context)? {
+        return Ok(Some(refused));
+    }
     let scored = has_score(found);
     if model.attention_mask == "set" && found.joins.iter().any(|join| is_score(&join.predicate)) {
         return Ok(Some(refusal(

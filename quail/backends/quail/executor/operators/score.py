@@ -381,8 +381,13 @@ class ScoreOperator(SingleNodeOperator):
             return True
 
         prefixes = DocumentPrefixes(head, documents[alias], document_ids)
-        self.stages = [Stage(suffixes=[[tail[-1]]], readout=score_readout(self.state),
-                             frame=list(tail[:-1]), decide=keep, single=True,
+        # the question is the frame and its last token the cue; a mask
+        # that keeps no question KV reads the whole tail as the suffix
+        frame, cue = ((list(tail[:-1]), [tail[-1]])
+                      if self.state.loaded_model.pipeline.mask == "causal"
+                      else ([], list(tail)))
+        self.stages = [Stage(suffixes=[cue], readout=score_readout(self.state),
+                             frame=frame, decide=keep, single=True,
                              label=f"score {spec.name}")]
         self.total = sum(len(head) + len(documents[alias][document_id]) + len(tail)
                          for document_id in document_ids)

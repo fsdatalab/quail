@@ -555,6 +555,76 @@ class DecisionHead:
         return bilinear / math.sqrt(self.head_dim) + mlp
 
 
+class LetterReadout:
+    """The slot_lm readout of mammoth-1 and elephant-1, in fp32.
+
+    Every option is scored at the prompt's last row: option i's score is
+    that row times the output head's row of option i's letter. It
+    answers the DecisionHead interface, so the decision readouts read
+    it with every option's offset 0.
+
+    Args:
+        F: torch.nn.functional.
+        weight: The (letters, hidden) rows of the output head.
+    """
+
+    def __init__(self, F, weight):
+        self.F = F
+        self.weight = weight.float()
+
+    @classmethod
+    def load(cls, torch, F, path, letters, device="cuda"):
+        """Read the output head's rows of the option letters.
+
+        Args:
+            torch: The torch module.
+            F: torch.nn.functional.
+            path: The checkpoint directory, with tokenizer.json and
+                either a safetensors index naming lm_head.weight's shard
+                or one model.safetensors holding it.
+            letters: The option letters, in option order.
+            device: Where the readout lives.
+
+        Raises:
+            ValueError: A letter is not one token.
+        """
+        import json
+
+        from safetensors import safe_open
+        from tokenizers import Tokenizer
+
+        path = Path(path)
+        tokenizer = Tokenizer.from_file(str(path / "tokenizer.json"))
+        ids = [tokenizer.encode(letter, add_special_tokens=False).ids
+               for letter in letters]
+        if any(len(token) != 1 for token in ids):
+            raise ValueError(f"the option letters {letters} are not one "
+                             f"token each in {path}")
+        index_path = path / "model.safetensors.index.json"
+        shard = (json.loads(index_path.read_text())["weight_map"]["lm_head.weight"]
+                 if index_path.exists() else "model.safetensors")
+        with safe_open(str(path / shard), framework="pt") as tensors:
+            head = tensors.get_slice("lm_head.weight")
+            rows = torch.cat([head[token:token + 1] for (token,) in ids])
+        return cls(F, rows.to(device))
+
+    def reordered(self, order):
+        """Return this readout with its rows taken in the given order."""
+        return type(self)(self.F, self.weight[list(order)])
+
+    def scores(self, options, last):
+        """Per prompt, one score per option.
+
+        Args:
+            options: (prompts, options, hidden) rows; only their count is read.
+            last: (prompts, hidden) last rows of the prompts.
+
+        Returns:
+            (prompts, options) float32 scores.
+        """
+        return self.F.linear(last.float(), self.weight[:options.shape[1]])
+
+
 class DecisionRows:
     """The rows a decision head reads from each answer's trailing rows.
 

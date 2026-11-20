@@ -127,6 +127,9 @@ class ModelSpec:
     attention_precision: Precision = "bf16"
     arch: str = "qwen3"    # forward pass in executor/models/<arch>.py
     role: Role = "generative"
+    readout: str = ""    # a decision model's head: "" is Decision 2.0's
+    #                      option head, "slot_lm" the output head's
+    #                      logits of the option letters
     decision_head_dim: int = 0    # width of a decision model's option
     #                               head (its key, query, and MLP rows);
     #                               the head's FLOPs and bytes follow
@@ -168,10 +171,14 @@ class ModelSpec:
     read_span_tokens: int = 0    # the longest span a pointer read returns
     set_size: int = 0    # the most questions one set-attention pass
     #                      holds: the size the model was trained with
-    attention_mask: Literal["causal", "set"] = "causal"
+    attention_mask: Literal["causal", "set", "document_isolated"] = "causal"
     #                    "set": d1's set attention, under which a
     #                    document reads its questions, so a document's
     #                    work is redone in every pass and no KV is kept
+    #                    "document_isolated": mammoth-1's, whose
+    #                    full-attention layers read the document block
+    #                    both ways and each question block whole, so a
+    #                    document's KV serves its own questions only
     answer_spellings: tuple[tuple[str, ...], tuple[str, ...]] = ()
     #                    (true spellings, false spellings) that a
     #                    filter, join, or score reads at the answer row;
@@ -261,6 +268,15 @@ class ModelSpec:
     def layer_kind(self, layer: int) -> LayerKind:
         """Return the kind of one layer."""
         return self.layer_kinds[layer] if self.layer_kinds else "full_attention"
+
+    @property
+    def bidirectional(self) -> bool:
+        """Whether the full-attention layers read whole blocks, both ways.
+
+        A "document_isolated" model's do; its Gated DeltaNet layers stay
+        causal.
+        """
+        return self.attention_mask == "document_isolated"
 
     @property
     def reuses_kv(self) -> bool:

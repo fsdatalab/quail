@@ -144,3 +144,32 @@ def check_copy_drafts_pack_as_causal_sequences_without_combining_slots(
     for key in reversed(keys):
         arena.free_key(key)
     assert not arena.accounting.owned
+
+
+def test_a_document_isolated_question_reads_the_document_as_its_own_sequence(
+        monkeypatch):
+    cpu_staging(monkeypatch)
+    arena = plain_arena()
+    key = ("d", 0)
+    arena.activate(key, 4, capacity_tokens=8, base_tokens=4)
+    group = dict(key=key, prefix=[1, 2, 3, 4], f=4, suffixes=[[10, 11]])
+    causal = chunk_mod.pack_chunk(torch, arena, [dict(group)],
+                                  attention_mode="unified").meta["unified"]
+    # causal: the document and its one question are one sequence
+    assert causal["cu_q_host"] == [0, 6]
+    assert causal["causal"]
+    isolated = chunk_mod.pack_chunk(
+        torch, arena, [dict(group, suffixes=[[10, 11], [12]])],
+        attention_mode="unified", mask="document_isolated").meta["unified"]
+    # the document reads its own 4 rows; each question reads the
+    # document and every row of itself
+    assert isolated["cu_q_host"] == [0, 4, 6, 7]
+    assert isolated["used_host"] == [4, 6, 5]
+    assert not isolated["causal"]
+    with pytest.raises(ValueError, match="keeps no suffix KV"):
+        chunk_mod.pack_chunk(
+            torch, arena, [dict(group, write_suffix_tokens=2, single=True)],
+            attention_mode="unified", mask="document_isolated")
+    with pytest.raises(ValueError, match="no decode rows"):
+        chunk_mod.pack_chunk(torch, arena, [dict(group)], attention_mode="tree",
+                             mask="document_isolated")

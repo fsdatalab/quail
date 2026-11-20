@@ -53,7 +53,7 @@ mod tests {
     fn every_built_in_spec_reads() {
         let models = read_models(&data("models")).unwrap();
         let devices = read_devices(&data("devices")).unwrap();
-        assert_eq!(models.len(), 16);
+        assert_eq!(models.len(), 20);
         assert_eq!(devices.len(), 4);
         for model in models.values() {
             let json = serde_json::to_value(model).unwrap();
@@ -67,6 +67,11 @@ mod tests {
         assert_eq!(variant.weight_precision, Precision::Fp8);
         assert_eq!(variant.attention_precision, Precision::Bf16);
         assert_eq!(variant.gdn_weight_precision, Some(Precision::Bf16));
+        // a fine-tune names its base and keeps the base's shapes
+        let mammoth = &models["mammoth-1-bf16"];
+        assert_eq!(mammoth.layers, models["qwen3.5-27b-fp8"].layers);
+        assert_eq!(mammoth.weight_precision, Precision::Bf16);
+        assert!(mammoth.bidirectional());
     }
 
     #[test]

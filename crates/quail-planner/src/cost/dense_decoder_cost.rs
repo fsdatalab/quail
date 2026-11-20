@@ -212,6 +212,17 @@ pub fn dense_decoder_components(work: &Work, model: &ModelSpec, passes: f64) -> 
 
 /// The answer readout: the decision head, or the output head's rows.
 fn readout(model: &ModelSpec, rows: f64, passes: f64, head_rows: f64) -> CostComponent {
+    if !model.readout.is_empty() {
+        // every code row of the fp32 readout times the prompt's last row
+        let codes = (crate::prompts::MAX_LETTERS as i64 * model.hidden) as f64;
+        return CostComponent {
+            name: "readout",
+            flops: Quantity::Scalar(2.0 * codes * rows),
+            bytes_moved: Quantity::Scalar(4.0 * codes * passes),
+            precision: Precision::Fp32,
+            gemm: false,
+        };
+    }
     if model.role == "decision" {
         let (width, hidden) = (model.decision_head_dim, model.hidden);
         return CostComponent {

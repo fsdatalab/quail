@@ -28,6 +28,7 @@ use crate::expressions::{aliased_call, call_aliases, condition_columns, conditio
 use crate::lowering::LoweredPrompt;
 use crate::operators::{Operators, SemanticColumn};
 use crate::plan_statistics::plan_prompts;
+use crate::prompts::prompt_layout;
 use crate::search::{
     ASK, StepKey, StepPricing, default_order_rule, label_calls, order_steps, resident_after,
     table_steps,
@@ -583,13 +584,32 @@ impl<'a, 'c> Estimate<'a, 'c> {
         })
     }
 
+    /// The pairs a block of `tokens` reads beyond causal ones.
+    ///
+    /// A bidirectional model's full-attention layers read every key of a
+    /// block: its document block (the preamble and the document) and each
+    /// question block, which also reads the document. A block reads
+    /// `tokens` squared pairs, where a causal one reads
+    /// `tokens (tokens + 1) / 2`.
+    fn block_work(&self, tokens: i64) -> Work {
+        if !self.context.model.bidirectional() {
+            return Work::default();
+        }
+        Work {
+            pairs: scalar((tokens * (tokens - 1) / 2) as f64),
+            ..Work::default()
+        }
+    }
+
     /// Compute one document's prefix for the first time in the query.
     fn first_use(&self, alias: &str, row: i64, suffix: i64) -> Work {
         let data = &self.aliases[alias];
         let prefix = self.pre + data.tokens[row as usize];
         let shared = data.shared[row as usize];
         if shared == 0 {
-            return scan(&scalar(prefix as f64), &scalar(suffix as f64), self.window);
+            return &(&scan(&scalar(prefix as f64), &scalar(suffix as f64), self.window)
+                + &self.block_work(prefix))
+                + &self.block_work(suffix);
         }
         let resident = self.pre + shared;
         // the document saves its own state after reading the parent's
@@ -615,7 +635,8 @@ impl<'a, 'c> Estimate<'a, 'c> {
                 self.first_use(alias, *row, suffix)
             } else {
                 let prefix = self.pre + self.aliases[alias].tokens[*row as usize];
-                ask(&scalar(prefix as f64), &scalar(suffix as f64), self.window)
+                &ask(&scalar(prefix as f64), &scalar(suffix as f64), self.window)
+                    + &self.block_work(suffix)
             };
             work = &work + &step;
         }
@@ -1486,10 +1507,22 @@ pub fn speed_of_light_estimate(
         .filter(|column| column.call.pooling == "max")
         .map(SemanticColumn::alias)
         .collect();
+    // the worker appends the layout's document_close to every document, so
+    // the model reads it in the document's block
+    let close = prompt_layout(&context.model.prompt_layout)?.document_close;
+    let close = if close.is_empty() {
+        0
+    } else {
+        (context.tokenizer)(close)?.len() as i64
+    };
     let aliases = inputs
         .aliases
         .iter()
-        .map(|data| (data.alias.clone(), data.clone()))
+        .map(|data| {
+            let mut data = data.clone();
+            data.tokens.iter_mut().for_each(|tokens| *tokens += close);
+            (data.alias.clone(), data)
+        })
         .collect();
     let mut estimate = Estimate {
         context,

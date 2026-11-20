@@ -13,6 +13,7 @@ import time
 import traceback
 from contextlib import ExitStack
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import _quail_native
@@ -28,11 +29,14 @@ from quail.backends.quail.executor.readout import (
     AsyncDecisions,
     AsyncDecisionScores,
     DecisionHead,
+    LetterReadout,
 )
 from quail.backends.quail.executor.warmup import warm_kernels
 from quail.backends.quail.graph import payload_tables, serve_region
 from quail.backends.resources import freeze_loaded_objects, release_models
 from quail.common import budgets
+from quail.common.tokens import close_documents
+from quail.physical.lowering import MAX_LETTERS, code_letters
 from quail.physical.plan import graph_from_envelope
 from quail.progress import (
     say,
@@ -76,6 +80,7 @@ class LoadedGpu:
                                 moe_backend=spec.moe_backend,
                                 text_only=spec.vision_tower,
                                 images=(spec.vision_tower
+                                        and spec.role != "decision"
                                         and not spec.checkpoint_layers),
                                 num_layers=(spec.layers if spec.checkpoint_layers
                                             else None),
@@ -113,11 +118,21 @@ class LoadedGpu:
 
         t0 = time.perf_counter()
         self.decision_head = None
+        self.yes_no_head = None
         if spec.role == "decision":
             path = resolve_model_path(model_path or spec.hf_name,
                                       None if model_path else spec.revision)
-            self.decision_head = DecisionHead.load(torch, F, path)
-            self.decision_offsets = decision_offsets(spec, path)
+            if spec.readout == "slot_lm":
+                # every option read at the prompt's last row
+                self.decision_head = LetterReadout.load(torch, F, path,
+                                                      slot_codes(spec, path))
+                self.decision_offsets = (0, 0, 0)
+                # a filter lists yes (A) then no (B); the yes/no
+                # readouts take no then yes
+                self.yes_no_head = self.decision_head.reordered((1, 0))
+            else:
+                self.decision_head = DecisionHead.load(torch, F, path)
+                self.decision_offsets = decision_offsets(spec, path)
         self.pipeline = build_pipeline(spec, self.model, self.arena)
         self.pipeline.piecewise_graphs = PiecewiseGraphs.for_specs(
             self.pipeline, spec, device)
@@ -171,10 +186,11 @@ class LoadedGpu:
         rows = AnswerRows(self.torch, self.F, self.model, true_ids, false_ids)
         async_scores = None
         if self.decision_head is not None:
+            yes_no = self.yes_no_head or self.decision_head
             self.async_ans = AsyncDecisions(
-                self.torch, self.decision_head, self.decision_offsets)
+                self.torch, yes_no, self.decision_offsets)
             async_scores = AsyncDecisionScores(
-                self.torch, self.decision_head, self.decision_offsets)
+                self.torch, yes_no, self.decision_offsets)
         else:
             self.async_ans = AsyncAnswers(self.torch, rows)
         self.chunk_tokens = chunk_tokens
@@ -257,6 +273,25 @@ def model_tokenizer(spec, model_path: str = ""):
                               None if model_path else spec.revision,
                               include_weights=False)
     return Tokenizer(path, spec.turn_suffix)
+
+
+def slot_codes(spec, path) -> tuple[str, ...]:
+    """Return the codes a slot_lm model's prompts list, in option order.
+
+    The planner chooses them with the same rule (code_letters), so
+    option i's code is the readout's row i.
+
+    Args:
+        spec: The ModelSpec.
+        path: The checkpoint directory, with tokenizer.json.
+    """
+    from tokenizers import Tokenizer
+
+    tokenizer = Tokenizer.from_file(str(Path(path) / "tokenizer.json"))
+    return code_letters(
+        MAX_LETTERS,
+        lambda text: tokenizer.encode(text, add_special_tokens=False).ids,
+        spec.turn_suffix)
 
 
 def decision_offsets(spec, path) -> tuple[int, ...]:
@@ -351,7 +386,8 @@ def _execution_state(gpu, payload, registry) -> dict:
     """Return the executor's state for one GPU and query."""
     return {
         "gpu": gpu,
-        "documents": payload["documents"],
+        "documents": close_documents(payload["documents"],
+                                     payload.get("document_close", ())),
         "texts": payload.get("texts", {}),
         "columns": payload.get("columns", {}),
         "runtimes": registry.runtimes,

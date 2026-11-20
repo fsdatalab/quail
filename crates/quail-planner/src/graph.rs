@@ -24,6 +24,7 @@ use crate::expressions::asked_call;
 use crate::expressions::{argument_alias, call_aliases, condition_columns, repr_str};
 use crate::operators::{ColumnTest, Operators, SemanticColumn};
 use crate::pricing::PlanPricer;
+use crate::prompts::prompt_layout;
 use crate::results::limit_node;
 use crate::retention::{group_sequence, streamed_aliases};
 use crate::scores::score_spec;
@@ -1483,6 +1484,13 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
             if model.answer_canvas.is_some() {
                 settings.insert("canvas_draws".into(), Value::from(context.canvas_draws));
             }
+        }
+        let close = prompt_layout(&model.prompt_layout)?.document_close;
+        if !close.is_empty() {
+            settings.insert(
+                "document_close".into(),
+                Value::from((context.tokenizer)(close)?),
+            );
         }
         let last = self.nodes.last().expect("a node");
         let root = port_of(last.id(), last.outputs()[0].0.clone());

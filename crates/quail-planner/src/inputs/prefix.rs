@@ -98,6 +98,16 @@ pub struct ReaderGroup {
 }
 
 impl PrefixTree {
+    /// The tree in which no document borrows: a model whose documents
+    /// read their whole block shares no prefix across documents.
+    pub fn unshared(count: usize) -> Self {
+        PrefixTree {
+            order: (0..count).collect(),
+            parent: vec![None; count],
+            shared: vec![0; count],
+        }
+    }
+
     /// Group the documents that borrow by their parent and borrowed
     /// tokens, in the order each group first appears.
     pub fn reader_groups(&self, lengths: &[i64]) -> Vec<ReaderGroup> {

@@ -48,6 +48,17 @@ pub struct PromptLayout {
     pub option_end: Option<&'static str>,
     pub read_end: Option<&'static str>,
     pub read_slots: Vec<&'static str>,
+    /// For a layout that lists a classification's labels as coded option
+    /// lines, the text before the lines; None writes one option block per
+    /// label.
+    pub options_label: Option<&'static str>,
+    /// The question text a prompt without one asks; empty keeps it empty.
+    pub empty_question: &'static str,
+    /// The text after each document that the model reads in the
+    /// document's attention block, so every question shares it. The
+    /// planner sends its tokens as the plan's `document_close` setting
+    /// and the worker appends them to every document.
+    pub document_close: &'static str,
 }
 
 impl PromptLayout {
@@ -66,12 +77,20 @@ impl PromptLayout {
             option_end: None,
             read_end: None,
             read_slots: Vec::new(),
+            options_label: None,
+            empty_question: "",
+            document_close: "",
         }
     }
 
     /// The text after a document: one entry per tokenized segment.
     pub fn question_segments(&self, question: &str, separator: &str) -> Vec<String> {
         let separator = self.question_separator.unwrap_or(separator);
+        let question = if question.is_empty() {
+            self.empty_question
+        } else {
+            question
+        };
         let mut segments = if self.label_segment {
             vec![
                 format!("{separator}{}", self.question_label),
@@ -93,6 +112,54 @@ impl PromptLayout {
             .replacen("{}", name, 1)
     }
 }
+
+/// Jev's limit on one choice's options, which OpenJev keeps.
+pub const MAX_LETTERS: usize = 255;
+
+/// The codes a coded prompt may use, in order: A to Z, then AA to ZZ.
+pub fn code_candidates() -> Vec<String> {
+    let upper: Vec<String> = ('A'..='Z').map(String::from).collect();
+    let mut codes = upper.clone();
+    for first in &upper {
+        for second in &upper {
+            codes.push(format!("{first}{second}"));
+        }
+    }
+    codes
+}
+
+/// One coded line per option, each `line` with its code and text.
+///
+/// # Errors
+///
+/// More than `MAX_LETTERS` options.
+fn coded_options(texts: &[String], letters: &[String], line: &str) -> Result<String, CompileError> {
+    if texts.len() > MAX_LETTERS {
+        return compile_error(format!(
+            "a coded prompt takes at most {MAX_LETTERS} options, got {}",
+            texts.len()
+        ));
+    }
+    Ok(letters
+        .iter()
+        .zip(texts)
+        .map(|(letter, text)| line.replace("{letter}", letter).replace("{text}", text))
+        .collect())
+}
+
+// Base Labs' mammoth-1 and elephant-1 (qev/prompt.py in OneJev at
+// 81ce62f): the document in a state block, then the question, its
+// lettered options, and the answer line. A filter asks the yes/no
+// question as two options, yes then no.
+const MAMMOTH_OPTIONS_LABEL: &str = "\n\nOptions:";
+const MAMMOTH_OPTION_LINE: &str = "\n{letter}. {text}";
+// the answer line; "{letters}" becomes the codes, joined by ", "
+const MAMMOTH_CLOSING: &str = "\n\nAnswer with one letter: {letters}.";
+const MAMMOTH_LABEL_CLOSING: &str = "\n\nAnswer with one label: {letters}.";
+const MAMMOTH_FILTER_END: &str = "\n\nOptions:\
+    \nA. yes: the statement is true / the answer is yes\
+    \nB. no: the statement is false / the answer is no\
+    \n\nAnswer with one letter: A, B.";
 
 fn decision2_option(key: &str, description: Option<&str>) -> String {
     let mut fields = BTreeMap::new();
@@ -140,6 +207,17 @@ pub fn prompt_layout(name: &str) -> Result<PromptLayout, CompileError> {
             read_end: Some("\n\nRead the text from the state, or nothing if it is absent."),
             read_slots: vec!["start", "end"],
             ..PromptLayout::plain("d1")
+        }),
+        "mammoth" => Ok(PromptLayout {
+            document_label: "<state>\n",
+            document_close: "\n</state>\n\n",
+            question_label: "Question: ",
+            question_end: MAMMOTH_FILTER_END,
+            question_separator: Some(""),
+            choice_label: Some("Question: "),
+            options_label: Some(MAMMOTH_OPTIONS_LABEL),
+            empty_question: "Which option applies to the state?",
+            ..PromptLayout::plain("mammoth")
         }),
         other => compile_error(format!("unknown prompt layout {}", repr_str(other))),
     }
@@ -713,12 +791,50 @@ fn bind_option_classify_prompt(
     Ok(bound)
 }
 
+/// The text after a document: the question, one block per label, the close.
+///
+/// A layout with an `options_label` returns one segment: the question,
+/// the options label, one coded line per label, and the closing.
 fn choice_segments(
     question: &str,
     labels: &[String],
     descriptions: &[String],
     layout: &PromptLayout,
-) -> Vec<String> {
+    letters: &[String],
+) -> Result<Vec<String>, CompileError> {
+    if let Some(options_label) = layout.options_label {
+        let texts: Vec<String> = labels
+            .iter()
+            .enumerate()
+            .map(|(index, label)| match descriptions.get(index) {
+                Some(description) if !description.is_empty() => format!("{label}: {description}"),
+                _ => label.clone(),
+            })
+            .collect();
+        let letters = if letters.is_empty() {
+            code_candidates().into_iter().take(labels.len()).collect()
+        } else {
+            letters.to_vec()
+        };
+        // mammoth's, the one coded layout: a two-letter code asks for a label
+        let closing = if letters.iter().any(|letter| letter.chars().count() > 1) {
+            MAMMOTH_LABEL_CLOSING
+        } else {
+            MAMMOTH_CLOSING
+        };
+        let question = if question.is_empty() {
+            layout.empty_question
+        } else {
+            question
+        };
+        return Ok(vec![format!(
+            "{}{}{question}{options_label}{}{}",
+            layout.question_separator.unwrap_or(JOIN_QUESTION_SEP),
+            layout.choice_label.expect("a choice layout"),
+            coded_options(&texts, &letters, MAMMOTH_OPTION_LINE)?,
+            closing.replace("{letters}", &letters.join(", "))
+        )]);
+    }
     let question = if question.is_empty() {
         CHOICE_QUESTION
     } else {
@@ -737,7 +853,7 @@ fn choice_segments(
         segments.push(decision2_option(label, description));
     }
     segments.push(layout.answer_segments.last().expect("a close").clone());
-    segments
+    Ok(segments)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -805,7 +921,7 @@ fn bind_choice_classify_prompt(
             format!("{question}\n{task_description}")
         };
     }
-    let mut segments = choice_segments(&question, labels, descriptions, layout);
+    let mut segments = choice_segments(&question, labels, descriptions, layout, &recipe.letters)?;
     segments.last_mut().expect("a close").push_str(&turn.1);
     let mut bound = prompt(stored, args, "label");
     bound.preamble = preamble;

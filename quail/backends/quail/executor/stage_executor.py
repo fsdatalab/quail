@@ -259,7 +259,10 @@ class StageExecutor:
                               prefill_tokens=0, pairs=0, kv_read=0, sol_s=0.0)
 
         k = len(self.stages)
-        if prefix_tree is not None and not prefix_tree.shared_tokens:
+        # a non-causal mask reads each document whole: a shared prefix's KV
+        # depends on the document after it, so no document borrows one
+        if prefix_tree is not None and (self.pipeline.mask != "causal"
+                                        or not prefix_tree.shared_tokens):
             prefix_tree = None
         # a whole-sequence anchor is one pass: it asks one request at its
         # start stage, its own or the stage's one suffix
@@ -864,7 +867,7 @@ class StageExecutor:
         chunk = pack_chunk(
             self.torch, self.arena, specs, attention_mode=self.mode,
             staging=self.staging, canvas=self.canvas, answer_row=self.answer_row,
-            decode=decode)
+            decode=decode, mask=self.pipeline.mask)
         for a, tokens in appended.items():
             self.appended[a] = tokens
         for a, start, end in replays:
