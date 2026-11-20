@@ -242,8 +242,10 @@ class ModelSpec:
             raise ValueError(
                 f"{self.name}: checkpoint_layers ({self.checkpoint_layers}) "
                 f"is below layers ({self.layers})")
-        if self.vision_tower and not self.checkpoint_layers and not (
-                self.image_patch_pixels and self.image_merge and self.image_max_pixels):
+        if (self.vision_tower and self.role != "decision"
+                and not self.checkpoint_layers and not (
+                    self.image_patch_pixels and self.image_merge
+                    and self.image_max_pixels)):
             raise ValueError(
                 f"{self.name}: a vision tower needs image_patch_pixels, "
                 "image_merge, and image_max_pixels")

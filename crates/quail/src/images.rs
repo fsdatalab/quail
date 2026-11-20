@@ -45,9 +45,12 @@ impl ImageSizing {
     /// loads no vision encoder.
     pub(crate) fn of_model(model: &serde_json::Value) -> Option<Self> {
         let field = |name: &str| model[name].as_u64().unwrap_or(0);
-        // a spec that loads only some of its checkpoint's layers loads no
-        // vision encoder
-        if !model["vision_tower"].as_bool().unwrap_or(false) || field("checkpoint_layers") != 0 {
+        // a spec that loads only some of its checkpoint's layers, or a
+        // decision model, loads no vision encoder
+        if !model["vision_tower"].as_bool().unwrap_or(false)
+            || model["role"].as_str() == Some("decision")
+            || field("checkpoint_layers") != 0
+        {
             return None;
         }
         let token_pixels =
@@ -376,6 +379,9 @@ mod tests {
         let mut partial = spec.clone();
         partial["checkpoint_layers"] = 24.into();
         assert_eq!(ImageSizing::of_model(&partial), None);
+        let mut decision = spec;
+        decision["role"] = "decision".into();
+        assert_eq!(ImageSizing::of_model(&decision), None);
         assert_eq!(
             ImageSizing::of_model(&serde_json::json!({"vision_tower": false})),
             None
