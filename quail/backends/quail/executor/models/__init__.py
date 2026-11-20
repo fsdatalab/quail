@@ -32,12 +32,11 @@ def build_pipeline(spec, model, arena, **kwargs) -> ModelPipeline:
         raise ValueError(
             f"no forward pass for architecture {spec.arch!r}; "
             f"known: {sorted(PIPELINES)}") from None
-    pipeline = cls(model, arena, spec=spec, **kwargs)
-    if pipeline.mask != pipeline_mask(spec):
-        raise ValueError(f"the {spec.arch} forward pass runs the "
-                         f"{pipeline.mask} mask, not {spec.name}'s "
+    if pipeline_mask(spec) not in cls.masks:
+        raise ValueError(f"the {spec.arch} forward pass runs only the "
+                         f"{', '.join(cls.masks)} mask, not {spec.name}'s "
                          f"{pipeline_mask(spec)}")
-    return pipeline
+    return cls(model, arena, spec=spec, **kwargs)
 
 
 __all__ = ["ModelPipeline", "PIPELINES", "build_pipeline", "supported_archs"]

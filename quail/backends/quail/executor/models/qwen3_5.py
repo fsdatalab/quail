@@ -47,6 +47,7 @@ class Qwen35Pipeline(ModelPipeline):
     warm_row_classes = False
     warm_joins = False
     gemm_warmup = False
+    masks = ("causal", "document_isolated")
     # the vision encoder, and the images the running region's documents
     # hold (executor/images.py)
     visual = None

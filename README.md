@@ -85,7 +85,11 @@ functions, and classifies only the reviews that `AI.IF` keeps.
 The [SQL reference](https://fsdatalab.github.io/quail/docs/user-guide/sql)
 describes each function. The model decides which functions you can use;
 [Supported models and GPUs](https://fsdatalab.github.io/quail/docs/user-guide/models)
-lists the models and the GPU each one needs.
+lists the models and the GPU each one needs. They include Qwen3, Qwen3.5
+(4B, 9B, and 27B), Qwen3.6, Qwen3.8, and LFM2, and Base Labs' decision
+models mammoth-1 and elephant-1. mammoth-1 and elephant-1 are fine-tunes
+of Qwen3.5 27B and 9B, and run `AI.IF` filters, `AI.SCORE`, and
+`AI.CLASSIFY` on H100 and B200.
 
 ## Quail Server
 

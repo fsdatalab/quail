@@ -57,7 +57,8 @@ class ModelPipeline:
     reads paged KV only. warm_tokens are the chunk sizes the warmup
     builds one small chunk of: a gated sequence's trailing chunks are
     100-500 tokens, a shape the full-size warm chunks do not cover.
-    mask is the keys each unified row reads, one of attention.MASKS.
+    mask is the keys each unified row reads, one of attention.MASKS;
+    masks lists the ones the forward pass can run.
     """
 
     engine = None
@@ -67,6 +68,7 @@ class ModelPipeline:
     canvas_answer_row = 0
     needs_pages = False
     mask = "causal"
+    masks = ("causal",)
     tree_attention = True
     gemm_warmup = True
     warm_row_classes = True    # row-count classes keep one KV row per reader

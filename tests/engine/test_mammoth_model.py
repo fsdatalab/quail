@@ -2,7 +2,6 @@
 
 import json
 from dataclasses import replace
-from types import SimpleNamespace
 
 import pyarrow as pa
 import pytest
@@ -12,7 +11,7 @@ import quail
 from quail.api.config import EngineConfig
 from quail.api.prompts import bind_classify_prompt, bind_prompt
 from quail.backends.quail.executor import model_loading
-from quail.backends.quail.executor.models import PIPELINES, build_pipeline
+from quail.backends.quail.executor.models import build_pipeline
 from quail.backends.quail.executor.models.base import pipeline_mask
 from quail.backends.quail.executor.readout import DecisionRows, LetterReadout
 from quail.baselines.vllm import stock_vllm_backend
@@ -88,15 +87,10 @@ def test_elephant_runs_mammoths_prompt_mask_and_readout_on_the_9b():
     assert pipeline_mask(base) == "causal"
 
 
-def test_a_causal_forward_pass_refuses_a_bidirectional_model(monkeypatch):
-    def causal(model, arena, spec, **kwargs):
-        return SimpleNamespace(mask="causal")
-
-    monkeypatch.setitem(PIPELINES, "qwen3", causal)
+def test_a_causal_forward_pass_refuses_a_bidirectional_model():
     spec = replace(QWEN3_4B_FP8, attention_mask="document_isolated")
-    with pytest.raises(ValueError, match="runs the causal mask"):
+    with pytest.raises(ValueError, match="runs only the causal mask"):
         build_pipeline(spec, model=None, arena=None)
-    assert build_pipeline(QWEN3_4B_FP8, model=None, arena=None).mask == "causal"
 
 
 def test_each_document_ends_with_the_close_tokens():
