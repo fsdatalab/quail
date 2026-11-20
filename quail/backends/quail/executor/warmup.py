@@ -243,11 +243,13 @@ def _warm_row_classes(torch, arena, pipeline, attention_mode):
 
     cached = ROW_CLASS_CACHED
     readers = max(m for _, m in ROW_CLASSES)
-    # each reader and the filler hold a Gated DeltaNet checkpoint slot
+    # each reader holds its document's checkpoint and a second slot for
+    # the token it keeps, and the filler holds one
+    needed = 2 * readers + 1
     slots = getattr(arena, "num_state_slots", 0)
-    if slots and slots < readers + 1:
-        logger.debug("kernels: %d checkpoint slots hold no %d row-class "
-                     "documents; skipping", slots, readers + 1)
+    if slots and slots < needed:
+        logger.debug("kernels: %d checkpoint slots, %d needed for the row "
+                     "classes; skipping", slots, needed)
         return
     keys = [("warm-rows", index) for index in range(readers)]
     prefix = list(range(10, 10 + cached))
