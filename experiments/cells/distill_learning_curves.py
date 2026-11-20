@@ -124,12 +124,26 @@ def _auc(scores, positive):
 
 
 def _metrics(scores, data):
+    """Score a student against the teacher's TRUE set on the test reviews.
+
+    Returns:
+        Agreement, precision, recall, and F1 of the student's TRUE set at
+        threshold 0, AUC, correlation with the teacher's margin, and
+        each test review's score.
+    """
     import numpy as np
     margins = data["margins"][data["test"]]
     positive = margins > 0
-    return {"agreement": float(((scores > 0) == positive).mean()),
+    passed = scores > 0
+    both = int((passed & positive).sum())
+    precision = both / max(1, int(passed.sum()))
+    recall = both / max(1, int(positive.sum()))
+    return {"agreement": float((passed == positive).mean()),
+            "precision": precision, "recall": recall,
+            "f1": 2 * precision * recall / max(1e-9, precision + recall),
             "auc": _auc(scores, positive),
-            "pearson_margin": float(np.corrcoef(scores, margins)[0, 1])}
+            "pearson_margin": float(np.corrcoef(scores, margins)[0, 1]),
+            "scores": np.round(scores, 4).tolist()}
 
 
 def _padded(torch, sequences, pad_id):
@@ -203,8 +217,17 @@ def _score_all(torch, data, inputs, indices, score):
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3 * 3600,
               volumes=VOLUMES)
-def frozen() -> list:
-    """Score the zero-shot student and fit probes on its frozen states."""
+def frozen(run_dir: str) -> list:
+    """Score the zero-shot student and save its frozen states.
+
+    Args:
+        run_dir: The run's directory on the results volume; the states
+            go to student_features.npz there, for `probes`.
+
+    Returns:
+        The zero-shot record.
+    """
+    import numpy as np
     import torch
 
     data = _load()
@@ -217,23 +240,30 @@ def frozen() -> list:
                          ("document", data["documents"])):
         features[name] = _features(torch, backbone, inputs, data["pad_id"])
     feature_seconds = time.perf_counter() - started
+    results.reload()
+    os.makedirs(run_dir, exist_ok=True)
+    np.savez(f"{run_dir}/student_features.npz",
+             direction=direction.cpu().numpy(), **features)
+    results.commit()
+    zero_shot = features["answer"][data["test"]] @ direction.cpu().numpy()
+    return [dict(setup="zero_shot", num_labels=0, seed=0,
+                 feature_seconds=feature_seconds, **_metrics(zero_shot, data))]
+
+
+def probes(data, features) -> list:
+    """Fit a probe on each frozen state at every label count and draw."""
     records = []
-    zero_shot = (features["answer"][data["test"]] @ direction.cpu().numpy())
-    records.append(dict(setup="zero_shot", num_labels=0, seed=0,
-                        **_metrics(zero_shot, data)))
     for name in ("answer", "document"):
         for num_labels, seeds in DRAWS.items():
             for seed in seeds:
                 train = _draw(data["pool"], num_labels, seed)
                 started = time.perf_counter()
-                scores = _probe(torch, features[name], data["margins"], train,
+                scores = _probe(features[name], data["margins"], train,
                                 data["test"])
                 records.append(dict(
                     setup=f"frozen_{name}_probe", num_labels=num_labels,
                     seed=seed, train_seconds=time.perf_counter() - started,
                     **_metrics(scores, data)))
-    for record in records:
-        record["feature_seconds"] = feature_seconds
     return records
 
 
@@ -250,14 +280,15 @@ def _features(torch, backbone, inputs, pad_id):
     return out
 
 
-def _probe(torch, features, margins, train, test):
+def _probe(features, margins, train, test):
     """Fit a standardized linear probe to sigmoid(margin); score the test set."""
-    x = torch.tensor(features[train], device="cuda")
+    import torch
+    x = torch.tensor(features[train])
     mean, scale = x.mean(0), x.std(0) + 1e-4
     x = (x - mean) / scale
-    target = torch.sigmoid(torch.tensor(margins[train], device="cuda"))
-    weight = torch.zeros(x.shape[1], device="cuda", requires_grad=True)
-    bias = torch.zeros((), device="cuda", requires_grad=True)
+    target = torch.sigmoid(torch.tensor(margins[train]))
+    weight = torch.zeros(x.shape[1], requires_grad=True)
+    bias = torch.zeros((), requires_grad=True)
     optimizer = torch.optim.LBFGS([weight, bias], max_iter=500,
                                   line_search_fn="strong_wolfe")
 
@@ -269,9 +300,9 @@ def _probe(torch, features, margins, train, test):
         return loss
 
     optimizer.step(closure)
-    x_test = (torch.tensor(features[test], device="cuda") - mean) / scale
+    x_test = (torch.tensor(features[test]) - mean) / scale
     with torch.no_grad():
-        return (x_test @ weight + bias).cpu().numpy()
+        return (x_test @ weight + bias).numpy()
 
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3 * 3600,
@@ -299,6 +330,9 @@ def trained(setup: str) -> list:
             hidden = backbone.config.hidden_size
             projection = torch.nn.Linear(hidden, states.shape[1], bias=False,
                                          device="cuda")
+            # a random projection read through the teacher's direction
+            # starts with logits in the hundreds
+            torch.nn.init.zeros_(projection.weight)
             probe = torch.nn.Linear(hidden, 1, device="cuda")
             heads = {"margin_state": projection, "document_probe": probe}.get(setup)
 
@@ -355,22 +389,31 @@ def trained(setup: str) -> list:
                 train_seconds=train_seconds,
                 eval_seconds=time.perf_counter() - started,
                 **_metrics(scores, data)))
-            print(json.dumps(records[-1]), flush=True)
+            print(json.dumps({key: value for key, value in records[-1].items()
+                              if key != "scores"}), flush=True)
             del model, base, optimizer, projection, probe
             torch.cuda.empty_cache()
     return records
 
 
 @app.function(image=image, timeout=4 * 3600, volumes=VOLUMES)
-def run_all() -> str:
-    """Run every setup, each in its own container, and save the records."""
+def run_all(setups: list) -> str:
+    """Run the frozen student and each trained setup in its own container.
+
+    Args:
+        setups: The trained setups to run.
+
+    Returns:
+        The path of the saved records.
+    """
     run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    pending = frozen.spawn()
-    records = [record for part in trained.map(TRAINED) for record in part]
+    run_dir = f"/results/distillation/learning_curves/{run_id}-imdb1-sf05"
+    pending = frozen.spawn(run_dir)
+    records = [record for part in trained.map(setups) for record in part]
     records = pending.get() + records
-    path = f"/results/distillation/learning_curves/{run_id}-imdb1-sf05.json"
+    path = f"{run_dir}/records.json"
     results.reload()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.makedirs(run_dir, exist_ok=True)
     with open(path, "w") as out:
         json.dump({"trace": TRACE_DIR, "student": STUDENT,
                    "student_revision": STUDENT_REVISION, "num_test": NUM_TEST,
@@ -383,7 +426,8 @@ def run_all() -> str:
 
 
 @app.local_entrypoint()
-def main():
-    """Start the run and print its function call id."""
-    call = run_all.spawn()
+def main(setups: str = ",".join(TRAINED)):
+    """Start the run, print its function call id, and wait for its records."""
+    call = run_all.spawn(setups.split(","))
     print(f"function call id: {call.object_id} (learning curves)", flush=True)
+    print(call.get(), flush=True)
