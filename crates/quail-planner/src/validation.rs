@@ -11,6 +11,7 @@ use crate::context::PlanningContext;
 use crate::error::{CompileError, Refusal};
 use crate::expressions::asked_call;
 use crate::expressions::{aliased_call, call_aliases, repr_str};
+use crate::lowering::score_token_parts;
 use crate::operators::Operators;
 use crate::plan_statistics::plan_prompts;
 use crate::prompts::prompt_layout;
@@ -293,31 +294,45 @@ fn bidirectional_refusal(
             "checked devices",
         )));
     }
-    // a document's block is computed in one pass: its rows read every
-    // later row of it, so it cannot be split across chunks
-    let Some(prompt) = plan_prompts(found).into_iter().find(|p| p.kind != "score") else {
-        return Ok(None);
-    };
+    // each document and its first question run in one pass: document rows
+    // read every later row of the block, so no pass splits a document
     let close = prompt_layout(&model.prompt_layout)?.document_close;
-    let block = (context.lowered(&prompt)?.preamble_token_ids.len()
-        + (context.tokenizer)(close)?.len()) as i64
-        + context
+    let close_tokens = if close.is_empty() {
+        0
+    } else {
+        (context.tokenizer)(close)?.len() as i64
+    };
+    let mut longest_pass = 0;
+    for prompt in plan_prompts(found) {
+        let Some(alias) = prompt_aliases(&prompt).into_iter().next() else {
+            continue;
+        };
+        let document = context
             .document_tokens
-            .values()
-            .flatten()
-            .copied()
-            .max()
+            .get(&alias)
+            .and_then(|lengths| lengths.iter().copied().max())
             .unwrap_or(0);
+        let fixed = if prompt.kind == "score" {
+            score_token_parts(&prompt, &context.prompt_model(), context.tokenizer)?
+                .iter()
+                .map(|part| part.len() as i64)
+                .sum()
+        } else {
+            let lowered = context.lowered(&prompt)?;
+            (lowered.preamble_token_ids.len() + lowered.tail_token_ids.len()) as i64
+        };
+        longest_pass = longest_pass.max(document + close_tokens + fixed);
+    }
     let chunk = chunk_budget(model, device);
-    if block > chunk {
+    if longest_pass > chunk {
         return Ok(Some(Refusal::new(
             format!(
-                "{} computes each document in one pass, but a document's block is {block} \
+                "{} computes each document and its first question in one pass of {longest_pass} \
                  tokens, more than the {chunk}-token chunk",
                 model.name
             ),
             "bidirectional_document_exceeds_chunk",
-            block as f64,
+            longest_pass as f64,
             chunk as f64,
             "tokens",
         )));

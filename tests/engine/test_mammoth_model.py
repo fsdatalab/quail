@@ -296,16 +296,49 @@ def test_the_speed_of_light_counts_the_close_in_each_document(session):
 
 
 def test_a_mammoth_document_longer_than_a_chunk_is_refused():
-    # the byte-level test tokenizer gives one token per character
+    from types import SimpleNamespace
+
+    from helpers.fakes import plain_arena
+    from helpers.planted_model import host_torch
+
+    from quail.backends.quail.executor.stage_executor import StageExecutor
+    from quail.backends.quail.executor.stages import Stage
+    from quail.common.budgets import chunk_budget
+
+    # the byte-level test tokenizer gives one token per character: a
+    # document whose own block fits the chunk is still refused when its
+    # first question pushes the pass past the chunk
+    chunk = chunk_budget(MAMMOTH, H100_SXM)
     config = EngineConfig(model=MAMMOTH.name, device="h100-sxm")
     with quail.Session(config, tokenizer=TOKENIZER) as session:
         session.register("documents", DocumentProvider.from_table(
-            pa.table({"id": [1], "body": ["x" * 40_000]}), id_col="id"))
-        refused = session.sql(
+            pa.table({"id": [1], "body": ["x" * (chunk - 225)]}), id_col="id"))
+        for query in (
             "SELECT d.id FROM documents d "
-            "WHERE AI_FILTER(PROMPT('Asks for a refund? {0}', d.body))").plan()
-    assert isinstance(refused, Refusal)
-    assert refused.constraint == "bidirectional_document_exceeds_chunk"
+            "WHERE AI_FILTER(PROMPT('Asks for a refund? {0}', d.body))",
+            "SELECT d.id, AI.SCORE(PROMPT('Asks for a refund? {0}', d.body)) AS s "
+            "FROM documents d",
+        ):
+            refused = session.sql(query).plan()
+            assert isinstance(refused, Refusal)
+            assert refused.constraint == "bidirectional_document_exceeds_chunk"
+
+    pipeline = SimpleNamespace(
+        mask="document_isolated", needs_pages=True, whole_sequences=False,
+        tree_attention=False, canvas_ids=(), canvas_answer_row=0)
+    readout = SimpleNamespace(dtype=None, trailing_rows=1)
+    executor = StageExecutor(
+        host_torch(), plain_arena(64), pipeline,
+        [Stage(suffixes=[[99] * 20], readout=readout, single=True)],
+        [[1] * 60, [2] * 70], budget=100, attention_mode="unified")
+    assert not executor.sched.chunked_prefill
+    assert executor.sched.next_chunk(64) == [(0, 0, 0, 1, True)]
+    assert executor.sched.take_prefills() == []
+    with pytest.raises(ValueError, match="without chunked prefill"):
+        StageExecutor(
+            host_torch(), plain_arena(64), pipeline,
+            [Stage(suffixes=[[99] * 20], readout=readout, single=True)],
+            [[1] * 90], budget=100, attention_mode="unified")
 
 
 def test_stock_vllm_refuses_mammoth_which_it_would_run_causal():

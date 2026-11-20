@@ -138,9 +138,15 @@ fn score_input_tokens(
 ) -> Result<(i64, i64), CompileError> {
     let parts = &spec.prompt_token_parts;
     let canvas = context.model.canvas_tokens;
+    let close = prompt_layout(&context.model.prompt_layout)?.document_close;
+    let close_tokens = if close.is_empty() {
+        0
+    } else {
+        (context.tokenizer)(close)?.len() as i64
+    };
     let mut longest = Vec::new();
     for alias in &spec.aliases {
-        longest.push(context.lengths(alias)?.iter().copied().max().unwrap_or(0));
+        longest.push(context.lengths(alias)?.iter().copied().max().unwrap_or(0) + close_tokens);
     }
     if spec.aliases.len() == 1 {
         return Ok((
