@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation
+    url: https://fsdatalab.github.io/quail
+    about: Quickstart, SQL reference, and supported models and GPUs.
+  - name: QUAIL-B
+    url: https://github.com/fsdatalab/quail-bench
+    about: Benchmark queries and datasets.
