@@ -646,3 +646,27 @@ def test_a_condition_keeps_sqls_nulls_checks_its_types_and_reads_back_from_a_pla
     read = decode_plan_value(written.to_json())
     rows = pa.table({"stars": [5, 1, None]})
     assert read.evaluate(rows).to_pylist() == [True, False, None]
+
+
+def test_an_ai_join_pairs_nan_keys_as_datafusion_does():
+    # DataFusion's = holds for NaN and NaN, and for 0.0 and -0.0
+    left = pa.table({"id": ["r0", "r1", "r2"], "body": ["b0", "b1", "b2"],
+                     "x": [0.0, -0.0, float("nan")]})
+    right = pa.table({"id": ["l0", "l1"], "topic": ["t0", "t1"],
+                      "x": [0.0, float("nan")]})
+    with Transcripts({"r": left, "l": right}, lambda kind, prompt, rows: True) as runs:
+        assert_transcript(runs.query(
+            "SELECT r.id, l.id FROM r JOIN l ON r.x = l.x "
+            "AND AI.IF(PROMPT('{0} vs {1}', r.body, l.topic))"), """\
+--- SELECT r.id, l.id FROM r JOIN l ON r.x = l.x AND AI.IF(PROMPT('{0} vs {1}', r.body,
+    l.topic)) ---
+plan
+  __quail_answer_1 = ai_filter('{0} vs {1}', r.body, l.topic), filter: __quail_answer_1,
+      returns: []
+asked 3 of 3
+  '{0} vs {1}': l0+r0 TRUE, l0+r1 TRUE, l1+r2 TRUE
+rows 3
+  r0, l0
+  r1, l0
+  r2, l1
+""")

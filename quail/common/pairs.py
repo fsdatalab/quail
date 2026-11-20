@@ -81,7 +81,7 @@ def _join_key_columns(left, right):
     A float joins an integer only at an integral value; a uint64 joins
     a signed integer as a decimal, so neither side wraps.
     """
-    left, right = (equality_keys(column, nan_equal=False) for column in (left, right))
+    left, right = (equality_keys(column, nan_equal=True) for column in (left, right))
     types = (left.type, right.type)
     if (any(pa.types.is_integer(kind) for kind in types)
             and any(pa.types.is_floating(kind) for kind in types)):
