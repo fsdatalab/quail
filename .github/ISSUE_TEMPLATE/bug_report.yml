@@ -1,0 +1,29 @@
+name: Bug report
+description: Report a bug, crash, or wrong query result.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the bug and expected behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproducer
+    attributes:
+      label: Minimal reproducer
+      description: Minimal SQL query or Python snippet, plus traceback or logs.
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Quail version/commit, model, GPU, and CUDA version.
+      placeholder: 0.2.0 / qwen3.8-27b-nvfp4 / B200 / CUDA 13.0
+    validations:
+      required: true
