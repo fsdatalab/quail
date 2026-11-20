@@ -224,7 +224,9 @@ def _warm_row_classes(torch, arena, pipeline, attention_mode):
 
     Each chunk holds m one-token rows that read a cached document and
     keep their token's KV, as greedy decode rounds do, and one fresh
-    filler document that brings the chunk to n rows.
+    filler document that brings the chunk to n rows. A hybrid model
+    whose arena has fewer checkpoint slots than those documents skips
+    the passes, and a query compiles the kernels when it first runs them.
 
     Args:
         torch: The torch module.
@@ -237,6 +239,12 @@ def _warm_row_classes(torch, arena, pipeline, attention_mode):
 
     cached = ROW_CLASS_CACHED
     readers = max(m for _, m in ROW_CLASSES)
+    # each reader and the filler hold a Gated DeltaNet checkpoint slot
+    slots = getattr(arena, "num_state_slots", 0)
+    if slots and slots < readers + 1:
+        logger.debug("kernels: %d checkpoint slots hold no %d row-class "
+                     "documents; skipping", slots, readers + 1)
+        return
     keys = [("warm-rows", index) for index in range(readers)]
     prefix = list(range(10, 10 + cached))
     for key in keys:
