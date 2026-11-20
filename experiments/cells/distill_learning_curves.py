@@ -68,6 +68,8 @@ ACCUMULATE = 4
 EPOCHS = 4
 MIN_STEPS, MAX_STEPS = 60, 800
 EVAL_TOKENS = 65536
+PROBE_PENALTIES = (1e-3, 1e-2, 1e-1, 1.0, 10.0)
+PROBE_FOLDS = 5
 
 
 def _load():
@@ -250,21 +252,40 @@ def frozen(run_dir: str) -> list:
                  feature_seconds=feature_seconds, **_metrics(zero_shot, data))]
 
 
-def probes(data, features) -> list:
-    """Fit a probe on each frozen state at every label count and draw."""
+@app.function(image=image, cpu=8, memory=32768, timeout=3600, volumes=VOLUMES)
+def probes(run_dir: str) -> str:
+    """Fit a probe on each saved frozen state at every label count and draw.
+
+    Args:
+        run_dir: The run's directory, holding student_features.npz.
+
+    Returns:
+        The path of the saved records, probes.json in `run_dir`.
+    """
+    import numpy as np
+
+    data = _load()
+    features = np.load(f"{run_dir}/student_features.npz")
     records = []
     for name in ("answer", "document"):
         for num_labels, seeds in DRAWS.items():
             for seed in seeds:
                 train = _draw(data["pool"], num_labels, seed)
                 started = time.perf_counter()
-                scores = _probe(features[name], data["margins"], train,
-                                data["test"])
+                scores, penalty = _probe(features[name], data["margins"], train,
+                                         data["test"])
                 records.append(dict(
                     setup=f"frozen_{name}_probe", num_labels=num_labels,
-                    seed=seed, train_seconds=time.perf_counter() - started,
+                    seed=seed, penalty=penalty,
+                    train_seconds=time.perf_counter() - started,
                     **_metrics(scores, data)))
-    return records
+    path = f"{run_dir}/probes.json"
+    results.reload()
+    with open(path, "w") as out:
+        json.dump({"penalties": list(PROBE_PENALTIES), "folds": PROBE_FOLDS,
+                   "records": records}, out, indent=1)
+    results.commit()
+    return path
 
 
 def _features(torch, backbone, inputs, pad_id):
@@ -280,8 +301,8 @@ def _features(torch, backbone, inputs, pad_id):
     return out
 
 
-def _probe(features, margins, train, test):
-    """Fit a standardized linear probe to sigmoid(margin); score the test set."""
+def _fit_probe(features, margins, train, test, penalty):
+    """Fit a standardized linear probe to sigmoid(margin); score `test`."""
     import torch
     x = torch.tensor(features[train])
     mean, scale = x.mean(0), x.std(0) + 1e-4
@@ -295,7 +316,7 @@ def _probe(features, margins, train, test):
     def closure():
         optimizer.zero_grad()
         loss = torch.nn.functional.binary_cross_entropy_with_logits(
-            x @ weight + bias, target) + 1e-2 * weight.square().sum() / len(train)
+            x @ weight + bias, target) + penalty * weight.square().sum()
         loss.backward()
         return loss
 
@@ -303,6 +324,24 @@ def _probe(features, margins, train, test):
     x_test = (torch.tensor(features[test]) - mean) / scale
     with torch.no_grad():
         return (x_test @ weight + bias).numpy()
+
+
+def _probe(features, margins, train, test):
+    """Fit a probe, its L2 penalty chosen by 5-fold agreement on `train`."""
+    import numpy as np
+    folds = np.array_split(np.random.default_rng(0).permutation(train),
+                           PROBE_FOLDS)
+
+    def held_out_agreement(penalty):
+        agreement = 0.0
+        for index, fold in enumerate(folds):
+            rest = np.concatenate(folds[:index] + folds[index + 1:])
+            scores = _fit_probe(features, margins, rest, fold, penalty)
+            agreement += ((scores > 0) == (margins[fold] > 0)).mean()
+        return agreement
+
+    penalty = max(PROBE_PENALTIES, key=held_out_agreement)
+    return _fit_probe(features, margins, train, test, penalty), penalty
 
 
 @app.function(image=image, gpu="H100!", memory=98304, timeout=3 * 3600,
