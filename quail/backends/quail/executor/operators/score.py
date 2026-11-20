@@ -382,17 +382,20 @@ class ScoreOperator(SingleNodeOperator):
 
         prefixes = DocumentPrefixes(head, documents[alias], document_ids)
         # the question is the frame and its last token the cue; a mask
-        # that keeps no question KV reads the whole tail as the suffix
-        frame, cue = ((list(tail[:-1]), [tail[-1]])
-                      if self.state.loaded_model.pipeline.mask == "causal"
+        # that keeps no question KV reads the whole tail as the suffix and
+        # shares no prefix, since a prefix's KV depends on the document
+        causal = self.state.loaded_model.pipeline.mask == "causal"
+        frame, cue = ((list(tail[:-1]), [tail[-1]]) if causal
                       else ([], list(tail)))
         self.stages = [Stage(suffixes=[cue], readout=score_readout(self.state),
                              frame=frame, decide=keep, single=True,
                              label=f"score {spec.name}")]
         self.total = sum(len(head) + len(documents[alias][document_id]) + len(tail)
                          for document_id in document_ids)
-        self.table = _table(prefixes, self._keys(prefixes), shared_prefix_tree(
-            spec.name, prefixes, self.state.loaded_model.arena))
+        tree = (shared_prefix_tree(spec.name, prefixes,
+                                   self.state.loaded_model.arena)
+                if causal else None)
+        self.table = _table(prefixes, self._keys(prefixes), tree)
 
     def _drawn(self, documents) -> None:
         """Score documents with reproducible diffusion draws.
