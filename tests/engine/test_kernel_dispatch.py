@@ -88,6 +88,7 @@ def test_the_gated_delta_rule_passes_bounds_flashinfer_takes_on_each_gpu(
     monkeypatch.setitem(sys.modules, "flashinfer.gdn_prefill", prefill)
     rows = torch.zeros(4, 1, 2)
     bounds = torch.tensor([0, 4], dtype=torch.int32)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     for capability in ((9, 0), (10, 0)):
         monkeypatch.setattr(torch.cuda, "get_device_capability",
                             lambda *_, capability=capability: capability)
