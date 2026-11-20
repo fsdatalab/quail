@@ -473,10 +473,8 @@ def _flashinfer_delta_rule(q, k, v, g, beta, state, cu_seqlens,
         kwargs["state_indices"] = state_indices
     # FlashInfer 0.6.18 passes the bounds unconverted to the context-parallel
     # kernel it picks for few sequences: int32 on SM100, int64 on SM90
-    bounds = cu_seqlens
-    if torch.cuda.is_available():
-        major = torch.cuda.get_device_capability(q.device)[0]
-        bounds = cu_seqlens.int() if major == 10 else cu_seqlens.long()
+    major = torch.cuda.get_device_capability(q.device)[0] if q.is_cuda else 0
+    bounds = cu_seqlens.int() if major == 10 else cu_seqlens.long()
     result = chunk_gated_delta_rule(
         q=q.contiguous(), k=k.contiguous(),
         v=v.contiguous(), g=decay,
@@ -495,9 +493,8 @@ def gated_delta_kernel(q, k, v, g, beta, state, cu_seqlens, scale, *,
     without repeating them. The backend is chosen by gdn_prefill_backend().
     """
     if gdn_prefill_backend() == "flashinfer":
-        # FlashInfer's SM90 chunked-prefill kernel rejects int32 bounds.
         return _flashinfer_delta_rule(
-            q, k, v, g, beta, state, cu_seqlens.long(), output_final_state,
+            q, k, v, g, beta, state, cu_seqlens, output_final_state,
             g_is_exp=g_is_exp)
     from vllm.third_party.flash_linear_attention.ops import (
         chunk_gated_delta_rule,

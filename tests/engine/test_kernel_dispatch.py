@@ -80,13 +80,17 @@ def test_the_gated_delta_rule_passes_bounds_flashinfer_takes_on_each_gpu(
 
     from quail.backends.quail.executor.gdn import _flashinfer_delta_rule
 
+    class CudaRows(torch.Tensor):
+        is_cuda = True
+
     seen = []
     prefill = ModuleType("flashinfer.gdn_prefill")
     prefill.chunk_gated_delta_rule = (
         lambda **kwargs: seen.append(kwargs["cu_seqlens"].dtype) or "out")
     monkeypatch.setitem(sys.modules, "flashinfer", ModuleType("flashinfer"))
     monkeypatch.setitem(sys.modules, "flashinfer.gdn_prefill", prefill)
-    rows = torch.zeros(4, 1, 2)
+    cpu_rows = torch.zeros(4, 1, 2)
+    rows = cpu_rows.as_subclass(CudaRows)
     bounds = torch.tensor([0, 4], dtype=torch.int32)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     for capability in ((9, 0), (10, 0)):
@@ -94,5 +98,12 @@ def test_the_gated_delta_rule_passes_bounds_flashinfer_takes_on_each_gpu(
                             lambda *_, capability=capability: capability)
         _flashinfer_delta_rule(rows, rows, rows, rows[..., 0], rows[..., 0],
                                None, bounds, False)
+    # CPU tensors on a GPU host must not ask CUDA for the CPU's capability
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability",
+        lambda device=None: (_ for _ in ()).throw(ValueError(device)))
+    _flashinfer_delta_rule(
+        cpu_rows, cpu_rows, cpu_rows, cpu_rows[..., 0], cpu_rows[..., 0],
+        None, bounds, False)
     # H100's context-parallel kernel takes int64, B200's int32
-    assert seen == [torch.int64, torch.int32]
+    assert seen == [torch.int64, torch.int32, torch.int64]
