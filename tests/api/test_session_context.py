@@ -379,6 +379,27 @@ def test_a_join_with_a_small_build_side_skips_probe_rows_whose_key_is_absent():
     context.session.close()
 
 
+def test_a_join_hint_that_skips_a_shared_prefix_still_asks_its_borrowers():
+    # the empty document's prompt is a prefix of r0's, and its NULL key
+    # makes the join's hint skip it
+    table = pa.table({"id": ["r0", "r1"], "body": ["a", ""],
+                      "n": pa.array([1, None], pa.int64())})
+    with Transcripts({"r": table}, lambda kind, prompt, rows: 0.25) as runs:
+        assert_transcript(runs.query(
+            "SELECT r.id, (SELECT MAX(AI.SCORE(PROMPT('k {0}', s.body))) "
+            "FROM r s WHERE s.n = r.n) AS m FROM r"), """\
+--- SELECT r.id, (SELECT MAX(AI.SCORE(PROMPT('k {0}', s.body))) FROM r s WHERE s.n =
+    r.n) AS m FROM r ---
+plan
+  __quail_call_1 = ai_score('k {0}', s.body)
+asked 1 of 1
+  'k {0}': r0 0.25
+rows 2
+  r0, 0.25
+  r1, NULL
+""")
+
+
 def test_a_top_k_over_a_join_skips_the_anchors_past_its_threshold():
     # the tables' id columns have different names: a test above the
     # region reads a column by its name

@@ -64,7 +64,12 @@ impl RegionEngine for PythonEngine {
             let answer = match planned {
                 Some((found, scans)) => {
                     let found = (found, scans_to_pyarrow(py, &scans)?);
-                    let sink = Bound::new(py, RegionSink(sink))?;
+                    // rows finish out of input order, so an ordered
+                    // region returns them all once it ends
+                    let sink = match model_region.has_sorted_input() {
+                        true => py.None(),
+                        false => Bound::new(py, RegionSink(sink))?.into_any().unbind(),
+                    };
                     let hint = hint
                         .map(|hint| Bound::new(py, InputHint(hint)))
                         .transpose()?;

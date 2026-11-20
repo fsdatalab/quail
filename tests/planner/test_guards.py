@@ -420,3 +420,24 @@ def test_a_guarded_ai_call_is_priced_on_the_rows_its_guard_passes(session):
     assert guarded.expected_rows == pytest.approx(0.8 * everything.expected_rows)
 
 
+
+
+def test_a_classification_guarded_by_an_extraction_runs_after_the_extraction():
+    assert_transcript(_transcript(
+        f"SELECT r.id FROM reviews r WHERE {EXTRACT}['w'] = 'b1' OR {TONE} = 'a'"), """\
+--- SELECT r.id FROM reviews r WHERE AI.EXTRACT(r.body, {'w': 'Which word?'})['w'] =
+    'b1' OR AI_CLASSIFY(PROMPT('tone: {0}', r.body), ['a', 'b']) = 'a' ---
+plan
+  __quail_column_2 = ai_classify('tone: {0}', r.body, make_array('a', 'b')), guard: NOT
+      get_field(__quail_column_1, 'w') = 'b1' IS TRUE
+  __quail_column_1 = ai_extract(r.body, named_struct('w', 'Which word?')), returns:
+      [__quail_column_1]
+asked 11 of 12
+  'Which word?': r0 'b0', r1 'b1', r2 'b2', r3 'b3', r4 'b4', r5 'b5'
+  'tone: {0}': r0 'a', r2 'a', r3 'b', r4 'a', r5 'b'
+rows 4
+  r0
+  r1
+  r2
+  r4
+""")

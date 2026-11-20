@@ -11,6 +11,7 @@
 
 <p align="center">
   <a href="https://pypi.org/project/quail-engine/"><img src="https://img.shields.io/pypi/v/quail-engine" alt="PyPI"></a>
+  <a href="https://crates.io/crates/quail-engine"><img src="https://img.shields.io/crates/v/quail-engine" alt="crates.io"></a>
   <a href="https://fsdatalab.github.io/quail"><img src="https://img.shields.io/badge/docs-fsdatalab.github.io%2Fquail-blue" alt="Docs"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License: MIT"></a>
 </p>

@@ -777,6 +777,20 @@ fn computed_arguments(node: &AiNode) -> Result<Option<LogicalPlan>> {
         .map(Expr::Column)
         .collect();
     exprs.push(node.call.clone().alias(&node.answer));
+    if let Expr::ScalarFunction(call) = &node.call
+        && call.name() == "ai_extract"
+    {
+        // an extraction's node also returns its spans
+        let spans = Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
+            crate::rules::lower::quail_function("ai_extract_span"),
+            call.args.clone(),
+        ));
+        exprs.push(spans.alias(format!(
+            "{}{}",
+            node.answer,
+            quail_planner::constants::SPAN_SUFFIX
+        )));
+    }
     let written = Projection::try_new(exprs, Arc::clone(&node.input))?;
     let computed = crate::rules::lower::precompute_prompt_arguments(written.clone())?;
     if computed == written {

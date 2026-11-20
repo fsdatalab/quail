@@ -866,6 +866,7 @@ impl Executor {
                         });
                     }
                 }
+                let ordered = region.has_sorted_input();
                 let ran = run_on_workers(
                     workers,
                     found,
@@ -877,6 +878,7 @@ impl Executor {
                     rows,
                     observer,
                     Arc::clone(&self.progress),
+                    ordered,
                 )?;
                 self.regions.lock().expect("the regions lock").push(ran);
                 return Ok(());
@@ -944,6 +946,7 @@ fn run_on_workers(
     rows: &RowSender,
     observer: Option<(Observer, bool)>,
     progress: Arc<Mutex<Option<serde_json::Value>>>,
+    ordered: bool,
 ) -> Result<RegionRan> {
     let read = |error: serde_json::Error| DataFusionError::External(Box::new(error));
     let plan: serde_json::Value = serde_json::from_str(&found).map_err(read)?;
@@ -990,10 +993,15 @@ fn run_on_workers(
         answers: matches!(observer, Some((_, true))),
     };
     *progress.lock().expect("the progress lock") = None;
-    let sender = rows.clone();
+    let conformed = Arc::new(conformed);
+    let (sender, conform_rows) = (rows.clone(), Arc::clone(&conformed));
     let on_rows = Arc::new(move |batch: RecordBatch| {
-        // the receiver is gone once DataFusion stops reading
-        let _ = sender.send(RegionRows::Batch(Ok(conformed(batch)?)));
+        // rows finish out of input order, so an ordered region sends
+        // them all once it ends
+        if !ordered {
+            // the receiver is gone once DataFusion stops reading
+            let _ = sender.send(RegionRows::Batch(Ok(conform_rows(batch)?)));
+        }
         Ok(())
     });
     let listener = observer.clone();
@@ -1024,9 +1032,13 @@ fn run_on_workers(
     let ran =
         crate::region_run::run_region(&mut workers, &planned, &listening, &finished, on_rows, ask)?;
     let seconds = started.elapsed().as_secs_f64();
-    let rows = (finished.lock().expect("the rows lock"))
+    let built = (finished.lock().expect("the rows lock"))
         .rows()
         .map_err(crate::workers::failure)?;
+    if ordered {
+        let _ = rows.send(RegionRows::Batch(Ok(conformed(built.clone())?)));
+    }
+    let rows = built;
     Ok(RegionRan {
         planned: found,
         scans,

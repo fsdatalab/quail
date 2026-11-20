@@ -4,6 +4,7 @@ import pyarrow as pa
 import pytest
 from helpers.oracle import Oracle, finish
 from helpers.sessions import TOKENIZER
+from helpers.transcript import Transcripts, assert_transcript
 
 import quail
 from quail.api.config import EngineConfig
@@ -68,3 +69,45 @@ def test_a_limit_stops_an_ai_filter_and_a_distinct_returns_each_value_once(sessi
                                 "refund" in (BODIES[document] or "") or document == 5))
     assert rows.collect().to_pylist() == [{"r.stars": 1}, {"r.stars": 2}]
     assert "AggregateExec" in query.explain()
+
+
+def test_a_sorted_limit_keeps_the_order_when_an_extraction_finishes_early():
+    # r3's extraction has no answer, so it finishes before the others
+    table = pa.table({"id": [f"r{index}" for index in range(6)],
+                      "body": [f"w{index} x" for index in range(6)]})
+
+    def answer(kind, prompt, rows):
+        return None if rows[0] == "r3" else f"w{rows[0][1:]}"
+
+    extract = "AI.EXTRACT(r.body, {'w': 'Which word?'})['w']"
+    with Transcripts({"r": table}, answer) as runs:
+        assert_transcript("\n".join(runs.query(sql, ordered=True) for sql in (
+            f"SELECT r.id, {extract} AS w FROM r ORDER BY r.id LIMIT 5",
+            f"SELECT r.id, {extract} AS w FROM r ORDER BY r.id LIMIT 100 OFFSET 3")),
+        """\
+--- SELECT r.id, AI.EXTRACT(r.body, {'w': 'Which word?'})['w'] AS w FROM r ORDER BY r.id
+    LIMIT 5 ---
+plan
+  __quail_call_1 = ai_extract(r.column_1, named_struct('w', 'Which word?')), fetch: 5,
+      returns: [__quail_call_1]
+asked 5 of 6
+  'Which word?': r0 'w0', r1 'w1', r2 'w2', r3 NULL, r4 'w4'
+rows 5, in order
+  r0, 'w0'
+  r1, 'w1'
+  r2, 'w2'
+  r3, NULL
+  r4, 'w4'
+
+--- SELECT r.id, AI.EXTRACT(r.body, {'w': 'Which word?'})['w'] AS w FROM r ORDER BY r.id
+    LIMIT 100 OFFSET 3 ---
+plan
+  __quail_call_1 = ai_extract(r.column_1, named_struct('w', 'Which word?')), fetch: 103,
+      returns: [__quail_call_1]
+asked 6 of 6
+  'Which word?': r0 'w0', r1 'w1', r2 'w2', r3 NULL, r4 'w4', r5 'w5'
+rows 3, in order
+  r3, NULL
+  r4, 'w4'
+  r5, 'w5'
+""")
