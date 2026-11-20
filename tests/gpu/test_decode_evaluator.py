@@ -38,11 +38,7 @@ def test_fast_launch_is_bitwise_identical_to_standard_triton():
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 
-    from quail.backends.quail.executor import (
-        decode_attention,
-        gdn_kernels,
-        triton_launch,
-    )
+    from quail.backends.quail.executor import attention, gdn
     from quail.backends.quail.executor.models import qwen3_5_kernels as k
 
     torch.manual_seed(101)
@@ -63,7 +59,7 @@ def test_fast_launch_is_bitwise_identical_to_standard_triton():
     )
     kp = torch.randn(32, 128, 4, 256, device="cuda", dtype=torch.bfloat16) * 0.2
     vp = torch.randn_like(kp)
-    saved_fast = triton_launch.USE_FAST_LAUNCH
+    saved_fast = attention.USE_FAST_LAUNCH
     try:
         for rows in (1, 7, 16, 45, 131):
             x = torch.randn(rows, 5120, device="cuda", dtype=torch.bfloat16)
@@ -94,7 +90,7 @@ def test_fast_launch_is_bitwise_identical_to_standard_triton():
 
             results = []
             for fast in (False, True):
-                triton_launch.USE_FAST_LAUNCH = fast
+                attention.USE_FAST_LAUNCH = fast
                 r_copy = res.clone()
                 fp8, bf16, _ = k.gemma_add_norm(
                     x, r_copy, w, 1e-6, inv_scale=scale, write_bf16=True)
@@ -104,26 +100,22 @@ def test_fast_launch_is_bitwise_identical_to_standard_triton():
                 p_copy = pool.clone()
                 gdn_out = torch.empty(rows, 48, 128, device="cuda",
                                       dtype=torch.bfloat16)
-                gdn_kernels.gdn_decode_step(
+                gdn.gdn_decode_step(
                     conv_out, a, b, a_log, dt_bias, p_copy, state_rows,
                     gdn_out, num_key_heads=16, scale=128 ** -0.5)
-                split_out = decode_attention.triton_splitkv_decode(
+                split_out = attention.triton_splitkv_decode(
                     q3, kp, vp, cu, 1, used, 128, table)
                 results.append((fp8, bf16, r_copy, gn, q, kk, vv, gg, sg,
                                 gdn_out, p_copy, split_out))
             for ref, got in zip(*results):
                 assert torch.equal(got, ref)
     finally:
-        triton_launch.USE_FAST_LAUNCH = saved_fast
+        attention.USE_FAST_LAUNCH = saved_fast
 
 
 def test_pdl_dependent_chains_are_race_free_and_bitwise_identical():
     """Run 200 randomized dependent kernel chains with PDL on vs off."""
-    from quail.backends.quail.executor import (
-        decode_attention,
-        gdn_kernels,
-        triton_launch,
-    )
+    from quail.backends.quail.executor import attention, gdn
     from quail.backends.quail.executor.models import qwen3_5_kernels as k
 
     if torch.cuda.get_device_capability()[0] < 9:
@@ -142,8 +134,8 @@ def test_pdl_dependent_chains_are_race_free_and_bitwise_identical():
     cu = torch.arange(17, device="cuda", dtype=torch.int32)
 
     def run_chain(use_pdl, x, res, conv_out, a, b, z, pool, q3, gate):
-        saved = triton_launch.USE_PDL
-        triton_launch.USE_PDL = use_pdl
+        saved = attention.USE_PDL
+        attention.USE_PDL = use_pdl
         try:
             r = res.clone()
             p = pool.clone()
@@ -152,16 +144,16 @@ def test_pdl_dependent_chains_are_race_free_and_bitwise_identical():
             gdn_out = torch.empty(rows, 48, 128, device="cuda",
                                   dtype=torch.bfloat16)
             state_rows = torch.arange(1, rows + 1, device="cuda")
-            gdn_kernels.gdn_decode_step(
+            gdn.gdn_decode_step(
                 conv_out, a, b, a_log, dt_bias, p, state_rows, gdn_out,
                 num_key_heads=16, scale=128 ** -0.5)
             gn = k.gdn_gated_norm(gdn_out, z, w_gdn, 1e-6, inv_scale=scale)
-            attn_out = decode_attention.triton_splitkv_decode(
+            attn_out = attention.triton_splitkv_decode(
                 q3, kp, vp, cu, 1, used, 500, table)
             gated = k.sigmoid_gate(attn_out.view(16, -1), gate, inv_scale=scale)
             return fp8, bf16, r, gn, p, gated
         finally:
-            triton_launch.USE_PDL = saved
+            attention.USE_PDL = saved
 
     for iteration in range(200):
         torch.manual_seed(1000 + iteration)
@@ -182,7 +174,7 @@ def test_pdl_dependent_chains_are_race_free_and_bitwise_identical():
 
 def test_triton_splitkv_decode_accuracy_zero_recompiles_and_speed():
     """Verify accuracy against fp32 dense attention and zero mid-query compiles."""
-    from quail.backends.quail.executor import decode_attention as d
+    from quail.backends.quail.executor import attention as d
 
     torch.manual_seed(303)
     heads, kv_heads, dim, page = 24, 4, 256, 128
@@ -198,7 +190,7 @@ def test_triton_splitkv_decode_accuracy_zero_recompiles_and_speed():
         4, 256, 16, 24, 4, causal=True, max_q=1, dtype=torch.bfloat16)
     small_kp = torch.randn(2, 16, kv_heads, dim, device="cuda",
                            dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="page_tokens divisible"):
+    with pytest.raises(AssertionError):
         d.triton_splitkv_decode(
             torch.randn(1, heads, dim, device="cuda", dtype=torch.bfloat16),
             small_kp, small_kp,
@@ -236,8 +228,9 @@ def test_triton_splitkv_decode_accuracy_zero_recompiles_and_speed():
     run_case([1], [[0]], [64])
     run_case([1], [[0, 1]], [256])
     device = torch.cuda.current_device()
-    part_cache = d._kernels()["splitkv_decode_part"].device_caches[device][0]
-    reduce_cache = d._kernels()["splitkv_decode_reduce"].device_caches[device][0]
+    part_cache = d._splitkv_kernels()["splitkv_decode_part"].device_caches[device][0]
+    reduce_cache = d._splitkv_kernels()["splitkv_decode_reduce"].device_caches[
+        device][0]
     part_count_before = len(part_cache)
     reduce_count_before = len(reduce_cache)
 

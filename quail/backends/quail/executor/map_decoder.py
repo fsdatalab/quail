@@ -63,8 +63,7 @@ class MapDecoder:
     def __init__(self, torch, head, num_documents: int, limits, stop_ids,
                  page_tokens: int, expected_tokens=None, *, workspace_bytes=0,
                  row_budget=None, in_flight: int = IN_FLIGHT):
-        if in_flight < 0:
-            raise ValueError(f"in_flight must be nonnegative, got {in_flight}")
+        assert in_flight >= 0
         self.workspace_bytes = workspace_bytes
         self.row_budget = row_budget
         self.in_flight = in_flight
@@ -428,17 +427,6 @@ class MapDecoder:
         return self.torch.as_tensor(values, dtype=self.torch.int64,
                                     device=self.device)
 
-    def _acquire_host(self, shape):
-        """Return a reusable pinned host buffer at least as large as shape."""
-        rows, width = shape
-        for index, buf in enumerate(self._host_pool):
-            if buf.shape[0] >= rows and buf.shape[1] >= width:
-                self._host_pool.pop(index)
-                return buf, buf[:rows, :width]
-        buf = self.torch.empty((max(rows, 64), width), dtype=self.torch.int64,
-                               pin_memory=self.head.is_cuda)
-        return buf, buf[:rows, :width]
-
     def feed(self, chunk) -> None:
         """Copy each decode row's input token from the token buffer."""
         rows = chunk.decode_rows
@@ -525,7 +513,15 @@ class MapDecoder:
             self._constrain(
                 group, projections[group.key], documents[mine], indices[mine],
                 out=values, output_rows=mine)
-        host_buf, host = self._acquire_host(values.shape)
+        num_rows, num_cols = values.shape
+        host_buf = next(
+            (self._host_pool.pop(i) for i, b in enumerate(self._host_pool)
+             if b.shape[0] >= num_rows and b.shape[1] >= num_cols), None)
+        if host_buf is None:
+            host_buf = torch.empty((max(num_rows, 64), num_cols),
+                                   dtype=torch.int64,
+                                   pin_memory=self.head.is_cuda)
+        host = host_buf[:num_rows, :num_cols]
         host.copy_(values, non_blocking=True)
         event = torch.cuda.Event()
         event.record()
@@ -728,16 +724,11 @@ class MapDecoder:
             self.copy_pending[slots] = ~ready
         if self.answer_stops:
             self._stop_decided(np.unique(documents))
-        self._release_host(copy.buffer)
-
-    def _release_host(self, buf) -> None:
-        """Return a pinned host buffer to the bounded pool."""
-        cap = self.in_flight + 2
-        self._host_pool.append(buf)
-        if len(self._host_pool) > cap:
-            smallest = min(range(len(self._host_pool)),
-                           key=lambda index: self._host_pool[index].numel())
-            self._host_pool.pop(smallest)
+        self._host_pool.append(copy.buffer)
+        if len(self._host_pool) > self.in_flight + 2:
+            self._host_pool.pop(min(
+                range(len(self._host_pool)),
+                key=lambda index: self._host_pool[index].numel()))
 
     def _stop_decided(self, slots) -> None:
         """End each answer whose tests are decided on its tokens so far."""

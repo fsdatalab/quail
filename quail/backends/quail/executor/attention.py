@@ -24,16 +24,340 @@ rotary, as Qwen3 and Gemma 4 have; qkv_norm_rope_heads is its form
 for any head geometry, with Gemma's weightless per-head V norm.
 """
 
-from quail.backends.quail.executor.decode_attention import (
-    TRITON_DECODE_MAX_Q,
-    supports_splitkv_decode,
-    triton_splitkv_decode,
-)
-
 GROUP = 128            # fp8 quant group size, matches the engine
 # FlashAttention 3's widest head; wider heads run FlashAttention 4,
 # whose Hopper build takes heads up to 512, over arena pages.
 FA_MAX_HEAD_DIM = 256
+TRITON_DECODE_MAX_Q = 16
+_SPLITKV_TILE_N = 32
+_SPLITKV_MAX_SPLITS = 16
+_PDL_MAX_ROWS = 512
+
+_COMPILED_TRITON = {}
+_PDL_CAPABLE = {}
+_SM_COUNTS = {}
+_SPLITKV_KERNELS = {}
+USE_FAST_LAUNCH = True
+USE_PDL = True
+
+
+def pdl_enabled(device, rows=None) -> bool:
+    """Return whether Hopper/Blackwell PDL should run for device and rows."""
+    if not USE_PDL or (rows is not None and rows > _PDL_MAX_ROWS):
+        return False
+    import torch
+
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    capable = _PDL_CAPABLE.get(index)
+    if capable is None:
+        capable = _PDL_CAPABLE[index] = (
+            torch.cuda.get_device_capability(index)[0] >= 9)
+    return capable
+
+
+def launch_triton(kernel, grid, args, *, key, kwargs, exact_args=True):
+    """Launch a Triton kernel via its cached compiled handle when safe."""
+    import torch
+    from triton import knobs
+    from triton.runtime import driver
+
+    if (not USE_FAST_LAUNCH or knobs.runtime.debug
+            or knobs.runtime.launch_enter_hook is not None
+            or knobs.runtime.launch_exit_hook is not None
+            or knobs.runtime.add_stages_inspection_hook is not None):
+        return kernel[grid](*args, **kwargs)
+    device = next(
+        (v.device.index if v.device.index is not None else torch.cuda.current_device()
+         for v in args
+         if getattr(getattr(v, "device", None), "type", None) == "cuda"),
+        torch.cuda.current_device())
+    sig = []
+    for value in args:
+        if hasattr(value, "data_ptr"):
+            sig.append((value.dtype, (value.data_ptr() & 15) == 0)
+                       if exact_args else value.dtype)
+        elif exact_args and isinstance(value, int):
+            sig.append((value == 1, (value & 15) == 0,
+                        value < -0x80000000 or value > 0x7FFFFFFF))
+    cache_key = (device, id(kernel), key, tuple(sig))
+    entry = _COMPILED_TRITON.get(cache_key)
+    if entry is None:
+        compiled = kernel[grid](*args, **kwargs)
+        _COMPILED_TRITON[cache_key] = (
+            compiled.run, compiled.function, compiled.packed_metadata)
+        return compiled
+    run, function, metadata = entry
+    stream = driver.active.get_current_stream(device)
+    g1 = grid[1] if len(grid) > 1 else 1
+    g2 = grid[2] if len(grid) > 2 else 1
+    run(grid[0], g1, g2, stream, function, metadata, None, None, None, *args)
+    return None
+
+
+def supports_splitkv_decode(fa_version: int, head_dim: int, page_tokens: int,
+                            num_q_heads: int, num_kv_heads: int, *,
+                            causal: bool, max_q: int, dtype=None) -> bool:
+    """Return whether a paged call should run Triton Split-KV decode."""
+    if dtype is not None:
+        import torch
+
+        if dtype != torch.bfloat16:
+            return False
+    return (fa_version == 4 and head_dim == 256 and causal
+            and 0 < max_q <= TRITON_DECODE_MAX_Q
+            and page_tokens > 0 and page_tokens % _SPLITKV_TILE_N == 0
+            and (head_dim & (head_dim - 1)) == 0
+            and num_kv_heads > 0 and num_q_heads % num_kv_heads == 0)
+
+
+def _splitkv_kernels() -> dict:
+    """Compile the split-KV decode Triton kernels on first use."""
+    if _SPLITKV_KERNELS:
+        return _SPLITKV_KERNELS
+    import triton
+    import triton.language as tl
+
+    # PDL invariant: loads before gdc_wait read only host-staged metadata.
+    @triton.jit(
+        do_not_specialize=[
+            "stride_bt", "max_q", "num_splits", "window_left", "window_right",
+        ],
+        do_not_specialize_on_alignment=[
+            "cu_q_ptr", "seq_lens_ptr", "block_tables_ptr",
+        ],
+    )
+    def splitkv_decode_part(
+        q_ptr, k_ptr, v_ptr, cu_q_ptr, seq_lens_ptr, block_tables_ptr,
+        out_ptr, part_out_ptr, part_lse_ptr,
+        stride_q0, stride_q1, stride_o0, stride_o1,
+        stride_k0, stride_k1, stride_k2, stride_v0, stride_v1, stride_v2,
+        stride_bt, stride_po_q, stride_po_kv, stride_po_s, stride_po_g,
+        stride_pl_q, stride_pl_kv, stride_pl_s,
+        scale_log2, max_q, num_splits, window_left, window_right,
+        GROUP: tl.constexpr, GROUP_PAD: tl.constexpr,
+        HEAD_DIM: tl.constexpr, PAGE_TOKENS: tl.constexpr,
+        TILE_N: tl.constexpr, HAS_WINDOW: tl.constexpr,
+        SINGLE_SPLIT: tl.constexpr, PDL: tl.constexpr,
+    ):
+        pid_q = tl.program_id(0)
+        kv_head = tl.program_id(1)
+        split_id = tl.program_id(2)
+        seq = pid_q // max_q
+        q_local = pid_q % max_q
+        q_start = tl.load(cu_q_ptr + seq).to(tl.int64)
+        q_len = tl.load(cu_q_ptr + seq + 1).to(tl.int64) - q_start
+        if q_local >= q_len:
+            if PDL:
+                tl.extra.cuda.gdc_launch_dependents()
+            return
+        q_row = q_start + q_local
+        visible_k = tl.load(seq_lens_ptr + seq).to(tl.int64) - q_len + q_local + 1
+        k_lo = visible_k - visible_k
+        if HAS_WINDOW and window_left >= 0:
+            k_lo = tl.maximum(k_lo, visible_k - 1 - window_left)
+        first_tile = k_lo // TILE_N
+        last_tile = (visible_k + TILE_N - 1) // TILE_N
+        tiles_per = (tl.maximum(0, last_tile - first_tile)
+                     + num_splits - 1) // num_splits
+        tile_start = first_tile + split_id * tiles_per
+        tile_end = tl.minimum(last_tile, tile_start + tiles_per)
+        offs_g = tl.arange(0, GROUP_PAD)
+        offs_d = tl.arange(0, HEAD_DIM)
+        g_mask = offs_g < GROUP
+
+        m_i = tl.full([GROUP_PAD], -1e38, dtype=tl.float32)
+        l_i = tl.zeros([GROUP_PAD], dtype=tl.float32)
+        acc = tl.zeros([GROUP_PAD, HEAD_DIM], dtype=tl.float32)
+        if tile_start < tile_end:
+            if PDL:
+                tl.extra.cuda.gdc_wait()
+            q_ptrs = (q_ptr + q_row * stride_q0
+                      + (kv_head * GROUP + offs_g[:, None]) * stride_q1
+                      + offs_d[None, :])
+            q_tile = tl.load(q_ptrs, mask=g_mask[:, None], other=0.0)
+            offs_k_tile = tl.arange(0, TILE_N)
+            bt_row = block_tables_ptr + seq * stride_bt
+            for tile_index in range(tile_start, tile_end):
+                position = tile_index * TILE_N
+                page_index = position // PAGE_TOKENS
+                in_page = position - page_index * PAGE_TOKENS
+                phys_page = tl.load(bt_row + page_index).to(tl.int64)
+                k_ptrs = (k_ptr + phys_page * stride_k0
+                          + (in_page + offs_k_tile[:, None]) * stride_k1
+                          + kv_head * stride_k2 + offs_d[None, :])
+                v_ptrs = (v_ptr + phys_page * stride_v0
+                          + (in_page + offs_k_tile[:, None]) * stride_v1
+                          + kv_head * stride_v2 + offs_d[None, :])
+                key_position = position + offs_k_tile
+                key_valid = (key_position < visible_k) & (key_position >= k_lo)
+                k_tile = tl.load(k_ptrs, mask=key_valid[:, None], other=0.0)
+                v_tile = tl.load(v_ptrs, mask=key_valid[:, None], other=0.0)
+                qk = tl.where(key_valid[None, :],
+                              tl.dot(q_tile, tl.trans(k_tile)) * scale_log2,
+                              -1e38)
+                m_new = tl.maximum(m_i, tl.max(qk, axis=1))
+                valid_row = m_new > -1e30
+                alpha = tl.where(valid_row, tl.math.exp2(m_i - m_new), 0.0)
+                p = tl.where(valid_row[:, None] & key_valid[None, :],
+                             tl.math.exp2(qk - m_new[:, None]), 0.0)
+                l_i = l_i * alpha + tl.sum(p, axis=1)
+                acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v_tile)
+                m_i = m_new
+
+        norm_acc = acc * tl.where(l_i > 0.0, 1.0 / l_i, 0.0)[:, None]
+        if PDL:
+            tl.extra.cuda.gdc_launch_dependents()
+        if SINGLE_SPLIT:
+            o_ptrs = (out_ptr + q_row * stride_o0
+                      + (kv_head * GROUP + offs_g[:, None]) * stride_o1
+                      + offs_d[None, :])
+            tl.store(o_ptrs, norm_acc.to(out_ptr.dtype.element_ty),
+                     mask=g_mask[:, None])
+        else:
+            lse = tl.where(l_i > 0.0, m_i + tl.math.log2(l_i), -1e38)
+            po_ptrs = (part_out_ptr + q_row * stride_po_q
+                       + kv_head * stride_po_kv + split_id * stride_po_s
+                       + offs_g[:, None] * stride_po_g + offs_d[None, :])
+            pl_ptrs = (part_lse_ptr + q_row * stride_pl_q
+                       + kv_head * stride_pl_kv + split_id * stride_pl_s
+                       + offs_g)
+            tl.store(po_ptrs, norm_acc, mask=g_mask[:, None])
+            tl.store(pl_ptrs, lse, mask=g_mask)
+
+    @triton.jit(do_not_specialize=["num_splits"])
+    def splitkv_decode_reduce(
+        part_out_ptr, part_lse_ptr, out_ptr,
+        stride_po_q, stride_po_kv, stride_po_s, stride_po_g,
+        stride_pl_q, stride_pl_kv, stride_pl_s,
+        stride_o0, stride_o1, num_splits,
+        GROUP: tl.constexpr, HEAD_DIM: tl.constexpr,
+        MAX_SPLITS: tl.constexpr, PDL: tl.constexpr,
+    ):
+        q_row = tl.program_id(0).to(tl.int64)
+        q_head = tl.program_id(1)
+        kv_head = q_head // GROUP
+        g = q_head % GROUP
+        offs_s = tl.arange(0, MAX_SPLITS)
+        offs_d = tl.arange(0, HEAD_DIM)
+        pl_base = part_lse_ptr + q_row * stride_pl_q + kv_head * stride_pl_kv + g
+        if PDL:
+            tl.extra.cuda.gdc_wait()
+        m_max = tl.max(tl.load(pl_base + offs_s * stride_pl_s,
+                               mask=offs_s < num_splits, other=-1e38), axis=0)
+        acc = tl.zeros([HEAD_DIM], dtype=tl.float32)
+        w_sum = 0.0
+        po_base = (part_out_ptr + q_row * stride_po_q
+                   + kv_head * stride_po_kv + g * stride_po_g + offs_d)
+        for split_id in range(0, num_splits):
+            lse_s = tl.load(pl_base + split_id * stride_pl_s)
+            if lse_s > -1e30:
+                w = tl.math.exp2(lse_s - m_max)
+                acc += w * tl.load(po_base + split_id * stride_po_s)
+                w_sum += w
+        out_val = (acc * tl.where(w_sum > 0.0, 1.0 / w_sum, 0.0)).to(
+            out_ptr.dtype.element_ty)
+        if PDL:
+            tl.extra.cuda.gdc_launch_dependents()
+        tl.store(out_ptr + q_row * stride_o0 + q_head * stride_o1 + offs_d,
+                 out_val)
+
+    _SPLITKV_KERNELS.update(
+        splitkv_decode_part=splitkv_decode_part,
+        splitkv_decode_reduce=splitkv_decode_reduce,
+    )
+    return _SPLITKV_KERNELS
+
+
+def triton_splitkv_decode(q3, kp, vp, cu_q, max_q, seqused_k, max_seqused_k,
+                          block_table, *, softmax_scale=None, window=None,
+                          output=None, workspace=None):
+    """Causal paged attention for short queries with dynamic Split-KV and PDL."""
+    import torch
+
+    total_q, num_q_heads, head_dim = q3.shape
+    page_tokens, num_kv_heads = kp.shape[1], kp.shape[2]
+    num_seqs = seqused_k.shape[0]
+    assert page_tokens % _SPLITKV_TILE_N == 0
+    assert q3.dtype == kp.dtype == vp.dtype == torch.bfloat16
+    assert (head_dim & (head_dim - 1)) == 0 and num_q_heads % num_kv_heads == 0
+    out = output if output is not None else torch.empty_like(q3)
+    assert q3.stride(-1) == kp.stride(-1) == vp.stride(-1) == out.stride(-1) == 1
+    if total_q == 0 or num_seqs == 0:
+        return out
+    group = num_q_heads // num_kv_heads
+    group_pad = max(16, 1 << (group - 1).bit_length())
+    scale_log2 = (head_dim ** -0.5 if softmax_scale is None
+                  else float(softmax_scale)) * 1.4426950408889634
+    has_window = window is not None and (window[0] >= 0 or window[1] >= 0)
+    window_left = window[0] if has_window else -1
+    window_right = window[1] if has_window else -1
+    dev_index = (q3.device.index if q3.device.index is not None
+                 else torch.cuda.current_device())
+    num_sms = _SM_COUNTS.get(dev_index)
+    if num_sms is None:
+        num_sms = _SM_COUNTS[dev_index] = int(
+            torch.cuda.get_device_properties(dev_index).multi_processor_count)
+    base_ctas = num_seqs * max_q * num_kv_heads
+    max_useful = max(1, (max_seqused_k + page_tokens - 1) // page_tokens)
+    num_splits = min(_SPLITKV_MAX_SPLITS, max_useful,
+                     max(1, (4 * num_sms + base_ctas - 1) // base_ctas))
+    single_split = num_splits == 1
+    if single_split:
+        part_out, part_lse, po_strides, pl_strides = out, out, (0,) * 4, (0,) * 3
+    else:
+        buf_key = (q3.device, num_kv_heads, group, head_dim)
+        cached = None if workspace is None else workspace.get(buf_key)
+        if cached is None or cached[0].shape[0] < total_q:
+            cap_q = max(total_q, 64 if cached is None else cached[0].shape[0])
+            buf_out = torch.empty((cap_q, num_kv_heads, _SPLITKV_MAX_SPLITS,
+                                   group, head_dim), dtype=torch.float32,
+                                  device=q3.device)
+            buf_lse = torch.empty((cap_q, num_kv_heads, _SPLITKV_MAX_SPLITS,
+                                   group), dtype=torch.float32, device=q3.device)
+            if workspace is not None:
+                workspace[buf_key] = (buf_out, buf_lse)
+        else:
+            buf_out, buf_lse = cached
+        part_out, part_lse = buf_out[:total_q], buf_lse[:total_q]
+        po_strides, pl_strides = part_out.stride()[:4], part_lse.stride()[:3]
+
+    pdl = pdl_enabled(q3.device)
+    part_args = (
+        q3, kp, vp, cu_q, seqused_k, block_table, out, part_out, part_lse,
+        q3.stride(0), q3.stride(1), out.stride(0), out.stride(1),
+        kp.stride(0), kp.stride(1), kp.stride(2),
+        vp.stride(0), vp.stride(1), vp.stride(2),
+        block_table.stride(0), *po_strides, *pl_strides,
+        scale_log2, int(max_q), int(num_splits),
+        int(window_left), int(window_right))
+    part_key = (
+        group, group_pad, head_dim, page_tokens, _SPLITKV_TILE_N,
+        has_window, single_split, pdl,
+        (q3.data_ptr() & 15) == 0, (out.data_ptr() & 15) == 0,
+        (kp.data_ptr() & 15) == 0, (vp.data_ptr() & 15) == 0,
+        (q3.stride(0) & 15) == 0, (out.stride(0) & 15) == 0,
+        (kp.stride(0) & 15) == 0, (kp.stride(1) & 15) == 0,
+        (kp.stride(2) & 15) == 0)
+    launch_triton(
+        _splitkv_kernels()["splitkv_decode_part"],
+        (num_seqs * max_q, num_kv_heads, num_splits), part_args,
+        key=part_key, exact_args=False,
+        kwargs=dict(GROUP=group, GROUP_PAD=group_pad, HEAD_DIM=head_dim,
+                    PAGE_TOKENS=page_tokens, TILE_N=_SPLITKV_TILE_N,
+                    HAS_WINDOW=has_window, SINGLE_SPLIT=single_split,
+                    PDL=pdl, num_warps=4, num_stages=3, launch_pdl=pdl))
+    if not single_split:
+        launch_triton(
+            _splitkv_kernels()["splitkv_decode_reduce"], (total_q, num_q_heads),
+            (part_out, part_lse, out, *po_strides, *pl_strides,
+             out.stride(0), out.stride(1), int(num_splits)),
+            key=(group, head_dim, _SPLITKV_MAX_SPLITS, pdl,
+                 (out.data_ptr() & 15) == 0, (out.stride(0) & 15) == 0),
+            exact_args=False,
+            kwargs=dict(GROUP=group, HEAD_DIM=head_dim,
+                        MAX_SPLITS=_SPLITKV_MAX_SPLITS, PDL=pdl,
+                        num_warps=4, launch_pdl=pdl))
+    return out
 
 # The two attention paths a chunk can run. "unified" is one causal
 # paged call in which every row reads the KV its own document needs.

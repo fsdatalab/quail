@@ -307,9 +307,9 @@ def test_sm100_nvfp4_silu_and_linear_match_both_row_regimes():
 def test_gdn_gather_scatter_and_transient_plan_match_reference():
     import numpy as np
 
-    from quail.backends.quail.executor.gdn import plan_phases
-    from quail.backends.quail.executor.gdn_kernels import (
+    from quail.backends.quail.executor.gdn import (
         gather_gdn_inputs,
+        plan_phases,
         scatter_gdn_rows,
     )
 
@@ -365,10 +365,7 @@ def test_gdn_decode_step_and_slot_copy_match_prep_and_recurrence():
         fused_recurrent_gated_delta_rule,
     )
 
-    from quail.backends.quail.executor.gdn_kernels import (
-        copy_slots,
-        gdn_decode_step,
-    )
+    from quail.backends.quail.executor.gdn import copy_slots, gdn_decode_step
 
     torch.manual_seed(7)
     heads, value_heads, dim, seqs = 16, 48, 128, 5
