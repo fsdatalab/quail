@@ -459,11 +459,15 @@ def _flashinfer_delta_rule(q, k, v, g, beta, state, cu_seqlens,
         kwargs["output_state"] = output_state
     if state_indices is not None:
         kwargs["state_indices"] = state_indices
+    # FlashInfer 0.6.18 passes the bounds unconverted to the context-parallel
+    # kernel it picks for few sequences: int32 on SM100, int64 on SM90
+    major = torch.cuda.get_device_capability(q.device)[0]
+    bounds = cu_seqlens.int() if major == 10 else cu_seqlens.long()
     result = chunk_gated_delta_rule(
         q=q.contiguous(), k=k.contiguous(),
         v=v.contiguous(), g=decay,
         beta=beta.float().contiguous(), initial_state=initial,
-        output_final_state=output_final_state, cu_seqlens=cu_seqlens,
+        output_final_state=output_final_state, cu_seqlens=bounds,
         **kwargs)
     return result if output_final_state else (result, None)
 
