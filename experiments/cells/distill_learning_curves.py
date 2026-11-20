@@ -13,7 +13,8 @@ Setups:
     margin: LoRA on the teacher's probability, sigmoid(margin).
     margin_state: margin, plus a projection of the student's answer-row
         state onto the teacher's, read with the teacher's answer
-        direction (SimKD).
+        direction (SimKD). The projection starts at the ridge regression
+        of the teacher's states on the untrained student's.
     document_probe: LoRA and a linear probe on the student's state at
         the review's last token, with no question in the input.
     frozen_answer_probe, frozen_document_probe: a linear probe on the
@@ -70,6 +71,7 @@ MIN_STEPS, MAX_STEPS = 60, 800
 EVAL_TOKENS = 65536
 PROBE_PENALTIES = (1e-3, 1e-2, 1e-1, 1.0, 10.0)
 PROBE_FOLDS = 5
+RIDGE_PENALTY = 100.0
 
 
 def _load():
@@ -368,11 +370,14 @@ def trained(setup: str) -> list:
                 target_modules=list(LORA_TARGETS)))
             backbone = model.get_base_model().model
             hidden = backbone.config.hidden_size
-            projection = torch.nn.Linear(hidden, states.shape[1], bias=False,
-                                         device="cuda")
-            # a random projection read through the teacher's direction
-            # starts with logits in the hundreds
-            torch.nn.init.zeros_(projection.weight)
+            train = _draw(data["pool"], num_labels, seed)
+            projection = torch.nn.Linear(hidden, states.shape[1], device="cuda")
+            if setup == "margin_state":
+                # trained from zero or at random, the projection learns the
+                # teacher's mean state first and passes all or no reviews
+                _ridge_start(torch, projection, _features(
+                    torch, backbone, [inputs[i] for i in train], data["pad_id"]),
+                    states[train])
             probe = torch.nn.Linear(hidden, 1, device="cuda")
             heads = {"margin_state": projection, "document_probe": probe}.get(setup)
 
@@ -388,7 +393,6 @@ def trained(setup: str) -> list:
             if heads is not None:
                 groups.append({"params": list(heads.parameters()), "lr": 1e-3})
             optimizer = torch.optim.AdamW(groups, weight_decay=0.0)
-            train = _draw(data["pool"], num_labels, seed)
             per_step = MICRO_DOCUMENTS * ACCUMULATE
             steps = int(np.clip(EPOCHS * num_labels // per_step, MIN_STEPS,
                                 MAX_STEPS))
@@ -434,6 +438,20 @@ def trained(setup: str) -> list:
             del model, base, optimizer, projection, probe
             torch.cuda.empty_cache()
     return records
+
+
+def _ridge_start(torch, projection, features, teacher_states):
+    """Set a projection to the ridge regression of teacher on student states."""
+    x = torch.tensor(features, device="cuda", dtype=torch.float64)
+    y = torch.tensor(teacher_states, device="cuda", dtype=torch.float64)
+    x_mean, y_mean = x.mean(0), y.mean(0)
+    x, y = x - x_mean, y - y_mean
+    weight = torch.linalg.solve(
+        x.T @ x + RIDGE_PENALTY * torch.eye(x.shape[1], device="cuda",
+                                             dtype=torch.float64), x.T @ y)
+    with torch.no_grad():
+        projection.weight.copy_(weight.T)
+        projection.bias.copy_(y_mean - x_mean @ weight)
 
 
 @app.function(image=image, timeout=4 * 3600, volumes=VOLUMES)
