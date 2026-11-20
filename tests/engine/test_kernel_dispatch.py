@@ -72,3 +72,26 @@ def test_attention_dispatch_preserves_each_device_path(monkeypatch):
             monkeypatch=monkeypatch, capability=capability, head_dim=head_dim,
             page_tokens=page_tokens, max_q=max_q, backend=backend,
             version=version)
+
+
+def test_the_gated_delta_rule_passes_bounds_flashinfer_takes_on_each_gpu(
+        monkeypatch):
+    import torch
+
+    from quail.backends.quail.executor.gdn import _flashinfer_delta_rule
+
+    seen = []
+    prefill = ModuleType("flashinfer.gdn_prefill")
+    prefill.chunk_gated_delta_rule = (
+        lambda **kwargs: seen.append(kwargs["cu_seqlens"].dtype) or "out")
+    monkeypatch.setitem(sys.modules, "flashinfer", ModuleType("flashinfer"))
+    monkeypatch.setitem(sys.modules, "flashinfer.gdn_prefill", prefill)
+    rows = torch.zeros(4, 1, 2)
+    bounds = torch.tensor([0, 4], dtype=torch.int32)
+    for capability in ((9, 0), (10, 0)):
+        monkeypatch.setattr(torch.cuda, "get_device_capability",
+                            lambda *_, capability=capability: capability)
+        _flashinfer_delta_rule(rows, rows, rows, rows[..., 0], rows[..., 0],
+                               None, bounds, False)
+    # H100's context-parallel kernel takes int64, B200's int32
+    assert seen == [torch.int64, torch.int32]
