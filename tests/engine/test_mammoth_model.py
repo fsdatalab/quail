@@ -13,12 +13,16 @@ from quail.api.prompts import bind_classify_prompt, bind_prompt
 from quail.backends.quail.executor import model_loading
 from quail.backends.quail.executor.models import build_pipeline
 from quail.backends.quail.executor.models.base import pipeline_mask
-from quail.backends.quail.executor.readout import DecisionRows, LetterReadout
+from quail.backends.quail.executor.readout import (
+    AsyncDecisions,
+    DecisionRows,
+    LetterReadout,
+)
 from quail.baselines.vllm import stock_vllm_backend
 from quail.catalog import DocumentProvider
 from quail.common.expressions import ColumnRef, CompileError
 from quail.common.tokens import close_documents
-from quail.physical import AiClassify, AiFilter, decode_plan_value
+from quail.physical import AiClassify, AiFilter, AiScore, decode_plan_value
 from quail.physical.plan import Refusal
 from quail.specs import H100_SXM, MODELS, QWEN3_4B_FP8
 
@@ -151,8 +155,15 @@ def test_the_mammoth_readout_scores_each_option_by_its_letter_row(tmp_path):
                           normed @ head[ids[:3]].T)
     # a filter lists yes (A) then no (B); the yes/no readers take no first
     yes_no = DecisionRows(torch, readout.reordered((1, 0)), [0, 0, 0])
-    assert torch.allclose(yes_no.scores(normed, [1, 1]),
-                          normed @ head[[ids[1], ids[0]]].T)
+    expected = normed @ head[[ids[1], ids[0]]].T
+    assert torch.allclose(yes_no.scores(normed, [1, 1]), expected)
+    from helpers.planted_model import host_torch
+
+    decisions = AsyncDecisions(host_torch(), readout.reordered((1, 0)),
+                               [0, 0, 0])
+    assert decisions.result(decisions.submit(normed, [1, 1])) == [
+        int(row[1] > row[0]) for row in expected.tolist()
+    ]
 
 
 def _text(session, ids) -> str:
@@ -196,6 +207,59 @@ def test_a_mammoth_classification_reads_every_label_at_the_last_row(session):
         "Question: Which option applies to the state?\n\nOptions:"
         "\nA. refund\nB. other\n\nAnswer with one letter: A, B."
         + TURN_CLOSE_TEXT)
+
+
+def test_a_mammoth_score_packs_each_document_before_its_question(
+        session, monkeypatch):
+    from types import SimpleNamespace
+
+    import numpy as np
+    from helpers.fakes import cpu_staging, plain_arena
+    from helpers.planted_model import host_torch
+
+    from quail.backends.quail.executor import chunk as chunk_mod
+    from quail.backends.quail.executor.operators.score import (
+        ScoreOperator,
+        ScoreRows,
+    )
+
+    cpu_staging(monkeypatch)
+    plan = session.sql(
+        "SELECT d.id, AI.SCORE(PROMPT('Asks for a refund? {0}', d.body)) AS s "
+        "FROM documents d").plan()
+    (node,) = [n for n in plan.nodes if isinstance(n, AiScore)]
+    closed = close_documents(
+        {"d": [session.tokenizer(text)
+               for text in ("refund please", "refund now")]},
+        plan.settings["document_close"])
+    arena = plain_arena(256)
+    state = SimpleNamespace(
+        torch=host_torch(),
+        score_readout=SimpleNamespace(trailing_rows=1, dtype=np.float32),
+        loaded_model=SimpleNamespace(
+            pipeline=SimpleNamespace(mask="document_isolated", canvas_ids=()),
+            model_spec=MAMMOTH,
+            arena=arena))
+    operator = ScoreOperator(state, node, ScoreRows((np.array([0, 1]),)), {},
+                             closed)
+    assert len(operator.table.prefixes) == 2
+    assert operator.table.tree is None
+    (stage,) = operator.stages
+    assert stage.frame == []
+    (question,) = stage.suffixes
+    assert _text(session, question) == (
+        "Question: Asks for a refund?" + NOUL_OPTIONS + TURN_CLOSE_TEXT)
+    prefix = list(operator.table.prefixes[0])
+    key = operator.table.keys[0]
+    arena.activate(key, len(prefix), capacity_tokens=len(prefix) + len(question),
+                   base_tokens=len(prefix))
+    unified = chunk_mod.pack_chunk(
+        state.torch, arena,
+        [dict(key=key, prefix=prefix, f=len(prefix), suffixes=[question])],
+        attention_mode="unified", mask="document_isolated").meta["unified"]
+    assert unified["cu_q_host"] == [0, len(prefix), len(prefix) + len(question)]
+    assert unified["used_host"] == [len(prefix), len(prefix) + len(question)]
+    assert not unified["causal"]
 
 
 def test_a_mammoth_refuses_a_join_and_a_device_it_was_not_checked_on(session):

@@ -685,7 +685,11 @@ class AsyncDecisions(DecisionRows):
         return self._copy((scores[:, 1] > scores[:, 0]).to(self.torch.uint8),
                           self.torch.uint8)
 
-    result = staticmethod(AsyncAnswers.result)
+    @staticmethod
+    def result(handle):
+        event, host = handle
+        event.synchronize()
+        return [int(b) for b in host.tolist()]
 
 
 class AsyncDecisionScores(DecisionRows):

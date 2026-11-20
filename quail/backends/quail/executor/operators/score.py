@@ -293,12 +293,13 @@ class ScoreOperator(SingleNodeOperator):
         if (len(spec.aliases) == 1 and spec.draws > 1
                 and state.loaded_model.pipeline.canvas_ids):
             self._drawn(documents)
-        elif len(spec.aliases) == 1 and (spec.share_prefixes
-                                         or (self.skip is not None and parts[1])):
-            # admission skips whole documents, so a score that skips rows
-            # gives each document its own prefix, sharing the prompt
-            # head's pages; with no prompt after the document, it asks
-            # every row
+        elif len(spec.aliases) == 1 and (
+                state.loaded_model.pipeline.mask != "causal"
+                or spec.share_prefixes
+                or (self.skip is not None and parts[1])):
+            # admission skips whole documents, and a non-causal mask reads each
+            # document block whole, so each document takes its own prefix; with
+            # no prompt after the document, a skipped causal score asks every row
             self._shared(documents)
         else:
             self._grouped(documents)
