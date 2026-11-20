@@ -265,7 +265,8 @@ def probes(run_dir: str) -> str:
     import numpy as np
 
     data = _load()
-    features = np.load(f"{run_dir}/student_features.npz")
+    with np.load(f"{run_dir}/student_features.npz") as saved:
+        features = {name: saved[name] for name in ("answer", "document")}
     records = []
     for name in ("answer", "document"):
         for num_labels, seeds in DRAWS.items():
