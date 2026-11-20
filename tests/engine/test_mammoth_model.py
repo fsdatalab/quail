@@ -196,7 +196,8 @@ def test_a_mammoth_refuses_a_join_and_a_device_it_was_not_checked_on(session):
         "ON AI_FILTER(PROMPT('Does {0} mention {1}?', d.body, o.body))").plan()
     assert isinstance(joined, Refusal)
     assert joined.constraint == "unsupported_bidirectional_query"
-    config = EngineConfig(model=MAMMOTH.name, device="b200")
+    config = EngineConfig(model=MAMMOTH.name,
+                          device="rtx-pro-6000-blackwell-server")
     with quail.Session(config, tokenizer=TOKENIZER) as other:
         other.register("documents", DocumentProvider.from_table(
             pa.table({"id": [1], "body": ["refund"]}), id_col="id"))

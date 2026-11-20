@@ -280,10 +280,11 @@ fn bidirectional_refusal(
             "documents per prompt",
         )));
     }
-    if device.name != "h100-sxm" {
+    if !["h100-sxm", "b200"].contains(&device.name.as_str()) {
         return Ok(Some(Refusal::new(
             format!(
-                "{} runs on h100-sxm only; its non-causal attention is not checked on {}",
+                "{} runs on h100-sxm and b200 only; its non-causal attention is not checked \
+                 on {}",
                 model.name, device.name
             ),
             "bidirectional_device_unchecked",

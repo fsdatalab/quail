@@ -65,8 +65,8 @@ tensor cores of a B200.
 | --- | --- | --- |
 | DiffusionGemma 26B-A4B | `diffusion-gemma-26b-a4b-fp8` | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY` |
 | Decision 2.0 Kai 0.6B | `decision-2.0-kai-0.6b-bf16` | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY` |
-| Base Labs mammoth-1 | `mammoth-1-bf16` | `AI.IF` filters, `AI.SCORE`, `AI.CLASSIFY`; H100 SXM only |
-| Base Labs elephant-1 | `elephant-1-bf16` | `AI.IF` filters, `AI.SCORE`, `AI.CLASSIFY`; H100 SXM only |
+| Base Labs mammoth-1 | `mammoth-1-bf16` | `AI.IF` filters, `AI.SCORE`, `AI.CLASSIFY`; H100 SXM and B200 only |
+| Base Labs elephant-1 | `elephant-1-bf16` | `AI.IF` filters, `AI.SCORE`, `AI.CLASSIFY`; H100 SXM and B200 only |
 | Qwen3 Reranker 0.6B | `qwen3-reranker-0.6b-bf16` | `AI.SCORE` |
 | Qwen3 Reranker 4B | `qwen3-reranker-4b-bf16` | `AI.SCORE` |
 | d1-2B | `d1-2b-bf16` | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT`, `AI.EXTRACT_SPAN` |
@@ -99,7 +99,7 @@ its system turn, and every question about it reads that KV. Because the
 system turn is part of each document's block, documents cannot share KV
 with each other.
 
-They run on H100 SXM and read one document per prompt, so Quail refuses
+They run on H100 SXM and B200 and read one document per prompt, so Quail refuses
 joins and prompts over two tables.
 
 ```python
@@ -113,7 +113,7 @@ Set `device` to the value for your GPU:
 | GPU | `device` value | Model support |
 | --- | --- | --- |
 | NVIDIA H100 SXM | `h100-sxm` | All supported models except `qwen3.8-27b-nvfp4` |
-| NVIDIA B200 | `b200` | All supported models except mammoth-1 and elephant-1 |
+| NVIDIA B200 | `b200` | All supported models |
 | NVIDIA RTX PRO 6000 Blackwell Server Edition | `rtx-pro-6000-blackwell-server` | All supported models except `qwen3.8-27b-nvfp4`, mammoth-1, and elephant-1 |
 | NVIDIA L40S | `l40s` | Qwen3, Qwen3 rerankers, Decision 2.0 Kai, LFM2, and d1-2B |
 
