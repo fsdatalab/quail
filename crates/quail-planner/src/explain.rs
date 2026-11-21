@@ -977,64 +977,6 @@ impl Graph {
         }
         ordered
     }
-
-    /// The planner's estimated rows on each output port.
-    fn estimated_rows(&self) -> HashMap<(String, String), Option<f64>> {
-        let mut rows: HashMap<(String, String), Option<f64>> = HashMap::new();
-        // by table, the rows its AI filters have passed so far
-        let mut flows: HashMap<String, RowFlow> = HashMap::new();
-        for index in self.topological() {
-            let node = &self.nodes[index];
-            let inputs: Vec<Option<f64>> = node
-                .inputs
-                .iter()
-                .map(|(_, source)| {
-                    rows.get(&(source.node_id.clone(), source.port.clone()))
-                        .copied()
-                        .flatten()
-                })
-                .collect();
-            let single = (inputs.len() == 1).then(|| inputs[0]).flatten();
-            let value = match &node.known {
-                Some(PhysicalNode::Scan(scan)) => Some(
-                    scan.attributes
-                        .expected_rows
-                        .unwrap_or(scan.attributes.num_documents as f64),
-                ),
-                Some(PhysicalNode::AiFilter(filter)) => {
-                    inputs.first().copied().flatten().map(|value| {
-                        let filter = &filter.attributes;
-                        let term = filter.disjunction.as_ref().map(|name| OrTerm {
-                            disjunction: name.clone(),
-                            short_circuit: filter.short_circuit,
-                        });
-                        let passing = match filter.answer {
-                            Some(_) => 1.0,
-                            None => effective_selectivity(filter.selectivity),
-                        };
-                        let mut flow = flows
-                            .remove(&filter.alias)
-                            .unwrap_or_else(|| RowFlow::new(value))
-                            .with_rows(value);
-                        flow.pass(passing, term.as_ref(), filter.closes_disjunction);
-                        let passed = flow.rows();
-                        flows.insert(filter.alias.clone(), flow);
-                        passed
-                    })
-                }
-                Some(PhysicalNode::Limit(limit)) => {
-                    single.map(|value| value.min(limit.attributes.count as f64))
-                }
-                _ => None,
-            };
-            for output in node.outputs() {
-                if !output.starts_with("filter_answers:") {
-                    rows.insert((node.id.clone(), output), value);
-                }
-            }
-        }
-        rows
-    }
 }
 
 /// `value` with each list of words under a token field read as zeros:
@@ -1071,31 +1013,6 @@ fn numeric_tokens(value: Value, in_tokens: bool) -> Value {
 struct Stages {
     filters: HashMap<(String, i64), Value>,
     joins: HashMap<i64, Value>,
-}
-
-impl Stages {
-    fn read(report: Option<&Value>) -> Self {
-        let mut stages = Self::default();
-        let Some(report) = report else {
-            return stages;
-        };
-        for stage in report["stages"].as_array().into_iter().flatten() {
-            let Some(position) = stage.get("written_position").and_then(Value::as_i64) else {
-                continue;
-            };
-            match stage["op"].as_str() {
-                Some("filter") => {
-                    let alias = py_str(&stage["alias"]);
-                    stages.filters.insert((alias, position), stage.clone());
-                }
-                Some("join") => {
-                    stages.joins.insert(position, stage.clone());
-                }
-                _ => {}
-            }
-        }
-        stages
-    }
 }
 
 type Cells = BTreeMap<&'static str, String>;
@@ -1629,6 +1546,79 @@ fn physical_tree(
         .enumerate()
         .map(|(position, node)| (node.id.clone(), position + 1))
         .collect();
+    let mut stages = Stages::default();
+    for stage in run
+        .and_then(|run| run.report["stages"].as_array())
+        .into_iter()
+        .flatten()
+    {
+        let Some(position) = stage.get("written_position").and_then(Value::as_i64) else {
+            continue;
+        };
+        match stage["op"].as_str() {
+            Some("filter") => {
+                let alias = py_str(&stage["alias"]);
+                stages.filters.insert((alias, position), stage.clone());
+            }
+            Some("join") => {
+                stages.joins.insert(position, stage.clone());
+            }
+            _ => {}
+        }
+    }
+    let mut rows: HashMap<(String, String), Option<f64>> = HashMap::new();
+    // by table, the rows its AI filters have passed so far
+    let mut flows: HashMap<String, RowFlow> = HashMap::new();
+    for &index in &topological {
+        let node = &graph.nodes[index];
+        let inputs: Vec<Option<f64>> = node
+            .inputs
+            .iter()
+            .map(|(_, source)| {
+                rows.get(&(source.node_id.clone(), source.port.clone()))
+                    .copied()
+                    .flatten()
+            })
+            .collect();
+        let single = (inputs.len() == 1).then(|| inputs[0]).flatten();
+        let value = match &node.known {
+            Some(PhysicalNode::Scan(scan)) => Some(
+                scan.attributes
+                    .expected_rows
+                    .unwrap_or(scan.attributes.num_documents as f64),
+            ),
+            Some(PhysicalNode::AiFilter(filter)) => {
+                inputs.first().copied().flatten().map(|value| {
+                    let filter = &filter.attributes;
+                    let term = filter.disjunction.as_ref().map(|name| OrTerm {
+                        disjunction: name.clone(),
+                        short_circuit: filter.short_circuit,
+                    });
+                    let passing = match filter.answer {
+                        Some(_) => 1.0,
+                        None => effective_selectivity(filter.selectivity),
+                    };
+                    let mut flow = flows
+                        .remove(&filter.alias)
+                        .unwrap_or_else(|| RowFlow::new(value))
+                        .with_rows(value);
+                    flow.pass(passing, term.as_ref(), filter.closes_disjunction);
+                    let passed = flow.rows();
+                    flows.insert(filter.alias.clone(), flow);
+                    passed
+                })
+            }
+            Some(PhysicalNode::Limit(limit)) => {
+                single.map(|value| value.min(limit.attributes.count as f64))
+            }
+            _ => None,
+        };
+        for output in node.outputs() {
+            if !output.starts_with("filter_answers:") {
+                rows.insert((node.id.clone(), output), value);
+            }
+        }
+    }
     let mut tree = TreeRows {
         graph,
         verbose,
@@ -1637,11 +1627,11 @@ fn physical_tree(
             .iter()
             .map(|(id, estimate)| (id.as_str(), estimate))
             .collect(),
-        stages: Stages::read(run.map(|run| &run.report)),
+        stages,
         scans,
         filters,
         joins,
-        rows_estimate: graph.estimated_rows(),
+        rows_estimate: rows,
         shared,
         visited: HashSet::new(),
         rows: Vec::new(),
