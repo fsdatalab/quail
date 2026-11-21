@@ -135,7 +135,12 @@ class RequestModelExecution:
                     body_texts=body_texts)
                 for spec, result in zip(specs, results):
                     self._extracted(alias, spec, ids, result, outputs, steps)
-            self._execute_maps(node, survivors, outputs, steps)
+            for alias, specs, ids, _, bodies, body_texts in self._answer_groups(
+                    node, node.maps, survivors, "AI.MAP"):
+                results = map_documents(self.client, specs, bodies, body_texts,
+                    submission=self.answer_submission)
+                for spec, result in zip(specs, results):
+                    self._mapped(alias, spec, ids, result, outputs, steps)
 
         for alias in node.aliases:
             outputs[f"rows:{alias}"] = Rows({alias: document_ids(survivors[alias])})
@@ -490,15 +495,6 @@ class RequestModelExecution:
                     for document in ids],
                 ([preamble_text + text for text in document_texts]
                     if self.submit_text else None))
-
-    def _execute_maps(self, node, survivors, outputs, steps):
-        """Submit every map's prompts and collect the answers."""
-        for alias, specs, ids, _, bodies, body_texts in self._answer_groups(
-                node, node.maps, survivors, "AI.MAP"):
-            results = map_documents(self.client, specs, bodies, body_texts,
-                submission=self.answer_submission)
-            for spec, result in zip(specs, results):
-                self._mapped(alias, spec, ids, result, outputs, steps)
 
     def _execute_answers(self, node, survivors, outputs, steps):
         """Submit each document's extraction and map prompts in one generate call."""
