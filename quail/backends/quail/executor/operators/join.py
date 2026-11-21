@@ -218,7 +218,13 @@ class JoinOperator(ModelOperator):
         own_tokens = list(self.own_tokens)
         kv_round = self.kv_round
         group = inputs["group"]
-        partner_lists = stage_partner_lists(group, lists_for, anchor_ids)
+        partner_lists = []
+        for index, join in enumerate(group):
+            if lists_for is None or not runs_over_pairs(join):
+                partner_lists.append(None)
+                continue
+            partner_lists.append({local: lists_for(anchor, index)
+                for local, anchor in enumerate(anchor_ids)})
         results = {}
         own_tokens[0] = tokens - sum(own_tokens[1:])
         for j, (member, rows, members) in enumerate(zip(nodes, answers, partner_lists)):
@@ -554,18 +560,6 @@ def partner_list_builder(group, tuples_by_stage, maps):
         return cache[position]
 
     return lists_for
-
-
-def stage_partner_lists(group, lists_for, anchor_ids) -> list:
-    """Per stage, anchor local index -> member indices, or None."""
-    out = []
-    for index, join in enumerate(group):
-        if lists_for is None or not runs_over_pairs(join):
-            out.append(None)
-            continue
-        out.append({local: lists_for(anchor, index)
-                    for local, anchor in enumerate(anchor_ids)})
-    return out
 
 
 def upstream_join(state, nodes, ids, chain, inputs, context):
