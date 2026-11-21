@@ -123,7 +123,19 @@ class FilterOperator(SingleNodeOperator):
         """
         finished, self.finished = self.finished, []
         if getattr(self.node, "answer", None) is not None:
-            return self._answered_rows(finished)
+            answered = [(document, answer) for document, _, answer in finished
+                if answer is not None]
+            if not answered or self.priors or finished_rows() is None:
+                return []
+            positions = np.asarray([self.ids[document] for document, _ in answered],
+                dtype=np.int64)
+            order = np.argsort(positions, kind="stable")
+            values = pa.array([answered[index][1] for index in order], pa.bool_())
+            alias = self.node.alias
+            rows = Rows({alias: arrow_ids(positions[order])}).with_column(
+                self.node.answer, values)
+            rows = join_prior_rows(rows, alias, (), self.prior_tables)
+            return [finished_table(self.node.node_id, f"rows:{alias}", rows.table())]
         sink = answer_sink()
         if sink is not None and finished:
             sink({"kind": "filter", "node": self.node.node_id,
@@ -133,27 +145,6 @@ class FilterOperator(SingleNodeOperator):
         passed = [document for document, survived, _ in finished if survived]
         return passed_rows(self.node, self.node.alias,
             [self.ids[document] for document in passed])
-
-    def _answered_rows(self, finished) -> list:
-        """The finished rows of settled documents, with the filter's answer.
-
-        Each row carries the columns of the rows the filter reads. A
-        filter whose rows carry the columns of an operator before it in
-        the chain reports its rows with its result instead.
-        """
-        answered = [(document, answer) for document, _, answer in finished
-            if answer is not None]
-        if not answered or self.priors or finished_rows() is None:
-            return []
-        positions = np.asarray([self.ids[document] for document, _ in answered],
-            dtype=np.int64)
-        order = np.argsort(positions, kind="stable")
-        values = pa.array([answered[index][1] for index in order], pa.bool_())
-        alias = self.node.alias
-        rows = Rows({alias: arrow_ids(positions[order])}).with_column(
-            self.node.answer, values)
-        rows = join_prior_rows(rows, alias, (), self.prior_tables)
-        return [finished_table(self.node.node_id, f"rows:{alias}", rows.table())]
 
     def read_answers(self, every) -> int | None:
         """Record filter answers and leave token accounting to the region."""
