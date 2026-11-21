@@ -66,6 +66,16 @@ Run every check before you push:
 - `check_names.py` flags two names for one concept, and one name for
   two.
 
+# Refactoring
+
+`tools/skill_issues.py` counts what Joseph Suarez's refactoring
+algorithm (PufferLib's SKILL_ISSUES.md) removes: tokens, functions used
+once, error guards, nesting, forwarding functions, and style. Save a
+baseline with `--json`, refactor, then run `--compare` on the baseline;
+it exits 1 when a count rises. `--list <metric>` prints the work, and
+`--under <path>` narrows the counts to one directory. The tests must
+still pass: the tool measures length, not behavior.
+
 # Build
 
 - Run `tools/build.sh` when you edit no Rust, and
