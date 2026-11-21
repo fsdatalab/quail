@@ -165,11 +165,6 @@ pub fn image_size(bytes: &[u8], sizing: ImageSizing) -> Result<(u32, u32), Compi
     Ok((sides[1] as u32, sides[0] as u32))
 }
 
-/// Whether a document part's bytes are an image rather than text.
-fn is_image(bytes: &[u8]) -> bool {
-    bytes.starts_with(PNG_SIGNATURE) || bytes.starts_with(JPEG_SIGNATURE)
-}
-
 /// The first token id of each image a planner has seen, by its bytes.
 #[derive(Debug, Default)]
 pub(crate) struct ImageIds {
@@ -227,7 +222,7 @@ pub(crate) fn image_token_lists(
     let mut lists = LargeListBuilder::new(Int32Builder::new());
     // one part's tokens: an image's tokens, or else its UTF-8 text's
     let mut part = |bytes: &[u8], tokens: &mut Int32Builder, text: bool| {
-        if text && !is_image(bytes) {
+        if text && !(bytes.starts_with(PNG_SIGNATURE) || bytes.starts_with(JPEG_SIGNATURE)) {
             let text = std::str::from_utf8(bytes).map_err(|_| {
                 CompileError::new("a document part is neither an image nor UTF-8 text")
             })?;
