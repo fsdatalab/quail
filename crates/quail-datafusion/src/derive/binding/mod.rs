@@ -241,6 +241,22 @@ impl Binder {
             .iter()
             .find(|(found, _, _)| found == alias)
             .expect("a table in scope");
+        use base64::Engine;
+        use datafusion::arrow::ipc::writer::{
+            DictionaryTracker, IpcDataGenerator, IpcWriteOptions, write_message,
+        };
+        let options = IpcWriteOptions::default();
+        let mut tracker = DictionaryTracker::new(false);
+        let encoded = IpcDataGenerator::default().schema_to_bytes_with_dictionary_tracker(
+            schema,
+            &mut tracker,
+            &options,
+        );
+        let mut bytes = Vec::new();
+        write_message(&mut bytes, encoded, &options).expect("an IPC schema message");
+        let schema = Schema {
+            ipc: base64::engine::general_purpose::STANDARD.encode(bytes),
+        };
         Scan {
             column: match self
                 .document_columns
@@ -250,31 +266,11 @@ impl Binder {
                 Some((_, column)) => ScanColumn::Expression(column.clone()),
                 None => ScanColumn::Unnamed(String::new()),
             },
-            schema: Some(schema_of(schema)),
+            schema: Some(schema),
             provider: provider.clone(),
             alias: alias.to_string(),
             columns: Vec::new(),
             predicates: Vec::new(),
         }
-    }
-}
-
-/// An Arrow schema as the plan codec writes it: IPC bytes in base64.
-fn schema_of(schema: &SchemaRef) -> Schema {
-    use base64::Engine;
-    use datafusion::arrow::ipc::writer::{
-        DictionaryTracker, IpcDataGenerator, IpcWriteOptions, write_message,
-    };
-    let options = IpcWriteOptions::default();
-    let mut tracker = DictionaryTracker::new(false);
-    let encoded = IpcDataGenerator::default().schema_to_bytes_with_dictionary_tracker(
-        schema,
-        &mut tracker,
-        &options,
-    );
-    let mut bytes = Vec::new();
-    write_message(&mut bytes, encoded, &options).expect("an IPC schema message");
-    Schema {
-        ipc: base64::engine::general_purpose::STANDARD.encode(bytes),
     }
 }
