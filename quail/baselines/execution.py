@@ -127,7 +127,20 @@ class RequestModelExecution:
         self._execute_joins(node, survivors, outputs, steps)
         self._execute_joined_classifications(node, survivors, outputs, steps)
         if self.answer_submission in ("operator-at-a-time", "shuffled"):
-            self._execute_answers(node, survivors, outputs, steps)
+            for alias, specs, ids, texts, bodies, body_texts in self._answer_groups(
+                    node, [*node.extracts, *node.maps], survivors,
+                    "AI.EXTRACT and AI.MAP"):
+                extracts = [spec for spec in specs
+                    if isinstance(spec, RequestExtractSpec)]
+                maps = [spec for spec in specs
+                    if not isinstance(spec, RequestExtractSpec)]
+                extracted, mapped = answer_documents(
+                    self.client, extracts, maps, bodies, texts, body_texts,
+                    shuffled=self.answer_submission == "shuffled")
+                for spec, result in zip(extracts, extracted):
+                    self._extracted(alias, spec, ids, result, outputs, steps)
+                for spec, result in zip(maps, mapped):
+                    self._mapped(alias, spec, ids, result, outputs, steps)
         else:
             for alias, specs, ids, texts, bodies, body_texts in self._answer_groups(
                     node, node.extracts, survivors, "AI.EXTRACT"):
@@ -495,22 +508,6 @@ class RequestModelExecution:
                     for document in ids],
                 ([preamble_text + text for text in document_texts]
                     if self.submit_text else None))
-
-    def _execute_answers(self, node, survivors, outputs, steps):
-        """Submit each document's extraction and map prompts in one generate call."""
-        for alias, specs, ids, texts, bodies, body_texts in self._answer_groups(
-                node, [*node.extracts, *node.maps], survivors,
-                "AI.EXTRACT and AI.MAP"):
-            extracts = [spec for spec in specs
-                if isinstance(spec, RequestExtractSpec)]
-            maps = [spec for spec in specs if not isinstance(spec, RequestExtractSpec)]
-            extracted, mapped = answer_documents(
-                self.client, extracts, maps, bodies, texts, body_texts,
-                shuffled=self.answer_submission == "shuffled")
-            for spec, result in zip(extracts, extracted):
-                self._extracted(alias, spec, ids, result, outputs, steps)
-            for spec, result in zip(maps, mapped):
-                self._mapped(alias, spec, ids, result, outputs, steps)
 
     def _extracted(self, alias, spec, ids, result, outputs, steps):
         """Record one extraction field's answers and its request step."""
