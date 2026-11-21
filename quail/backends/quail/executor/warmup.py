@@ -34,22 +34,6 @@ ROW_CLASSES = ((1, 1), (32, 1), (32, 16), (32, 17),
 ROW_CLASS_CACHED = 64
 
 
-def _warm_inputs(budget, question_tokens=16):
-    """Generate synthetic document and question tokens for kernel warmup.
-
-    Cycled to any length the passes need. Fixed small ids; only the
-    counts matter to the kernels.
-    """
-    document = [10 + (i % 500) for i in range(512)]
-    question = [10 + (i % 500) for i in range(question_tokens)]
-    q_max = len(question)
-    warm_documents, used = [], 0
-    while used + len(document) + q_max <= budget:
-        warm_documents.append(document)
-        used += len(document) + q_max
-    return warm_documents or [document[:max(8, budget - q_max)]], question, document
-
-
 def _warm_convolutions(torch, pipeline, budget):
     """Compile and load convolution kernels for every private state capacity."""
     from quail.backends.quail.executor.gdn import GdnPhase, causal_conv_kernel
@@ -165,8 +149,15 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
     _warm_short_attention(torch, arena, pipeline)
     # a readout of several trailing rows needs a question that long
     trailing = 1 if async_ans is None else async_ans.trailing_rows
-    warm_documents, question, document = _warm_inputs(budget, max(16, trailing))
+    question_tokens = max(16, trailing)
+    document = [10 + (i % 500) for i in range(512)]
+    question = [10 + (i % 500) for i in range(question_tokens)]
     q_max = len(question)
+    warm_documents, used = [], 0
+    while used + len(document) + q_max <= budget:
+        warm_documents.append(document)
+        used += len(document) + q_max
+    warm_documents = warm_documents or [document[:max(8, budget - q_max)]]
     modes = ("unified", "tree") if pipeline.tree_attention else ("unified",)
     for mode in modes:
         logger.debug("kernels: warming %s attention, full chunk", mode)
