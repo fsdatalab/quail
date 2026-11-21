@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import warnings
-from dataclasses import asdict, replace
+from dataclasses import replace
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import _quail_native
@@ -51,28 +51,6 @@ def backend_refusal(session) -> Refusal | None:
             constraint="unsupported_backend_configuration", needed=1,
             available=0, unit="configurations")
     return None
-
-
-def planning_settings(session, order: str | None) -> dict:
-    """The configuration Rust plans a region for.
-
-    Args:
-        session: The session whose model, device, and backend plan it.
-        order: The stage order rule, 'by_cost' or 'as_written', or None.
-    """
-    config = session.config
-    backend = session.registry.backend(config.backend)
-    return {
-        "model": asdict(session.model),
-        "device": asdict(session.device),
-        "gpus": config.gpus, "canvas_draws": config.canvas_draws,
-        "gpu_timing": config.gpu_timing,
-        "attention": config.attention, "order": order,
-        "backend": config.backend,
-        "physical_rules": [rule.name for rule in
-                           session.registry.physical_rules.values()],
-        "request": getattr(backend, "request_settings", None),
-    }
 
 
 @runtime_checkable
