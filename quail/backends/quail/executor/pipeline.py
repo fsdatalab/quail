@@ -8,6 +8,7 @@ answered, since a step asks only the rows the steps before it kept.
 """
 
 import numpy as np
+import pyarrow as pa
 
 from quail.backends.quail.executor.operators.filter import (
     filter_result,
@@ -15,9 +16,8 @@ from quail.backends.quail.executor.operators.filter import (
 )
 from quail.backends.quail.executor.operators.join import set_joins, upstream_join
 from quail.backends.quail.executor.operators.set_classify import (
-    SetLabels,
-    classify_result,
     joined_labels,
+    labeled_result,
     score_result,
 )
 from quail.backends.quail.executor.operators.set_extract import (
@@ -160,11 +160,21 @@ def set_steps(state, nodes, ids, prefixes, ask, *, texts=None, inputs=None,
                 results[node.node_id] = score_result(node, ids[asked], values,
                     priors, cost, suffix_tokens)
             elif kind == "label":
-                labels = SetLabels(
-                    np.asarray(node.spec.labels, dtype=object)[values.argmax(-1)],
-                    values, suffix_tokens=suffix_tokens, **cost)
-                results[node.node_id] = classify_result(node, ids[asked], labels,
-                    priors)
+                labels = np.asarray(node.spec.labels, dtype=object)[values.argmax(-1)]
+                asked_ids = ids[asked]
+                spec = node.spec
+                labeled = [index for index, label in enumerate(labels)
+                    if label is not None]
+                results[node.node_id] = labeled_result(
+                    node, np.asarray([[asked_ids[index]] for index in labeled],
+                        dtype=np.int32).reshape(-1, 1),
+                    [labels[index] for index in labeled], priors, pa.string(),
+                    values[labeled] if spec.probabilities else None,
+                    input_rows=len(asked_ids), output_rows=len(labeled),
+                    evaluated_documents=len(labeled), fresh_tokens=cost["tokens"],
+                    gpu_s=cost["gpu_s"], chunks=cost["chunks"],
+                    extension={"input_rows": len(asked_ids),
+                        "suffix_tokens": suffix_tokens})
             else:
                 if texts is None:
                     raise ValueError(f"AI.EXTRACT reads the text of {alias!r}, "

@@ -1,7 +1,5 @@
 """AI.CLASSIFY under set attention: option-code questions packed in passes."""
 
-from dataclasses import dataclass
-
 import numpy as np
 import pyarrow as pa
 
@@ -25,28 +23,6 @@ from quail.backends.quail.reranker import (
 from quail.common.expressions import PROBABILITIES_SUFFIX
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.progress import answer_sink
-
-
-@dataclass
-class SetLabels:
-    """One classification's labels from set-attention passes.
-
-    Attributes:
-        labels: Per row, its label, or None for a row no pass reached.
-        probabilities: Per row, each label's probability.
-        tokens: The fresh tokens of the passes this classification led.
-        gpu_s: Their forward-pass GPU seconds.
-        chunks: Their forward passes.
-        suffix_tokens: The tokens of this classification's question, summed
-            over the rows it labeled.
-    """
-
-    labels: np.ndarray
-    probabilities: np.ndarray
-    tokens: int = 0
-    gpu_s: float = 0.0
-    chunks: int = 0
-    suffix_tokens: int = 0
 
 
 def labeled_result(node, rows, values, priors=(), value_type=None,
@@ -77,29 +53,6 @@ def labeled_result(node, rows, values, priors=(), value_type=None,
     metrics["extension"] = {"output": spec.name, "aliases": list(spec.aliases),
         **metrics.get("extension", {})}
     return NodeResult(classify_outputs(node, scored), NodeMetrics(**metrics))
-
-
-def classify_result(node, ids, labels: SetLabels, priors) -> NodeResult:
-    """A classification's NodeResult: the labeled rows joined with its inputs.
-
-    Args:
-        node: The AiClassify.
-        ids: The document ids it was asked about.
-        labels: Its SetLabels.
-        priors: The Rows of each of its rows inputs.
-    """
-    spec = node.spec
-    labeled = [index for index, label in enumerate(labels.labels)
-        if label is not None]
-    return labeled_result(
-        node, np.asarray([[ids[index]] for index in labeled],
-            dtype=np.int32).reshape(-1, 1),
-        [labels.labels[index] for index in labeled], priors, pa.string(),
-        labels.probabilities[labeled] if spec.probabilities else None,
-        input_rows=len(ids), output_rows=len(labeled),
-        evaluated_documents=len(labeled), fresh_tokens=labels.tokens,
-        gpu_s=labels.gpu_s, chunks=labels.chunks,
-        extension={"input_rows": len(ids), "suffix_tokens": labels.suffix_tokens})
 
 
 def score_result(node, ids, scores, priors, cost, suffix_tokens) -> NodeResult:
