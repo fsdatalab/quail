@@ -167,9 +167,28 @@ class JoinOperator(ModelOperator):
 
     def read_answers(self, every) -> int:
         """Map predicate answers to reached anchors and count suffix work."""
-        self.own_tokens = _predicate_tokens(
-            self.stages, every, self.inputs.get("anchor_partners"),
-            self.inputs["anchor_keys"], self.canvas_tokens)
+        lists_for = self.inputs.get("anchor_partners")
+        anchor_keys = self.inputs["anchor_keys"]
+        canvas_tokens = self.canvas_tokens
+        self.own_tokens = []
+        previous = None
+        for j, (stage, rows) in enumerate(zip(self.stages, every)):
+            frame = list(stage.frame)
+            writes = bool(frame) and frame != previous
+            previous = frame
+            lengths = np.fromiter(
+                (len(suffix) + canvas_tokens for suffix in stage.suffixes),
+                dtype=np.int64, count=len(stage.suffixes))
+            suffix_tokens = int(lengths.sum())
+            total = len(rows) * (len(frame) + canvas_tokens if writes else 0)
+            if lists_for is None:
+                total += len(rows) * suffix_tokens
+            else:
+                for anchor in rows:
+                    indices = lists_for(anchor_keys[anchor][1], j)
+                    total += (suffix_tokens if indices is None
+                        else int(lengths[indices].sum()))
+            self.own_tokens.append(total)
         upstream = self.inputs.get("upstream")
         if upstream is not None:
             if every:
@@ -458,31 +477,6 @@ def set_joins(state, join) -> dict:
     join.read_answers(every)
     join.own_tokens = own_tokens
     return join.close(sum(own_tokens), all_spans, {}, 0)
-
-
-def _predicate_tokens(join_stages, answers, lists_for, anchor_keys,
-                      canvas_tokens) -> list[int]:
-    """Count each predicate's fresh frame and partner suffix tokens."""
-    totals = []
-    previous = None
-    for j, (stage, rows) in enumerate(zip(join_stages, answers)):
-        frame = list(stage.frame)
-        writes = bool(frame) and frame != previous
-        previous = frame
-        lengths = np.fromiter(
-            (len(suffix) + canvas_tokens for suffix in stage.suffixes),
-            dtype=np.int64, count=len(stage.suffixes))
-        suffix_tokens = int(lengths.sum())
-        total = len(rows) * (len(frame) + canvas_tokens if writes else 0)
-        if lists_for is None:
-            total += len(rows) * suffix_tokens
-        else:
-            for anchor in rows:
-                indices = lists_for(anchor_keys[anchor][1], j)
-                total += (suffix_tokens if indices is None
-                          else int(lengths[indices].sum()))
-        totals.append(total)
-    return totals
 
 
 def _join_round_kv(anchor_keys, arena) -> dict:
