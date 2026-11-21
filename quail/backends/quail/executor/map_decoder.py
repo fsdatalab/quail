@@ -450,9 +450,7 @@ class MapDecoder:
         self.fed[plain] += 1
         self.rows_fed += np.bincount(self.map[rows.slots],
                                      minlength=len(self.limits))
-        self._count_reads(rows, chunk.meta.get("shared") is not None)
-
-    def _count_reads(self, rows, shared: bool) -> None:
+        shared = chunk.meta.get("shared") is not None
         reads = self.read_tokens
         lengths = rows.positions + 1
         reads["all"] += int(lengths.sum())
