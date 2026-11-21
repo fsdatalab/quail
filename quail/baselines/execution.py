@@ -11,7 +11,6 @@ import pyarrow as pa
 
 from quail.backends.base import GpuContext
 from quail.baselines.operators import (
-    allowed_members_by_anchor,
     answer_documents,
     choose_documents,
     classification_rows,
@@ -31,6 +30,12 @@ from quail.baselines.request_scheduling import (
     run_join_grouped,
     text_answer,
     true_bit,
+)
+from quail.common.pairs import (
+    allowed_members,
+    members_by_partner,
+    pair_partner,
+    partner_map,
 )
 from quail.execution.ids import document_ids, id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
@@ -340,9 +345,12 @@ class RequestModelExecution:
             allowed = None
             request_pairs = None
             if spec.written_position in self.pairs:
-                allowed = allowed_members_by_anchor(
-                    anchor, partners, anchor_ids, members,
-                    self.pairs[spec.written_position])
+                pairs = self.pairs[spec.written_position]
+                position = partners.index(pair_partner(anchor, partners))
+                by_partner = members_by_partner(members, position)
+                rows = partner_map(pairs, anchor, partners[position])
+                allowed = [allowed_members(rows, by_partner, anchor_id)
+                    for anchor_id in anchor_ids]
                 request_pairs = [
                     (anchor_index, member_index)
                     for anchor_index, mine in enumerate(allowed)

@@ -7,12 +7,6 @@ import time
 import numpy as np
 import pyarrow as pa
 
-from quail.common.pairs import (
-    allowed_members,
-    members_by_partner,
-    pair_partner,
-    partner_map,
-)
 from quail.execution.labels import match_label
 from quail.execution.result import (
     answer_table,
@@ -429,15 +423,6 @@ def read_extractions(outputs, texts, wall_s: float) -> dict:
         "unaligned": unaligned,
         "cut": cut,
     }
-
-
-def allowed_members_by_anchor(anchor, partners, anchor_ids, members, pairs) -> list:
-    """Per anchor, the member indices its equality conditions allow."""
-    position = partners.index(pair_partner(anchor, partners))
-    by_partner = members_by_partner(members, position)
-    rows = partner_map(pairs, anchor, partners[position])
-    return [allowed_members(rows, by_partner, anchor_id)
-            for anchor_id in anchor_ids]
 
 
 def join_answers(spec, rows, answers, anchor, partners) -> pa.Table:
