@@ -88,6 +88,56 @@ def test_relative_attention_matches_dense_attention(window):
             assert error < 2e-2, (block_rows, index, error)
 
 
+@pytest.mark.parametrize("window", [0, 1024])
+def test_answer_step_attention_matches_dense_attention(window):
+    import numpy as np
+
+    from quail.backends.quail.executor.models import inkling2_kernels as kernels
+
+    torch.manual_seed(1)
+    # (queries, keys): one-token steps over long and short contexts, and a
+    # three-token step
+    shapes = [(1, 2100), (1, 9), (3, 700), (1, 1500)]
+    pages_per = [-(-used // PAGE) for _, used in shapes]
+    num_pages = sum(pages_per) + 3
+    kp = torch.randn(num_pages, PAGE, KV_HEADS, DIM, device="cuda",
+                     dtype=torch.bfloat16)
+    vp = torch.randn_like(kp)
+    order = torch.randperm(num_pages, device="cuda")
+    table = torch.zeros(len(shapes), max(pages_per), dtype=torch.int32,
+                        device="cuda")
+    start = 0
+    for index, count in enumerate(pages_per):
+        table[index, :count] = order[start:start + count].int()
+        start += count
+    total = sum(rows for rows, _ in shapes)
+    q = torch.randn(total, HEADS, DIM, device="cuda", dtype=torch.bfloat16)
+    q = q / q.float().norm(dim=-1, keepdim=True).to(q.dtype) * 4
+    rel = torch.randn(total, HEADS, RANK, device="cuda", dtype=torch.bfloat16)
+    sink = torch.randn(total, HEADS, device="cuda", dtype=torch.bfloat16)
+    proj = torch.randn(RANK, EXTENT, device="cuda", dtype=torch.bfloat16) * 0.3
+    cu = np.cumsum([0] + [rows for rows, _ in shapes])
+    cu_q = torch.tensor(cu, dtype=torch.int32, device="cuda")
+    used = torch.tensor([u for _, u in shapes], dtype=torch.int32, device="cuda")
+    seqs, firsts = kernels.attention_tiles(cu, 1)
+    tokens = tuple(torch.from_numpy(a.astype(np.int32)).cuda()
+                   for a in (seqs, firsts, cu[seqs] + firsts))
+    out = torch.zeros_like(q)
+    kernels.decode_attention(torch, q, kp, vp, rel, sink,
+                             proj.t().contiguous(), out, tokens, cu_q, used,
+                             table, window=window,
+                             max_keys=max(u for _, u in shapes))
+    for index, (rows, keys) in enumerate(shapes):
+        pages = table[index, :pages_per[index]].long()
+        k = kp[pages].reshape(-1, KV_HEADS, DIM)[:keys]
+        v = vp[pages].reshape(-1, KV_HEADS, DIM)[:keys]
+        span = slice(cu[index], cu[index + 1])
+        expected = _dense_attention(q[span], k, v, rel[span], sink[span],
+                                    proj, window)
+        error = (out[span].float() - expected).abs().max().item()
+        assert error < 2e-2, (index, error)
+
+
 def test_the_block_mix_matches_its_definition():
     from quail.backends.quail.executor.models import inkling2_kernels as kernels
 

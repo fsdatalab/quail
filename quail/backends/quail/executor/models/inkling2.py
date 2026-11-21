@@ -46,6 +46,9 @@ SKIPPED_PARTS = ("model.visual.",)
 # fused MoE; smaller ones run Quail's, since the fused call's host time
 # outweighs its GPU savings on launch-bound answer steps
 FUSED_MIN_TOKENS = 4096
+# a sequence with at most this many new queries in a pass runs its
+# attention one token per program
+DECODE_MAX_QUERIES = 4
 STATE_CHANNELS = {"k": (0, 1024), "v": (1024, 2048), "attn": (2048, 4352),
                   "mlp": (4352, 6656)}
 # the message gates of a loop layer, by checkpoint controller name
@@ -209,6 +212,7 @@ def load_inkling2(path, device="cuda"):
         layer.q_scale = take(own("attn.q_l2_clip.scale"))
         layer.rel_scale = take(own("attn.rel_l2_clip.scale"))
         layer.rel_proj = take(own("attn.rel_logits_proj.proj")).contiguous()
+        layer.rel_proj_t = layer.rel_proj.t().contiguous()
         layer.attn_conv = take(own("attn_sconv.weight"), fp32).view(-1, 4)
         layer.mlp_conv = take(own("mlp_sconv.weight"), fp32).view(-1, 4)
         layer.mlp_norm = take(own("mlp_norm.weight")).view(1, hidden)
@@ -836,14 +840,19 @@ class Inkling2Pipeline(ModelPipeline):
         if not isinstance(buffers, PiecewiseBuffers):
             buffers.attn = torch.empty_like(buffers.q3)
         prefill = plan["block_rows"] >= 64
+        window = self.window if layer.is_local else 0
+        args = (unified["cu_q"], unified["used"], unified["table"])
+        # the query tiles first: their split merge writes every row
         kernels.rel_attention(
             torch, buffers.q3[:n], kp, vp, buffers.rel[:n], buffers.sink[:n],
-            layer.rel_proj, buffers.attn[:n], plan["tiles"], unified["cu_q"],
-            unified["used"], unified["table"],
-            window=self.window if layer.is_local else 0,
-            max_keys=unified["max_used"], block_rows=plan["block_rows"],
-            block_keys=64 if prefill else 32,
+            layer.rel_proj, buffers.attn[:n], plan["tiles"], *args,
+            window=window, max_keys=unified["max_used"],
+            block_rows=plan["block_rows"], block_keys=64 if prefill else 32,
             num_warps=8 if prefill else 4, num_stages=3 if prefill else 2)
+        kernels.decode_attention(
+            torch, buffers.q3[:n], kp, vp, buffers.rel[:n], buffers.sink[:n],
+            layer.rel_proj_t, buffers.attn[:n], plan["tokens"], *args,
+            window=window, max_keys=unified["max_used"])
 
     def stage(self, buffers, chunk):
         """Copy the chunk's convolution taps and state writes into buffers.
@@ -879,10 +888,17 @@ class Inkling2Pipeline(ModelPipeline):
         taps, slots, sources = conv_taps(meta["gdn"], chunk.tokens)
         unified = meta["unified"]
         group = self.spec.num_q_heads // self.spec.num_kv_heads
-        # 16-row tiles for answer steps, 64-row tiles for prefill
-        block_rows = 16 if unified["max_q"] <= 5 else 64
-        seqs, firsts = kernels.attention_tiles(unified["cu_q_host"],
-                                               block_rows // group)
+        cu = np.asarray(unified["cu_q_host"], dtype=np.int64)
+        lengths = np.diff(cu)
+        # answer steps' tokens run one per program; longer sequences, in
+        # query tiles: 16 rows when every one is short, else 64
+        decoded = lengths <= DECODE_MAX_QUERIES
+        longest = int(lengths[~decoded].max()) if (~decoded).any() else 0
+        block_rows = 16 if longest <= 5 else 64
+        seqs, firsts = kernels.attention_tiles(cu, block_rows // group,
+                                               keep=~decoded)
+        token_seqs, token_q = kernels.attention_tiles(cu, 1, keep=decoded)
+        token_rows = cu[token_seqs] + token_q
 
         def gpu(array, dtype):
             return torch.from_numpy(np.ascontiguousarray(array)).to(
@@ -892,6 +908,8 @@ class Inkling2Pipeline(ModelPipeline):
                     write_slots=gpu(slots, torch.int64),
                     write_sources=gpu(sources, torch.int32),
                     tiles=(gpu(seqs, torch.int32), gpu(firsts, torch.int32)),
+                    tokens=(gpu(token_seqs, torch.int32), gpu(token_q, torch.int32),
+                            gpu(token_rows, torch.int32)),
                     block_rows=block_rows)
         meta["inkling_plan"] = plan
         return plan

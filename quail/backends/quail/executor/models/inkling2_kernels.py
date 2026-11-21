@@ -852,6 +852,125 @@ def _kernels() -> dict:
                      + head[:, None] * stride_o1 + offs_d[None, :],
                      out.to(tl.bfloat16), mask=row_ok[:, None])
 
+    @triton.jit(do_not_specialize=["window", "splits"])
+    def decode_attention(q_ptr, k_ptr, v_ptr, rel_ptr, proj_t_ptr, sink_ptr,
+                         out_ptr, part_acc_ptr, part_ml_ptr, token_seq_ptr,
+                         token_q_ptr, cu_q_ptr, used_ptr, table_ptr, stride_q0,
+                         stride_q1, stride_r0, stride_r1, stride_s0,
+                         stride_o0, stride_o1, stride_k0, stride_k1,
+                         stride_k2, stride_v0, stride_v1, stride_v2,
+                         stride_bt, scale_log2, window, splits,
+                         GROUP: tl.constexpr, HEADS: tl.constexpr,
+                         BM: tl.constexpr, BN: tl.constexpr, D: tl.constexpr,
+                         R: tl.constexpr, EXTENT: tl.constexpr,
+                         PAGE: tl.constexpr, HAS_WINDOW: tl.constexpr,
+                         SPLIT: tl.constexpr):
+        # One query token's GROUP heads against one KV head's keys. Every
+        # row shares the token's position, so a key tile's bias is one dot:
+        # the rows' relative states times the profile at the tile's
+        # distances, read from the transposed (EXTENT, R) profile.
+        LOG2E: tl.constexpr = 1.4426950408889634
+        token = tl.program_id(0) // splits
+        split = tl.program_id(0) % splits
+        kv_head = tl.program_id(1)
+        seq = tl.load(token_seq_ptr + token)
+        qi = tl.load(token_q_ptr + token)
+        q_start = tl.load(cu_q_ptr + seq)
+        q_len = tl.load(cu_q_ptr + seq + 1) - q_start
+        used = tl.load(used_ptr + seq)
+        qpos = used - q_len + qi
+        q_row = (q_start + qi).to(tl.int64)
+        offs_m = tl.arange(0, BM)
+        row_ok = offs_m < GROUP
+        head = kv_head * GROUP + offs_m
+        offs_d = tl.arange(0, D)
+        offs_r = tl.arange(0, R)
+        offs_key = tl.arange(0, BN)
+        q = tl.load(q_ptr + q_row * stride_q0 + head[:, None] * stride_q1
+                    + offs_d[None, :], mask=row_ok[:, None], other=0.0)
+        rel = tl.load(rel_ptr + q_row * stride_r0 + head[:, None] * stride_r1
+                      + offs_r[None, :], mask=row_ok[:, None], other=0.0)
+        if split == 0:
+            sink = tl.load(sink_ptr + q_row * stride_s0 + head, mask=row_ok,
+                           other=0.0).to(tl.float32)
+            m_i = sink * LOG2E
+            l_i = tl.zeros((BM,), dtype=tl.float32) + 1.0
+        else:
+            m_i = tl.zeros((BM,), dtype=tl.float32) - float("inf")
+            l_i = tl.zeros((BM,), dtype=tl.float32)
+        acc = tl.zeros((BM, D), dtype=tl.float32)
+        lo = qpos * 0
+        if HAS_WINDOW:
+            lo = tl.maximum(qpos - (window - 1), 0)
+        start = lo // BN * BN
+        per = tl.cdiv(tl.cdiv(qpos + 1 - start, BN), splits) * BN
+        lo_key = start + split * per
+        hi_key = tl.minimum(lo_key + per, qpos + 1)
+        bt_row = table_ptr + seq.to(tl.int64) * stride_bt
+        for n0 in range(lo_key, hi_key, BN):
+            page = tl.load(bt_row + n0 // PAGE).to(tl.int64)
+            in_page = n0 % PAGE
+            kpos = n0 + offs_key
+            k = tl.load(k_ptr + page * stride_k0
+                        + (in_page + offs_key[:, None]) * stride_k1
+                        + kv_head * stride_k2 + offs_d[None, :])
+            v = tl.load(v_ptr + page * stride_v0
+                        + (in_page + offs_key[:, None]) * stride_v1
+                        + kv_head * stride_v2 + offs_d[None, :])
+            s = tl.dot(q, tl.trans(k)) * scale_log2
+            dist = qpos - kpos
+            near = (dist >= 0) & (dist < EXTENT)
+            profile = tl.load(proj_t_ptr + tl.minimum(tl.maximum(dist, 0),
+                                                      EXTENT - 1)[:, None] * R
+                              + offs_r[None, :], mask=near[:, None],
+                              other=0.0)
+            # rounded to bf16 as the reference's bias is
+            bias = tl.dot(rel, tl.trans(profile)).to(tl.bfloat16)
+            s += bias.to(tl.float32) * LOG2E
+            valid = (kpos >= lo) & (dist >= 0)
+            s = tl.where(valid[None, :], s, -float("inf"))
+            m_new = tl.maximum(m_i, tl.max(s, axis=1))
+            m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
+            alpha = tl.math.exp2(m_i - m_safe)
+            p = tl.math.exp2(s - m_safe[:, None])
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
+            m_i = m_new
+        if SPLIT:
+            slot = (token * HEADS + head) * splits + split
+            tl.store(part_acc_ptr + slot[:, None] * D + offs_d[None, :], acc,
+                     mask=row_ok[:, None])
+            tl.store(part_ml_ptr + slot * 2, m_i, mask=row_ok)
+            tl.store(part_ml_ptr + slot * 2 + 1, l_i, mask=row_ok)
+        else:
+            out = acc / l_i[:, None]
+            tl.store(out_ptr + q_row * stride_o0 + head[:, None] * stride_o1
+                     + offs_d[None, :], out.to(tl.bfloat16),
+                     mask=row_ok[:, None])
+
+    @triton.jit(do_not_specialize=["splits"])
+    def merge_tokens(part_acc_ptr, part_ml_ptr, rows_ptr, out_ptr, stride_o0,
+                     stride_o1, splits, HEADS: tl.constexpr, D: tl.constexpr,
+                     MAX_SPLITS: tl.constexpr):
+        # one decoded token and head: the splits' softmax states, merged
+        # into the token's row
+        token = tl.program_id(0).to(tl.int64)
+        head = tl.program_id(1)
+        row = tl.load(rows_ptr + token).to(tl.int64)
+        offs_s = tl.arange(0, MAX_SPLITS)
+        offs_d = tl.arange(0, D)
+        slot = (token * HEADS + head) * splits + offs_s
+        ok = offs_s < splits
+        m = tl.load(part_ml_ptr + slot * 2, mask=ok, other=-float("inf"))
+        sums = tl.load(part_ml_ptr + slot * 2 + 1, mask=ok, other=0.0)
+        top = tl.max(m, axis=0)
+        w = tl.where(ok, tl.math.exp2(m - top), 0.0)
+        acc = tl.load(part_acc_ptr + slot[:, None] * D + offs_d[None, :],
+                      mask=ok[:, None], other=0.0)
+        out = tl.sum(acc * w[:, None], axis=0) / tl.sum(sums * w, axis=0)
+        tl.store(out_ptr + row * stride_o0 + head * stride_o1 + offs_d,
+                 out.to(tl.bfloat16))
+
     @triton.jit(do_not_specialize=["splits"])
     def merge_splits(part_acc_ptr, part_ml_ptr, out_ptr, stride_o0,
                      stride_o1, splits, HEADS: tl.constexpr,
@@ -1035,12 +1154,10 @@ def _kernels() -> dict:
         # the softcapped SwiGLU of columns [start, start + W), from 2N
         # columns that alternate 64 up and 64 gate columns; the result is
         # rounded to bf16, so approximate tanh and sigmoid suffice
-        groups = tl.load(gate_up_ptr + p * 2 * N + 2 * start
-                         + tl.arange(0, 2 * W)).to(tl.float32)
-        groups = tl.permute(tl.reshape(groups, (W // 64, 2, 64)), (0, 2, 1))
-        up, gate = tl.split(groups)
-        up = tl.reshape(up, (W,))
-        gate = tl.reshape(gate, (W,))
+        index = start + tl.arange(0, W)
+        column = gate_up_ptr + p * 2 * N + (index // 64) * 128 + index % 64
+        up = tl.load(column).to(tl.float32)
+        gate = tl.load(column + 64).to(tl.float32)
         if NVFP4:
             gate = (gate * outer).to(tl.bfloat16).to(tl.float32)
             up = (up * outer).to(tl.bfloat16).to(tl.float32)
@@ -1148,6 +1265,7 @@ def _kernels() -> dict:
         rms_norm=rms_norm, short_conv=short_conv, kv_conv=kv_conv,
         clip_heads=clip_heads, gate_attention=gate_attention, route=route,
         rel_attention=rel_attention, merge_splits=merge_splits,
+        decode_attention=decode_attention, merge_tokens=merge_tokens,
         quantize_tokens=quantize_tokens,
         swiglu_quantize=swiglu_quantize, combine=combine,
         gather_state=gather_state)
@@ -1401,11 +1519,16 @@ def gate_attention(torch, attn, gate):
 
 
 
-def attention_tiles(cu_q_host, rows_per_tile):
-    """(sequence, first query) per query tile, over sequences' query counts."""
+def attention_tiles(cu_q_host, rows_per_tile, keep=None):
+    """(sequence, first query) per query tile, over sequences' query counts.
+
+    keep, when given, marks the sequences to tile; the rest get no tiles.
+    """
     import numpy as np
 
     lengths = np.diff(np.asarray(cu_q_host, dtype=np.int64))
+    if keep is not None:
+        lengths = np.where(keep, lengths, 0)
     counts = -(-lengths // rows_per_tile)
     seqs = np.repeat(np.arange(len(lengths), dtype=np.int32), counts)
     firsts = (np.arange(int(counts.sum()), dtype=np.int64)
@@ -1474,6 +1597,63 @@ def rel_attention(torch, q3, kp, vp, rel, sink, proj, out, tiles, cu_q, used,
         _kernels()["merge_splits"][(rows, heads)](
             part_acc, part_ml, out, out.stride(0), out.stride(1), splits,
             HEADS=heads, D=dim, MAX_SPLITS=MAX_SPLITS, num_warps=4)
+    return out
+
+
+def decode_attention(torch, q3, kp, vp, rel, sink, proj_t, out, tokens,
+                     cu_q, used, table, *, window, max_keys, block_keys=64,
+                     num_warps=4, num_stages=3):
+    """Attention of answer-step tokens, one token's heads per program.
+
+    Args:
+        torch: The torch module.
+        q3: (rows, heads, dim) queries.
+        kp: (pages, page tokens, KV heads, dim) arena key pool.
+        vp: The arena value pool, shaped as kp.
+        rel: (rows, heads, rank) relative states.
+        sink: (rows, heads) view of the sink logits.
+        proj_t: (extent, rank) bf16 bias profiles, transposed.
+        out: (rows, heads, dim) output; only the tokens' rows are written.
+        tokens: (sequence ids, query indices, rows) of the tokens, on the
+            GPU.
+        cu_q: Each sequence's query bounds over the rows.
+        used: Keys per sequence, its queries' included.
+        table: Each sequence's arena pages.
+        window: Keys each row sees, or 0 for every earlier key.
+        max_keys: The most keys any sequence holds.
+        block_keys: Keys per key tile.
+        num_warps: Warps per program.
+        num_stages: Software pipeline stages of the key loop.
+    """
+    count = tokens[0].numel()
+    if count == 0:
+        return out
+    heads, dim = q3.shape[1], q3.shape[2]
+    kv_heads, page = kp.shape[2], kp.shape[1]
+    group = heads // kv_heads
+    extent, rank = proj_t.shape
+    splits = num_splits(count * kv_heads, max_keys, window)
+    if splits > 1:
+        part_acc = torch.empty((count * heads * splits, dim),
+                               dtype=torch.float32, device=q3.device)
+        part_ml = torch.empty((count * heads * splits, 2),
+                              dtype=torch.float32, device=q3.device)
+    else:
+        part_acc = part_ml = out
+    _kernels()["decode_attention"][(count * splits, kv_heads)](
+        q3, kp, vp, rel, proj_t, sink, out, part_acc, part_ml, tokens[0],
+        tokens[1], cu_q, used, table, q3.stride(0), q3.stride(1),
+        rel.stride(0), rel.stride(1), sink.stride(0), out.stride(0),
+        out.stride(1), kp.stride(0), kp.stride(1), kp.stride(2), vp.stride(0),
+        vp.stride(1), vp.stride(2), table.stride(0),
+        dim ** -0.5 * 1.4426950408889634, int(window), splits, GROUP=group,
+        HEADS=heads, BM=16, BN=block_keys, D=dim, R=rank, EXTENT=extent,
+        PAGE=page, HAS_WINDOW=window > 0, SPLIT=splits > 1,
+        num_warps=num_warps, num_stages=num_stages)
+    if splits > 1:
+        _kernels()["merge_tokens"][(count, heads)](
+            part_acc, part_ml, tokens[2], out, out.stride(0), out.stride(1),
+            splits, HEADS=heads, D=dim, MAX_SPLITS=MAX_SPLITS, num_warps=4)
     return out
 
 
