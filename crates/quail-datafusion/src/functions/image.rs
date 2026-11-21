@@ -137,21 +137,16 @@ fn shrink(bytes: &[u8], longest_edge: u32) -> Option<Vec<u8>> {
     let side = |pixels: u32| ((f64::from(pixels) * scale).round() as u32).max(1);
     // Qwen's image processor resizes with bicubic interpolation
     let resized = decoded.resize_exact(side(width), side(height), FilterType::CatmullRom);
-    encoded(resized, format)
-}
-
-/// An image's bytes in `format`: a PNG as it is, a JPEG as 8-bit RGB.
-fn encoded(image: DynamicImage, format: ImageFormat) -> Option<Vec<u8>> {
-    let mut bytes = Cursor::new(Vec::new());
+    let mut encoded = Cursor::new(Vec::new());
     if format == ImageFormat::Jpeg {
-        let encoder = JpegEncoder::new_with_quality(&mut bytes, JPEG_QUALITY);
-        DynamicImage::ImageRgb8(image.to_rgb8())
+        let encoder = JpegEncoder::new_with_quality(&mut encoded, JPEG_QUALITY);
+        DynamicImage::ImageRgb8(resized.to_rgb8())
             .write_with_encoder(encoder)
             .ok()?;
     } else {
-        image.write_to(&mut bytes, ImageFormat::Png).ok()?;
+        resized.write_to(&mut encoded, ImageFormat::Png).ok()?;
     }
-    Some(bytes.into_inner())
+    Some(encoded.into_inner())
 }
 
 /// `AI.IMAGE` as a DataFusion UDF, also named `AI.IMAGE` and `ai.image`.
