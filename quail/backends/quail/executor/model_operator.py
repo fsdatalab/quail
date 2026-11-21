@@ -22,7 +22,7 @@ from quail.backends.quail.executor.stages import Stage, frame_writes
 from quail.backends.quail.executor.state import QueryExecutionState
 from quail.common.expressions import effective_selectivity
 from quail.common.tokens import prefix_tree
-from quail.physical import AiFilter, AiJoin, Filter, ValueType
+from quail.physical import AiFilter, AiJoin, Filter
 from quail.progress import detail
 
 
@@ -50,20 +50,6 @@ def input_staging(state: QueryExecutionState):
     if state.loaded_model.input_staging is None:
         state.loaded_model.input_staging = InputStaging(state.torch)
     return state.loaded_model.input_staging
-
-
-def prior_inputs(node, operators, inputs):
-    """Return the preceding operators and external row tables a node reads."""
-    by_node = {member.node_id: operator for operator in operators
-               for member in operator.nodes}
-    priors, prior_tables = [], []
-    for port in node.inputs:
-        if port.value_type is ValueType.ROWS:
-            if port.source.node_id in by_node:
-                priors.append((by_node[port.source.node_id], port.source))
-            else:
-                prior_tables.append(inputs[port.name])
-    return priors, prior_tables
 
 
 def join_prior_rows(rows, alias, priors, prior_tables):

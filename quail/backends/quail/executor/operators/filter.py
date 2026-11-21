@@ -9,7 +9,6 @@ from pyarrow import compute as pc
 from quail.backends.quail.executor.model_operator import (
     SingleNodeOperator,
     join_prior_rows,
-    prior_inputs,
 )
 from quail.backends.quail.executor.stages import Stage, filter_stages
 from quail.common.expressions import accepts
@@ -22,6 +21,7 @@ from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.result import filter_answer_table
 from quail.execution.rows import Rows
 from quail.execution.runtimes.filter import filter_scores, tested_table
+from quail.physical import ValueType
 from quail.progress import answer_sink
 
 # the key of a NaN stop key value
@@ -39,10 +39,20 @@ class FilterOperator(SingleNodeOperator):
         pipeline = query.loaded_model.pipeline
         found = cls(node, region.document_ids(), query.async_answers,
                     len(pipeline.canvas_ids), frames=pipeline.mask == "causal")
-        if getattr(node, "answer", None) is not None:
-            # a filter that keeps every row carries the columns before it
-            found.priors, found.prior_tables = prior_inputs(
-                node, chain, region.node_inputs(node))
+        if getattr(node, "answer", None) is None:
+            return found
+        # a filter that keeps every row carries the columns before it
+        inputs = region.node_inputs(node)
+        by_node = {member.node_id: operator for operator in chain
+            for member in operator.nodes}
+        priors, prior_tables = [], []
+        for port in node.inputs:
+            if port.value_type is ValueType.ROWS:
+                if port.source.node_id in by_node:
+                    priors.append((by_node[port.source.node_id], port.source))
+                else:
+                    prior_tables.append(inputs[port.name])
+        found.priors, found.prior_tables = priors, prior_tables
         return found
 
     @classmethod
