@@ -17,44 +17,8 @@ use quail_planner::cost::statistics::AliasStats;
 use quail_planner::cost::work::Work;
 use quail_planner::cost::{packing, sol};
 
-/// A number, or a list of numbers, from Python.
-fn quantity(value: &Bound<'_, PyAny>) -> PyResult<Quantity> {
-    if let Ok(number) = value.extract::<f64>() {
-        return Ok(Quantity::Scalar(number));
-    }
-    Ok(Quantity::Array(value.extract::<Vec<f64>>()?))
-}
-
-fn to_python<'py>(py: Python<'py>, value: &Quantity) -> PyResult<Bound<'py, PyAny>> {
-    match value {
-        Quantity::Scalar(number) => Ok(number.into_pyobject(py)?.into_any()),
-        Quantity::Array(numbers) => Ok(numbers.clone().into_pyobject(py)?.into_any()),
-    }
-}
-
 /// Read nodes, fed nodes, and each label's decode round tokens.
 type LabelNodes = (Vec<Vec<i64>>, Vec<Vec<i64>>, Vec<Vec<i64>>);
-
-fn work_from(fields: &Bound<'_, PyDict>) -> PyResult<Work> {
-    let get = |name: &str| -> PyResult<Quantity> {
-        match fields.get_item(name)? {
-            Some(value) => quantity(&value),
-            None => Ok(Quantity::Scalar(0.0)),
-        }
-    };
-    Ok(Work {
-        tokens: get("tokens")?,
-        pairs: get("pairs")?,
-        kv_written: get("kv_written")?,
-        kv_read: get("kv_read")?,
-        sliding_pairs: get("sliding_pairs")?,
-        sliding_kv_read: get("sliding_kv_read")?,
-        state_written: get("state_written")?,
-        state_read: get("state_read")?,
-        sae_encoded: get("sae_encoded")?,
-        ..Work::default()
-    })
-}
 
 fn work_to<'py>(py: Python<'py>, work: &Work) -> PyResult<Bound<'py, PyDict>> {
     let fields = PyDict::new(py);
@@ -70,7 +34,11 @@ fn work_to<'py>(py: Python<'py>, work: &Work) -> PyResult<Bound<'py, PyDict>> {
         &work.sae_encoded,
     ];
     for (name, value) in WORK_FIELDS.iter().zip(values) {
-        fields.set_item(*name, to_python(py, value)?)?;
+        let value = match value {
+            Quantity::Scalar(number) => number.into_pyobject(py)?.into_any(),
+            Quantity::Array(numbers) => numbers.clone().into_pyobject(py)?.into_any(),
+        };
+        fields.set_item(*name, value)?;
     }
     Ok(fields)
 }
@@ -137,8 +105,29 @@ impl CostModel {
         head_rows: i64,
     ) -> PyResult<f64> {
         let model = self.model(model)?;
+        let get = |name: &str| -> PyResult<Quantity> {
+            let Some(value) = work.get_item(name)? else {
+                return Ok(Quantity::Scalar(0.0));
+            };
+            if let Ok(number) = value.extract::<f64>() {
+                return Ok(Quantity::Scalar(number));
+            }
+            Ok(Quantity::Array(value.extract::<Vec<f64>>()?))
+        };
+        let work = Work {
+            tokens: get("tokens")?,
+            pairs: get("pairs")?,
+            kv_written: get("kv_written")?,
+            kv_read: get("kv_read")?,
+            sliding_pairs: get("sliding_pairs")?,
+            sliding_kv_read: get("sliding_kv_read")?,
+            state_written: get("state_written")?,
+            state_read: get("state_read")?,
+            sae_encoded: get("sae_encoded")?,
+            ..Work::default()
+        };
         Ok(sol::unrounded_seconds(
-            &work_from(work)?.with_readout(rows, head_rows, model.vocab),
+            &work.with_readout(rows, head_rows, model.vocab),
             model,
             self.device(device)?,
             chunk_tokens,
