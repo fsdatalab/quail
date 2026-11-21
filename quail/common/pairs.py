@@ -1,10 +1,11 @@
-"""Pair tables for joins with ordinary equality conditions.
+"""Pair tables for joins with ordinary conditions.
 
 A pair table has one int32 column per joined alias holding row indices
 into that alias's document store. It lists exactly the (left, right)
-rows whose key columns are equal, so the model is asked about those
+rows whose key columns are equal, or every pair when the join has no
+keys, where the join's filter is TRUE, so the model is asked about those
 pairs and no others. The HashJoin node builds it at run time from the
-key columns the request carries as ``columns:<alias>`` relations.
+columns the request carries as ``columns:<alias>`` relations.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from quail.common.expressions import accepts
 from quail.common.selection import equality_keys
 
 COLUMNS_PREFIX = "columns:"
@@ -26,6 +28,9 @@ NULL_DOCUMENT = _quail_native.NULL_DOCUMENT
 # the value column of a deduplicated rows input to an AI filter with a
 # stop key: the documents each key document stands for
 COPIES = "__copies"
+# the most candidate pairs a join's filter tests at once, which bounds
+# the memory of a join without keys to its pairs that pass
+FILTER_BATCH_PAIRS = 1 << 20
 
 
 def pair_keys(anchors, partners):
@@ -61,6 +66,59 @@ def pair_table(left_alias: str, left_keys, right_alias: str,
     return joined.select(["left", "right"]).sort_by(
         [("left", "ascending"), ("right", "ascending")]).rename_columns(
             [left_alias, right_alias])
+
+
+def join_pairs(left_alias: str, left_keys, right_alias: str, right_keys, *,
+               join_filter=None, values=None) -> pa.Table:
+    """Row index pairs whose keys are equal and where the filter is TRUE.
+
+    For example, ``r JOIN t ON r.n < t.n`` has no keys, so every pair is
+    a candidate, and keeps the pairs where the r row's n is less.
+
+    Args:
+        left_alias: Alias of the left table; names its index column.
+        left_keys: Its key columns, one Arrow array per equality; empty
+            for a join without keys.
+        right_alias: Alias of the right table.
+        right_keys: Its key columns, in the same equality order.
+        join_filter: The join's other conditions, an Expression over
+            both tables' columns, or None.
+        values: alias -> a table of the columns the filter reads, one row
+            per key row.
+
+    Returns:
+        A table with columns (left_alias, right_alias), sorted by both.
+    """
+    if join_filter is None:
+        return pair_table(left_alias, left_keys, right_alias, right_keys)
+    if left_keys:
+        candidates = pair_table(left_alias, left_keys, right_alias, right_keys)
+        batches = (candidates.slice(start, FILTER_BATCH_PAIRS)
+                   for start in range(0, candidates.num_rows, FILTER_BATCH_PAIRS))
+    else:
+        batches = _cross_pairs(left_alias, values[left_alias].num_rows,
+                               right_alias, values[right_alias].num_rows)
+    kept = []
+    for batch in batches:
+        columns = {f"{ref.alias}.{ref.column}": pc.take(
+            values[ref.alias].column(ref.column), batch.column(ref.alias))
+            for ref in join_filter.references}
+        passes = accepts(join_filter, pa.table(columns), qualified=True)
+        kept.append(batch.filter(passes))
+    if not kept:
+        return pa.table({left_alias: pa.array([], pa.int32()),
+                         right_alias: pa.array([], pa.int32())})
+    return pa.concat_tables(kept).combine_chunks()
+
+
+def _cross_pairs(left_alias: str, num_left: int, right_alias: str, num_right: int):
+    """Yield every (left, right) row pair, left-major, in bounded batches."""
+    block = max(1, FILTER_BATCH_PAIRS // max(1, num_right))
+    right = np.arange(num_right, dtype=np.int32)
+    for start in range(0, num_left, block):
+        left = np.arange(start, min(start + block, num_left), dtype=np.int32)
+        yield pa.table({left_alias: np.repeat(left, num_right),
+                        right_alias: np.tile(right, len(left))})
 
 
 def _join_key_tables(left_keys, right_keys) -> tuple[pa.Table, pa.Table]:

@@ -302,11 +302,15 @@ physical_nodes! {
         next_anchor: String,
         aliases: Vec<String>,
     }
-    /// An equality join that asks no model.
+    /// The pairs of two tables an AI join asks about: those whose `on`
+    /// keys are equal, or every pair without keys, where `filter` is
+    /// TRUE. It asks no model.
     HashJoin(HashJoinAttributes) = "quail.hash_join" {
         left: String,
         right: String,
         on: Vec<(ValueExpression, ValueExpression)>,
+        #[serde(default)]
+        filter: Option<ValueExpression>,
         written_position: i64,
         pair_fraction: f64,
     }

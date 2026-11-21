@@ -175,6 +175,11 @@ pub struct SemanticJoin {
     pub anchor: Option<String>,
     /// The equality conditions of the joins below it, in written order.
     pub on: Vec<Equality>,
+    /// The joins' other conditions over the two tables' columns, which
+    /// ask no model; the model is asked only about the pairs where it is
+    /// TRUE, as DataFusion's `HashJoinExec` keeps `filter` beside `on`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<ValueExpression>,
     /// The aliases of the rows it extends: everything below its new tables.
     pub outer_aliases: Vec<String>,
 }

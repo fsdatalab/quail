@@ -90,8 +90,8 @@ fn tagged_node<A>(id: &str, inputs: &[PortRef], attributes: A) -> Node<A> {
     }
 }
 
-/// One HashJoin per join with equality conditions, over the scans, as
-/// `hash_join_nodes`.
+/// One HashJoin per join with equality conditions or a filter, over the
+/// scans.
 pub fn hash_join_nodes(
     found: &Operators,
     pair_fractions: &BTreeMap<usize, f64>,
@@ -100,11 +100,15 @@ pub fn hash_join_nodes(
     let mut nodes = Vec::new();
     for (position, join) in found.joins.iter().enumerate() {
         let conditions = &join.on;
-        if conditions.is_empty() {
-            continue;
-        }
-        let left = argument_alias(&conditions[0].left);
-        let right = argument_alias(&conditions[0].right);
+        // a join with only a filter pairs its call's two tables
+        let (left, right) = match (conditions.first(), &join.filter) {
+            (Some(first), _) => (argument_alias(&first.left), argument_alias(&first.right)),
+            (None, Some(_)) => match call_aliases(asked_call(&join.predicate)).as_slice() {
+                [left, right] => (left.clone(), right.clone()),
+                _ => continue,
+            },
+            (None, None) => continue,
+        };
         let on: Vec<(ValueExpression, ValueExpression)> = conditions
             .iter()
             .map(|condition| {
@@ -122,6 +126,7 @@ pub fn hash_join_nodes(
                 left: left.clone(),
                 right: right.clone(),
                 on,
+                filter: join.filter.clone(),
                 written_position: position as i64,
                 pair_fraction: pair_fractions.get(&position).copied().unwrap_or(1.0),
             },

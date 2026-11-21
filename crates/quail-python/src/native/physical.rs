@@ -196,7 +196,7 @@ static KINDS: &[Kind] = &[
         class: "HashJoin",
         tag: "quail.hash_join",
         node: true,
-        fields: fields!(NODE; "left" = S, "right" = S, "on" = EMPTY,
+        fields: fields!(NODE; "left" = S, "right" = S, "on" = EMPTY, "filter" = NONE,
             "written_position" = Some("-1"), "pair_fraction" = Some("1.0")),
     },
     Kind {
