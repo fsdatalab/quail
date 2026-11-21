@@ -108,14 +108,6 @@ fn filters_on_or(node: &AiNode) -> bool {
     crate::rules::or_guards::or_terms(node).is_some()
 }
 
-/// Whether an `AiNode` in `plan` filters on an OR.
-pub(crate) fn any_filters_on_or(plan: &LogicalPlan) -> bool {
-    datafusion::common::tree_node::TreeNode::exists(plan, |below| {
-        Ok(crate::extension::as_node::<AiNode>(below).is_some_and(filters_on_or))
-    })
-    .unwrap_or(false)
-}
-
 /// One AI call over the rows of its input, as `AiNode`; the module
 /// explains each part.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -300,7 +292,12 @@ impl AiNode {
     /// above one: the executor counts the rows the model passes, not the
     /// rows the OR's other terms pass.
     pub fn accepts_fetch(&self) -> bool {
-        self.hint.is_none() && !filters_on_or(self) && !any_filters_on_or(&self.input)
+        self.hint.is_none()
+            && !filters_on_or(self)
+            && !datafusion::common::tree_node::TreeNode::exists(self.input.as_ref(), |below| {
+                Ok(crate::extension::as_node::<AiNode>(below).is_some_and(filters_on_or))
+            })
+            .unwrap_or(false)
     }
 
     /// Whether `term` is the node's answer column or its `NOT`, and which:
@@ -397,39 +394,6 @@ impl AiNode {
     /// Whether `name` is a column the node adds.
     pub(crate) fn is_field(&self, name: &str) -> bool {
         self.fields.iter().any(|field| field.name() == name)
-    }
-
-    /// Write the node's line in a plan's text, before line breaks are
-    /// escaped.
-    fn write_explain(&self, f: &mut impl fmt::Write) -> fmt::Result {
-        write!(f, "AiNode: ")?;
-        if self.semantics != Semantics::Rows {
-            write!(f, "{} ", self.semantics_name())?;
-        }
-        write!(f, "{} = {}", self.answer, self.call)?;
-        if let Some(guard) = &self.guard {
-            write!(f, ", guard: {guard}")?;
-        }
-        if let Some(filter) = &self.filter {
-            write!(f, ", filter: {filter}")?;
-        }
-        if let Some(hint) = &self.hint {
-            write!(f, ", hint: {hint}")?;
-        }
-        match &self.fetch {
-            Some(Fetch::Global(n)) => write!(f, ", fetch: {n}")?,
-            Some(Fetch::PerKey { key, n }) => write!(f, ", fetch: {n} per [{}]", key.join(", "))?,
-            None => {}
-        }
-        if self.projection.is_some() {
-            let names: Vec<String> = self
-                .returned_fields()
-                .iter()
-                .map(|field| field.name().clone())
-                .collect();
-            write!(f, ", returns: [{}]", names.join(", "))?;
-        }
-        Ok(())
     }
 }
 
@@ -554,8 +518,37 @@ impl UserDefinedLogicalNodeCore for AiNode {
 
     fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
         // a prompt literal's line break would break the plan's indentation
-        let mut text = String::new();
-        self.write_explain(&mut text)?;
+        use std::fmt::Write;
+
+        let mut text = String::from("AiNode: ");
+        if self.semantics != Semantics::Rows {
+            write!(text, "{} ", self.semantics_name())?;
+        }
+        write!(text, "{} = {}", self.answer, self.call)?;
+        if let Some(guard) = &self.guard {
+            write!(text, ", guard: {guard}")?;
+        }
+        if let Some(filter) = &self.filter {
+            write!(text, ", filter: {filter}")?;
+        }
+        if let Some(hint) = &self.hint {
+            write!(text, ", hint: {hint}")?;
+        }
+        match &self.fetch {
+            Some(Fetch::Global(n)) => write!(text, ", fetch: {n}")?,
+            Some(Fetch::PerKey { key, n }) => {
+                write!(text, ", fetch: {n} per [{}]", key.join(", "))?
+            }
+            None => {}
+        }
+        if self.projection.is_some() {
+            let names: Vec<String> = self
+                .returned_fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect();
+            write!(text, ", returns: [{}]", names.join(", "))?;
+        }
         write!(f, "{}", text.replace('\r', "\\r").replace('\n', "\\n"))
     }
 
