@@ -119,16 +119,6 @@ def request_runtimes() -> dict:
 SUPPORTED_DEVICES = frozenset(DEVICES)
 
 
-def _warm_boot() -> dict:
-    return {
-        "kind": "warm",
-        "llm_init_s": 0.0,
-        "weight_load_s": None,
-        "kv_profile_s": None,
-        "boot_s": 0.0,
-    }
-
-
 # Architectures the request backends do not serve: vLLM 0.29 has no
 # LFM3 model.
 UNSERVED_ARCHS = frozenset({"lfm3"})
@@ -233,7 +223,13 @@ class RequestBackend:
         """Boot the engine into the runtime state, or reuse the one there."""
         engine = context.runtime_state.get("engine")
         if engine is not None:
-            return engine, _warm_boot()
+            return engine, {
+                "kind": "warm",
+                "llm_init_s": 0.0,
+                "weight_load_s": None,
+                "kv_profile_s": None,
+                "boot_s": 0.0,
+            }
         envelope = context.request.plan
         model = context.registry.model(envelope["model"])
         allowed_ids = sorted(set(
