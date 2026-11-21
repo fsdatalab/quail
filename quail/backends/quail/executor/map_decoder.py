@@ -859,19 +859,3 @@ class MapDecoder:
         lengths = self.lengths[map_index]
         return [self.tokens[map_index][document, :max(0, lengths[document])]
                 for document in documents]
-
-
-def map_decoder(state, limits, num_documents: int, expected_tokens=None) -> MapDecoder:
-    """Return a decoder for a pipeline's maps on the loaded model."""
-    from quail.backends.quail.executor.model_loading import full_output_head
-    from quail.common.budgets import copy_verification_workspace_bytes
-
-    decoder = MapDecoder(
-        state.torch, full_output_head(state.loaded_model.model), num_documents,
-        limits, state.loaded_model.tokenizer.stop_ids,
-        state.loaded_model.arena.page_tokens, expected_tokens=expected_tokens,
-        workspace_bytes=copy_verification_workspace_bytes(
-            state.loaded_model.model_spec, state.chunk_tokens),
-        row_budget=state.chunk_tokens)
-    decoder.tokenizer = state.loaded_model.tokenizer
-    return decoder

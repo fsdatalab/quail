@@ -22,7 +22,7 @@ from typing import Any
 
 import numpy as np
 
-from quail.backends.quail.executor.map_decoder import map_decoder
+from quail.backends.quail.executor.map_decoder import MapDecoder
 from quail.backends.quail.executor.model_operator import (
     close_operators,
     execution_prefix_tree,
@@ -309,7 +309,19 @@ class RegionExecution:
         expected_tokens = [expected for operator in operators
                            if operator.answer_limits
                            for expected in operator.expected_answer_tokens]
-        decoder = map_decoder(self.query, limits, num_anchors, expected_tokens)
+        state = self.query
+        from quail.backends.quail.executor.model_loading import full_output_head
+        from quail.common.budgets import copy_verification_workspace_bytes
+
+        decoder = MapDecoder(
+            state.torch, full_output_head(state.loaded_model.model),
+            num_anchors, limits, state.loaded_model.tokenizer.stop_ids,
+            state.loaded_model.arena.page_tokens,
+            expected_tokens=expected_tokens,
+            workspace_bytes=copy_verification_workspace_bytes(
+                state.loaded_model.model_spec, state.chunk_tokens),
+            row_budget=state.chunk_tokens)
+        decoder.tokenizer = state.loaded_model.tokenizer
         for operator in operators:
             if operator.answer_limits:
                 operator.decoder = decoder
