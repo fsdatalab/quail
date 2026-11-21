@@ -735,16 +735,9 @@ class CopyConstraint:
         if at.shape[1] == 1:
             return values, alive, following, traces, active
         # The first choice can change a tied source after stream compaction.
-        tail, alive, source, tail_traces, active = self._verify_tail(
-            projected[:, 1:], streams, alive, following, at[:, 1:], documents,
-            limits, valid[:, 1:], active)
-        if traces is not None:
-            traces = torch.cat((traces, tail_traces), dim=1)
-        return torch.cat((values, tail), dim=1), alive, source, traces, active
-
-    def _verify_tail(self, projected, streams, alive, source, at, documents,
-                     limits, valid, active):
-        torch = self.torch
+        first_values, first_traces = values, traces
+        projected, source, at, valid = (
+            projected[:, 1:], following, at[:, 1:], valid[:, 1:])
         num_rows, num_steps = at.shape
         expanded = streams[:, None, :].expand(-1, num_steps, -1)
         tokens = self.tokens_at(expanded, at[:, :, None])
@@ -773,19 +766,22 @@ class CopyConstraint:
         final = torch.where(use[:, :1], after[rows, last], alive)
         following = self.source(flat_streams, after.flatten(0, 1)).view_as(at)
         values = torch.stack((torch.where(ended, -1, chosen), following,
-                              after.sum(dim=2), hit.to(torch.int64)), dim=2)
+            after.sum(dim=2), hit.to(torch.int64)), dim=2)
         values = torch.where(use[:, :, None], values, -2)
         traces = None
         if self.trace is not None:
             # The sequential trace also records unused rows against frozen state.
             traced = torch.where(use[:, :, None], before, final[:, None])
             self.choose_readout(projected.flatten(0, 1), flat_streams,
-                                traced.flatten(0, 1), flat_at, flat_documents,
-                                first=False)
+                traced.flatten(0, 1), flat_at, flat_documents, first=False)
             traces = self.trace_values.view(num_rows, num_steps, -1)
             traces = traces.view(torch.int32).to(torch.int64)
         active = use[:, -1] & continues[:, -1]
-        return values, final, self.source(streams, final), traces, active
+        source = self.source(streams, final)
+        if first_traces is not None:
+            traces = torch.cat((first_traces, traces), dim=1)
+        return (torch.cat((first_values, values), dim=1),
+            final, source, traces, active)
 
     def _runner(self, tokens, values, allowed, chosen):
         torch = self.torch
