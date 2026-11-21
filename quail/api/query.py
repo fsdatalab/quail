@@ -18,7 +18,7 @@ from quail.common.tokens import ScanInput, TokenStore
 from quail.execution.finished import finished_table
 from quail.execution.metrics import NodeMetrics, NodeResult, scalar_node_metrics
 from quail.execution.result import QueryResult
-from quail.execution.rows import as_table
+from quail.execution.rows import Rows
 from quail.execution.runner import compute_subgraph
 from quail.execution.types import PhysicalRequest, document_input
 from quail.explain import explain
@@ -546,7 +546,7 @@ class RegionQuery:
             json.dumps(out, default=str), coordinator_wall))
         tables = {}
         for ref, value in response.outputs.items():
-            table = as_table(value)
+            table = value.table() if isinstance(value, Rows) else value
             if isinstance(table, pa.Table):
                 tables[(ref.node_id, ref.port)] = table
         if relation is None:

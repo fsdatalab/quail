@@ -141,11 +141,6 @@ def extraction_rows(alias, name, span_name, document_ids, answers, spans) -> Row
                 pa.table({name: pa.array(answers, pa.string()), span_name: span_array}))
 
 
-def as_table(value):
-    """Return rows as their table, and any other value as it is."""
-    return value.table() if isinstance(value, Rows) else value
-
-
 def rows_of(value, alias: str) -> Rows:
     """Return a port's value as rows: itself, or the ids of one table."""
     return value if isinstance(value, Rows) else Rows({alias: value})
