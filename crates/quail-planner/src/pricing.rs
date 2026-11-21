@@ -53,38 +53,6 @@ fn set(priced: &mut Priced, node_id: &str, price: NodePrice, entry: Map<String, 
     }
 }
 
-fn spec_expected_rows(node: &PhysicalNode) -> f64 {
-    match node {
-        PhysicalNode::AiFilter(node) => node.attributes.expected_rows,
-        PhysicalNode::AiScore(node) => node
-            .attributes
-            .spec
-            .as_ref()
-            .map_or(0.0, |s| s.expected_rows),
-        PhysicalNode::AiClassify(node) => node
-            .attributes
-            .spec
-            .as_ref()
-            .map_or(0.0, |s| s.expected_rows),
-        PhysicalNode::AiExtract(node) => node
-            .attributes
-            .spec
-            .as_ref()
-            .map_or(0.0, |s| s.expected_rows),
-        PhysicalNode::AiMap(node) => node
-            .attributes
-            .spec
-            .as_ref()
-            .map_or(0.0, |s| s.expected_rows),
-        PhysicalNode::AiSaeFeatures(node) => node
-            .attributes
-            .spec
-            .as_ref()
-            .map_or(0.0, |s| s.expected_rows),
-        _ => 0.0,
-    }
-}
-
 fn spec_seconds(node: &PhysicalNode) -> Option<f64> {
     match node {
         PhysicalNode::AiScore(node) => node.attributes.spec.as_ref().map(|s| s.estimated_seconds),
@@ -111,27 +79,6 @@ fn spec_work(node: &PhysicalNode) -> Option<Work> {
         _ => return None,
     };
     (!values.is_empty()).then(|| Work::from_values(values))
-}
-
-fn spec_state_tail(node: &PhysicalNode) -> i64 {
-    match node {
-        PhysicalNode::AiScore(node) => node
-            .attributes
-            .spec
-            .as_ref()
-            .map_or(0, |s| s.state_tail_tokens),
-        PhysicalNode::AiClassify(node) => node
-            .attributes
-            .spec
-            .as_ref()
-            .map_or(0, |s| s.state_tail_tokens),
-        PhysicalNode::AiExtract(node) => node
-            .attributes
-            .spec
-            .as_ref()
-            .map_or(0, |s| s.state_tail_tokens),
-        _ => 0,
-    }
 }
 
 /// Whether a node borrows its documents' shared prefix KV.
@@ -179,15 +126,61 @@ pub fn head_tokens(node: &PhysicalNode) -> i64 {
 /// An operator's question tokens after the state tail, as
 /// `passes.question_tokens`.
 pub fn pass_question_tokens(node: &PhysicalNode, state_tail: i64) -> i64 {
-    match node {
-        PhysicalNode::AiFilter(node) => (node.attributes.question_tokens - state_tail).max(1),
-        _ => node.prompt_token_parts()[1].len() as i64 - spec_state_tail(node),
-    }
+    let state_tail = match node {
+        PhysicalNode::AiFilter(node) => {
+            return (node.attributes.question_tokens - state_tail).max(1);
+        }
+        PhysicalNode::AiScore(node) => node
+            .attributes
+            .spec
+            .as_ref()
+            .map_or(0, |s| s.state_tail_tokens),
+        PhysicalNode::AiClassify(node) => node
+            .attributes
+            .spec
+            .as_ref()
+            .map_or(0, |s| s.state_tail_tokens),
+        PhysicalNode::AiExtract(node) => node
+            .attributes
+            .spec
+            .as_ref()
+            .map_or(0, |s| s.state_tail_tokens),
+        _ => 0,
+    };
+    node.prompt_token_parts()[1].len() as i64 - state_tail
 }
 
 /// The documents an operator is expected to be asked about.
 pub fn expected_documents(node: &PhysicalNode) -> f64 {
-    spec_expected_rows(node)
+    match node {
+        PhysicalNode::AiFilter(node) => node.attributes.expected_rows,
+        PhysicalNode::AiScore(node) => node
+            .attributes
+            .spec
+            .as_ref()
+            .map_or(0.0, |s| s.expected_rows),
+        PhysicalNode::AiClassify(node) => node
+            .attributes
+            .spec
+            .as_ref()
+            .map_or(0.0, |s| s.expected_rows),
+        PhysicalNode::AiExtract(node) => node
+            .attributes
+            .spec
+            .as_ref()
+            .map_or(0.0, |s| s.expected_rows),
+        PhysicalNode::AiMap(node) => node
+            .attributes
+            .spec
+            .as_ref()
+            .map_or(0.0, |s| s.expected_rows),
+        PhysicalNode::AiSaeFeatures(node) => node
+            .attributes
+            .spec
+            .as_ref()
+            .map_or(0.0, |s| s.expected_rows),
+        _ => 0.0,
+    }
 }
 
 /// The positions of each pass group's operators, in execution order.
@@ -326,7 +319,7 @@ impl PlanPricer {
                     match spec_work(node) {
                         // its work joins the plan's, packed with the rest
                         Some(work) => {
-                            let copies = parallel_copies(context.gpus, spec_expected_rows(node));
+                            let copies = parallel_copies(context.gpus, expected_documents(node));
                             let work = &work * (share / copies);
                             let seconds = unrounded_seconds(
                                 &work,
