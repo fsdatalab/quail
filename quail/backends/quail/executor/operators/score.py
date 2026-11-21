@@ -111,26 +111,6 @@ def candidate_rows(node, inputs):
     return ScoreRows((_ids(selected, left), _ids(selected, right))), priors
 
 
-def hinted_rows(node, rows: ScoreRows):
-    """Callable(row position) -> whether the region's hint drops the row, or None.
-
-    A row is dropped when the hint drops the document of any of its
-    tables.
-    """
-    if not hinting():
-        return None
-    aliases = node.spec.aliases
-    width = len(rows.columns[-1])
-
-    def skip(position):
-        places = ((position // width, position % width) if rows.product
-                  else (position,) * len(aliases))
-        return not all(keeps(alias, int(documents[place])) for alias, documents, place
-                       in zip(aliases, rows.columns, places))
-
-    return skip
-
-
 def value_type(spec) -> pa.DataType:
     """Return the Arrow type for a label or a numeric score."""
     return pa.string() if isinstance(spec, ClassifySpec) else pa.float64()
@@ -233,11 +213,17 @@ class ScoreOperator(SingleNodeOperator):
         self.sent = np.zeros(len(self.rows), dtype=bool)
         self.finished = []
         self.order = self.offsets = None   # a grouped layout's rows by anchor
-        hinted = hinted_rows(node, rows)
         self.skip = None
-        if hinted is not None:
+        if hinting():
+            aliases = node.spec.aliases
+            width = len(rows.columns[-1])
+
             def skip(position):
-                self.skipped[position] = hinted(position)
+                places = ((position // width, position % width) if rows.product
+                    else (position,) * len(aliases))
+                self.skipped[position] = not all(
+                    keeps(alias, int(documents[place]))
+                    for alias, documents, place in zip(aliases, rows.columns, places))
                 return bool(self.skipped[position])
 
             self.skip = skip
