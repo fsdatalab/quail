@@ -510,14 +510,13 @@ class HeadroomAdmission:
     def _admission_risk(self, members):
         """The answer slots of waiting anchors and their R(j) grid."""
         if self._candidate is not None and self._candidate[0] == members:
-            _, slots, risk = self._candidate
-        else:
-            slots = self._answer_slots(members)
-            risk = self._risk(
-                slots, self.curves.slot_map[slots],
-                np.zeros(len(slots), dtype=np.int64),
-                self.capacity[slots] - self.prompt[slots], self.prompt[slots])
-            self._candidate = (members, slots, risk)
+            return self._candidate[1:]
+        slots = self._answer_slots(members)
+        risk = self._risk(
+            slots, self.curves.slot_map[slots],
+            np.zeros(len(slots), dtype=np.int64),
+            self.capacity[slots] - self.prompt[slots], self.prompt[slots])
+        self._candidate = (members, slots, risk)
         return slots, risk
 
     def allows(self, anchor, free_pages, prompt_pages):
