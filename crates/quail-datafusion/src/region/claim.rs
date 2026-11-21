@@ -339,14 +339,6 @@ fn claim_needed(plan: LogicalPlan, needed: Option<Vec<Column>>) -> Result<Logica
     crate::extension::with_inputs(&plan, inputs)
 }
 
-/// Quail's binder's error for `plan` as a region, if it has one.
-fn derive_error(plan: &LogicalPlan) -> Option<CompileError> {
-    // the chat turn and layout change the prompts, not what Quail reads
-    let turn: quail_planner::prompts::Turn = (String::new(), String::new());
-    let region = ModelRegion::new(plan.clone());
-    crate::derive::derive_region(&region, &turn, "ai-if").err()
-}
-
 /// The CTE name and body of a FROM subquery: `x` over the CTE `clauses`,
 /// or the subquery itself.
 pub(crate) fn subquery_body(
@@ -502,7 +494,14 @@ pub(crate) fn calls_ai_function(plan: &LogicalPlan) -> Result<bool> {
 /// Whether Quail can plan every operator in the subtree.
 pub(super) fn quail_plans(plan: &LogicalPlan) -> Result<bool> {
     let unsupported = plan.exists(|node| {
-        if !is_quail_operator(node) {
+        if !(matches!(
+            node,
+            LogicalPlan::Projection(_)
+                | LogicalPlan::Join(_)
+                | LogicalPlan::SubqueryAlias(_)
+                | LogicalPlan::TableScan(_)
+        ) || as_node::<AiNode>(node).is_some())
+        {
             return Ok(true);
         }
         for expr in node.expressions() {
@@ -513,17 +512,6 @@ pub(super) fn quail_plans(plan: &LogicalPlan) -> Result<bool> {
         Ok(false)
     })?;
     Ok(!unsupported)
-}
-
-/// Whether Quail's planner has an operator for this node.
-fn is_quail_operator(plan: &LogicalPlan) -> bool {
-    matches!(
-        plan,
-        LogicalPlan::Projection(_)
-            | LogicalPlan::Join(_)
-            | LogicalPlan::SubqueryAlias(_)
-            | LogicalPlan::TableScan(_)
-    ) || as_node::<AiNode>(plan).is_some()
 }
 
 /// Whether an expression is a subquery Quail does not plan: anything
@@ -672,10 +660,15 @@ fn claim_run(
     }
     // a shape the binder does not read may run in smaller parts; any
     // other error is the query's own, reported when the region is planned
-    if let Some(error) = derive_error(&bound).filter(CompileError::is_unsupported) {
+    let mut region = ModelRegion::new(bound);
+    // the chat turn and layout change the prompts, not what Quail reads
+    let turn = (String::new(), String::new());
+    if let Some(error) = crate::derive::derive_region(&region, &turn, "ai-if")
+        .err()
+        .filter(CompileError::is_unsupported)
+    {
         return Ok(Err(error.to_string()));
     }
-    let mut region = ModelRegion::new(bound);
     for (name, input) in inputs {
         let mut input = claim_regions(input)?;
         if numbered_inputs.contains(&name) {
