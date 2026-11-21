@@ -34,16 +34,6 @@ def label_trie(label_ids) -> dict[tuple[int, ...], list[int]]:
     return {prefix: sorted(tokens) for prefix, tokens in children.items()}
 
 
-def choice_nodes(label_ids) -> set:
-    """Return every trie node with two or more children.
-
-    These are the nodes where a greedy decode chooses between labels;
-    a node with one child is passed without a read.
-    """
-    trie = label_trie(label_ids)
-    return {node for node, tokens in trie.items() if len(tokens) > 1}
-
-
 def read_nodes(label_ids) -> set:
     """Return the trie nodes whose rows the trie_tree rule reads.
 
@@ -101,7 +91,8 @@ def decode_runs(label_ids) -> DecodeRuns:
         ValueError: A label has no tokens.
     """
     trie = label_trie(label_ids)
-    choices = choice_nodes(label_ids)
+    choices = {node for node, tokens in label_trie(label_ids).items()
+        if len(tokens) > 1}
 
     def follow(node):
         while node in trie and node not in choices:
