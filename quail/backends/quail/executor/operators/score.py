@@ -245,55 +245,46 @@ class ScoreOperator(SingleNodeOperator):
             # no prompt after the document, a skipped causal score asks every row
             self._shared(documents)
         else:
-            self._grouped(documents)
+            grouped_rows = self.rows
+            if len(spec.aliases) == 1:
+                prefixes = [parts[0]]
+                suffixes = [concat_tokens(documents[spec.aliases[0]][document_id],
+                    parts[1])
+                    for document_id in grouped_rows[:, 0]]
+                partners = None
+                self.order = np.arange(len(grouped_rows))
+                self.offsets = np.array([0, len(grouped_rows)])
+                self.total = len(grouped_rows) * len(parts[0]) + sum(map(len, suffixes))
+            else:
+                left, right = spec.aliases
+                anchors, anchor_index = np.unique(grouped_rows[:, 0],
+                    return_inverse=True)
+                candidates, candidate_index = np.unique(grouped_rows[:, 1],
+                    return_inverse=True)
+                prefixes = [concat_tokens(parts[0], documents[left][document_id],
+                    parts[1])
+                    for document_id in anchors]
+                suffixes = [concat_tokens(documents[right][document_id], parts[2])
+                    for document_id in candidates]
+                self.order = order = np.argsort(anchor_index, kind="stable")
+                self.offsets = offsets = np.concatenate(
+                    ([0], np.cumsum(np.bincount(anchor_index))))
+                partners = [candidate_index[order[start:end]]
+                    for start, end in zip(offsets[:-1], offsets[1:])]
+                prefix_lengths = np.asarray([len(prefix) for prefix in prefixes])
+                suffix_lengths = np.asarray([len(suffix) for suffix in suffixes])
+                self.total = int(prefix_lengths[anchor_index].sum()
+                    + suffix_lengths[candidate_index].sum())
+            self.stages = [Stage(suffixes=suffixes, readout=score_readout(self.state),
+                requests=(None if partners is None else
+                    lambda key: partners[key[2]]))]
+            self.table = _table(prefixes, self._keys(prefixes))
 
     def layout(self, region):
         return self.table
 
     def _keys(self, prefixes) -> list:
         return [("score", self.node.spec.name, index) for index in range(len(prefixes))]
-
-    def _grouped(self, documents) -> None:
-        """Ask each anchor's rows after one shared prefix.
-
-        A score of one table asks every document after the prompt head;
-        a score of pairs asks each left document's partners after the
-        left document.
-        """
-        spec = self.node.spec
-        parts = spec.prompt_token_parts
-        rows = self.rows
-        if len(spec.aliases) == 1:
-            prefixes = [parts[0]]
-            suffixes = [concat_tokens(documents[spec.aliases[0]][document_id],
-                parts[1])
-                for document_id in rows[:, 0]]
-            partners = None
-            self.order = np.arange(len(rows))
-            self.offsets = np.array([0, len(rows)])
-            self.total = len(rows) * len(parts[0]) + sum(map(len, suffixes))
-        else:
-            left, right = spec.aliases
-            anchors, anchor_index = np.unique(rows[:, 0], return_inverse=True)
-            candidates, candidate_index = np.unique(rows[:, 1], return_inverse=True)
-            prefixes = [concat_tokens(parts[0], documents[left][document_id],
-                parts[1])
-                for document_id in anchors]
-            suffixes = [concat_tokens(documents[right][document_id], parts[2])
-                for document_id in candidates]
-            self.order = order = np.argsort(anchor_index, kind="stable")
-            self.offsets = offsets = np.concatenate(
-                ([0], np.cumsum(np.bincount(anchor_index))))
-            partners = [candidate_index[order[start:end]]
-                for start, end in zip(offsets[:-1], offsets[1:])]
-            prefix_lengths = np.asarray([len(prefix) for prefix in prefixes])
-            suffix_lengths = np.asarray([len(suffix) for suffix in suffixes])
-            self.total = int(prefix_lengths[anchor_index].sum()
-                + suffix_lengths[candidate_index].sum())
-        self.stages = [Stage(suffixes=suffixes, readout=score_readout(self.state),
-            requests=(None if partners is None else
-                lambda key: partners[key[2]]))]
-        self.table = _table(prefixes, self._keys(prefixes))
 
     def _positions(self, anchor) -> np.ndarray:
         """The row positions an anchor asks."""
