@@ -134,16 +134,12 @@ class LoweredPrompt:
         return self.prompt.letters
 
 
-def _decode_prompt(value):
-    return decode_plan_value(json.dumps(value))
-
-
 def _lowered(found: dict, vocabulary: Vocabulary) -> LoweredPrompt:
     def words(ids):
         return tuple(vocabulary.word(token) for token in ids)
 
     return LoweredPrompt(
-        prompt=_decode_prompt(found["prompt"]),
+        prompt=decode_plan_value(json.dumps(found["prompt"])),
         preamble_token_ids=words(found["preamble_token_ids"]),
         tail_token_ids=words(found["tail_token_ids"]),
         frame_tokens=found["frame_tokens"],
