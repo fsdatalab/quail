@@ -410,13 +410,9 @@ fn repr_as(value: &Value, tuples: bool) -> String {
 
 /// Python's `str` of a JSON value.
 fn py_str(value: &Value) -> String {
-    str_as(value, false)
-}
-
-fn str_as(value: &Value, tuples: bool) -> String {
     match value {
         Value::String(text) => text.clone(),
-        other => repr_as(other, tuples),
+        other => repr_as(other, false),
     }
 }
 
@@ -768,21 +764,16 @@ struct WrittenNode {
     attributes: Shown,
 }
 
-/// A node's attributes in declaration order.
-fn attributes(node: &PhysicalNode) -> Vec<(String, Shown)> {
-    let written = serde_json::to_string(node)
-        .ok()
-        .and_then(|text| serde_json::from_str::<WrittenNode>(&text).ok());
-    match written.map(|written| written.attributes) {
-        Some(Shown::Map(pairs)) => pairs,
-        _ => Vec::new(),
-    }
-}
-
 /// A node's explain fields, as its Python class's `explain_fields`, and
 /// whether its arrays are tuples: the default lists every attribute.
 fn known_fields(node: &PhysicalNode) -> (Vec<(String, Shown)>, bool) {
-    let attributes = attributes(node);
+    let written = serde_json::to_string(node)
+        .ok()
+        .and_then(|text| serde_json::from_str::<WrittenNode>(&text).ok());
+    let attributes = match written.map(|written| written.attributes) {
+        Some(Shown::Map(pairs)) => pairs,
+        _ => Vec::new(),
+    };
     let get = |name: &str| {
         attributes
             .iter()
