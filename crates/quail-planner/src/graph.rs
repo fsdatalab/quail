@@ -7,11 +7,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::cost::budgets::pages;
 use crate::cost::quantity::python_sum;
 use crate::cost::work::Work;
+use crate::physical::port as port_of;
 use crate::physical::{
     AiClassifyAttributes, AiExtractAttributes, AiFilterAttributes, AiJoinAttributes,
     AiMapAttributes, AiSaeFeaturesAttributes, AiScoreAttributes, Asked, BarrierAttributes,
     ClassifySpec, ColumnRef, Expression, FilterAttributes, HashJoinAttributes, ModelCall, Node,
-    PhysicalNode, PortRef, Prompt, ScanAttributes, ValueExpression, input_ports, port,
+    PhysicalNode, PortRef, Prompt, ScanAttributes, ValueExpression, input_ports,
 };
 use serde_json::{Map, Value};
 
@@ -251,7 +252,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
             )));
             ports.insert(
                 scan.alias.clone(),
-                port(&scan_id, format!("rows:{}", scan.alias)),
+                port_of(&scan_id, format!("rows:{}", scan.alias)),
             );
         }
         for node in hash_join_nodes(self.operators, &self.context.pair_fractions, &ports) {
@@ -272,7 +273,28 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
             }
         }
         let emitted = (|| -> Result<_, CompileError> {
-            let ports = self.emit_documents(ports)?;
+            let mut ports = ports;
+            let aliases: Vec<String> = self
+                .operators
+                .scans
+                .iter()
+                .map(|scan| scan.alias.clone())
+                .collect();
+            for alias in aliases {
+                // a column operator the planner lifted above the joins is emitted after them
+                let lifted = self.after_joins.get(&alias).cloned().unwrap_or_default();
+                let kinds: Kinds = [ASK, "classify", "extract", "features", "map"]
+                    .into_iter()
+                    .filter(|kind| !lifted.contains(kind))
+                    .collect();
+                let after = self.emit_steps(
+                    &alias,
+                    self.order.statistics.stats[&alias].num_documents as f64,
+                    &kinds,
+                    ports[&alias].clone(),
+                )?;
+                ports.insert(alias, after);
+            }
             let (mut ports, joins) = self.emit_joins(ports)?;
             self.emit_join_answers(&joins)?;
             self.emit_after_joins(&mut ports)?;
@@ -400,31 +422,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
             estimates,
             pricer,
         }))
-    }
-
-    fn emit_documents(
-        &mut self,
-        ports: BTreeMap<String, PortRef>,
-    ) -> Result<BTreeMap<String, PortRef>, CompileError> {
-        let mut ports = ports;
-        let aliases: Vec<String> = self
-            .operators
-            .scans
-            .iter()
-            .map(|scan| scan.alias.clone())
-            .collect();
-        for alias in aliases {
-            // a column operator the planner lifted above the joins is emitted after them
-            let lifted = self.after_joins.get(&alias).cloned().unwrap_or_default();
-            let kinds: Kinds = [ASK, "classify", "extract", "features", "map"]
-                .into_iter()
-                .filter(|kind| !lifted.contains(kind))
-                .collect();
-            let rows = self.order.statistics.stats[&alias].num_documents as f64;
-            let after = self.emit_steps(&alias, rows, &kinds, ports[&alias].clone())?;
-            ports.insert(alias, after);
-        }
-        Ok(ports)
     }
 
     /// Emit the given kinds of a table's steps in run order.
@@ -1422,10 +1419,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         }
         Ok(score_pairs)
     }
-}
-
-fn port_of(node_id: &str, name: impl Into<String>) -> PortRef {
-    port(node_id, name)
 }
 
 fn classify_node(
