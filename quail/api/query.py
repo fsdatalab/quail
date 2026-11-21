@@ -577,7 +577,18 @@ class RegionQuery:
         }
         if observer_reports:
             report["observers"] = observer_reports
-        self._collect_answers(result, plan, tables)
+        answers, survivors, true_joins, stages = _quail_native.collect_answers(
+            json.dumps(self._answer_request(plan)), tables)
+        result.answer_tables = {kind: {} for kind in (
+            "filters", "joins", "classifies", "scores", "extracts", "features",
+            "maps")}
+        for kind, key, table in answers:
+            key = tuple(key) if isinstance(key, list) else key
+            result.answer_tables[kind][key] = table
+        result.survivor_indices = {alias: table.column(0).combine_chunks()
+            for alias, table in survivors}
+        result.true_join_tables = dict(true_joins)
+        result.report["stages"] = json.loads(stages)
         return result
 
     def _built_rows(self, tables: dict, finished=None) -> pa.Table:
@@ -641,32 +652,6 @@ class RegionQuery:
             "num_documents": {alias: len(tokens)
                               for alias, tokens in self._document_tokens.items()},
             "source_rows": source_rows}
-
-    def _collect_answers(self, result, plan, tables) -> None:
-        """Attach the answers, survivors, and stages Rust reads from outputs.
-
-        Each model operator's answers, the surviving documents, and each
-        predicate's measured selectivity; documents are numbered by their
-        row in the registered table.
-
-        Args:
-            result: The QueryResult to attach them to.
-            plan: The executed physical plan.
-            tables: Each output relation, by (node id, port).
-        """
-        answers, survivors, true_joins, stages = _quail_native.collect_answers(
-            json.dumps(self._answer_request(plan)), tables)
-        result.answer_tables = {kind: {} for kind in (
-            "filters", "joins", "classifies", "scores", "extracts", "features",
-            "maps")}
-        for kind, key, table in answers:
-            key = tuple(key) if isinstance(key, list) else key
-            result.answer_tables[kind][key] = table
-        result.survivor_indices = {alias: table.column(0).combine_chunks()
-                                   for alias, table in survivors}
-        result.true_join_tables = dict(true_joins)
-        result.report["stages"] = json.loads(stages)
-
 
 def _observe(graph, outputs, metrics, observers) -> None:
     """Show each observer every node whose outputs the run returned."""
