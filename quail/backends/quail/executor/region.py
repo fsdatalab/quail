@@ -24,12 +24,12 @@ import numpy as np
 
 from quail.backends.quail.executor.map_decoder import MapDecoder
 from quail.backends.quail.executor.model_operator import (
-    close_operators,
     execution_prefix_tree,
     gated_stages,
     input_staging,
     settle_documents,
     stage_slices,
+    stage_spans,
     survival,
 )
 from quail.backends.quail.executor.stages import Stage
@@ -299,7 +299,20 @@ class RegionExecution:
             every, spans, tokens = self.executor.run()
         for operator in operators[1:]:
             operator.finish_input()
-        return close_operators(operators, every, spans, tokens, stats)
+        slices = stage_slices(operators)
+        own = [operator.read_answers(every[low:high])
+            for operator, (low, high) in zip(operators, slices)]
+        staged = [index for index, operator in enumerate(operators)
+            if operator.stages]
+        remainder = tokens - sum(own[index] or 0 for index in staged[1:])
+        results = {}
+        for index, (operator, (low, high)) in enumerate(zip(operators, slices)):
+            results.update(operator.close(
+                remainder if staged and index == staged[0] else (own[index] or 0),
+                stage_spans(spans, low, high),
+                stats if staged and index == staged[0] else {},
+                low))
+        return results
 
     def _decoder(self, operators, num_anchors):
         """The MapDecoder writing the answers of the chain's maps, or None."""

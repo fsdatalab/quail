@@ -384,39 +384,6 @@ def stage_slices(operators) -> list:
     return slices
 
 
-def close_operators(operators, every, spans, tokens, stats) -> dict:
-    """Read each operator's answers and build its nodes' results.
-
-    The first operator with stages receives the document token costs,
-    the prefix-sharing counts, and the packing time. Later operators
-    receive their own frame and suffix token costs. GPU time is
-    apportioned by the rows each operator processed.
-
-    Args:
-        operators: The chain's operators in execution order.
-        every: Answer mappings for all stages.
-        spans: Per-chunk row counts and timing events.
-        tokens: Fresh token count of the whole run.
-        stats: Packing time and prefix-sharing counts.
-
-    Returns:
-        Node id -> NodeResult, for every operator's nodes.
-    """
-    slices = stage_slices(operators)
-    own = [operator.read_answers(every[low:high])
-           for operator, (low, high) in zip(operators, slices)]
-    staged = [index for index, operator in enumerate(operators) if operator.stages]
-    remainder = tokens - sum(own[index] or 0 for index in staged[1:])
-    results = {}
-    for index, (operator, (low, high)) in enumerate(zip(operators, slices)):
-        results.update(operator.close(
-            remainder if staged and index == staged[0] else (own[index] or 0),
-            stage_spans(spans, low, high),
-            stats if staged and index == staged[0] else {},
-            low))
-    return results
-
-
 def survival(operators) -> float:
     """The fraction of documents expected to pass every operator."""
     fraction = 1.0
