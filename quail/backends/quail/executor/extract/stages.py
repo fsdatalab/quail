@@ -72,40 +72,31 @@ class ExtractionInputs:
         stored = [None if documents is None else documents[document_id]
             for document_id in positions]
         encoded = vocabulary.document_batch(shown, stored)
-        self.documents = [self._prepare(index, document_id, text, tokens, prior)
-                     for index, (document_id, text, tokens, prior) in enumerate(
-                         zip(document_ids, shown, encoded, stored))]
+        prepared = []
+        for index, (document_id, text, ids, prior) in enumerate(
+                zip(document_ids, shown, encoded, stored)):
+            alias = self.specs[0].alias
+            key = (("extract", alias), int(document_id))
+            shared = self.head == self.pipeline_head
+            tokens = ids.numpy()
+            same_tokens = prior is ids
+            if shared and prior is not None and not same_tokens:
+                previous = (prior.numpy() if hasattr(prior, "numpy")
+                    else np.asarray(prior))
+                same_tokens = np.array_equal(previous, tokens)
+            if shared and prior is not None and same_tokens:
+                key = (alias, int(document_id))
+            prefix = concat_tokens(self.head, ids)
+            scan = DocumentTokens.from_tokens(
+                self.vocabulary, tokens, ids.character_offsets, len(self.head))
+            # the round's KV read covers the prompt through the first tail
+            rho = self.spec.round_cost_per_token * (len(prefix) + len(self.tails[0]))
+            prepared.append(Document(index=index, text=text, prefix=prefix,
+                scan=scan, key=key, rho=rho))
+        self.documents = prepared
         document_ids = np.asarray(document_ids, dtype=np.int64)
         self.document_order = np.argsort(document_ids, kind="stable")
         self.document_ids = document_ids[self.document_order]
         self.prefixes = [document.prefix for document in self.documents]
         self.keys = [document.key for document in self.documents]
-
-    def _prepare(self, index, document_id, text, ids, stored) -> Document:
-        """Build a document's prefix: the head and its text.
-
-        The key names the document under the extraction's head, so a
-        later extraction of the same table reads the KV this one
-        leaves resident. A document shown under the query's shared
-        head, whose tokens are the table's, keeps the table's key, so
-        the KV a filter wrote is read.
-        """
-        alias = self.specs[0].alias
-        key = (("extract", alias), int(document_id))
-        shared = self.head == self.pipeline_head
-        tokens = ids.numpy()
-        same_tokens = stored is ids
-        if shared and stored is not None and not same_tokens:
-            prior = stored.numpy() if hasattr(stored, "numpy") else np.asarray(stored)
-            same_tokens = np.array_equal(prior, tokens)
-        if shared and stored is not None and same_tokens:
-            key = (alias, int(document_id))
-        prefix = concat_tokens(self.head, ids)
-        scan = DocumentTokens.from_tokens(
-            self.vocabulary, tokens, ids.character_offsets, len(self.head))
-        # the round's KV read covers the prompt through the first tail
-        rho = self.spec.round_cost_per_token * (len(prefix) + len(self.tails[0]))
-        return Document(index=index, text=text, prefix=prefix, scan=scan, key=key,
-            rho=rho)
-
 

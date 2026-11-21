@@ -16,12 +16,12 @@ from quail.common import budgets
 from quail.specs.base import CANVAS_SEED
 
 
-def canvas_token_ids(vocab: int, tokens: int, seed: int = CANVAS_SEED) -> tuple:
+def canvas_token_ids(vocab: int, tokens: int) -> tuple:
     """Return fixed random canvas tokens for filter and join requests.
 
     The same tokens are reused for every document to keep answers reproducible.
     """
-    rng = np.random.default_rng(seed)
+    rng = np.random.default_rng(CANVAS_SEED)
     return tuple(int(i) for i in rng.integers(0, vocab, tokens))
 
 

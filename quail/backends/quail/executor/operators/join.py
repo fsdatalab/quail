@@ -472,15 +472,6 @@ def set_joins(state, join) -> dict:
     return join.close(sum(own_tokens), all_spans, {}, 0)
 
 
-def _tuple_suffix(join, documents, member):
-
-    parts = []
-    for alias, document in zip(join["partners"], member):
-        parts.extend((join["labels"][alias], documents[alias][document]))
-    parts.append(join["tail"])
-    return concat_tokens(*parts)
-
-
 def runs_over_pairs(join: dict) -> bool:
     """Whether a stage streams each anchor's own pairs."""
     return bool(join.get("pairs_from"))
@@ -641,7 +632,11 @@ def join_inputs(nodes, documents, indices, prefixes, arena, retention, pair_tabl
         for positions in itertools.product(
             *(range(len(indices[p])) for p in partners)):
             members.append([indices[p][i] for p, i in zip(partners, positions)])
-            tokens.append(_tuple_suffix(join, documents, positions))
+            parts = []
+            for alias, document in zip(join["partners"], positions):
+                parts.extend((join["labels"][alias], documents[alias][document]))
+            parts.append(join["tail"])
+            tokens.append(concat_tokens(*parts))
         tuple_indices[join["written_position"]] = members
         stage_suffixes.append(tokens)
     maps = partner_maps(group, pair_tables)

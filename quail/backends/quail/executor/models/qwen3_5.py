@@ -385,7 +385,7 @@ class Qwen35Pipeline(ModelPipeline):
             inputs = dict(qkv=buffers.qkv[:n], b=buffers.b[:n], a=buffers.a[:n])
             self._gdn_core(layer.linear_attn, inputs, chunk.meta["gdn"],
                 self.gdn_slots[index], output=buffers.core[:n])
-        else:
-            inputs = dict(q=buffers.q[:n], k=buffers.k[:n], v=buffers.v[:n])
-            self._attention_core(layer.self_attn, inputs, chunk.meta,
-                output=buffers.attention[:n])
+            return
+        inputs = dict(q=buffers.q[:n], k=buffers.k[:n], v=buffers.v[:n])
+        self._attention_core(layer.self_attn, inputs, chunk.meta,
+            output=buffers.attention[:n])
