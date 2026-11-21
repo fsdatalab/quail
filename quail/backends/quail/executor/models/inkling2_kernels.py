@@ -1305,7 +1305,8 @@ def _kernels() -> dict:
             tl.store(out_row[:, None] + cols, values,
                      mask=(cols >= 0) & (cols < SPAN) & ok[:, None])
 
-    @triton.jit
+    # lse's stride is the chunk's row count
+    @triton.jit(do_not_specialize=["stride_lse"])
     def sink_gate(o_ptr, lse_ptr, stride_lse, sink_ptr, stride_s0, out_ptr,
                   stride_o0, stride_o1, HEADS: tl.constexpr,
                   HP: tl.constexpr, D: tl.constexpr):

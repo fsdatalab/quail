@@ -361,7 +361,7 @@ index 00000000..001460a5
 +    cute.arch.sync_warp()
 +    pipe.consumer_release(state)
 diff --git a/flash_attn/cute/interface.py b/flash_attn/cute/interface.py
-index b097c807..7bd48f75 100644
+index b097c807..7a97c42c 100644
 --- a/flash_attn/cute/interface.py
 +++ b/flash_attn/cute/interface.py
 @@ -21,6 +21,7 @@ from quack.compile_utils import make_fake_tensor as fake_tensor
@@ -385,3 +385,14 @@ index b097c807..7bd48f75 100644
      # The config is chosen; from here on the window only reaches the kernels, so use the clamped sides.
      window_size_left, window_size_right = kernel_window_left, kernel_window_right
      num_splits = config.num_splits
+@@ -1174,7 +1181,9 @@ def _flash_attn_fwd(
+         is_varlen_q
+         and not use_swapab
+         and use_single_tile_varlen_scheduler
+-        and batch_size > BIN_BATCH_SEARCH_THRESH
++        # Inkling keeps the hint at every batch size: one kernel per window
++        and (batch_size > BIN_BATCH_SEARCH_THRESH
++             or getattr(score_mod, "inkling_relative_bias", False))
+         and qv is None
+     )
+     if (
