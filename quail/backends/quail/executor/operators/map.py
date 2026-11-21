@@ -7,7 +7,6 @@ document's stage is reported only after every branch's answer ends.
 """
 
 from dataclasses import replace
-from itertools import groupby
 
 import numpy as np
 import pyarrow as pa
@@ -340,14 +339,3 @@ class AnswerBranches(MapOperator):
     def results(self):
         return {key: value for operator in self.operators
                 for key, value in operator.results().items()}
-
-
-def branch_operators(operators):
-    """Coalesce adjacent answer operators without crossing dependent conditions."""
-    combined = []
-    for answers, group in groupby(operators,
-                                  lambda operator: isinstance(operator, MapOperator)):
-        members = list(group)
-        combined.extend([AnswerBranches(members)] if answers and len(members) > 1
-                        else members)
-    return combined

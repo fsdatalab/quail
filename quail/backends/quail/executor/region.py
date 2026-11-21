@@ -237,13 +237,20 @@ class RegionExecution:
         Returns:
             Node id -> NodeResult.
         """
-        from quail.backends.quail.executor.operators.map import branch_operators
+        from quail.backends.quail.executor.operators import map
         from quail.backends.quail.executor.stage_executor import StageExecutor
 
         state = self.query
         settings = settings or ChainRun()
         prefixes, keys, tree = table.prefixes, table.keys, table.tree
-        operators = branch_operators(operators)
+        combined = []
+        for answers, group in groupby(operators,
+            lambda operator: isinstance(operator, map.MapOperator)):
+            members = list(group)
+            combined.extend(
+                [map.AnswerBranches(members)] if answers and len(members) > 1
+                else members)
+        operators = combined
         stages = gated_stages(operators, HintGate() if hinting() else None)
         dependencies = {}
         for operator, (low, _) in zip(operators, stage_slices(operators)):
