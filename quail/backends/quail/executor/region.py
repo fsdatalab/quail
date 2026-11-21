@@ -87,15 +87,6 @@ class ChainRun:
     skip: Any = None
 
 
-def _chain_label(nodes) -> str:
-    """Name a chain by what it does: "classify ×3 over t" or "filter → map over r"."""
-    kinds = [node.type_name.rsplit("ai_", 1)[-1] for node in nodes]
-    steps = [kind if (count := len(list(group))) == 1 else f"{kind} ×{count}"
-             for kind, group in groupby(kinds)]
-    alias = (nodes[0].document_aliases or ("",))[0]
-    return f"{' → '.join(steps)} over {alias}"
-
-
 def pipeline_rows(first, inputs):
     """The rows, or ids, a chain's first operator reads."""
     alias = first.document_aliases[0]
@@ -204,8 +195,12 @@ class RegionExecution:
             return results
         table = self._table()
         first, operators = self.nodes[0], self.operators
+        kinds = [node.type_name.rsplit("ai_", 1)[-1] for node in self.nodes]
+        steps = [kind if (count := len(list(group))) == 1 else f"{kind} ×{count}"
+                 for kind, group in groupby(kinds)]
+        alias = (self.nodes[0].document_aliases or ("",))[0]
         settings = ChainRun(
-            label=_chain_label(self.nodes),
+            label=f"{' → '.join(steps)} over {alias}",
             limit=self.context.state.get("filter_limit"),
             attention=(first.attention or None
                        if isinstance(first, (AiFilter, AiJoin)) else None))
@@ -227,10 +222,6 @@ class RegionExecution:
         return RegionDocuments(prefixes, DocumentKeys(alias, ids),
                                execution_prefix_tree(first, prefixes,
                                                      self.query.loaded_model.arena))
-
-    def send_finished(self, operator) -> None:
-        """Report the operator's finished rows to the region's FinishedRows."""
-        report(operator.take_finished())
 
     def run_operators(self, operators, table, settings=None, *,
                       keep_kv=False) -> dict:
@@ -363,7 +354,7 @@ class RegionExecution:
             if passed and index + 1 < len(routes.operators):
                 routes.operators[index + 1].push([anchor])
         for operator in touched:
-            self.send_finished(operator)
+            report(operator.take_finished())
 
 
 class HintGate:
