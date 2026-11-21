@@ -133,7 +133,7 @@ class RegionImages:
                     for part in parts]
                 encoded = [part for part in parts
                     if part is not None and part.startswith(IMAGE_SIGNATURES)]
-                found = (tuple(_image_firsts(_tokens_of(store[index])))
+                found = (tuple(_image_firsts(store[index]))
                     if encoded else ())
                 firsts.append(found)
                 for first, image in zip(found, encoded, strict=True):
@@ -391,16 +391,12 @@ def _host(values, device_values) -> np.ndarray:
     return device_values.cpu().numpy().astype(np.int64)
 
 
-def _tokens_of(document) -> np.ndarray:
-    """A document's token ids as one array."""
+def _image_firsts(document) -> list[int]:
+    """The first token id of each image in a document's tokens, in order."""
     parts = getattr(document, "token_parts", (document,))
     arrays = [part.numpy() if hasattr(part, "numpy") else np.asarray(part)
         for part in parts]
-    return np.concatenate(arrays) if arrays else np.zeros(0, dtype=np.int64)
-
-
-def _image_firsts(tokens: np.ndarray) -> list[int]:
-    """The first token id of each image in a document's tokens, in order."""
+    tokens = np.concatenate(arrays) if arrays else np.zeros(0, dtype=np.int64)
     marked = tokens >= IMAGE_TOKEN_BASE
     begins = marked & ~np.concatenate([[False], marked[:-1]])
     return tokens[begins].astype(np.int64).tolist()
