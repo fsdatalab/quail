@@ -18,6 +18,7 @@ use crate::cost::sol::speed_of_light;
 use crate::cost::statistics::int_true_divide;
 use crate::cost::work::{Work, ask, scan};
 use crate::physical::{ModelCall, Prompt, ValueExpression};
+use Quantity::Scalar;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -134,14 +135,10 @@ struct PairRelation {
 
 fn work_with(state_written: f64, state_read: f64) -> Work {
     Work {
-        state_written: Quantity::Scalar(state_written),
-        state_read: Quantity::Scalar(state_read),
+        state_written: Scalar(state_written),
+        state_read: Scalar(state_read),
         ..Work::default()
     }
-}
-
-fn scalar(value: f64) -> Quantity {
-    Quantity::Scalar(value)
 }
 
 /// Each alias's partner label and anchor frame tokens, and the tail.
@@ -453,7 +450,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
             return Work::default();
         }
         Work {
-            pairs: scalar((tokens * (tokens - 1) / 2) as f64),
+            pairs: Scalar((tokens * (tokens - 1) / 2) as f64),
             ..Work::default()
         }
     }
@@ -464,15 +461,15 @@ impl<'a, 'c> Estimate<'a, 'c> {
         let prefix = self.pre + data.tokens[row as usize];
         let shared = data.shared[row as usize];
         if shared == 0 {
-            return &(&scan(&scalar(prefix as f64), &scalar(suffix as f64), self.window)
+            return &(&scan(&Scalar(prefix as f64), &Scalar(suffix as f64), self.window)
                 + &self.block_work(prefix))
                 + &self.block_work(suffix);
         }
         let resident = self.pre + shared;
         // the document saves its own state after reading the parent's
         &ask(
-            &scalar(resident as f64),
-            &scalar((prefix - resident + suffix) as f64),
+            &Scalar(resident as f64),
+            &Scalar((prefix - resident + suffix) as f64),
             self.window,
         ) + &work_with(1.0, 0.0)
     }
@@ -492,7 +489,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
                 self.first_use(alias, *row, suffix)
             } else {
                 let prefix = self.pre + self.aliases[alias].tokens[*row as usize];
-                &ask(&scalar(prefix as f64), &scalar(suffix as f64), self.window)
+                &ask(&Scalar(prefix as f64), &Scalar(suffix as f64), self.window)
                     + &self.block_work(suffix)
             };
             work = &work + &step;
@@ -568,7 +565,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
             let prefix = self.pre + self.aliases[anchor].tokens[*row as usize];
             if resident.contains(row) {
                 // the frame's state is saved for every partner to start from
-                work = &(&work + &ask(&scalar(prefix as f64), &scalar(frame as f64), self.window))
+                work = &(&work + &ask(&Scalar(prefix as f64), &Scalar(frame as f64), self.window))
                     + &work_with(1.0, 0.0);
             } else {
                 work = &work + &self.first_use(anchor, *row, frame);
@@ -987,7 +984,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
         );
         work = &work
             + &Work {
-                sae_encoded: scalar(encoded),
+                sae_encoded: Scalar(encoded),
                 ..Work::default()
             };
         let mut record = stage(
@@ -1047,7 +1044,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
                 tokens = 1;
             }
             let context = self.pre + self.aliases[alias].tokens[*row as usize] + tail;
-            work = &work + &ask(&scalar(context as f64), &scalar(tokens as f64), self.window);
+            work = &work + &ask(&Scalar(context as f64), &Scalar(tokens as f64), self.window);
             answer_rows += tokens;
         }
         self.answer_rows += answer_rows as f64;
@@ -1143,10 +1140,10 @@ impl<'a, 'c> Estimate<'a, 'c> {
             let (fed_f, document_f, tail_f) = (fed as f64, document as f64, tail as f64);
             work = &work
                 + &Work {
-                    tokens: scalar(fed_f),
-                    pairs: scalar(fed_f * (document_f + tail_f) + fed_f * (fed_f + 1.0) / 2.0),
-                    kv_written: scalar(fed_f),
-                    kv_read: scalar(
+                    tokens: Scalar(fed_f),
+                    pairs: Scalar(fed_f * (document_f + tail_f) + fed_f * (fed_f + 1.0) / 2.0),
+                    kv_written: Scalar(fed_f),
+                    kv_read: Scalar(
                         document_reads as f64 * document_f
                             + fed_f * tail_f
                             + fed_f * (fed_f - 1.0) / 2.0,

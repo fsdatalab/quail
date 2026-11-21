@@ -12,17 +12,14 @@ use crate::cost::quantity::{Quantity, numpy_sum};
 use crate::cost::sol::unrounded_seconds;
 use crate::cost::specs::{DeviceSpec, ModelSpec};
 use crate::cost::work::{Work, ask, scan, triangle};
-
-fn scalar(value: f64) -> Quantity {
-    Quantity::Scalar(value)
-}
+use Quantity::Scalar;
 
 fn value(quantity: &Quantity) -> f64 {
     quantity.scalar().expect("one document's count")
 }
 
 fn tri(tokens: f64, window: i64) -> f64 {
-    value(&triangle(&scalar(tokens), window))
+    value(&triangle(&Scalar(tokens), window))
 }
 
 /// The keep chance of the answer prior, for a whole mean answer length.
@@ -172,13 +169,13 @@ impl RoundChances {
                 context * reach_chance + step * reach_round + (w - 1.0) * (chance - reach_chance);
         }
         Work {
-            tokens: scalar(suffix * chance),
-            pairs: scalar(suffix * kv_read + tri(suffix, 0) * chance),
-            kv_written: scalar(suffix * chance),
-            kv_read: scalar(kv_read),
-            sliding_pairs: scalar(sliding_pairs),
-            sliding_kv_read: scalar(sliding_kv_read),
-            state_read: scalar(chance),
+            tokens: Scalar(suffix * chance),
+            pairs: Scalar(suffix * kv_read + tri(suffix, 0) * chance),
+            kv_written: Scalar(suffix * chance),
+            kv_read: Scalar(kv_read),
+            sliding_pairs: Scalar(sliding_pairs),
+            sliding_kv_read: Scalar(sliding_kv_read),
+            state_read: Scalar(chance),
             ..Work::default()
         }
     }
@@ -268,32 +265,32 @@ pub fn document_work(
                 shared.get(index).copied().unwrap_or(0.0)
             };
             let mut work = if inputs.resident {
-                ask(&scalar(prefix), &scalar(tail), window)
+                ask(&Scalar(prefix), &Scalar(tail), window)
             } else if borrowed > 0.0 {
                 ask(
-                    &scalar(borrowed + head),
-                    &scalar(context - borrowed - head),
+                    &Scalar(borrowed + head),
+                    &Scalar(context - borrowed - head),
                     window,
                 )
             } else {
-                scan(&scalar(prefix), &scalar(tail), window)
+                scan(&Scalar(prefix), &Scalar(tail), window)
             };
             if inputs.recurrent {
-                work.state_read = scalar(1.0 + if borrowed > 0.0 { 1.0 } else { 0.0 });
-                work.state_written = scalar(1.0 + if inputs.resident { 0.0 } else { 1.0 });
+                work.state_read = Scalar(1.0 + if borrowed > 0.0 { 1.0 } else { 0.0 });
+                work.state_written = Scalar(1.0 + if inputs.resident { 0.0 } else { 1.0 });
             }
             let step = round_tokens[index];
             let rounds = expected_rounds(inputs.answer_tokens, inputs.max_answer_tokens, step);
             let mut fed = tail + rounds * step as f64;
             if inputs.recurrent {
-                let mut first = ask(&scalar(context), &scalar(step as f64), window);
-                first.state_read = scalar(1.0);
-                first.state_written = scalar(0.0);
+                let mut first = ask(&Scalar(context), &Scalar(step as f64), window);
+                first.state_read = Scalar(1.0);
+                first.state_written = Scalar(0.0);
                 work = &work + &(&first * chances.chance[&step][0]);
                 let mut replays = chances.asks(step, context, 2, 1, window);
                 let read = value(&replays.state_read);
-                replays.state_read = scalar(2.0 * read);
-                replays.state_written = scalar(read);
+                replays.state_read = Scalar(2.0 * read);
+                replays.state_written = Scalar(read);
                 work = &work + &replays;
                 fed += step as f64 * read;
             } else {
@@ -344,15 +341,15 @@ pub fn table_work(
     };
     let records = document_work(&sampled, &sampled_shared, inputs)?;
     let mut work = Work {
-        tokens: scalar(column(&records, |w| &w.tokens)),
-        pairs: scalar(column(&records, |w| &w.pairs)),
-        kv_written: scalar(column(&records, |w| &w.kv_written)),
-        kv_read: scalar(column(&records, |w| &w.kv_read)),
-        sliding_pairs: scalar(column(&records, |w| &w.sliding_pairs)),
-        sliding_kv_read: scalar(column(&records, |w| &w.sliding_kv_read)),
-        state_written: scalar(column(&records, |w| &w.state_written)),
-        state_read: scalar(column(&records, |w| &w.state_read)),
-        sae_encoded: scalar(column(&records, |w| &w.sae_encoded)),
+        tokens: Scalar(column(&records, |w| &w.tokens)),
+        pairs: Scalar(column(&records, |w| &w.pairs)),
+        kv_written: Scalar(column(&records, |w| &w.kv_written)),
+        kv_read: Scalar(column(&records, |w| &w.kv_read)),
+        sliding_pairs: Scalar(column(&records, |w| &w.sliding_pairs)),
+        sliding_kv_read: Scalar(column(&records, |w| &w.sliding_kv_read)),
+        state_written: Scalar(column(&records, |w| &w.state_written)),
+        state_read: Scalar(column(&records, |w| &w.state_read)),
+        sae_encoded: Scalar(column(&records, |w| &w.sae_encoded)),
         ..Work::default()
     };
     let mut fed = numpy_sum(&records.iter().map(|r| r.1).collect::<Vec<_>>());
