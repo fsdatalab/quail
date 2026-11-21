@@ -409,18 +409,6 @@ pub(crate) fn quail_function(name: &str) -> Arc<datafusion::logical_expr::Scalar
         .expect("a Quail function")
 }
 
-/// Whether an argument is a `{'selectivity': ...}` hint and nothing else.
-fn is_selectivity_hint(arg: &Expr) -> bool {
-    match arg {
-        Expr::ScalarFunction(call) if call.name() == "named_struct" => {
-            call.args.len() == 2
-                && matches!(&call.args[0], Expr::Literal(value, _)
-                    if value.try_as_str().flatten() == Some("selectivity"))
-        }
-        _ => false,
-    }
-}
-
 /// The call a column operator runs for `call`: an extraction for the
 /// spans of one, and a test's call without its selectivity hint, which
 /// the test keeps.
@@ -429,7 +417,12 @@ fn base_call(call: &Expr) -> Expr {
         return call.clone();
     };
     let mut args = found.args.clone();
-    if args.last().is_some_and(is_selectivity_hint) {
+    if let Some(Expr::ScalarFunction(hint)) = args.last()
+        && hint.name() == "named_struct"
+        && hint.args.len() == 2
+        && matches!(&hint.args[0], Expr::Literal(value, _)
+            if value.try_as_str().flatten() == Some("selectivity"))
+    {
         args.pop();
     }
     let function = if found.name() == "ai_extract_span" {
