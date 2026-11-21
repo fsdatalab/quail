@@ -141,7 +141,22 @@ class JoinOperator(ModelOperator):
         matched = [tuples[start + position if members is None
                           else int(members[start + position])]
                    for position, answer in enumerate(answers) if answer]
-        self.finished.extend(settled_pairs(node, anchor_id, matched))
+        if matched and finished_rows() is not None:
+            count = len(matched)
+            columns = {node.anchor: pa.array([anchor_id] * count, pa.int32())}
+            for index, alias in enumerate(node.partners):
+                columns[alias] = pa.array(
+                    [int(found[index]) for found in matched], pa.int32())
+            columns["answer"] = pa.array([True] * count)
+            tables = [finished_table(
+                node.node_id, f"join_answers:{node.written_position}",
+                pa.table(columns))]
+            if node.semantics != "anti":
+                tables.append(finished_table(
+                    node.node_id, f"rows:{node.anchor}", Rows({
+                        node.anchor: np.asarray([anchor_id], dtype=np.int32)
+                    }).table()))
+            self.finished.extend(tables)
         return bool(matched)
 
     def take_finished(self):
@@ -280,34 +295,6 @@ class JoinOperator(ModelOperator):
     def results(self) -> dict:
         """Return results for every join predicate in the group."""
         return self._results
-
-
-def settled_pairs(node, anchor_id, partner_tuples) -> list:
-    """The finished rows of an anchor's pairs a join answered true.
-
-    Args:
-        node: The AiJoin.
-        anchor_id: The anchor's document id.
-        partner_tuples: Each true pair's partner ids, one per partner alias.
-
-    Returns:
-        The pairs as rows of the join's answers, and, for a join that
-        keeps matched anchors, the anchor as a row of its rows port.
-    """
-    if not partner_tuples or finished_rows() is None:
-        return []
-    count = len(partner_tuples)
-    columns = {node.anchor: pa.array([anchor_id] * count, pa.int32())}
-    for index, alias in enumerate(node.partners):
-        columns[alias] = pa.array([int(found[index]) for found in partner_tuples],
-                                  pa.int32())
-    columns["answer"] = pa.array([True] * count)
-    tables = [finished_table(node.node_id, f"join_answers:{node.written_position}",
-                             pa.table(columns))]
-    if node.semantics != "anti":
-        tables.append(finished_table(node.node_id, f"rows:{node.anchor}", Rows(
-            {node.anchor: np.asarray([anchor_id], dtype=np.int32)}).table()))
-    return tables
 
 
 @dataclass(frozen=True)
