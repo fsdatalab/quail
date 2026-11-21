@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 
 import _quail_native
 
@@ -11,6 +12,7 @@ from quail.backends.quail.executor.memory import memory_report
 from quail.backends.quail.retention import apply_retention
 from quail.common.pairs import columns_key
 from quail.common.tokens import documents_from_table
+from quail.execution.finished import finished_table, first_rows
 from quail.execution.metrics import NodeResult
 from quail.execution.runner import (
     ExecutionContext,
@@ -18,8 +20,7 @@ from quail.execution.runner import (
 )
 from quail.execution.stages import (
     answer_hint,
-    payload_first_rows,
-    ran_message,
+    plain,
     serve_stages,
 )
 from quail.physical import (
@@ -158,7 +159,8 @@ def serve_region(state, payload, graph: PhysicalGraph, end, wanted,
         with torch.inference_mode():
             results = serve_stages(
                 end, context, compute_subgraph(graph), payload["stages"],
-                wanted, hinted, payload_first_rows(payload) if hinted else None)
+                wanted, hinted, first_rows(payload.get("columns", {}),
+                    payload.get("deduplicate", {})) if hinted else None)
         torch.cuda.synchronize()
         # the region is timed until its end, so the files fall inside it
         arena.write_trace_files()
@@ -184,7 +186,12 @@ def serve_region(state, payload, graph: PhysicalGraph, end, wanted,
         },
         "memory": memory_report(gpu),
     }
-    end.ran(*ran_message(results, measurements))
+    tables = [finished_table(node_id, port, table)
+        for node_id, result in results.items()
+        for port, table in result.outputs.items()]
+    metrics = {node_id: asdict(result.metrics)
+        for node_id, result in results.items()}
+    end.ran(json.dumps({**measurements, "metrics": metrics}, default=plain), tables)
 
 
 def answer_region(hint, sinks, question: str):
@@ -216,7 +223,7 @@ def region_report(graph: PhysicalGraph, ran: list, wall: float, device, *,
 
     Args:
         graph: The region's graph.
-        ran: Per worker, what it ran as ``ran_message`` wrote it.
+        ran: Per worker, what it ran as ``serve_region`` wrote it.
         wall: Seconds the region took.
         device: The GPUs' device spec.
         gpus: How many GPUs.

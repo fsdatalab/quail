@@ -14,13 +14,12 @@ from __future__ import annotations
 import json
 import time
 import traceback
-from dataclasses import asdict
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from quail.execution.finished import finished_table, first_rows, reporting
+from quail.execution.finished import reporting
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.rows import Rows
 from quail.execution.runner import ExecutionContext, GenericRunner
@@ -135,30 +134,6 @@ def plain(value):
     if isinstance(value, np.ndarray):
         return value.tolist()
     raise TypeError(f"{type(value).__name__} is not JSON")
-
-
-def ran_message(results: dict, measurements: dict) -> tuple[str, list]:
-    """Return what a worker ran as the JSON and tables it sends.
-
-    Args:
-        results: Node id -> NodeResult, of Arrow tables.
-        measurements: The worker's KV counters and memory report.
-
-    Returns:
-        The measurements and each node's metrics as JSON, and each
-        node's output tables, tagged with node and port.
-    """
-    tables = [finished_table(node_id, port, table)
-              for node_id, result in results.items()
-              for port, table in result.outputs.items()]
-    metrics = {node_id: asdict(result.metrics)
-               for node_id, result in results.items()}
-    return json.dumps({**measurements, "metrics": metrics}, default=plain), tables
-
-
-def payload_first_rows(payload: dict) -> dict:
-    """Each deduplicated alias's first rows, from a runtime payload."""
-    return first_rows(payload.get("columns", {}), payload.get("deduplicate", {}))
 
 
 class _StageRows:
