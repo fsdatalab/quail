@@ -21,13 +21,6 @@ pub struct PrefixIndex {
     pub shared: Vec<i64>,
 }
 
-fn common_prefix<T: PartialEq>(left: &[T], right: &[T]) -> usize {
-    left.iter()
-        .zip(right)
-        .position(|(a, b)| a != b)
-        .unwrap_or_else(|| left.len().min(right.len()))
-}
-
 impl PrefixIndex {
     /// Sort `documents` and measure what each shares with its predecessor.
     pub fn new(documents: &Documents<'_>) -> Self {
@@ -37,7 +30,11 @@ impl PrefixIndex {
         let mut shared = vec![0i64; documents.len()];
         for pair in order.windows(2) {
             let (previous, index) = (documents[pair[0]], documents[pair[1]]);
-            let common = common_prefix(previous, index);
+            let common = previous
+                .iter()
+                .zip(index)
+                .position(|(a, b)| a != b)
+                .unwrap_or_else(|| previous.len().min(index.len()));
             shared[pair[1]] = common.min(index.len().saturating_sub(1)) as i64;
         }
         PrefixIndex { order, shared }
