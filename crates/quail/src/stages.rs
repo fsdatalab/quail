@@ -78,10 +78,6 @@ struct Staged {
 }
 
 impl Staged {
-    fn partitions(&self) -> usize {
-        self.workers.len()
-    }
-
     /// The run of one stage's partition, started on first use.
     fn run(self: &Arc<Self>, stage: usize, partition: usize) -> Once<Written> {
         let mut runs = self.runs.lock().expect("the runs lock");
@@ -173,7 +169,7 @@ impl Staged {
                     .iter()
                     .position(|found| *found == wanted)
                     .ok_or_else(|| failure(format!("stage {from} does not write {wanted:?}")))?;
-                let runs = (0..self.partitions()).map(|partition| self.run(from, partition));
+                let runs = (0..self.workers.len()).map(|partition| self.run(from, partition));
                 let written = try_join_all(runs).await.map_err(failure)?;
                 // a GPU that wrote no rows may type a column apart from
                 // the others: its empty batches are left out
@@ -222,7 +218,7 @@ impl Staged {
             None => (schema, partitions, key.as_str()),
         };
         let memory = MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&schema), None)?;
-        let hash = Partitioning::Hash(vec![col(column, &schema)?], self.partitions());
+        let hash = Partitioning::Hash(vec![col(column, &schema)?], self.workers.len());
         Ok(Ready::Hashed(Arc::new(RepartitionExec::try_new(
             memory, hash,
         )?)))
@@ -394,7 +390,7 @@ pub fn run_stages(
                 let runtime = crate::runtime()?;
                 runtime.block_on(async move {
                     let runs = (0..staged.stages.len()).flat_map(|stage| {
-                        (0..staged.partitions()).map(move |partition| (stage, partition))
+                        (0..staged.workers.len()).map(move |partition| (stage, partition))
                     });
                     let runs = runs.map(|(stage, partition)| staged.run(stage, partition));
                     try_join_all(runs).await.map(|_| ()).map_err(failure)
