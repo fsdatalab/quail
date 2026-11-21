@@ -146,8 +146,8 @@ class RequestModelExecution:
                     for step in steps if not step.get("partner")
                     and step["kind"] != "join"),
                 evaluated_document_pairs=sum(step["requests"] for step in steps
-                                             if step.get("partner")
-                                             or step["kind"] == "join"),
+                    if step.get("partner")
+                    or step["kind"] == "join"),
                 fresh_tokens=sum(step["fresh_tokens"] for step in steps),
                 cached_tokens=sum(step["cached_tokens"] for step in steps),
                 extension={
@@ -245,7 +245,7 @@ class RequestModelExecution:
                 spec, {spec.alias: document_ids}, result["labels"])
             outputs[f"label_answers:{spec.output}"] = labels
             labeled = list(zip(labels.ids[spec.alias].to_pylist(),
-                               labels.column(spec.output).to_pylist()))
+                labels.column(spec.output).to_pylist()))
             survivors[spec.alias] = labels.ids[spec.alias].to_pylist()
             test_answers = {}
             for index, (position, accepted) in enumerate(spec.tests):
@@ -383,7 +383,7 @@ class RequestModelExecution:
             rows = []
             for anchor_index, anchor_id in enumerate(anchor_ids):
                 mine = (range(len(members)) if allowed is None
-                        else allowed[anchor_index])
+                    else allowed[anchor_index])
                 for member_index in mine:
                     by_alias = {anchor: anchor_id}
                     by_alias.update(zip(partners, members[member_index]))
@@ -431,7 +431,7 @@ class RequestModelExecution:
             answers = outputs[f"join_answers:{spec.join_written_position}"]
             kept = answers.filter(answer_values(answers))
             pairs = list(zip(kept.column(spec.alias).to_pylist(),
-                             kept.column(spec.partner).to_pylist()))
+                kept.column(spec.partner).to_pylist()))
             note, partner_label = (
                 token_list(ids) for ids in spec.join_layout_token_ids)
             result = self._classify(
@@ -443,7 +443,7 @@ class RequestModelExecution:
                     for anchor, partner in pairs])
             labels = classification_rows(
                 spec, {spec.alias: kept.column(spec.alias),
-                       spec.partner: kept.column(spec.partner)}, result["labels"])
+                    spec.partner: kept.column(spec.partner)}, result["labels"])
             outputs[f"label_answers:{spec.output}"] = labels
             steps.append(request_step(result,
                 kind="classify",
@@ -468,10 +468,10 @@ class RequestModelExecution:
         groups = {}
         for spec in specs:
             preamble = token_list(spec.preamble_token_ids
-                                  or node.preamble_token_ids)
+                or node.preamble_token_ids)
             preamble_text = spec.preamble_text or node.preamble_text
             groups.setdefault((spec.alias, tuple(preamble), preamble_text),
-                              []).append(spec)
+                []).append(spec)
         for (alias, preamble, preamble_text), members in groups.items():
             ids = list(survivors[alias])
             texts = self.document_texts.get(alias)
@@ -481,9 +481,9 @@ class RequestModelExecution:
                     f"the scan did not load")
             document_texts = [text_value(texts, document) for document in ids]
             yield (alias, members, ids, document_texts,
-                   [list(preamble) + token_list(self.documents[alias][document])
+                [list(preamble) + token_list(self.documents[alias][document])
                     for document in ids],
-                   ([preamble_text + text for text in document_texts]
+                ([preamble_text + text for text in document_texts]
                     if self.submit_text else None))
 
     def _execute_extractions(self, node, survivors, outputs, steps):
@@ -491,7 +491,7 @@ class RequestModelExecution:
         for alias, specs, ids, texts, bodies, body_texts in self._answer_groups(
                 node, node.extracts, survivors, "AI.EXTRACT"):
             results = extract_fields(self.client, specs, bodies, texts,
-                                     body_texts=body_texts)
+                body_texts=body_texts)
             for spec, result in zip(specs, results):
                 self._extracted(alias, spec, ids, result, outputs, steps)
 
@@ -500,7 +500,7 @@ class RequestModelExecution:
         for alias, specs, ids, _, bodies, body_texts in self._answer_groups(
                 node, node.maps, survivors, "AI.MAP"):
             results = map_documents(self.client, specs, bodies, body_texts,
-                                    submission=self.answer_submission)
+                submission=self.answer_submission)
             for spec, result in zip(specs, results):
                 self._mapped(alias, spec, ids, result, outputs, steps)
 
@@ -510,7 +510,7 @@ class RequestModelExecution:
                 node, [*node.extracts, *node.maps], survivors,
                 "AI.EXTRACT and AI.MAP"):
             extracts = [spec for spec in specs
-                        if isinstance(spec, RequestExtractSpec)]
+                if isinstance(spec, RequestExtractSpec)]
             maps = [spec for spec in specs if not isinstance(spec, RequestExtractSpec)]
             extracted, mapped = answer_documents(
                 self.client, extracts, maps, bodies, texts, body_texts,
@@ -542,7 +542,7 @@ class RequestModelExecution:
             {alias: document_ids(ids)},
             pa.table({spec.output: pa.array(result["answers"], pa.string())}))
         steps.append(request_step(result, kind="map", alias=alias,
-                                  output=spec.output,
-                                  submission=self.answer_submission,
-                                  num_in=len(ids), num_out=len(ids),
-                                  document_cap=result["doc_cap"]))
+            output=spec.output,
+            submission=self.answer_submission,
+            num_in=len(ids), num_out=len(ids),
+            document_cap=result["doc_cap"]))

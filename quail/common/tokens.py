@@ -31,7 +31,7 @@ class TokenView(Sequence):
             if step != 1:
                 return list(self)[index]
             offsets = (None if self._character_offsets is None else
-                       self._character_offsets.slice(start, stop - start))
+                self._character_offsets.slice(start, stop - start))
             return TokenView(self._values.slice(start, stop - start), offsets)
         return self._values[index].as_py()
 
@@ -135,7 +135,7 @@ class ArrowTokenDocuments(Sequence):
             for chunk in self._chunks)
         self._values_by_chunk = tuple(chunk.values for chunk in self._chunks)
         self._values = (self._values_by_chunk[0]
-                        if len(self._values_by_chunk) == 1 else None)
+            if len(self._values_by_chunk) == 1 else None)
         self._character_offsets = (
             None if character_offsets is None else
             tuple(character_offsets.chunks) if hasattr(character_offsets, "chunks")
@@ -173,8 +173,8 @@ class TokenLengths(Sequence):
 
     def __init__(self, values, store: "TokenStore | None" = None):
         self.arrow_array = (values.cast(pa.int64())
-                            if isinstance(values, pa.ChunkedArray)
-                            else pa.chunked_array([pa.array(values, pa.int64())]))
+            if isinstance(values, pa.ChunkedArray)
+            else pa.chunked_array([pa.array(values, pa.int64())]))
         self.store = store
 
     def __len__(self):
@@ -259,8 +259,8 @@ class TokenStore(Sequence):
                 with nulls equal, NaNs equal, and -0.0 equal to 0.0.
         """
         values = (pa.table({str(index): equality_keys(column, nan_equal=True)
-                            for index, column in enumerate(columns)})
-                  if columns else None)
+            for index, column in enumerate(columns)})
+            if columns else None)
         return _quail_native.first_documents(
             pa.table({"tokens": self.arrow_array}), values)
 
@@ -359,7 +359,7 @@ def close_documents(documents: dict, close) -> dict:
     if not close:
         return documents
     return {alias: ClosedDocuments(values, close)
-            for alias, values in documents.items()}
+        for alias, values in documents.items()}
 
 
 class DocumentKeys(Sequence):
@@ -410,8 +410,8 @@ def _token_array(document):
     """A document's integer token ids as an int32 array."""
     parts = getattr(document, "token_parts", (document,))
     arrays = [np.asarray(part.numpy() if hasattr(part, "numpy") else list(part),
-                         dtype=np.int32)
-              for part in parts]
+        dtype=np.int32)
+        for part in parts]
     if not arrays:
         return np.empty(0, dtype=np.int32)
     return arrays[0] if len(arrays) == 1 else np.concatenate(arrays)

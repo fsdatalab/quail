@@ -24,7 +24,7 @@ MAX_MODEL_LEN = -1
 
 
 def gpu_memory_utilization(device: DeviceSpec | None,
-                           model: ModelSpec) -> float:
+        model: ModelSpec) -> float:
     """Return the fraction of device memory vLLM may use.
 
     The default is ``GPU_MEMORY_UTILIZATION``. A model that sets
@@ -93,7 +93,7 @@ class GigatokenVLLMTokenizer:
 
         truncation_side = kwargs.pop("truncation_side", "left")
         path = resolve_model_path(path_or_repo_id, kwargs.get("revision"),
-                                  include_weights=False)
+            include_weights=False)
         tokenizer = Tokenizer(path).as_hf()
         tokenizer.truncation_side = truncation_side
         vocab = tokenizer.get_vocab()
@@ -119,7 +119,7 @@ def engine_environment(spec):
     # DeltaNet kernel while it captures such an engine's graphs
     if spec.vision_tower and os.environ.get("QUAIL_VLLM_IMAGES"):
         root = os.environ.get("VLLM_CACHE_ROOT",
-                              os.path.expanduser("~/.cache/vllm"))
+            os.path.expanduser("~/.cache/vllm"))
         settings["VLLM_CACHE_ROOT"] = root.rstrip("/") + "-images"
         settings["VLLM_USE_V2_MODEL_RUNNER"] = "0"
     previous = {key: os.environ.get(key) for key in settings}
@@ -218,7 +218,7 @@ def text_only_kwargs(spec) -> dict:
         return {}
     if os.environ.get("QUAIL_VLLM_IMAGES"):
         return {"limit_mm_per_prompt": {"image": 1, "video": 0},
-                "tokenizer_mode": "auto"}
+            "tokenizer_mode": "auto"}
     return {"limit_mm_per_prompt": {"image": 0, "video": 0}}
 
 
@@ -230,11 +230,11 @@ def sampling_kwargs(allowed_ids: list[int], canvas_tokens: int = 0) -> dict:
     """
     if canvas_tokens == 1:
         return {"max_tokens": 1, "logprobs": DIFFUSION_LOGPROBS,
-                "detokenize": False}
+            "detokenize": False}
     if canvas_tokens:
         return {"max_tokens": DIFFUSION_TEXT_TOKENS}
     return {"temperature": 0.0, "max_tokens": 1, "min_tokens": 1,
-            "allowed_token_ids": allowed_ids, "detokenize": False}
+        "allowed_token_ids": allowed_ids, "detokenize": False}
 
 
 class VLLMClient:
@@ -260,7 +260,7 @@ class VLLMClient:
 
     def generate(self, prompts, sampling_params, use_tqdm=False):
         return self.llm.generate([self._prompt(prompt) for prompt in prompts],
-                                 sampling_params, use_tqdm=use_tqdm)
+            sampling_params, use_tqdm=use_tqdm)
 
     def decode_params(self, max_tokens: int, stop=None):
         """Build sampling parameters for greedy text generation.
@@ -273,7 +273,7 @@ class VLLMClient:
         from vllm import SamplingParams
 
         return SamplingParams(max_tokens=max_tokens, temperature=0.0,
-                              stop=stop)
+            stop=stop)
 
     def reset_prefix_cache(self):
         return self.llm.reset_prefix_cache()
@@ -303,8 +303,8 @@ class VLLMClient:
         )
 
     def run_extract_fields(self, sampling_params, body_ids, tail_ids, *,
-                           answer_tokens, tag="x", body_texts=None,
-                           tail_texts=None):
+            answer_tokens, tag="x", body_texts=None,
+            tail_texts=None):
         """Decode the answers of each document through the engine's step loop.
 
         sampling_params is one setting for every field, or one per field.
@@ -368,8 +368,8 @@ class VLLMEngine:
                 "cudagraph_capture_sizes": list(GRAPH_TOKEN_BUCKETS)
             },
             "max_num_seqs": (DIFFUSION_SEQUENCES if spec.canvas_tokens == 1
-                             else min(MAX_SEQUENCES,
-                                      spec.max_num_seqs or MAX_SEQUENCES)),
+                else min(MAX_SEQUENCES,
+                    spec.max_num_seqs or MAX_SEQUENCES)),
         }
         if spec.moe_backend is not None:
             kwargs["moe_backend"] = spec.moe_backend
@@ -386,8 +386,8 @@ class VLLMEngine:
         return kwargs
 
     def boot(self, spec, allowed_ids: list[int],
-             device: DeviceSpec | None = None, *,
-             resources: ExitStack) -> tuple[dict, dict]:
+            device: DeviceSpec | None = None, *,
+            resources: ExitStack) -> tuple[dict, dict]:
         """Load the spec's model and return its settings and boot record.
 
         Args:
@@ -476,8 +476,8 @@ class NgramVLLMEngine(VLLMEngine):
 
     def llm_kwargs(self, spec, device: DeviceSpec | None = None) -> dict:
         return {**super().llm_kwargs(spec, device),
-                "speculative_config": speculative_config(
-                    f"ngram:{NGRAM_SPECULATIVE_TOKENS}")}
+            "speculative_config": speculative_config(
+                f"ngram:{NGRAM_SPECULATIVE_TOKENS}")}
 
 
 def speculative_config(value: str) -> dict:
@@ -496,7 +496,7 @@ def speculative_config(value: str) -> dict:
             f"QUAIL_VLLM_SPECULATIVE={value!r} is not ngram:<tokens>")
     # the lookup length is vLLM's documented example
     return {"method": "ngram", "num_speculative_tokens": int(tokens),
-            "prompt_lookup_max": 4}
+        "prompt_lookup_max": 4}
 
 
 def stock_vllm_backend() -> RequestBackend:

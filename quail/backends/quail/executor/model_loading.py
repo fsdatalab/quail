@@ -28,7 +28,7 @@ def is_decision2(path) -> bool:
     """Whether a checkpoint directory holds a Decision 2.0 package."""
     config = Path(path) / "config.json"
     return (config.is_file()
-            and json.loads(config.read_text()).get("model_type") == "decision2")
+        and json.loads(config.read_text()).get("model_type") == "decision2")
 
 
 def engine_args(path, architecture: str = "") -> dict:
@@ -54,9 +54,9 @@ def engine_args(path, architecture: str = "") -> dict:
         )
 
         return {"model": str(Path(path) / "backbone"),
-                "tokenizer": str(path), "dtype": "bfloat16",
-                "hf_overrides": {"architectures": [
-                    architecture or BACKBONE_ARCHITECTURE]}}
+            "tokenizer": str(path), "dtype": "bfloat16",
+            "hf_overrides": {"architectures": [
+                architecture or BACKBONE_ARCHITECTURE]}}
     settings = {"model": str(path)}
     config = Path(path) / "config.json"
     if not config.is_file():
@@ -180,7 +180,7 @@ def retain_answer_head(torch, model, token_ids, head=None):
 
 # the 16 FP4 E2M1 values, by their 4-bit code: sign bit, then magnitude
 E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-               -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
 NVFP4_GROUP = 16
 
 
@@ -256,7 +256,7 @@ def answer_weights(model, token_ids):
     """Return the retained rows for a query's answer token ids."""
     if tuple(token_ids) != model.quail_answer_token_ids:
         raise ValueError("Query answer token ids differ from the loaded "
-                         "model's retained rows")
+            "model's retained rows")
     return model.quail_answer_weights
 
 
@@ -286,9 +286,9 @@ def keep_layers(torch, model, num_layers: int):
 
 
 def load_model(model_name: str, revision: str | None = None, *,
-               answer_token_ids, max_batched_tokens=None,
-               moe_backend=None, text_only=False, images=False,
-               num_layers=None, quantize_fp8=False):
+        answer_token_ids, max_batched_tokens=None,
+        moe_backend=None, text_only=False, images=False,
+        num_layers=None, quantize_fp8=False):
     """Load model weights and retain the answer rows and the full output head.
 
     max_batched_tokens is the largest chunk the model will see. vLLM's
@@ -321,18 +321,18 @@ def load_model(model_name: str, revision: str | None = None, *,
         model = load_lfm3(model_path, quantize_fp8=quantize_fp8)
     else:
         model = _load_vllm_model(model_path, max_batched_tokens, moe_backend,
-                                 text_only, images)
+            text_only, images)
     if num_layers is not None:
         keep_layers(torch, model, num_layers)
     retain_answer_head(torch, model, answer_token_ids,
-                       head=nvfp4_output_head(torch, model_path))
+        head=nvfp4_output_head(torch, model_path))
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
     return model
 
 
 def _load_vllm_model(model_path, max_batched_tokens, moe_backend, text_only,
-                     images=False):
+        images=False):
     """Load a checkpoint through vLLM's model loader, with no engine."""
     import torch
     from vllm.config import set_current_vllm_config

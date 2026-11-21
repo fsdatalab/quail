@@ -194,7 +194,7 @@ def run_filter_sequence(
     return sequence.result(
         time.perf_counter() - started,
         **_cap_settings(document_cap, budget_tokens, block_size,
-                        max_num_seqs),
+            max_num_seqs),
     )
 
 
@@ -221,7 +221,7 @@ def extract_document_cap(
         return (tokens + block_size - 1) // block_size * block_size
 
     fields = sum(blocks(len(tail) + answer_tokens + block_size)
-                 for tail in tail_ids)
+        for tail in tail_ids)
     sizes = [blocks(len(body)) + fields for body in body_ids]
     document_cap = max(1, budget_tokens // (sum(sizes) // len(sizes)))
     if max_num_seqs is not None:
@@ -260,8 +260,8 @@ def run_extract_fields(
     """
     fields = len(tail_ids)
     field_params = (list(sampling_params)
-                    if isinstance(sampling_params, (list, tuple))
-                    else [sampling_params] * fields)
+        if isinstance(sampling_params, (list, tuple))
+        else [sampling_params] * fields)
     document_cap = extract_document_cap(
         body_ids, tail_ids, answer_tokens, budget_tokens,
         block_size=block_size, max_num_seqs=max_num_seqs,
@@ -385,12 +385,12 @@ def run_join_grouped(
     """
     if pairs is None:
         pairs = [(anchor, suffix) for anchor in range(len(prefixes))
-                 for suffix in range(len(suffixes))]
+            for suffix in range(len(suffixes))]
     if submission == "anchor-major":
         order = list(range(len(pairs)))
     elif submission == "suffix-major":
         order = sorted(range(len(pairs)),
-                       key=lambda index: (pairs[index][1], pairs[index][0]))
+            key=lambda index: (pairs[index][1], pairs[index][0]))
     else:
         raise ValueError(f"unknown join submission {submission!r}")
     if prefix_texts is not None and suffix_texts is not None:
@@ -401,7 +401,7 @@ def run_join_grouped(
     else:
         prompts = [
             {"prompt_token_ids": prefixes[pairs[index][0]]
-             + suffixes[pairs[index][1]]}
+                + suffixes[pairs[index][1]]}
             for index in order
         ]
 
@@ -418,7 +418,7 @@ def run_join_grouped(
         submitted_at[index] = position
     answers = [bits[position] for position in submitted_at]
     cached_per_request = [cached_by_output[position]
-                          for position in submitted_at]
+        for position in submitted_at]
     prompt_tokens = sum(len(output.prompt_token_ids) for output in outputs)
     cached_tokens = sum(cached_per_request)
     return {

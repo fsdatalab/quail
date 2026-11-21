@@ -34,7 +34,7 @@ def columns_key(alias: str) -> str:
 
 
 def pair_table(left_alias: str, left_keys, right_alias: str,
-               right_keys) -> pa.Table:
+        right_keys) -> pa.Table:
     """Row index pairs whose key columns are all equal.
 
     Args:
@@ -60,12 +60,12 @@ def _join_key_tables(left_keys, right_keys) -> tuple[pa.Table, pa.Table]:
     """Build both sides' key tables, with one type per equality."""
     if len(left_keys) != len(right_keys) or not left_keys:
         raise ValueError("a join needs one key column per side "
-                         "and at least one equality")
+            "and at least one equality")
     names = [f"key{index}" for index in range(len(left_keys))]
     columns = [_join_key_columns(left, right)
-               for left, right in zip(left_keys, right_keys)]
+        for left, right in zip(left_keys, right_keys)]
     return tuple(pa.Table.from_arrays([pair[side] for pair in columns], names=names)
-                 for side in (0, 1))
+        for side in (0, 1))
 
 
 def _join_key_columns(left, right):
@@ -83,7 +83,7 @@ def _join_key_columns(left, right):
         kind = pa.decimal128(20, 0)
         return left.cast(kind), right.cast(kind)
     schema = pa.unify_schemas([pa.schema([("key", kind)]) for kind in types],
-                              promote_options="permissive")
+        promote_options="permissive")
     kind = schema.field(0).type
     # Arrow's hash join needs a concrete key type when every value is null
     kind = pa.bool_() if pa.types.is_null(kind) else kind
@@ -95,7 +95,7 @@ def _integral_join_key(column):
     if pa.types.is_floating(column.type):
         integral = pc.equal(column, pc.floor(column))
         in_range = pc.and_kleene(pc.greater_equal(column, float(-2**63)),
-                                 pc.less(column, float(2**64)))
+            pc.less(column, float(2**64)))
         column = pc.if_else(pc.and_kleene(integral, in_range), column, None)
     return column.cast(pa.decimal128(20, 0))
 
@@ -146,10 +146,10 @@ class RowGroups:
 
 
 def partner_map(pairs: pa.Table, anchor_alias: str,
-                partner_alias: str) -> RowGroups:
+        partner_alias: str) -> RowGroups:
     """Anchor row -> its partner rows, from a pair table."""
     return RowGroups(pairs.column(anchor_alias).to_numpy(),
-                     pairs.column(partner_alias).to_numpy())
+        pairs.column(partner_alias).to_numpy())
 
 
 def members_by_partner(members, position: int) -> RowGroups:

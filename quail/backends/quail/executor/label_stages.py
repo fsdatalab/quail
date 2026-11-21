@@ -93,7 +93,7 @@ def label_requests(spec, targets=None) -> LabelRequests:
         read = read_nodes(ids)
         paths = trie_paths(ids, read)
         tokens = [cue if node == () else node[-1]
-                  for nodes, _, _ in paths for node in nodes]
+            for nodes, _, _ in paths for node in nodes]
         return LabelRequests(
             frame, [tokens], targets, True,
             lambda logprobs: tree_scores(ids, paths, targets, logprobs[0], read),
@@ -181,7 +181,7 @@ class ClassifyStages:
     choice = None           # (frame, request) of a decision_choice rule
 
     def __init__(self, state: QueryExecutionState, spec, count, index_of, on_label=None,
-                 partners=None):
+            partners=None):
         self.spec = spec
         self.index_of = index_of
         if spec.scoring == DECISION_SCORING:
@@ -207,7 +207,7 @@ class ClassifyStages:
         # need no normalizer
         same_rows = all(len(ids) == 1 for ids in spec.label_token_ids)
         self.readout = readout = _label_readout(state, targets, readout_rows,
-                                                not same_rows)
+            not same_rows)
         self.labels = np.full(count, None, dtype=object)
         if spec.probabilities:
             self.probabilities = np.full((count, len(spec.labels)), np.nan)
@@ -257,7 +257,7 @@ class ClassifyStages:
         """Initialize one classification stage over the pairs retained by a join."""
         if spec.scoring != "letters":
             raise ValueError("a classification of joined rows reads letters, "
-                             f"not {spec.scoring!r}")
+                f"not {spec.scoring!r}")
         if partners is None:
             raise ValueError(
                 "a classification of joined rows needs the join's partners")
@@ -276,7 +276,7 @@ class ClassifyStages:
         (cue,) = request.suffixes[0]
         # suffix p is partner p's block and the cue; its last row is read
         suffixes = [concat_tokens(document, question, (cue,))
-                    for document in partners.documents]
+            for document in partners.documents]
         self.block_tokens = [len(tokens) - 1 for tokens in suffixes]
 
         def ask(key):
@@ -288,7 +288,7 @@ class ClassifyStages:
             for position, partner in enumerate(kept):
                 self.pair_labels[(anchor, partner)] = spec.labels[best_label(
                     letter_scores(spec.label_token_ids, targets,
-                                  logprobs[position]))]
+                        logprobs[position]))]
             return True
 
         self.stages = [Stage(
@@ -298,7 +298,7 @@ class ClassifyStages:
             read_rows=[1] * len(suffixes), label=spec.name)]
 
     def _choice_stages(self, state: QueryExecutionState, spec, count, on_label,
-                       partners):
+            partners):
         """Initialize one stage whose decision head scores every option block.
 
         For individual documents the question is the frame and the one
@@ -331,13 +331,13 @@ class ClassifyStages:
                 return True
 
             self.stages = [Stage(suffixes=[request], readout=readout, frame=frame,
-                                 decide=whole, label=spec.name)]
+                decide=whole, label=spec.name)]
             return
         note, partner_label = spec.join_layout
         self.partners = partners
         self.pair_labels = {}
         blocks = [concat_tokens(document, frame, request)
-                  for document in partners.documents]
+            for document in partners.documents]
         self.block_tokens = [len(tokens) - 1 for tokens in blocks]
 
         def ask(key):
@@ -400,7 +400,7 @@ class ClassifyStages:
 
         def ask(key):
             return (Stage.SKIP if self.labels[self.index_of(key)] is not None
-                    else None)
+                else None)
 
         def average(anchor, row):
             probs = self._probs(row, more)[0]
@@ -430,7 +430,7 @@ class ClassifyStages:
         """
         logits = np.asarray(logits).reshape(draws, self.readout_rows, -1)
         probs = _softmax(np.stack([self.request.score(logits[draw:draw + 1])
-                                   for draw in range(draws)]))
+            for draw in range(draws)]))
         entropy = -np.sum(probs * np.log(np.maximum(probs, 1e-30)), axis=1)
         return probs, entropy
 
@@ -487,7 +487,7 @@ class ClassifyStages:
             frame_tokens = len(self.stages[0].frame)
         if self.partners is not None:
             streamed = sum(1 + self.block_tokens[partner]
-                           for _, partner in self.pair_labels)
+                for _, partner in self.pair_labels)
             anchors = {anchor for anchor, _ in self.pair_labels}
             streamed += len(anchors) * frame_tokens
             return len(self.pair_labels), streamed

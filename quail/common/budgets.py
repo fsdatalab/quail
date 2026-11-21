@@ -37,7 +37,7 @@ def _budgets(model_json: str, device_json: str | None):
 def budgets_of(model: ModelSpec, device: DeviceSpec | None = None):
     """Return the Rust ``Budgets`` of a model, on a device when given."""
     return _budgets(_spec_json(model),
-                    None if device is None else _spec_json(device))
+        None if device is None else _spec_json(device))
 
 
 def pages(tokens: int, page_tokens: int = PAGE_TOKENS) -> int:
@@ -61,9 +61,9 @@ def kernel_index_cap(model: ModelSpec) -> int:
 
 
 def arena_pages(model: ModelSpec, device: DeviceSpec,
-                chunk_tokens: int | None = None,
-                mean_document_tokens: float | None = None,
-                writes_answers: bool = True) -> tuple[int, int]:
+        chunk_tokens: int | None = None,
+        mean_document_tokens: float | None = None,
+        writes_answers: bool = True) -> tuple[int, int]:
     """Return the pages of the two KV pools: (every-token, sliding-layer).
 
     Args:
@@ -84,16 +84,16 @@ def arena_pages(model: ModelSpec, device: DeviceSpec,
 
 
 def arena_tokens(model: ModelSpec, device: DeviceSpec,
-                 chunk_tokens: int | None = None,
-                 mean_document_tokens: float | None = None,
-                 writes_answers: bool = True) -> int:
+        chunk_tokens: int | None = None,
+        mean_document_tokens: float | None = None,
+        writes_answers: bool = True) -> int:
     """Return the tokens of document KV that can be resident at once."""
     return budgets_of(model, device).arena_tokens(
         chunk_tokens, mean_document_tokens, writes_answers)
 
 
 def arena_bytes(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
-                writes_answers: bool = True) -> float:
+        writes_answers: bool = True) -> float:
     """Return the bytes left for KV after weights and activations.
 
     A plan that writes answers also leaves the CUDA graph memory.
@@ -102,22 +102,22 @@ def arena_bytes(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
 
 
 def hybrid_arena_pages(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
-                       mean_document_tokens: float | None,
-                       writes_answers: bool = True) -> int:
+        mean_document_tokens: float | None,
+        writes_answers: bool = True) -> int:
     """Return a hybrid model's arena KV pages."""
     return budgets_of(model, device).hybrid_arena_pages(
         chunk_tokens, mean_document_tokens, writes_answers)
 
 
 def hybrid_pool_pages(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
-                      writes_answers: bool = True) -> int:
+        writes_answers: bool = True) -> int:
     """Return the pages a hybrid model shares between KV and checkpoints."""
     return budgets_of(model, device).hybrid_pool_pages(
         chunk_tokens, writes_answers)
 
 
 def checkpoint_slots(model: ModelSpec, device: DeviceSpec, chunk_tokens: int,
-                     kv_pages: int, writes_answers: bool = True) -> int:
+        kv_pages: int, writes_answers: bool = True) -> int:
     """Return the checkpoints the pool holds beside an arena of `kv_pages`."""
     return budgets_of(model, device).checkpoint_slots(
         chunk_tokens, kv_pages, writes_answers)
@@ -134,13 +134,13 @@ def checkpoint_pass_bytes(model: ModelSpec, questions: int, chunk_tokens: int) -
 
 
 def checkpoint_memory_bytes(model: ModelSpec, chunk_tokens: int,
-                            page_tokens: int = PAGE_TOKENS) -> float:
+        page_tokens: int = PAGE_TOKENS) -> float:
     """Return the workspace, execution KV, and one retained document's state."""
     return budgets_of(model).checkpoint_memory_bytes(chunk_tokens, page_tokens)
 
 
 def chunk_memory_bytes(model: ModelSpec, chunk_tokens: int,
-                       page_tokens: int = PAGE_TOKENS) -> float:
+        page_tokens: int = PAGE_TOKENS) -> float:
     """Return the resident weights, activations, and checkpoint reservations."""
     return budgets_of(model).chunk_memory_bytes(chunk_tokens, page_tokens)
 
@@ -161,7 +161,7 @@ def minimum_weight_gpus(model: ModelSpec, device: DeviceSpec) -> int:
 
 
 def sliding_kv_fits(model: ModelSpec, device: DeviceSpec,
-                    chunk_tokens: int | None = None) -> bool:
+        chunk_tokens: int | None = None) -> bool:
     """Return whether the leftover arena holds one chunk's sliding KV."""
     return budgets_of(model, device).sliding_kv_fits(chunk_tokens)
 
@@ -191,8 +191,8 @@ def tree_attention_allowed(model: ModelSpec) -> bool:
 
 
 def cheaper_attention_path(model: ModelSpec, device: DeviceSpec, *,
-                           readers: float, reader_rows: float,
-                           node_tokens: float) -> str:
+        readers: float, reader_rows: float,
+        node_tokens: float) -> str:
     """Return "unified" or "tree" attention for readers of one shared node."""
     return budgets_of(model, device).cheaper_attention_path(
         readers, reader_rows, node_tokens)

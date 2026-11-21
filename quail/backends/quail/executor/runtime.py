@@ -34,7 +34,7 @@ class QuailModelExecution:
         return self._query
 
     def bind_loaded_model(self, *, model, arena, pipeline,
-                          decision_head=None, tokenizer=None) -> None:
+            decision_head=None, tokenizer=None) -> None:
         """Attach the loaded model and discard the previous model's caches.
 
         Args:
@@ -60,7 +60,7 @@ class QuailModelExecution:
         self.loaded_model = None
 
     def bind_query(self, *, torch, async_answers, answer_rows,
-                   chunk_tokens: int, async_scores=None) -> None:
+            chunk_tokens: int, async_scores=None) -> None:
         """Attach state that is valid for the current query.
 
         answer_rows are the retained output rows every readout scores

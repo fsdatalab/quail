@@ -44,7 +44,7 @@ class ImagePrompts:
         if not pictures:
             return prompt
         return {**prompt, "prompt_token_ids": ids,
-                "multi_modal_data": {"image": pictures}}
+            "multi_modal_data": {"image": pictures}}
 
 
 def _picture(encoded: bytes):

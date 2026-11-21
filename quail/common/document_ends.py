@@ -68,7 +68,7 @@ def joined_state(document, tail, ends):
         return list(tail)
     if ends is None:
         raise ValueError("the plan joined no document ends with this tail; "
-                         "plan the query on its documents' exact tokens")
+            "plan the query on its documents' exact tokens")
     last = int(document[-1])
     if last not in ends:
         raise ValueError(f"the plan joined no document ending in token {last}")

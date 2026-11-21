@@ -54,7 +54,7 @@ class LoadedGpu:
     """One model loaded on one GPU, reusable across queries."""
 
     def __init__(self, backend, context, answer_token_ids, *,
-                 model_path=None):
+            model_path=None):
         import torch
         import torch.nn.functional as F
 
@@ -73,18 +73,18 @@ class LoadedGpu:
         budget = budgets.chunk_budget(spec, device)
         t0 = time.perf_counter()
         self.model = load_model(model_path or spec.hf_name,
-                                revision=None if model_path else spec.revision,
-                                answer_token_ids=answer_token_ids,
-                                max_batched_tokens=budget,
-                                moe_backend=spec.moe_backend,
-                                text_only=spec.vision_tower,
-                                images=(spec.vision_tower
-                                        and spec.role != "decision"
-                                        and not spec.checkpoint_layers),
-                                num_layers=(spec.layers if spec.checkpoint_layers
-                                            else None),
-                                quantize_fp8=(spec.arch == "lfm3"
-                                              and spec.weight_precision == "fp8"))
+            revision=None if model_path else spec.revision,
+            answer_token_ids=answer_token_ids,
+            max_batched_tokens=budget,
+            moe_backend=spec.moe_backend,
+            text_only=spec.vision_tower,
+            images=(spec.vision_tower
+                and spec.role != "decision"
+                and not spec.checkpoint_layers),
+            num_layers=(spec.layers if spec.checkpoint_layers
+                else None),
+            quantize_fp8=(spec.arch == "lfm3"
+                and spec.weight_precision == "fp8"))
         self.load_model_s = time.perf_counter() - t0
         self.weights_bytes = int(torch.cuda.memory_allocated())
         say(f"loaded {self.weights_bytes / 2**30:.2f} GiB of weights in "
@@ -102,16 +102,16 @@ class LoadedGpu:
         full_pages, sliding_pages = budgets.arena_pages(spec, device, budget)
         self.device = device
         self.arena = KVArena(num_layers=spec.layers,
-                             num_pages=full_pages,
-                             page_tokens=device.page_tokens,
-                             num_kv_heads=spec.num_kv_heads, d_head=spec.d_head,
-                             dtype=torch.bfloat16,
-                             layer_kv=spec.kv_shapes,
-                             sliding_layers=spec.sliding_layer_set,
-                             sliding_window=spec.sliding_window,
-                             num_sliding_pages=sliding_pages,
-                             **checkpoint_arena_args(spec, device, budget,
-                                                     full_pages))
+            num_pages=full_pages,
+            page_tokens=device.page_tokens,
+            num_kv_heads=spec.num_kv_heads, d_head=spec.d_head,
+            dtype=torch.bfloat16,
+            layer_kv=spec.kv_shapes,
+            sliding_layers=spec.sliding_layer_set,
+            sliding_window=spec.sliding_window,
+            num_sliding_pages=sliding_pages,
+            **checkpoint_arena_args(spec, device, budget,
+                full_pages))
         self.arena_s = time.perf_counter() - t0
         self.pool_bytes = pool_bytes(self.arena)
 
@@ -119,7 +119,7 @@ class LoadedGpu:
         self.decision_head = None
         if spec.role == "decision":
             path = resolve_model_path(model_path or spec.hf_name,
-                                      None if model_path else spec.revision)
+                None if model_path else spec.revision)
             if spec.readout == "slot_lm":
                 # every option read at the prompt's last row
                 self.decision_head = LetterReadout.load(
@@ -150,7 +150,7 @@ class LoadedGpu:
         self.chunk_tokens = None
 
     def bind_query(self, true_ids, false_ids, chunk_tokens, arena_pages=None,
-                   *, writes_answers):
+            *, writes_answers):
         """Attach the answer rows, readout, and chunk budget for one query.
 
         arena_pages resizes the KV pools to the plan's split; nothing
@@ -178,8 +178,8 @@ class LoadedGpu:
                 self.torch.cuda.synchronize()
                 graphs.invalidate()
             self.arena.resize(*arena_pages, free_resident=True,
-                              **{k: v for k, v in slots.items()
-                                 if k == "num_state_slots"})
+                **{k: v for k, v in slots.items()
+                    if k == "num_state_slots"})
             self.pool_bytes = pool_bytes(self.arena)
         self.torch.cuda.reset_peak_memory_stats()
         rows = AnswerRows(self.torch, self.F, self.model, true_ids, false_ids)
@@ -187,7 +187,7 @@ class LoadedGpu:
         if self.decision_head is not None:
             # a filter lists yes (A) then no (B); yes/no readouts take no first
             yes_no = (self.decision_head.reordered((1, 0))
-                      if self.spec.readout == "slot_lm" else self.decision_head)
+                if self.spec.readout == "slot_lm" else self.decision_head)
             self.async_ans = AsyncDecisions(
                 self.torch, yes_no, self.decision_offsets)
             async_scores = AsyncDecisionScores(
@@ -220,9 +220,9 @@ class LoadedGpu:
         with self.torch.inference_mode():
             if not self._warmed:
                 warm = warm_kernels(self.torch, self.arena, self.pipeline,
-                                    self.async_ans, self.chunk_tokens,
-                                    model_name=self.spec.hf_name,
-                                    model=self.model)
+                    self.async_ans, self.chunk_tokens,
+                    model_name=self.spec.hf_name,
+                    model=self.model)
                 tier = warm["tier"]
             graphs = self.pipeline.piecewise_graphs
             if graphs is not None and writes_answers and graphs.prepare():
@@ -240,7 +240,7 @@ class LoadedGpu:
 
 
 def checkpoint_arena_args(spec, device, chunk_tokens, kv_pages,
-                          writes_answers=True) -> dict:
+        writes_answers=True) -> dict:
     """KVArena arguments for the checkpoint slots; empty without state layers.
 
     writes_answers is whether the plan holds AI.MAP or AI.EXTRACT, and so
@@ -253,9 +253,9 @@ def checkpoint_arena_args(spec, device, chunk_tokens, kv_pages,
         "num_state_slots": budgets.checkpoint_slots(
             spec, device, chunk_tokens, kv_pages, writes_answers),
         "gdn_state_shape": (layers, spec.gdn_value_heads,
-                            spec.gdn_value_dim, spec.gdn_key_dim),
+            spec.gdn_value_dim, spec.gdn_key_dim),
         "conv_state_shape": (layers, spec.conv_width - 1,
-                             spec.conv_state_channels),
+            spec.conv_state_channels),
     }
 
 
@@ -292,13 +292,13 @@ def pool_bytes(arena) -> dict:
     return {
         "kv": sum(size(t) for t in list(arena.k) + list(arena.v)),
         "state": (size(arena.gdn_state if rows is None else rows)
-                  + size(arena.conv_state)),
+            + size(arena.conv_state)),
     }
 
 
 
 def _boot_gpu(gpu, backend, gpu_context, chunk_tokens, true_ids, false_ids,
-              arena_pages=None, *, writes_answers, model_path=None):
+        arena_pages=None, *, writes_answers, model_path=None):
     """Prepare a GPU for a query, releasing it when preparation fails.
 
     A gpu of None loads the model; otherwise the loaded GPU is reused.
@@ -312,10 +312,10 @@ def _boot_gpu(gpu, backend, gpu_context, chunk_tokens, true_ids, false_ids,
         rollback.callback(release_models, state)
         if cold:
             gpu = LoadedGpu(backend, gpu_context, true_ids + false_ids,
-                            model_path=model_path)
+                model_path=model_path)
         state["gpu"] = gpu
         gpu.bind_query(true_ids, false_ids, chunk_tokens, arena_pages,
-                       writes_answers=writes_answers)
+            writes_answers=writes_answers)
         warm_s, warm_tier = gpu.warm(writes_answers)
         if cold:
             # Model objects outlive queries; later collections need not walk them.
@@ -347,7 +347,7 @@ def _execution_state(gpu, payload, registry) -> dict:
     return {
         "gpu": gpu,
         "documents": close_documents(payload["documents"],
-                                     payload.get("document_close", ())),
+            payload.get("document_close", ())),
         "texts": payload.get("texts", {}),
         "columns": payload.get("columns", {}),
         "runtimes": registry.runtimes,
@@ -408,7 +408,7 @@ def _boot_worker(state, setup) -> dict:
         setup.get("arena_pages"), writes_answers=setup["writes_answers"],
         # a setup without the model's files has the worker find them
         model_path=(setup["model_path"]
-                    or resolve_model_path(spec.hf_name, spec.revision)))
+            or resolve_model_path(spec.hf_name, spec.revision)))
     return boot
 
 
@@ -424,7 +424,7 @@ def _serve_region(state, region, tables, end) -> None:
         set_answer_sink(lambda event: end.ask(json.dumps({"answer": [event]})))
     try:
         serve_region(_execution_state(state.gpu, payload, state.registry),
-                     payload, graph, end, region["wanted"], region["hinted"])
+            payload, graph, end, region["wanted"], region["hinted"])
     finally:
         set_progress_sink(None)
         set_answer_sink(None)

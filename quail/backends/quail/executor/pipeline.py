@@ -63,9 +63,9 @@ def _kind(node) -> str:
 def _node_inputs(node, results, inputs) -> dict:
     """A node's input values: from the pipeline's results, else from outside it."""
     return {port.name: (results[port.source.node_id].outputs[port.source.port]
-                        if port.source.node_id in results
-                        else inputs[node.node_id][port.name])
-            for port in node.inputs}
+        if port.source.node_id in results
+        else inputs[node.node_id][port.name])
+        for port in node.inputs}
 
 
 PACKED = ("filter", "score", "label", "extract")
@@ -88,7 +88,7 @@ def _join_run(nodes, index) -> list:
 
 
 def set_steps(state, nodes, ids, prefixes, ask, *, texts=None, inputs=None,
-              context=None):
+        context=None):
     """Run a pipeline's steps under set attention, in order.
 
     The operators of one pass group (PackSetPasses) are asked in one
@@ -129,7 +129,7 @@ def set_steps(state, nodes, ids, prefixes, ask, *, texts=None, inputs=None,
         if kind in PACKED:
             if node.pass_group not in groups:
                 members = [member for member in nodes if _kind(member) in PACKED
-                           and member.pass_group == node.pass_group]
+                    and member.pass_group == node.pass_group]
                 group = ask.group(node.pass_group, kept)
                 groups[node.pass_group] = (members, group, kept[group.positions])
             members, group, answered = groups[node.pass_group]
@@ -140,8 +140,8 @@ def set_steps(state, nodes, ids, prefixes, ask, *, texts=None, inputs=None,
             asked, values = kept[hit], group.answers[members.index(node)][at[hit]]
             lead = node is members[0]
             cost = dict(tokens=group.tokens if lead else 0,
-                        gpu_s=group.gpu_s if lead else 0.0,
-                        chunks=group.chunks if lead else 0)
+                gpu_s=group.gpu_s if lead else 0.0,
+                chunks=group.chunks if lead else 0)
             if kind == "filter":
                 passed = values > 0
                 results[node.node_id] = filter_result(
@@ -158,17 +158,17 @@ def set_steps(state, nodes, ids, prefixes, ask, *, texts=None, inputs=None,
                 if port.value_type is ValueType.ROWS]
             if kind == "score":
                 results[node.node_id] = score_result(node, ids[asked], values,
-                                                     priors, cost, suffix_tokens)
+                    priors, cost, suffix_tokens)
             elif kind == "label":
                 labels = SetLabels(
                     np.asarray(node.spec.labels, dtype=object)[values.argmax(-1)],
                     values, suffix_tokens=suffix_tokens, **cost)
                 results[node.node_id] = classify_result(node, ids[asked], labels,
-                                                        priors)
+                    priors)
             else:
                 if texts is None:
                     raise ValueError(f"AI.EXTRACT reads the text of {alias!r}, "
-                                     f"which was not loaded")
+                        f"which was not loaded")
                 found, keep = found_reads(values, model_spec.read_found)
                 answers, characters = read_texts(
                     values, keep, [prefixes[int(p)] for p in asked],
@@ -224,15 +224,15 @@ class SetChain:
         alias = first.document_aliases[0]
         self.ids = pipeline_ids(first, inputs)
         head = next((node.document_head for node in nodes
-                     if _kind(node) in PACKED), ())
+            if _kind(node) in PACKED), ())
         self.prefixes = DocumentPrefixes(head, context.state["documents"][alias],
-                                         self.ids)
+            self.ids)
         self.texts = context.state.get("texts", {}).get(alias)
         self.groups = {}
         for node in nodes:
             if _kind(node) in PACKED and node.pass_group not in self.groups:
                 members = [member for member in nodes if _kind(member) in PACKED
-                           and member.pass_group == node.pass_group]
+                    and member.pass_group == node.pass_group]
                 self.groups[node.pass_group] = PassGroup(
                     state, [node_question(member) for member in members],
                     self.prefixes, f"pass group ({len(members)} questions)")
@@ -240,17 +240,17 @@ class SetChain:
         # chain, when it is one pass
         last = self.nodes[-1]
         ending = (self.groups.get(last.pass_group) if _kind(last) in PACKED
-                  else None)
+            else None)
         self.ending = ending if ending and len(ending.passes) == 1 else None
         first_filter = next((node for node in nodes if isinstance(node, AiFilter)),
-                            None)
+            None)
         self.stop_groups = (None if first_filter is None or self.ending is None
-                            else filter_stop_groups(
-                                context.state, first_filter,
-                                pipeline_rows(first, inputs)
-                                if first_filter is first else self.ids))
+            else filter_stop_groups(
+                context.state, first_filter,
+                pipeline_rows(first, inputs)
+                if first_filter is first else self.ids))
         self.num_key_survivors = (1 if first_filter is None
-                                  else first_filter.num_key_survivors)
+            else first_filter.num_key_survivors)
 
     def group(self, pass_group, kept):
         """Ask a pass group of the kept documents; return its GroupAnswers."""
@@ -259,14 +259,14 @@ class SetChain:
         if group is not self.ending:
             return group.ask(prefixes)
         return group.ask(prefixes, None if self.stop_groups is None
-                         else [self.stop_groups[int(p)] for p in kept],
-                         limit=self.context.state.get("filter_limit"),
-                         num_key_survivors=self.num_key_survivors)
+            else [self.stop_groups[int(p)] for p in kept],
+            limit=self.context.state.get("filter_limit"),
+            num_key_survivors=self.num_key_survivors)
 
     def joins(self, nodes, anchor_ids):
         """Ask a group of joins of the anchors; return their JoinOperator."""
         join = upstream_join(self.state, nodes, anchor_ids, (), self.inputs,
-                             self.context)
+            self.context)
         set_joins(self.state, join)
         return join
 
@@ -277,5 +277,5 @@ class SetChain:
     def execute(self) -> dict:
         """Run the chain's steps; return node id -> NodeResult."""
         return set_steps(self.state, self.nodes, self.ids, self.prefixes, self,
-                         texts=self.texts, inputs=self.inputs,
-                         context=self.context)
+            texts=self.texts, inputs=self.inputs,
+            context=self.context)

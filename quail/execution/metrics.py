@@ -38,7 +38,7 @@ class NodeMetrics:
         return cls(
             **{name: value for name, value in metrics.items() if name in names},
             extension={name: value for name, value in metrics.items()
-                       if name not in names})
+                if name not in names})
 
     def __add__(self, other: "NodeMetrics") -> "NodeMetrics":
         return NodeMetrics(
@@ -91,8 +91,8 @@ def scalar_node_metrics(nodes: Mapping[str, "NodeResult"]) -> dict:
         node_id: {
             **{name: getattr(result.metrics, name) for name in scalar_fields},
             **{name: value
-               for name, value in result.metrics.extension.items()
-               if isinstance(value, (int, float)) and not isinstance(value, bool)},
+                for name, value in result.metrics.extension.items()
+                if isinstance(value, (int, float)) and not isinstance(value, bool)},
         }
         for node_id, result in nodes.items()
     }

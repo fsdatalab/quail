@@ -40,7 +40,7 @@ def source_odds(num_streams, trials, accepts) -> np.ndarray:
 
 
 def draft_lengths(cap, limit, survival, written, num_streams, rho, trials,
-                  accepts) -> np.ndarray:
+        accepts) -> np.ndarray:
     """Return each answer's draft length: the least cost per written token.
 
     Args:
@@ -60,7 +60,7 @@ def draft_lengths(cap, limit, survival, written, num_streams, rho, trials,
 
 
 def draft_gains(cap, limit, survival, written, num_streams, trials,
-                accepts) -> np.ndarray:
+        accepts) -> np.ndarray:
     """Return each answer's expected written tokens from each draft token.
 
     Column j - 1 is draft token j's: the chance the answer goes on past

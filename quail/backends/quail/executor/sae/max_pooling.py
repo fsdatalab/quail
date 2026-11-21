@@ -77,7 +77,7 @@ class _SlotMatrix:
         self.torch = torch
         self.width = width
         self.matrix = torch.zeros((capacity, width), device="cuda",
-                                  dtype=torch.float32)
+            dtype=torch.float32)
         self.free = list(range(capacity - 1, -1, -1))
         self.dirty = []    # freed slots, zeroed before the next scatter
 
@@ -85,7 +85,7 @@ class _SlotMatrix:
         if not self.free:
             capacity = self.matrix.shape[0]
             grown = self.torch.zeros((2 * capacity, self.width),
-                                     device="cuda", dtype=self.torch.float32)
+                device="cuda", dtype=self.torch.float32)
             grown[:capacity] = self.matrix
             self.matrix = grown
             self.free.extend(range(2 * capacity - 1, capacity - 1, -1))
@@ -160,27 +160,27 @@ class SaeMaxAccumulator:
         row1 = np.fromiter((span[3] for span in spans), np.int64, count)
         per_span = np.stack([
             np.fromiter((self._slot(self.document_slot, key) for key in keys),
-                        np.int64, count),
+                np.int64, count),
             np.fromiter((self._slot(self.tail_slot, key) for key in keys),
-                        np.int64, count),
+                np.int64, count),
             np.fromiter((self.document_tokens(key) for key in keys),
-                        np.int64, count)])
+                np.int64, count)])
         lengths = row1 - row0
         total = int(lengths.sum())
         per_row = np.repeat(per_span, lengths, axis=1)
         contiguous = (total == stream.shape[0] and row0[0] == 0
-                      and np.array_equal(row0[1:], row1[:-1]))
+            and np.array_equal(row0[1:], row1[:-1]))
         dirty = np.asarray(self._slots.dirty, dtype=np.int64)
         self._slots.dirty = []
         parts = [per_row.reshape(-1), dirty]
         if not contiguous:
             parts.insert(0, np.repeat(row0 - np.cumsum(lengths) + lengths,
-                                      lengths) + np.arange(total))
+                lengths) + np.arange(total))
         array = np.concatenate(parts)
         index = self._staging_index
         self._staging_index ^= 1
         host = self._staging.host(index, max(array.size, 1 << 16),
-                                  self.torch.int64)
+            self.torch.int64)
         host[:array.size].numpy()[:] = array
         block = self._staging.upload(index, array.size)
         at = 0
@@ -201,7 +201,7 @@ class SaeMaxAccumulator:
         slot = torch.where(positions < tokens, document_slots, tail_slots)
         flat = slot.unsqueeze(1) * self._slots.width + indices.long()
         matrix.view(-1).scatter_reduce_(0, flat.view(-1), strengths.reshape(-1),
-                                        reduce="amax")
+            reduce="amax")
 
     def settle(self, key, *, collect: bool = True) -> tuple | None:
         """Return the handle of one document's combined maxima for one call.
@@ -281,4 +281,4 @@ class SaeMaxAccumulator:
         return tuple(
             np.concatenate(parts) if parts else np.empty(0, dtype)
             for parts, dtype in ((taken, np.int64), (lengths, np.int64),
-                                 (indices, np.int32), (strengths, np.float32)))
+                (indices, np.int32), (strengths, np.float32)))

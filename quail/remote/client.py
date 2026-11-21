@@ -114,7 +114,7 @@ class ServerClient:
         return answer.body.to_pybytes()
 
     def upload(self, name: str, reader: pa.RecordBatchReader,
-               id_col: str) -> None:
+            id_col: str) -> None:
         """Register ``reader``'s rows on the server as the table ``name``."""
         path = (name, id_col) if id_col else (name,)
         descriptor = flight.FlightDescriptor.for_path(*path)
@@ -127,16 +127,16 @@ class ServerClient:
             writer.close()
 
     def submit(self, sql: str, *, dialect: str | None = None,
-               query_id: str | None = None,
-               timeout_s: float | None = None) -> QueryStatus:
+            query_id: str | None = None,
+            timeout_s: float | None = None) -> QueryStatus:
         """Queue a query; submitting one id twice runs the query once."""
         asked = {"sql": sql, "dialect": dialect, "id": query_id,
-                 "timeout_s": timeout_s}
+            "timeout_s": timeout_s}
         return _status(self._act("submit", {
             key: value for key, value in asked.items() if value is not None}))
 
     def status(self, query_id: str, *, after: int | None = None,
-               wait_s: float = 0.0) -> QueryStatus:
+            wait_s: float = 0.0) -> QueryStatus:
         """Return a submission's status.
 
         Args:
@@ -151,7 +151,7 @@ class ServerClient:
             "id": query_id, "after": after, "wait_s": wait_s}))
 
     def answers(self, query_id: str, *, after: int = 0,
-                limit: int = 1000) -> dict:
+            limit: int = 1000) -> dict:
         """Return a run's answer events from the one numbered ``after`` on.
 
         Returns:
@@ -179,7 +179,7 @@ class ServerClient:
     def submissions(self) -> list[QueryStatus]:
         """Return every submission the server has."""
         return [_status(json.dumps(found))
-                for found in json.loads(self._act("list", ""))]
+            for found in json.loads(self._act("list", ""))]
 
     def explain(self, sql: str, dialect: str | None = None) -> str:
         """Return the server's plan of a query."""
@@ -302,7 +302,7 @@ class RemoteQuery:
         self.dialect = dialect
 
     def submit(self, *, query_id: str | None = None,
-               timeout_s: float | None = None) -> QueryRun:
+            timeout_s: float | None = None) -> QueryRun:
         """Queue the query on the server; return its run at once.
 
         Args:
@@ -312,7 +312,7 @@ class RemoteQuery:
         """
         client = self.session._remote.client
         status = client.submit(self.text, dialect=self.dialect,
-                               query_id=query_id, timeout_s=timeout_s)
+            query_id=query_id, timeout_s=timeout_s)
         return QueryRun(client, status.id)
 
     def run(self, plan=None, *, timeout_s: float | None = None) -> QueryResult:
@@ -327,12 +327,12 @@ class RemoteQuery:
         return self.submit(timeout_s=timeout_s).result()
 
     def collect(self, limit: int | None = None,
-                batch_rows: int = 65_536) -> pa.Table:
+            batch_rows: int = 65_536) -> pa.Table:
         """Run the query and return its rows."""
         return self.run().collect(limit=limit, batch_rows=batch_rows)
 
     def execute_stream(self, batch_rows: int = 65_536, limit: int | None = None,
-                       *, timeout_s: float | None = None) -> pa.RecordBatchReader:
+            *, timeout_s: float | None = None) -> pa.RecordBatchReader:
         """Submit the query and stream its rows as the server produces them.
 
         The rows an AI filter keeps arrive while the model still answers

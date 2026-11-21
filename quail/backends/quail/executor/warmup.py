@@ -29,7 +29,7 @@ WARMUP_VERSION = 16
 # attention, the count m of its rows that read cached KV (m <= n).
 # These (n, m) pairs cover every class pair.
 ROW_CLASSES = ((1, 1), (32, 1), (32, 16), (32, 17),
-               (33, 1), (33, 16), (33, 17))
+    (33, 1), (33, 16), (33, 17))
 # tokens of each cached document the reading rows attend to
 ROW_CLASS_CACHED = 64
 
@@ -66,7 +66,7 @@ def _warm_convolutions(torch, pipeline, budget):
                 [0, 2], dtype=torch.int32, device=weight.device))
         for power in range(largest.bit_length()):
             causal_conv_kernel(x, weight, phase, history[:1 << power],
-                               bias, activate)
+                bias, activate)
 
 
 def _warm_recurrent(torch, arena, pipeline):
@@ -92,14 +92,14 @@ def _warm_recurrent(torch, arena, pipeline):
     heads, dim = spec.gdn_key_heads, spec.gdn_key_dim
     value_heads, value_dim = spec.gdn_value_heads, spec.gdn_value_dim
     conv_out = torch.zeros((1, 2 * heads * dim + value_heads * value_dim),
-                           dtype=torch.bfloat16, device=device)
+        dtype=torch.bfloat16, device=device)
     gate = torch.zeros((1, value_heads), dtype=torch.bfloat16, device=device)
     params = torch.zeros(value_heads, dtype=torch.float32, device=device)
     row = torch.zeros(1, dtype=torch.int64, device=device)
     gdn_decode_step(
         conv_out, gate, gate, params, params, arena.gdn_state_rows[:, 0], row,
         torch.empty((1, value_heads, value_dim), dtype=torch.bfloat16,
-                    device=device),
+            device=device),
         num_key_heads=heads, scale=dim ** -0.5)
     copy_slots(arena.gdn_state_rows[:, 0], row, row)
     copy_slots(arena.conv_state[:, 0], row, row)
@@ -113,7 +113,7 @@ def _warm_recurrent(torch, arena, pipeline):
         scratch = SimpleNamespace(
             conv_state=weight.new_zeros((1, 1, width - 1, channels)))
         _decode_conv_kernel(weight.new_zeros((1, channels)), weight, bias,
-                            scratch, phase, 0)
+            scratch, phase, 0)
 
 
 def _warm_short_attention(torch, arena, pipeline):
@@ -133,9 +133,9 @@ def _warm_short_attention(torch, arena, pipeline):
         return
     device = arena.conv_state.device if arena.conv_state is not None else "cuda"
     pages = torch.zeros((2, arena.page_tokens, attn.num_kv_heads, attn.head_dim),
-                        dtype=torch.bfloat16, device=device)
+        dtype=torch.bfloat16, device=device)
     q = torch.zeros((1, attn.num_heads, attn.head_dim),
-                    dtype=torch.bfloat16, device=device)
+        dtype=torch.bfloat16, device=device)
     cu = torch.tensor([0, 1], dtype=torch.int32, device=device)
     for num_pages in (1, 2):
         used_tokens = num_pages * arena.page_tokens
@@ -153,7 +153,7 @@ def _warm_run(*args, **kwargs):
 
 
 def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
-                  join_chunk):
+        join_chunk):
     """Run real forward passes over every attention path.
 
     Runs each attention path the model has with arena writes, then the
@@ -249,29 +249,29 @@ def _warm_row_classes(torch, arena, pipeline, attention_mode):
     slots = getattr(arena, "num_state_slots", 0)
     if slots and slots < needed:
         logger.debug("kernels: %d checkpoint slots, %d needed for the row "
-                     "classes; skipping", slots, needed)
+            "classes; skipping", slots, needed)
         return
     keys = [("warm-rows", index) for index in range(readers)]
     prefix = list(range(10, 10 + cached))
     for key in keys:
         arena.activate(key, cached, capacity_tokens=cached + 1,
-                       base_tokens=cached)
+            base_tokens=cached)
     try:
         # a forward pass ends in a norm over its answer rows, which
         # fails with a CUDA error when there are none: each document
         # takes a one-token question whose answer is not read
         forward_chunk(pipeline, arena, pack_chunk(
             torch, arena, [dict(key=key, prefix=prefix, f=cached, suffixes=[[11]])
-                           for key in keys], attention_mode=attention_mode))
+                for key in keys], attention_mode=attention_mode))
         for n, m in ROW_CLASSES:
             groups = [dict(key=key, prefix=None, f=cached, suffixes=[[11]],
-                           write_suffix_tokens=1, single=True)
-                      for key in keys[:m]]
+                write_suffix_tokens=1, single=True)
+                for key in keys[:m]]
             filler = ("warm-rows", "filler", n, m)
             if n > m:
                 arena.activate(filler, n - m, base_tokens=n - m)
                 groups.append(dict(key=filler, prefix=prefix[:n - m],
-                                   f=n - m, suffixes=[]))
+                    f=n - m, suffixes=[]))
             try:
                 forward_chunk(pipeline, arena, pack_chunk(
                     torch, arena, groups, attention_mode=attention_mode))
@@ -299,15 +299,15 @@ def warm_label_readout(torch, head):
 
     block = AsyncLabelLogprobs.BLOCK_ROWS
     hidden = torch.zeros((block + 300, head.shape[1]), dtype=torch.bfloat16,
-                         device=head.device)
+        device=head.device)
     # a kernel's first launch waits for the GPU's queued work, which in
     # a query is a whole forward pass; PyTorch selects up to 16 indices
     # with one kernel and more with another
     for targets in (16, 128):
         for normalize, rows in ((True, 1), (True, 4), (False, 1)):
             readout = AsyncLabelLogprobs(torch, torch.nn.functional, head,
-                                         list(range(targets)), rows=rows,
-                                         normalize=normalize)
+                list(range(targets)), rows=rows,
+                normalize=normalize)
             for count in (1, 37, 200, block, block + 300):
                 readout.result(readout.submit(
                     hidden[:count],
@@ -331,7 +331,7 @@ def compile_kernels(torch, arena, pipeline, async_ans, budget):
     """
     if not pipeline.gemm_warmup:
         _forward_warm(torch, arena, pipeline, async_ans, budget,
-                      join_chunk=True)
+            join_chunk=True)
         return
     linears = pipeline.linears()
     if pipeline.engine.use_deep_gemm:
@@ -339,13 +339,13 @@ def compile_kernels(torch, arena, pipeline, async_ans, budget):
             _generate_optimal_warmup_m_values,
         )
         work = [(m, lin) for lin in linears
-                for m in _generate_optimal_warmup_m_values(
-                    budget, lin.weight.shape[0], torch.device("cuda"))]
+            for m in _generate_optimal_warmup_m_values(
+                budget, lin.weight.shape[0], torch.device("cuda"))]
     else:
         counts = _triton_warmup_m_values(budget)
         work = [(m, lin) for lin in linears for m in counts]
     progress = Progress("kernels: GEMM warmup", total=len(work),
-                        unit="configurations", emit=logger.info)
+        unit="configurations", emit=logger.info)
     logger.info("warming up %s matrix multiply shapes", len(work))
     with torch.inference_mode():
         # one buffer per linear, row-sliced per call; the sweep only
@@ -354,8 +354,8 @@ def compile_kernels(torch, arena, pipeline, async_ans, budget):
         for done, (m, lin) in enumerate(work, 1):
             if lin is not cur:
                 buf = torch.randn(budget, lin.weight.shape[1],
-                                  device="cuda",
-                                  dtype=torch.bfloat16)
+                    device="cuda",
+                    dtype=torch.bfloat16)
                 cur = lin
             q, s = pipeline.engine.quant(buf[:m])
             pipeline.engine.gemm(q, s, lin)
@@ -365,7 +365,7 @@ def compile_kernels(torch, arena, pipeline, async_ans, budget):
     progress.finish("kernels: GEMM warmup done")
     logger.info("warming up the forward pass kernels")
     _forward_warm(torch, arena, pipeline, async_ans, budget,
-                  join_chunk=True)
+        join_chunk=True)
 
 
 def touch_kernels(torch, arena, pipeline, async_ans, budget):
@@ -374,7 +374,7 @@ def touch_kernels(torch, arena, pipeline, async_ans, budget):
     Cached binaries then load at boot instead of mid-run.
     """
     _forward_warm(torch, arena, pipeline, async_ans, budget,
-                  join_chunk=True)
+        join_chunk=True)
 
 
 def _marker_path(model_name, budget):
@@ -392,13 +392,13 @@ def _marker_identity(torch, model_name, budget):
     except ImportError:
         vllm_version = None
     return dict(warmup_version=WARMUP_VERSION, model=model_name,
-                budget=int(budget), vllm=vllm_version,
-                torch=torch.__version__, cuda=torch.version.cuda,
-                gpu=torch.cuda.get_device_name())
+        budget=int(budget), vllm=vllm_version,
+        torch=torch.__version__, cuda=torch.version.cuda,
+        gpu=torch.cuda.get_device_name())
 
 
 def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
-                 model_name, force_compile=False, model=None):
+        model_name, force_compile=False, model=None):
     """Compile once under a file lock, then warm each GPU process.
 
     Args:
@@ -459,7 +459,7 @@ def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
         warm_s = round(time.perf_counter() - t0 - wait_s, 2)
         wait_s = round(wait_s, 2)
         logger.info("kernels ready in %s s (%s pass, %s s waiting for compilation)",
-                    warm_s, tier, wait_s)
+            warm_s, tier, wait_s)
         return dict(tier=tier, warm_s=warm_s, wait_s=wait_s)
 
 

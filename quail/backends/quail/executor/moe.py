@@ -37,7 +37,7 @@ class FP8Experts:
                 and not self.weights.apply_router_weight_on_input
                 and self.weights.expert_map is None):
             raise ValueError("Expert fusion requires local Triton FP8 experts "
-                             "with dynamic per-token scales and GELU gating")
+                "with dynamic per-token scales and GELU gating")
 
     def __call__(self, inputs, scales, logits):
         """Return expert output valid until the next workspace allocation."""
@@ -82,6 +82,6 @@ class FP8Experts:
         activated, activation_scales = self.engine.gelu_mul_quant_vllm(
             gate_up.view(rows * topk, doubled))
         multiply(activated, w2, expert_out, activation_scales,
-                 self.quant.w2_scale, 1, True)
+            self.quant.w2_scale, 1, True)
         ops.moe_sum(expert_out, output)
         return output

@@ -58,8 +58,8 @@ class Deduplicated:
             read = dict(current)
             outputs = {}
             ports = sorted(node.outputs,
-                           key=lambda port: port.value_type is not
-                           ValueType.JOIN_ANSWERS)
+                key=lambda port: port.value_type is not
+                ValueType.JOIN_ANSWERS)
             for port in ports:
                 value = result.outputs[port.name]
                 aliases = self._aliases(node, port, value)
@@ -69,24 +69,24 @@ class Deduplicated:
                 keys = self._keys(aliases, pairs)
                 if port.value_type is ValueType.JOIN_ANSWERS:
                     table = (value if isinstance(value, pa.Table)
-                             else _join_answers_table(value))
+                        else _join_answers_table(value))
                     outputs[port.name] = _expanded(table, aliases, read, keys, pairs)
                 elif port.value_type is ValueType.FILTER_ANSWERS:
                     outputs[port.name] = _expanded(value, aliases, read, keys, None)
                 elif isinstance(node, AiJoin):
                     # an AI join's anchor rows come from its expanded answers
                     joined = next(table for table in outputs.values()
-                                  if isinstance(table, pa.Table))
+                        if isinstance(table, pa.Table))
                     (anchor,) = aliases
                     reached = np.sort(read[anchor])
                     matched = np.isin(reached, true_answer_rows(joined)
-                                      .column(anchor).to_numpy())
+                        .column(anchor).to_numpy())
                     outputs[port.name] = Rows(
                         {anchor: reached[node.keeps(matched)].astype(np.int32)})
                 else:
                     rows = rows_of(value, aliases[0])
                     table = _expanded(rows.table(), aliases, read, keys,
-                                      pairs if len(aliases) == 2 else None)
+                        pairs if len(aliases) == 2 else None)
                     outputs[port.name] = Rows(
                         {alias: table.column(alias) for alias in aliases},
                         table.drop_columns(list(aliases)))
@@ -99,7 +99,7 @@ class Deduplicated:
             if read is not None:
                 metrics = replace(metrics, input_rows=read)
             rows = next((value for value in outputs.values()
-                         if isinstance(value, Rows)), None)
+                if isinstance(value, Rows)), None)
             if rows is not None:
                 metrics = replace(metrics, output_rows=rows.num_rows)
             expanded[node.node_id] = NodeResult(outputs, metrics)
@@ -127,7 +127,7 @@ class Deduplicated:
                 for node in self.nodes):
             return None
         aliases = [field.name for field in table.schema
-                   if field.metadata and b"quail.alias" in field.metadata]
+            if field.metadata and b"quail.alias" in field.metadata]
         if not any(alias in self.keys for alias in aliases):
             return table
         if len(aliases) != 1:
@@ -163,7 +163,7 @@ class Deduplicated:
             if pairs is not None and alias in pairs.column_names:
                 known.append(pairs.column(alias).to_numpy())
             size = max((int(ids.max()) + 1 for ids in known if len(ids)),
-                       default=0)
+                default=0)
             keys[alias] = np.arange(size, dtype=np.int64)
         return keys
 
@@ -223,7 +223,7 @@ def deduplicate(graph, nodes, inputs, context) -> Deduplicated | None:
             isinstance(node, MODEL_NODES) for node in nodes):
         return None
     if any(isinstance(node, AiJoin) and len(node.partners) != 1
-           for node in nodes):
+            for node in nodes):
         return None
     inside = {node.node_id for node in nodes}
     keys = {}
@@ -231,7 +231,7 @@ def deduplicate(graph, nodes, inputs, context) -> Deduplicated | None:
     pairs = {}
     reduced = {node.node_id: dict(inputs.get(node.node_id, {})) for node in nodes}
     outside = [(node, port) for node in nodes for port in node.inputs
-               if port.source.node_id not in inside]
+        if port.source.node_id not in inside]
     # the rows ports say which documents the group read; a pair input
     # read beside them is filtered to those documents when expanded
     for node, port in sorted(outside, key=lambda item: _is_pairs(
@@ -239,17 +239,17 @@ def deduplicate(graph, nodes, inputs, context) -> Deduplicated | None:
         value = inputs[node.node_id][port.name]
         if _is_pairs(port, value):
             aliases = (value.aliases if isinstance(value, Rows)
-                       else tuple(value.column_names))
+                else tuple(value.column_names))
             table = value.table() if isinstance(value, Rows) else value
             # a pair input may carry only its two id columns: other
             # values could differ between copies
             if len(aliases) != 2 or table.num_columns != 2:
                 return None
             _read_pairs(context, aliases, table, keys, every, pairs, node,
-                        port, reduced)
+                port, reduced)
         elif port.value_type is ValueType.ROWS:
             alias = (value.aliases[0] if isinstance(value, Rows)
-                     else port.source.port.split(":", 1)[1])
+                else port.source.port.split(":", 1)[1])
             ids = document_ids(value).to_numpy()
             if alias in every and not np.array_equal(every[alias], ids):
                 return None
@@ -259,7 +259,7 @@ def deduplicate(graph, nodes, inputs, context) -> Deduplicated | None:
                 if value is None:
                     return None
                 if any(isinstance(member, AiFilter) and member.stop_key
-                       and member.alias == alias for member in nodes):
+                        and member.alias == alias for member in nodes):
                     value = _with_copies(value, alias, ids, keys[alias])
                 reduced[node.node_id][port.name] = value
         else:
@@ -295,7 +295,7 @@ def _reduced_rows(value, alias: str, ids, keys):
     Otherwise the group runs without deduplication.
     """
     kept, first, inverse = np.unique(keys[ids], return_index=True,
-                                     return_inverse=True)
+        return_inverse=True)
     if isinstance(value, Rows) and value.values.num_columns:
         if not value.values.take(first[inverse]).equals(value.values):
             return None
@@ -324,7 +324,7 @@ def _with_copies(value, alias: str, ids, keys) -> Rows:
 
 
 def _read_pairs(context, aliases, table, keys, every, pairs, node, port,
-                reduced) -> None:
+        reduced) -> None:
     """Record a pair input and reduce it to one pair of key documents each."""
     left, right = aliases
     for alias in aliases:
@@ -405,9 +405,9 @@ def _matches(wanted, answered) -> tuple[np.ndarray, np.ndarray]:
         return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
     common = np.result_type(wanted, answered)
     joined = pa.table({"key": wanted.astype(common),
-                       "i": np.arange(len(wanted))}).join(
-        pa.table({"key": answered.astype(common),
-                  "j": np.arange(len(answered))}), keys="key", join_type="inner")
+        "i": np.arange(len(wanted))}).join(
+pa.table({"key": answered.astype(common),
+"j": np.arange(len(answered))}), keys="key", join_type="inner")
     index, rows = (joined.column(name).to_numpy() for name in ("i", "j"))
     order = np.argsort(index, kind="stable")
     return index[order], rows[order]

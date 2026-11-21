@@ -31,7 +31,7 @@ def probability_column(labels, probabilities) -> pa.MapArray:
 def score_rows(rows, aliases, name, scores, value_type=None) -> Rows:
     """The rows a score or classification returns: the ids and one value column."""
     return Rows({alias: rows[:, index] for index, alias in enumerate(aliases)},
-                pa.table({name: pa.array(scores, type=value_type or pa.float64())}))
+        pa.table({name: pa.array(scores, type=value_type or pa.float64())}))
 
 
 def scored_batch(node, rows, values) -> dict:
@@ -44,9 +44,9 @@ def scored_batch(node, rows, values) -> dict:
     rows = np.asarray(rows)
     values = list(values)
     payload = {"kind": "score", "node": node.node_id,
-               "output": node.spec.name, "aliases": list(node.spec.aliases),
-               "rows": (rows[:, 0].tolist() if rows.shape[1] == 1
-                        else rows.tolist())}
+        "output": node.spec.name, "aliases": list(node.spec.aliases),
+        "rows": (rows[:, 0].tolist() if rows.shape[1] == 1
+            else rows.tolist())}
     if isinstance(node.spec, ClassifySpec):
         return {**payload, "kind": "label", "labels": values}
     return {**payload, "scores": [round(float(value), 4) for value in values]}

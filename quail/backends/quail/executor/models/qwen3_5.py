@@ -50,7 +50,7 @@ class Qwen35Pipeline(ModelPipeline):
     images = None
 
     def __init__(self, model, arena, *, spec, kernels="quail",
-                 engine_class=Engine):
+            engine_class=Engine):
         self.mask = "document_isolated" if spec.bidirectional else "causal"
         text = getattr(model, "language_model", model)
         self.spec = spec
@@ -72,7 +72,7 @@ class Qwen35Pipeline(ModelPipeline):
             fp8=False, kernels=kernels)
         # each Gated DeltaNet layer's index among them, its state slot
         gdn_layers = [index for index, layer in enumerate(self.layers)
-                      if hasattr(layer, "linear_attn")]
+            if hasattr(layer, "linear_attn")]
         self.gdn_slots = {index: slot for slot, index in enumerate(gdn_layers)}
         self.feed_forwards = tuple(
             layer.mlp if spec.experts else partial(self._mlp, layer.mlp)
@@ -124,7 +124,7 @@ class Qwen35Pipeline(ModelPipeline):
             "A_log": mixer.A_log, "dt_bias": mixer.dt_bias,
         }
         return gdn_core(self.spec, tensors, phases, self.arena, slot,
-                        output=output)
+            output=output)
 
     def _gdn_output(self, mixer, core, z):
         """Norm the recurrence output gated by z, then project it out."""
@@ -165,7 +165,7 @@ class Qwen35Pipeline(ModelPipeline):
         q = attn.q_norm(q.reshape(rows, attn.num_heads, attn.head_dim))
         k = attn.k_norm(k.reshape(rows, attn.num_kv_heads, attn.head_dim))
         q, k = attn.rotary_emb(positions, q.reshape(rows, -1),
-                               k.reshape(rows, -1))
+            k.reshape(rows, -1))
         return dict(q=q, k=k, v=v.contiguous(), gate=gate.reshape(rows, -1))
 
     def _attention_core(self, attn, inputs, meta, output=None):
@@ -221,7 +221,7 @@ class Qwen35Pipeline(ModelPipeline):
         layer = self.layers[index]
         if hasattr(layer, "linear_attn"):
             core = self._gdn_core(layer.linear_attn, inputs, chunk.meta["gdn"],
-                                  self.gdn_slots[index])
+                self.gdn_slots[index])
             return self._gdn_output(layer.linear_attn, core, inputs["z"])
         out = self._attention_core(layer.self_attn, inputs, chunk.meta)
         return self._attention_output(layer.self_attn, out, inputs["gate"])
@@ -295,7 +295,7 @@ class Qwen35Pipeline(ModelPipeline):
             chunk.meta["layer"] = index
             x = self._mixer_from_inputs(index, inputs, chunk)
             x, residual = self._norm(layer.post_attention_layernorm, x,
-                                     residual, inplace_x=True)
+                residual, inplace_x=True)
             hidden = self.feed_forwards[index](x)
         final = chunk.final_indices
         if self.spec.sae is not None:
@@ -306,9 +306,9 @@ class Qwen35Pipeline(ModelPipeline):
                 self.forward_hook(stream, chunk)
                 return stream.index_select(0, final)
             return (hidden.index_select(0, final)
-                    + residual.index_select(0, final))
+                + residual.index_select(0, final))
         normed, _ = self._norm(self.final_norm, hidden.index_select(0, final),
-                               residual.index_select(0, final))
+            residual.index_select(0, final))
         return normed
 
     def boundary(self, num_tokens, device):
@@ -333,11 +333,11 @@ class Qwen35Pipeline(ModelPipeline):
         (core,), (attention,) = overlaid_rows(
             torch, num_tokens, device, [value_width], [q_width])
         (b, a), = overlaid_rows(torch, num_tokens, device,
-                                [spec.gdn_value_heads, spec.gdn_value_heads])
+            [spec.gdn_value_heads, spec.gdn_value_heads])
         return dict(qkv=qkv, z=z, b=b, a=a,
-                    core=core.view(num_tokens, spec.gdn_value_heads,
-                                   spec.gdn_value_dim),
-                    q=q, k=k, v=v, gate=gate, attention=attention)
+            core=core.view(num_tokens, spec.gdn_value_heads,
+                spec.gdn_value_dim),
+            q=q, k=k, v=v, gate=gate, attention=attention)
 
     def piece(self, index, buffers):
         """Finish the previous layer, then project the next mixer's inputs.
@@ -356,7 +356,7 @@ class Qwen35Pipeline(ModelPipeline):
                 x = self._attention_output(
                     layer.self_attn, buffers.attention, buffers.gate)
             x, residual = self._norm(layer.post_attention_layernorm, x,
-                                     buffers.residual, inplace_x=True)
+                buffers.residual, inplace_x=True)
             hidden = self.feed_forwards[index - 1](x)
         if index == len(self.layers):
             normed, _ = self._norm(self.final_norm, hidden, residual)
@@ -384,8 +384,8 @@ class Qwen35Pipeline(ModelPipeline):
         if hasattr(layer, "linear_attn"):
             inputs = dict(qkv=buffers.qkv[:n], b=buffers.b[:n], a=buffers.a[:n])
             self._gdn_core(layer.linear_attn, inputs, chunk.meta["gdn"],
-                           self.gdn_slots[index], output=buffers.core[:n])
+                self.gdn_slots[index], output=buffers.core[:n])
         else:
             inputs = dict(q=buffers.q[:n], k=buffers.k[:n], v=buffers.v[:n])
             self._attention_core(layer.self_attn, inputs, chunk.meta,
-                                 output=buffers.attention[:n])
+                output=buffers.attention[:n])

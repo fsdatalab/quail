@@ -68,7 +68,7 @@ class JoinOperator(ModelOperator):
             inputs = prepare_join_inputs(nodes, region.inputs, region.context)
             return cls(region.query, nodes, inputs, inputs["anchor_ids"])
         return upstream_join(region.query, nodes, region.document_ids(), chain,
-                             region.inputs, region.context)
+            region.inputs, region.context)
 
     @classmethod
     def alone(cls, region, operators, table, settings):
@@ -83,9 +83,9 @@ class JoinOperator(ModelOperator):
 
         prefixes = self.inputs["prefixes"]
         return RegionDocuments(prefixes, self.inputs["anchor_keys"],
-                               execution_prefix_tree(
-                                   self.node, prefixes,
-                                   region.query.loaded_model.arena))
+            execution_prefix_tree(
+                self.node, prefixes,
+                region.query.loaded_model.arena))
 
     def __init__(self, state, nodes, inputs, ids, *, context=None):
         self.nodes = nodes
@@ -102,9 +102,9 @@ class JoinOperator(ModelOperator):
         lists_for = inputs.get("anchor_partners")
         self.stages = [
             Stage(suffixes=suffixes, readout=state.async_answers, frame=frame,
-                  requests=(None if lists_for is None
-                            else lambda key, j=j: lists_for(key[1], j)),
-                  label=f"join predicate {j}")
+                requests=(None if lists_for is None
+                    else lambda key, j=j: lists_for(key[1], j)),
+                label=f"join predicate {j}")
             for j, (suffixes, frame) in enumerate(
                 zip(inputs["stage_suffixes"], inputs["stage_frames"]))]
         self._results = {}
@@ -139,8 +139,8 @@ class JoinOperator(ModelOperator):
         members = None if lists_for is None else lists_for(anchor_id, stage)
         tuples = self.inputs["partner_indices"][node.written_position]
         matched = [tuples[start + position if members is None
-                          else int(members[start + position])]
-                   for position, answer in enumerate(answers) if answer]
+            else int(members[start + position])]
+            for position, answer in enumerate(answers) if answer]
         if matched and finished_rows() is not None:
             count = len(matched)
             columns = {node.anchor: pa.array([anchor_id] * count, pa.int32())}
@@ -216,8 +216,8 @@ class JoinOperator(ModelOperator):
                 for answers in every]
             self.anchor_ids = [self.ids[position] for position in reached]
             self.kv_round = ({"hits": len(reached), "misses": 0}
-                             if upstream["operators"]
-                             else {"hits": 0, "misses": len(reached)})
+                if upstream["operators"]
+                else {"hits": 0, "misses": len(reached)})
         else:
             self.answers = every
             self.anchor_ids = list(self.ids)
@@ -245,7 +245,7 @@ class JoinOperator(ModelOperator):
         for j, (member, rows, members) in enumerate(zip(nodes, answers, partner_lists)):
             reached_ids = [anchor_ids[int(local)] for local in sorted(rows)]
             matched = [anchor_ids[int(local)] for local in sorted(rows)
-                       if any(rows[local])]
+                if any(rows[local])]
             survivors = matched
             # Anchors with no candidates never launch a request.
             if member.semantics == "anti":
@@ -268,7 +268,7 @@ class JoinOperator(ModelOperator):
             own_spans = stage_spans(spans, offset + j, offset + j + 1)
             results[member.node_id] = NodeResult(
                 outputs={f"rows:{member.anchor}": Rows({member.anchor: survivors}),
-                         f"join_answers:{member.written_position}": answer},
+                    f"join_answers:{member.written_position}": answer},
                 metrics=NodeMetrics(
                     input_rows=len(anchor_ids) if j == 0 else len(reached_ids),
                     output_rows=len(survivors),
@@ -280,9 +280,9 @@ class JoinOperator(ModelOperator):
                     chunks=len(own_spans),
                     extension={
                         **({"borrowed_prefix_tokens": stats["borrowed_tokens"]}
-                           if j == 0 and stats.get("borrowed_tokens") else {}),
+                            if j == 0 and stats.get("borrowed_tokens") else {}),
                         **({"pack_s": round(stats["pack_s"], 3)}
-                           if j == 0 and stats.get("pack_s") else {}),
+                            if j == 0 and stats.get("pack_s") else {}),
                     }))
         self._results = results
         if self.context is not None:
@@ -346,8 +346,8 @@ def set_join_questions(node, documents) -> list:
     for alias in node.partners:
         ends = ends_for(node.document_ends, alias, separator)
         blocks[alias] = [list(labels[alias])
-                         + list(joined_state(document, separator, ends))
-                         for document in documents[alias]]
+            + list(joined_state(document, separator, ends))
+            for document in documents[alias]]
     questions = []
     for positions in itertools.product(
             *(range(len(blocks[alias])) for alias in node.partners)):
@@ -359,7 +359,7 @@ def set_join_questions(node, documents) -> list:
 
 
 def join_passes(node, prefixes, anchors, members_of, documents, set_size: int,
-                budget: int) -> Passes:
+        budget: int) -> Passes:
     """One join's passes over the anchors, each pass's questions its own request.
 
     Args:
@@ -389,7 +389,7 @@ def join_passes(node, prefixes, anchors, members_of, documents, set_size: int,
             continue
         prefix = joined_state(prefixes[anchor], frame, ends)
         for block in split_passes(len(prefix), members, lengths, len(header),
-                                  set_size, budget):
+                set_size, budget):
             suffix, shape = [], []
             for index, member in enumerate(block):
                 question = (header if index else []) + questions[member]
@@ -446,13 +446,13 @@ def set_joins(state, join) -> dict:
         passes = join_passes(
             node, inputs["prefixes"], reached,
             lambda anchor, j=j: (None if lists_for is None
-                                 else lists_for(keys[anchor][1], j)),
+                else lists_for(keys[anchor][1], j)),
             inputs["partner_documents"], state.loaded_model.model_spec.set_size,
             state.chunk_tokens)
         passes.stages = [0] * len(passes.states)
         label = f"join predicate {node.written_position}"
         run_passes(state, [own_stage(state, readout, label, passes)], passes,
-                   label=label)
+            label=label)
         rows = {}
         for anchor, margins in zip(passes.owners, passes.values):
             if margins is not None:
@@ -462,7 +462,7 @@ def set_joins(state, join) -> dict:
         own_tokens.append(passes.tokens)
         # one run per join: its stage 0 is the group's stage j
         all_spans += [({j: by_stage.get(0, 0)}, chunk, start, end)
-                      for by_stage, chunk, start, end in passes.spans]
+            for by_stage, chunk, start, end in passes.spans]
         reached = [anchor for anchor in sorted(rows) if any(rows[anchor])]
     last = settled_rows(every, asked)
     for anchor in sorted(last):
@@ -526,7 +526,7 @@ def partner_list_builder(group, tuples_by_stage, maps):
             pair_partner(join["anchor"], join["partners"]))
         rows = maps[join["written_position"]]
         cache = (np.full(len(rows.keys), None, dtype=object)
-                 if isinstance(rows, RowGroups) else None)
+            if isinstance(rows, RowGroups) else None)
         stage_maps.append((rows, members_by_partner(tuples, position), cache))
     if all(entry is None for entry in stage_maps):
         return None
@@ -569,7 +569,7 @@ def upstream_join(state, nodes, ids, chain, inputs, context):
 
 
 def prepare_join_inputs(nodes, inputs, context: ExecutionContext,
-                        upstream=None) -> dict:
+        upstream=None) -> dict:
     """Prepare join requests from graph ports and preceding operator state.
 
     Args:
@@ -584,7 +584,7 @@ def prepare_join_inputs(nodes, inputs, context: ExecutionContext,
     by_alias = {}
     port_pairs = {}        # written position -> pair table from a port
     for member, input_port in ((member, port) for member in nodes
-                               for port in member.inputs):
+            for port in member.inputs):
         values = inputs[member.node_id]
         port = input_port.source.port
         if input_port.name not in values:
@@ -612,15 +612,15 @@ def prepare_join_inputs(nodes, inputs, context: ExecutionContext,
         )
     config = state["retention"]
     apply_retention(state["gpu"].arena, config,
-                    config.get("before", {}).get(node.node_id, {}), by_alias)
+        config.get("before", {}).get(node.node_id, {}), by_alias)
     documents = {alias: [state["documents"][alias][index]
-                         for index in by_alias[alias]]
-                 for member in nodes for alias in member.partners}
+        for index in by_alias[alias]]
+        for member in nodes for alias in member.partners}
     prefixes = (DocumentPrefixes(node.document_head, state["documents"][node.anchor],
-                                 by_alias[node.anchor])
-                if upstream is None else upstream["documents"])
+        by_alias[node.anchor])
+        if upstream is None else upstream["documents"])
     prepared = join_inputs(nodes, documents, by_alias, prefixes, state["gpu"].arena,
-                           config, port_pairs, upstream=upstream, report_answers=True)
+        config, port_pairs, upstream=upstream, report_answers=True)
     if upstream is None:
         counts = prepared["kv_round"]
         state["kv_stats"]["join_anchor_hits"] += counts["hits"]
@@ -630,7 +630,7 @@ def prepare_join_inputs(nodes, inputs, context: ExecutionContext,
 
 
 def join_inputs(nodes, documents, indices, prefixes, arena, retention, pair_tables,
-                *, upstream=None, report_answers=False) -> dict:
+        *, upstream=None, report_answers=False) -> dict:
     """Build join requests and KV settlement for local or worker execution."""
     node = nodes[0]
     group = [join_request(member) for member in nodes]
@@ -649,7 +649,7 @@ def join_inputs(nodes, documents, indices, prefixes, arena, retention, pair_tabl
         group, [tuple_indices[stage.written_position] for stage in nodes], maps)
     anchor_ids = indices[node.anchor] if upstream is None else None
     anchor_keys = DocumentKeys(node.anchor, anchor_ids if upstream is None
-                               else upstream["document_ids"])
+        else upstream["document_ids"])
     round_kv = None
     if upstream is None:
         hits = sum(arena.is_resident(key) for key in anchor_keys)
@@ -672,9 +672,9 @@ def join_inputs(nodes, documents, indices, prefixes, arena, retention, pair_tabl
                 member = position if members is None else int(members[position])
                 matches.append(list(last_tuples[member]))
         return {"kind": "join", "node": node.node_id, "anchor": node.anchor,
-                "partners": list(last["partners"]),
-                "semantics": last["semantics"], "document": int(document),
-                "asked": len(row), "matches": matches}
+            "partners": list(last["partners"]),
+            "semantics": last["semantics"], "document": int(document),
+            "asked": len(row), "matches": matches}
 
     settle = join_settlement(arena, anchor_keys, prefixes, nodes[-1], retention)
 

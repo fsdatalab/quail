@@ -59,8 +59,8 @@ class Engine:
     """
 
     def __init__(self, session, physical_executor: Callable | None = None, *,
-                 order: str | None = None, run_query: Callable | None = None,
-                 owns_session: bool = False):
+            order: str | None = None, run_query: Callable | None = None,
+            owns_session: bool = False):
         self.session = session
         self._physical_executor = physical_executor
         self._order = order
@@ -69,7 +69,7 @@ class Engine:
 
     @classmethod
     def open(cls, model: str, device: str, gpus: int = 1,
-             backend: str = "quail") -> Engine:
+            backend: str = "quail") -> Engine:
         """Open an engine on a new session of ``model`` on ``device``."""
         from quail.api.config import EngineConfig
         from quail.api.session import Session
@@ -124,7 +124,7 @@ class Engine:
         })
 
     def execute(self, planned: tuple[str, dict], tables: dict | None = None,
-                on_rows: Callable | None = None, hint=None) -> pa.Table | None:
+            on_rows: Callable | None = None, hint=None) -> pa.Table | None:
         """Run a region Rust planned and return its rows.
 
         Args:
@@ -151,23 +151,23 @@ class Engine:
         if "refusal" in found:
             raise RefusalError(refusal_from_fields(found["refusal"]))
         query = region_query(self.session, found["operators"],
-                             logical=found.get("logical", ""), order=self._order,
-                             tables=tables, keep_order=True,
-                             region_id=found.get("region_id"))
+            logical=found.get("logical", ""), order=self._order,
+            tables=tables, keep_order=True,
+            region_id=found.get("region_id"))
         query.adopt_plan(found, scans)
         return self._run(query, on_rows, hint)
 
     def _run(self, query, on_rows: Callable | None = None,
-             hint=None) -> pa.Table | None:
+            hint=None) -> pa.Table | None:
         if self._run_query is not None:
             table = self._run_query(query, on_rows, hint)
         else:
             table = execute_query(query, physical_executor=self._physical_executor,
-                                  on_rows=on_rows, hint=hint).collect()
+                on_rows=on_rows, hint=hint).collect()
         return None if on_rows is not None else table
 
     def run_region(self, payload: str, tables: dict | None = None,
-                   fetch: int | None = None) -> pa.Table:
+            fetch: int | None = None) -> pa.Table:
         """Plan and run one model region and return its rows.
 
         Args:
@@ -184,8 +184,8 @@ class Engine:
         if fetch is not None:
             operators = _quail_native.limited_operators(operators, fetch)
         query = region_query(self.session, operators, logical=found["logical"],
-                             order=self._order, tables=tables,
-                             region_id=found.get("region_id"))
+            order=self._order, tables=tables,
+            region_id=found.get("region_id"))
         return self._run(query)
 
     def close(self) -> None:

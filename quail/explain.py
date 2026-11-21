@@ -30,14 +30,14 @@ def _metrics(node_metrics) -> dict:
     """Each node's measured metrics as (field, value) pairs."""
     return {
         node_id: ([(field.name, getattr(measured, field.name))
-                   for field in fields(measured)]
-                  if is_dataclass(measured) else list(dict(measured).items()))
+            for field in fields(measured)]
+            if is_dataclass(measured) else list(dict(measured).items()))
         for node_id, measured in node_metrics.items()
     }
 
 
 def explain(logical, operators, physical, *, verbose: bool = False, result=None,
-            usd_per_hour: float | None = None, rules=None) -> str:
+        usd_per_hour: float | None = None, rules=None) -> str:
     """Format DataFusion's plan of a region and its physical operator tree.
 
     Args:
@@ -62,7 +62,7 @@ def explain(logical, operators, physical, *, verbose: bool = False, result=None,
         "verbose": verbose,
         "usd_per_hour": usd_per_hour,
         "rules": (None if rules is None
-                  else [[rule.name, rule.kind] for rule in rules]),
+            else [[rule.name, rule.kind] for rule in rules]),
     }
     if isinstance(physical, Refusal):
         request["refusal"] = asdict(physical)
@@ -72,7 +72,7 @@ def explain(logical, operators, physical, *, verbose: bool = False, result=None,
             "device": physical.device, "gpus": physical.gpus,
             "settings": list(physical.settings.items()),
             "shown_settings": [(name, _shown(value))
-                               for name, value in physical.settings.items()],
+                for name, value in physical.settings.items()],
             "graph": json.loads(physical.graph.to_json()),
             "estimates": list((physical.estimates or {}).items()),
         }
@@ -82,5 +82,5 @@ def explain(logical, operators, physical, *, verbose: bool = False, result=None,
         request["model_spec"] = None if spec is None else asdict(spec)
         if result is not None:
             request["run"] = {"report": result.report,
-                              "metrics": _metrics(result.node_metrics)}
+                "metrics": _metrics(result.node_metrics)}
     return _quail_native.explain_plan(_json(request))

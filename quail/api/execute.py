@@ -32,7 +32,7 @@ class _BackendState:
     def bind(self, envelope, backend) -> dict:
         """Return the runtime state for the plan, releasing another engine."""
         configuration = (getattr(backend, "engine_name", backend.name),
-                         envelope["model"], envelope["device"], envelope["gpus"])
+            envelope["model"], envelope["device"], envelope["gpus"])
         if configuration != self.configuration:
             self.close()
             self.configuration = configuration
@@ -102,7 +102,7 @@ def _execute_physical(request, registry):
 
 
 def execute_query(query, physical_executor=None, on_backend_ready=None,
-                  on_execution_ready=None, on_rows=None, hint=None):
+        on_execution_ready=None, on_rows=None, hint=None):
     """Execute one query in its session's process.
 
     Args:
@@ -121,13 +121,13 @@ def execute_query(query, physical_executor=None, on_backend_ready=None,
 
     if isinstance(query, Query):
         return _execute_in_datafusion(query, physical_executor,
-                                      on_backend_ready, on_execution_ready)
+            on_backend_ready, on_execution_ready)
     return _execute_region(query, physical_executor,
-                           on_backend_ready, on_execution_ready, on_rows, hint)
+        on_backend_ready, on_execution_ready, on_rows, hint)
 
 
 def _execute_in_datafusion(query, physical_executor, on_backend_ready,
-                           on_execution_ready):
+        on_execution_ready):
     """Run a query's SQL in DataFusion, which calls back for each model region.
 
     The result holds DataFusion's rows. A query of one model region also
@@ -157,14 +157,14 @@ def _execute_in_datafusion(query, physical_executor, on_backend_ready,
             region_s, region_results)
         # starting the workers is model startup, not query time
         return _query_result(query, context, table, whole, started + startup_s,
-                             results, region_tables, region_s, region_results)
+            results, region_tables, region_s, region_results)
 
     def run_query(region, on_rows=None, hint=None):
         if region.region_id is None or region.region_id in region_results:
             raise RuntimeError("model region has a missing or duplicate logical ID")
         region_started = time.perf_counter()
         result = _execute_region(region, physical_executor,
-                                 on_backend_ready, on_execution_ready, on_rows, hint)
+            on_backend_ready, on_execution_ready, on_rows, hint)
         region_s.append(time.perf_counter() - region_started)
         results.append(result)
         region_results[region.region_id] = result
@@ -175,11 +175,11 @@ def _execute_in_datafusion(query, physical_executor, on_backend_ready,
     context = SessionContext(query.session, order=query.order, run_query=run_query)
     table = context.sql(query.text, query.dialect)
     return _query_result(query, context, table, whole, started, results,
-                         region_tables, region_s, region_results)
+        region_tables, region_s, region_results)
 
 
 def _run_in_rust(query, source, ready, results, region_tables, region_s,
-                 region_results):
+        region_results):
     """Run a query whose model regions Rust runs on GPU workers.
 
     Each region's QueryResult is built from what Rust kept of its run.
@@ -283,13 +283,13 @@ def streams(query, physical_executor=None) -> bool:
 
     session = query.session
     return (query.num_regions > 0 and session.config.backend == "quail"
-            and backend_refusal(session) is None
-            and (physical_executor is None
-                 or hasattr(physical_executor, "start_workers")))
+        and backend_refusal(session) is None
+        and (physical_executor is None
+            or hasattr(physical_executor, "start_workers")))
 
 
 def stream_query(query, physical_executor=None, batch_rows: int = 65_536,
-                 limit: int | None = None):
+        limit: int | None = None):
     """Run a query and return its rows as DataFusion produces them.
 
     A model region sends each row once the model has answered every
@@ -337,7 +337,7 @@ def stream_query(query, physical_executor=None, batch_rows: int = 65_536,
 
 
 def _query_result(query, context, table, whole, started, results, region_tables,
-                  region_s, region_results):
+        region_s, region_results):
     """Return a query's result from its rows and its regions' results."""
     if len(results) != 1:
         result = QueryResult.from_table(table, report={
@@ -351,7 +351,7 @@ def _query_result(query, context, table, whole, started, results, region_tables,
     region.report["datafusion_s"] = round(
         time.perf_counter() - started - region_s[0], 4)
     result = QueryResult.from_table(region_tables[0] if whole else table,
-                                    report=region.report)
+        report=region.report)
     result.plan = region.plan
     result.physical_plan = region.physical_plan
     result.region_id = region.region_id
@@ -367,7 +367,7 @@ def _query_result(query, context, table, whole, started, results, region_tables,
 
 
 def _execute_region(query, physical_executor, on_backend_ready,
-                    on_execution_ready, on_rows=None, hint=None):
+        on_execution_ready, on_rows=None, hint=None):
     """Execute one model region's Query in its session's process.
 
     With ``on_rows``, the region's rows go to it as they finish, each
@@ -382,8 +382,8 @@ def _execute_region(query, physical_executor, on_backend_ready,
     if plan.gpus > 8:
         raise NotImplementedError("query execution supports at most 8 GPUs")
     has_compute = any(node.backend is not None or
-                      node.location is ExecutionLocation.GPU_EXECUTOR
-                      for node in plan.nodes)
+        node.location is ExecutionLocation.GPU_EXECUTOR
+        for node in plan.nodes)
     if has_compute and physical_executor is None:
         problem = gpu_problem()
         if problem is not None:
@@ -409,12 +409,12 @@ def _execute_region(query, physical_executor, on_backend_ready,
         first = {}
         if hint is not None:
             first = first_rows(request.column_tables(),
-                               plan.settings.get("deduplicate", {}))
+                plan.settings.get("deduplicate", {}))
         # with no one taking rows as they finish, they are built at the end
         with reporting(None if on_rows is None else finished, hint, tables,
-                       first):
+                first):
             response = (physical_executor(request) if physical_executor is not None
-                        else _execute_physical(request, query.session.registry))
+                else _execute_physical(request, query.session.registry))
     else:
         response = PhysicalResponse(
             {}, {"wall_s": 0.0, "fresh_tokens": 0, "cached_tokens": 0})

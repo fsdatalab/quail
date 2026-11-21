@@ -30,10 +30,10 @@ SKIPPED_PARTS = ("model.vision_tower.", "model.multi_modal_projector.")
 LAYER_TENSORS = {
     "conv": ("conv.in_proj", "conv.out_proj", "conv.conv"),
     "attention": ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
-                  "self_attn.gate_proj", "self_attn.o_proj", "self_attn.q_norm",
-                  "self_attn.k_norm"),
+        "self_attn.gate_proj", "self_attn.o_proj", "self_attn.q_norm",
+        "self_attn.k_norm"),
     "every": ("operator_norm", "post_operator_norm", "ffn_norm", "post_ffn_norm",
-              "feed_forward.w1", "feed_forward.w2", "feed_forward.w3"),
+        "feed_forward.w1", "feed_forward.w2", "feed_forward.w3"),
 }
 
 
@@ -55,7 +55,7 @@ def text_tensors(layer_types, language_model) -> list[str]:
     for index, kind in enumerate(layer_types):
         mixer = LAYER_TENSORS["conv" if kind == "conv" else "attention"]
         names += [f"layers.{index}.{name}" for name in
-                  (*LAYER_TENSORS["every"], *mixer)]
+            (*LAYER_TENSORS["every"], *mixer)]
     return [f"{language_model}.{name}.weight" for name in names]
 
 
@@ -70,7 +70,7 @@ def check_tensors(found, expected) -> None:
     if missing := expected - found:
         raise ValueError(f"the checkpoint is missing {sorted(missing)[:5]}")
     unexpected = [name for name in found - expected
-                  if not name.startswith(SKIPPED_PARTS)]
+        if not name.startswith(SKIPPED_PARTS)]
     if unexpected:
         raise ValueError(f"the LFM3 pass does not use {sorted(unexpected)[:5]}")
 
@@ -95,7 +95,7 @@ def rotary_tables(torch, config, layer_type, max_positions, device):
     params = config["rope_parameters"][layer_type]
     if params.get("rope_type", "default") != "default":
         raise ValueError(f"LFM3 rotary type {params['rope_type']!r} is not "
-                         f"supported")
+            f"supported")
     dim = config["head_dim"]
     rotated = int(params.get("partial_rotary_factor", 1.0) * dim) // 2
     inverse = 1.0 / params["rope_theta"] ** (
@@ -103,7 +103,7 @@ def rotary_tables(torch, config, layer_type, max_positions, device):
     inverse = torch.cat((inverse, torch.zeros(dim // 2 - rotated)))
     angles = torch.arange(max_positions, dtype=torch.float32)[:, None] * inverse
     return tuple(t.to(torch.bfloat16).float().to(device)
-                 for t in (angles.cos(), angles.sin()))
+        for t in (angles.cos(), angles.sin()))
 
 
 # the block of the fp8 weights and activations, as Quail's fp8 GEMM reads them
@@ -125,7 +125,7 @@ class Lfm3Model:
 
     def __init__(self, embed, layers, final_norm, config, rotary):
         self.model = SimpleNamespace(embed_tokens=embed, layers=layers,
-                                     embedding_norm=final_norm)
+            embedding_norm=final_norm)
         self.lm_head = SimpleNamespace(weight=embed)
         self.config = config
         self.rotary = rotary
@@ -164,7 +164,7 @@ def load_lfm3(path, device="cuda", max_positions=None, *, quantize_fp8=False):
         raise ValueError("an LFM3 convolution with bias is not supported")
     if not config.get("use_sandwich_norm", False):
         raise ValueError("an LFM3 model without sandwich norms is not "
-                         "supported")
+            "supported")
     root = LANGUAGE_MODEL[model_type]
     expected = text_tensors(config["layer_types"], root)
     files = {}
@@ -181,7 +181,7 @@ def load_lfm3(path, device="cuda", max_positions=None, *, quantize_fp8=False):
 
     def take(name):
         return tensors.pop(f"{root}.{name}.weight").to(device=device,
-                                                       dtype=torch.bfloat16)
+            dtype=torch.bfloat16)
 
     eps = config["norm_eps"]
 
@@ -203,11 +203,11 @@ def load_lfm3(path, device="cuda", max_positions=None, *, quantize_fp8=False):
         padded = -(-rows // FP8_BLOCK) * FP8_BLOCK
         if padded != rows:
             weight = torch.cat((weight, weight.new_zeros(padded - rows,
-                                                         weight.shape[1])))
+                weight.shape[1])))
         quantized, scale = per_block_cast_to_fp8(
             weight, [FP8_BLOCK, FP8_BLOCK], use_ue8m0=is_deep_gemm_e8m0_used())
         return SimpleNamespace(weight=quantized, weight_scale_inv=scale,
-                               out_features=rows)
+            out_features=rows)
 
     # the execution layout: q, k, v, and the gate fused, and w1 with w3
     layers = []
@@ -230,7 +230,7 @@ def load_lfm3(path, device="cuda", max_positions=None, *, quantize_fp8=False):
             layer.taps = taps.view(taps.shape[0], taps.shape[2]).contiguous()
         else:
             layer.qkv_gate = linear(*(own(f"self_attn.{part}_proj")
-                                      for part in ("q", "k", "v", "gate")))
+                for part in ("q", "k", "v", "gate")))
             layer.o_proj = linear(own("self_attn.o_proj"))
             layer.q_norm = norm(own("self_attn.q_norm"))
             layer.k_norm = norm(own("self_attn.k_norm"))
@@ -239,7 +239,7 @@ def load_lfm3(path, device="cuda", max_positions=None, *, quantize_fp8=False):
     final_norm = norm("embedding_norm")
     positions = max_positions or config["max_position_embeddings"]
     rotary = {kind: rotary_tables(torch, config, kind, positions, device)
-              for kind in set(config["layer_types"]) - {"conv"}}
+        for kind in set(config["layer_types"]) - {"conv"}}
     return Lfm3Model(embed, layers, final_norm, config, rotary)
 
 
@@ -266,22 +266,22 @@ class Lfm3Pipeline(ModelPipeline):
                 f"{spec.attention_mask!r}")
         config = model.config
         loaded = (len(model.model.layers), config["hidden_size"],
-                  config["num_attention_heads"], config["num_key_value_heads"],
-                  config["head_dim"], config.get("sliding_window", 0),
-                  config["conv_L_cache"])
+            config["num_attention_heads"], config["num_key_value_heads"],
+            config["head_dim"], config.get("sliding_window", 0),
+            config["conv_L_cache"])
         expected = (spec.layers, spec.hidden, spec.num_q_heads,
-                    spec.num_kv_heads, spec.d_head, spec.sliding_window,
-                    spec.conv_width)
+            spec.num_kv_heads, spec.d_head, spec.sliding_window,
+            spec.conv_width)
         if loaded != expected:
             raise ValueError(
                 f"the loaded model's geometry (layers, hidden, q heads, kv "
                 f"heads, head dim, window, conv width) {loaded} differs from "
                 f"the spec's {expected}")
         kinds = tuple("short_conv" if kind == "conv" else kind
-                      for kind in config["layer_types"])
+            for kind in config["layer_types"])
         if kinds != spec.layer_kinds:
             raise ValueError("the loaded model's layer kinds differ from "
-                             "the spec's")
+                "the spec's")
         self.spec = spec
         self.arena = arena
         self.layers = model.model.layers
@@ -298,19 +298,19 @@ class Lfm3Pipeline(ModelPipeline):
         # per attention layer kind, its [cos | sin] table, as the fused
         # q/k norm and rotary kernel reads it
         self.cos_sin = {kind: self.engine.torch.cat(tables, -1).contiguous()
-                        for kind, tables in model.rotary.items()}
+            for kind, tables in model.rotary.items()}
         attention = next(layer for layer in self.layers if layer.kind != "conv")
         conv = next(layer for layer in self.layers if layer.kind == "conv")
         self.attention_layer, self.conv_layer = attention, conv
         widest = max(conv.in_proj.weight.shape[0],
-                     attention.qkv_gate.weight.shape[0],
-                     conv.w13.weight.shape[0])
+            attention.qkv_gate.weight.shape[0],
+            conv.w13.weight.shape[0])
         self.max_chunk_tokens = (2**31 - 1) // widest
 
     def linears(self):
         conv, attention = self.conv_layer, self.attention_layer
         return (conv.in_proj, conv.out_proj, attention.qkv_gate,
-                attention.o_proj, conv.w13, conv.w2)
+            attention.o_proj, conv.w13, conv.w2)
 
     def _linear(self, x, module):
         if not self.engine.is_fp8:
@@ -324,7 +324,7 @@ class Lfm3Pipeline(ModelPipeline):
 
     def _short_conv(self, layer, x, starts):
         conv = kernels.gated_conv(self._linear(x, layer.in_proj), layer.taps,
-                                  starts)
+            starts)
         return self._linear(conv, layer.out_proj)
 
     def _attention(self, layer, x, positions, meta):
@@ -342,14 +342,14 @@ class Lfm3Pipeline(ModelPipeline):
         cu, longest = meta["cu_a"], meta["max_a"]
         if layer.kind == "sliding_attention":
             out, _ = self.engine._fa(q, k, v, cu, cu, longest, longest,
-                                     causal=True, window=(self.window - 1, 0))
+                causal=True, window=(self.window - 1, 0))
         elif meta.get("set_rows") is None:
             out, _ = self.engine._fa(q, k, v, cu, cu, longest, longest,
-                                     causal=False)
+                causal=False)
         else:
             out = self._set_attention(q, k, v, meta)
         out = kernels.gate_heads(out.reshape(rows, H * D),
-                                 projected[:, (H + 2 * KH) * D:])
+            projected[:, (H + 2 * KH) * D:])
         return self._linear(out, layer.o_proj)
 
     def _set_attention(self, q, k, v, meta):
@@ -362,8 +362,8 @@ class Lfm3Pipeline(ModelPipeline):
         out = torch.empty_like(q)
         state, asked = plan["state"], plan["asked"]
         state_out, _ = fa(q.index_select(0, state), k, v, plan["cu_state"],
-                          meta["cu_a"], plan["max_state"], meta["max_a"],
-                          causal=False)
+            meta["cu_a"], plan["max_state"], meta["max_a"],
+            causal=False)
         out.index_copy_(0, state, state_out)
         q_asked = q.index_select(0, asked)
         read = plan["read_state"]
@@ -437,12 +437,12 @@ class Lfm3Pipeline(ModelPipeline):
         meta = chunk.meta
         if meta.get("unified") is not None or meta.get("reads") is not None:
             raise ValueError("an LFM3 chunk packs whole sequences without "
-                             "arena pages")
+                "arena pages")
         lengths = tuple(end - first for _, first, _, end in chunk.row_spans)
         if sum(lengths) != chunk.tokens:
             raise ValueError("an LFM3 chunk holds whole sequences only")
         starts = kernels.sequence_starts(self.engine.torch, lengths,
-                                         chunk.input_ids.device)
+            chunk.input_ids.device)
         meta["set_rows"] = self._plan_set_rows(chunk, meta)
         hidden = F.embedding(chunk.input_ids, self.embed)
         x = self._norm(hidden, self.layers[0].operator_norm)
@@ -455,7 +455,7 @@ class Lfm3Pipeline(ModelPipeline):
                 y, hidden, layer.post_operator_norm.weight, layer.ffn_norm.weight,
                 layer.ffn_norm.variance_epsilon)
             following = (self.layers[index + 1].operator_norm.weight
-                         if index + 1 < len(self.layers) else None)
+                if index + 1 < len(self.layers) else None)
             x = kernels.post_norm_add_norm(
                 self._mlp(layer, x), hidden, layer.post_ffn_norm.weight,
                 following, layer.post_ffn_norm.variance_epsilon)

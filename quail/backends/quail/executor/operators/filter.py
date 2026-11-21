@@ -38,7 +38,7 @@ class FilterOperator(SingleNodeOperator):
         node = nodes[0]
         pipeline = query.loaded_model.pipeline
         found = cls(node, region.document_ids(), query.async_answers,
-                    len(pipeline.canvas_ids), frames=pipeline.mask == "causal")
+            len(pipeline.canvas_ids), frames=pipeline.mask == "causal")
         if getattr(node, "answer", None) is None:
             return found
         # a filter that keeps every row carries the columns before it
@@ -127,12 +127,12 @@ class FilterOperator(SingleNodeOperator):
         sink = answer_sink()
         if sink is not None and finished:
             sink({"kind": "filter", "node": self.node.node_id,
-                  "alias": self.node.alias, "stages": 1,
-                  "documents": [[int(self.ids[document]), 0, passed]
-                                for document, passed, _ in finished]})
+                "alias": self.node.alias, "stages": 1,
+                "documents": [[int(self.ids[document]), 0, passed]
+                    for document, passed, _ in finished]})
         passed = [document for document, survived, _ in finished if survived]
         return passed_rows(self.node, self.node.alias,
-                           [self.ids[document] for document in passed])
+            [self.ids[document] for document in passed])
 
     def _answered_rows(self, finished) -> list:
         """The finished rows of settled documents, with the filter's answer.
@@ -142,11 +142,11 @@ class FilterOperator(SingleNodeOperator):
         the chain reports its rows with its result instead.
         """
         answered = [(document, answer) for document, _, answer in finished
-                    if answer is not None]
+            if answer is not None]
         if not answered or self.priors or finished_rows() is None:
             return []
         positions = np.asarray([self.ids[document] for document, _ in answered],
-                               dtype=np.int64)
+            dtype=np.int64)
         order = np.argsort(positions, kind="stable")
         values = pa.array([answered[index][1] for index in order], pa.bool_())
         alias = self.node.alias
@@ -162,8 +162,8 @@ class FilterOperator(SingleNodeOperator):
                 self.answers.setdefault(document, []).append(
                     int(bool(row[0]) != self.node.negated))
         return len(self.answers) * (len(self.stages[0].suffixes[0])
-                                    + self.frame_tokens
-                                    + self.canvas_tokens)
+            + self.frame_tokens
+            + self.canvas_tokens)
 
     def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
         found = filter_result(
@@ -178,7 +178,7 @@ class FilterOperator(SingleNodeOperator):
         positions = np.asarray(self.ids, dtype=np.int64)[local]
         order = np.argsort(positions, kind="stable")
         values = np.fromiter((bool(row[0]) for row in self.answers.values()),
-                             dtype=bool, count=len(self.answers))[order]
+            dtype=bool, count=len(self.answers))[order]
         rows = Rows({alias: arrow_ids(positions[order])}).with_column(
             self.node.answer, pa.array(values, pa.bool_()))
         rows = join_prior_rows(rows, alias, self.priors, self.prior_tables)
@@ -204,15 +204,15 @@ class ConditionGate(SingleNodeOperator):
         producers = {}
         for name in node.tested_columns:
             operator = next((operator for operator in reversed(chain)
-                             if name in operator.tested_columns), None)
+                if name in operator.tested_columns), None)
             if operator is not None:
                 producers[name] = operator
         source = next(operator for operator in reversed(chain)
-                      if any(member.node_id == source_id
-                             for member in operator.nodes))
+            if any(member.node_id == source_id
+                for member in operator.nodes))
         return cls(node, producers, source,
-                   region.context.sources.get(columns_key(node.aliases[0])),
-                   region.document_ids)
+            region.context.sources.get(columns_key(node.aliases[0])),
+            region.document_ids)
 
     def __init__(self, node, producers, source, columns, document_ids=None):
         self.node = node
@@ -224,7 +224,7 @@ class ConditionGate(SingleNodeOperator):
         self.columns = columns  # the table's source columns, by document
         self.positions = {
             id(operator): {document: index
-                           for index, document in enumerate(operator.ids)}
+                for index, document in enumerate(operator.ids)}
             for operator in producers.values()}
         self.accepted = {}
         self.decided = {}  # key -> kept, from decide, until gate asks
@@ -243,10 +243,10 @@ class ConditionGate(SingleNodeOperator):
         if operator is not None:
             positions = self.positions[id(operator)]
             return operator.tested_values(name, [positions[document]
-                                                 for document in documents])
+                for document in documents])
         if self.columns is None or name not in self.columns.column_names:
             raise KeyError(f"{self.node.node_id!r} reads {name!r}, which no "
-                           f"operator computes and the scan does not hold")
+                f"operator computes and the scan does not hold")
         if len(documents) == 1:
             # one document at a time: a slice copies nothing
             return self.columns.column(name).slice(documents[0], 1)
@@ -263,7 +263,7 @@ class ConditionGate(SingleNodeOperator):
             return keys
         documents = [key[1] for key in keys]
         values = {column: self.read(column, documents)
-                  for column in self.node.tested_columns}
+            for column in self.node.tested_columns}
         kept = accepts(self.node.predicate, pa.table(values))
         kept = kept.to_numpy(zero_copy_only=False).tolist()
         self.decided.update(zip(keys, kept))
@@ -277,7 +277,7 @@ class ConditionGate(SingleNodeOperator):
         # chunk report, is tested alone; a repeated value, such as a
         # label, is evaluated once
         values = {column: self.read(column, [key[1]])
-                  for column in self.node.tested_columns}
+            for column in self.node.tested_columns}
         token = tuple(_hashable(found[0].as_py()) for found in values.values())
         if token not in self.accepted:
             self.accepted[token] = bool(
@@ -295,7 +295,7 @@ class ConditionGate(SingleNodeOperator):
             return []
         ids = self.document_ids()
         return passed_rows(self.node, self.node.aliases[0],
-                           [ids[document] for document in finished])
+            [ids[document] for document in finished])
 
     def read_answers(self, every):
         return None
@@ -327,8 +327,8 @@ def passed_rows(node, alias, document_ids) -> list:
 
 
 def filter_result(node, answers, tokens, document_ids,
-                  gpu_s: float = 0.0, chunks: int = 0,
-                  borrowed_tokens: int = 0, pack_s: float = 0.0) -> NodeResult:
+        gpu_s: float = 0.0, chunks: int = 0,
+        borrowed_tokens: int = 0, pack_s: float = 0.0) -> NodeResult:
     """Build a filter result using global document IDs and execution metrics.
 
     Args:
@@ -347,15 +347,15 @@ def filter_result(node, answers, tokens, document_ids,
     """
     local = np.fromiter(answers, dtype=np.int64, count=len(answers))
     passed = np.fromiter((len(row) == 1 and all(row) for row in answers.values()),
-                         dtype=bool, count=len(answers))
+        dtype=bool, count=len(answers))
     positions = np.asarray(document_ids, dtype=np.int64)
     survivors = arrow_ids(np.sort(positions[local[passed]]))
     lengths = np.fromiter((len(row) for row in answers.values()),
-                          dtype=np.int64, count=len(answers))
+        dtype=np.int64, count=len(answers))
     answered = np.repeat(positions[local], lengths)
     values = (np.concatenate([np.asarray(row, dtype=bool)
-                              for row in answers.values()])
-              if len(answers) else np.zeros(0, dtype=bool))
+        for row in answers.values()])
+        if len(answers) else np.zeros(0, dtype=bool))
     return NodeResult(
         outputs={
             f"rows:{node.alias}": Rows({node.alias: survivors}),
@@ -372,7 +372,7 @@ def filter_result(node, answers, tokens, document_ids,
             chunks=chunks,
             extension={
                 **({"borrowed_prefix_tokens": borrowed_tokens}
-                   if borrowed_tokens else {}),
+                    if borrowed_tokens else {}),
                 **({"pack_s": round(pack_s, 3)} if pack_s else {}),
             },
         ),
@@ -423,11 +423,11 @@ class StopKeyGroups:
     def _numbers(self, positions) -> list:
         """The group number of each position's stop key values."""
         values = [equality_keys(self.columns.column(name).take(positions),
-                                nan_equal=True).to_pylist()
-                  for name in self.node.stop_key]
+            nan_equal=True).to_pylist()
+            for name in self.node.stop_key]
         # every NaN is one key, though no two NaN floats are equal
         keys = (tuple(NAN_KEY if value != value else value for value in row)
-                for row in zip(*values))
+            for row in zip(*values))
         return [self.numbers.setdefault(key, len(self.numbers)) for key in keys]
 
 
@@ -456,5 +456,5 @@ def filter_stop_groups(state, node, rows) -> list | None:
     if keys is None:
         return None
     copies = (rows.column(COPIES) if isinstance(rows, Rows)
-              and COPIES in rows.column_names else None)
+        and COPIES in rows.column_names else None)
     return keys.of(id_positions(rows), copies)

@@ -28,8 +28,8 @@ def _kernels() -> dict:
     # compiled kernel
     @triton.jit(do_not_specialize=["rows"])
     def gated_conv(proj_ptr, taps_ptr, starts_ptr, out_ptr, rows, stride_proj,
-                   stride_out, C: tl.constexpr, WIDTH: tl.constexpr,
-                   BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr):
+            stride_out, C: tl.constexpr, WIDTH: tl.constexpr,
+            BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr):
         # proj holds [B | C | x] per row; out = C * conv(B * x)
         row_block = tl.program_id(0)
         channel_block = tl.program_id(1)
@@ -47,31 +47,31 @@ def _kernels() -> dict:
             x = tl.load(proj_ptr + offsets + 2 * C, mask=mask, other=0.0)
             gated = (b * x).to(tl.bfloat16).to(tl.float32)
             weight = tl.load(taps_ptr + c * WIDTH + tap, mask=c < C,
-                             other=0.0).to(tl.float32)
+                other=0.0).to(tl.float32)
             acc += gated * weight[None, :]
         mask = row_ok[:, None] & (c[None, :] < C)
         here = t[:, None].to(tl.int64) * stride_proj + c[None, :]
         gate = tl.load(proj_ptr + here + C, mask=mask, other=0.0)
         out = gate * acc.to(tl.bfloat16)
         tl.store(out_ptr + t[:, None].to(tl.int64) * stride_out + c[None, :],
-                 out.to(out_ptr.dtype.element_ty), mask=mask)
+            out.to(out_ptr.dtype.element_ty), mask=mask)
 
     @triton.jit
     def post_norm_add_norm(x_ptr, hidden_ptr, post_ptr, next_ptr, out_ptr,
-                           stride_x, stride_hidden, stride_out, eps,
-                           H: tl.constexpr, BLOCK: tl.constexpr,
-                           HAS_NEXT: tl.constexpr):
+            stride_x, stride_hidden, stride_out, eps,
+            H: tl.constexpr, BLOCK: tl.constexpr,
+            HAS_NEXT: tl.constexpr):
         row = tl.program_id(0).to(tl.int64)
         offs = tl.arange(0, BLOCK)
         mask = offs < H
         x = tl.load(x_ptr + row * stride_x + offs, mask=mask,
-                    other=0.0).to(tl.float32)
+            other=0.0).to(tl.float32)
         weight = tl.load(post_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         # as vLLM's rms_norm: the scaled row is rounded before the weight
         scaled = x * tl.math.rsqrt(tl.sum(x * x, axis=0) / H + eps)
         normed = (scaled.to(tl.bfloat16).to(tl.float32) * weight).to(tl.bfloat16)
         hidden = tl.load(hidden_ptr + row * stride_hidden + offs, mask=mask,
-                         other=0.0).to(tl.float32)
+            other=0.0).to(tl.float32)
         hidden = (hidden + normed.to(tl.float32)).to(tl.bfloat16)
         tl.store(hidden_ptr + row * stride_hidden + offs, hidden, mask=mask)
         if HAS_NEXT:
@@ -80,11 +80,11 @@ def _kernels() -> dict:
             scaled = total * tl.math.rsqrt(tl.sum(total * total, axis=0) / H + eps)
             out = scaled.to(tl.bfloat16).to(tl.float32) * weight
             tl.store(out_ptr + row * stride_out + offs,
-                     out.to(out_ptr.dtype.element_ty), mask=mask)
+                out.to(out_ptr.dtype.element_ty), mask=mask)
 
     @triton.jit
     def gate_heads(out_ptr, gate_ptr, stride_out, stride_gate,
-                   HEADS: tl.constexpr, D: tl.constexpr):
+            HEADS: tl.constexpr, D: tl.constexpr):
         row = tl.program_id(0).to(tl.int64)
         heads = tl.arange(0, HEADS)
         dims = tl.arange(0, D)
@@ -93,13 +93,13 @@ def _kernels() -> dict:
         gate = tl.load(gate_ptr + row * stride_gate + heads).to(tl.float32)
         scale = (1.0 / (1.0 + tl.exp(-gate))).to(tl.bfloat16).to(tl.float32)
         tl.store(out_ptr + offsets,
-                 (values.to(tl.bfloat16).to(tl.float32) * scale[:, None])
-                 .to(out_ptr.dtype.element_ty))
+            (values.to(tl.bfloat16).to(tl.float32) * scale[:, None])
+            .to(out_ptr.dtype.element_ty))
 
     @triton.jit(do_not_specialize=["count"])
     def merge_questions(out_ptr, rows_ptr, a_ptr, lse_a_ptr, b_ptr, lse_b_ptr,
-                        count, stride_out, stride_a, stride_b, stride_lse_a,
-                        stride_lse_b, HEADS: tl.constexpr, D: tl.constexpr):
+            count, stride_out, stride_a, stride_b, stride_lse_a,
+            stride_lse_b, HEADS: tl.constexpr, D: tl.constexpr):
         index = tl.program_id(0)
         heads = tl.arange(0, HEADS)
         dims = tl.arange(0, D)
@@ -114,10 +114,10 @@ def _kernels() -> dict:
         merged = (a * wa[:, None] + b * wb[:, None]) / (wa + wb)[:, None]
         row = tl.load(rows_ptr + index).to(tl.int64)
         tl.store(out_ptr + row * stride_out + within,
-                 merged.to(out_ptr.dtype.element_ty))
+            merged.to(out_ptr.dtype.element_ty))
 
     _KERNELS.update(gated_conv=gated_conv, post_norm_add_norm=post_norm_add_norm,
-                    gate_heads=gate_heads, merge_questions=merge_questions)
+        gate_heads=gate_heads, merge_questions=merge_questions)
     return _KERNELS
 
 
@@ -147,7 +147,7 @@ def gated_conv(projected, taps, starts):
     rows, width3 = projected.shape
     channels = width3 // 3
     out = torch.empty((rows, channels), dtype=projected.dtype,
-                      device=projected.device)
+        device=projected.device)
     block_t, block_c = 32, 128
     grid = ((rows + block_t - 1) // block_t, (channels + block_c - 1) // block_c)
     _kernels()["gated_conv"][grid](

@@ -41,7 +41,7 @@ def _convert(annotation, value):
     if is_dataclass(annotation):
         hints = get_type_hints(annotation)
         return annotation(**{key: _convert(hints[key], item)
-                             for key, item in value.items()})
+            for key, item in value.items()})
     if annotation is float:
         return float(value)
     return value
@@ -51,8 +51,8 @@ def _read(kind: type, name: str, directory: Path) -> dict:
     hints = get_type_hints(kind)
     found = json.loads(_quail_native.read_specs(name, str(directory)))
     return {spec: kind(**{key: _convert(hints[key], value)
-                          for key, value in values.items()})
-            for spec, values in found.items()}
+        for key, value in values.items()})
+        for spec, values in found.items()}
 
 
 @cache

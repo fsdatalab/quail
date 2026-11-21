@@ -42,7 +42,7 @@ class _GpuFilter(logging.Filter):
     def filter(self, record):
         tag = os.environ.get(LOG_TAG_ENV)
         record.gpu = (("" if not tag else f"[{tag}]")
-                      + ("" if _GPU_INDEX is None else f"[GPU {_GPU_INDEX}]"))
+            + ("" if _GPU_INDEX is None else f"[GPU {_GPU_INDEX}]"))
         return True
 
 
@@ -70,12 +70,12 @@ class _ConsoleHandler(logging.Handler):
             stamp = time.strftime("%m-%d %H:%M:%S", time.localtime(record.created))
             # a log file keeps one unwrapped line per message
             print(f"{record.levelname} {stamp} [quail]{tag} {text}",
-                  file=found.file, flush=True)
+                file=found.file, flush=True)
         elif not getattr(record, "detail", False):
             done = getattr(record, "done", False)
             mark = "[green]✓[/green]" if done else "[dim]·[/dim]"
             found.print(f"  {mark} [dim]{escape(tag)}[/dim]{escape(text.strip())}",
-                        soft_wrap=True)
+                soft_wrap=True)
 
 
 class _CountColumn(ProgressColumn):
@@ -83,7 +83,7 @@ class _CountColumn(ProgressColumn):
 
     def render(self, task):
         return Text(f"{int(task.completed):,} of {int(task.total):,} "
-                    f"{task.fields['unit']}")
+            f"{task.fields['unit']}")
 
 
 class _RateColumn(ProgressColumn):
@@ -208,7 +208,7 @@ class Progress:
     """
 
     def __init__(self, label: str, total: int | None = None,
-                 unit: str = "documents", every: float = 5.0, *, emit=say):
+            unit: str = "documents", every: float = 5.0, *, emit=say):
         self.label = label
         self.total = total
         self.unit = unit
@@ -268,4 +268,4 @@ class Progress:
         if self.total is not None:
             count += f" of {self.total:,}"
         return (f"{label}: {count} {self.unit} in {elapsed:.1f} s "
-                f"({rate:,.0f} per second)")
+            f"({rate:,.0f} per second)")

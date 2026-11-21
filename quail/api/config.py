@@ -14,7 +14,7 @@ def resolve_model(name: str, models=None):
         return models[name]
     return Refusal(
         reasons=(f"unknown model {name!r}; registered models: "
-                 f"{sorted(models)}",),
+            f"{sorted(models)}",),
         constraint="unknown_model", needed=1, available=0, unit="specs")
 
 

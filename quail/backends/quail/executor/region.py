@@ -90,9 +90,9 @@ def pipeline_rows(first, inputs):
     """The rows, or ids, a chain's first operator reads."""
     alias = first.document_aliases[0]
     anchor_port = next((port.name for port in first.inputs
-                        if port.source.port == f"rows:{alias}"), None)
+        if port.source.port == f"rows:{alias}"), None)
     return (inputs[first.node_id][anchor_port] if anchor_port is not None
-            else next(iter(inputs[first.node_id].values())))
+        else next(iter(inputs[first.node_id].values())))
 
 
 def pipeline_ids(first, inputs) -> np.ndarray:
@@ -218,11 +218,11 @@ class RegionExecution:
         alias, ids = first.document_aliases[0], self.document_ids()
         prefixes = DocumentPrefixes(first.document_head, self.documents[alias], ids)
         return RegionDocuments(prefixes, DocumentKeys(alias, ids),
-                               execution_prefix_tree(first, prefixes,
-                                                     self.query.loaded_model.arena))
+            execution_prefix_tree(first, prefixes,
+                self.query.loaded_model.arena))
 
     def run_operators(self, operators, table, settings=None, *,
-                      keep_kv=False) -> dict:
+            keep_kv=False) -> dict:
         """Run operators' stages over a document table in one GPU loop.
 
         Args:
@@ -268,7 +268,7 @@ class RegionExecution:
         if keep_kv and not paged:
             raise ValueError("retaining document KV requires arena writes")
         owner = next((operator for operator in operators
-                      if getattr(operator, "settles_kv", False)), None)
+            if getattr(operator, "settles_kv", False)), None)
         settled = (owner.settle_kv if owner is not None else settle_documents(
             state.loaded_model.arena, keys, prefixes, keep_kv, state.chunk_tokens,
             dependencies))
@@ -286,14 +286,14 @@ class RegionExecution:
                 state.chunk_tokens, anchor_keys=keys, on_settled=settled,
                 staging=input_staging(state),
                 attention_mode=next((operator.attention for operator in operators
-                                     if operator.attention), settings.attention),
+                    if operator.attention), settings.attention),
                 prefix_tree=tree, stats=stats, limit=settings.limit,
                 survival=survival(operators),
                 paged=paged, label=settings.label, on_chunk=self._on_chunk,
                 on_answers=(None if finished_rows() is None else self._on_answers),
                 stop_groups=settings.stop_groups,
                 appended_tokens=max(operator.appended_tokens
-                                    for operator in operators) or None,
+                    for operator in operators) or None,
                 gpu_timing=state.gpu_timing, decoder=decoder,
                 dependencies=dependencies,
                 knee_rows=getattr(state, "knee_rows", 0),
@@ -326,8 +326,8 @@ class RegionExecution:
         if not limits:
             return None
         expected_tokens = [expected for operator in operators
-                           if operator.answer_limits
-                           for expected in operator.expected_answer_tokens]
+            if operator.answer_limits
+            for expected in operator.expected_answer_tokens]
         state = self.query
         from quail.backends.quail.executor.model_loading import full_output_head
         from quail.common.budgets import copy_verification_workspace_bytes
@@ -361,7 +361,7 @@ class RegionExecution:
         index = routes.owner[stage]
         operator = routes.operators[index]
         if operator.answered(anchor, stage - routes.slices[index][0], start, end,
-                             answers) and operator not in self._answered:
+                answers) and operator not in self._answered:
             self._answered.append(operator)
 
     def _on_chunk(self, transitions) -> None:
@@ -413,4 +413,4 @@ class _Routes:
         self.operators = operators
         self.slices = stage_slices(operators)
         self.owner = [index for index, (low, high) in enumerate(self.slices)
-                      for _ in range(low, high)]
+            for _ in range(low, high)]

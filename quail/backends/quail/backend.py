@@ -59,10 +59,10 @@ class QuailBackend:
     def workers(self, config):
         """Return the GPUs' workers for a session's configuration."""
         return quail_workers(config.model, config.device, config.backend,
-                             config.gpus)
+            config.gpus)
 
     def report_region(self, plan, ran: list, boots: list, seconds: float,
-                      device) -> dict:
+            device) -> dict:
         """Report a region's run on workers that Rust drove.
 
         Args:
@@ -77,7 +77,7 @@ class QuailBackend:
             The run's report, with its outputs under "_outputs".
         """
         report = region_report(plan.graph, ran, seconds, device, gpus=plan.gpus,
-                               gpu_timing=plan.settings.get("gpu_timing", False))
+            gpu_timing=plan.settings.get("gpu_timing", False))
         slowest = max(boots, key=lambda boot: boot["boot_s"])
         boot = {**slowest, "kind": (
             "cold" if any(boot["kind"] == "cold" for boot in boots) else "warm")}

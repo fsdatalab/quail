@@ -25,7 +25,7 @@ class ScanRuntime:
             _tested_documents(node, context) if node.predicates
             else context.sources[node.input_id])
         return NodeResult({f"rows:{node.alias}": Rows({node.alias: value})},
-                          NodeMetrics(output_rows=len(value)))
+            NodeMetrics(output_rows=len(value)))
 
 
 def _tested_documents(node, context) -> pa.Array:
@@ -51,6 +51,6 @@ class LimitRuntime:
         rows = len(value)
         kept = min(rows, node.count)
         value = (value.take(range(kept)) if isinstance(value, Rows)
-                 else value[:kept])
+            else value[:kept])
         return NodeResult({"rows": value}, NodeMetrics(
             input_rows=rows, output_rows=kept))

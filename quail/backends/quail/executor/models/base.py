@@ -21,7 +21,7 @@ def overlaid_rows(torch, num_tokens, device, *layouts):
         One list of tensors per layout.
     """
     flat = torch.zeros(num_tokens * max(sum(layout) for layout in layouts),
-                       dtype=torch.bfloat16, device=device)
+        dtype=torch.bfloat16, device=device)
     views = []
     for layout in layouts:
         start, tensors = 0, []

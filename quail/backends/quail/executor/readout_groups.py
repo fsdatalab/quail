@@ -17,14 +17,14 @@ class ReadoutGroups:
         self.torch = torch
         # Combine stages sharing a readout in one submission per chunk.
         self.shared_readout = all(stage.readout is stages[0].readout
-                                  for stage in stages)
+            for stage in stages)
         groups = []
         self.group_key = []
         self.readout_of = []
         self.read_all_of = []
         for stage in stages:
             key = (id(stage.readout),
-                   False if self.shared_readout else stage.read_all_rows)
+                False if self.shared_readout else stage.read_all_rows)
             if key not in groups:
                 groups.append(key)
                 self.readout_of.append(stage.readout)

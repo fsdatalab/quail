@@ -30,9 +30,9 @@ class Session:
     """
 
     def __init__(self, config: EngineConfig, *,
-                 tokenizer: str | os.PathLike | None = None,
-                 registry: ExtensionRegistry | None = None,
-                 endpoint: str | None = None):
+            tokenizer: str | os.PathLike | None = None,
+            registry: ExtensionRegistry | None = None,
+            endpoint: str | None = None):
         self.registry = registry or built_in_registry()
         model = resolve_model(config.model, self.registry.models)
         if isinstance(model, Refusal):
@@ -54,7 +54,7 @@ class Session:
         if not support.supported:
             raise RefusalError(Refusal(
                 reasons=(support.reason or
-                         "unsupported backend configuration",),
+                    "unsupported backend configuration",),
                 constraint="unsupported_backend_configuration",
                 needed=1,
                 available=0,
@@ -153,7 +153,7 @@ class Session:
         self._register_files(name, path, "csv", id_col)
 
     def _register_files(self, name: str, path: str, file_format: str,
-                        id_col: str) -> None:
+            id_col: str) -> None:
         import pyarrow.dataset as ds
 
         dataset = ds.dataset(os.fspath(path), format=file_format)

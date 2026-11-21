@@ -45,7 +45,7 @@ class AnswerRows:
         """Per row, the best logit of each class over its spellings."""
         scores = self.F.linear(normed, self.weights)
         return (scores.index_select(1, self.true_cols).amax(dim=1),
-                scores.index_select(1, self.false_cols).amax(dim=1))
+            scores.index_select(1, self.false_cols).amax(dim=1))
 
     def __call__(self, normed):
         """TRUE/FALSE bits read synchronously, for tests and probes."""
@@ -78,7 +78,7 @@ class AsyncAnswers:
         host = self.available.pop() if self.available else None
         if host is None or host.shape[0] < count:
             host = torch.empty(max(count, 64), dtype=torch.uint8,
-                               pin_memory=bits.is_cuda)
+                pin_memory=bits.is_cuda)
         host[:count].copy_(bits, non_blocking=True)
         event = torch.cuda.Event()
         event.record()
@@ -104,7 +104,7 @@ def answer_rows(rows_per_answer) -> tuple[np.ndarray, np.ndarray]:
     counts = np.asarray(rows_per_answer, dtype=np.int64)
     starts = np.repeat(np.cumsum(counts) - counts, counts)
     return (np.repeat(np.arange(len(counts)), counts),
-            np.arange(int(counts.sum())) - starts)
+        np.arange(int(counts.sum())) - starts)
 
 
 class _HostReadout:
@@ -166,13 +166,13 @@ class AsyncLabelLogprobs(_HostReadout):
         self.F = F
         self.head = head
         self.targets = torch.tensor(list(targets), device=head.device,
-                                    dtype=torch.long)
+            dtype=torch.long)
         self.rows = rows
         self.normalize = normalize
         self.head_rows = None if normalize else head.index_select(
             0, self.targets)
         self.dtype = np.dtype((np.float32, (rows, len(targets)) if rows > 1
-                               else (len(targets),)))
+            else (len(targets),)))
 
     def logprobs(self, normed):
         """Compute selected token values from normalized hidden states.
@@ -188,9 +188,9 @@ class AsyncLabelLogprobs(_HostReadout):
         torch = self.torch
         if not self.normalize:
             return self.F.linear(normed.to(self.head.dtype),
-                                 self.head_rows).float()
+                self.head_rows).float()
         out = torch.empty((normed.shape[0], len(self.targets)),
-                          dtype=torch.float32, device=normed.device)
+            dtype=torch.float32, device=normed.device)
         for start in range(0, normed.shape[0], self.BLOCK_ROWS):
             block = normed[start:start + self.BLOCK_ROWS]
             logits = self.F.linear(block.to(self.head.dtype), self.head).float()
@@ -210,8 +210,8 @@ class AsyncLabelLogprobs(_HostReadout):
                     f"a suffix has {max(rows_per_answer)} rows to read; "
                     f"the readout holds {self.rows}")
             answers = torch.full((len(rows_per_answer), self.rows,
-                                  values.shape[1]), float("nan"),
-                                 dtype=torch.float32, device=values.device)
+                values.shape[1]), float("nan"),
+                dtype=torch.float32, device=values.device)
             # copied from pinned memory, so the host does not wait for
             # the forward pass ahead of the copy on the stream
             answer_index, row_index = (
@@ -266,13 +266,13 @@ class AsyncTopLogprobs(_HostReadout):
         self.width = len(extras) + 2 * k
         self.ragged = ragged
         self.dtype = (np.dtype(object) if ragged
-                      else np.dtype((np.float32, (self.width,))))
+            else np.dtype((np.float32, (self.width,))))
 
     def values(self, normed):
         """Compute each row's values from normalized hidden states."""
         torch = self.torch
         out = torch.empty((normed.shape[0], self.width), dtype=torch.float32,
-                          device=normed.device)
+            device=normed.device)
         for start in range(0, normed.shape[0], self.BLOCK_ROWS):
             block = normed[start:start + self.BLOCK_ROWS]
             logits = self.F.linear(block.to(self.head.dtype), self.head)
@@ -286,7 +286,7 @@ class AsyncTopLogprobs(_HostReadout):
         logits = logits - torch.logsumexp(logits, dim=1, keepdim=True)
         picked = logits.index_select(1, self.extras)
         extras = [torch.logsumexp(picked[:, group], dim=1)[:, None]
-                  for group in self.groups]
+            for group in self.groups]
         top, ids = torch.topk(logits, self.k, dim=1)
         return torch.cat([*extras, ids.float(), top], dim=1)
 
@@ -369,7 +369,7 @@ class AsyncSlotMargins(_SlotReadout):
         rows = self.rows
         logits = rows.F.linear(normed.float(), self.weights)
         margins = (logits.index_select(1, rows.true_cols).amax(dim=1)
-                   - logits.index_select(1, rows.false_cols).amax(dim=1))
+            - logits.index_select(1, rows.false_cols).amax(dim=1))
         return (*self._copy(margins), rows_per_answer)
 
 
@@ -542,15 +542,15 @@ class DecisionHead:
         F, w = self.F, self.w
         hidden = options.shape[-1]
         option = F.layer_norm(options.float(), (hidden,),
-                              w["candidate_norm.weight"], w["candidate_norm.bias"])
+            w["candidate_norm.weight"], w["candidate_norm.bias"])
         query = F.layer_norm(last.float(), (hidden,),
-                             w["query_norm.weight"], w["query_norm.bias"])
+            w["query_norm.weight"], w["query_norm.bias"])
         bilinear = (F.linear(option, w["key.weight"])
-                    * F.linear(query, w["query.weight"])[:, None, :]).sum(-1)
+            * F.linear(query, w["query.weight"])[:, None, :]).sum(-1)
         mlp = F.linear(
             F.gelu(F.linear(option, w["candidate_mlp.weight"],
-                            w["candidate_mlp.bias"])
-                   + F.linear(query, w["query_mlp.weight"])[:, None, :]),
+                w["candidate_mlp.bias"])
+                + F.linear(query, w["query_mlp.weight"])[:, None, :]),
             w["scalar.weight"]).squeeze(-1)
         return bilinear / math.sqrt(self.head_dim) + mlp
 
@@ -574,7 +574,7 @@ class LetterReadout:
 
     @classmethod
     def load(cls, torch, F, path, letters=None, *, turn_suffix="",
-             device="cuda"):
+            device="cuda"):
         """Read the output head's rows of the option letters.
 
         Args:
@@ -607,7 +607,7 @@ class LetterReadout:
         assert all(len(token) == 1 for token in ids)
         index_path = path / "model.safetensors.index.json"
         shard = (json.loads(index_path.read_text())["weight_map"]["lm_head.weight"]
-                 if index_path.exists() else "model.safetensors")
+            if index_path.exists() else "model.safetensors")
         with safe_open(str(path / shard), framework="pt") as tensors:
             head = tensors.get_slice("lm_head.weight")
             rows = torch.cat([head[token:token + 1] for (token,) in ids])
@@ -688,7 +688,7 @@ class AsyncDecisions(DecisionRows):
     def submit(self, normed, rows_per_answer=None):
         scores = self.scores(normed, rows_per_answer)
         return self._copy((scores[:, 1] > scores[:, 0]).to(self.torch.uint8),
-                          self.torch.uint8)
+            self.torch.uint8)
 
     @staticmethod
     def result(handle):
@@ -706,7 +706,7 @@ class AsyncDecisionScores(DecisionRows):
     def submit(self, normed, rows_per_answer=None):
         scores = self.scores(normed, rows_per_answer)
         return self._copy(self.torch.sigmoid(scores[:, 1] - scores[:, 0]),
-                          self.torch.float32)
+            self.torch.float32)
 
     @staticmethod
     def result(handle):

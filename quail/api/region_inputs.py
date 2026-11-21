@@ -34,7 +34,7 @@ def input_scans(facts: dict, catalog) -> dict:
         catalog: The session's catalog.
     """
     return {scan["provider"]: scan for scan in facts["scans"]
-            if scan["provider"] not in catalog}
+        if scan["provider"] not in catalog}
 
 
 def source_rows(catalog, name: str, table) -> pa.Array | None:
@@ -57,7 +57,7 @@ def source_rows(catalog, name: str, table) -> pa.Array | None:
 
 
 def region_query(session, operators: str, *, tables: dict | None = None,
-                 keep_order: bool = False, **options):
+        keep_order: bool = False, **options):
     """Return the RegionQuery for a model region, over its input tables.
 
     Args:
@@ -75,7 +75,7 @@ def region_query(session, operators: str, *, tables: dict | None = None,
     from quail.api.query import RegionQuery
 
     scans = input_scans(json.loads(_quail_native.region_facts(operators)),
-                        session.catalog)
+        session.catalog)
     if not scans:
         return RegionQuery(session, operators, **options)
     providers = dict(session.catalog.providers)
@@ -95,7 +95,7 @@ def region_query(session, operators: str, *, tables: dict | None = None,
             table = pa.ipc.read_schema(pa.py_buffer(
                 base64.b64decode(scan["schema_ipc"]))).empty_table()
         providers[name] = MemoryTableProvider(table, id_col="",
-                                              identity=f"input:{name}")
+            identity=f"input:{name}")
     catalog = Catalog(providers)
     query = RegionQuery(session, operators, catalog=catalog, **options)
     query.source_rows = rows

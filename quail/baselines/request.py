@@ -48,7 +48,7 @@ def execute_request_graph(context, backend, engine_state, boot):
     ))
     client = engine_state["client"]
     images = RegionImages(documents, context.request.column_tables(),
-                          context.registry.model(envelope["model"]))
+        context.registry.model(envelope["model"]))
     if images:
         if not hasattr(client, "image_pad_id"):
             raise ValueError(f"{backend.name} reads no image documents")
@@ -57,14 +57,14 @@ def execute_request_graph(context, backend, engine_state, boot):
         model_execution.submit_text = False
     try:
         return _run_request_graph(context, backend, engine_state, boot,
-                                  model_execution, documents)
+            model_execution, documents)
     finally:
         if images:
             client.images = None
 
 
 def _run_request_graph(context, backend, engine_state, boot, model_execution,
-                       documents):
+        documents):
     try:
         import torch
     except ImportError:
@@ -81,7 +81,7 @@ def _run_request_graph(context, backend, engine_state, boot, model_execution,
             model_execution=model_execution,
             sources={
                 **{alias: range(len(value))
-                   for alias, value in documents.items()},
+                    for alias, value in documents.items()},
                 **context.request.relations,
             },
         ),

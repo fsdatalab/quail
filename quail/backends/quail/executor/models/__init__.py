@@ -14,10 +14,10 @@ from quail.backends.quail.executor.models.qwen3 import Qwen3Pipeline
 from quail.backends.quail.executor.models.qwen3_5 import Qwen35Pipeline
 
 PIPELINES = {"qwen3": Qwen3Pipeline,
-             "qwen3_5": Qwen35Pipeline,
-             "lfm2": Lfm2Pipeline,
-             "lfm3": Lfm3Pipeline,
-             "diffusion_gemma": DiffusionGemmaPipeline}
+    "qwen3_5": Qwen35Pipeline,
+    "lfm2": Lfm2Pipeline,
+    "lfm3": Lfm3Pipeline,
+    "diffusion_gemma": DiffusionGemmaPipeline}
 
 
 def supported_archs() -> frozenset:
@@ -35,8 +35,8 @@ def build_pipeline(spec, model, arena, **kwargs) -> ModelPipeline:
     mask = "document_isolated" if spec.bidirectional else "causal"
     if mask not in cls.masks:
         raise ValueError(f"the {spec.arch} forward pass runs only the "
-                         f"{', '.join(cls.masks)} mask, not {spec.name}'s "
-                         f"{mask}")
+            f"{', '.join(cls.masks)} mask, not {spec.name}'s "
+            f"{mask}")
     return cls(model, arena, spec=spec, **kwargs)
 
 

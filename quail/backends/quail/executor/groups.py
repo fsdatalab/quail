@@ -19,7 +19,7 @@ class SlidingAttentionGroup:
         slots, inverse = np.unique(rows.slots, return_inverse=True)
         pages = [self.arena.owned_sliding_pages(self.keys[slot]) for slot in slots]
         starts = np.array([self.arena.sliding_start(self.keys[slot])
-                           for slot in slots], dtype=np.int64)
+            for slot in slots], dtype=np.int64)
         table = np.zeros((len(slots), max(map(len, pages))), dtype=np.int32)
         for index, owned in enumerate(pages):
             table[index, :len(owned)] = owned
@@ -27,9 +27,9 @@ class SlidingAttentionGroup:
         positions = rows.positions - starts[inverse]
         page_tokens = self.arena.page_tokens
         write_rows = (table[np.arange(len(rows)), positions // page_tokens]
-                      .astype(np.int64) * page_tokens + positions % page_tokens)
+            .astype(np.int64) * page_tokens + positions % page_tokens)
         return replace(rows, write_rows=write_rows, own_table=table,
-                       own_lengths=positions + 1)
+            own_lengths=positions + 1)
 
 
 class StateGroup:
@@ -49,7 +49,7 @@ class StateGroup:
             key = self.keys[slot]
             extension = self.arena.extension(key)
             start = (extension[1] if extension is not None
-                     else self.arena.checkpoint_tokens(key))
+                else self.arena.checkpoint_tokens(key))
             end = int(rows.positions[begin])
             if start < end:
                 spans.append((int(slot), start, end))
@@ -133,9 +133,9 @@ class FullAttentionGroup:
         table = self.pages[running, :width]
         index = np.arange(len(running))
         write_rows = (table[index, page].astype(np.int64)
-                      * self.page_tokens + positions % self.page_tokens)
+            * self.page_tokens + positions % self.page_tokens)
         rows = DecodeRows(positions=positions, write_rows=write_rows,
-                          page_table=table, slots=running)
+            page_table=table, slots=running)
         if not share:
             return rows
         # a group is a slot and the slots that borrow the most from it,

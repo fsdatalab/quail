@@ -59,8 +59,8 @@ class AnswerStop:
     hint: object = None
 
     def decide(self, prefix: str, *, may_be_null: bool = False,
-               tails: list[str] | None = None,
-               max_chars: int | None = None) -> Stop:
+            tails: list[str] | None = None,
+            max_chars: int | None = None) -> Stop:
         """Return whether to stop an answer whose text so far is prefix.
 
         Args:
@@ -71,7 +71,7 @@ class AnswerStop:
             max_chars: The most characters the answer may add, or None.
         """
         return self.decide_any([dict(prefix=prefix, may_be_null=may_be_null,
-                                     tails=tails, max_chars=max_chars)])
+            tails=tails, max_chars=max_chars)])
 
     def decide_any(self, completions: list[dict]) -> Stop:
         """Return whether to stop an answer that may go on as any of completions.
@@ -90,8 +90,8 @@ class AnswerStop:
         decided = []
         for test in self.stop_tests:
             found = {test.decide(self.answer, **completion)
-                     if hasattr(test, "decide") else "undecided"
-                     for completion in completions}
+                if hasattr(test, "decide") else "undecided"
+                for completion in completions}
             decided.append(found.pop() if len(found) == 1 else "undecided")
         if "not true" in decided:
             return Stop.REJECTED
@@ -117,7 +117,7 @@ def answer_stop(node, hint=None) -> AnswerStop | None:
     if not stop_tests and hint is None:
         return None
     return AnswerStop(node.spec.name, stop_tests,
-                      bool(getattr(node, "stop_when_true", False)), hint)
+        bool(getattr(node, "stop_when_true", False)), hint)
 
 
 def copied_completions(text: str, spans) -> list[dict]:

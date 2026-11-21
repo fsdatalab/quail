@@ -68,17 +68,17 @@ def launch_triton(kernel, grid, args, *, key, kwargs, exact_args=True):
         return kernel[grid](*args, **kwargs)
     device = next(
         (v.device.index if v.device.index is not None else torch.cuda.current_device()
-         for v in args
-         if getattr(getattr(v, "device", None), "type", None) == "cuda"),
+            for v in args
+            if getattr(getattr(v, "device", None), "type", None) == "cuda"),
         torch.cuda.current_device())
     sig = []
     for value in args:
         if hasattr(value, "data_ptr"):
             sig.append((value.dtype, (value.data_ptr() & 15) == 0)
-                       if exact_args else value.dtype)
+                if exact_args else value.dtype)
         elif exact_args and isinstance(value, int):
             sig.append((value == 1, (value & 15) == 0,
-                        value < -0x80000000 or value > 0x7FFFFFFF))
+                value < -0x80000000 or value > 0x7FFFFFFF))
     cache_key = (device, id(kernel), key, tuple(sig))
     entry = _COMPILED_TRITON.get(cache_key)
     if entry is None:
@@ -95,8 +95,8 @@ def launch_triton(kernel, grid, args, *, key, kwargs, exact_args=True):
 
 
 def supports_splitkv_decode(fa_version: int, head_dim: int, page_tokens: int,
-                            num_q_heads: int, num_kv_heads: int, *,
-                            causal: bool, max_q: int, dtype=None) -> bool:
+        num_q_heads: int, num_kv_heads: int, *,
+        causal: bool, max_q: int, dtype=None) -> bool:
     """Return whether a paged call should run Triton Split-KV decode."""
     if dtype is not None:
         import torch
@@ -104,10 +104,10 @@ def supports_splitkv_decode(fa_version: int, head_dim: int, page_tokens: int,
         if dtype != torch.bfloat16:
             return False
     return (fa_version == 4 and head_dim == 256 and causal
-            and 0 < max_q <= TRITON_DECODE_MAX_Q
-            and page_tokens > 0 and page_tokens % _SPLITKV_TILE_N == 0
-            and (head_dim & (head_dim - 1)) == 0
-            and num_kv_heads > 0 and num_q_heads % num_kv_heads == 0)
+        and 0 < max_q <= TRITON_DECODE_MAX_Q
+        and page_tokens > 0 and page_tokens % _SPLITKV_TILE_N == 0
+        and (head_dim & (head_dim - 1)) == 0
+        and num_kv_heads > 0 and num_q_heads % num_kv_heads == 0)
 
 
 def _splitkv_kernels() -> dict:
@@ -158,7 +158,7 @@ def _splitkv_kernels() -> dict:
         first_tile = k_lo // TILE_N
         last_tile = (visible_k + TILE_N - 1) // TILE_N
         tiles_per = (tl.maximum(0, last_tile - first_tile)
-                     + num_splits - 1) // num_splits
+            + num_splits - 1) // num_splits
         tile_start = first_tile + split_id * tiles_per
         tile_end = tl.minimum(last_tile, tile_start + tiles_per)
         offs_g = tl.arange(0, GROUP_PAD)
@@ -172,8 +172,8 @@ def _splitkv_kernels() -> dict:
             if PDL:
                 tl.extra.cuda.gdc_wait()
             q_ptrs = (q_ptr + q_row * stride_q0
-                      + (kv_head * GROUP + offs_g[:, None]) * stride_q1
-                      + offs_d[None, :])
+                + (kv_head * GROUP + offs_g[:, None]) * stride_q1
+                + offs_d[None, :])
             q_tile = tl.load(q_ptrs, mask=g_mask[:, None], other=0.0)
             offs_k_tile = tl.arange(0, TILE_N)
             bt_row = block_tables_ptr + seq * stride_bt
@@ -183,23 +183,23 @@ def _splitkv_kernels() -> dict:
                 in_page = position - page_index * PAGE_TOKENS
                 phys_page = tl.load(bt_row + page_index).to(tl.int64)
                 k_ptrs = (k_ptr + phys_page * stride_k0
-                          + (in_page + offs_k_tile[:, None]) * stride_k1
-                          + kv_head * stride_k2 + offs_d[None, :])
+                    + (in_page + offs_k_tile[:, None]) * stride_k1
+                    + kv_head * stride_k2 + offs_d[None, :])
                 v_ptrs = (v_ptr + phys_page * stride_v0
-                          + (in_page + offs_k_tile[:, None]) * stride_v1
-                          + kv_head * stride_v2 + offs_d[None, :])
+                    + (in_page + offs_k_tile[:, None]) * stride_v1
+                    + kv_head * stride_v2 + offs_d[None, :])
                 key_position = position + offs_k_tile
                 key_valid = (key_position < visible_k) & (key_position >= k_lo)
                 k_tile = tl.load(k_ptrs, mask=key_valid[:, None], other=0.0)
                 v_tile = tl.load(v_ptrs, mask=key_valid[:, None], other=0.0)
                 qk = tl.where(key_valid[None, :],
-                              tl.dot(q_tile, tl.trans(k_tile)) * scale_log2,
-                              -1e38)
+                    tl.dot(q_tile, tl.trans(k_tile)) * scale_log2,
+                    -1e38)
                 m_new = tl.maximum(m_i, tl.max(qk, axis=1))
                 valid_row = m_new > -1e30
                 alpha = tl.where(valid_row, tl.math.exp2(m_i - m_new), 0.0)
                 p = tl.where(valid_row[:, None] & key_valid[None, :],
-                             tl.math.exp2(qk - m_new[:, None]), 0.0)
+                    tl.math.exp2(qk - m_new[:, None]), 0.0)
                 l_i = l_i * alpha + tl.sum(p, axis=1)
                 acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v_tile)
                 m_i = m_new
@@ -209,18 +209,18 @@ def _splitkv_kernels() -> dict:
             tl.extra.cuda.gdc_launch_dependents()
         if SINGLE_SPLIT:
             o_ptrs = (out_ptr + q_row * stride_o0
-                      + (kv_head * GROUP + offs_g[:, None]) * stride_o1
-                      + offs_d[None, :])
+                + (kv_head * GROUP + offs_g[:, None]) * stride_o1
+                + offs_d[None, :])
             tl.store(o_ptrs, norm_acc.to(out_ptr.dtype.element_ty),
-                     mask=g_mask[:, None])
+                mask=g_mask[:, None])
         else:
             lse = tl.where(l_i > 0.0, m_i + tl.math.log2(l_i), -1e38)
             po_ptrs = (part_out_ptr + q_row * stride_po_q
-                       + kv_head * stride_po_kv + split_id * stride_po_s
-                       + offs_g[:, None] * stride_po_g + offs_d[None, :])
+                + kv_head * stride_po_kv + split_id * stride_po_s
+                + offs_g[:, None] * stride_po_g + offs_d[None, :])
             pl_ptrs = (part_lse_ptr + q_row * stride_pl_q
-                       + kv_head * stride_pl_kv + split_id * stride_pl_s
-                       + offs_g)
+                + kv_head * stride_pl_kv + split_id * stride_pl_s
+                + offs_g)
             tl.store(po_ptrs, norm_acc, mask=g_mask[:, None])
             tl.store(pl_ptrs, lse, mask=g_mask)
 
@@ -243,11 +243,11 @@ def _splitkv_kernels() -> dict:
         if PDL:
             tl.extra.cuda.gdc_wait()
         m_max = tl.max(tl.load(pl_base + offs_s * stride_pl_s,
-                               mask=offs_s < num_splits, other=-1e38), axis=0)
+            mask=offs_s < num_splits, other=-1e38), axis=0)
         acc = tl.zeros([HEAD_DIM], dtype=tl.float32)
         w_sum = 0.0
         po_base = (part_out_ptr + q_row * stride_po_q
-                   + kv_head * stride_po_kv + g * stride_po_g + offs_d)
+            + kv_head * stride_po_kv + g * stride_po_g + offs_d)
         for split_id in range(0, num_splits):
             lse_s = tl.load(pl_base + split_id * stride_pl_s)
             if lse_s > -1e30:
@@ -259,7 +259,7 @@ def _splitkv_kernels() -> dict:
         if PDL:
             tl.extra.cuda.gdc_launch_dependents()
         tl.store(out_ptr + q_row * stride_o0 + q_head * stride_o1 + offs_d,
-                 out_val)
+            out_val)
 
     _SPLITKV_KERNELS.update(
         splitkv_decode_part=splitkv_decode_part,
@@ -269,8 +269,8 @@ def _splitkv_kernels() -> dict:
 
 
 def triton_splitkv_decode(q3, kp, vp, cu_q, max_q, seqused_k, max_seqused_k,
-                          block_table, *, softmax_scale=None, window=None,
-                          output=None, workspace=None):
+        block_table, *, softmax_scale=None, window=None,
+        output=None, workspace=None):
     """Causal paged attention for short queries with dynamic Split-KV and PDL."""
     import torch
 
@@ -287,12 +287,12 @@ def triton_splitkv_decode(q3, kp, vp, cu_q, max_q, seqused_k, max_seqused_k,
     group = num_q_heads // num_kv_heads
     group_pad = max(16, 1 << (group - 1).bit_length())
     scale_log2 = (head_dim ** -0.5 if softmax_scale is None
-                  else float(softmax_scale)) * 1.4426950408889634
+        else float(softmax_scale)) * 1.4426950408889634
     has_window = window is not None and (window[0] >= 0 or window[1] >= 0)
     window_left = window[0] if has_window else -1
     window_right = window[1] if has_window else -1
     dev_index = (q3.device.index if q3.device.index is not None
-                 else torch.cuda.current_device())
+        else torch.cuda.current_device())
     num_sms = _SM_COUNTS.get(dev_index)
     if num_sms is None:
         num_sms = _SM_COUNTS[dev_index] = int(
@@ -300,7 +300,7 @@ def triton_splitkv_decode(q3, kp, vp, cu_q, max_q, seqused_k, max_seqused_k,
     base_ctas = num_seqs * max_q * num_kv_heads
     max_useful = max(1, (max_seqused_k + page_tokens - 1) // page_tokens)
     num_splits = min(_SPLITKV_MAX_SPLITS, max_useful,
-                     max(1, (4 * num_sms + base_ctas - 1) // base_ctas))
+        max(1, (4 * num_sms + base_ctas - 1) // base_ctas))
     single_split = num_splits == 1
     if single_split:
         part_out, part_lse, po_strides, pl_strides = out, out, (0,) * 4, (0,) * 3
@@ -310,10 +310,10 @@ def triton_splitkv_decode(q3, kp, vp, cu_q, max_q, seqused_k, max_seqused_k,
         if cached is None or cached[0].shape[0] < total_q:
             cap_q = max(total_q, 64 if cached is None else cached[0].shape[0])
             buf_out = torch.empty((cap_q, num_kv_heads, _SPLITKV_MAX_SPLITS,
-                                   group, head_dim), dtype=torch.float32,
-                                  device=q3.device)
+                group, head_dim), dtype=torch.float32,
+                device=q3.device)
             buf_lse = torch.empty((cap_q, num_kv_heads, _SPLITKV_MAX_SPLITS,
-                                   group), dtype=torch.float32, device=q3.device)
+                group), dtype=torch.float32, device=q3.device)
             if workspace is not None:
                 workspace[buf_key] = (buf_out, buf_lse)
         else:
@@ -343,20 +343,20 @@ def triton_splitkv_decode(q3, kp, vp, cu_q, max_q, seqused_k, max_seqused_k,
         (num_seqs * max_q, num_kv_heads, num_splits), part_args,
         key=part_key, exact_args=False,
         kwargs=dict(GROUP=group, GROUP_PAD=group_pad, HEAD_DIM=head_dim,
-                    PAGE_TOKENS=page_tokens, TILE_N=_SPLITKV_TILE_N,
-                    HAS_WINDOW=has_window, SINGLE_SPLIT=single_split,
-                    PDL=pdl, num_warps=4, num_stages=3, launch_pdl=pdl))
+            PAGE_TOKENS=page_tokens, TILE_N=_SPLITKV_TILE_N,
+            HAS_WINDOW=has_window, SINGLE_SPLIT=single_split,
+            PDL=pdl, num_warps=4, num_stages=3, launch_pdl=pdl))
     if not single_split:
         launch_triton(
             _splitkv_kernels()["splitkv_decode_reduce"], (total_q, num_q_heads),
             (part_out, part_lse, out, *po_strides, *pl_strides,
-             out.stride(0), out.stride(1), int(num_splits)),
+                out.stride(0), out.stride(1), int(num_splits)),
             key=(group, head_dim, _SPLITKV_MAX_SPLITS, pdl,
-                 (out.data_ptr() & 15) == 0, (out.stride(0) & 15) == 0),
+                (out.data_ptr() & 15) == 0, (out.stride(0) & 15) == 0),
             exact_args=False,
             kwargs=dict(GROUP=group, HEAD_DIM=head_dim,
-                        MAX_SPLITS=_SPLITKV_MAX_SPLITS, PDL=pdl,
-                        num_warps=4, launch_pdl=pdl))
+                MAX_SPLITS=_SPLITKV_MAX_SPLITS, PDL=pdl,
+                num_warps=4, launch_pdl=pdl))
     return out
 
 # The two attention paths a chunk can run. "unified" is one causal
@@ -424,7 +424,7 @@ def merge_partial(out, lse, index, out_c, lse_c) -> None:
     weight_b = (w_b / total).transpose(0, 1).unsqueeze(-1)
     weight_c = (w_c / total).transpose(0, 1).unsqueeze(-1)
     merged = (out.index_select(0, index).float() * weight_b
-              + out_c.float() * weight_c)
+        + out_c.float() * weight_c)
     out.index_copy_(0, index, merged.to(out.dtype))
     lse[:, index] = top + total.log()
 
@@ -444,13 +444,13 @@ class Engine:
     """
 
     def __init__(self, arena, *, num_q_heads, num_kv_heads, head_dim, rotary, fp8,
-                 kernels="quail"):
+            kernels="quail"):
         import torch
         from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
 
         if kernels not in ("quail", "vllm"):
             raise ValueError(f"kernels must be 'quail' or 'vllm', "
-                             f"got {kernels!r}")
+                f"got {kernels!r}")
         self.kernels = kernels
 
         capability = torch.cuda.get_device_capability()
@@ -486,8 +486,8 @@ class Engine:
                 (q_input.shape[0], linear.weight.shape[0]),
                 dtype=self.torch.bfloat16, device=q_input.device)
             fp8_gemm_nt((q_input, input_scale),
-                        (linear.weight, weight_scale),
-                        out, is_deep_gemm_e8m0_used=self.use_ue8m0)
+                (linear.weight, weight_scale),
+                out, is_deep_gemm_e8m0_used=self.use_ue8m0)
             return out
         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
             w8a8_triton_block_scaled_mm,
@@ -558,7 +558,7 @@ class Engine:
     def fused_add_rms_norm(self, hidden, residual, norm):
         from vllm import _custom_ops as ops
         ops.fused_add_rms_norm(hidden, residual, norm.weight,
-                               norm.variance_epsilon)
+            norm.variance_epsilon)
         return hidden, residual
 
     def norm_quant_rows(self, x, weight, eps):
@@ -606,11 +606,11 @@ class Engine:
         n = qkv.shape[0]
         torch = self.torch
         q = torch.empty((n, num_q_heads * head_dim), dtype=torch.bfloat16,
-                        device=qkv.device)
+            device=qkv.device)
         k = torch.empty((n, num_kv_heads * head_dim), dtype=torch.bfloat16,
-                        device=qkv.device)
+            device=qkv.device)
         v = torch.empty((n, num_kv_heads * head_dim), dtype=torch.bfloat16,
-                        device=qkv.device)
+            device=qkv.device)
         self._triton_kernels()["qkv"][(n,)](
             qkv, q, k, v, cos_sin_cache, positions, q_weight, k_weight,
             qkv.stride(0), q.stride(0), k.stride(0), v.stride(0), eps,
@@ -619,7 +619,7 @@ class Engine:
         return q, k, v
 
     def qk_norm_rope_heads(self, qkv, positions, *, num_q_heads, num_kv_heads,
-                           head_dim, q_weight, k_weight, eps, cos_sin_cache):
+            head_dim, q_weight, k_weight, eps, cos_sin_cache):
         """The fused per-head q and k RMS norm plus neox rotary, any geometry.
 
         qkv_norm_rope_heads without the norm of v: q and k are read from
@@ -630,9 +630,9 @@ class Engine:
         n = qkv.shape[0]
         torch = self.torch
         q = torch.empty((n, num_q_heads * head_dim), dtype=torch.bfloat16,
-                        device=qkv.device)
+            device=qkv.device)
         k = torch.empty((n, num_kv_heads * head_dim), dtype=torch.bfloat16,
-                        device=qkv.device)
+            device=qkv.device)
         self._triton_kernels()["qk"][(n,)](
             qkv, q, k, cos_sin_cache, positions, q_weight, k_weight,
             qkv.stride(0), q.stride(0), k.stride(0), eps,
@@ -651,9 +651,9 @@ class Engine:
         n, doubled = gate_up.shape
         half = doubled // 2
         q = self.torch.empty((n, half), dtype=self.torch.float8_e4m3fn,
-                             device=gate_up.device)
+            device=gate_up.device)
         scales = self.torch.empty((n, 1), dtype=self.torch.float32,
-                                  device=gate_up.device)
+            device=gate_up.device)
         self._triton_kernels()["gelu_quant"][(n,)](
             gate_up, q, scales, gate_up.stride(0), q.stride(0),
             HALF=half, BLOCK=1 << (half - 1).bit_length(),
@@ -668,9 +668,9 @@ class Engine:
         """
         n, width = x.shape
         q = self.torch.empty((n, width), dtype=self.torch.float8_e4m3fn,
-                             device=x.device)
+            device=x.device)
         scales = self.torch.empty((n, 1), dtype=self.torch.float32,
-                                  device=x.device)
+            device=x.device)
         self._triton_kernels()["scale_norm_quant"][(n,)](
             x, residual, weight, q, scales, x.stride(0), residual.stride(0),
             q.stride(0), float(scale), eps, H=width,
@@ -687,7 +687,7 @@ class Engine:
         first = self.torch.empty_like(x, dtype=dtype)
         second = self.torch.empty_like(x)
         scales = (self.torch.empty((n, 1), dtype=self.torch.float32,
-                                   device=x.device) if output_fp8 else None)
+            device=x.device) if output_fp8 else None)
         self._triton_kernels()["norm2"][(n,)](
             x, weight1, weight2, first, second, scales, x.stride(0),
             first.stride(0), second.stride(0), eps, H=width,
@@ -733,26 +733,26 @@ class Engine:
 
         @triton.jit
         def gemma_add_rms_norm(x_ptr, res_ptr, w_ptr, out_ptr, res_out_ptr,
-                               stride_x, stride_res, stride_out,
-                               stride_res_out, eps, H: tl.constexpr,
-                               BLOCK: tl.constexpr,
-                               HAS_RESIDUAL: tl.constexpr):
+                stride_x, stride_res, stride_out,
+                stride_res_out, eps, H: tl.constexpr,
+                BLOCK: tl.constexpr,
+                HAS_RESIDUAL: tl.constexpr):
             row = tl.program_id(0).to(tl.int64)
             offs = tl.arange(0, BLOCK)
             mask = offs < H
             total = tl.load(x_ptr + row * stride_x + offs, mask=mask,
-                            other=0.0).to(tl.float32)
+                other=0.0).to(tl.float32)
             if HAS_RESIDUAL:
                 total += tl.load(res_ptr + row * stride_res + offs,
-                                 mask=mask, other=0.0).to(tl.float32)
+                    mask=mask, other=0.0).to(tl.float32)
                 tl.store(res_out_ptr + row * stride_res_out + offs,
-                         total.to(res_out_ptr.dtype.element_ty), mask=mask)
+                    total.to(res_out_ptr.dtype.element_ty), mask=mask)
             variance = tl.sum(total * total, axis=0) / H
             scale = 1.0 + tl.load(w_ptr + offs, mask=mask,
-                                  other=0.0).to(tl.float32)
+                other=0.0).to(tl.float32)
             normed = total * tl.math.rsqrt(variance + eps) * scale
             tl.store(out_ptr + row * stride_out + offs,
-                     normed.to(out_ptr.dtype.element_ty), mask=mask)
+                normed.to(out_ptr.dtype.element_ty), mask=mask)
 
         self._gemma_kernel = gemma_add_rms_norm
         return self._gemma_kernel
@@ -770,9 +770,9 @@ class Engine:
         # fuses vLLM's silu_and_mul + per_token_group_quant_fp8
         @triton.jit
         def silu_mul_quant(gu_ptr, q_ptr, s_ptr, stride_gu, stride_q,
-                           s_stride_g, s_stride_t,
-                           HALF: tl.constexpr, GROUP_C: tl.constexpr,
-                           GPB: tl.constexpr, UE8M0: tl.constexpr):
+                s_stride_g, s_stride_t,
+                HALF: tl.constexpr, GROUP_C: tl.constexpr,
+                GPB: tl.constexpr, UE8M0: tl.constexpr):
             t = tl.program_id(0)
             block = tl.program_id(1)
             offs = block * GROUP_C * GPB + tl.arange(0, GROUP_C * GPB)
@@ -787,29 +787,29 @@ class Engine:
             q = y2 / scale[:, None]
             q = tl.minimum(tl.maximum(q, -448.0), 448.0)
             tl.store(q_ptr + t * stride_q + offs,
-                     tl.reshape(q, (GROUP_C * GPB,)).to(
-                         q_ptr.dtype.element_ty))
+                tl.reshape(q, (GROUP_C * GPB,)).to(
+                    q_ptr.dtype.element_ty))
             group_index = block * GPB + tl.arange(0, GPB)
             tl.store(s_ptr + group_index * s_stride_g + t * s_stride_t, scale)
 
         # fuses vLLM's fused_add_rms_norm + per_token_group_quant_fp8
         @triton.jit
         def add_rms_norm_quant(x_ptr, res_ptr, w_ptr, q_ptr, s_ptr,
-                               stride_x, stride_res, stride_q,
-                               s_stride_g, s_stride_t, eps,
-                               H: tl.constexpr, BLOCK: tl.constexpr,
-                               GROUP_C: tl.constexpr, NG: tl.constexpr,
-                               UE8M0: tl.constexpr):
+                stride_x, stride_res, stride_q,
+                s_stride_g, s_stride_t, eps,
+                H: tl.constexpr, BLOCK: tl.constexpr,
+                GROUP_C: tl.constexpr, NG: tl.constexpr,
+                UE8M0: tl.constexpr):
             t = tl.program_id(0)
             offs = tl.arange(0, BLOCK)
             mask = offs < H
             x = tl.load(x_ptr + t * stride_x + offs, mask=mask,
-                        other=0.0).to(tl.float32)
+                other=0.0).to(tl.float32)
             r = tl.load(res_ptr + t * stride_res + offs, mask=mask,
-                        other=0.0).to(tl.float32)
+                other=0.0).to(tl.float32)
             x = x + r
             tl.store(res_ptr + t * stride_res + offs,
-                     x.to(res_ptr.dtype.element_ty), mask=mask)
+                x.to(res_ptr.dtype.element_ty), mask=mask)
             ms = tl.sum(x * x, axis=0) / H
             rstd = 1.0 / tl.sqrt(ms + eps)
             w = tl.load(w_ptr + offs, mask=mask, other=0.0).to(tl.float32)
@@ -822,19 +822,19 @@ class Engine:
             q = y2 / scale[:, None]
             q = tl.minimum(tl.maximum(q, -448.0), 448.0)
             tl.store(q_ptr + t * stride_q + offs,
-                     tl.reshape(q, (BLOCK,)).to(q_ptr.dtype.element_ty),
-                     mask=mask)
+                tl.reshape(q, (BLOCK,)).to(q_ptr.dtype.element_ty),
+                mask=mask)
             group_index = tl.arange(0, BLOCK // GROUP_C)
             tl.store(s_ptr + group_index * s_stride_g + t * s_stride_t, scale,
-                     mask=group_index < NG)
+                mask=group_index < NG)
 
         # fuses vLLM's two per-head rms_norm calls + rotary_emb
         # (five launches) into one
         @triton.jit
         def qk_norm_rope(qkv_ptr, q_out_ptr, k_out_ptr, cs_ptr, position_ptr,
-                         qw_ptr, kw_ptr, stride_qkv, stride_qo, stride_ko,
-                         eps, QH: tl.constexpr, KH: tl.constexpr,
-                         HD: tl.constexpr, HALF: tl.constexpr):
+                qw_ptr, kw_ptr, stride_qkv, stride_qo, stride_ko,
+                eps, QH: tl.constexpr, KH: tl.constexpr,
+                HD: tl.constexpr, HALF: tl.constexpr):
             t = tl.program_id(0)
             position = tl.load(position_ptr + t)
             half_offs = tl.arange(0, HALF)
@@ -857,9 +857,9 @@ class Engine:
             out_a = qa * cos[None, :] - qb * sin[None, :]
             out_b = qb * cos[None, :] + qa * sin[None, :]
             tl.store(q_out_ptr + t * stride_qo + qa_offs,
-                     out_a.to(q_out_ptr.dtype.element_ty))
+                out_a.to(q_out_ptr.dtype.element_ty))
             tl.store(q_out_ptr + t * stride_qo + qb_offs,
-                     out_b.to(q_out_ptr.dtype.element_ty))
+                out_b.to(q_out_ptr.dtype.element_ty))
 
             k_heads = tl.arange(0, KH)
             ka_offs = k_heads[:, None] * HD + half_offs[None, :]
@@ -874,9 +874,9 @@ class Engine:
             out_a = ka * cos[None, :] - kb * sin[None, :]
             out_b = kb * cos[None, :] + ka * sin[None, :]
             tl.store(k_out_ptr + t * stride_ko + ka_offs,
-                     out_a.to(k_out_ptr.dtype.element_ty))
+                out_a.to(k_out_ptr.dtype.element_ty))
             tl.store(k_out_ptr + t * stride_ko + kb_offs,
-                     out_b.to(k_out_ptr.dtype.element_ty))
+                out_b.to(k_out_ptr.dtype.element_ty))
 
         # the paged-KV append every paged engine has (vLLM:
         # reshape_and_cache_flash; FlashInfer: append_paged_kv_cache),
@@ -884,8 +884,8 @@ class Engine:
         # packed chunk are written, from arbitrary positions
         @triton.jit
         def kv_row_scatter(k_src_ptr, v_src_ptr, k_dst_ptr, v_dst_ptr,
-                           src_rows_ptr, dst_rows_ptr,
-                           ROW: tl.constexpr, ROW_POW2: tl.constexpr):
+                src_rows_ptr, dst_rows_ptr,
+                ROW: tl.constexpr, ROW_POW2: tl.constexpr):
             i = tl.program_id(0)
             s = tl.load(src_rows_ptr + i)
             d = tl.load(dst_rows_ptr + i)
@@ -901,32 +901,32 @@ class Engine:
         # off it stores the bf16 merge and no scales
         @triton.jit
         def merge_attn_quant(a_ptr, b_ptr, la_ptr, lb_ptr, source_ptr,
-                             q_ptr, s_ptr,
-                             stride_a_t, stride_a_h, stride_b_t, stride_b_h,
-                             stride_la_t, stride_la_h,
-                             stride_lb_t, stride_lb_h,
-                             stride_q_t, s_stride_g, s_stride_t,
-                             D: tl.constexpr, GPB: tl.constexpr,
-                             UE8M0: tl.constexpr, QUANT: tl.constexpr):
+                q_ptr, s_ptr,
+                stride_a_t, stride_a_h, stride_b_t, stride_b_h,
+                stride_la_t, stride_la_h,
+                stride_lb_t, stride_lb_h,
+                stride_q_t, s_stride_g, s_stride_t,
+                D: tl.constexpr, GPB: tl.constexpr,
+                UE8M0: tl.constexpr, QUANT: tl.constexpr):
             t = tl.program_id(0)
             block = tl.program_id(1)
             offs = tl.arange(0, D * GPB)
             h0 = block * GPB
             a = tl.load(a_ptr + t * stride_a_t
-                        + h0 * stride_a_h + offs)
+                + h0 * stride_a_h + offs)
             source = tl.load(source_ptr + t)
             has_b = source >= 0
             source_safe = tl.maximum(source, 0)
             b = tl.load(b_ptr + source_safe * stride_b_t
-                        + h0 * stride_b_h + offs,
-                        mask=has_b, other=0.0)
+                + h0 * stride_b_h + offs,
+                mask=has_b, other=0.0)
             heads = h0 + tl.arange(0, GPB)
             la = tl.load(la_ptr + t * stride_la_t
-                         + heads * stride_la_h,
-                         mask=has_b, other=0.0)
+                + heads * stride_la_h,
+                mask=has_b, other=0.0)
             lb = tl.load(lb_ptr + source_safe * stride_lb_t
-                         + heads * stride_lb_h,
-                         mask=has_b, other=0.0)
+                + heads * stride_lb_h,
+                mask=has_b, other=0.0)
             w = tl.sigmoid(lb - la).to(tl.bfloat16).to(tl.float32)
             a2 = tl.reshape(a, (GPB, D)).to(tl.float32)
             b2 = tl.reshape(b, (GPB, D)).to(tl.float32)
@@ -941,25 +941,25 @@ class Engine:
                 q = y / scale[:, None]
                 q = tl.minimum(tl.maximum(q, -448.0), 448.0)
                 tl.store(q_ptr + t * stride_q_t + h0 * D + offs,
-                         tl.reshape(q, (D * GPB,)).to(q_ptr.dtype.element_ty))
+                    tl.reshape(q, (D * GPB,)).to(q_ptr.dtype.element_ty))
                 tl.store(s_ptr + heads * s_stride_g + t * s_stride_t, scale)
             else:
                 tl.store(q_ptr + t * stride_q_t + h0 * D + offs,
-                         tl.reshape(y, (D * GPB,)).to(q_ptr.dtype.element_ty))
+                    tl.reshape(y, (D * GPB,)).to(q_ptr.dtype.element_ty))
 
         # gelu_tanh_and_mul fused with the per-row fp8 quantization the
         # next linear would run on its output
         @triton.jit
         def gelu_mul_quant(gu_ptr, q_ptr, s_ptr, stride_gu, stride_q,
-                           HALF: tl.constexpr, BLOCK: tl.constexpr,
-                           match_vllm_rounding: tl.constexpr):
+                HALF: tl.constexpr, BLOCK: tl.constexpr,
+                match_vllm_rounding: tl.constexpr):
             t = tl.program_id(0)
             offs = tl.arange(0, BLOCK)
             mask = offs < HALF
             gate = tl.load(gu_ptr + t * stride_gu + offs, mask=mask,
-                           other=0.0).to(tl.float32)
+                other=0.0).to(tl.float32)
             up = tl.load(gu_ptr + t * stride_gu + HALF + offs, mask=mask,
-                         other=0.0).to(tl.float32)
+                other=0.0).to(tl.float32)
             if match_vllm_rounding:
                 # vLLM rounds GELU to BF16 before the gating multiplication.
                 cube = gate * gate * gate
@@ -975,14 +975,14 @@ class Engine:
             amax = tl.max(tl.abs(y), axis=0)
             if match_vllm_rounding:
                 scale = tl.maximum(tl.div_rn(amax, 448.0),
-                                   1.0 / (448.0 * 512.0))
+                    1.0 / (448.0 * 512.0))
                 q = tl.div_rn(y, scale)
             else:
                 scale = tl.maximum(amax / 448.0, 1.0 / (448.0 * 512.0))
                 q = y / scale
             q = tl.minimum(tl.maximum(q, -448.0), 448.0)
             tl.store(q_ptr + t * stride_q + offs,
-                     q.to(q_ptr.dtype.element_ty), mask=mask)
+                q.to(q_ptr.dtype.element_ty), mask=mask)
             tl.store(s_ptr + t, scale)
 
         # vLLM's rms_norm_dynamic_per_token_quant with a residual,
@@ -990,19 +990,19 @@ class Engine:
         # + x, then the row norm quantized per row
         @triton.jit
         def scale_add_rms_norm_quant(x_ptr, res_ptr, w_ptr, q_ptr, s_ptr,
-                                     stride_x, stride_res, stride_q,
-                                     scale, eps, H: tl.constexpr,
-                                     BLOCK: tl.constexpr):
+                stride_x, stride_res, stride_q,
+                scale, eps, H: tl.constexpr,
+                BLOCK: tl.constexpr):
             t = tl.program_id(0)
             offs = tl.arange(0, BLOCK)
             mask = offs < H
             x = tl.load(x_ptr + t * stride_x + offs, mask=mask,
-                        other=0.0).to(tl.float32)
+                other=0.0).to(tl.float32)
             r = tl.load(res_ptr + t * stride_res + offs, mask=mask,
-                        other=0.0).to(tl.float32)
+                other=0.0).to(tl.float32)
             r = r * scale + x
             tl.store(res_ptr + t * stride_res + offs,
-                     r.to(res_ptr.dtype.element_ty), mask=mask)
+                r.to(res_ptr.dtype.element_ty), mask=mask)
             ms = tl.sum(r * r, axis=0) / H
             rstd = 1.0 / tl.sqrt(ms + eps)
             w = tl.load(w_ptr + offs, mask=mask, other=0.0)
@@ -1011,20 +1011,20 @@ class Engine:
             qscale = tl.maximum(amax / 448.0, 1.0 / (448.0 * 512.0))
             q = tl.minimum(tl.maximum(y / qscale, -448.0), 448.0)
             tl.store(q_ptr + t * stride_q + offs,
-                     q.to(q_ptr.dtype.element_ty), mask=mask)
+                q.to(q_ptr.dtype.element_ty), mask=mask)
             tl.store(s_ptr + t, qscale)
 
         # one read of a row for two RMS norms with different weights
         @triton.jit
         def rms_norm2(x_ptr, w1_ptr, w2_ptr, o1_ptr, o2_ptr, s_ptr, stride_x,
-                      stride_o1, stride_o2, eps, H: tl.constexpr,
-                      BLOCK: tl.constexpr, output_fp8: tl.constexpr):
+                stride_o1, stride_o2, eps, H: tl.constexpr,
+                BLOCK: tl.constexpr, output_fp8: tl.constexpr):
             t = tl.program_id(0)
             # Keep the BF16 reduction order when one output becomes FP8.
             offs = tl.max_contiguous(tl.arange(0, BLOCK), 8)
             mask = offs < H
             x = tl.load(x_ptr + t * stride_x + offs, mask=mask,
-                        other=0.0).to(tl.float32)
+                other=0.0).to(tl.float32)
             ms = tl.sum(x * x, axis=0) / H
             xn = x * (1.0 / tl.sqrt(ms + eps))
             w1 = tl.load(w1_ptr + offs, mask=mask, other=0.0).to(tl.float32)
@@ -1034,27 +1034,27 @@ class Engine:
                 # Preserve the BF16 intermediate's rounding before quantizing.
                 first = first.to(tl.float32)
                 scale = tl.maximum(tl.div_rn(tl.max(tl.abs(first), axis=0),
-                                             448.0),
-                                   1.0 / (448.0 * 512.0))
+                    448.0),
+                    1.0 / (448.0 * 512.0))
                 first = tl.minimum(tl.maximum(tl.div_rn(first, scale), -448.0),
-                                   448.0)
+                    448.0)
                 tl.store(s_ptr + t, scale)
             tl.store(o1_ptr + t * stride_o1 + offs,
-                     first.to(o1_ptr.dtype.element_ty), mask=mask)
+                first.to(o1_ptr.dtype.element_ty), mask=mask)
             tl.store(o2_ptr + t * stride_o2 + offs,
-                     (xn * w2).to(o2_ptr.dtype.element_ty), mask=mask)
+                (xn * w2).to(o2_ptr.dtype.element_ty), mask=mask)
 
         # qk_norm_rope plus the weightless per-head v norm Gemma
         # applies, written contiguous for the KV scatter
         @triton.jit
         def qkv_norm_rope(qkv_ptr, q_out_ptr, k_out_ptr, v_out_ptr, cs_ptr,
-                          position_ptr, qw_ptr, kw_ptr, stride_qkv, stride_qo,
-                          stride_ko, stride_vo, eps, QH: tl.constexpr,
-                          KH: tl.constexpr, HD: tl.constexpr,
-                          HALF: tl.constexpr):
+                position_ptr, qw_ptr, kw_ptr, stride_qkv, stride_qo,
+                stride_ko, stride_vo, eps, QH: tl.constexpr,
+                KH: tl.constexpr, HD: tl.constexpr,
+                HALF: tl.constexpr):
             qk_norm_rope(qkv_ptr, q_out_ptr, k_out_ptr, cs_ptr, position_ptr,
-                         qw_ptr, kw_ptr, stride_qkv, stride_qo, stride_ko,
-                         eps, QH, KH, HD, HALF)
+                qw_ptr, kw_ptr, stride_qkv, stride_qo, stride_ko,
+                eps, QH, KH, HD, HALF)
             t = tl.program_id(0)
             half_offs = tl.arange(0, HALF)
             k_heads = tl.arange(0, KH)
@@ -1066,19 +1066,19 @@ class Engine:
             ms = (tl.sum(va * va, axis=1) + tl.sum(vb * vb, axis=1)) / HD
             rstd = 1.0 / tl.sqrt(ms + eps)
             tl.store(v_out_ptr + t * stride_vo + ka_offs,
-                     (va * rstd[:, None]).to(v_out_ptr.dtype.element_ty))
+                (va * rstd[:, None]).to(v_out_ptr.dtype.element_ty))
             tl.store(v_out_ptr + t * stride_vo + kb_offs,
-                     (vb * rstd[:, None]).to(v_out_ptr.dtype.element_ty))
+                (vb * rstd[:, None]).to(v_out_ptr.dtype.element_ty))
 
         self._kernels = {"silu": silu_mul_quant,
-                         "norm": add_rms_norm_quant,
-                         "qk": qk_norm_rope,
-                         "qkv": qkv_norm_rope,
-                         "gelu_quant": gelu_mul_quant,
-                         "scale_norm_quant": scale_add_rms_norm_quant,
-                         "norm2": rms_norm2,
-                         "kv_scatter": kv_row_scatter,
-                         "merge_quant": merge_attn_quant}
+            "norm": add_rms_norm_quant,
+            "qk": qk_norm_rope,
+            "qkv": qkv_norm_rope,
+            "gelu_quant": gelu_mul_quant,
+            "scale_norm_quant": scale_add_rms_norm_quant,
+            "norm2": rms_norm2,
+            "kv_scatter": kv_row_scatter,
+            "merge_quant": merge_attn_quant}
         return self._kernels
 
     def custom_silu_quant(self, gate_up):
@@ -1115,9 +1115,9 @@ class Engine:
         qw = self.num_q_heads * self.head_dim
         kw = self.num_kv_heads * self.head_dim
         q = self.torch.empty((n, qw), dtype=self.torch.bfloat16,
-                             device="cuda")
+            device="cuda")
         k = self.torch.empty((n, kw), dtype=self.torch.bfloat16,
-                             device="cuda")
+            device="cuda")
         self._triton_kernels()["qk"][(n,)](
             qkv, q, k, self.rotary.cos_sin_cache, positions,
             attn.q_norm.weight, attn.k_norm.weight,
@@ -1136,7 +1136,7 @@ class Engine:
         Two kernels where custom_norm_quant is one.
         """
         normed, residual = self.fused_add_rms_norm(hidden, residual,
-                                                   norm)
+            norm)
         return self.quant(normed)
 
     def vllm_silu_quant(self, gate_up):
@@ -1157,9 +1157,9 @@ class Engine:
         kw = self.num_kv_heads * self.head_dim
         q, k, _ = qkv.split([qw, kw, kw], dim=-1)
         q = self.rms_norm(q.reshape(-1, self.head_dim).contiguous(),
-                          attn.q_norm).reshape(n, qw)
+            attn.q_norm).reshape(n, qw)
         k = self.rms_norm(k.reshape(-1, self.head_dim).contiguous(),
-                          attn.k_norm).reshape(n, kw)
+            attn.k_norm).reshape(n, kw)
         return self.rotary(positions, q, k)
 
     def kv_row_scatter(self, k3, v3, src, dst, layer):
@@ -1192,7 +1192,7 @@ class Engine:
         if copy_tail and pool["tail_src"] is not None:
             k_pool, v_pool = self.arena.layer_kv(layer)
             self.kv_row_scatter(k_pool, v_pool,
-                                pool["tail_src"], pool["tail_dst"], layer)
+                pool["tail_src"], pool["tail_dst"], layer)
 
     def merge_attn_quant(self, out_a, lse_a, out_b, lse_b, source, *, output=None):
         """Merge cached and fresh attention and write the o_proj input.
@@ -1211,16 +1211,16 @@ class Engine:
             q, scales = output
         elif self.is_fp8:
             q = self.torch.empty((n, heads * dim), dtype=self.fp8,
-                                 device=out_a.device)
+                device=out_a.device)
             scales = self._col_major_scales(n, heads * dim)
         else:
             q = self.torch.empty((n, heads * dim), dtype=self.torch.bfloat16,
-                                 device=out_a.device)
+                device=out_a.device)
             scales = None
         if self.is_fp8:
             assert dim == GROUP
         scale_strides = ((0, 0) if scales is None
-                         else (scales.stride(1), scales.stride(0)))
+            else (scales.stride(1), scales.stride(0)))
         self._triton_kernels()["merge_quant"][(n, heads // gpb)](
             out_a, out_b, lse_a, lse_b, source, q,
             q if scales is None else scales,
@@ -1270,7 +1270,7 @@ class Engine:
         if chunk.meta.get("shared") is not None:
             return self.attention_shared(q3, k3, v3, chunk.meta, output=output)
         target = (output[0].view(n, H, D)
-                  if output is not None and not self.is_fp8 else None)
+            if output is not None and not self.is_fp8 else None)
         return self.quant(self.attention_unified(
             q3, k3, v3, chunk.meta, output=target), output=output)
 
@@ -1306,7 +1306,7 @@ class Engine:
             return_softmax_lse=True, **extra)
 
     def _flashinfer_paged(self, q3, kp, vp, metadata, *, causal,
-                          softmax_scale, window, output=None):
+            softmax_scale, window, output=None):
         """Run paged attention with a FlashInfer plan shared across layers."""
         import numpy as np
         from flashinfer import BatchPrefillWithPagedKVCacheWrapper
@@ -1317,7 +1317,7 @@ class Engine:
             self._flashinfer_workspace = self.torch.empty(
                 256 * 1024 * 1024, dtype=self.torch.uint8, device=q3.device)
         key = (causal, softmax_scale, window, q3.shape[1:], kp.shape[1:],
-               q3.dtype, kp.dtype)
+            q3.dtype, kp.dtype)
         previous, wrapper, uploaded = self._flashinfer_plans.get(
             key, (None, None, None))
         if wrapper is None:
@@ -1366,7 +1366,7 @@ class Engine:
             workspace=workspace)
 
     def _paged(self, q3, kp, vp, cu_q, max_q, seqused_k, max_seqused_k, block_table, *,
-               causal, softmax_scale=None, window=None, metadata=None, output=None):
+            causal, softmax_scale=None, window=None, metadata=None, output=None):
         """One paged attention call.
 
         FlashAttention 3, or FlashAttention 4 when the head is wider
@@ -1407,7 +1407,7 @@ class Engine:
 
         reads = meta["reads"]
         target = (output[0].view(n, H, D) if reads is None
-                  and output is not None and not self.is_fp8 else None)
+            and output is not None and not self.is_fp8 else None)
         out_a, lse_a = self._fa(
             q3, k3, v3, meta["cu_a"], meta["cu_a"],
             meta["max_a"], meta["max_a"], causal=True, output=target)
@@ -1475,7 +1475,7 @@ class Engine:
         return tables.get("sliding") or tables
 
     def attention_unified(self, q3, k3, v3, meta, *, softmax_scale=None,
-                          window=None, output=None):
+            window=None, output=None):
         """Write current KV to its cache slots, then one paged attention call.
 
         The call reads retained and current KV together. It is causal

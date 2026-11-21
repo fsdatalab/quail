@@ -16,7 +16,7 @@ class Qwen3Pipeline(ModelPipeline):
     """Forward passes for Qwen3 checkpoints loaded by vLLM."""
 
     def __init__(self, model, arena, *, spec, kernels="quail",
-                 engine_class=Engine):
+            engine_class=Engine):
         import torch
 
         self.layers = model.model.layers
@@ -31,8 +31,8 @@ class Qwen3Pipeline(ModelPipeline):
         # The fused kernels compute element offsets in 32-bit ints,
         # so a chunk needs rows x widest_row < 2^31.
         widest = max(max(layer.self_attn.qkv_proj.weight.shape[0],
-                         layer.mlp.gate_up_proj.weight.shape[0])
-                     for layer in self.layers)
+            layer.mlp.gate_up_proj.weight.shape[0])
+            for layer in self.layers)
         self.max_chunk_tokens = (2**31 - 1) // widest
         self.tree_attention = spec is None or tree_attention_allowed(spec)
 
@@ -40,7 +40,7 @@ class Qwen3Pipeline(ModelPipeline):
         # every layer has the same four shapes
         layer = self.layers[0]
         return (layer.self_attn.qkv_proj, layer.self_attn.o_proj,
-                layer.mlp.gate_up_proj, layer.mlp.down_proj)
+            layer.mlp.gate_up_proj, layer.mlp.down_proj)
 
     def before_attention(self, hidden, residual, positions, layer):
         """Normalize and project rows into rotary Q, K, V and the residual."""
@@ -74,7 +74,7 @@ class Qwen3Pipeline(ModelPipeline):
         kv_width = self.engine.num_kv_heads * self.engine.head_dim
         q = torch.zeros((num_tokens, q_width), dtype=torch.bfloat16, device=device)
         k = torch.zeros((num_tokens, kv_width), dtype=torch.bfloat16,
-                        device=device)
+            device=device)
         o_in, _ = self.engine.quant(torch.zeros_like(q))
         return dict(q=q, k=k, v=torch.zeros_like(k), o_in=o_in)
 
@@ -115,7 +115,7 @@ class Qwen3Pipeline(ModelPipeline):
         self.engine.attention(
             buffers.q[:n], buffers.k[:n], buffers.v[:n], chunk,
             output=(buffers.o_in[:n],
-                    None if buffers.o_scale is None else buffers.o_scale[:n]))
+                None if buffers.o_scale is None else buffers.o_scale[:n]))
 
     def forward_chunk(self, chunk):
         engine = self.engine

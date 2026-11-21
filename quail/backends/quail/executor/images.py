@@ -130,11 +130,11 @@ class RegionImages:
                 parts = value if isinstance(value, list) else [value]
                 # the pages AI.PDF_PAGES returns: each its number and image
                 parts = [part.get("image") if isinstance(part, dict) else part
-                         for part in parts]
+                    for part in parts]
                 encoded = [part for part in parts
-                           if part is not None and part.startswith(IMAGE_SIGNATURES)]
+                    if part is not None and part.startswith(IMAGE_SIGNATURES)]
                 found = (tuple(_image_firsts(_tokens_of(store[index])))
-                         if encoded else ())
+                    if encoded else ())
                 firsts.append(found)
                 for first, image in zip(found, encoded, strict=True):
                     if first not in self.images:
@@ -153,8 +153,8 @@ class RegionImages:
 
             self._pool = ThreadPoolExecutor(max_workers=DECODE_THREADS)
             self._pixels = {first: self._pool.submit(decode_image, image,
-                                                     self.token_pixels)
-                            for first, image in self.images.items()}
+                self.token_pixels)
+                for first, image in self.images.items()}
         self._embeddings: dict[int, object] = {}
         # (start, end) CUDA events around each encoder call, the seconds
         # the GPU loop waited for decoded pixels, and the images encoded
@@ -171,7 +171,7 @@ class RegionImages:
     def encoder_s(self) -> float:
         """The GPU seconds the vision encoder took so far."""
         return sum(start.elapsed_time(end) for start, end in
-                   self._encoder_events) / 1000.0
+            self._encoder_events) / 1000.0
 
     def close(self) -> None:
         """Stop decoding and drop every image's pixels and embeddings."""
@@ -217,8 +217,8 @@ class RegionImages:
         starts = self._sorted[np.searchsorted(self._sorted, tokens, side="right") - 1]
         firsts = np.unique(starts).tolist()
         self._encode(torch, visual, [first for first in firsts
-                                     if first not in self._embeddings],
-                     hidden.dtype)
+            if first not in self._embeddings],
+            hidden.dtype)
         # each image's embeddings stacked, and each row's index into them
         stacked = torch.cat([self._embeddings[first] for first in firsts])
         offsets = dict(zip(firsts, np.cumsum([0] + [self.images[first].tokens
@@ -264,8 +264,8 @@ class RegionImages:
             waited = time.perf_counter()
             pixels = self._pixels.pop(first, None)
             pixels = (decode_image(self.images[first], self.token_pixels)
-                      if pixels is None
-                      else pixels.result())
+                if pixels is None
+                else pixels.result())
             self.decode_wait_s += time.perf_counter() - waited
             rgb = torch.from_numpy(pixels.copy()).to(device)
             patch_pixels, merge = self.patch_pixels, self.merge
@@ -286,7 +286,7 @@ class RegionImages:
         timed = pixel_values.is_cuda
         if timed:
             start, end = (torch.cuda.Event(enable_timing=True),
-                          torch.cuda.Event(enable_timing=True))
+                torch.cuda.Event(enable_timing=True))
             start.record()
         embeddings = visual(pixel_values, grid_thw=grid_thw)
         if timed:
@@ -330,7 +330,7 @@ class RegionImages:
                 for first in np.unique(firsts).tolist():
                     at = int(np.flatnonzero(firsts == first)[0])
                     start = int(positions[row0 + index[at]]
-                                - (found[index[at]] - first))
+                        - (found[index[at]] - first))
                     starts[first] = start
                     self._image_starts[first] = start
             # a document that borrowed an image's KV starts it where its
@@ -339,7 +339,7 @@ class RegionImages:
                 if image.first not in starts and image.first in self._image_starts:
                     starts[image.first] = self._image_starts[image.first]
             known = sorted((starts[image.first], image) for image in images
-                           if image.first in starts)
+                if image.first in starts)
             if not known:
                 continue
             ends = np.array([start + image.tokens for start, image in known])
@@ -351,7 +351,7 @@ class RegionImages:
             if len(index):
                 within = found[index] - firsts
                 columns = np.array([self.images[first].columns
-                                    for first in firsts.tolist()])
+                    for first in firsts.tolist()])
                 anchors = np.array([starts[first] for first in firsts.tolist()])
                 anchors = anchors - shift[index]
                 grid_row, grid_column = np.divmod(within, columns)
@@ -395,7 +395,7 @@ def _tokens_of(document) -> np.ndarray:
     """A document's token ids as one array."""
     parts = getattr(document, "token_parts", (document,))
     arrays = [part.numpy() if hasattr(part, "numpy") else np.asarray(part)
-              for part in parts]
+        for part in parts]
     return np.concatenate(arrays) if arrays else np.zeros(0, dtype=np.int64)
 
 
@@ -413,11 +413,11 @@ def _binary_column(table: pa.Table):
 
     def pages(kind):
         return (pa.types.is_struct(kind) and kind.get_field_index("image") >= 0
-                and binary(kind.field("image").type))
+            and binary(kind.field("image").type))
 
     for index, field in enumerate(table.schema):
         kind = field.type
         if binary(kind) or ((pa.types.is_list(kind) or pa.types.is_large_list(kind))
-                            and (binary(kind.value_type) or pages(kind.value_type))):
+                and (binary(kind.value_type) or pages(kind.value_type))):
             return table.column(index)
     return None

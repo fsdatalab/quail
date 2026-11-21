@@ -35,24 +35,24 @@ def _kernels() -> dict:
         if PDL:
             tl.extra.cuda.gdc_wait()
         total = tl.load(x_ptr + row * stride_x + offs, mask=mask,
-                        other=0.0).to(tl.float32)
+            other=0.0).to(tl.float32)
         if HAS_RESIDUAL:
             total += tl.load(res_ptr + row * stride_res + offs,
-                             mask=mask, other=0.0).to(tl.float32)
+                mask=mask, other=0.0).to(tl.float32)
         normed = (total * tl.math.rsqrt(tl.sum(total * total, axis=0) / H + eps)
-                  * scale).to(tl.bfloat16)
+            * scale).to(tl.bfloat16)
         if PDL:
             tl.extra.cuda.gdc_launch_dependents()
         if HAS_RESIDUAL:
             tl.store(res_ptr + row * stride_res + offs,
-                     total.to(res_ptr.dtype.element_ty), mask=mask)
+                total.to(res_ptr.dtype.element_ty), mask=mask)
         if WRITE_BF16:
             tl.store(bf16_ptr + row * stride_bf16 + offs, normed, mask=mask)
         if WRITE_FP8:
             clamped = tl.minimum(tl.maximum(
                 normed.to(tl.float32) * inv_scale, -448.0), 448.0)
             tl.store(fp8_ptr + row * stride_fp8 + offs,
-                     clamped.to(fp8_ptr.dtype.element_ty), mask=mask)
+                clamped.to(fp8_ptr.dtype.element_ty), mask=mask)
 
     @triton.jit
     def gdn_gated_norm(
@@ -63,7 +63,7 @@ def _kernels() -> dict:
     ):
         row = tl.program_id(0).to(tl.int64)
         h_offs = (tl.program_id(1).to(tl.int64) * HEADS_PER_BLOCK
-                  + tl.arange(0, HEADS_PER_BLOCK))
+            + tl.arange(0, HEADS_PER_BLOCK))
         d_offs = tl.arange(0, BLOCK)
         d_mask = d_offs < D
         mask = (h_offs < HEADS)[:, None] & d_mask[None, :]
@@ -74,11 +74,11 @@ def _kernels() -> dict:
         if PDL:
             tl.extra.cuda.gdc_wait()
         x = tl.load(core_ptr + row * stride_core + offsets,
-                    mask=mask, other=0.0).to(tl.float32)
+            mask=mask, other=0.0).to(tl.float32)
         z = tl.load(z_ptr + row * stride_z + offsets,
-                    mask=mask, other=0.0).to(tl.float32)
+            mask=mask, other=0.0).to(tl.float32)
         normed = (x * tl.math.rsqrt(tl.sum(x * x, axis=1) / D + eps)[:, None]
-                  * w[None, :])
+            * w[None, :])
         sig = tl.sigmoid(z)
         gated = (normed * (z * sig if SILU_GATE else sig)).to(tl.bfloat16)
         if PDL:
@@ -87,7 +87,7 @@ def _kernels() -> dict:
             clamped = tl.minimum(tl.maximum(
                 gated.to(tl.float32) * inv_scale, -448.0), 448.0)
             tl.store(out_ptr + row * stride_out + offsets,
-                     clamped.to(out_ptr.dtype.element_ty), mask=mask)
+                clamped.to(out_ptr.dtype.element_ty), mask=mask)
         else:
             tl.store(out_ptr + row * stride_out + offsets, gated, mask=mask)
 
@@ -111,7 +111,7 @@ def _kernels() -> dict:
             if PDL:
                 tl.extra.cuda.gdc_wait()
             vals = tl.load(qkv_ptr + row * stride_qkv + q_gate_cols + k_cols
-                           + v_offs, mask=v_mask, other=0.0)
+                + v_offs, mask=v_mask, other=0.0)
             if PDL:
                 tl.extra.cuda.gdc_launch_dependents()
             tl.store(v_out_ptr + row * stride_v + v_offs, vals, mask=v_mask)
@@ -127,11 +127,11 @@ def _kernels() -> dict:
             in_base = qkv_ptr + row * stride_qkv + local_head * 2 * HD
             w_ptr, out_base = qw_ptr, q_out_ptr + row * stride_q + local_head * HD
         w = 1.0 + tl.load(w_ptr + head_offs, mask=head_mask,
-                          other=0.0).to(tl.float32)
+            other=0.0).to(tl.float32)
         w1 = 1.0 + tl.load(w_ptr + rot_offs, mask=rot_mask,
-                           other=0.0).to(tl.float32)
+            other=0.0).to(tl.float32)
         w2 = 1.0 + tl.load(w_ptr + HALF_ROT + rot_offs, mask=rot_mask,
-                           other=0.0).to(tl.float32)
+            other=0.0).to(tl.float32)
         position = tl.load(positions_ptr + row * stride_pt).to(tl.int64)
         if HAS_MROPE:
             position_h = tl.load(positions_ptr + stride_pm + row * stride_pt).to(
@@ -141,33 +141,33 @@ def _kernels() -> dict:
             position = tl.where(
                 (rot_offs % 3 == 1) & (rot_offs < 3 * MROPE_H), position_h,
                 tl.where((rot_offs % 3 == 2) & (rot_offs < 3 * MROPE_W),
-                         position_w, position))
+                    position_w, position))
         cs_base = cs_ptr + position * stride_cs
         cos = tl.load(cs_base + rot_offs, mask=rot_mask, other=0.0).to(tl.float32)
         sin = tl.load(cs_base + HALF_ROT + rot_offs, mask=rot_mask,
-                      other=0.0).to(tl.float32)
+            other=0.0).to(tl.float32)
         if PDL:
             tl.extra.cuda.gdc_wait()
         x = tl.load(in_base + head_offs, mask=head_mask, other=0.0).to(tl.float32)
         inv_rms = tl.math.rsqrt(tl.sum(x * x, axis=0) / HD + eps)
         if HAS_PASS:
             tl.store(out_base + head_offs, (x * inv_rms * w).to(tl.bfloat16),
-                     mask=head_mask & (head_offs >= ROT))
+                mask=head_mask & (head_offs >= ROT))
         x1 = (tl.load(in_base + rot_offs, mask=rot_mask, other=0.0).to(tl.float32)
-              * inv_rms * w1).to(tl.bfloat16).to(tl.float32)
+            * inv_rms * w1).to(tl.bfloat16).to(tl.float32)
         x2 = (tl.load(in_base + HALF_ROT + rot_offs, mask=rot_mask,
-                      other=0.0).to(tl.float32)
-              * inv_rms * w2).to(tl.bfloat16).to(tl.float32)
+            other=0.0).to(tl.float32)
+            * inv_rms * w2).to(tl.bfloat16).to(tl.float32)
         tl.store(out_base + rot_offs, (x1 * cos - x2 * sin).to(tl.bfloat16),
-                 mask=rot_mask)
+            mask=rot_mask)
         tl.store(out_base + HALF_ROT + rot_offs,
-                 (x2 * cos + x1 * sin).to(tl.bfloat16), mask=rot_mask)
+            (x2 * cos + x1 * sin).to(tl.bfloat16), mask=rot_mask)
         if not is_k:
             gate = tl.load(in_base + HD + head_offs, mask=head_mask, other=0.0)
             if PDL:
                 tl.extra.cuda.gdc_launch_dependents()
             tl.store(gate_out_ptr + row * stride_gate + local_head * HD + head_offs,
-                     gate, mask=head_mask)
+                gate, mask=head_mask)
         elif PDL:
             tl.extra.cuda.gdc_launch_dependents()
 
@@ -185,9 +185,9 @@ def _kernels() -> dict:
         if PDL:
             tl.extra.cuda.gdc_wait()
         vals = tl.load(out_ptr + row * stride_out + offs, mask=mask,
-                       other=0.0).to(tl.bfloat16)
+            other=0.0).to(tl.bfloat16)
         sig = tl.sigmoid(tl.load(gate_ptr + row * stride_gate + offs, mask=mask,
-                                 other=0.0).to(tl.float32)).to(tl.bfloat16)
+            other=0.0).to(tl.float32)).to(tl.bfloat16)
         gated = (vals.to(tl.float32) * sig.to(tl.float32)).to(tl.bfloat16)
         if PDL:
             tl.extra.cuda.gdc_launch_dependents()
@@ -195,7 +195,7 @@ def _kernels() -> dict:
             clamped = tl.minimum(tl.maximum(
                 gated.to(tl.float32) * inv_scale, -448.0), 448.0)
             tl.store(dst_ptr + row * stride_dst + offs,
-                     clamped.to(dst_ptr.dtype.element_ty), mask=mask)
+                clamped.to(dst_ptr.dtype.element_ty), mask=mask)
         else:
             tl.store(dst_ptr + row * stride_dst + offs, gated, mask=mask)
 
@@ -211,11 +211,11 @@ def _kernels() -> dict:
 def is_static_fp8(module) -> bool:
     """Return whether a linear module runs static per-tensor ModelOpt FP8."""
     return (type(getattr(module, "quant_method", None)).__name__
-            == "ModelOptFp8LinearMethod"
-            and getattr(module, "input_scale", None) is not None
-            and getattr(module, "weight_scale", None) is not None
-            and module.input_scale.numel() == 1
-            and module.weight_scale.numel() == 1)
+        == "ModelOptFp8LinearMethod"
+        and getattr(module, "input_scale", None) is not None
+        and getattr(module, "weight_scale", None) is not None
+        and module.input_scale.numel() == 1
+        and module.weight_scale.numel() == 1)
 
 
 def is_nvfp4(module) -> bool:
@@ -228,16 +228,16 @@ def is_nvfp4(module) -> bool:
     import torch
 
     index = (weight.device.index if weight.device.index is not None
-             else torch.cuda.current_device())
+        else torch.cuda.current_device())
     sm100 = _SM100_CAPABLE.get(index)
     if sm100 is None:
         sm100 = _SM100_CAPABLE[index] = (
             torch.cuda.get_device_capability(index)[0] == 10)
     return (sm100
-            and getattr(module, "input_global_scale_inv", None) is not None
-            and getattr(module, "weight_scale", None) is not None
-            and getattr(module, "alpha", None) is not None
-            and getattr(module, "weights_padding_cols", 0) == 0)
+        and getattr(module, "input_global_scale_inv", None) is not None
+        and getattr(module, "weight_scale", None) is not None
+        and getattr(module, "alpha", None) is not None
+        and getattr(module, "weights_padding_cols", 0) == 0)
 
 
 def inv_input_scale(module):
@@ -259,17 +259,17 @@ def fp8_linear(x_fp8, module, bias=None):
     if rows <= _ROW_TILE_ABOVE:
         if rows == 0:
             return torch.empty((0, module.weight.shape[1]), dtype=torch.bfloat16,
-                               device=x_fp8.device)
+                device=x_fp8.device)
         return torch._scaled_mm(
             x_fp8, module.weight, scale_a=scale_a, scale_b=scale_b,
             out_dtype=torch.bfloat16, bias=bias)
     out = torch.empty((rows, module.weight.shape[1]), dtype=torch.bfloat16,
-                      device=x_fp8.device)
+        device=x_fp8.device)
     for low in range(0, rows, ROW_TILE):
         high = min(rows, low + ROW_TILE)
         torch._scaled_mm(x_fp8[low:high], module.weight, scale_a=scale_a,
-                         scale_b=scale_b, out_dtype=torch.bfloat16, bias=bias,
-                         out=out[low:high])
+            scale_b=scale_b, out_dtype=torch.bfloat16, bias=bias,
+            out=out[low:high])
     return out
 
 
@@ -280,7 +280,7 @@ def nvfp4_quant(x, module):
     return scaled_fp4_quant(
         x, module.input_global_scale_inv, is_sf_swizzled_layout=True,
         backend=("cutlass" if x.shape[0] <= _FP4_CUTLASS_MAX_ROWS
-                 else "flashinfer-cutedsl"))
+            else "flashinfer-cutedsl"))
 
 
 def nvfp4_linear(x_fp4, x_scale, module, bias=None, *, out=None):
@@ -339,23 +339,23 @@ def nvfp4_mlp(x, gate_up, down):
     def tile(rows, out=None):
         x_fp4, x_scale = nvfp4_quant(rows, gate_up)
         hidden = nvfp4_linear(x_fp4, x_scale, gate_up,
-                              getattr(gate_up, "bias", None))
+            getattr(gate_up, "bias", None))
         d_fp4, d_scale = silu_mul_nvfp4(hidden, down)
         return nvfp4_linear(d_fp4, d_scale, down, getattr(down, "bias", None),
-                            out=out)
+            out=out)
 
     rows = x.shape[0]
     if rows <= _ROW_TILE_ABOVE:
         return tile(x)
     out = torch.empty((rows, down.output_size_per_partition),
-                      dtype=torch.bfloat16, device=x.device)
+        dtype=torch.bfloat16, device=x.device)
     for low in range(0, rows, ROW_TILE):
         tile(x[low:min(rows, low + ROW_TILE)], out[low:min(rows, low + ROW_TILE)])
     return out
 
 
 def gemma_add_norm(x, residual, weight, eps, *, inv_scale=None,
-                   write_bf16=True, inplace_x=False):
+        write_bf16=True, inplace_x=False):
     """Add x into residual in place, normalize with (1 + weight), and quantize."""
     import torch
 
@@ -363,23 +363,23 @@ def gemma_add_norm(x, residual, weight, eps, *, inv_scale=None,
     has_residual, write_fp8 = residual is not None, inv_scale is not None
     new_residual = residual if has_residual else x
     bf16_out = (None if not write_bf16
-                else (x if inplace_x and has_residual else torch.empty_like(x)))
+        else (x if inplace_x and has_residual else torch.empty_like(x)))
     fp8_out = (torch.empty((rows, width), dtype=torch.float8_e4m3fn,
-                           device=x.device) if write_fp8 else None)
+        device=x.device) if write_fp8 else None)
     if rows == 0:
         return fp8_out, bf16_out, new_residual
     block, pdl = 1 << (width - 1).bit_length(), pdl_enabled(x.device, rows)
     launch_triton(
         _kernels()["gemma_add_norm_fp8"], (rows,),
         (x, new_residual, weight, fp8_out if write_fp8 else x,
-         bf16_out if write_bf16 else x, x.stride(0), new_residual.stride(0),
-         fp8_out.stride(0) if write_fp8 else 0,
-         bf16_out.stride(0) if write_bf16 else 0,
-         inv_scale if write_fp8 else weight, eps),
+            bf16_out if write_bf16 else x, x.stride(0), new_residual.stride(0),
+            fp8_out.stride(0) if write_fp8 else 0,
+            bf16_out.stride(0) if write_bf16 else 0,
+            inv_scale if write_fp8 else weight, eps),
         key=(width, block, has_residual, write_fp8, write_bf16, pdl),
         kwargs=dict(H=width, BLOCK=block, HAS_RESIDUAL=has_residual,
-                    WRITE_FP8=write_fp8, WRITE_BF16=write_bf16, PDL=pdl,
-                    num_warps=8, launch_pdl=pdl))
+            WRITE_FP8=write_fp8, WRITE_BF16=write_bf16, PDL=pdl,
+            num_warps=8, launch_pdl=pdl))
     return fp8_out, bf16_out, new_residual
 
 
@@ -390,8 +390,8 @@ def gdn_gated_norm(core, z, weight, eps, *, inv_scale=None, activation="silu"):
     rows, heads, width = core.shape
     total_width, write_fp8 = heads * width, inv_scale is not None
     out = torch.empty((rows, total_width),
-                      dtype=torch.float8_e4m3fn if write_fp8 else core.dtype,
-                      device=core.device)
+        dtype=torch.float8_e4m3fn if write_fp8 else core.dtype,
+        device=core.device)
     if rows == 0:
         return out
     z_2d, core_2d = z.view(rows, total_width), core.reshape(rows, total_width)
@@ -402,16 +402,16 @@ def gdn_gated_norm(core, z, weight, eps, *, inv_scale=None, activation="silu"):
         _kernels()["gdn_gated_norm"],
         (rows, (heads + heads_per_block - 1) // heads_per_block),
         (core_2d, z_2d, weight, out, inv_scale if write_fp8 else weight,
-         core_2d.stride(0), z_2d.stride(0), out.stride(0), eps),
+            core_2d.stride(0), z_2d.stride(0), out.stride(0), eps),
         key=(heads, width, heads_per_block, block, silu_gate, write_fp8, pdl),
         kwargs=dict(HEADS=heads, D=width, HEADS_PER_BLOCK=heads_per_block,
-                    BLOCK=block, SILU_GATE=silu_gate, WRITE_FP8=write_fp8,
-                    PDL=pdl, num_warps=4, launch_pdl=pdl))
+            BLOCK=block, SILU_GATE=silu_gate, WRITE_FP8=write_fp8,
+            PDL=pdl, num_warps=4, launch_pdl=pdl))
     return out
 
 
 def qkv_gemma_norm_rope_gate(qkv, positions, attn, *, q_out=None, k_out=None,
-                             v_out=None, gate_out=None):
+        v_out=None, gate_out=None):
     """Split qkv, apply Gemma Q/K RMSNorm and partial RoPE/MRoPE, and copy V/gate."""
     import torch
 
@@ -423,11 +423,11 @@ def qkv_gemma_norm_rope_gate(qkv, positions, attn, *, q_out=None, k_out=None,
     q_width, kv_width = num_q_heads * head_dim, num_kv_heads * head_dim
     dtype, device = qkv.dtype, qkv.device
     q = q_out if q_out is not None else torch.empty((rows, q_width), dtype=dtype,
-                                                    device=device)
+        device=device)
     k = k_out if k_out is not None else torch.empty((rows, kv_width), dtype=dtype,
-                                                    device=device)
+        device=device)
     v = v_out if v_out is not None else torch.empty((rows, kv_width), dtype=dtype,
-                                                    device=device)
+        device=device)
     gate = gate_out if gate_out is not None else torch.empty(
         (rows, q_width), dtype=dtype, device=device)
     if rows == 0:
@@ -448,18 +448,18 @@ def qkv_gemma_norm_rope_gate(qkv, positions, attn, *, q_out=None, k_out=None,
         _kernels()["qkv_gemma_norm_rope_gate"],
         (rows, num_q_heads + num_kv_heads + (kv_width + v_block - 1) // v_block),
         (qkv, q, k, v, gate, attn.q_norm.weight, attn.k_norm.weight,
-         rotary.cos_sin_cache, positions, qkv.stride(0), q.stride(0),
-         k.stride(0), v.stride(0), gate.stride(0),
-         rotary.cos_sin_cache.stride(0), stride_pm, stride_pt,
-         attn.q_norm.variance_epsilon),
+            rotary.cos_sin_cache, positions, qkv.stride(0), q.stride(0),
+            k.stride(0), v.stride(0), gate.stride(0),
+            rotary.cos_sin_cache.stride(0), stride_pm, stride_pt,
+            attn.q_norm.variance_epsilon),
         key=(num_q_heads, num_kv_heads, head_dim, rotary_dim, half_rot,
-             head_block, rot_block, v_block, has_pass, has_mrope, mrope_h,
-             mrope_w, warps, pdl),
+            head_block, rot_block, v_block, has_pass, has_mrope, mrope_h,
+            mrope_w, warps, pdl),
         kwargs=dict(QH=num_q_heads, KH=num_kv_heads, HD=head_dim,
-                    ROT=rotary_dim, HALF_ROT=half_rot, HEAD_BLOCK=head_block,
-                    ROT_BLOCK=rot_block, V_BLOCK=v_block, HAS_PASS=has_pass,
-                    HAS_MROPE=has_mrope, MROPE_H=mrope_h, MROPE_W=mrope_w,
-                    PDL=pdl, num_warps=warps, launch_pdl=pdl))
+            ROT=rotary_dim, HALF_ROT=half_rot, HEAD_BLOCK=head_block,
+            ROT_BLOCK=rot_block, V_BLOCK=v_block, HAS_PASS=has_pass,
+            HAS_MROPE=has_mrope, MROPE_H=mrope_h, MROPE_W=mrope_w,
+            PDL=pdl, num_warps=warps, launch_pdl=pdl))
     return q, k, v, gate
 
 
@@ -470,15 +470,15 @@ def sigmoid_gate(out, gate, *, inv_scale=None):
     rows, width = out.shape
     write_fp8 = inv_scale is not None
     dst = (torch.empty((rows, width), dtype=torch.float8_e4m3fn,
-                       device=out.device) if write_fp8 else out)
+        device=out.device) if write_fp8 else out)
     if rows == 0:
         return dst
     block, pdl = 512, pdl_enabled(out.device, rows)
     launch_triton(
         _kernels()["sigmoid_gate"], (rows, (width + block - 1) // block),
         (out, gate, dst, inv_scale if write_fp8 else out, out.stride(0),
-         gate.stride(0), dst.stride(0)),
+            gate.stride(0), dst.stride(0)),
         key=(width, block, write_fp8, pdl),
         kwargs=dict(WIDTH=width, BLOCK=block, WRITE_FP8=write_fp8, PDL=pdl,
-                    num_warps=4, launch_pdl=pdl))
+            num_warps=4, launch_pdl=pdl))
     return dst

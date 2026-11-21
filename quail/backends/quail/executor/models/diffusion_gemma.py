@@ -60,7 +60,7 @@ class DiffusionGemmaPipeline(ModelPipeline):
         self.window = spec.sliding_window
         attn = self.layers[0].self_attn
         loaded = (backbone.config.sliding_window, attn.num_heads,
-                  attn.num_kv_heads, attn.head_dim)
+            attn.num_kv_heads, attn.head_dim)
         expected = (
             spec.sliding_window,
             spec.num_q_heads,
@@ -85,7 +85,7 @@ class DiffusionGemmaPipeline(ModelPipeline):
             # the router's constant scale and learned per-dimension scale
             # fold into one vector
             router.quail_scale = (router.root_size.to(router.scale.dtype)
-                                  * router.scale).detach()
+                * router.scale).detach()
         if any(layer.self_attn.v_norm.has_weight for layer in self.layers):
             raise ValueError("the fused qkv kernel expects a weightless v norm")
         self._fold_layer_scalars(model)
@@ -93,12 +93,12 @@ class DiffusionGemmaPipeline(ModelPipeline):
         self.canvas_ids = canvas_token_ids(spec.vocab, spec.canvas_tokens)
         # an empty canvas reads the answer at the prompt's last row
         self.canvas_answer_row = (spec.canvas_answer_row
-                                  if spec.canvas_tokens else 0)
+            if spec.canvas_tokens else 0)
         init_moe_workspace()
         self.max_chunk_tokens = budgets.kernel_index_cap(spec)
         self.experts = [FP8Experts(layer.moe.experts, self.engine)
-                        if layer.enable_moe_block else None
-                        for layer in self.layers]
+            if layer.enable_moe_block else None
+            for layer in self.layers]
 
     def _norm(self, x, module):
         """One of the model's RMS norms, through the engine's kernel."""
@@ -132,7 +132,7 @@ class DiffusionGemmaPipeline(ModelPipeline):
     def forward_chunk(self, chunk):
         hidden = self.backbone_rows(chunk)
         return self._norm(hidden.index_select(0, chunk.final_indices),
-                          self.final_norm)
+            self.final_norm)
 
     def backbone_rows(self, chunk):
         """Every row's hidden state after the last layer, before the final norm."""
@@ -161,7 +161,7 @@ class DiffusionGemmaPipeline(ModelPipeline):
 
     def _norm_quant(self, x, norm):
         return self.engine.norm_quant_rows(x, norm.weight,
-                                           norm.variance_epsilon)
+            norm.variance_epsilon)
 
     def _layers(self, hidden, positions, meta):
         engine = self.engine
@@ -196,7 +196,7 @@ class DiffusionGemmaPipeline(ModelPipeline):
                 routed = self._norm(routed, layer.post_feedforward_layernorm_2)
                 # dense becomes the norm of the two branches' sum
                 engine.fused_add_rms_norm(dense, routed,
-                                          layer.post_feedforward_layernorm)
+                    layer.post_feedforward_layernorm)
             else:
                 dense = self._norm(dense, layer.post_feedforward_layernorm)
             # dense carries the layer scalar through its norm weight;
@@ -228,4 +228,4 @@ class DiffusionGemmaPipeline(ModelPipeline):
         """One layer's attention: the unified paged call."""
         window = self.window if attn.is_sliding else None
         return self.engine.attention_unified(q3, k3, v3, meta,
-                                             softmax_scale=1.0, window=window)
+            softmax_scale=1.0, window=window)

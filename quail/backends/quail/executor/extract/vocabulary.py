@@ -63,13 +63,13 @@ class Vocabulary:
             key = self.keys[kid]
             if isinstance(key, str) and key.isascii():
                 pairs = [(t, j) for j in range(len(key), 0, -1)
-                         for t in self.variants.get(key[:j], [])]
+                    for t in self.variants.get(key[:j], [])]
             elif isinstance(key, str):
                 pairs = [(t, len(key)) for t in self.variants[key]]
             else:
                 pairs = [(key, len(self.vocab[key]))]
             found = (np.array([t for t, _ in pairs], dtype=np.int64),
-                     np.array([j for _, j in pairs], dtype=np.int64))
+                np.array([j for _, j in pairs], dtype=np.int64))
             self._options[kid] = found
         return found
 
@@ -82,7 +82,7 @@ class Vocabulary:
         tokens = np.concatenate([tokens for tokens, _ in options]) if options else []
         lengths = np.concatenate([lengths for _, lengths in options]) if options else []
         return (np.r_[0, np.cumsum(counts)], np.asarray(tokens, dtype=np.int64),
-                np.asarray(lengths, dtype=np.int64))
+            np.asarray(lengths, dtype=np.int64))
 
     def filler(self, token: int, length: int) -> list:
         """Return the rest of a token's word after its first length characters."""
@@ -107,8 +107,8 @@ class Vocabulary:
         texts = pa.array(texts, type=pa.large_string()).to_pylist()
         ids, ranges, boundaries = self.tokenizer.encode_packed(texts)
         return (np.frombuffer(ids, dtype="<i8"),
-                np.frombuffer(ranges, dtype="<i8").reshape(-1, 2),
-                np.frombuffer(boundaries, dtype="<i8"))
+            np.frombuffer(ranges, dtype="<i8").reshape(-1, 2),
+            np.frombuffer(boundaries, dtype="<i8"))
 
     def encode_batch(self, texts) -> list:
         """Return (token ids, character ranges) of each text, encoded together."""
@@ -116,7 +116,7 @@ class Vocabulary:
             return []
         ids, ranges, boundaries = self.encode_packed(texts)
         return [(ids[start:end], ranges[start:end])
-                for start, end in zip(boundaries[:-1], boundaries[1:])]
+            for start, end in zip(boundaries[:-1], boundaries[1:])]
 
     def document_batch(self, texts, stored) -> list[TokenView]:
         """Return document token views with source character ranges.
@@ -125,8 +125,8 @@ class Vocabulary:
         with the tokenizer continuations use.
         """
         missing = [index for index, tokens in enumerate(stored)
-                   if not isinstance(tokens, TokenView)
-                   or tokens.character_offsets is None]
+            if not isinstance(tokens, TokenView)
+            or tokens.character_offsets is None]
         result = list(stored)
         encoded = self.encode_batch([texts[index] for index in missing])
         for index, (ids, offsets) in zip(missing, encoded):

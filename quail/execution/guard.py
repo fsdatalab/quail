@@ -114,7 +114,7 @@ class Guarded:
         answered = result.outputs[port]
         alias = self.node.spec.aliases[0]
         positions = pc.index_in(self.rows.ids[alias],
-                                value_set=answered.ids[alias])
+            value_set=answered.ids[alias])
         # a row asked and given no answer row was dropped by the node
         kept = pc.or_(pc.invert(self.asked), pc.is_valid(positions))
         rows = self.rows
@@ -123,7 +123,7 @@ class Guarded:
                 rows = rows.with_column(name, pc.take(answered.column(name), positions))
         rows = rows.filter(kept)
         metrics = replace(result.metrics, input_rows=self.rows.num_rows,
-                          output_rows=rows.num_rows)
+            output_rows=rows.num_rows)
         return NodeResult({**result.outputs, port: rows}, metrics)
 
 
@@ -141,7 +141,7 @@ class Guarded:
                     rows = rows.with_column(
                         name, pc.take(found.column(name), positions))
             metrics = replace(result.metrics, input_rows=self.rows.num_rows,
-                              output_rows=rows.num_rows)
+                output_rows=rows.num_rows)
             return NodeResult({**result.outputs, port: rows}, metrics)
         survivors = result.outputs[port].ids[alias] if isinstance(
             result.outputs[port], Rows) else result.outputs[port]
@@ -150,7 +150,7 @@ class Guarded:
         answers = pc.if_else(self.asked, passed, unasked)
         rows = self.rows.with_column(self.node.answer, answers)
         metrics = replace(result.metrics, input_rows=self.rows.num_rows,
-                          output_rows=rows.num_rows)
+            output_rows=rows.num_rows)
         return NodeResult({**result.outputs, port: rows}, metrics)
 
     def _undecided(self, result: NodeResult) -> NodeResult:
@@ -167,7 +167,7 @@ class Guarded:
             values = values.drop_columns([name])
         rows = Rows(self.rows.ids, values.append_column(name, decided))
         metrics = replace(result.metrics, input_rows=self.rows.num_rows,
-                          output_rows=rows.num_rows)
+            output_rows=rows.num_rows)
         return NodeResult({**result.outputs, port: rows}, metrics)
 
 @dataclass
@@ -203,7 +203,7 @@ class NullPairs:
         unasked = Rows({alias: self.unasked.ids[alias] for alias in answered.aliases})
         for name in answered.column_names:
             carried = (self.unasked.column(name) if name in self.unasked.column_names
-                       else pa.nulls(unasked.num_rows, answered.column(name).type))
+                else pa.nulls(unasked.num_rows, answered.column(name).type))
             unasked = unasked.with_column(name, carried)
         rows = Rows.concat([answered, unasked])
         metrics = replace(result.metrics, output_rows=rows.num_rows)
@@ -238,7 +238,7 @@ def _null_pairs(node, inputs: dict, context) -> NullPairs | None:
         for name in carried.column_names:
             pairs = pairs.with_column(name, carried.column(name))
     present = {port.name: side.filter(pa.array(~mask))
-               for port, side, mask in zip(node.inputs, sides, absent)}
+        for port, side, mask in zip(node.inputs, sides, absent)}
     return NullPairs(node, present, pairs)
 
 
@@ -298,7 +298,7 @@ def present_join_inputs(node, inputs: dict, context) -> dict:
 
 
 def guarded(node, inputs: dict, context, *, runtime_answers: bool = False,
-            answers: Mapping[str, Rows] | None = None) -> Guarded | NullPairs | None:
+        answers: Mapping[str, Rows] | None = None) -> Guarded | NullPairs | None:
     """Evaluate a column node's guard over the rows it reads.
 
     Args:
@@ -336,7 +336,7 @@ def guarded(node, inputs: dict, context, *, runtime_answers: bool = False,
     everyone = pa.array([True] * rows.num_rows, pa.bool_())
     asked = everyone if guard is None else accepts(guard, read)
     passes = (pc.invert(everyone) if alternative is None
-              else pc.fill_null(accepts(alternative, read), False))
+        else pc.fill_null(accepts(alternative, read), False))
     if disjunction in rows.column_names:
         earlier = pc.fill_null(rows.column(disjunction), False)
         passes = pc.or_(passes, earlier)
@@ -350,14 +350,14 @@ def guarded(node, inputs: dict, context, *, runtime_answers: bool = False,
 
 
 def _read(node, rows: Rows, alias: str, context, conditions,
-          answers: Mapping[str, Rows]) -> pa.Table:
+        answers: Mapping[str, Rows]) -> pa.Table:
     """Return the columns the conditions read, one row per row read.
 
     A column is a value the rows carry, an answer an earlier node
     returned for the same documents, or a column of the alias's table.
     """
     names = {ref.column for condition in conditions
-             for ref in condition.references}
+        for ref in condition.references}
     read = rows.values.select([name for name in rows.column_names if name in names])
     for name in sorted(names - set(read.column_names)):
         answered = answers.get(name)

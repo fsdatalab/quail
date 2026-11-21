@@ -46,8 +46,8 @@ class ExtractionInputs:
     """
 
     def __init__(self, state, specs, vocabulary: Vocabulary, document_ids,
-                 documents, texts, readout=None, pipeline_head=None,
-                 document_positions=None):
+            documents, texts, readout=None, pipeline_head=None,
+            document_positions=None):
         self.specs = list(specs)
         first = self.specs[0]
         self.spec = first
@@ -61,16 +61,16 @@ class ExtractionInputs:
             raise ValueError("a pipeline's extractions share a prompt head")
         self.tails = [list(tail) for _, tail in parts]
         self.pipeline_head = (None if pipeline_head is None
-                              else [int(t) for t in pipeline_head])
+            else [int(t) for t in pipeline_head])
         if any(len(tail) < 2 for tail in self.tails):
             raise ValueError("an extraction's tail ends in its cue after the question")
         self.vocabulary = vocabulary
         positions = (document_ids if document_positions is None
-                     else document_positions)
+            else document_positions)
         shown = [text.as_py() if hasattr(text, "as_py") else str(text)
-                 for text in (texts[position] for position in positions)]
+            for text in (texts[position] for position in positions)]
         stored = [None if documents is None else documents[document_id]
-                  for document_id in positions]
+            for document_id in positions]
         encoded = vocabulary.document_batch(shown, stored)
         self.documents = [self._prepare(index, document_id, text, tokens, prior)
                      for index, (document_id, text, tokens, prior) in enumerate(
@@ -106,6 +106,6 @@ class ExtractionInputs:
         # the round's KV read covers the prompt through the first tail
         rho = self.spec.round_cost_per_token * (len(prefix) + len(self.tails[0]))
         return Document(index=index, text=text, prefix=prefix, scan=scan, key=key,
-                        rho=rho)
+            rho=rho)
 
 

@@ -21,5 +21,5 @@ class Decision2ForCausalLM(Qwen3ForCausalLM):
     def load_weights(self, weights):
         loader = AutoWeightsLoader(
             self, skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings
-                                 else None))
+                else None))
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

@@ -39,7 +39,7 @@ def describe(config: dict) -> dict:
         RefusalError: The backend refuses the configuration.
     """
     engine = Engine.open(config["model"], config["device"], config["gpus"],
-                         config["backend"])
+        config["backend"])
     try:
         return engine_description(engine)
     finally:

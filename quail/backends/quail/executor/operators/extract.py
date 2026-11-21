@@ -26,14 +26,14 @@ class ExtractOperator(MapOperator):
         documents = region.documents
         if region.one_family:
             return cls(region.query, nodes, region.document_ids(),
-                       {"documents": documents, "texts": texts})
+                {"documents": documents, "texts": texts})
         operator = cls(region.query, nodes, region.document_ids(), {
             "documents": documents, "texts": texts,
             "pipeline_head": (chain[0].node if chain else nodes[0]).document_head},
             first=sum(len(operator.answer_limits) for operator in chain))
         alias = operator.node.spec.alias
         if any(document.key != (alias, document_id) for document, document_id
-               in zip(operator.extraction.documents, operator.ids)):
+                in zip(operator.extraction.documents, operator.ids)):
             raise ValueError("AI.EXTRACT needs the pipeline's document tokens and head")
         return operator
 
@@ -45,8 +45,8 @@ class ExtractOperator(MapOperator):
 
         stages = self.extraction
         tree = (shared_prefix_tree(self.node.spec.name, stages.prefixes,
-                                   region.query.loaded_model.arena)
-                if self.node.spec.share_prefixes else None)
+            region.query.loaded_model.arena)
+            if self.node.spec.share_prefixes else None)
         return RegionDocuments(stages.prefixes, stages.keys, tree)
 
     def column_values(self, index, positions) -> tuple:
@@ -74,14 +74,14 @@ class ExtractOperator(MapOperator):
     def bind_decoder(self, decoder):
         super().bind_decoder(decoder)
         decoder.configure_copy(self.first, self.slots, self.extraction,
-                               [node.spec for node in self.nodes])
+            [node.spec for node in self.nodes])
 
     def answer_rows(self, q, positions):
         """The Rows of field q's answers and spans over documents, by position."""
         spec = self.nodes[q].spec
         values, spans = self.answers(q, positions)
         return extraction_rows(spec.alias, spec.name, spec.span_name,
-                               self.ids[positions], values, spans)
+            self.ids[positions], values, spans)
 
     def answers(self, q, kept=None):
         slots = self.slots[q] if kept is None else self.slots[q, kept]

@@ -54,19 +54,19 @@ def node_question(node) -> SetQuestion:
         cut, ids = node.state_tail_tokens, tuple(node.question_token_ids)
         alias, head = node.alias, tuple(node.document_head)
         question = SetQuestion("yes_no", head, ids[:cut], ids[cut:],
-                               tuple(node.question_header_token_ids))
+            tuple(node.question_header_token_ids))
     else:
         head, tail = (tuple(part) for part in spec.prompt_token_parts)
         cut, alias = spec.state_tail_tokens, spec.aliases[0]
         header = tuple(spec.question_header_token_ids)
         if isinstance(spec, ClassifySpec):
             question = SetQuestion("choice", head, tail[:cut], tail[cut:], header,
-                                   spellings=tuple(spec.label_token_ids))
+                spellings=tuple(spec.label_token_ids))
         elif isinstance(spec, ScoreSpec):
             question = SetQuestion("score", head, tail[:cut], tail[cut:], header)
         elif isinstance(spec, ExtractSpec):
             question = SetQuestion("read", head, tail[:cut], tail[cut:], header,
-                                   slots=tuple(spec.read_slots))
+                slots=tuple(spec.read_slots))
         else:
             raise TypeError(f"no set-attention question for {type(node).__name__}")
     ends = ends_for(node.document_ends, alias, question.state_tail)
@@ -105,7 +105,7 @@ def option_columns(spellings, targets) -> np.ndarray:
     """Per option, the target columns of its spellings, -1 past its last."""
     column = {token: index for index, token in enumerate(targets)}
     matrix = np.full((len(spellings), max(len(ids) for ids in spellings)), -1,
-                     dtype=np.int64)
+        dtype=np.int64)
     for option, ids in enumerate(spellings):
         matrix[option, :len(ids)] = [column[token] for token in ids]
     return matrix
@@ -123,7 +123,7 @@ def option_probabilities(logits, matrix, temperature) -> np.ndarray:
         (rows, options) probabilities.
     """
     scores = np.where(matrix >= 0, logits[:, np.maximum(matrix, 0)],
-                      -np.inf).max(-1) / temperature
+        -np.inf).max(-1) / temperature
     scores = np.exp(scores - scores.max(-1, keepdims=True))
     return scores / scores.sum(-1, keepdims=True)
 
@@ -145,10 +145,10 @@ def _layout(questions, members, yes, no, targets):
         kinds.append("code")
         if question.kind in ("yes_no", "score"):
             places.append((question.kind, code, [column[t] for t in yes],
-                           [column[t] for t in no]))
+                [column[t] for t in no]))
         else:
             places.append(("choice", code,
-                           option_columns(question.spellings, targets)))
+                option_columns(question.spellings, targets)))
         code += 1
     return kinds, places, code * width, reads
 
@@ -167,7 +167,7 @@ def _decode(values, places, code_width, width, temperature):
             margin = code[:, slot, yes].max(-1) - code[:, slot, no].max(-1)
             # AsyncScores' probability: the margin over the temperature
             out.append(margin if kind == "yes_no"
-                       else 1 / (1 + np.exp(-margin / temperature)))
+                else 1 / (1 + np.exp(-margin / temperature)))
         else:
             _, slot, matrix = place
             out.append(option_probabilities(code[:, slot], matrix, temperature))
@@ -196,9 +196,9 @@ class PassGroup:
     def __init__(self, state, questions, prefixes, label="pass group"):
         first = questions[0]
         if any(q.head != first.head or q.state_tail != first.state_tail
-               for q in questions):
+                for q in questions):
             raise ValueError("the questions of one pass group share their prompt "
-                             "head and state tail")
+                "head and state tail")
         self.state = state
         self.label = label
         self.questions = questions
@@ -209,8 +209,8 @@ class PassGroup:
         yes = [rows.allowed[i] for i in rows.true_cols.tolist()]
         no = [rows.allowed[i] for i in rows.false_cols.tolist()]
         targets = sorted({token for q in questions if q.kind != "read"
-                          for token in (yes + no if q.kind in ("yes_no", "score")
-                                        else [t for ids in q.spellings for t in ids])})
+            for token in (yes + no if q.kind in ("yes_no", "score")
+                else [t for ids in q.spellings for t in ids])})
         self.width = len(targets)
         model_spec = state.loaded_model.model_spec
         self.temperature = model_spec.answer_temperature
@@ -223,21 +223,21 @@ class PassGroup:
                 longest, [q.tokens for q in questions], first.header,
                 model_spec.set_size, state.chunk_tokens):
             kinds, places, code_width, reads = _layout(questions, members, yes, no,
-                                                       targets)
+                targets)
             yes_no = [(place[1], place[2], place[3]) for place in places
-                      if place[0] == "yes_no"]
+                if place[0] == "yes_no"]
 
             def decide(_, row, yes_no=yes_no, width=self.width):
                 values = np.asarray(row[0]).reshape(-1)
                 return all(values[slot * width + np.asarray(y)].max()
-                           > values[slot * width + np.asarray(n)].max()
-                           for slot, y, n in yes_no)
+                    > values[slot * width + np.asarray(n)].max()
+                    for slot, y, n in yes_no)
 
             self.passes.append((members, places, code_width, reads, shape))
             self.stages.append(Stage(
                 suffixes=[suffix],
                 readout=AsyncPassReadout(torch, torch.nn.functional, head_weights,
-                                         targets, kinds, model_spec.read_span_tokens),
+                    targets, kinds, model_spec.read_span_tokens),
                 questions=(shape,),
                 question_slots=tuple(questions[member].slots for member in members),
                 state_reads=self.reads.__getitem__ if reads else None,
@@ -266,10 +266,10 @@ class PassGroup:
         # a read's document rows: the first row, which stands for nothing,
         # then each document row the state kept
         reads = ([np.r_[0, np.arange(head, min(len(prefix), len(kept)))]
-                  for prefix, kept in zip(prefixes, states)]
-                 if self.reads_any else [])
+            for prefix, kept in zip(prefixes, states)]
+            if self.reads_any else [])
         passes = Passes(stop_groups=(None if stop_groups is None
-                                     or len(self.passes) > 1 else list(stop_groups)))
+            or len(self.passes) > 1 else list(stop_groups)))
         self.reads[:] = []
         for stage, (*_, shape) in enumerate(self.passes):
             passes.stages += [stage] * len(states)
@@ -278,9 +278,9 @@ class PassGroup:
             passes.owners += range(len(states))
             self.reads += reads
         return self.answers(run_passes(self.state, self.stages, passes,
-                                       label=self.label, limit=limit,
-                                       num_key_survivors=num_key_survivors),
-                            len(states))
+            label=self.label, limit=limit,
+            num_key_survivors=num_key_survivors),
+            len(states))
 
     def answers(self, passes, count) -> GroupAnswers:
         """Decode the group's answers from its answered passes.
@@ -294,16 +294,16 @@ class PassGroup:
         answers = [None] * len(questions)
         suffix_tokens = [0] * len(questions)
         group = GroupAnswers(np.zeros(0, dtype=np.int64), answers, suffix_tokens,
-                             tokens=passes.tokens, gpu_s=passes.gpu_s,
-                             chunks=passes.chunks)
+            tokens=passes.tokens, gpu_s=passes.gpu_s,
+            chunks=passes.chunks)
         for index, (members, places, code_width, reads, shape) in enumerate(
                 self.passes):
             found = passes.values[index * count:(index + 1) * count]
             positions = np.asarray([position for position, value in enumerate(found)
-                                    if value is not None], dtype=np.int64)
+                if value is not None], dtype=np.int64)
             values = (np.stack([np.asarray(found[p], dtype=np.float64).reshape(-1)
-                                for p in positions])
-                      if len(positions) else np.zeros((0, code_width + 3 * reads)))
+                for p in positions])
+                if len(positions) else np.zeros((0, code_width + 3 * reads)))
             for member, answer, length in zip(members, _decode(
                     values, places, code_width, self.width, self.temperature),
                     shape):

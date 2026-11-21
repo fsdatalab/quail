@@ -40,8 +40,8 @@ def shared_prefix_tree(name, prefixes, arena):
     started = time.perf_counter()
     tree = prefix_tree(prefixes, arena.page_tokens)
     detail(f"prefix sharing for {name}: {len(prefixes):,} documents reuse "
-           f"{tree.shared_tokens:,} tokens of earlier documents "
-           f"(found in {time.perf_counter() - started:.2f} s)")
+        f"{tree.shared_tokens:,} tokens of earlier documents "
+        f"(found in {time.perf_counter() - started:.2f} s)")
     return tree
 
 
@@ -55,7 +55,7 @@ def input_staging(state: QueryExecutionState):
 def join_prior_rows(rows, alias, priors, prior_tables):
     """Join columns from preceding operators onto the surviving documents."""
     prior_results = (operator.results()[port.node_id].outputs[port.port]
-                     for operator, port in priors)
+        for operator, port in priors)
     for prior in (*prior_tables, *prior_results):
         rows = rows.joined(prior, alias)
     return rows
@@ -213,9 +213,9 @@ class ColumnOperator:
     def column_sources(self) -> dict:
         """Map each computed column to its node and value indices."""
         return {column: (index, field)
-                for index, node in enumerate(self.nodes)
-                for field, column in enumerate(
-                    node.spec.output_columns[len(node.spec.aliases):])}
+            for index, node in enumerate(self.nodes)
+            for field, column in enumerate(
+                node.spec.output_columns[len(node.spec.aliases):])}
 
     @property
     def tested_columns(self) -> tuple[str, ...]:
@@ -312,7 +312,7 @@ def gated_stages(operators, gate=None) -> list:
             # place of whatever the operator before it appended, as
             # the next question of an extraction does
             operator.stages = [replace(operator.stages[0], rewind=True),
-                               *operator.stages[1:]]
+                *operator.stages[1:]]
     for operator in operators:
         if not operator.stages:
             pending.append(operator)
@@ -349,14 +349,14 @@ def gated_stages(operators, gate=None) -> list:
         # a document that passes the trailing conditions skips this
         # stage and counts as a survivor, with nothing asked
         terminal = Stage(suffixes=[], readout=stages[-1].readout, requests=finish,
-                         answer_dependencies=tuple(dict.fromkeys(dependencies)),
-                         prepare=_prepare(tuple(pending), None))
+            answer_dependencies=tuple(dict.fromkeys(dependencies)),
+            prepare=_prepare(tuple(pending), None))
         operators[-1].stages = [terminal]
         stages.append(terminal)
     writes = frame_writes(stages)
     for operator, (low, high) in zip(operators, stage_slices(operators)):
         operator.frame_tokens = (len(stages[low].frame)
-                                 if low < high and writes[low] else 0)
+            if low < high and writes[low] else 0)
     return stages
 
 
@@ -420,7 +420,7 @@ def gpu_seconds(spans) -> float:
 
 
 def settle_documents(arena, keys, prefixes, keep_kv: bool, budget: int,
-                     dependencies=()):
+        dependencies=()):
     """Return a callback that applies the final operator's KV retention setting."""
     if keep_kv and arena.retention_cap_pages is None:
         arena.retention_cap_pages = max(

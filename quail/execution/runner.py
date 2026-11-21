@@ -157,7 +157,7 @@ class GenericRunner:
                 inputs = {
                     member.node_id: {
                         port.name: values[(port.source.node_id,
-                                           port.source.port)]
+                            port.source.port)]
                         for port in member.inputs
                         if port.source.node_id not in inside}
                     for member in pipeline}
@@ -166,7 +166,7 @@ class GenericRunner:
                         member, inputs[member.node_id], context)
                 # a guarded node runs in a pipeline of its own
                 guard = guarded(node, inputs[node.node_id], context,
-                                runtime_answers=True, answers=_answers(values))
+                    runtime_answers=True, answers=_answers(values))
                 if guard is not None:
                     inputs[node.node_id] = guard.inputs(inputs[node.node_id])
                 deduplicated = deduplicate(graph, pipeline, inputs, context)
@@ -180,11 +180,11 @@ class GenericRunner:
                     results = deduplicated.expanded(results)
                 if guard is not None:
                     results = {**results,
-                               node.node_id: guard.expanded(results[node.node_id])}
+                        node.node_id: guard.expanded(results[node.node_id])}
                 # a pipeline's wall is charged once, to its first member
                 for index, member in enumerate(pipeline):
                     record(member, results[member.node_id],
-                           started if index == 0 else None)
+                        started if index == 0 else None)
                 continue
             supplied = {
                 output.name: values[(node.node_id, output.name)]

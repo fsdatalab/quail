@@ -89,7 +89,7 @@ class SpeedOfLight:
     def component(self, name: str) -> ComponentLatency:
         """Return one named component result."""
         return next(component for component in self.components
-                    if component.name == name)
+            if component.name == name)
 
     @property
     def bytes_moved(self) -> float:
@@ -155,22 +155,22 @@ class SpeedOfLightEstimate:
     @property
     def filter_evaluations(self) -> int:
         return sum(stage["evaluated"] for stage in self.filter_stages
-                   if stage["operator"] == FILTER)
+            if stage["operator"] == FILTER)
 
     @property
     def classification_evaluations(self) -> int:
         """Return the number of documents and joined rows classified."""
         return sum(stage["evaluated"] for stage in self.filter_stages
-                   if stage["operator"] == CLASSIFY) + sum(
-            classification["pairs"]
-            for stage in self.join_stages
-            for classification in stage["classifications"])
+            if stage["operator"] == CLASSIFY) + sum(
+     classification["pairs"]
+     for stage in self.join_stages
+     for classification in stage["classifications"])
 
     @property
     def extraction_evaluations(self) -> int:
         """Return the number of documents an answer was copied from."""
         return sum(stage["evaluated"] for stage in self.filter_stages
-                   if stage["operator"] == EXTRACT)
+            if stage["operator"] == EXTRACT)
 
     @property
     def join_pair_evaluations(self) -> int:
@@ -366,7 +366,7 @@ def speed_of_light_estimate(
             f"{model.name} reads each document as one bidirectional block, "
             f"so no prefix is shared across documents")
     chunk = (budgets.chunk_budget(model, device) if chunk_tokens is None
-             else chunk_tokens)
+        else chunk_tokens)
     stores = query.token_inputs()
     try:
         facts = query.facts()
@@ -411,14 +411,14 @@ def speed_of_light_estimate(
     except (NotImplementedError, ValueError):
         # an operator the estimate cannot price; Rust names it
         inputs = {"aliases": [], "stop_groups": {}, "allowed_pairs": {},
-                  "order": query.order, "credit_shared": credit_shared_prefixes,
-                  "chunk_tokens": chunk}
+            "order": query.order, "credit_shared": credit_shared_prefixes,
+            "chunk_tokens": chunk}
     vocabulary = Vocabulary(query.session.tokenizer)
     fields = {"model": asdict(model), "device": asdict(device),
-              "gpus": 1, "canvas_draws": 4,
-              "document_tokens": {data["alias"]: data["tokens"]
-                                  for data in inputs["aliases"]},
-              "operators": None, "attention": None}
+        "gpus": 1, "canvas_draws": 4,
+        "document_tokens": {data["alias"]: data["tokens"]
+            for data in inputs["aliases"]},
+        "operators": None, "attention": None}
     found, message = _quail_native.plan_operator(
         "speed_of_light", json.dumps(fields),
         json.dumps({"operators": json.loads(query.operators), "inputs": inputs}),

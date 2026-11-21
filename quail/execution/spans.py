@@ -36,8 +36,8 @@ def _word_span(document: str, phrase: str) -> tuple[int, int] | None:
     head = r"(?<!\w)" if phrase.strip()[0].isalnum() else ""
     tail = r"(?!\w)" if phrase.strip()[-1].isalnum() else ""
     for pattern, flags in ((re.escape(phrase.strip()), 0),
-                           (r"\s+".join(re.escape(word) for word in words),
-                            re.IGNORECASE)):
+            (r"\s+".join(re.escape(word) for word in words),
+                    re.IGNORECASE)):
         match = re.search(head + pattern + tail, document, flags)
         if match is not None:
             return match.span()

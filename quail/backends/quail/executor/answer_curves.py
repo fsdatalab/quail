@@ -56,7 +56,7 @@ class AnswerCurves:
         if self.buckets is None:
             return {}
         return {(int(row // self.num_buckets), int(row % self.num_buckets)):
-                self.buckets[row, :self.row_limit[row] + 1] for row in self.rows}
+            self.buckets[row, :self.row_limit[row] + 1] for row in self.rows}
 
     def _observation(self, slots):
         """Each slot's last token count and whether its answer ended."""

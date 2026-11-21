@@ -50,7 +50,7 @@ class DocumentTokens:
         tokens = np.asarray(tokens)
         offsets = np.asarray(offsets).reshape(-1, 2)
         return cls(np.arange(len(tokens), dtype=np.int64) + shift,
-                   offsets[:, 0], offsets[:, 1], tokens, vocabulary.key_of[tokens])
+            offsets[:, 0], offsets[:, 1], tokens, vocabulary.key_of[tokens])
 
 
 class SqueezedText:
@@ -102,7 +102,7 @@ class CandidateIndex:
 
     @classmethod
     def of(cls, scan: DocumentTokens, vocabulary: Vocabulary,
-           option_table=None) -> "CandidateIndex":
+            option_table=None) -> "CandidateIndex":
         kids, first, inverse, occurrences = np.unique(
             scan.kids, return_index=True, return_inverse=True, return_counts=True)
         if option_table is None:
@@ -110,12 +110,12 @@ class CandidateIndex:
         offsets, tokens, lengths = option_table
         counts = offsets[kids + 1] - offsets[kids]
         indices = (np.repeat(offsets[kids] - (np.cumsum(counts) - counts), counts)
-                   + np.arange(counts.sum()))
+            + np.arange(counts.sum()))
         return cls(kids, first, inverse, tokens[indices], lengths[indices],
-                   np.repeat(np.arange(len(kids)), counts),
-                   np.cumsum(counts) - counts,
-                   np.argsort(inverse, kind="stable"),
-                   np.concatenate(([0], np.cumsum(occurrences))))
+            np.repeat(np.arange(len(kids)), counts),
+            np.cumsum(counts) - counts,
+            np.argsort(inverse, kind="stable"),
+            np.concatenate(([0], np.cumsum(occurrences))))
 
 
 @dataclass
@@ -144,7 +144,7 @@ class Stream:
         """Return the next squeezed window and its document character ends."""
         start = self.ends[-1]
         cut = start + (self.first_window_chars if not self.windows
-                       else self.window_chars)
+            else self.window_chars)
         self.windows += 1
         if cut < len(self.text):
             boundary = re.compile(r"\s").search(self.text, cut)
@@ -192,7 +192,7 @@ def ensure_tokens(streams: list, at: int, vocabulary: Vocabulary) -> None:
     """Tokenize windows together until each live stream reaches the requested token."""
     limits = np.broadcast_to(at, (len(streams),))
     while pending := [stream for stream, limit in zip(streams, limits)
-                      if limit >= len(stream.stream) and not stream.exhausted]:
+            if limit >= len(stream.stream) and not stream.exhausted]:
         extend_streams(pending, vocabulary)
 
 
@@ -286,16 +286,16 @@ def first_tokens(vocabulary: Vocabulary, lp, scan: DocumentTokens) -> FirstToken
     maxima = np.maximum.reduceat(values, index.offsets)
     # Vocabulary.options orders equal-score spellings longest first.
     eligible = np.where(values == maxima[index.segment],
-                        np.arange(len(values)), len(values))
+        np.arange(len(values)), len(values))
     best = np.minimum.reduceat(eligible, index.offsets)
     return FirstTokens(scan=scan, kids=index.kids, inverse=index.inverse,
-                       token=index.token[best], lp=values[best],
-                       length=index.length[best], anchor=index.anchor)
+        token=index.token[best], lp=values[best],
+        length=index.length[best], anchor=index.anchor)
 
 
 def make_streams(vocabulary: Vocabulary, text: str, starts: FirstTokens,
-                 first, *, first_window_chars: int = FIRST_WINDOW_CHARS,
-                 window_chars: int = WINDOW_CHARS) -> list:
+        first, *, first_window_chars: int = FIRST_WINDOW_CHARS,
+        window_chars: int = WINDOW_CHARS) -> list:
     """Return a stream for each start the chosen first token begins.
 
     A stream's tokens are the text from the start as the model writes
@@ -309,14 +309,14 @@ def make_streams(vocabulary: Vocabulary, text: str, starts: FirstTokens,
     streams = []
     for k in starts.keys_of(first):
         filler = vocabulary.filler(int(scan.tokens[starts.anchor[k]]),
-                                   int(starts.length[k]))
+            int(starts.length[k]))
         for at in starts.positions_of([k]):
             end = int(scan.ends[at])
             streams.append(Stream(int(scan.starts[at]), [first, *filler],
-                                  [end] * (1 + len(filler)), text,
-                                  normalized=scan.normalized,
-                                  first_window_chars=first_window_chars,
-                                  window_chars=window_chars))
+                [end] * (1 + len(filler)), text,
+                normalized=scan.normalized,
+                first_window_chars=first_window_chars,
+                window_chars=window_chars))
     return streams
 
 
@@ -332,7 +332,7 @@ class TextWindows:
             text.ends + offset for text, offset in zip(normalized, self.offsets)
         ])
         characters = [np.frombuffer(text.text.encode("utf-32-le"), dtype="<u4")
-                      for text in normalized]
+            for text in normalized]
         self.boundaries = np.concatenate([
             np.r_[np.r_[0, text.ends][:-1][chars == 32] + offset, limit]
             for text, chars, offset, limit in zip(

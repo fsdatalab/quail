@@ -52,7 +52,7 @@ def finished_rows():
 
 @contextlib.contextmanager
 def reporting(rows, hint=None, tables: dict | None = None,
-              first: dict | None = None):
+        first: dict | None = None):
     """Report to rows, and skip the rows of tables by hint, while the block runs.
 
     Args:
@@ -69,17 +69,17 @@ def reporting(rows, hint=None, tables: dict | None = None,
     """
     region = _REGION
     previous = (region.rows, region.hint, region.tables, region.keep,
-                region.first)
+        region.first)
     held = set() if hint is None else set(hint.tables())
     region.rows, region.hint, region.keep = rows, hint, {}
     region.first = first or {}
     region.tables = {alias: table for alias, table in (tables or {}).items()
-                     if table in held}
+        if table in held}
     try:
         yield rows
     finally:
         (region.rows, region.hint, region.tables, region.keep,
-         region.first) = previous
+            region.first) = previous
 
 
 @contextlib.contextmanager
@@ -112,7 +112,7 @@ def _composed(outer, inner):
     if outer is None:
         return inner
     return lambda table: (None if (found := inner(table)) is None
-                          else outer(found))
+        else outer(found))
 
 
 def _translated(table: pa.Table) -> pa.Table | None:
@@ -153,7 +153,7 @@ def report_outputs(node, result) -> None:
 def finished_table(node_id: str, port: str, table: pa.Table) -> pa.Table:
     """Tag a table of finished rows with the node and port that wrote them."""
     metadata = {**(table.schema.metadata or {}),
-                b"quail.node": node_id.encode(), b"quail.port": port.encode()}
+        b"quail.node": node_id.encode(), b"quail.port": port.encode()}
     return table.replace_schema_metadata(metadata)
 
 
@@ -178,7 +178,7 @@ def first_rows(columns: dict, aliases) -> dict:
         aliases: The aliases the plan deduplicates.
     """
     return {alias: columns[alias].column(FIRST_DOCUMENT).to_numpy()
-            for alias in aliases if alias in columns}
+        for alias in aliases if alias in columns}
 
 
 def keeps(alias, document: int) -> bool:
@@ -217,4 +217,4 @@ def hinted(key) -> bool:
         key: An arena key, (alias, document) for a document.
     """
     return (isinstance(key, tuple) and len(key) == 2
-            and not keeps(key[0], int(key[1])))
+        and not keeps(key[0], int(key[1])))

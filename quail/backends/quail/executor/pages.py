@@ -42,7 +42,7 @@ class PageArena:
         return -(-tokens // self.page_tokens)
 
     def alloc(self, key, tokens: int, capacity_tokens: int | None = None,
-              borrowed=()):
+            borrowed=()):
         """The document's own pages, or None when the free list is short.
 
         The admission scheduler treats None as "wait". borrowed are
@@ -271,7 +271,7 @@ class PageArena:
         if key not in self.owned:
             raise KeyError(key)
         need = (self.pages_needed(capacity_tokens) - len(self.borrowed[key])
-                - len(self.owned[key]))
+            - len(self.owned[key]))
         if need <= 0:
             return 0
         if need > len(self.free):
@@ -339,4 +339,4 @@ def _evict_event(key, prefix_tokens):
     except (TypeError, ValueError):
         return None
     return {"kind": "evict", "alias": alias, "document": document,
-            "tokens": int(prefix_tokens)}
+        "tokens": int(prefix_tokens)}

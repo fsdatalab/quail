@@ -60,7 +60,7 @@ def quail_runtimes() -> dict:
 
 
 def record_model_result(node, result: NodeResult,
-                        context: ExecutionContext) -> None:
+        context: ExecutionContext) -> None:
     """Record reuse of anchor KV supplied by preceding operators."""
     state = context.state
     if isinstance(node, AiJoin) and state["join_streamed"]:
@@ -94,7 +94,7 @@ def execution_context(state, payload, graph: PhysicalGraph) -> ExecutionContext:
         "retention": retention,
         "filter_limit": (
             None if any(isinstance(node, AiJoin)
-                        for node in graph.nodes)
+                for node in graph.nodes)
             else payload.get("filter_limit")
         ),
         "joins_started": False,
@@ -115,7 +115,7 @@ def execution_context(state, payload, graph: PhysicalGraph) -> ExecutionContext:
         state=runtime_state,
         # an execution that runs node by node leaves the runner's chains out
         run_pipeline=(execution.execute_pipeline if execution.groups_operators
-                      else None),
+            else None),
         deduplicate=payload.get("deduplicate", {}),
     )
 
@@ -143,7 +143,7 @@ def payload_tables(tables: dict) -> dict:
 
 
 def serve_region(state, payload, graph: PhysicalGraph, end, wanted,
-                 hinted: dict | None = None) -> None:
+        hinted: dict | None = None) -> None:
     """Serve a begun region's stages on one GPU, then say what the GPU ran.
 
     Args:
@@ -160,7 +160,7 @@ def serve_region(state, payload, graph: PhysicalGraph, end, wanted,
     pipeline = state["gpu"].pipeline
     if hasattr(pipeline, "images"):
         pipeline.images = RegionImages(payload["documents"], payload["columns"],
-                                       pipeline.spec)
+            pipeline.spec)
     try:
         with torch.inference_mode():
             results = serve_stages(
@@ -221,7 +221,7 @@ def answer_region(hint, sinks, question: str):
 
 
 def region_report(graph: PhysicalGraph, ran: list, wall: float, device, *,
-                  gpus: int, gpu_timing: bool = False) -> dict:
+        gpus: int, gpu_timing: bool = False) -> dict:
     """Report a region's run from what each worker ran.
 
     Rust merges the workers' outputs and metrics
@@ -245,7 +245,7 @@ def region_report(graph: PhysicalGraph, ran: list, wall: float, device, *,
     for table in tables:
         metadata = dict(table.schema.metadata)
         ref = PortRef(metadata.pop(b"quail.node").decode(),
-                      metadata.pop(b"quail.port").decode())
+            metadata.pop(b"quail.port").decode())
         outputs[ref] = table.replace_schema_metadata(metadata or None)
     report["_outputs"] = outputs
     return report

@@ -25,7 +25,7 @@ DATAFUSION_DIALECTS = {"snowflake": "Snowflake", "bq": "BigQuery"}
 
 # the start of a DataFusion error, which names its kind
 _ERROR_KINDS = ("Error during planning: ", "SQL error: ", "Schema error: ",
-                "External error: ", "CompileError: ")
+    "External error: ", "CompileError: ")
 
 
 # what WHERE tests besides an AI call, in the refusal of anything else
@@ -47,15 +47,15 @@ def compile_message(error: Exception, sql: str) -> str:
     if 'List(Struct("feature"' in text:
         if "character_length" in text:
             return ("LENGTH needs text, so use array_length for a feature list "
-                    "or UNNEST to test its fields.")
+                "or UNNEST to test its fields.")
         if "Cannot infer common argument type" in text:
             return ("AI.SAE_FEATURES returns a list, so use UNNEST "
-                    "before testing its fields.")
+                "before testing its fields.")
     if found := re.match(r"Invalid function '(\w+)'", text):
         name = found[1]
         if name.lower() == "mod":
             call = re.search(r"\bMOD\s*\(\s*([^,()]+?)\s*,\s*([^()]+?)\s*\)", sql,
-                             re.IGNORECASE)
+                re.IGNORECASE)
             shown = f"{call[1]} % {call[2]}" if call else "MOD"
             return f"MOD is not a DataFusion function; write {shown}"
         return f"unknown function {name!r}"

@@ -59,7 +59,7 @@ class TableProvider(Protocol):
 
 def _check_request(schema: pa.Schema, request: ScanRequest) -> None:
     missing = [name for name in request.columns
-               if name not in schema.names]
+        if name not in schema.names]
     if missing:
         raise CompileError(
             f"columns {missing} not in schema {tuple(schema.names)}")
@@ -236,7 +236,7 @@ class DocumentProvider:
 
         dataset = ds.dataset(path, format="parquet")
         return replace(cls.from_dataset(dataset, id_col=id_col),
-                       file_format="parquet")
+            file_format="parquet")
 
     @classmethod
     def from_ipc(cls, path: str, id_col: str) -> ArrowDatasetProvider:
@@ -244,7 +244,7 @@ class DocumentProvider:
         import pyarrow.dataset as ds
 
         return replace(cls.from_dataset(ds.dataset(path, format="ipc"), id_col),
-                       file_format="arrow")
+            file_format="arrow")
 
     @classmethod
     def from_hf(
@@ -269,7 +269,7 @@ class DocumentProvider:
         from datasets import load_dataset_builder
 
         builder = load_dataset_builder(dataset, config or None,
-                                       revision=revision or None)
+            revision=revision or None)
         features = builder.info.features
         schema = getattr(features, "arrow_schema", None)
         if schema is None:

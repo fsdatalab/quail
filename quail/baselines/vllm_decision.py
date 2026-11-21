@@ -40,7 +40,7 @@ def pooling_params(offsets, *, read_cache: bool = True):
     from vllm import PoolingParams
 
     return PoolingParams(task=TASK, skip_reading_prefix_cache=not read_cache,
-                         extra_kwargs={OFFSETS_KEY: [int(o) for o in offsets]})
+        extra_kwargs={OFFSETS_KEY: [int(o) for o in offsets]})
 
 
 def pool_decision_rows(torch, head, chunks, finished, params, states) -> list:
@@ -83,7 +83,7 @@ def pool_decision_rows(torch, head, chunks, finished, params, states) -> list:
         state.clean()
         if rows.shape[0] < need:
             out[index] = torch.full((len(offsets) - 1,), float("nan"),
-                                    device=rows.device)
+                device=rows.device)
             continue
         last = rows.shape[0] - 1
         groups.setdefault(tuple(offsets), []).append(
@@ -131,7 +131,7 @@ class _RetryingEngine:
 
     def abort_request(self, request_ids):
         retries = [retry for retry, original in self.retries.items()
-                   if original in request_ids]
+            if original in request_ids]
         for retry in retries:
             del self.retries[retry]
         for request_id in request_ids:
@@ -218,7 +218,7 @@ class VLLMDecisionClient:
 
 
 def boot_decision(spec, llm_kwargs: dict, *,
-                  resources: ExitStack) -> tuple[dict, dict]:
+        resources: ExitStack) -> tuple[dict, dict]:
     """Load a decision checkpoint on the pooling runner.
 
     Each query sets its own pooling parameters from its plan. Prompts
@@ -241,7 +241,7 @@ def boot_decision(spec, llm_kwargs: dict, *,
     register()
     path = resolve_model_path(spec.hf_name, spec.revision)
     llm_kwargs = {key: value for key, value in llm_kwargs.items()
-                  if key != "tokenizer_mode"}
+        if key != "tokenizer_mode"}
     llm_kwargs["skip_tokenizer_init"] = True
     started = time.perf_counter()
     llm = LLM(runner="pooling", **engine_args(path, ARCHITECTURE), **llm_kwargs)
@@ -263,5 +263,5 @@ def boot_decision(spec, llm_kwargs: dict, *,
     return (
         {"client": client, "sampling_params": params, "capacity": capacity},
         {"kind": "cold", "llm_init_s": round(boot_s, 2), "weight_load_s": None,
-         "kv_profile_s": None, "boot_s": round(boot_s, 2)},
+            "kv_profile_s": None, "boot_s": round(boot_s, 2)},
     )

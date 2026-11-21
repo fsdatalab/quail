@@ -16,7 +16,7 @@ from quail.backends.quail.executor.stages import Stage
 
 
 def split_passes(state: int, members, lengths, header: int, set_size: int,
-                 budget: int) -> list[list]:
+        budget: int) -> list[list]:
     """Split an anchor's members into passes, in order.
 
     A pass holds at most set_size questions and fits the chunk budget
@@ -34,7 +34,7 @@ def split_passes(state: int, members, lengths, header: int, set_size: int,
                 f"a join question of {tokens} tokens does not fit one "
                 f"{budget}-token chunk with its {state}-token state")
         if current and (len(current) == set_size
-                        or used + header + tokens > budget):
+                or used + header + tokens > budget):
             passes.append(current)
             current, used = [], state
         used += tokens + (header if current else 0)
@@ -62,8 +62,8 @@ def group_passes(state: int, questions, header, set_size: int, budget: int) -> l
         question's length in the suffix.
     """
     passes = split_passes(state, range(len(questions)),
-                          [len(question) for question in questions], len(header),
-                          set_size, budget)
+        [len(question) for question in questions], len(header),
+        set_size, budget)
     out = []
     for members in passes:
         suffix, shape = [], []
@@ -110,12 +110,12 @@ class Passes:
 def own_stage(state, readout, label: str, passes: Passes) -> Stage:
     """A stage whose one request is each pass's own, from passes.requests."""
     return Stage(suffixes=passes.requests.__getitem__,
-                 suffix_tokens=state.chunk_tokens, readout=readout,
-                 decide=lambda _, row: True, label=label)
+        suffix_tokens=state.chunk_tokens, readout=readout,
+        decide=lambda _, row: True, label=label)
 
 
 def run_passes(state, stages, passes: Passes, *, label: str, limit=None,
-               num_key_survivors=1) -> Passes:
+        num_key_survivors=1) -> Passes:
     """Ask a step's passes in one GPU loop; fill in their answers and costs.
 
     Each pass is one anchor that asks only its stage, settling there.

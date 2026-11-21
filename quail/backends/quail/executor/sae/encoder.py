@@ -39,7 +39,7 @@ class SaeEncoder:
         from huggingface_hub import hf_hub_download
 
         path = hf_hub_download(sae.hf_name, sae.file,
-                               revision=sae.revision or None)
+            revision=sae.revision or None)
         tensors = torch.load(path, map_location="cpu", weights_only=True)
         weight = tensors["W_enc"]
         bias = tensors["b_enc"]
@@ -48,7 +48,7 @@ class SaeEncoder:
                 f"{sae.file} W_enc is {tuple(weight.shape)}, expected "
                 f"({sae.num_features}, {spec.hidden})")
         return cls(torch, F, weight.to(device="cuda", dtype=torch.bfloat16),
-                   bias.to(device="cuda", dtype=torch.float32), sae.keep)
+            bias.to(device="cuda", dtype=torch.float32), sae.keep)
 
     def top_features(self, rows):
         """Return (indices int32, strengths fp32), the keep largest per row."""
@@ -60,7 +60,7 @@ class SaeEncoder:
             # negative value is selected only when a row has fewer than
             # keep positives, and the clamp on the selection zeroes it
             pre = self.F.linear(rows[start:start + block].to(torch.bfloat16),
-                                self.weight) + self.bias
+                self.weight) + self.bias
             values, index = torch.topk(pre, self.keep, dim=1)
             indices.append(index.to(torch.int32))
             strengths.append(values.clamp_(min=0.0))
@@ -107,7 +107,7 @@ def feature_lists_of_rows(packed, keep: int) -> tuple:
     row_ids, columns = np.nonzero(strengths > 0.0)
     lengths = np.bincount(row_ids, minlength=packed.shape[0])
     return (lengths, indices[row_ids, columns].astype(np.int32),
-            strengths[row_ids, columns])
+        strengths[row_ids, columns])
 
 
 def sae_encoder(state) -> SaeEncoder:

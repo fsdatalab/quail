@@ -35,7 +35,7 @@ def _feature_column(lengths, indices, strengths) -> pa.ListArray:
     np.cumsum(lengths, out=offsets[1:])
     values = pa.StructArray.from_arrays(
         [pa.array(np.ascontiguousarray(indices, dtype=np.int32)),
-         pa.array(np.ascontiguousarray(strengths, dtype=np.float32))],
+            pa.array(np.ascontiguousarray(strengths, dtype=np.float32))],
         names=FEATURE_LIST.value_type.names)
     return pa.ListArray.from_arrays(pa.array(offsets, pa.int32()), values)
 
@@ -48,16 +48,16 @@ class SaeFeaturesOperator(ColumnOperator, SingleNodeOperator):
         node = nodes[0]
         accumulator = next(
             (operator.accumulator for operator in chain
-             if isinstance(operator, SaeFeaturesOperator)
-             and operator.accumulator is not None), None)
+                if isinstance(operator, SaeFeaturesOperator)
+                and operator.accumulator is not None), None)
         return cls(region.query, node, region.document_ids(), region.documents,
-                   accumulator=accumulator)
+            accumulator=accumulator)
 
     @staticmethod
     def prepare_group(operators):
         """Clear each question's maxima when its call finishes, for either pooling."""
         accumulator = next((operator.accumulator for operator in operators
-                            if operator.accumulator is not None), None)
+            if operator.accumulator is not None), None)
         if accumulator is not None:
             for operator in operators:
                 operator.accumulator = accumulator
@@ -106,7 +106,7 @@ class SaeFeaturesOperator(ColumnOperator, SingleNodeOperator):
                     return lengths[key]
 
                 accumulator = SaeMaxAccumulator(torch, encoder,
-                                                document_tokens)
+                    document_tokens)
                 self._pipeline = state.loaded_model.pipeline
             self.accumulator = accumulator
 
@@ -135,7 +135,7 @@ class SaeFeaturesOperator(ColumnOperator, SingleNodeOperator):
         if self.node.spec.pooling == "max":
             self._harvest(completed_only=False, positions=positions)
             return (pa.array([self.values[position] for position in positions],
-                             type=FEATURE_LIST),)
+                type=FEATURE_LIST),)
         return (_feature_column(*feature_lists_of_rows(
             [self.values[position] for position in positions], self.keep)),)
 
@@ -177,10 +177,10 @@ class SaeFeaturesOperator(ColumnOperator, SingleNodeOperator):
             values = pa.concat_arrays([column for _, column in batches])
         else:
             answered = [index for index, value in enumerate(self.values)
-                        if value is not None]
+                if value is not None]
             (values,) = self.column_values(0, answered)
         rows = np.asarray([[self.ids[index]] for index in answered],
-                          dtype=np.int32).reshape(-1, 1)
+            dtype=np.int32).reshape(-1, 1)
         (alias,) = spec.aliases
         listed = Rows({alias: rows[:, 0]}, pa.table({
             spec.name: values}))

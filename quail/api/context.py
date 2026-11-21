@@ -116,7 +116,7 @@ def register_provider(datafusion, name: str, provider: TableProvider) -> None:
     files = local_files(provider)
     if files is not None:
         datafusion.register_files(name, provider.file_format, files, schema,
-                                  id_column, identity)
+            id_column, identity)
         return
 
     def scan(columns: list[str]) -> pa.RecordBatchReader:
@@ -142,14 +142,14 @@ class SessionContext:
     """
 
     def __init__(self, session, physical_executor: Callable | None = None, *,
-                 order: str | None = None, run_query: Callable | None = None,
-                 workers=None):
+            order: str | None = None, run_query: Callable | None = None,
+            workers=None):
         from _quail_native import NativeSession
 
         self.session = session
         if workers is None:
             engine = Engine(session, physical_executor, order=order,
-                            run_query=run_query)
+                run_query=run_query)
             self._native = NativeSession(engine, session.planner, session.datafusion)
         else:
             description = engine_description(Engine(session, order=order))

@@ -356,7 +356,7 @@ class ModelSpec:
         if not self.sliding_window:
             return frozenset()
         return frozenset(i for i in range(self.layers)
-                         if self.layer_kind(i) == "sliding_attention")
+            if self.layer_kind(i) == "sliding_attention")
 
     @property
     def kappa_sliding(self) -> float:

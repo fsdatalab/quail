@@ -120,13 +120,13 @@ class MapOperator(ColumnOperator, ModelOperator):
                 positions.append(document)
                 parents.append(document)
                 shared.append(max(0, len(prefixes[document]) - 1)
-                              // page_tokens * page_tokens)
+                    // page_tokens * page_tokens)
         order = [a for parent in order
-                 for a in (parent, *(
-                     self.slots[1:, parent].tolist()
-                     if parent < num_documents else ()))]
+            for a in (parent, *(
+                self.slots[1:, parent].tolist()
+                if parent < num_documents else ()))]
         return (DocumentPrefixes((), prefixes, positions), keys,
-                PrefixTree(order, parents, shared), dependencies)
+            PrefixTree(order, parents, shared), dependencies)
 
     @property
     def decoder(self):
@@ -145,7 +145,7 @@ class MapOperator(ColumnOperator, ModelOperator):
         for q, slots in enumerate(self.slots):
             decoder.answer_slots[self.first + q] = slots
         decoder.share |= any(getattr(node, "attention", "") == "tree"
-                             for node in self.nodes)
+            for node in self.nodes)
 
     def _slots(self, q: int, documents) -> np.ndarray:
         """The decoder slots of map q's answers over the documents."""
@@ -176,7 +176,7 @@ class MapOperator(ColumnOperator, ModelOperator):
             node = self.nodes[q]
             positions = sorted(position for found, position in finished if found == q)
             tables.append(finished_table(node.node_id, node.rows_port,
-                                         self.answer_rows(q, positions).table()))
+                self.answer_rows(q, positions).table()))
         return tables
 
     def answer_rows(self, q, positions):
@@ -185,12 +185,12 @@ class MapOperator(ColumnOperator, ModelOperator):
         (values,) = self.column_values(q, positions)
         (alias,) = spec.aliases
         return Rows({alias: self.ids[positions].astype(np.int32)},
-                    pa.table({spec.name: values}))
+            pa.table({spec.name: values}))
 
     def read_answers(self, every) -> int:
         """Return the tokens the maps fed: their tails and their decode rows."""
         tails = sum(int(asked.sum()) * len(node.spec.prompt_token_parts[1])
-                    for asked, node in zip(self.asked, self.nodes))
+            for asked, node in zip(self.asked, self.nodes))
         rows = self.decoder.rows_fed[self.first:self.first + len(self.nodes)]
         self.fed = [int(n) for n in rows]
         return tails + sum(self.fed)
@@ -214,7 +214,7 @@ class MapOperator(ColumnOperator, ModelOperator):
     def close(self, fresh, spans, stats, offset) -> dict:
         """Build each answer's table and attribute its GPU work."""
         own = [int(asked.sum()) * len(node.spec.prompt_token_parts[1]) + fed
-               for asked, node, fed in zip(self.asked, self.nodes, self.fed)]
+            for asked, node, fed in zip(self.asked, self.nodes, self.fed)]
         for q, node in enumerate(self.nodes):
             spec = node.spec
             asked = self.answered_positions(q)
@@ -242,12 +242,12 @@ class MapOperator(ColumnOperator, ModelOperator):
                         "borrowed_prefix_tokens": (
                             stats.get("borrowed_tokens", 0) if q == 0 else 0),
                         "pack_s": (round(stats.get("pack_s", 0.0), 3)
-                                   if q == 0 else 0.0),
+                            if q == 0 else 0.0),
                         "answer_admission": stats.get("answer_admission"),
                         "answer_evictions": (stats.get("num_evictions", 0)
-                                             if q == 0 else 0),
+                            if q == 0 else 0),
                         "recomputed_tokens": (stats.get("recomputed_tokens", 0)
-                                              if q == 0 else 0),
+                            if q == 0 else 0),
                         **(admission_metrics(stats) if q == 0 else {}),
                         **self.answer_counts(q)}))
         return self._results
@@ -293,8 +293,8 @@ class AnswerBranches(MapOperator):
         self.operators = operators
         first = operators[0]
         super().__init__(first.state,
-                         [node for operator in operators for node in operator.nodes],
-                         first.ids, first.first)
+            [node for operator in operators for node in operator.nodes],
+            first.ids, first.first)
         self.asked = [asked for operator in operators for asked in operator.asked]
 
     def settle(self, document, survived, row):
@@ -309,7 +309,7 @@ class AnswerBranches(MapOperator):
 
     def take_finished(self):
         return [table for operator in self.operators
-                for table in operator.take_finished()]
+            for table in operator.take_finished()]
 
     def branch_inputs(self, prefixes, keys, tree, page_tokens, stage):
         result = super().branch_inputs(prefixes, keys, tree, page_tokens, stage)
@@ -332,10 +332,10 @@ class AnswerBranches(MapOperator):
             tokens = fresh - sum(self.own[1:]) if index == 0 else self.own[index]
             share = tokens / max(1, fresh)
             selected = [({j: n * share for j, n in rows.items()}, total, start, end)
-                        for rows, total, start, end in spans]
+                for rows, total, start, end in spans]
             operator.close(tokens, selected, stats if index == 0 else {}, offset)
         return self.results()
 
     def results(self):
         return {key: value for operator in self.operators
-                for key, value in operator.results().items()}
+            for key, value in operator.results().items()}

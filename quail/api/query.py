@@ -43,7 +43,7 @@ def backend_refusal(session) -> Refusal | None:
         backend = session.registry.backend(config.backend)
     except ValueError as error:
         return Refusal(reasons=(str(error),), constraint="unknown_backend",
-                       needed=1, available=0, unit="backends")
+            needed=1, available=0, unit="backends")
     support = backend.supports(session.model, session.device, config.gpus)
     if not support.supported:
         return Refusal(
@@ -67,10 +67,10 @@ class QueryLike(Protocol):
     def submit(self, **options): ...
 
     def execute_stream(self, batch_rows: int = 65_536,
-                       limit: int | None = None) -> pa.RecordBatchReader: ...
+            limit: int | None = None) -> pa.RecordBatchReader: ...
 
     def collect(self, limit: int | None = None,
-                batch_rows: int = 65_536) -> pa.Table: ...
+            batch_rows: int = 65_536) -> pa.Table: ...
 
     def explain(self, **options) -> str: ...
 
@@ -93,7 +93,7 @@ class Query:
     """
 
     def __init__(self, session: "Session", text: str, dialect: str = "snowflake",
-                 order: str | None = None):
+            order: str | None = None):
         self.session = session
         self.text = text
         self.dialect = dialect
@@ -106,7 +106,7 @@ class Query:
         from quail.api.context import SessionContext
 
         return SessionContext(self.session, physical_executor, order=self.order,
-                              run_query=run_query)._native
+            run_query=run_query)._native
 
     def _dialect(self) -> str:
         from quail.api.compile import DATAFUSION_DIALECTS
@@ -191,8 +191,8 @@ class Query:
             for payload, planned in found:
                 found = json.loads(payload)
                 region = region_query(self.session, found["operators"],
-                                      logical=found["logical"], order=self.order,
-                                      region_id=found["region_id"])
+                    logical=found["logical"], order=self.order,
+                    region_id=found["region_id"])
                 if planned is not None:
                     text, scans = planned
                     region.adopt_plan(json.loads(text), scans)
@@ -234,14 +234,14 @@ class Query:
         result = self.run() if analyze else None
         if result is not None:
             unexpected = (set(result.region_results)
-                          - {region.region_id for region in regions})
+                - {region.region_id for region in regions})
             if unexpected:
                 raise RuntimeError(
                     f"executed model regions do not match the query: {unexpected}")
         texts = []
         for region in regions:
             executed = (result.region_results.get(region.region_id)
-                        if result is not None else None)
+                if result is not None else None)
             text = region._explain(executed, verbose)
             if result is not None and executed is None:
                 # LIMIT and other SQL operators need not read every model region.
@@ -250,8 +250,8 @@ class Query:
         if len(regions) == 1 and self._whole and not regions[0].has_inputs():
             return texts[0]
         around = (result.datafusion_plan if result is not None
-                  and result.datafusion_plan is not None
-                  else self._native().explain(self.text, self._dialect()))
+            and result.datafusion_plan is not None
+            else self._native().explain(self.text, self._dialect()))
         if len(texts) == 1:
             return f"DataFusion:\n{around}\n\nmodel region:\n{texts[0]}"
         return "\n\n".join([around, *(f"model region {index + 1}:\n{text}"
@@ -273,7 +273,7 @@ class Query:
             "queries in the current process, so call run() or collect()")
 
     def execute_stream(self, batch_rows: int = 65_536, limit: int | None = None,
-                       *, physical_executor=None) -> pa.RecordBatchReader:
+            *, physical_executor=None) -> pa.RecordBatchReader:
         """Execute the query and stream its rows as Arrow record batches.
 
         On Quail's backend, the rows arrive as DataFusion produces them:
@@ -304,7 +304,7 @@ class Query:
         return stream_query(self, physical_executor, batch_rows, limit)
 
     def collect(self, limit: int | None = None,
-                batch_rows: int = 65_536) -> pa.Table:
+            batch_rows: int = 65_536) -> pa.Table:
         """Execute the query and collect one Arrow table."""
         return self.run().collect(limit=limit, batch_rows=batch_rows)
 
@@ -313,8 +313,8 @@ class RegionQuery:
     """One model region of a query: its plan, and its run in this process."""
 
     def __init__(self, session: "Session", operators: str,
-                 order: str | None = None, *, logical: str = "", catalog=None,
-                 region_id: int | None = None):
+            order: str | None = None, *, logical: str = "", catalog=None,
+            region_id: int | None = None):
         self.session = session
         self.region_id = region_id
         self.catalog = session.catalog if catalog is None else catalog
@@ -405,7 +405,7 @@ class RegionQuery:
         return self._planning_s
 
     def explain(self, *, verbose: bool = False,
-                analyze: bool = False) -> str:
+            analyze: bool = False) -> str:
         """Return the optimized plan, optionally measured by running it.
 
         Args:
@@ -427,11 +427,11 @@ class RegionQuery:
         # A downstream region may have been inspected with empty placeholder
         # inputs. ANALYZE must use the plan chosen for its actual input rows.
         physical = (result.physical_plan if result is not None
-                    and result.physical_plan is not None else self.plan())
+            and result.physical_plan is not None else self.plan())
         if result is not None:
             # the root relation is lazy, so its row count is taken here
             rows = (result.region_rows if result.region_rows is not None
-                    else result.count())
+                else result.count())
             root = physical.graph.root.node_id
             result.node_metrics[root] = replace(
                 result.node_metrics.get(root, NodeMetrics()),
@@ -441,16 +441,16 @@ class RegionQuery:
         registry = self.session.registry
         operators = physical.operators if not isinstance(physical, Refusal) else None
         text = explain(self.logical, operators or self.operators, physical,
-                       verbose=verbose, result=result,
-                       rules=tuple(registry.rules.values()),
-                       usd_per_hour=(
-                           self.session.device.usd_per_hour or None))
+            verbose=verbose, result=result,
+            rules=tuple(registry.rules.values()),
+            usd_per_hour=(
+                self.session.device.usd_per_hour or None))
         return text
 
     def has_inputs(self) -> bool:
         """Whether the region reads a table the session did not register."""
         return bool(input_scans(self.facts(self._operators_input),
-                                self.session.catalog))
+            self.session.catalog))
 
     def run(self) -> QueryResult:
         """Execute the query in the current process."""
@@ -478,21 +478,21 @@ class RegionQuery:
                 self._token_inputs[node.alias].tokens,
                 None if texts is None else texts.column("text"))
         relations = {columns_key(name.split(":", 1)[1]): table
-                     for name, table in tables.items()
-                     if name.startswith("columns:")}
+            for name, table in tables.items()
+            if name.startswith("columns:")}
         return PhysicalRequest(envelope, inputs, relations,
-                               self._alias_source_rows())
+            self._alias_source_rows())
 
     def scan_tables(self) -> dict:
         """Each scan's token store and the columns of its rows, by alias."""
         return {alias: (store.tokens.table, store.columns)
-                for alias, store in self._token_inputs.items()}
+            for alias, store in self._token_inputs.items()}
 
     def _alias_source_rows(self) -> dict:
         """Each filtered input's rows in its registered table, by scan alias."""
         return {scan["alias"]: self.source_rows[scan["provider"]]
-                for scan in self.facts()["scans"]
-                if scan["provider"] in self.source_rows}
+            for scan in self.facts()["scans"]
+            if scan["provider"] in self.source_rows}
 
     def finished_rows(self, on_rows=None):
         """Return the FinishedRows that builds the region's rows from its run.
@@ -503,10 +503,10 @@ class RegionQuery:
         """
         request = self._answer_request(self.plan(), returned=True)
         return _quail_native.FinishedRows(json.dumps(request), self._source_values,
-                                          on_rows)
+            on_rows)
 
     def finish(self, response, coordinator_wall: float = 0.0,
-               finished=None, relation: pa.Table | None = None) -> QueryResult:
+            finished=None, relation: pa.Table | None = None) -> QueryResult:
         """Return the region's result: its rows and the run's report.
 
         Args:
@@ -592,7 +592,7 @@ class RegionQuery:
         alias = source.references[0].alias
         store = self._token_inputs[alias]
         loaded = (store.column_names if isinstance(store, pa.Table)
-                  else store.projected_columns)
+            else store.projected_columns)
         for ref in source.references:
             if ref.column not in loaded:
                 raise CompileError(
@@ -618,17 +618,17 @@ class RegionQuery:
             nodes = [node for node in nodes if node.node_id in kept]
         ports = [
             {"node_type": node.type_name, "node": node.node_id,
-             "port": output.name, "value_type": output.value_type.value,
-             "answer": None if output.answer is None else {
-                 "kind": output.answer.kind, "name": output.answer.name,
-                 "columns": list(output.answer.columns)}}
+                "port": output.name, "value_type": output.value_type.value,
+                "answer": None if output.answer is None else {
+                    "kind": output.answer.kind, "name": output.answer.name,
+                    "columns": list(output.answer.columns)}}
             for node in nodes for output in node.outputs]
         source_rows = {alias: rows.to_pylist()
-                       for alias, rows in self._alias_source_rows().items()}
+            for alias, rows in self._alias_source_rows().items()}
         return {
             "operators": self.operators, "ports": ports,
             "num_documents": {alias: len(tokens)
-                              for alias, tokens in self._document_tokens.items()},
+                for alias, tokens in self._document_tokens.items()},
             "source_rows": source_rows}
 
 def _observe(graph, outputs, metrics, observers) -> None:
@@ -638,8 +638,8 @@ def _observe(graph, outputs, metrics, observers) -> None:
     values = {(ref.node_id, ref.port): value for ref, value in outputs.items()}
     for node in graph.topological_nodes():
         found = {output.name: values[(node.node_id, output.name)]
-                 for output in node.outputs
-                 if (node.node_id, output.name) in values}
+            for output in node.outputs
+            if (node.node_id, output.name) in values}
         if not found or len(found) != len(node.outputs):
             continue
         result = NodeResult(found, metrics.get(node.node_id, NodeMetrics()))

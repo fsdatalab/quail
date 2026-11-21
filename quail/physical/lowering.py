@@ -57,7 +57,7 @@ class Vocabulary:
         def decoded(ids):
             text = decode([self.word(token) for token in ids])
             return (text.decode("utf-8", errors="replace")
-                    if isinstance(text, bytes) else str(text))
+                if isinstance(text, bytes) else str(text))
 
         return decoded
 
@@ -99,7 +99,7 @@ class LoweredPrompt:
     def labels(self) -> tuple:
         """Per placeholder, (alias, label tokens, frame tokens)."""
         return tuple((alias, len(label), len(frame))
-                     for alias, label, frame in self.label_token_ids)
+            for alias, label, frame in self.label_token_ids)
 
     @property
     def template(self) -> str:
@@ -144,9 +144,9 @@ def _lowered(found: dict, vocabulary: Vocabulary) -> LoweredPrompt:
         tail_token_ids=words(found["tail_token_ids"]),
         frame_tokens=found["frame_tokens"],
         label_token_ids=tuple((alias, words(label), words(frame))
-                              for alias, label, frame in found["label_token_ids"]),
+            for alias, label, frame in found["label_token_ids"]),
         lettered=(None if found.get("lettered") is None
-                  else _lowered(found["lettered"], vocabulary)))
+            else _lowered(found["lettered"], vocabulary)))
 
 
 def _call(name: str, arguments: list, tokenizer):
@@ -163,8 +163,8 @@ def _call(name: str, arguments: list, tokenizer):
 def model_fields(model) -> dict:
     """The model fields prompt lowering reads."""
     return {"role": model.role,
-            "answer_spellings": [list(words) for words in model.answer_spellings],
-            "turn": list(model.turn), "prompt_layout": model.prompt_layout}
+        "answer_spellings": [list(words) for words in model.answer_spellings],
+        "turn": list(model.turn), "prompt_layout": model.prompt_layout}
 
 
 def lower_prompt(prompt: Prompt, tokenizer) -> LoweredPrompt:
@@ -183,7 +183,7 @@ def answer_ids(model, tokenizer) -> tuple[list, list]:
     (true_ids, false_ids), vocabulary = _call(
         "answer_ids", [model_fields(model)], tokenizer)
     return ([vocabulary.word(token) for token in true_ids],
-            [vocabulary.word(token) for token in false_ids])
+        [vocabulary.word(token) for token in false_ids])
 
 
 def option_aliases(codes, tokenizer) -> tuple[str, ...]:
@@ -242,8 +242,8 @@ def set_question_parts(prompt: Prompt, tokenizer) -> dict:
     (state_tail, header), vocabulary = _call(
         "set_question_parts", [json.loads(prompt.to_json()), prompt.layout], tokenizer)
     return dict(state_tail_tokens=state_tail,
-                question_header_token_ids=tuple(
-                    vocabulary.word(token) for token in header))
+        question_header_token_ids=tuple(
+            vocabulary.word(token) for token in header))
 
 
 def prompt_layout(name: str) -> dict:

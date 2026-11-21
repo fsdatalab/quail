@@ -17,7 +17,7 @@ def chunk_writes(chunk):
     """Return the chunk's fresh and partial-page write mappings."""
     if chunk.attention_mode == "tree":
         return dict(src=chunk.meta["kv_src"], dst=chunk.meta["kv_dst"],
-                    tail_src=None, tail_dst=None)
+            tail_src=None, tail_dst=None)
     return chunk.meta["unified"]
 
 
@@ -32,7 +32,7 @@ class KVWriteBuffers:
         self.meta = {}
         self.has_tails = False
         self._state = (storage._state if storage is not None
-                       else {"src": 0, "dst": 0, "tail_src": 0, "tail_dst": 0})
+            else {"src": 0, "dst": 0, "tail_src": 0, "tail_dst": 0})
         for name in ("src", "dst", "tail_src", "tail_dst"):
             count = num_tokens * (page_tokens if name.startswith("tail_") else 1)
             if storage is not None:
@@ -51,7 +51,7 @@ class KVWriteBuffers:
     def copy(self, writes):
         """Stage mappings and mask only previously written unused entries."""
         self.has_tails = (writes is not None and writes["tail_src"] is not None
-                          and writes["tail_src"].numel() > 0)
+            and writes["tail_src"].numel() > 0)
         for name, target in self.meta.items():
             if (name.startswith("tail_") and not self.has_tails
                     and not self._state[name]):
@@ -97,13 +97,13 @@ class PiecewiseBuffers:
             width = pipeline.final_norm.weight.numel()
             ids = torch.zeros(num_tokens, dtype=torch.int64, device=device)
             residual = torch.zeros((num_tokens, width), dtype=torch.bfloat16,
-                                   device=device)
+                device=device)
             rows = dict(ids=ids, positions=torch.zeros_like(ids),
-                        residual=residual, output=torch.empty_like(residual),
-                        **pipeline.boundary(num_tokens, device))
+                residual=residual, output=torch.empty_like(residual),
+                **pipeline.boundary(num_tokens, device))
         else:
             rows = {name: tensor[:num_tokens]
-                    for name, tensor in storage.rows.items()}
+                for name, tensor in storage.rows.items()}
         self.rows = rows
         for name, tensor in (rows | pipeline.bucket_boundary(
                 num_tokens, device)).items():
@@ -124,14 +124,14 @@ class PiecewiseBuffers:
     def has_tails(self):
         """Whether either KV pool has retained partial pages to copy."""
         return (self.writes.has_tails
-                or (self.sliding_writes is not None and self.sliding_writes.has_tails))
+            or (self.sliding_writes is not None and self.sliding_writes.has_tails))
 
     def supports(self, chunk):
         """Whether the full and sliding KV mappings fit this token bucket."""
         writes = chunk_writes(chunk)
         return (self.writes.supports(writes)
-                and (self.sliding_writes is None or self.sliding_writes.supports(
-                    writes.get("sliding") or writes if writes is not None else None)))
+            and (self.sliding_writes is None or self.sliding_writes.supports(
+                writes.get("sliding") or writes if writes is not None else None)))
 
     def copy(self, chunk):
         """Stage real input rows and clear padding from the previous pass."""
@@ -178,7 +178,7 @@ class CapturedPieces:
         """Replay pieces separated by eager token mixers; copy selected outputs."""
         self.buffers.copy(chunk)
         graphs = (self.tail_graphs if self.buffers.has_tails
-                  and self.tail_graphs is not None else self.graphs)
+            and self.tail_graphs is not None else self.graphs)
         chunk.meta["layer"] = 0
         previous = chunk.meta.get("kv_written")
         chunk.meta["kv_written"] = True
@@ -238,7 +238,7 @@ class PiecewiseGraphs:
         if not buckets:
             return None
         return cls(pipeline, token_buckets=buckets,
-                   memory_bytes=graph_memory_bytes(model, device))
+            memory_bytes=graph_memory_bytes(model, device))
 
     def invalidate(self):
         """Release captures before replacing the KV allocation they write."""
@@ -285,7 +285,7 @@ class PiecewiseGraphs:
                 f"graphs allocated {self.captured_bytes} bytes, "
                 f"exceeding their {self.memory_bytes}-byte reserve")
         self.token_bytes = ((self.captured_bytes - self.buffer_bytes)
-                            / self.token_buckets[-1])
+            / self.token_buckets[-1])
         self.growth_bytes = (self.memory_bytes - self.captured_bytes) // 8
         by_tokens = {item.buffers.num_tokens: item for item in self.graphs}
         for size in _PRECAPTURE_BUCKETS:
@@ -314,11 +314,11 @@ class PiecewiseGraphs:
         else:
             self.capture(captured)
         self.growth_bytes = max(self.growth_bytes,
-                                self.captured_bytes - before - scaled)
+            self.captured_bytes - before - scaled)
         if self.captured_bytes > self.memory_bytes:
             logger.warning("CUDA graphs: %.0f MiB exceeds the %.0f MiB reserve; "
-                           "smaller buckets run eagerly",
-                           self.captured_bytes / 2**20, self.memory_bytes / 2**20)
+                "smaller buckets run eagerly",
+                self.captured_bytes / 2**20, self.memory_bytes / 2**20)
         return True
 
     def capture(self, captured, *, copy_tail=False):
@@ -344,7 +344,7 @@ class PiecewiseGraphs:
                 buffers.sliding_writes.copy(None)
             num_pieces = len(self.pipeline.layers) + 1
             with (torch.cuda.stream(stream), torch.inference_mode(),
-                  self.pipeline.forward_context(buffers.num_tokens)):
+                    self.pipeline.forward_context(buffers.num_tokens)):
                 for index in range(num_pieces):
                     buffers.piece(self.pipeline, index, copy_tail=copy_tail)
                 graphs = []
@@ -372,9 +372,9 @@ class PiecewiseGraphs:
         seconds = time.perf_counter() - started
         self.capture_s += seconds
         logger.info("CUDA graphs: captured %d tokens%s in %.1f s, using "
-                    "%.0f of %.0f MiB", buffers.num_tokens,
-                    " (tails)" if copy_tail else "", seconds,
-                    self.captured_bytes / 2**20, self.memory_bytes / 2**20)
+            "%.0f of %.0f MiB", buffers.num_tokens,
+            " (tails)" if copy_tail else "", seconds,
+            self.captured_bytes / 2**20, self.memory_bytes / 2**20)
 
     def supports(self, chunk):
         """Whether a chunk fits capture without a model-specific forward hook."""
@@ -385,21 +385,21 @@ class PiecewiseGraphs:
                 or self.pipeline.forward_hook is not None):
             return False
         return next(c.buffers for c in self.graphs
-                    if c.buffers.num_tokens >= chunk.tokens).supports(chunk)
+            if c.buffers.num_tokens >= chunk.tokens).supports(chunk)
 
     def _select_bucket(self, chunk):
         """Return the bucket to replay for chunk, reusing a tile-aligned capture."""
         first = next(c for c in self.graphs
-                     if c.buffers.num_tokens >= chunk.tokens)
+            if c.buffers.num_tokens >= chunk.tokens)
         if first.graphs is not None:
             return first
         if len(self.graphs) > 16 and chunk.tokens <= _TILE_ROUND_MAX_TOKENS:
             ceiling = max(16, ((chunk.tokens + _TILE_ROUND_STEP - 1)
-                               // _TILE_ROUND_STEP) * _TILE_ROUND_STEP)
+                // _TILE_ROUND_STEP) * _TILE_ROUND_STEP)
             ready = next((c for c in self.graphs
-                          if chunk.tokens <= c.buffers.num_tokens <= ceiling
-                          and c.graphs is not None
-                          and c.buffers.supports(chunk)), None)
+                if chunk.tokens <= c.buffers.num_tokens <= ceiling
+                and c.graphs is not None
+                and c.buffers.supports(chunk)), None)
             if ready is not None:
                 return ready
         return first
@@ -415,7 +415,7 @@ class PiecewiseGraphs:
                 needs_tails = (
                     writes is not None and (
                         (writes["tail_src"] is not None
-                         and writes["tail_src"].numel() > 0)
+                            and writes["tail_src"].numel() > 0)
                         or (writes.get("sliding") is not None
                             and writes["sliding"]["tail_src"] is not None
                             and writes["sliding"]["tail_src"].numel() > 0)

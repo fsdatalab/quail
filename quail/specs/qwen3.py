@@ -17,8 +17,8 @@ FP8_BLOCK = [128, 128]
 
 
 def qwen3_spec(name: str, hf_name: str, revision: str = "", *,
-               config: dict | str | Path | None = None,
-               config_file: str = "config.json", **fields) -> ModelSpec:
+        config: dict | str | Path | None = None,
+        config_file: str = "config.json", **fields) -> ModelSpec:
     """Build a ModelSpec for a Qwen3 checkpoint from its config.json.
 
     For example, imagine registering a Qwen3 fine-tune that Quail does
@@ -66,9 +66,9 @@ def qwen3_spec(name: str, hf_name: str, revision: str = "", *,
     d_head = config.get("head_dim") or hidden // num_q_heads
     intermediate = config["intermediate_size"]
     per_layer = (hidden * (num_q_heads + 2 * num_kv_heads) * d_head    # qkv_proj
-                 + num_q_heads * d_head * hidden                # o_proj
-                 + 3 * hidden * intermediate            # gate_up, down
-                 + 2 * hidden + 2 * d_head)             # four norms
+        + num_q_heads * d_head * hidden                # o_proj
+        + 3 * hidden * intermediate            # gate_up, down
+        + 2 * hidden + 2 * d_head)             # four norms
     params = float(layers * per_layer + hidden)
     tied_head = bool(config.get("tie_word_embeddings", False))
     # vLLM keeps the embedding table and output head in bf16
@@ -88,15 +88,15 @@ def qwen3_spec(name: str, hf_name: str, revision: str = "", *,
         vocab=config["vocab_size"],
         tied_head=tied_head,
         w_mem_bytes=(params * w_bytes
-                     + embedding_bytes * (1 if tied_head else 2)),
+            + embedding_bytes * (1 if tied_head else 2)),
         weight_precision=weight_precision,
         arch="qwen3",
     )
     role = fields.get("role", spec.role)
     if role == "generative":
         spec = replace(spec, turn_prefix=QWEN3_TURN_PREFIX,
-                       turn_suffix=QWEN3_TURN_SUFFIX,
-                       prompt_format=QWEN3_PROMPT_FORMAT)
+            turn_suffix=QWEN3_TURN_SUFFIX,
+            prompt_format=QWEN3_PROMPT_FORMAT)
     elif role == "reranker":
         spec = replace(spec, prompt_format=QWEN3_RERANKER_PROMPT_FORMAT)
     return replace(spec, **fields)

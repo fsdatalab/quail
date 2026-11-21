@@ -57,7 +57,7 @@ def letter_scores(label_ids, targets, logprobs) -> np.ndarray:
     """
     column = {token: index for index, token in enumerate(targets)}
     return np.asarray([float(logprobs[column[ids[0]]]) for ids in label_ids],
-                      dtype=np.float64)
+        dtype=np.float64)
 
 
 def best_label(scores) -> int:
@@ -138,8 +138,8 @@ class GreedyDecoder:
             self.label[document] = self.leaf[node]
             return
         best = min(self.trie[node],
-                   key=lambda token: (-float(row[self.column[token]]),
-                                      self.order[token]))
+            key=lambda token: (-float(row[self.column[token]]),
+                self.order[token]))
         target, run = self.runs.after[node, best]
         if run is None:
             self.label[document] = self.leaf[target]
@@ -180,7 +180,7 @@ def trie_paths(label_ids, read=None) -> list:
         placed[node] = (path, len(paths[path][0]))
         paths[path][0].append(node)
         children = [node + (token,) for token in trie[node]
-                    if node + (token,) in fed]
+            if node + (token,) in fed]
         for index, child in enumerate(children):
             if index == 0:
                 extend(path, child)
@@ -210,7 +210,7 @@ def path_reads(paths, read=None) -> list[bool]:
         read: The read nodes, from ``read_nodes``; None reads every row.
     """
     return [read is None or node in read
-            for nodes, _, _ in paths for node in nodes]
+        for nodes, _, _ in paths for node in nodes]
 
 
 def tree_scores(label_ids, paths, targets, logprobs, read=None) -> np.ndarray:
@@ -236,14 +236,14 @@ def tree_scores(label_ids, paths, targets, logprobs, read=None) -> np.ndarray:
     """
     row_of = {}
     for node, is_read in zip((node for nodes, _, _ in paths for node in nodes),
-                             path_reads(paths, read)):
+            path_reads(paths, read)):
         if is_read:
             row_of[node] = len(row_of)
     column = {token: index for index, token in enumerate(targets)}
 
     def logprob(ids, start=0):
         return sum(float(logprobs[row_of[ids[:depth]], column[ids[depth]]])
-                   for depth in range(start, len(ids)) if ids[:depth] in row_of)
+            for depth in range(start, len(ids)) if ids[:depth] in row_of)
 
     paths = [tuple(ids) for ids in label_ids]
     taken = dict.fromkeys(paths, 0.0)   # share held by the nearest extensions
@@ -256,5 +256,5 @@ def tree_scores(label_ids, paths, targets, logprobs, read=None) -> np.ndarray:
     for label, ids in enumerate(paths):
         # rounding can push the extensions' share to 1 or past it
         scores[label] = (logprob(ids) + math.log1p(-taken[ids])
-                         if taken[ids] < 1.0 else -math.inf)
+            if taken[ids] < 1.0 else -math.inf)
     return scores

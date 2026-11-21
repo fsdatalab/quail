@@ -6,7 +6,7 @@ from pathlib import Path
 
 @lru_cache(maxsize=16)
 def resolve_model_path(model_name: str, revision: str | None = None, *,
-                       include_weights: bool = True) -> str:
+        include_weights: bool = True) -> str:
     """Return the local directory holding one model revision.
 
     Args:
@@ -24,4 +24,4 @@ def resolve_model_path(model_name: str, revision: str | None = None, *,
     if include_weights:
         patterns.append("*.safetensors")
     return snapshot_download(repo_id=model_name, revision=revision or None,
-                             allow_patterns=patterns)
+        allow_patterns=patterns)

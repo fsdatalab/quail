@@ -11,7 +11,7 @@ from quail.backends.quail.executor.extract.trace import TRACE_WIDTH, trace_path
 
 
 def verification_blocks(counts, stream_width, num_streams, num_options, num_keys,
-                        top_tokens, mask_words, workspace_bytes):
+        top_tokens, mask_words, workspace_bytes):
     """Yield row indices, position block sizes, and workspace byte bounds.
 
     The bound excludes resident inputs and the caller's final output. It includes
@@ -62,7 +62,7 @@ STREAM_STRIDE = 1 << 24
 def _flat_ranges(starts, counts):
     """Return the ranges start to start + count, concatenated."""
     return (np.repeat(starts - (np.cumsum(counts) - counts), counts)
-            + np.arange(int(counts.sum())))
+        + np.arange(int(counts.sum())))
 
 
 def _concatenated(arrays):
@@ -118,7 +118,7 @@ def copy_tables(documents) -> SimpleNamespace:
     indices = _flat_ranges(offsets[anchor_kids], anchor_counts)
     option_tokens = table_tokens[indices]
     lookup = (np.repeat(np.arange(len(anchors)), anchor_counts)
-              * len(vocabulary.vocab) + option_tokens)
+        * len(vocabulary.vocab) + option_tokens)
     order = np.argsort(lookup)
     key_option_counts = anchor_counts[key_anchors]
     document_options = np.bincount(
@@ -182,7 +182,7 @@ class StreamRows:
             streams = constraint.initial_streams(documents, width)
             return streams, streams >= 0
         streams = torch.full((len(answers), width), -1, dtype=torch.int64,
-                             device=constraint.device)
+            device=constraint.device)
         if not held.all():
             at = constraint.tensor(np.flatnonzero(~held))
             streams[at] = constraint.initial_streams(documents[at], width)
@@ -204,10 +204,10 @@ class StreamRows:
             grown = max(num_rows + max(0, short), 2 * num_rows if short > 0 else 0)
             self.unused.extend(range(num_rows, grown))
             wider = torch.full((grown, max(width, streams.shape[1])), -1,
-                               dtype=torch.int64, device=constraint.device)
+                dtype=torch.int64, device=constraint.device)
             wider[:num_rows, :width] = self.streams
             mask = torch.zeros(wider.shape, dtype=torch.bool,
-                               device=constraint.device)
+                device=constraint.device)
             mask[:num_rows, :width] = self.alive
             self.streams, self.alive = wider, mask
         for answer in new.tolist():
@@ -302,12 +302,12 @@ class CopyConstraint:
         self.prepared = np.union1d(self.prepared, pairs)
         documents, tokens = np.divmod(pairs, width)
         counts = (self.document_key_ends[documents]
-                  - self.document_key_starts[documents])
+            - self.document_key_starts[documents])
         keys = _flat_ranges(self.document_key_starts[documents], counts)
         lookup = (self.key_anchors[keys] * width
-                  + np.repeat(tokens, counts))
+            + np.repeat(tokens, counts))
         found = np.minimum(np.searchsorted(self.option_lookup, lookup),
-                           len(self.option_lookup) - 1)
+            len(self.option_lookup) - 1)
         options = np.unique(
             self.option_order[found[self.option_lookup[found] == lookup]])
         missing = options[self.filler_lengths[options] < 0]
@@ -392,7 +392,7 @@ class CopyConstraint:
         drafts = np.minimum(drafts, np.maximum(0, remaining))
         answers, positions = self.live_positions(documents, masks)
         lookup = (self.key_anchors[self.position_keys[positions]]
-                  * len(self.vocabulary.vocab) + tokens[answers])
+            * len(self.vocabulary.vocab) + tokens[answers])
         options = self.option_order[np.searchsorted(self.option_lookup, lookup)]
         for step in range(int(drafts.max(initial=0)) + 1):
             at = written[answers] + step
@@ -479,7 +479,7 @@ class CopyConstraint:
         self.changed[positions] = True
         while True:
             pending = ((self.position_lengths[positions] < needed)
-                       & ~self.exhausted[positions])
+                & ~self.exhausted[positions])
             positions, needed = positions[pending], needed[pending]
             if not len(positions):
                 break
@@ -495,7 +495,7 @@ class CopyConstraint:
         self.prepare_documents()
         documents = self.position_documents[positions]
         sizes = np.where(self.window_started[positions], self.spec.window_chars,
-                         self.spec.first_window_chars)
+            self.spec.first_window_chars)
         text, left, cuts = self.windows.windows(
             documents, self.window_ends[positions], sizes)
         self.window_started[positions] = True
@@ -504,13 +504,13 @@ class CopyConstraint:
         counts = np.diff(boundaries)
         owner = np.repeat(np.arange(len(positions)), counts)
         columns = (np.arange(len(tokens)) - np.repeat(boundaries[:-1], counts)
-                   + self.position_lengths[positions[owner]])
+            + self.position_lengths[positions[owner]])
         rows = self.position_rows[positions[owner]]
         valid = columns < self.continuations_host.shape[1] - 1
         self.continuations_host[rows[valid], columns[valid]] = tokens[valid]
         valid = columns + 1 < self.ends.shape[1]
         end = np.minimum(self.windows.ends[left[owner] + offsets[:, 1] - 1]
-                         - self.windows.offsets[documents[owner]], cuts[owner])
+            - self.windows.offsets[documents[owner]], cuts[owner])
         self.ends[rows[valid], columns[valid] + 1] = end[valid]
         self.position_lengths[positions] = np.minimum(
             self.position_lengths[positions] + counts,
@@ -519,7 +519,7 @@ class CopyConstraint:
             (cuts + self.windows.offsets[documents] == self.windows.limits[documents])
             | (counts == 0)
             | (self.position_lengths[positions]
-               == self.continuations_host.shape[1] - 1))
+                == self.continuations_host.shape[1] - 1))
 
     def _upload(self):
         positions = np.flatnonzero(self.changed)
@@ -601,7 +601,7 @@ class CopyConstraint:
         """Apply the token rule to an already projected top-k readout."""
         k = self.spec.top_tokens
         return self._choose(values[:, 1 + k:], values[:, 1:1 + k].to(self.torch.int64),
-                            values[:, 0], streams, alive, at, documents, first)
+            values[:, 0], streams, alive, at, documents, first)
 
     def _choose(self, top_values, top_ids, stop, streams, alive, at, documents, first):
         torch = self.torch
@@ -612,7 +612,7 @@ class CopyConstraint:
             columns = torch.searchsorted(sorted_ids, tokens.contiguous())
             columns = columns.clamp_max(sorted_ids.shape[1] - 1)
             return torch.where(sorted_ids.gather(1, columns) == tokens,
-                               sorted_values.gather(1, columns), -float("inf"))
+                sorted_values.gather(1, columns), -float("inf"))
 
         top = top_ids[:, 0]
         possible = alive
@@ -716,7 +716,7 @@ class CopyConstraint:
         return streams.gather(1, columns), alive.gather(1, columns)
 
     def verify(self, projected, streams, alive, source, at, documents, limits,
-               valid, first, active):
+            valid, first, active):
         """Verify every draft position, retaining the first rejected choice."""
         torch = self.torch
         chosen, ended, keep = self.choose_readout(
@@ -726,10 +726,10 @@ class CopyConstraint:
         following = self.source(streams, alive)
         hit = chosen == self.tokens_at(source, at[:, 0])
         values = torch.stack((torch.where(ended, -1, chosen), following,
-                              alive.sum(dim=1), hit.to(torch.int64)), dim=1)[:, None]
+            alive.sum(dim=1), hit.to(torch.int64)), dim=1)[:, None]
         values = torch.where(use[:, None, None], values, -2)
         traces = (self.trace_values[:, None].view(torch.int32).to(torch.int64)
-                  if self.trace is not None else None)
+            if self.trace is not None else None)
         active = use & ~ended & hit & (at[:, 0] + 1 < limits)
         if at.shape[1] == 1:
             return values, alive, following, traces, active
@@ -849,21 +849,21 @@ class CopyConstraint:
         if not len(positions):
             return None
         lookup = (self.key_anchors[self.position_keys[positions]]
-                  * len(self.vocabulary.vocab) + first_token)
+            * len(self.vocabulary.vocab) + first_token)
         found = np.minimum(np.searchsorted(self.option_lookup, lookup),
-                           len(self.option_lookup) - 1)
+            len(self.option_lookup) - 1)
         if not (self.option_lookup[found] == lookup).all():
             return None
         spans = []
         for position, option in zip(positions.tolist(),
-                                    self.option_order[found].tolist()):
+                self.option_order[found].tolist()):
             filler = self.filler_lengths[option]
             index = length - 1 - max(0, filler)
             row = self.position_rows[position]
             if length > 1 and filler < 0:
                 return None
             if index > 0 and (row < 0 or index >= self.ends.shape[1]
-                              or self.ends[row, index] < 0):
+                    or self.ends[row, index] < 0):
                 return None
             spans.append(self._span(position, option, length))
         return spans

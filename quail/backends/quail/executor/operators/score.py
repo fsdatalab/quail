@@ -63,7 +63,7 @@ class ScoreRows:
         if self.product:
             left, right = self.columns
             return np.column_stack((np.repeat(left, len(right)),
-                                    np.tile(right, len(left))))
+                np.tile(right, len(left))))
         return np.column_stack(self.columns)
 
 
@@ -195,7 +195,7 @@ class ScoreOperator(SingleNodeOperator):
         """A score reads no limit; it skips the rows the region's hint drops."""
         (operator,) = operators
         return replace(settings, label=f"score {operator.node.spec.name}",
-                       limit=None, attention=None, skip=operator.skip)
+            limit=None, attention=None, skip=operator.skip)
 
     def __init__(self, state, node, rows: ScoreRows, priors, documents):
         spec = node.spec
@@ -266,8 +266,8 @@ class ScoreOperator(SingleNodeOperator):
         if len(spec.aliases) == 1:
             prefixes = [parts[0]]
             suffixes = [concat_tokens(documents[spec.aliases[0]][document_id],
-                                      parts[1])
-                        for document_id in rows[:, 0]]
+                parts[1])
+                for document_id in rows[:, 0]]
             partners = None
             self.order = np.arange(len(rows))
             self.offsets = np.array([0, len(rows)])
@@ -277,22 +277,22 @@ class ScoreOperator(SingleNodeOperator):
             anchors, anchor_index = np.unique(rows[:, 0], return_inverse=True)
             candidates, candidate_index = np.unique(rows[:, 1], return_inverse=True)
             prefixes = [concat_tokens(parts[0], documents[left][document_id],
-                                      parts[1])
-                        for document_id in anchors]
+                parts[1])
+                for document_id in anchors]
             suffixes = [concat_tokens(documents[right][document_id], parts[2])
-                        for document_id in candidates]
+                for document_id in candidates]
             self.order = order = np.argsort(anchor_index, kind="stable")
             self.offsets = offsets = np.concatenate(
                 ([0], np.cumsum(np.bincount(anchor_index))))
             partners = [candidate_index[order[start:end]]
-                        for start, end in zip(offsets[:-1], offsets[1:])]
+                for start, end in zip(offsets[:-1], offsets[1:])]
             prefix_lengths = np.asarray([len(prefix) for prefix in prefixes])
             suffix_lengths = np.asarray([len(suffix) for suffix in suffixes])
             self.total = int(prefix_lengths[anchor_index].sum()
-                             + suffix_lengths[candidate_index].sum())
+                + suffix_lengths[candidate_index].sum())
         self.stages = [Stage(suffixes=suffixes, readout=score_readout(self.state),
-                             requests=(None if partners is None else
-                                       lambda key: partners[key[2]]))]
+            requests=(None if partners is None else
+                lambda key: partners[key[2]]))]
         self.table = _table(prefixes, self._keys(prefixes))
 
     def _positions(self, anchor) -> np.ndarray:
@@ -330,15 +330,15 @@ class ScoreOperator(SingleNodeOperator):
         # shares no prefix, since a prefix's KV depends on the document
         causal = self.state.loaded_model.pipeline.mask == "causal"
         frame, cue = ((list(tail[:-1]), [tail[-1]]) if causal
-                      else ([], list(tail)))
+            else ([], list(tail)))
         self.stages = [Stage(suffixes=[cue], readout=score_readout(self.state),
-                             frame=frame, decide=keep, single=True,
-                             label=f"score {spec.name}")]
+            frame=frame, decide=keep, single=True,
+            label=f"score {spec.name}")]
         self.total = sum(len(head) + len(documents[alias][document_id]) + len(tail)
-                         for document_id in document_ids)
+            for document_id in document_ids)
         tree = (shared_prefix_tree(spec.name, prefixes,
-                                   self.state.loaded_model.arena)
-                if causal else None)
+            self.state.loaded_model.arena)
+            if causal else None)
         self.table = _table(prefixes, self._keys(prefixes), tree)
 
     def _drawn(self, documents) -> None:
@@ -382,20 +382,20 @@ class ScoreOperator(SingleNodeOperator):
         readout = score_readout(state)
         self.stages = [
             Stage(suffixes=[cue], readout=readout, frame=list(tail[:-1]),
-                  decide=settle, single=True, label=f"score {spec.name}",
-                  canvas=lambda anchor: canvas(anchor, 0), canvas_rows=width),
+                decide=settle, single=True, label=f"score {spec.name}",
+                canvas=lambda anchor: canvas(anchor, 0), canvas_rows=width),
             Stage(suffixes=[cue] * more, readout=readout,
-                  frame=list(tail[:-1]), decide=average,
-                  requests=lambda key: (None if np.isnan(scores[key[2]])
-                                        else Stage.SKIP),
-                  label=f"score {spec.name} draws",
-                  canvas=lambda anchor: np.stack(
-                      [canvas(anchor, draw) for draw in range(1, spec.draws)]),
-                  canvas_rows=width),
+                frame=list(tail[:-1]), decide=average,
+                requests=lambda key: (None if np.isnan(scores[key[2]])
+                    else Stage.SKIP),
+                label=f"score {spec.name} draws",
+                canvas=lambda anchor: np.stack(
+                    [canvas(anchor, draw) for draw in range(1, spec.draws)]),
+                canvas_rows=width),
         ]
         prefixes = DocumentPrefixes(head, documents[alias], document_ids)
         tree = (shared_prefix_tree(spec.name, prefixes, state.loaded_model.arena)
-                if spec.share_prefixes else None)
+            if spec.share_prefixes else None)
         read = len(cue) + width
         base = sum(
             len(head) + len(documents[alias][document_id])
@@ -434,8 +434,8 @@ class ScoreOperator(SingleNodeOperator):
     def take_finished(self):
         """Send newly scored rows to the answer sink; return their rows."""
         positions = sorted({position for position in self.finished
-                            if not self.sent[position] and not self.skipped[position]
-                            and not np.isnan(self.scores[position])})
+            if not self.sent[position] and not self.skipped[position]
+            and not np.isnan(self.scores[position])})
         self.finished = []
         if not positions:
             return []
@@ -458,7 +458,7 @@ class ScoreOperator(SingleNodeOperator):
             sink = answer_sink()
             if sink is not None:
                 sink(scored_batch(self.node, self.rows[rest],
-                                  self.scores[rest].tolist()))
+                    self.scores[rest].tolist()))
         return self._total()
 
     def result(self, fresh_tokens, gpu_s, chunks, stats) -> NodeResult:

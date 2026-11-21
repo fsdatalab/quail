@@ -50,7 +50,7 @@ def install_step_trace() -> None:
         scheduled = output.num_scheduled_tokens
         recomputed = 0
         for request_id in [request_id for request_id in computed_at_preemption
-                           if request_id in scheduled]:
+                if request_id in scheduled]:
             after = self.requests[request_id].num_computed_tokens
             before = after - scheduled[request_id]
             reached = computed_at_preemption[request_id]

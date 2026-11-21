@@ -27,8 +27,8 @@ def operator_types() -> dict:
     )
 
     return {AiFilter.type_name: FilterOperator,
-            AiClassify.type_name: ClassifyOperator,
-            AiExtract.type_name: ExtractOperator, AiJoin.type_name: JoinOperator,
-            AiSaeFeatures.type_name: SaeFeaturesOperator,
-            AiMap.type_name: MapOperator, AiScore.type_name: ScoreOperator,
-            Filter.type_name: ConditionGate}
+        AiClassify.type_name: ClassifyOperator,
+        AiExtract.type_name: ExtractOperator, AiJoin.type_name: JoinOperator,
+        AiSaeFeatures.type_name: SaeFeaturesOperator,
+        AiMap.type_name: MapOperator, AiScore.type_name: ScoreOperator,
+        Filter.type_name: ConditionGate}

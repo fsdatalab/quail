@@ -216,7 +216,7 @@ def choose_documents(client, spec, bodies) -> dict:
     prompts = [{"prompt_token_ids": body + tail} for body in bodies]
     started = time.perf_counter()
     outputs = (client.generate(prompts, pooling_params(spec.option_offsets))
-               if prompts else [])
+        if prompts else [])
     wall_s = time.perf_counter() - started
     prompt_tokens = sum(len(output.prompt_token_ids) for output in outputs)
     cached_tokens = sum(int(output.num_cached_tokens or 0) for output in outputs)
@@ -268,7 +268,7 @@ def extract_fields(client, specs, bodies, texts, body_texts=None) -> list[dict]:
         answer_tokens=answer_tokens, body_texts=body_texts,
         tail_texts=[spec.tail_text for spec in specs])
     return [read_extractions(outputs, texts, run["wall"])
-            for outputs in run["outputs"]]
+        for outputs in run["outputs"]]
 
 
 def generate_answers(client, specs, bodies, body_texts=None, *, shuffled=False):
@@ -298,15 +298,15 @@ def generate_answers(client, specs, bodies, body_texts=None, *, shuffled=False):
     if shuffled:
         order = np.random.default_rng(SHUFFLE_SEED).permutation(len(prompts))
     sent = (client.generate([prompts[i] for i in order],
-                            [params[i % len(specs)] for i in order],
-                            use_tqdm=False)
-            if prompts else [])
+        [params[i % len(specs)] for i in order],
+        use_tqdm=False)
+        if prompts else [])
     outputs = [sent[k] for k in np.argsort(order)]
     return [outputs[q::len(specs)] for q in range(len(specs))]
 
 
 def answer_documents(client, extracts, maps, bodies, texts, body_texts=None, *,
-                     shuffled=False) -> tuple[list[dict], list[dict]]:
+        shuffled=False) -> tuple[list[dict], list[dict]]:
     """Decode extraction fields and maps over the same bodies in one generate call.
 
     Args:
@@ -325,19 +325,19 @@ def answer_documents(client, extracts, maps, bodies, texts, body_texts=None, *,
     """
     started = time.perf_counter()
     per_spec = generate_answers(client, [*extracts, *maps], bodies, body_texts,
-                                shuffled=shuffled)
+        shuffled=shuffled)
     wall_s = time.perf_counter() - started
     extracted = [read_extractions(own, texts, wall_s)
-                 for own in per_spec[:len(extracts)]]
+        for own in per_spec[:len(extracts)]]
     mapped = [{"answers": [output.outputs[0].text.strip() for output in own],
-               "wall_s": wall_s, "requests": len(own), "doc_cap": None,
-               **_generation_counts(own)}
-              for own in per_spec[len(extracts):]]
+        "wall_s": wall_s, "requests": len(own), "doc_cap": None,
+        **_generation_counts(own)}
+        for own in per_spec[len(extracts):]]
     return extracted, mapped
 
 
 def map_documents(client, specs, bodies, body_texts=None, *,
-                  submission="operator-at-a-time") -> list[dict]:
+        submission="operator-at-a-time") -> list[dict]:
     """Write every map's answer over the same prompt bodies.
 
     Operator-at-a-time submission sends every prompt in one engine
@@ -380,15 +380,15 @@ def map_documents(client, specs, bodies, body_texts=None, *,
         per_spec, document_cap = run["outputs"], run["doc_cap"]
     elif submission in ("operator-at-a-time", "shuffled"):
         per_spec = generate_answers(client, specs, bodies, body_texts,
-                                    shuffled=submission == "shuffled")
+            shuffled=submission == "shuffled")
         document_cap = None
     else:
         raise ValueError(f"unknown map submission {submission!r}")
     wall_s = time.perf_counter() - started
     return [{"answers": [output.outputs[0].text.strip() for output in own],
-             "wall_s": wall_s, "requests": len(own), "doc_cap": document_cap,
-             **_generation_counts(own)}
-            for own in per_spec]
+        "wall_s": wall_s, "requests": len(own), "doc_cap": document_cap,
+        **_generation_counts(own)}
+        for own in per_spec]
 
 
 def read_extractions(outputs, texts, wall_s: float) -> dict:
@@ -455,5 +455,5 @@ def request_step(result, **details) -> dict:
         "requests": result.get("requests", details.get("pairs", 0)),
         **{name: result[name] for name in (
             "prompt_tokens", "fresh_tokens", "cached_tokens", "generated_tokens")
-           if name in result},
+            if name in result},
     }

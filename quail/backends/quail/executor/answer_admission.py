@@ -211,9 +211,9 @@ class HeadroomAdmission:
     """
 
     def __init__(self, decoder, prefix_lengths, capacity_extra, dependencies,
-                 shared, page_cost, decode_cost=None, page_holds=None, *,
-                 choose_headroom=True, chunk_tokens=0, bucket_answers=30,
-                 trace=False):
+            shared, page_cost, decode_cost=None, page_holds=None, *,
+            choose_headroom=True, chunk_tokens=0, bucket_answers=30,
+            trace=False):
         self.decoder = decoder
         self.prefix = np.asarray(prefix_lengths, dtype=np.int64)
         self.parent = np.arange(len(self.prefix))
@@ -238,7 +238,7 @@ class HeadroomAdmission:
         order = np.argsort(self.parent, kind="stable")
         self.child_order = order
         self.child_start = np.searchsorted(self.parent[order],
-                                           np.arange(len(self.prefix) + 1))
+            np.arange(len(self.prefix) + 1))
         self.chunk_tokens = chunk_tokens
         self.curves = decoder.answer_curves = AnswerCurves(
             decoder, self.prefix, bucket_answers)
@@ -330,7 +330,7 @@ class HeadroomAdmission:
         holds = None if self.page_holds is None else self.page_holds()
         self.curves.update()
         return self.decoder.eviction_order(policy, holds,
-                                           remaining=self._remaining_tokens())
+            remaining=self._remaining_tokens())
 
     def _remaining_tokens(self):
         """Per slot, E[L - t | L > t] from its bucket curve, t its written tokens."""
@@ -346,7 +346,7 @@ class HeadroomAdmission:
         rows = np.arange(len(running))
         survived = curves[rows, index]
         remaining[running] = np.divide(tails[rows, index], survived,
-                                       out=np.zeros(len(running)), where=survived > 0)
+            out=np.zeros(len(running)), where=survived > 0)
         return remaining
 
     def _refresh_work(self, writing, replays):
@@ -359,7 +359,7 @@ class HeadroomAdmission:
         running = decoder.running(writing)
         counts = decoder.row_counts(running)
         offsets = (np.arange(int(counts.sum()))
-                   - np.repeat(np.cumsum(counts) - counts, counts))
+            - np.repeat(np.cumsum(counts) - counts, counts))
         slots = np.repeat(running, counts)
         contexts = decoder.origin[slots] + decoder.fed[slots] + offsets + 1
         if replays:
@@ -367,8 +367,8 @@ class HeadroomAdmission:
             slots = np.r_[slots, replay[:, 0]]
             contexts = np.r_[contexts, replay[:, 2] + 1]
         groups, shared = (decode_groups(slots, decoder.kv.parent, decoder.kv.borrowed,
-                                        decoder.kv.lead)
-                          if decoder.share else (None, None))
+            decoder.kv.lead)
+            if decoder.share else (None, None))
         self.work = cost.row_work(contexts, groups, shared).total()
 
     def _added_work(self, members):
@@ -417,8 +417,8 @@ class HeadroomAdmission:
     def _waiting_members(self, anchor):
         """The anchor, then its document's other anchors not committed or placed."""
         return (anchor, *(b for b in self._children(self.parent[anchor]).tolist()
-                          if b != anchor and not self.committed[b]
-                          and self.stages[b] == -1))
+            if b != anchor and not self.committed[b]
+            and self.stages[b] == -1))
 
     def order_waiting(self, waiting):
         """Put each document's waiting branches expected-longest first, in place.
@@ -467,7 +467,7 @@ class HeadroomAdmission:
         self.held_pages = np.asarray(chosen, dtype=np.int64)
         self.held_budget = budget
         self.reach[self.held_slots] = ((self.held_base + self.held_pages)
-                                       * self.decoder.page_tokens)
+            * self.decoder.page_tokens)
 
     def _risk(self, slots, maps, written, available, origin):
         """Return P(Y > j) * R(j) per slot and headroom j, inf past its limit.
@@ -488,11 +488,11 @@ class HeadroomAdmission:
         reach = np.minimum(limits, held + 1 + pages * page_tokens)
         survived = flat[base + np.minimum(limits, written[:, None])]
         overrun = np.divide(flat[base + reach], survived, out=np.zeros(reach.shape),
-                            where=survived > 0)
+            where=survived > 0)
         # an overrun is evicted with the tokens its pages held
         tokens = origin[:, None] + np.minimum(limits, held + pages * page_tokens)
         recover = self.decode_cost.replay_seconds(self.work, tokens,
-                                                  self.chunk_tokens)
+            self.chunk_tokens)
         risk = overrun * recover
         risk[pages > -(-limits // page_tokens)] = np.inf
         return risk
@@ -504,8 +504,8 @@ class HeadroomAdmission:
         pages = np.bincount(rows, weights=remaining, minlength=len(self.curves.buckets))
         for row in np.flatnonzero(num_answers).tolist():
             self.trace.append((self._refreshes, row // self.curves.num_buckets,
-                               row % self.curves.num_buckets, int(num_answers[row]),
-                               float(pages[row] / num_answers[row])))
+                row % self.curves.num_buckets, int(num_answers[row]),
+                float(pages[row] / num_answers[row])))
 
     def _admission_risk(self, members):
         """The answer slots of waiting anchors and their R(j) grid."""
@@ -562,7 +562,7 @@ class HeadroomAdmission:
             if self._least_extra(held, risk, budget - need) > gain * (1 + 1e-9):
                 continue
             extra, chosen = admission_cost(self.held_risk, self.held_pages, risk,
-                                           budget - need, self.price)
+                budget - need, self.price)
             if extra <= gain * (1 + 1e-9):
                 self._decision = (anchor, members, budget - need, chosen)
                 return True
@@ -614,7 +614,7 @@ class HeadroomAdmission:
             return
         decision = self._decision
         members = (decision[1] if decision is not None and decision[0] == anchor
-                   else (anchor,))
+            else (anchor,))
         self.partial_admissions += len(members) < len(self._waiting_members(anchor))
         self.committed[list(members)] = True
         slots = self._answer_slots(members)
@@ -622,13 +622,13 @@ class HeadroomAdmission:
             self._hold_admitted(members, slots)
         self._decision = None
         granted = ((self.reach[slots] - self.capacity[slots])
-                   // self.decoder.page_tokens).clip(0)
+            // self.decoder.page_tokens).clip(0)
         self.work = self.work + self._added_work(members)[1]
         self._candidate = None
         self.granted.extend(granted.tolist())
         self.granted_at.extend(zip([self._refreshes] * len(slots),
-                                   self.curves.slot_bucket[slots].tolist(),
-                                   granted.tolist()))
+            self.curves.slot_bucket[slots].tolist(),
+            granted.tolist()))
         branch_pages = self._branch_pages(members)
         self.unplaced.update(members[1:])
         self.fixed_pages += branch_pages
@@ -648,7 +648,7 @@ class HeadroomAdmission:
         self.held_slots = np.r_[self.held_slots, slots]
         self.held_risk = np.concatenate((self.held_risk, risk))
         self.held_base = np.r_[self.held_base,
-                               self.capacity[slots] // self.decoder.page_tokens]
+            self.capacity[slots] // self.decoder.page_tokens]
         if decision is not None and decision[1] == members:
             self._hold(decision[3], decision[2])
         else:

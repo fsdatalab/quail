@@ -68,7 +68,7 @@ class ServedHint:
 
     def rejects_answer(self, answer: str, prefix: str, **completion) -> bool:
         return json.loads(self._ask("rejects_answer", answer=answer,
-                                    prefix=prefix, completion=completion))
+            prefix=prefix, completion=completion))
 
 
 def answer_hint(hint, question: dict):
@@ -89,8 +89,8 @@ def answer_hint(hint, question: dict):
 
 
 def serve_stages(server, context: ExecutionContext, graph: PhysicalGraph,
-                 stages: list, wanted, hinted: dict | None = None,
-                 first: dict | None = None) -> dict:
+        stages: list, wanted, hinted: dict | None = None,
+        first: dict | None = None) -> dict:
     """Run each stage Rust sends until the region ends.
 
     Args:
@@ -150,7 +150,7 @@ class _StageRows:
 
 
 def run_stage(context: ExecutionContext, graph: PhysicalGraph, stage: dict,
-              tables: list, rows: _StageRows) -> tuple[list, dict]:
+        tables: list, rows: _StageRows) -> tuple[list, dict]:
     """Run one stage's nodes over its input rows.
 
     Args:
@@ -175,7 +175,7 @@ def run_stage(context: ExecutionContext, graph: PhysicalGraph, stage: dict,
     # a node outside the stage counts as run; only the ports the stage
     # reads hold rows
     initial = {PortRef(node_id, port.name): None for node_id in outside
-               for port in by_id[node_id].outputs}
+        for port in by_id[node_id].outputs}
     scanned = {}
     for spec, table in zip(stage["inputs"], tables, strict=True):
         node = by_id[spec["node_id"]]
@@ -189,21 +189,21 @@ def run_stage(context: ExecutionContext, graph: PhysicalGraph, stage: dict,
     last = by_id[stage["nodes"][-1]]
     subgraph = PhysicalGraph(
         tuple(node for node in graph.topological_nodes()
-              if node.node_id in inside | outside),
+            if node.node_id in inside | outside),
         PortRef(last.node_id, last.outputs[0].name))
     # the documents a scan sent here are this GPU's share of its rows
     scans = [spec["node_id"] for spec in stage["inputs"]
-             if isinstance(by_id[spec["node_id"]], Scan)]
+        if isinstance(by_id[spec["node_id"]], Scan)]
     rows.nodes = {*inside, *scans}
     result = GenericRunner().run(subgraph, context, initial_outputs=initial,
-                                 initial_metrics=scanned)
+        initial_metrics=scanned)
     ran = {}
     for node_id in [*scans, *stage["nodes"]]:
         ports = {port.name: port for port in by_id[node_id].outputs}
         found = result.nodes[node_id]
         ran[node_id] = NodeResult(
             {name: output_table(by_id[node_id], ports[name], value)
-             for name, value in found.outputs.items()}, found.metrics)
+                for name, value in found.outputs.items()}, found.metrics)
     outputs = [ran[node_id].outputs[port] for node_id, port in stage["outputs"]]
     return outputs, ran
 

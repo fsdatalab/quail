@@ -150,11 +150,11 @@ class Stage:
         if self.own_suffixes:
             if self.suffix_tokens < 1:
                 raise ValueError("a stage whose suffixes come from a callback "
-                                 "names its most tokens in suffix_tokens")
+                    "names its most tokens in suffix_tokens")
             if (self.requests is not None or self.paths is not None
                     or self.read_rows is not None or self.canvas is not None):
                 raise ValueError("a stage whose suffixes come from a callback "
-                                 "takes no requests, paths, read_rows, or canvas")
+                    "takes no requests, paths, read_rows, or canvas")
             return
         trailing = 1 if self.readout is None else self.readout.trailing_rows
         if self.read_rows is None and trailing > 1:
@@ -193,7 +193,7 @@ def filter_stages(question_ids, readout, frames=True) -> list:
                 f"stage {index} question has no tokens beyond the shared "
                 f"preamble ({p} tokens)")
         stages.append(Stage(suffixes=[tail], readout=readout, frame=frame,
-                            single=True, label=f"filter stage {index}"))
+            single=True, label=f"filter stage {index}"))
     return stages
 
 

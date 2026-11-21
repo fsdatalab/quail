@@ -71,7 +71,7 @@ class Rows:
     def filter(self, mask) -> Rows:
         """Keep the rows the boolean mask is true for."""
         return Rows({alias: pc.filter(ids, mask) for alias, ids in self.ids.items()},
-                    self.values.filter(mask))
+            self.values.filter(mask))
 
     def take(self, indices) -> Rows:
         """Return the rows at the indices, in that order."""
@@ -80,7 +80,7 @@ class Rows:
         # an empty numpy array is float; a take wants integer positions
         indices = indices.cast(pa.int64())
         return Rows({alias: pc.take(ids, indices) for alias, ids in self.ids.items()},
-                    self.values.take(indices))
+            self.values.take(indices))
 
     def with_column(self, name: str, array) -> Rows:
         """Return the rows with one value column added."""
@@ -109,7 +109,7 @@ class Rows:
         table = document_index_table(self.ids, "rows")
         for name in self.values.column_names:
             table = table.append_column(self.values.schema.field(name),
-                                        self.values.column(name))
+                self.values.column(name))
         return table
 
     def to_pydict(self) -> dict:
@@ -123,22 +123,22 @@ class Rows:
         if not parts:
             raise ValueError("no rows to concatenate")
         return cls({alias: pa.concat_arrays([part.ids[alias] for part in parts])
-                    for alias in parts[0].aliases},
-                   pa.concat_tables([part.values for part in parts]))
+            for alias in parts[0].aliases},
+            pa.concat_tables([part.values for part in parts]))
 
 
 def extraction_rows(alias, name, span_name, document_ids, answers, spans) -> Rows:
     """Build the rows of an extraction: its answers and nullable character spans."""
     valid = np.fromiter((span is not None for span in spans), dtype=bool,
-                        count=len(spans))
+        count=len(spans))
     bounds = np.zeros((len(spans), 2), dtype=np.int32)
     bounds[valid] = np.asarray([span for span in spans if span is not None],
-                               dtype=np.int32).reshape(-1, 2)
+        dtype=np.int32).reshape(-1, 2)
     span_array = pa.StructArray.from_arrays(
         [pa.array(bounds[:, 0]), pa.array(bounds[:, 1])],
         names=["start", "end"], mask=pa.array(~valid))
     return Rows({alias: document_ids},
-                pa.table({name: pa.array(answers, pa.string()), span_name: span_array}))
+        pa.table({name: pa.array(answers, pa.string()), span_name: span_array}))
 
 
 def rows_of(value, alias: str) -> Rows:

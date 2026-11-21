@@ -49,7 +49,7 @@ def read_nodes(label_ids) -> set:
     trie = label_trie(label_ids)
     ends = {tuple(ids) for ids in label_ids}
     return {()} | {node for node, tokens in trie.items()
-                   if len(tokens) > 1 or node in ends}
+        if len(tokens) > 1 or node in ends}
 
 
 @dataclass(frozen=True)

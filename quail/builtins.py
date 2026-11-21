@@ -16,7 +16,7 @@ PHYSICAL_RULES = tuple(_quail_native.PHYSICAL_RULES)
 # the rules that each derive one option of an AI operator; listed in
 # place of "derive", they leave the others out
 DERIVE_OPTIONS = ("derive.filters", "derive.fetch", "derive.projection",
-                  "derive.guard")
+    "derive.guard")
 
 
 def logical_rules_without(name: str) -> tuple[str, ...]:
@@ -35,7 +35,7 @@ def logical_rules_without(name: str) -> tuple[str, ...]:
 
 
 def built_in_registry(logical_rules=LOGICAL_RULES,
-                      physical_rules=None) -> ExtensionRegistry:
+        physical_rules=None) -> ExtensionRegistry:
     """Create one registry with Quail built ins.
 
     Args:

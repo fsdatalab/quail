@@ -23,8 +23,8 @@ class RetentionPolicy:
     def prefill_seconds(self, tokens: int) -> float:
         """Return ideal compute time to rebuild a prefix of this length."""
         return (self.linear_seconds * tokens
-                + self.pair_seconds * triangle(tokens)
-                + self.sliding_pair_seconds * triangle(tokens, self.sliding_window))
+            + self.pair_seconds * triangle(tokens)
+            + self.sliding_pair_seconds * triangle(tokens, self.sliding_window))
 
     def priority(self, key, tokens: int, pages: int) -> tuple:
         alias, document = key

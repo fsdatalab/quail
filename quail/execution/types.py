@@ -82,8 +82,8 @@ class PhysicalRequest:
     def column_tables(self) -> dict[str, pa.Table]:
         """Return the value tables of the scans, by alias."""
         return {key[len(COLUMNS_PREFIX):]: table
-                for key, table in self.relations.items()
-                if key.startswith(COLUMNS_PREFIX)}
+            for key, table in self.relations.items()
+            if key.startswith(COLUMNS_PREFIX)}
 
     @property
     def gpus(self) -> int:
@@ -137,10 +137,10 @@ def _join_answers_table(value: Mapping[str, Any]) -> pa.Table:
         answer_parts.append(row)
     members = pa.array(chain.from_iterable(member_parts), type=pa.int32())
     columns = {anchor: pa.array(chain.from_iterable(anchor_parts),
-                                type=pa.int32())}
+        type=pa.int32())}
     for index, alias in enumerate(partners):
         documents = pa.array([int(member[index]) for member in partner_map],
-                             type=pa.int32())
+            type=pa.int32())
         columns[alias] = pc.take(documents, members)
     # answers arrive as 0/1 integers or booleans; the cast covers both
     answers = pc.cast(pa.array(chain.from_iterable(answer_parts)), pa.bool_())

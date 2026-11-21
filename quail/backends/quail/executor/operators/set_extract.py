@@ -110,11 +110,11 @@ def read_result(node, ids, reads: SetReads) -> NodeResult:
     """An extraction's NodeResult: one answer and span per row."""
     spec = node.spec
     answers = extraction_rows(spec.alias, spec.name, spec.span_name,
-                              np.asarray(ids), reads.answers, reads.spans)
+        np.asarray(ids), reads.answers, reads.spans)
     return NodeResult({node.rows_port: answers}, NodeMetrics(
         input_rows=len(ids), output_rows=len(ids), evaluated_documents=len(ids),
         fresh_tokens=reads.tokens, gpu_s=reads.gpu_s, chunks=reads.chunks,
         extension={"output": spec.name, "aliases": list(spec.aliases),
-                   "input_rows": len(ids), "suffix_tokens": reads.suffix_tokens}))
+            "input_rows": len(ids), "suffix_tokens": reads.suffix_tokens}))
 
 

@@ -40,18 +40,18 @@ class ClassifyOperator(ColumnOperator, SingleNodeOperator):
         position = document_positions(ids)
         if spec.partner is None:
             plan = ClassifyStages(region.query, spec, len(ids),
-                                  lambda key: position[key[1]])
+                lambda key: position[key[1]])
             plan.seeds = ids
             return cls(node, ids, plan)
         join = next(operator for operator in reversed(chain)
-                    if isinstance(operator, JoinOperator))
+            if isinstance(operator, JoinOperator))
         stage = next(stage for stage in join.nodes
-                     if set(spec.aliases) == {stage.anchor, *stage.partners})
+            if set(spec.aliases) == {stage.anchor, *stage.partners})
         # the join's partner tuples, one partner alias each
         partner_ids = [int(entry[0]) if isinstance(entry, (tuple, list))
-                       else int(entry)
-                       for entry in join.inputs["partner_indices"][
-                           stage.written_position]]
+            else int(entry)
+            for entry in join.inputs["partner_indices"][
+                stage.written_position]]
         documents = region.context.state["documents"][spec.partner]
         kept = KeptPairs(join.nodes.index(stage))
         partners = JoinPartners(
@@ -59,7 +59,7 @@ class ClassifyOperator(ColumnOperator, SingleNodeOperator):
             documents=[documents[partner] for partner in partner_ids],
             kept=kept.of)
         plan = ClassifyStages(region.query, spec, len(ids),
-                              lambda key: position[key[1]], partners=partners)
+            lambda key: position[key[1]], partners=partners)
         join.add_reader(kept)
         return cls(node, ids, plan, kept=kept)
 
@@ -90,13 +90,13 @@ class ClassifyOperator(ColumnOperator, SingleNodeOperator):
             return []
         plan = self.plan
         ready = [document for document in documents
-                 if document not in self.reported
-                 and (plan.partners is not None or plan.labels[document] is not None)]
+            if document not in self.reported
+            and (plan.partners is not None or plan.labels[document] is not None)]
         self.reported.update(ready)
         if plan.partners is not None:
             pairs = [(anchor, partner) for anchor in ready
-                     for partner in plan.partners.kept(anchor)
-                     if (anchor, partner) in plan.pair_labels]
+                for partner in plan.partners.kept(anchor)
+                if (anchor, partner) in plan.pair_labels]
             rows = self._pair_rows(pairs) if pairs else None
         else:
             rows = self._label_rows(ready) if ready else None
@@ -107,23 +107,23 @@ class ClassifyOperator(ColumnOperator, SingleNodeOperator):
     def _pair_ids(self, pairs) -> np.ndarray:
         """The (anchor, partner) document ids of pairs given by position."""
         return np.asarray([[self.ids[anchor], self.plan.partners.ids[partner]]
-                           for anchor, partner in pairs],
-                          dtype=np.int32).reshape(-1, 2)
+            for anchor, partner in pairs],
+            dtype=np.int32).reshape(-1, 2)
 
     def _pair_rows(self, pairs):
         """The label rows of (anchor, partner) pairs given by position."""
         spec, plan = self.node.spec, self.plan
         return score_rows(self._pair_ids(pairs), spec.aliases, spec.name,
-                          [plan.pair_labels[pair] for pair in pairs], pa.string())
+            [plan.pair_labels[pair] for pair in pairs], pa.string())
 
     def _label_rows(self, documents):
         """The label rows of documents that have a label, with probabilities."""
         spec, plan = self.node.spec, self.plan
         rows = np.asarray([[self.ids[index]] for index in documents],
-                          dtype=np.int32).reshape(-1, 1)
+            dtype=np.int32).reshape(-1, 1)
         scored = score_rows(rows, spec.aliases, spec.name,
-                            [plan.labels[index] for index in documents],
-                            pa.string())
+            [plan.labels[index] for index in documents],
+            pa.string())
         if plan.probabilities is not None:
             scored = scored.with_column(
                 spec.name + PROBABILITIES_SUFFIX,
@@ -136,13 +136,13 @@ class ClassifyOperator(ColumnOperator, SingleNodeOperator):
         if sink is None or self.plan.partners is not None:
             return
         ready = [document for document in documents
-                 if document not in self.sent
-                 and self.plan.labels[document] is not None]
+            if document not in self.sent
+            and self.plan.labels[document] is not None]
         if ready:
             self.sent.update(ready)
             rows = np.asarray(self.ids).reshape(-1, 1)[np.asarray(ready)]
             sink(scored_batch(self.node, rows,
-                              [self.plan.labels[document] for document in ready]))
+                [self.plan.labels[document] for document in ready]))
 
     def read_answers(self, every) -> int:
         """Finalize labels and count tokens processed after the documents."""
@@ -154,7 +154,7 @@ class ClassifyOperator(ColumnOperator, SingleNodeOperator):
 
     def column_values(self, index, positions) -> tuple:
         return (pa.array([self.plan.labels[position] for position in positions],
-                         pa.string()),)
+            pa.string()),)
 
     def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
         spec = self.node.spec
@@ -165,17 +165,17 @@ class ClassifyOperator(ColumnOperator, SingleNodeOperator):
             sink = answer_sink()
             if sink is not None and pairs:
                 sink(scored_batch(self.node, self._pair_ids(pairs),
-                                  scored.column(spec.name).to_pylist()))
+                    scored.column(spec.name).to_pylist()))
             return NodeResult(classify_outputs(self.node, scored), NodeMetrics(
                 input_rows=len(pairs), output_rows=len(pairs),
                 evaluated_document_pairs=len(pairs), fresh_tokens=tokens,
                 gpu_s=gpu_s, chunks=chunks,
                 extension={"output": spec.name, "aliases": list(spec.aliases),
-                           "input_rows": len(pairs),
-                           "suffix_tokens": self.suffix_tokens}))
+                    "input_rows": len(pairs),
+                    "suffix_tokens": self.suffix_tokens}))
         # a document whose answer named no label has no row
         labeled = [index for index, label in enumerate(plan.labels)
-                   if label is not None]
+            if label is not None]
         scored = self._label_rows(labeled)
         return NodeResult(classify_outputs(self.node, scored), NodeMetrics(
             input_rows=self.reached, output_rows=len(labeled),

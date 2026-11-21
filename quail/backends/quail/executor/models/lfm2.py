@@ -24,7 +24,7 @@ class Lfm2Pipeline(ModelPipeline):
     warm_joins = False
 
     def __init__(self, model, arena, *, spec, kernels="quail",
-                 engine_class=Engine):
+            engine_class=Engine):
         text = getattr(model, "language_model", model)
         self.spec = spec
         self.arena = arena
@@ -52,7 +52,7 @@ class Lfm2Pipeline(ModelPipeline):
         attn = self.attention_layer.self_attn
         mlp = self.attention_layer.feed_forward
         return (conv.in_proj, conv.out_proj, attn.qkv_proj, attn.out_proj,
-                mlp.w13, mlp.w2)
+            mlp.w13, mlp.w2)
 
     def convolutions(self):
         """Return the convolution weights and activation used by this model."""
@@ -82,7 +82,7 @@ class Lfm2Pipeline(ModelPipeline):
         k = attn.k_layernorm(
             k.reshape(rows, attn.num_kv_heads, attn.head_dim).contiguous())
         q, k = attn.rotary_emb(positions, q.reshape(rows, -1),
-                               k.reshape(rows, -1))
+            k.reshape(rows, -1))
         out = self.engine.attention_unified(
             q.view(rows, attn.num_heads, attn.head_dim),
             k.view(rows, attn.num_kv_heads, attn.head_dim),
@@ -101,7 +101,7 @@ class Lfm2Pipeline(ModelPipeline):
         from vllm.config import set_current_vllm_config
 
         context = (nullcontext() if self.vllm_config is None
-                   else set_current_vllm_config(self.vllm_config))
+            else set_current_vllm_config(self.vllm_config))
         with context:
             return self._forward(chunk)
 
@@ -133,5 +133,5 @@ class Lfm2Pipeline(ModelPipeline):
             hidden = self._mlp(layer.feed_forward, x)
         final = chunk.final_indices
         normed, _ = self.final_norm(hidden.index_select(0, final),
-                                    residual.index_select(0, final))
+            residual.index_select(0, final))
         return normed

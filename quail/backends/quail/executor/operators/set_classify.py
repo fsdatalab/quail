@@ -50,7 +50,7 @@ class SetLabels:
 
 
 def labeled_result(node, rows, values, priors=(), value_type=None,
-                   probabilities=None, **metrics) -> NodeResult:
+        probabilities=None, **metrics) -> NodeResult:
     """A set-attention score's or classification's NodeResult.
 
     Args:
@@ -68,14 +68,14 @@ def labeled_result(node, rows, values, priors=(), value_type=None,
     scored = score_rows(rows, spec.aliases, spec.name, values, value_type)
     if probabilities is not None:
         scored = scored.with_column(spec.name + PROBABILITIES_SUFFIX,
-                                    probability_column(spec.labels, probabilities))
+            probability_column(spec.labels, probabilities))
     for prior in priors:
         scored = scored.joined(prior, spec.aliases[0])
     sink = answer_sink()
     if sink is not None and len(rows):
         sink(scored_batch(node, rows, values))
     metrics["extension"] = {"output": spec.name, "aliases": list(spec.aliases),
-                            **metrics.get("extension", {})}
+        **metrics.get("extension", {})}
     return NodeResult(classify_outputs(node, scored), NodeMetrics(**metrics))
 
 
@@ -90,10 +90,10 @@ def classify_result(node, ids, labels: SetLabels, priors) -> NodeResult:
     """
     spec = node.spec
     labeled = [index for index, label in enumerate(labels.labels)
-               if label is not None]
+        if label is not None]
     return labeled_result(
         node, np.asarray([[ids[index]] for index in labeled],
-                         dtype=np.int32).reshape(-1, 1),
+            dtype=np.int32).reshape(-1, 1),
         [labels.labels[index] for index in labeled], priors, pa.string(),
         labels.probabilities[labeled] if spec.probabilities else None,
         input_rows=len(ids), output_rows=len(labeled),
@@ -140,7 +140,7 @@ def joined_labels(state, node, join) -> NodeResult:
     kept = {}
     for local, row in answer["rows"].items():
         members = (None if answer["anchor_partners"] is None
-                   else answer["anchor_partners"][local])
+            else answer["anchor_partners"][local])
         members = range(len(row)) if members is None else members
         chosen = [int(member) for member, bit in zip(members, row) if bit]
         if chosen:
@@ -157,22 +157,22 @@ def joined_labels(state, node, join) -> NodeResult:
     torch = state.torch
     model_spec = state.loaded_model.model_spec
     passes = join_passes(questions, join.inputs["prefixes"], sorted(kept), kept.get,
-                         join.inputs["partner_documents"], model_spec.set_size,
-                         state.chunk_tokens)
+        join.inputs["partner_documents"], model_spec.set_size,
+        state.chunk_tokens)
     passes.stages = [0] * len(passes.states)
     readout = AsyncPassReadout(torch, torch.nn.functional,
-                               full_output_head(state.loaded_model.model), targets,
-                               None)
+        full_output_head(state.loaded_model.model), targets,
+        None)
     label = f"classify {spec.name}"
     run_passes(state, [own_stage(state, readout, label, passes)], passes,
-               label=label)
+        label=label)
     rows = np.zeros((0, 2), dtype=np.int32)
     values = np.zeros(0, dtype=object)
     if passes.states:
         # every pass's question rows, in pass order, and their pairs: an
         # anchor's passes cover its kept partners in order
         logits = np.concatenate([np.asarray(value, dtype=np.float64)
-                                 for value in passes.values])
+            for value in passes.values])
         chosen = option_probabilities(
             logits, option_columns(spec.label_token_ids, targets),
             model_spec.answer_temperature).argmax(-1)
@@ -180,9 +180,9 @@ def joined_labels(state, node, join) -> NodeResult:
         counts = np.array([len(kept[anchor]) for anchor in anchors])
         tuples = answer["partner_index"]
         partners = np.array([int(tuples[member][0]) for anchor in anchors
-                             for member in kept[anchor]], dtype=np.int64)
+            for member in kept[anchor]], dtype=np.int64)
         rows = np.stack((np.repeat(np.asarray(join.ids, dtype=np.int64)[anchors],
-                                   counts), partners), -1).astype(np.int32)
+            counts), partners), -1).astype(np.int32)
         values = np.asarray(spec.labels, dtype=object)[chosen]
     return labeled_result(
         node, rows, list(values), value_type=pa.string(),

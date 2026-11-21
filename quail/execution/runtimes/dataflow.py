@@ -30,11 +30,11 @@ class BarrierRuntime:
                 survivors[alias] = document_ids(value)
             elif port.value_type is ValueType.JOIN_ANSWERS:
                 tables.append(value if isinstance(value, pa.Table)
-                              else _join_answers_table(value))
+                    else _join_answers_table(value))
         survivors = joined_survivors(
             [true_answer_rows(table) for table in tables], survivors)
         return NodeResult({f"rows:{alias}": Rows({alias: survivors[alias]})
-                           for alias in node.aliases})
+            for alias in node.aliases})
 
 
 def relation_values(columns, expression):
@@ -42,7 +42,7 @@ def relation_values(columns, expression):
     for ref in expression.references:
         if columns is None or ref.column not in columns.column_names:
             raise KeyError(f"column {ref.alias}.{ref.column} is not among the "
-                           f"request's relations")
+                f"request's relations")
     return expression.evaluate(columns)
 
 
@@ -68,16 +68,16 @@ class HashJoinRuntime:
             raise TypeError(type(node).__name__)
         sides = {}
         for alias, keys in ((node.left, [left for left, _ in node.on]),
-                            (node.right, [right for _, right in node.on])):
+                (node.right, [right for _, right in node.on])):
             port = next(port for port in node.inputs
-                        if port.source.port == f"rows:{alias}")
+                if port.source.port == f"rows:{alias}")
             ids = document_ids(inputs[port.name])
             columns = context.sources.get(columns_key(alias))
             # a key column may carry the alias's name: the ids stay apart
             sides[alias] = (ids, [relation_values(columns, key).take(ids)
-                                  for key in keys])
+                for key in keys])
         positions = pair_table(node.left, sides[node.left][1],
-                               node.right, sides[node.right][1])
+            node.right, sides[node.right][1])
         # pair_table pairs row positions; map them back to the ids read
         pairs = pa.table({
             alias: pc.take(sides[alias][0], positions.column(alias))

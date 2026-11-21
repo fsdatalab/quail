@@ -27,8 +27,8 @@ IN_FLIGHT = 3
 # draft the model left for another position, the draft rows unread after
 # it, and the draft rows unread after an answer's end
 DRAFT_COUNTS = ("draft_rounds", "draft_rounds_many_positions", "draft_rows",
-                "draft_rows_written", "draft_rounds_rejected",
-                "draft_rows_rejected", "draft_rows_after_end")
+    "draft_rows_written", "draft_rounds_rejected",
+    "draft_rows_rejected", "draft_rows_after_end")
 
 
 @dataclass
@@ -61,8 +61,8 @@ class MapDecoder:
     """
 
     def __init__(self, torch, head, num_documents: int, limits, stop_ids,
-                 page_tokens: int, expected_tokens=None, *, workspace_bytes=0,
-                 row_budget=None, in_flight: int = IN_FLIGHT):
+            page_tokens: int, expected_tokens=None, *, workspace_bytes=0,
+            row_budget=None, in_flight: int = IN_FLIGHT):
         assert in_flight >= 0
         self.workspace_bytes = workspace_bytes
         self.row_budget = row_budget
@@ -70,18 +70,18 @@ class MapDecoder:
         self.torch = torch
         self.head = head
         self._staging = (InputStaging(torch, head.device)
-                         if head.is_cuda else None)
+            if head.is_cuda else None)
         self._host_pool = []
         self.limits = np.asarray(limits, dtype=np.int64)
         self.expected_tokens = (np.minimum(64, self.limits) if expected_tokens is None
-                                else np.asarray(expected_tokens, dtype=np.float64))
+            else np.asarray(expected_tokens, dtype=np.float64))
         self.page_tokens = page_tokens
         n = num_documents
         self.stop_ids = np.asarray(sorted(stop_ids), dtype=np.int64)
         # per map, each document's tokens and its answer's length, -1
         # while the answer has not ended
         self.tokens = [np.zeros((n, int(limit)), dtype=np.int32)
-                       for limit in self.limits]
+            for limit in self.limits]
         self.lengths = np.full((len(self.limits), n), -1, dtype=np.int64)
         self.written = np.zeros((len(self.limits), n), dtype=np.int64)
         self.paused = np.zeros(n, dtype=bool)
@@ -179,7 +179,7 @@ class MapDecoder:
             rows=StreamRows(constraint, slots.size),
             widths=np.full(slots.size, constraint.max_positions, dtype=np.int64),
             source=self.torch.zeros(slots.size, dtype=self.torch.int64,
-                                    device=self.device),
+                device=self.device),
             masks=np.zeros((slots.size, constraint.mask_words), dtype=np.int64),
             prepared_written=np.full(slots.size, -1, dtype=np.int64),
             prepared_drafts=np.zeros(slots.size, dtype=np.int64),
@@ -242,7 +242,7 @@ class MapDecoder:
                 raise AssertionError("copy inputs were not prepared before packing")
             position, option = np.divmod(self.copy_sources[slots], STREAM_STRIDE)
             remaining = (1 + constraint.filler_lengths[option]
-                         + constraint.position_lengths[position] - written[mine])
+                + constraint.position_lengths[position] - written[mine])
             counts[mine] += np.minimum(sizes[mine], np.maximum(0, remaining))
         if self.row_budget is not None and counts.sum() > self.row_budget:
             counts = 1 + self._fit_drafts(running, written, counts - 1, curves)
@@ -298,7 +298,7 @@ class MapDecoder:
     # ---- documents entering and leaving -----------------------------------
 
     def start(self, document: int, map_index: int, position: int, pages,
-              parent: int | None = None, shared_tokens: int = 0) -> None:
+            parent: int | None = None, shared_tokens: int = 0) -> None:
         """Begin an answer whose first token the current pass chooses.
 
         Args:
@@ -369,11 +369,11 @@ class MapDecoder:
                 width = int(num_pages.max())
                 table = self.kv.pages[running, :width]
                 num_pages = ((np.arange(width) < num_pages[:, None])
-                             & (page_holds[table] == 1)).sum(axis=1)
+                    & (page_holds[table] == 1)).sum(axis=1)
             seconds = recompute_cost.prefill_seconds(
                 self.origin[running] + written[running])
             scores[running] *= np.divide(num_pages, seconds,
-                                         out=np.zeros(len(running)), where=seconds > 0)
+                out=np.zeros(len(running)), where=seconds > 0)
         return running[np.lexsort((running, written[running], -scores[running]))]
 
     def running(self, writing=None):
@@ -386,9 +386,9 @@ class MapDecoder:
             writing = np.flatnonzero(self.map >= 0)
         running = writing[~self.paused[writing]]
         ready = (~self.constrained[self.map[running]]
-                 | (self.inflight[running] == 0))
+            | (self.inflight[running] == 0))
         return running[ready & ~self.stopped[running] & ~self.copy_pending[running]
-                       & (self.fed[running] + 1 < self.limits[self.map[running]])]
+            & (self.fed[running] + 1 < self.limits[self.map[running]])]
 
     @property
     def active(self) -> bool:
@@ -413,7 +413,7 @@ class MapDecoder:
             return None
         counts = self.row_counts(running)
         offsets = (np.arange(int(counts.sum()))
-                   - np.repeat(np.cumsum(counts) - counts, counts))
+            - np.repeat(np.cumsum(counts) - counts, counts))
         running = np.repeat(running, counts)
         positions = self.origin[running] + self.fed[running] + offsets
         rows = self.kv.rows(running, positions, self.share)
@@ -425,7 +425,7 @@ class MapDecoder:
         if self._staging is not None:
             return self._staging.copy(name, values, self.torch.int64)
         return self.torch.as_tensor(values, dtype=self.torch.int64,
-                                    device=self.device)
+            device=self.device)
 
     def feed(self, chunk) -> None:
         """Copy each decode row's input token from the token buffer."""
@@ -449,7 +449,7 @@ class MapDecoder:
         plain = rows.slots[~self.constrained[self.map[rows.slots]]]
         self.fed[plain] += 1
         self.rows_fed += np.bincount(self.map[rows.slots],
-                                     minlength=len(self.limits))
+            minlength=len(self.limits))
         shared = chunk.meta.get("shared") is not None
         reads = self.read_tokens
         lengths = rows.positions + 1
@@ -496,7 +496,7 @@ class MapDecoder:
         hidden = selected[0] if len(selected) == 1 else torch.cat(selected)
         width = 4 + self.copy_words + self.copy_trace_words
         values = torch.full((len(documents), width), -1, dtype=torch.int64,
-                            device=self.device)
+            device=self.device)
         chosen, projections = self._project(hidden, documents)
         plain = np.flatnonzero(~self.constrained[self.map[documents]])
         if len(plain):
@@ -514,11 +514,11 @@ class MapDecoder:
         num_rows, num_cols = values.shape
         host_buf = next(
             (self._host_pool.pop(i) for i, b in enumerate(self._host_pool)
-             if b.shape[0] >= num_rows and b.shape[1] >= num_cols), None)
+                if b.shape[0] >= num_rows and b.shape[1] >= num_cols), None)
         if host_buf is None:
             host_buf = torch.empty((max(num_rows, 64), num_cols),
-                                   dtype=torch.int64,
-                                   pin_memory=self.head.is_cuda)
+                dtype=torch.int64,
+                pin_memory=self.head.is_cuda)
         host = host_buf[:num_rows, :num_cols]
         host.copy_(values, non_blocking=True)
         event = torch.cuda.Event()
@@ -535,7 +535,7 @@ class MapDecoder:
                     slots, self.copy_document[slots], group.masks[group.index[slots]],
                     indices[mine][first])))
         self.copies.append(_Copy(event, host, host_buf, documents, indices,
-                                 self.map[documents].copy(), lookahead))
+            self.map[documents].copy(), lookahead))
         np.add.at(self.inflight, documents, 1)
         while len(self.copies) > self.in_flight:
             self._read(self.copies.popleft())
@@ -563,7 +563,7 @@ class MapDecoder:
         return chosen, projections
 
     def _constrain(self, group, projected, documents, indices, *, out=None,
-                   output_rows=None):
+            output_rows=None):
         from quail.backends.quail.executor.extract.copy import verification_blocks
 
         torch, constraint = self.torch, group.constraint
@@ -579,14 +579,14 @@ class MapDecoder:
         if out is None:
             width = 4 + self.copy_words + self.copy_trace_words
             out = torch.full((len(documents), width), -2,
-                             dtype=torch.int64, device=self.device)
+                dtype=torch.int64, device=self.device)
         if output_rows is None:
             output_rows = np.arange(len(documents))
         for block, num_steps, _ in blocks:
             sizes = counts[block]
             offsets = np.repeat(np.cumsum(sizes) - sizes, sizes)
             selected = (np.repeat(first[block], sizes)
-                        + np.arange(int(sizes.sum())) - offsets)
+                + np.arange(int(sizes.sum())) - offsets)
             index = constraint.tensor(output_rows[selected])
             out[index] = self._constrain_block(
                 group, projected[index], documents[selected], indices[selected],
@@ -594,7 +594,7 @@ class MapDecoder:
         return out
 
     def _constrain_block(self, group, projected, documents, indices, stream_width,
-                         num_streams, num_steps):
+            num_streams, num_steps):
         torch, constraint = self.torch, group.constraint
         slots, first, inverse, counts = np.unique(
             documents, return_index=True, return_inverse=True, return_counts=True)
@@ -609,7 +609,7 @@ class MapDecoder:
         active = torch.ones(len(slots), dtype=torch.bool, device=self.device)
         width = 4 + self.copy_words + self.copy_trace_words
         out = torch.full((len(documents), width), -2,
-                         dtype=torch.int64, device=self.device)
+            dtype=torch.int64, device=self.device)
         offsets = np.arange(len(documents)) - first[inverse]
         for start in range(0, int(counts.max()), num_steps):
             end = min(start + num_steps, int(counts.max()))
@@ -624,7 +624,7 @@ class MapDecoder:
                 active=active)
             selected = np.flatnonzero((offsets >= start) & (offsets < end))
             take = constraint.tensor(np.column_stack((selected, inverse[selected],
-                                                      offsets[selected] - start)))
+                offsets[selected] - start)))
             out[take[:, 0], :4] = values[take[:, 1], take[:, 2]]
             if self.copy_trace is not None:
                 out[take[:, 0], 4 + self.copy_words:] = traces[take[:, 1], take[:, 2]]
@@ -650,7 +650,7 @@ class MapDecoder:
             self._look_ahead(copy)
         for group in self.copy_groups:
             slots = np.flatnonzero(self.copy_pending & (self.inflight == 0)
-                                   & np.isin(self.map, group.questions))
+                & np.isin(self.map, group.questions))
             if not len(slots):
                 continue
             written = np.empty(len(slots), dtype=np.int64)
@@ -679,7 +679,7 @@ class MapDecoder:
         documents, indices, maps = copy.documents, copy.indices, copy.maps
         np.subtract.at(self.inflight, documents, 1)
         current = ((self.map[documents] == maps) & ~self.stopped[documents]
-                   & (values[:, 0] != -2))
+            & (values[:, 0] != -2))
         documents, indices, values, maps = (
             documents[current], indices[current], values[current], maps[current])
         tokens = values[:, 0]
@@ -714,9 +714,9 @@ class MapDecoder:
             local = group.index[slots]
             spec = group.constraint.spec
             needed = np.minimum(written + spec.draft_tokens,
-                                spec.max_answer_tokens + spec.draft_tokens - 1)
+                spec.max_answer_tokens + spec.draft_tokens - 1)
             ready = ((group.prepared_written[local] > 0)
-                     & (group.lookahead[local] >= needed))
+                & (group.lookahead[local] >= needed))
             group.prepared_written[local[ready]] = written[ready]
             group.prepared_drafts[local[ready]] = spec.draft_tokens
             self.copy_pending[slots] = ~ready
@@ -736,7 +736,7 @@ class MapDecoder:
             mine = slots[(self.map[slots] == q) & ~self.stopped[slots]]
             mine = mine[self.written[q][mine] > 0].tolist()
             texts = (None if q in self.copy_constraints
-                     else self._partial_texts(q, mine))
+                else self._partial_texts(q, mine))
             for index, slot in enumerate(mine):
                 if texts is None:
                     completions, length = self._partial_answer(q, slot)
@@ -829,12 +829,12 @@ class MapDecoder:
 
             traces = values[:, 4 + self.copy_words:].astype(np.int32).view(np.float32)
             selected = [state.constraint.documents.documents[d]
-                        for d in self.copy_document[documents]]
+                for d in self.copy_document[documents]]
             write_choices(self.copy_trace, selected, q, indices, values[:, 0], traces)
         state.masks[self.copy_document[slots]] = values[
             last, 4:4 + state.constraint.mask_words]
         observed = ((self.num_streams[slots] > 1) & (self.drafts[slots] > 0)
-                    & (values[first, 0] >= 0) & (indices[first] + 1 < self.limits[q]))
+            & (values[first, 0] >= 0) & (indices[first] + 1 < self.limits[q]))
         drafts = self.drafts[slots]
         written = np.bincount(inverse, minlength=len(slots)) - 1
         unread = drafts - written
@@ -858,4 +858,4 @@ class MapDecoder:
         """Return each document's answer tokens for one map."""
         lengths = self.lengths[map_index]
         return [self.tokens[map_index][document, :max(0, lengths[document])]
-                for document in documents]
+            for document in documents]

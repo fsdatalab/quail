@@ -102,7 +102,7 @@ class PhysicalPlan:
     estimates: Mapping[str, Mapping[str, float]] = field(
         default_factory=dict, repr=False)
     pricing: Mapping[str, Any] | None = field(default=None, repr=False,
-                                              compare=False)
+        compare=False)
     # the operators the graph lowers, as Rust's JSON
     operators: str | None = field(default=None, repr=False, compare=False)
     graph: PhysicalGraph = field(init=False, repr=False)

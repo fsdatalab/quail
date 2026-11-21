@@ -38,7 +38,7 @@ def join_settlement(arena, keys, prefixes, node, config):
         if node.keeps(any(row)) and node.keep_kv:
             tokens = len(prefixes[anchor])
             value = (priority.priority(key, tokens, arena.pages_needed(tokens))
-                     if priority is not None else None)
+                if priority is not None else None)
             arena.retain(key, tokens, priority=value)
         else:
             arena.free_key(key)

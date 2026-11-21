@@ -45,7 +45,7 @@ def tested_table(node, rows: Rows, read) -> pa.Table:
     ids = rows.ids[node.aliases[0]]
     return pa.table({
         name: (rows.column(name) if name in rows.column_names
-               else read(name, ids))
+            else read(name, ids))
         for name in node.tested_columns})
 
 

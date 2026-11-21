@@ -49,7 +49,7 @@ NATIVE_SOURCE = "/opt/quail-native"
 # where CI uploads a prebuilt native module for each key of the Rust
 # sources (.github/workflows/publish.yml)
 NATIVE_WHEELS_URL = ("https://github.com/fsdatalab/quail/releases/download/"
-                     "native-wheels")
+    "native-wheels")
 MATURIN = "maturin>=1.9,<2"
 # the native module alone, as a project: the image mounts the quail
 # package from source
@@ -76,11 +76,11 @@ FORWARDED_ENV = ("QUAIL_GDN_PREFILL",)
 def _cuda_base() -> modal.Image:
     # a run picks the Gated DeltaNet prefill kernel from its own shell
     forwarded = {name: os.environ[name] for name in FORWARDED_ENV
-                 if name in os.environ}
+        if name in os.environ}
     return (modal.Image.from_registry(CUDA_BASE, add_python="3.12")
-            .entrypoint([])
-            .apt_install("git")
-            .env(CACHE_ENV | forwarded))
+        .entrypoint([])
+        .apt_install("git")
+        .env(CACHE_ENV | forwarded))
 
 
 def _with_sources(image: modal.Image) -> modal.Image:
@@ -89,7 +89,7 @@ def _with_sources(image: modal.Image) -> modal.Image:
     A Python source mount copies Python files only; the specs are TOML.
     """
     return (image.add_local_python_source("quail", "bench")
-            .add_local_dir(SPEC_DATA, "/root/quail/specs/data"))
+        .add_local_dir(SPEC_DATA, "/root/quail/specs/data"))
 
 
 def _is_rust_source(path: Path) -> bool:
@@ -139,54 +139,54 @@ def _with_native_planner(image: modal.Image) -> modal.Image:
         # the image's environment has no pip; a wheel is a zip archive
         fetch = f"import urllib.request as r; r.urlretrieve('{url}', '/tmp/native.whl')"
         unpack = ("import sysconfig, zipfile; "
-                  "wheel = zipfile.ZipFile('/tmp/native.whl'); "
-                  "wheel.extractall(sysconfig.get_paths()['platlib'], [name for name "
-                  "in wheel.namelist() if name.startswith('_quail_native/')])")
+            "wheel = zipfile.ZipFile('/tmp/native.whl'); "
+            "wheel.extractall(sysconfig.get_paths()['platlib'], [name for name "
+            "in wheel.namelist() if name.startswith('_quail_native/')])")
         return image.run_commands(
             f'python -c "{fetch}"', f'python -c "{unpack}"',
             "python -c 'import _quail_native; _quail_native.LOGICAL_RULES'")
     cargo = (f"cd {NATIVE_SOURCE} && PATH=$HOME/.cargo/bin:$PATH "
-             # an image builds once: Cargo's default release settings,
-             # not the workspace's fast-rebuild ones
-             "CARGO_PROFILE_RELEASE_INCREMENTAL=false "
-             "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 ")
+        # an image builds once: Cargo's default release settings,
+        # not the workspace's fast-rebuild ones
+        "CARGO_PROFILE_RELEASE_INCREMENTAL=false "
+        "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 ")
     return (image.apt_install("curl", "build-essential")
-            .run_commands("curl -sSf https://sh.rustup.rs | sh -s -- -y "
-                          "--profile minimal")
-            .uv_pip_install(MATURIN, uv_version=UV_VERSION)
-            .add_local_file(REPOSITORY / "Cargo.toml", f"{NATIVE_SOURCE}/Cargo.toml",
-                            copy=True)
-            .add_local_file(REPOSITORY / "Cargo.lock", f"{NATIVE_SOURCE}/Cargo.lock",
-                            copy=True)
-            .add_local_file(REPOSITORY / "rust-toolchain.toml",
-                            f"{NATIVE_SOURCE}/rust-toolchain.toml", copy=True)
-            .add_local_dir(REPOSITORY / "crates", f"{NATIVE_SOURCE}/crates", copy=True,
-                           ignore=_is_rust_source)
-            .run_commands(
-                # each crate as an empty library, so Cargo builds what
-                # the crates depend on and nothing of their own
-                f"cd {NATIVE_SOURCE} && for crate in crates/*/; do "
-                "mkdir -p $crate/src && touch $crate/src/lib.rs; done",
-                cargo + "cargo build --release --locked -p quail-python")
-            .add_local_dir(REPOSITORY / "crates", f"{NATIVE_SOURCE}/crates", copy=True)
-            .run_commands(
-                f"cat > {NATIVE_SOURCE}/pyproject.toml <<'EOF'\n"
-                f"{NATIVE_PROJECT_TEXT}EOF",
-                # Cargo compares file times: a copied file older than the
-                # empty library's build would leave the empty one in place
-                f"find {NATIVE_SOURCE}/crates -name '*.rs' -exec touch {{}} +",
-                cargo + f"maturin build --release -o {NATIVE_SOURCE}/wheels",
-                # the image's environment has no pip; a wheel is a zip archive
-                "python -c \"import glob, sysconfig, zipfile; "
-                "zipfile.ZipFile(glob.glob("
-                f"'{NATIVE_SOURCE}/wheels/quail_native-*.whl')[0]).extractall("
-                "sysconfig.get_paths()['platlib'])\"",
-                "python -c 'import _quail_native; _quail_native.LOGICAL_RULES'"))
+        .run_commands("curl -sSf https://sh.rustup.rs | sh -s -- -y "
+            "--profile minimal")
+        .uv_pip_install(MATURIN, uv_version=UV_VERSION)
+        .add_local_file(REPOSITORY / "Cargo.toml", f"{NATIVE_SOURCE}/Cargo.toml",
+            copy=True)
+        .add_local_file(REPOSITORY / "Cargo.lock", f"{NATIVE_SOURCE}/Cargo.lock",
+            copy=True)
+        .add_local_file(REPOSITORY / "rust-toolchain.toml",
+            f"{NATIVE_SOURCE}/rust-toolchain.toml", copy=True)
+        .add_local_dir(REPOSITORY / "crates", f"{NATIVE_SOURCE}/crates", copy=True,
+            ignore=_is_rust_source)
+        .run_commands(
+            # each crate as an empty library, so Cargo builds what
+            # the crates depend on and nothing of their own
+            f"cd {NATIVE_SOURCE} && for crate in crates/*/; do "
+            "mkdir -p $crate/src && touch $crate/src/lib.rs; done",
+            cargo + "cargo build --release --locked -p quail-python")
+        .add_local_dir(REPOSITORY / "crates", f"{NATIVE_SOURCE}/crates", copy=True)
+        .run_commands(
+            f"cat > {NATIVE_SOURCE}/pyproject.toml <<'EOF'\n"
+            f"{NATIVE_PROJECT_TEXT}EOF",
+            # Cargo compares file times: a copied file older than the
+            # empty library's build would leave the empty one in place
+            f"find {NATIVE_SOURCE}/crates -name '*.rs' -exec touch {{}} +",
+            cargo + f"maturin build --release -o {NATIVE_SOURCE}/wheels",
+            # the image's environment has no pip; a wheel is a zip archive
+            "python -c \"import glob, sysconfig, zipfile; "
+            "zipfile.ZipFile(glob.glob("
+            f"'{NATIVE_SOURCE}/wheels/quail_native-*.whl')[0]).extractall("
+            "sysconfig.get_paths()['platlib'])\"",
+            "python -c 'import _quail_native; _quail_native.LOGICAL_RULES'"))
 
 
 def gpu_image(*local_dirs: tuple[str, str],
-              packages: tuple[str, ...] = (),
-              commands: tuple[str, ...] = ()) -> modal.Image:
+        packages: tuple[str, ...] = (),
+        commands: tuple[str, ...] = ()) -> modal.Image:
     """The GPU image: quail's locked dependencies and the dev group.
 
     Args:
@@ -198,8 +198,8 @@ def gpu_image(*local_dirs: tuple[str, str],
             install into a folder outside the project's environment.
     """
     image = (_cuda_base().uv_sync(groups=["dev"], uv_version=UV_VERSION)
-             .add_local_dir(VLLM_PLUGIN_DIR, "/opt/quail-vllm-plugin", copy=True)
-             .uv_pip_install("/opt/quail-vllm-plugin", uv_version=UV_VERSION))
+        .add_local_dir(VLLM_PLUGIN_DIR, "/opt/quail-vllm-plugin", copy=True)
+        .uv_pip_install("/opt/quail-vllm-plugin", uv_version=UV_VERSION))
     image = _with_native_planner(image)
     if packages:
         image = image.uv_pip_install(*packages, uv_version=UV_VERSION)
@@ -228,7 +228,7 @@ def pypi_gpu_image(*local_dirs: tuple[str, str]) -> modal.Image:
 def cpu_image() -> modal.Image:
     """The CPU image: the locked dependencies without the GPU stack."""
     image = (modal.Image.debian_slim(python_version="3.12")
-             .apt_install("git")
-             .uv_sync(groups=["dev"], uv_version=UV_VERSION,
-                      extra_options="--no-install-package vllm"))
+        .apt_install("git")
+        .uv_sync(groups=["dev"], uv_version=UV_VERSION,
+            extra_options="--no-install-package vllm"))
     return _with_sources(image)
