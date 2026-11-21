@@ -935,10 +935,11 @@ def _kernels() -> dict:
                         sf_offsets_ptr, q_ptr, sf_ptr, row_scale_ptr,
                         bf16_ptr, K: tl.constexpr, CH: tl.constexpr,
                         TOPK: tl.constexpr, NVFP4: tl.constexpr,
-                        HW: tl.constexpr):
+                        HW: tl.constexpr, LINEAR: tl.constexpr):
         # one token, quantized once and stored to each of its TOPK
-        # permuted rows; NVFP4 writes packed values, swizzled scales, and
-        # the row scale, else the MXFP8-rounded row in bf16
+        # permuted rows; NVFP4 writes packed values, swizzled (or, with
+        # LINEAR, row-major) scales, and the row scale, else the
+        # MXFP8-rounded row in bf16
         token = tl.program_id(0).to(tl.int64)
         slots = token * TOPK + tl.arange(0, TOPK)
         rows = tl.load(c_map_ptr + slots).to(tl.int64)
@@ -960,10 +961,14 @@ def _kernels() -> dict:
                 tl.store(q_ptr + rows[:, None] * (K // 2) + byte[None, :],
                          tl.broadcast_to(packed[None, :], (TOPK, CH // 2)))
                 block = c * (CH // 16) + tl.arange(0, CH // 16)
-                tl.store(sf_ptr + _scale_offset(
-                    sf_rows[:, None], block[None, :], (K // 16 + 3) // 4),
-                    tl.broadcast_to(scales.to(tl.float8e4nv)[None, :],
-                                    (TOPK, CH // 16)))
+                if LINEAR:
+                    offset = sf_rows[:, None] * (K // 16) + block[None, :]
+                else:
+                    offset = _scale_offset(sf_rows[:, None], block[None, :],
+                                           (K // 16 + 3) // 4)
+                tl.store(sf_ptr + offset,
+                         tl.broadcast_to(scales.to(tl.float8e4nv)[None, :],
+                                         (TOPK, CH // 16)))
             else:
                 y = _mxfp8_round(x, CH // 32).to(tl.bfloat16)
                 cols = c * CH + offs
@@ -990,12 +995,15 @@ def _kernels() -> dict:
     @triton.jit
     def _situ(gate_up_ptr, p, start, outer, gamma, gate_cap, up_cap,
               N: tl.constexpr, W: tl.constexpr, NVFP4: tl.constexpr):
-        # the softcapped SwiGLU of columns [start, start + W), from
-        # (gate, up) pairs interleaved over 2N columns; the result is
+        # the softcapped SwiGLU of columns [start, start + W), from 2N
+        # columns that alternate 64 up and 64 gate columns; the result is
         # rounded to bf16, so approximate tanh and sigmoid suffice
-        pairs = tl.load(gate_up_ptr + p * 2 * N + 2 * start
-                        + tl.arange(0, 2 * W)).to(tl.float32)
-        gate, up = tl.split(tl.reshape(pairs, (W, 2)))
+        groups = tl.load(gate_up_ptr + p * 2 * N + 2 * start
+                         + tl.arange(0, 2 * W)).to(tl.float32)
+        groups = tl.permute(tl.reshape(groups, (W // 64, 2, 64)), (0, 2, 1))
+        up, gate = tl.split(groups)
+        up = tl.reshape(up, (W,))
+        gate = tl.reshape(gate, (W,))
         if NVFP4:
             gate = (gate * outer).to(tl.bfloat16).to(tl.float32)
             up = (up * outer).to(tl.bfloat16).to(tl.float32)
@@ -1463,8 +1471,32 @@ def quantize_tokens(torch, x, c_map, ids, offsets, sf_offsets, *, nvfp4,
         _kernels()["quantize_tokens"][(tokens,)](
             x, x.stride(0), c_map, ids, offsets, sf_offsets, q, sf,
             row_scale, bf16, K=k, CH=_chunk(k, 256), TOPK=topk, NVFP4=nvfp4,
-            HW=_hardware_e2m1(device), num_warps=4)
+            HW=_hardware_e2m1(device), LINEAR=False, num_warps=4)
     return (q, sf, row_scale) if nvfp4 else (bf16, None, None)
+
+
+def quantize_dense(torch, x):
+    """Quantize each row of x to NVFP4 once, with row-major block scales.
+
+    Returns:
+        (packed (rows, K/2) uint8, scales (rows, K/16) uint8 holding fp8,
+        row scales (rows,) fp32), as FlashInfer's fused MoE takes them.
+    """
+    rows, k = x.shape
+    device = x.device
+    q = torch.empty((rows, k // 2), dtype=torch.uint8, device=device)
+    sf = torch.empty((rows, k // 16), dtype=torch.float8_e4m3fn,
+                     device=device)
+    row_scale = torch.empty((rows,), dtype=torch.float32, device=device)
+    if rows:
+        # one expert holding every row in order
+        c_map = torch.arange(rows, dtype=torch.int32, device=device)
+        zeros = torch.zeros(rows, dtype=torch.int32, device=device)
+        _kernels()["quantize_tokens"][(rows,)](
+            x, x.stride(0), c_map, zeros, zeros, zeros, q, sf, row_scale, q,
+            K=k, CH=_chunk(k, 256), TOPK=1, NVFP4=True,
+            HW=_hardware_e2m1(device), LINEAR=True, num_warps=4)
+    return q, sf.view(torch.uint8), row_scale
 
 
 def swiglu_quantize(torch, gate_up, row_scale, gamma, expert, offsets,

@@ -42,6 +42,9 @@ ROOT = "model.llm."
 SKIPPED_PARTS = ("model.visual.",)
 # the convolution state columns of one visit: key, value, attention
 # output, expert output
+# passes above this many tokens run the NVFP4 experts through FlashInfer's
+# fused MoE; smaller ones, CUDA graph buckets included, run Quail's
+FUSED_MIN_TOKENS = 512
 STATE_CHANNELS = {"k": (0, 1024), "v": (1024, 2048), "attn": (2048, 4352),
                   "mlp": (4352, 6656)}
 # the message gates of a loop layer, by checkpoint controller name
@@ -98,6 +101,19 @@ class Inkling2Model:
         setattr(self, name, tensor)
 
 
+def _fused_order(torch, w13):
+    """FC1 rows of each expert reordered from (gate, up) pairs to groups.
+
+    The checkpoint interleaves gate and up rows one by one; FlashInfer's
+    fused MoE reads 64 up rows, then the 64 matching gate rows, and so on.
+    """
+    experts, rows, cols = w13.shape
+    raw = w13.view(torch.uint8) if w13.element_size() == 1 else w13
+    up_gate = torch.stack([raw[:, 1::2], raw[:, 0::2]], dim=1)
+    grouped = up_gate.view(experts, 2, rows // 128, 64, cols).transpose(1, 2)
+    return grouped.reshape(experts, rows, cols).contiguous().view(w13.dtype)
+
+
 def _dequantize_mxfp8(torch, weight, scale):
     """bf16 values of e4m3 weights with a power-of-two scale per 32 columns."""
     experts, rows, columns = weight.shape
@@ -122,6 +138,7 @@ def load_inkling2(path, device="cuda"):
         ValueError: The checkpoint lacks a tensor the pass reads.
     """
     import torch
+    from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
     from safetensors import safe_open
     from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
         swizzle_blockscale,
@@ -206,9 +223,19 @@ def load_inkling2(path, device="cuda"):
         w2_scale = take(own("mlp.experts.w2_weight_scale"))
         layer.nvfp4 = w13.dtype == torch.uint8
         if layer.nvfp4:
-            layer.w13, layer.w2 = w13.contiguous(), w2.contiguous()
-            layer.w13_scale = swizzle_blockscale(w13_scale).contiguous()
+            layer.w13, layer.w2 = _fused_order(torch, w13), w2.contiguous()
+            layer.w13_scale = swizzle_blockscale(
+                _fused_order(torch, w13_scale)).contiguous()
             layer.w2_scale = swizzle_blockscale(w2_scale).contiguous()
+            # the same scales, viewed in FlashInfer's MMA layout
+            experts, rows, cols = w13.shape
+            layer.w13_mma = convert_sf_to_mma_layout(
+                layer.w13_scale.view(experts * rows, -1), m=rows,
+                k=cols * 2, num_groups=experts)
+            experts, rows, cols = w2.shape
+            layer.w2_mma = convert_sf_to_mma_layout(
+                layer.w2_scale.view(experts * rows, -1), m=rows, k=cols * 2,
+                num_groups=experts)
             for name in ("w13", "w2"):
                 amax = take(own(f"mlp.experts.{name}_weight_amax"), fp32)
                 denominator = take(
@@ -217,7 +244,8 @@ def load_inkling2(path, device="cuda"):
                 setattr(layer, f"{name}_alpha",
                         (amax / denominator).contiguous())
         else:
-            layer.w13 = _dequantize_mxfp8(torch, w13, w13_scale)
+            layer.w13 = _fused_order(
+                torch, _dequantize_mxfp8(torch, w13, w13_scale))
             layer.w2 = _dequantize_mxfp8(torch, w2, w2_scale)
             del w13, w2
         layer.gates = None
@@ -398,6 +426,7 @@ class Inkling2Pipeline(ModelPipeline):
         self.max_chunk_tokens = (2**31 - 1) // (8 * 2 * self.hidden)
         # whether torch.mm takes out_dtype for bf16 inputs; probed once
         self._fp32_out = None
+        self._fc2_scale = None
         self.schedule, self.final_blocks = visit_schedule(model.layers,
                                                           self.loop)
         # the piecewise graphs capture one piece per visit, plus the last
@@ -477,6 +506,8 @@ class Inkling2Pipeline(ModelPipeline):
             return torch.empty_like(x)
         ids, weights = self._router(layer, x)
         experts = self.config["n_routed_experts"]
+        if layer.nvfp4 and tokens > FUSED_MIN_TOKENS:
+            return self._fused_experts(layer, x, ids, weights)
         topk = ids.shape[1]
         rows = tokens * topk
         hidden, inter = self.hidden, self.config["intermediate_size"]
@@ -525,6 +556,29 @@ class Inkling2Pipeline(ModelPipeline):
             nvfp4=False, sf_rows=sf_rows, **caps)
         down = torch._grouped_mm(y, layer.w2.transpose(1, 2), offs=ends)
         return kernels.combine(torch, down, None, c_map, tokens, topk)
+
+    def _fused_experts(self, layer, x, ids, weights):
+        """NVFP4 experts through FlashInfer's fused CuTe-DSL MoE.
+
+        It quantizes each expert's SwiGLU output per token, as the
+        checkpoint does, and applies the routing weights after FC2.
+        """
+        from flashinfer import cute_dsl_fused_moe_nvfp4
+
+        torch = self.torch
+        values, scales, row_scale = kernels.quantize_dense(torch, x)
+        if self._fc2_scale is None:
+            # the row scale is the row's largest magnitude over 1536
+            self._fc2_scale = torch.tensor([1.0 / 1536.0],
+                                           dtype=torch.float32,
+                                           device=x.device)
+        return cute_dsl_fused_moe_nvfp4(
+            values, scales.unsqueeze(-1), ids, weights, layer.w13,
+            layer.w13_mma, layer.w13_alpha, self._fc2_scale, layer.w2,
+            layer.w2_mma, layer.w2_alpha, self.config["n_routed_experts"],
+            ids.shape[1], situ_beta=self.config["mlp_gate_softcap"],
+            situ_linear_beta=self.config["mlp_up_softcap"],
+            per_token_scale=row_scale)
 
     # ---- one visit --------------------------------------------------
 
