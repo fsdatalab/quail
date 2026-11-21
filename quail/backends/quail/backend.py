@@ -9,7 +9,6 @@ from quail.backends.quail.executor.models import supported_archs
 from quail.backends.quail.executor.runtime import QuailModelExecution
 from quail.backends.quail.graph import region_report
 from quail.backends.quail.worker import (
-    boot_record,
     quail_workers,
     release_quail_request,
 )
@@ -79,7 +78,9 @@ class QuailBackend:
         """
         report = region_report(plan.graph, ran, seconds, device, gpus=plan.gpus,
                                gpu_timing=plan.settings.get("gpu_timing", False))
-        boot = boot_record(boots)
+        slowest = max(boots, key=lambda boot: boot["boot_s"])
+        boot = {**slowest, "kind": (
+            "cold" if any(boot["kind"] == "cold" for boot in boots) else "warm")}
         report.update(boot_s=boot["boot_s"], boot_kind=boot["kind"], boot=boot)
         return report
 
