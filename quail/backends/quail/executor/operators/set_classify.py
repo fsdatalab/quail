@@ -55,24 +55,6 @@ def labeled_result(node, rows, values, priors=(), value_type=None,
     return NodeResult(classify_outputs(node, scored), NodeMetrics(**metrics))
 
 
-def score_result(node, ids, scores, priors, cost, suffix_tokens) -> NodeResult:
-    """A score's NodeResult: the scored rows joined with its inputs.
-
-    Args:
-        node: The AiScore.
-        ids: The document ids it scored.
-        scores: Their scores, in order.
-        priors: The Rows of each of its rows inputs.
-        cost: The fresh tokens, GPU seconds, and forward passes it led.
-        suffix_tokens: Its question's tokens, summed over the rows.
-    """
-    return labeled_result(
-        node, np.asarray(ids, dtype=np.int32).reshape(-1, 1), scores, priors,
-        input_rows=len(ids), output_rows=len(ids), evaluated_documents=len(ids),
-        fresh_tokens=cost["tokens"], gpu_s=cost["gpu_s"], chunks=cost["chunks"],
-        extension={"input_rows": len(ids), "suffix_tokens": suffix_tokens})
-
-
 def joined_labels(state, node, join) -> NodeResult:
     """Classify the pairs a join kept, as option-code questions in each anchor's passes.
 

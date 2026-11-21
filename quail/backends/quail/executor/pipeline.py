@@ -18,7 +18,6 @@ from quail.backends.quail.executor.operators.join import set_joins, upstream_joi
 from quail.backends.quail.executor.operators.set_classify import (
     joined_labels,
     labeled_result,
-    score_result,
 )
 from quail.backends.quail.executor.operators.set_extract import (
     SetReads,
@@ -157,8 +156,14 @@ def set_steps(state, nodes, ids, prefixes, ask, *, texts=None, inputs=None,
                     node.inputs, _node_inputs(node, results, inputs).values())
                 if port.value_type is ValueType.ROWS]
             if kind == "score":
-                results[node.node_id] = score_result(node, ids[asked], values,
-                    priors, cost, suffix_tokens)
+                count = len(asked)
+                results[node.node_id] = labeled_result(
+                    node, np.asarray(ids[asked], dtype=np.int32).reshape(-1, 1),
+                    values, priors, input_rows=count,
+                    output_rows=count, evaluated_documents=count,
+                    fresh_tokens=cost["tokens"], gpu_s=cost["gpu_s"],
+                    chunks=cost["chunks"],
+                    extension={"input_rows": count, "suffix_tokens": suffix_tokens})
             elif kind == "label":
                 labels = np.asarray(node.spec.labels, dtype=object)[values.argmax(-1)]
                 asked_ids = ids[asked]
