@@ -63,6 +63,7 @@ def test_relative_attention_matches_dense_attention(window):
     q = q / q.float().norm(dim=-1, keepdim=True).to(q.dtype) * 4
     rel = torch.randn(total, HEADS, RANK, device="cuda", dtype=torch.bfloat16)
     sink = torch.randn(total, HEADS, device="cuda", dtype=torch.bfloat16)
+    gate = torch.randn(total, HEADS * DIM, device="cuda", dtype=torch.bfloat16)
     proj = torch.randn(RANK, EXTENT, device="cuda", dtype=torch.bfloat16) * 0.3
     cu = [0]
     for rows, _ in shapes:
@@ -73,7 +74,8 @@ def test_relative_attention_matches_dense_attention(window):
         seqs, firsts = kernels.attention_tiles(cu, block_rows // 3)
         tiles = (torch.from_numpy(seqs).cuda(), torch.from_numpy(firsts).cuda())
         out = torch.empty_like(q)
-        kernels.rel_attention(torch, q, kp, vp, rel, sink, proj, out, tiles,
+        kernels.rel_attention(torch, q, kp, vp, rel, sink, gate, proj, out,
+                              tiles,
                               cu_q, used, table, window=window,
                               max_keys=max(u for _, u in shapes),
                               block_rows=block_rows)
@@ -84,6 +86,8 @@ def test_relative_attention_matches_dense_attention(window):
             span = slice(cu[index], cu[index + 1])
             expected = _dense_attention(q[span], k, v, rel[span], sink[span],
                                         proj, window)
+            expected = expected * gate[span].float().view(
+                -1, HEADS, DIM).sigmoid()
             error = (out[span].float() - expected).abs().max().item()
             assert error < 2e-2, (block_rows, index, error)
 
@@ -239,7 +243,7 @@ def test_the_fused_experts_agree_with_quails_expert_path(monkeypatch):
     from quail.backends.quail.executor.models.inkling2 import Inkling2Pipeline
 
     torch.manual_seed(5)
-    experts, topk, hidden, inter, tokens = 128, 8, 2304, 1152, 600
+    experts, topk, hidden, inter, tokens = 128, 8, 2304, 1152, 4200
 
     def weight(rows, cols):
         values = torch.randint(0, 256, (experts, rows, cols // 2),
@@ -279,3 +283,19 @@ def test_the_fused_experts_agree_with_quails_expert_path(monkeypatch):
     cosine = torch.nn.functional.cosine_similarity(
         fused.flatten(), quail.flatten(), dim=0).item()
     assert cosine > 0.99, cosine
+
+
+def test_routing_picks_the_top_experts_by_biased_score():
+    from quail.backends.quail.executor.models import inkling2_kernels as kernels
+
+    torch.manual_seed(6)
+    rows, experts, top_k = 1000, 128, 8
+    logits = torch.randn(rows, experts, device="cuda") * 2
+    bias = torch.randn(experts, device="cuda") * 0.1
+    ids, weights = kernels.route(torch, logits, bias, top_k, 8.0)
+    scores = logits.sigmoid()
+    expected = torch.topk(scores + bias, top_k, dim=-1).indices
+    assert torch.equal(ids.long().sort(-1).values, expected.sort(-1).values)
+    picked = scores.gather(1, ids.long())
+    assert torch.allclose(weights, picked / picked.sum(-1, keepdim=True) * 8,
+                          rtol=1e-5, atol=1e-6)

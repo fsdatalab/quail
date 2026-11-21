@@ -43,8 +43,9 @@ SKIPPED_PARTS = ("model.visual.",)
 # the convolution state columns of one visit: key, value, attention
 # output, expert output
 # passes above this many tokens run the NVFP4 experts through FlashInfer's
-# fused MoE; smaller ones, CUDA graph buckets included, run Quail's
-FUSED_MIN_TOKENS = 512
+# fused MoE; smaller ones run Quail's, since the fused call's host time
+# outweighs its GPU savings on launch-bound answer steps
+FUSED_MIN_TOKENS = 4096
 STATE_CHANNELS = {"k": (0, 1024), "v": (1024, 2048), "attn": (2048, 4352),
                   "mlp": (4352, 6656)}
 # the message gates of a loop layer, by checkpoint controller name
@@ -487,14 +488,9 @@ class Inkling2Pipeline(ModelPipeline):
     def _router(self, layer, x):
         torch = self.torch
         logits = self._mm_fp32(x, layer.router.t())
-        scores = logits.sigmoid()
-        ids = torch.topk(scores + layer.router_bias,
-                         self.config["num_experts_per_tok"], dim=-1,
-                         sorted=False).indices
-        weights = scores.gather(1, ids)
-        weights = (weights / (weights.sum(-1, keepdim=True) + 1e-20)
-                   * self.config["route_scale"])
-        return ids.to(torch.int32), weights
+        return kernels.route(torch, logits, layer.router_bias,
+                             self.config["num_experts_per_tok"],
+                             self.config["route_scale"])
 
     def _experts(self, layer, x):
         """The routed experts over bf16 rows, as bf16 rows."""
@@ -690,8 +686,7 @@ class Inkling2Pipeline(ModelPipeline):
         n = run.residual.shape[0]
         width = spec.num_q_heads * spec.d_head
         state = self.arena.conv_state[:, visit.index]
-        gated = kernels.gate_attention(torch, run.attn.view(n, width),
-                                       run.gate)
+        gated = run.attn.view(n, width)
         projected = torch.mm(gated, layer.wo.t())
         attn_out = kernels.short_conv(torch, projected, run.taps,
                                       state[:, :, 2048:4352], layer.attn_conv)
@@ -782,8 +777,8 @@ class Inkling2Pipeline(ModelPipeline):
         prefill = plan["block_rows"] >= 64
         kernels.rel_attention(
             torch, buffers.q3[:n], kp, vp, buffers.rel[:n], buffers.sink[:n],
-            layer.rel_proj, buffers.attn[:n], plan["tiles"], unified["cu_q"],
-            unified["used"], unified["table"],
+            buffers.gate[:n], layer.rel_proj, buffers.attn[:n], plan["tiles"],
+            unified["cu_q"], unified["used"], unified["table"],
             window=self.window if layer.is_local else 0,
             max_keys=unified["max_used"], block_rows=plan["block_rows"],
             block_keys=64 if prefill else 32,

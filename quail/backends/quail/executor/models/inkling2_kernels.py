@@ -574,50 +574,104 @@ def _kernels() -> dict:
         tl.store(out_ptr + r64 * stride_out + cols[None, :], y, mask=mask)
 
     @triton.jit
+    def _taps(x_ptr, stride_x, state_ptr, stride_slot, stride_tap, src, cols,
+              ok):
+        # (rows, cols) values of each row's tap source src (rows,): a row
+        # of x, zero, or a saved state column
+        is_row = (src >= 0)[:, None] & ok[:, None]
+        old = -src - 2
+        is_old = (src <= -2)[:, None] & ok[:, None]
+        slot = tl.where(src <= -2, old // 3, 0).to(tl.int64)
+        tap = tl.where(src <= -2, old % 3, 0).to(tl.int64)
+        row = tl.where(src >= 0, src, 0).to(tl.int64)
+        value = tl.load(x_ptr + row[:, None] * stride_x + cols[None, :],
+                        mask=is_row, other=0.0).to(tl.float32)
+        value += tl.load(state_ptr + slot[:, None] * stride_slot
+                         + tap[:, None] * stride_tap + cols[None, :],
+                         mask=is_old, other=0.0).to(tl.float32)
+        return value
+
+    @triton.jit(do_not_specialize=["rows"])
     def kv_conv(x_ptr, stride_x, dyn_ptr, stride_dyn, taps_ptr, state_ptr,
-                stride_slot, stride_tap, w_ptr, out_ptr, stride_o0, stride_o1,
-                eps, clip, inv_scale, D: tl.constexpr, DYNAMIC: tl.constexpr,
+                stride_slot, stride_tap, w_ptr, out_ptr, stride_o0, rows, eps,
+                clip, inv_scale, HEADS: tl.constexpr, D: tl.constexpr,
+                BT: tl.constexpr, DYNAMIC: tl.constexpr,
                 IS_KEY: tl.constexpr):
-        # static: w is (C, 4), w[:, 3] current; dynamic: w is (4, C) by
-        # backward distance, plus the row's (heads, 4) taps at dyn_ptr
-        row = tl.program_id(0).to(tl.int64)
-        head = tl.program_id(1)
-        cols = head * D + tl.arange(0, D)
-        mask = cols < (head + 1) * D
-        C = tl.num_programs(1) * D
-        x = tl.load(x_ptr + row * stride_x + cols).to(tl.float32)
-        srcs0 = tl.load(taps_ptr + row * 3)
-        srcs1 = tl.load(taps_ptr + row * 3 + 1)
-        srcs2 = tl.load(taps_ptr + row * 3 + 2)
-        t3 = _tap(x_ptr, stride_x, state_ptr, stride_slot, stride_tap, srcs0,
-                  cols, mask)
-        t2 = _tap(x_ptr, stride_x, state_ptr, stride_slot, stride_tap, srcs1,
-                  cols, mask)
-        t1 = _tap(x_ptr, stride_x, state_ptr, stride_slot, stride_tap, srcs2,
-                  cols, mask)
+        # BT rows, every head. static: w is (C, 4), w[:, 3] current;
+        # dynamic: w is (4, C) by backward distance, plus each row's
+        # (heads, 4) taps at dyn_ptr
+        C: tl.constexpr = HEADS * D
+        r = tl.program_id(0) * BT + tl.arange(0, BT)
+        ok = r < rows
+        r64 = r.to(tl.int64)
+        cols = tl.arange(0, C)
+        x = tl.load(x_ptr + r64[:, None] * stride_x + cols[None, :],
+                    mask=ok[:, None], other=0.0).to(tl.float32)
+        src0 = tl.load(taps_ptr + r64 * 3, mask=ok, other=-1)
+        src1 = tl.load(taps_ptr + r64 * 3 + 1, mask=ok, other=-1)
+        src2 = tl.load(taps_ptr + r64 * 3 + 2, mask=ok, other=-1)
+        t3 = _taps(x_ptr, stride_x, state_ptr, stride_slot, stride_tap, src0,
+                   cols, ok)
+        t2 = _taps(x_ptr, stride_x, state_ptr, stride_slot, stride_tap, src1,
+                   cols, ok)
+        t1 = _taps(x_ptr, stride_x, state_ptr, stride_slot, stride_tap, src2,
+                   cols, ok)
         if DYNAMIC:
-            d0 = tl.load(dyn_ptr + row * stride_dyn + head * 4).to(tl.float32)
-            d1 = tl.load(dyn_ptr + row * stride_dyn + head * 4 + 1).to(tl.float32)
-            d2 = tl.load(dyn_ptr + row * stride_dyn + head * 4 + 2).to(tl.float32)
-            d3 = tl.load(dyn_ptr + row * stride_dyn + head * 4 + 3).to(tl.float32)
-            w0 = tl.load(w_ptr + cols).to(tl.float32) + d0
-            w1 = tl.load(w_ptr + C + cols).to(tl.float32) + d1
-            w2 = tl.load(w_ptr + 2 * C + cols).to(tl.float32) + d2
-            w3 = tl.load(w_ptr + 3 * C + cols).to(tl.float32) + d3
+            dyn = dyn_ptr + r64[:, None] * stride_dyn + (cols // D)[None, :] * 4
+            w0 = tl.load(w_ptr + cols).to(tl.float32)[None, :] + tl.load(
+                dyn, mask=ok[:, None], other=0.0).to(tl.float32)
+            w1 = tl.load(w_ptr + C + cols).to(tl.float32)[None, :] + tl.load(
+                dyn + 1, mask=ok[:, None], other=0.0).to(tl.float32)
+            w2 = tl.load(w_ptr + 2 * C + cols).to(tl.float32)[None, :] + tl.load(
+                dyn + 2, mask=ok[:, None], other=0.0).to(tl.float32)
+            w3 = tl.load(w_ptr + 3 * C + cols).to(tl.float32)[None, :] + tl.load(
+                dyn + 3, mask=ok[:, None], other=0.0).to(tl.float32)
             acc = w0 * x + w1 * t1 + w2 * t2 + w3 * t3
         else:
-            acc = (tl.load(w_ptr + cols * 4 + 3) * x
-                   + tl.load(w_ptr + cols * 4 + 2) * t1
-                   + tl.load(w_ptr + cols * 4 + 1) * t2
-                   + tl.load(w_ptr + cols * 4) * t3)
+            acc = (tl.load(w_ptr + cols * 4 + 3)[None, :] * x
+                   + tl.load(w_ptr + cols * 4 + 2)[None, :] * t1
+                   + tl.load(w_ptr + cols * 4 + 1)[None, :] * t2
+                   + tl.load(w_ptr + cols * 4)[None, :] * t3)
         y = ((acc + x) * inv_scale).to(tl.bfloat16).to(tl.float32)
+        heads = tl.reshape(y, (BT, HEADS, D))
+        sq = tl.sum(heads * heads, axis=2)
         if IS_KEY:
-            norm = tl.sqrt(tl.sum(y * y, axis=0))
-            y = y * tl.minimum(clip / (norm + 1e-6), 1.0)
+            factor = tl.minimum(clip / (tl.sqrt(sq) + 1e-6), 1.0)
         else:
-            y = y * tl.math.rsqrt(tl.sum(y * y, axis=0) / D + eps)
-        tl.store(out_ptr + row * stride_o0 + head * stride_o1
-                 + tl.arange(0, D), y.to(tl.bfloat16))
+            factor = tl.math.rsqrt(sq / D + eps)
+        y = tl.reshape(heads * factor[:, :, None], (BT, C))
+        tl.store(out_ptr + r64[:, None] * stride_o0 + cols[None, :],
+                 y.to(tl.bfloat16), mask=ok[:, None])
+
+    @triton.jit(do_not_specialize=["rows"])
+    def route(logits_ptr, bias_ptr, ids_ptr, weights_ptr, rows, scale,
+              E: tl.constexpr, K: tl.constexpr, BT: tl.constexpr):
+        # each row's K experts by sigmoid score plus bias, and their scores
+        # normalized to sum to scale; ties go to the lower expert
+        r = tl.program_id(0) * BT + tl.arange(0, BT)
+        ok = r < rows
+        r64 = r.to(tl.int64)
+        experts = tl.arange(0, E)
+        logits = tl.load(logits_ptr + r64[:, None] * E + experts[None, :],
+                         mask=ok[:, None], other=0.0)
+        scores = tl.sigmoid(logits)
+        choice = scores + tl.load(bias_ptr + experts)[None, :]
+        slots = tl.arange(0, K)
+        ids = tl.zeros((BT, K), dtype=tl.int32)
+        picked = tl.zeros((BT, K), dtype=tl.float32)
+        for k in tl.static_range(K):
+            best = tl.max(choice, axis=1)
+            index = tl.min(tl.where(choice == best[:, None], experts[None, :],
+                                    E), axis=1)
+            hit = experts[None, :] == index[:, None]
+            score = tl.sum(tl.where(hit, scores, 0.0), axis=1)
+            ids = tl.where(slots[None, :] == k, index[:, None], ids)
+            picked = tl.where(slots[None, :] == k, score[:, None], picked)
+            choice = tl.where(hit, -float("inf"), choice)
+        picked = picked / (tl.sum(picked, axis=1)[:, None] + 1e-20) * scale
+        out = r64[:, None] * K + slots[None, :]
+        tl.store(ids_ptr + out, ids, mask=ok[:, None])
+        tl.store(weights_ptr + out, picked, mask=ok[:, None])
 
     @triton.jit
     def clip_heads(x_ptr, stride_x, scale_ptr, positions_ptr, out_ptr,
@@ -643,18 +697,6 @@ def _kernels() -> dict:
             y = (y.to(tl.float32) * tau).to(tl.bfloat16)
         tl.store(out_ptr + row * stride_o0 + heads[:, None] * stride_o1
                  + offs[None, :], y, mask=mask)
-
-    @triton.jit
-    def gate_attention(attn_ptr, gate_ptr, stride_gate, out_ptr, N,
-                       BLOCK: tl.constexpr):
-        row = tl.program_id(0).to(tl.int64)
-        cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-        mask = cols < N
-        a = tl.load(attn_ptr + row * N + cols, mask=mask, other=0.0)
-        g = tl.load(gate_ptr + row * stride_gate + cols, mask=mask,
-                    other=0.0).to(tl.float32)
-        out = a.to(tl.float32) * tl.sigmoid(g)
-        tl.store(out_ptr + row * N + cols, out.to(tl.bfloat16), mask=mask)
 
     @triton.jit
     def _attend_tile(q, k_ptr, v_ptr, bt_row, n0, kv_head, qpos, row_ok,
@@ -702,7 +744,8 @@ def _kernels() -> dict:
 
     @triton.jit(do_not_specialize=["window", "splits"])
     def rel_attention(q_ptr, k_ptr, v_ptr, rel_ptr, proj_ptr, sink_ptr,
-                      out_ptr, scratch_ptr, part_acc_ptr, part_ml_ptr,
+                      gate_ptr, stride_g, out_ptr, scratch_ptr, part_acc_ptr,
+                      part_ml_ptr,
                       tile_seq_ptr, tile_q0_ptr, cu_q_ptr, used_ptr,
                       table_ptr, stride_q0, stride_q1, stride_r0, stride_r1,
                       stride_s0, stride_o0, stride_o1, stride_k0, stride_k1,
@@ -810,14 +853,18 @@ def _kernels() -> dict:
             tl.store(part_ml_ptr + slot * 2, m_i, mask=row_ok)
             tl.store(part_ml_ptr + slot * 2 + 1, l_i, mask=row_ok)
         else:
-            out = acc / l_i[:, None]
+            # the output gate, sigmoid(gate) per channel
+            gate = tl.load(gate_ptr + q_row[:, None] * stride_g
+                           + head[:, None] * D + offs_d[None, :],
+                           mask=row_ok[:, None], other=0.0).to(tl.float32)
+            out = acc / l_i[:, None] * tl.sigmoid(gate)
             tl.store(out_ptr + q_row[:, None] * stride_o0
                      + head[:, None] * stride_o1 + offs_d[None, :],
                      out.to(tl.bfloat16), mask=row_ok[:, None])
 
     @triton.jit(do_not_specialize=["splits"])
-    def merge_splits(part_acc_ptr, part_ml_ptr, out_ptr, stride_o0,
-                     stride_o1, splits, HEADS: tl.constexpr,
+    def merge_splits(part_acc_ptr, part_ml_ptr, gate_ptr, stride_g, out_ptr,
+                     stride_o0, stride_o1, splits, HEADS: tl.constexpr,
                      D: tl.constexpr, MAX_SPLITS: tl.constexpr):
         # one row and head: the splits' softmax states, merged
         row = tl.program_id(0).to(tl.int64)
@@ -833,6 +880,8 @@ def _kernels() -> dict:
         acc = tl.load(part_acc_ptr + slot[:, None] * D + offs_d[None, :],
                       mask=ok[:, None], other=0.0)
         out = tl.sum(acc * w[:, None], axis=0) / tl.sum(sums * w, axis=0)
+        gate = tl.load(gate_ptr + row * stride_g + head * D + offs_d)
+        out = out * tl.sigmoid(gate.to(tl.float32))
         tl.store(out_ptr + row * stride_o0 + head * stride_o1 + offs_d,
                  out.to(tl.bfloat16))
 
@@ -1109,7 +1158,7 @@ def _kernels() -> dict:
         scatter_state=scatter_state,
         mix=mix, gate_inputs=gate_inputs, gate_apply=gate_apply,
         rms_norm=rms_norm, short_conv=short_conv, kv_conv=kv_conv,
-        clip_heads=clip_heads, gate_attention=gate_attention,
+        clip_heads=clip_heads, route=route,
         rel_attention=rel_attention, merge_splits=merge_splits,
         quantize_tokens=quantize_tokens,
         swiglu_quantize=swiglu_quantize, combine=combine,
@@ -1297,12 +1346,38 @@ def kv_conv(torch, x, taps, state, weight, *, heads, head_dim, dynamic=None,
         return out
     scale = 1.0 / math.sqrt(9.0 if dynamic is not None else 5.0)
     dyn = dynamic if dynamic is not None else x
-    _kernels()["kv_conv"][(rows, heads)](
+    rows_per = 4
+    _kernels()["kv_conv"][(triton_cdiv(rows, rows_per),)](
         x, x.stride(0), dyn, dyn.stride(0), taps, state, state.stride(0),
-        state.stride(1), weight, out, out.stride(0), out.stride(1), eps, clip,
-        scale, D=head_dim, DYNAMIC=dynamic is not None, IS_KEY=is_key,
-        num_warps=4)
+        state.stride(1), weight, out, out.stride(0), rows, eps, clip, scale,
+        HEADS=heads, D=head_dim, BT=rows_per, DYNAMIC=dynamic is not None,
+        IS_KEY=is_key, num_warps=8)
     return out
+
+
+def route(torch, logits, bias, top_k, scale):
+    """Top-k experts by sigmoid score plus bias, with normalized scores.
+
+    Args:
+        torch: The torch module.
+        logits: (rows, experts) fp32 router logits.
+        bias: (experts,) fp32 selection bias.
+        top_k: Experts per row.
+        scale: What each row's weights sum to.
+
+    Returns:
+        (ids (rows, top_k) int32, weights (rows, top_k) fp32).
+    """
+    rows, experts = logits.shape
+    ids = torch.empty((rows, top_k), dtype=torch.int32, device=logits.device)
+    weights = torch.empty((rows, top_k), dtype=torch.float32,
+                          device=logits.device)
+    if rows:
+        rows_per = 8
+        _kernels()["route"][(triton_cdiv(rows, rows_per),)](
+            logits, bias, ids, weights, rows, float(scale), E=experts, K=top_k,
+            BT=rows_per, num_warps=4)
+    return ids, weights
 
 
 def clip_heads(torch, x, scale, positions, *, heads, head_dim, clip,
@@ -1322,16 +1397,6 @@ def clip_heads(torch, x, scale, positions, *, heads, head_dim, clip,
     return out
 
 
-def gate_attention(torch, attn, gate):
-    rows, width = attn.shape
-    out = torch.empty_like(attn)
-    if rows:
-        block = 1024
-        _kernels()["gate_attention"][(rows, triton_cdiv(width, block))](
-            attn, gate, gate.stride(0), out, width, BLOCK=block, num_warps=4)
-    return out
-
-
 def attention_tiles(cu_q_host, rows_per_tile):
     """(sequence, first query) per query tile, over sequences' query counts."""
     import numpy as np
@@ -1344,10 +1409,11 @@ def attention_tiles(cu_q_host, rows_per_tile):
     return seqs, firsts.astype(np.int32)
 
 
-def rel_attention(torch, q3, kp, vp, rel, sink, proj, out, tiles, cu_q, used,
-                  table, *, window, max_keys, block_rows=64, block_keys=64,
+def rel_attention(torch, q3, kp, vp, rel, sink, gate, proj, out, tiles, cu_q,
+                  used, table, *, window, max_keys, block_rows=64,
+                  block_keys=64,
                   num_warps=8, num_stages=3):
-    """Causal paged attention with the relative bias and sink logits.
+    """Causal paged attention with the relative bias, sink logits, and gate.
 
     Args:
         torch: The torch module.
@@ -1356,6 +1422,8 @@ def rel_attention(torch, q3, kp, vp, rel, sink, proj, out, tiles, cu_q, used,
         vp: The arena value pool, shaped as kp.
         rel: (rows, heads, rank) relative states.
         sink: (rows, heads) view of the sink logits.
+        gate: (rows, heads * dim) view of the output gate's logits; the
+            output is multiplied by their sigmoid.
         proj: (rank, extent) bf16 bias profiles.
         out: (rows, heads, dim) output.
         tiles: (sequence ids, first queries) on the GPU, from
@@ -1391,7 +1459,8 @@ def rel_attention(torch, q3, kp, vp, rel, sink, proj, out, tiles, cu_q, used,
     else:
         part_acc = part_ml = out
     _kernels()["rel_attention"][(num_tiles * splits, kv_heads)](
-        q3, kp, vp, rel, proj, sink, out, scratch, part_acc, part_ml,
+        q3, kp, vp, rel, proj, sink, gate, gate.stride(0), out, scratch,
+        part_acc, part_ml,
         tiles[0], tiles[1], cu_q, used, table, q3.stride(0), q3.stride(1),
         rel.stride(0), rel.stride(1), sink.stride(0), out.stride(0),
         out.stride(1), kp.stride(0), kp.stride(1), kp.stride(2), vp.stride(0),
@@ -1403,7 +1472,8 @@ def rel_attention(torch, q3, kp, vp, rel, sink, proj, out, tiles, cu_q, used,
         num_warps=num_warps, num_stages=num_stages)
     if splits > 1:
         _kernels()["merge_splits"][(rows, heads)](
-            part_acc, part_ml, out, out.stride(0), out.stride(1), splits,
+            part_acc, part_ml, gate, gate.stride(0), out, out.stride(0),
+            out.stride(1), splits,
             HEADS=heads, D=dim, MAX_SPLITS=MAX_SPLITS, num_warps=4)
     return out
 
