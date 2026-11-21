@@ -3,9 +3,7 @@
 A token mixer (attention, or a Gated DeltaNet layer's convolution and
 recurrence) reads per-chunk metadata of variable size, so it runs
 eagerly between captured pieces, as vLLM's piecewise graphs split at
-the same ops. A pipeline whose mixers read fixed-size metadata for some
-chunks (ModelPipeline.whole_step) replays those chunks as one graph,
-mixers included, as vLLM and SGLang capture whole decode steps.
+the same ops.
 """
 
 import time
@@ -175,15 +173,6 @@ class CapturedPieces:
     buffers: PiecewiseBuffers
     graphs: list | None
     tail_graphs: list | None = None
-    whole: object | None = None
-
-    def forward_whole(self, pipeline, chunk):
-        """Replay the whole step, token mixers included; copy selected outputs."""
-        self.buffers.copy(chunk)
-        pipeline.stage(self.buffers, chunk)
-        with pipeline.forward_context(self.buffers.num_tokens):
-            self.whole.replay()
-        return self.buffers.output.index_select(0, chunk.final_indices)
 
     def forward(self, pipeline, chunk):
         """Replay pieces separated by eager token mixers; copy selected outputs."""
@@ -307,8 +296,7 @@ class PiecewiseGraphs:
                     continue
         return True
 
-    def capture_within_reserve(self, captured, *, copy_tail=False,
-                               whole=False):
+    def capture_within_reserve(self, captured, *, copy_tail=False):
         """Capture a smaller bucket or tail variant if the pool has room.
 
         A bucket grows the pool by its tokens' share of the largest
@@ -322,8 +310,8 @@ class PiecewiseGraphs:
         if self.captured_bytes + scaled + self.growth_bytes > self.memory_bytes:
             return False
         before = self.captured_bytes
-        if copy_tail or whole:
-            self.capture(captured, copy_tail=copy_tail, whole=whole)
+        if copy_tail:
+            self.capture(captured, copy_tail=True)
         else:
             self.capture(captured)
         self.growth_bytes = max(self.growth_bytes,
@@ -334,14 +322,13 @@ class PiecewiseGraphs:
                            self.captured_bytes / 2**20, self.memory_bytes / 2**20)
         return True
 
-    def capture(self, captured, *, copy_tail=False, whole=False):
+    def capture(self, captured, *, copy_tail=False):
         """Capture one bucket's pieces into the shared pool.
 
         Each piece runs once eagerly before its capture, so the KV write
         mappings and the pipeline's staged inputs are cleared first; they
         may still hold a real pass's pages and state slots. The
         partial-page tail variant is captured only when a pass needs it.
-        whole captures the pieces and the token mixers as one graph.
         """
         engine = self.pipeline.engine
         torch = engine.torch
@@ -358,32 +345,16 @@ class PiecewiseGraphs:
                 buffers.sliding_writes.copy(None)
             self.pipeline.stage(buffers, None)
             num_pieces = len(self.pipeline.layers) + 1
-
-            def step():
-                for index in range(num_pieces):
-                    buffers.piece(self.pipeline, index, copy_tail=copy_tail)
-                    if index < num_pieces - 1:
-                        self.pipeline.mixer(index, buffers, None)
-
             with (torch.cuda.stream(stream), torch.inference_mode(),
                   self.pipeline.forward_context(buffers.num_tokens)):
-                if whole:
-                    step()
+                for index in range(num_pieces):
+                    buffers.piece(self.pipeline, index, copy_tail=copy_tail)
+                graphs = []
+                for index in range(num_pieces):
                     graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(graph, pool=self.pool, stream=stream):
-                        step()
-                    graphs = graph
-                else:
-                    for index in range(num_pieces):
                         buffers.piece(self.pipeline, index, copy_tail=copy_tail)
-                    graphs = []
-                    for index in range(num_pieces):
-                        graph = torch.cuda.CUDAGraph()
-                        with torch.cuda.graph(graph, pool=self.pool,
-                                              stream=stream):
-                            buffers.piece(self.pipeline, index,
-                                          copy_tail=copy_tail)
-                        graphs.append(graph)
+                    graphs.append(graph)
             current.wait_stream(stream)
             stream.synchronize()
             # The pool's segments stay reserved until its graphs die. A
@@ -396,9 +367,7 @@ class PiecewiseGraphs:
         except Exception:
             self.invalidate()
             raise
-        if whole:
-            captured.whole = graphs
-        elif copy_tail:
+        if copy_tail:
             captured.tail_graphs = graphs
         else:
             captured.graphs = graphs
@@ -406,7 +375,6 @@ class PiecewiseGraphs:
         self.capture_s += seconds
         logger.info("CUDA graphs: captured %d tokens%s in %.1f s, using "
                     "%.0f of %.0f MiB", buffers.num_tokens,
-                    " (whole step)" if whole else
                     " (tails)" if copy_tail else "", seconds,
                     self.captured_bytes / 2**20, self.memory_bytes / 2**20)
 
@@ -455,13 +423,6 @@ class PiecewiseGraphs:
                             and writes["sliding"]["tail_src"].numel() > 0)
                     )
                 )
-                if (not needs_tails and self.pipeline.whole_step(
-                        chunk, captured.buffers.num_tokens)
-                        and (captured.whole is not None
-                             or self.capture_within_reserve(captured,
-                                                            whole=True))):
-                    self.replays += 1
-                    return captured.forward_whole(self.pipeline, chunk)
                 if (not needs_tails or captured.tail_graphs is not None
                         or self.capture_within_reserve(captured, copy_tail=True)):
                     self.replays += 1

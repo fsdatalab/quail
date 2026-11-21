@@ -862,8 +862,7 @@ def _kernels() -> dict:
     @triton.jit(do_not_specialize=["window", "splits"])
     def decode_attention(q_ptr, k_ptr, v_ptr, rel_ptr, proj_t_ptr, sink_ptr,
                          out_ptr, part_acc_ptr, part_ml_ptr, token_seq_ptr,
-                         token_q_ptr, num_real_ptr, cu_q_ptr, used_ptr,
-                         table_ptr, stride_q0,
+                         token_q_ptr, cu_q_ptr, used_ptr, table_ptr, stride_q0,
                          stride_q1, stride_r0, stride_r1, stride_s0,
                          stride_o0, stride_o1, stride_k0, stride_k1,
                          stride_k2, stride_v0, stride_v1, stride_v2,
@@ -872,7 +871,7 @@ def _kernels() -> dict:
                          BM: tl.constexpr, BN: tl.constexpr, D: tl.constexpr,
                          R: tl.constexpr, EXTENT: tl.constexpr,
                          PAGE: tl.constexpr, HAS_WINDOW: tl.constexpr,
-                         SPLIT: tl.constexpr, LIMIT: tl.constexpr):
+                         SPLIT: tl.constexpr):
         # One query token's GROUP heads against one KV head's keys. Every
         # row shares the token's position, so a key tile's bias is one dot:
         # the rows' relative states times the profile at the tile's
@@ -881,10 +880,6 @@ def _kernels() -> dict:
         token = tl.program_id(0) // splits
         split = tl.program_id(0) % splits
         kv_head = tl.program_id(1)
-        # a captured grid covers a bucket; tokens past the real ones exit
-        if LIMIT:
-            if token >= tl.load(num_real_ptr):
-                return
         seq = tl.load(token_seq_ptr + token)
         qi = tl.load(token_q_ptr + token)
         q_start = tl.load(cu_q_ptr + seq)
@@ -961,17 +956,13 @@ def _kernels() -> dict:
                      mask=row_ok[:, None])
 
     @triton.jit(do_not_specialize=["splits"])
-    def merge_tokens(part_acc_ptr, part_ml_ptr, rows_ptr, num_real_ptr,
-                     out_ptr, stride_o0, stride_o1, splits,
-                     HEADS: tl.constexpr, D: tl.constexpr,
-                     MAX_SPLITS: tl.constexpr, LIMIT: tl.constexpr):
+    def merge_tokens(part_acc_ptr, part_ml_ptr, rows_ptr, out_ptr, stride_o0,
+                     stride_o1, splits, HEADS: tl.constexpr, D: tl.constexpr,
+                     MAX_SPLITS: tl.constexpr):
         # one decoded token and head: the splits' softmax states, merged
         # into the token's row
         token = tl.program_id(0).to(tl.int64)
         head = tl.program_id(1)
-        if LIMIT:
-            if token >= tl.load(num_real_ptr):
-                return
         row = tl.load(rows_ptr + token).to(tl.int64)
         offs_s = tl.arange(0, MAX_SPLITS)
         offs_d = tl.arange(0, D)
@@ -1817,7 +1808,7 @@ def prefill_attention(torch, q3, kp, vp, rel, sink, proj, out, tiles, cu_q,
 
 def decode_attention(torch, q3, kp, vp, rel, sink, proj_t, out, tokens,
                      cu_q, used, table, *, window, max_keys, block_keys=64,
-                     num_warps=4, num_stages=3, num_real=None, splits=None):
+                     num_warps=4, num_stages=3):
     """Attention of answer-step tokens, one token's heads per program.
 
     Args:
@@ -1839,11 +1830,6 @@ def decode_attention(torch, q3, kp, vp, rel, sink, proj_t, out, tokens,
         block_keys: Keys per key tile.
         num_warps: Warps per program.
         num_stages: Software pipeline stages of the key loop.
-        num_real: A one-element GPU tensor of how many of the tokens are
-            real, or None when all are; a CUDA graph's grid covers its
-            bucket's tokens.
-        splits: Key splits per token, or None to choose them from
-            max_keys.
     """
     count = tokens[0].numel()
     if count == 0:
@@ -1852,11 +1838,7 @@ def decode_attention(torch, q3, kp, vp, rel, sink, proj_t, out, tokens,
     kv_heads, page = kp.shape[2], kp.shape[1]
     group = heads // kv_heads
     extent, rank = proj_t.shape
-    if splits is None:
-        splits = num_splits(count * kv_heads, max_keys, window)
-    limit = num_real is not None
-    if not limit:
-        num_real = tokens[0]
+    splits = num_splits(count * kv_heads, max_keys, window)
     if splits > 1:
         part_acc = torch.empty((count * heads * splits, dim),
                                dtype=torch.float32, device=q3.device)
@@ -1866,19 +1848,18 @@ def decode_attention(torch, q3, kp, vp, rel, sink, proj_t, out, tokens,
         part_acc = part_ml = out
     _kernels()["decode_attention"][(count * splits, kv_heads)](
         q3, kp, vp, rel, proj_t, sink, out, part_acc, part_ml, tokens[0],
-        tokens[1], num_real, cu_q, used, table, q3.stride(0), q3.stride(1),
+        tokens[1], cu_q, used, table, q3.stride(0), q3.stride(1),
         rel.stride(0), rel.stride(1), sink.stride(0), out.stride(0),
         out.stride(1), kp.stride(0), kp.stride(1), kp.stride(2), vp.stride(0),
         vp.stride(1), vp.stride(2), table.stride(0),
         dim ** -0.5 * 1.4426950408889634, int(window), splits, GROUP=group,
         HEADS=heads, BM=16, BN=block_keys, D=dim, R=rank, EXTENT=extent,
-        PAGE=page, HAS_WINDOW=window > 0, SPLIT=splits > 1, LIMIT=limit,
+        PAGE=page, HAS_WINDOW=window > 0, SPLIT=splits > 1,
         num_warps=num_warps, num_stages=num_stages)
     if splits > 1:
         _kernels()["merge_tokens"][(count, heads)](
-            part_acc, part_ml, tokens[2], num_real, out, out.stride(0),
-            out.stride(1), splits, HEADS=heads, D=dim, MAX_SPLITS=MAX_SPLITS,
-            LIMIT=limit, num_warps=4)
+            part_acc, part_ml, tokens[2], out, out.stride(0), out.stride(1),
+            splits, HEADS=heads, D=dim, MAX_SPLITS=MAX_SPLITS, num_warps=4)
     return out
 
 

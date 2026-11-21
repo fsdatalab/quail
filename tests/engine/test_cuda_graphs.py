@@ -267,33 +267,3 @@ def test_a_capture_clears_the_pipelines_staged_inputs_before_its_eager_pass(
                                   None))
     # the eager pass, then the capture, of the one piece
     assert seen == [("stage", None), ("piece", 0), ("piece", 0)]
-
-
-def test_a_whole_step_capture_runs_each_mixer_between_its_pieces(monkeypatch):
-    from contextlib import nullcontext
-
-    model = pipeline()
-    model.layers = [None, None]
-    model.forward_context = lambda num_tokens: nullcontext()
-    seen = []
-    model.stage = lambda buffers, chunk: seen.append(("stage", chunk))
-    model.piece = lambda index, buffers: seen.append(("piece", index))
-    model.mixer = lambda index, buffers, chunk: seen.append(
-        ("mixer", index, chunk))
-    stream = SimpleNamespace(wait_stream=lambda other: None,
-                             synchronize=lambda: None)
-    for name, value in (("current_stream", lambda: stream),
-                        ("stream", lambda s: nullcontext()),
-                        ("CUDAGraph", lambda: SimpleNamespace()),
-                        ("graph", lambda graph, **kw: nullcontext()),
-                        ("memory_snapshot", lambda: [])):
-        monkeypatch.setattr(torch.cuda, name, value)
-    graphs = PiecewiseGraphs(model, token_buckets=(4,), memory_bytes=1000)
-    graphs.stream = stream
-    captured = CapturedPieces(PiecewiseBuffers(model, 4, device="cpu"), None)
-    graphs.capture(captured, whole=True)
-    step = [("piece", 0), ("mixer", 0, None), ("piece", 1), ("mixer", 1, None),
-            ("piece", 2)]
-    # the eager pass, then the capture, of the whole step as one graph
-    assert seen == [("stage", None)] + step + step
-    assert captured.whole is not None and captured.graphs is None
