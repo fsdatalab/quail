@@ -509,9 +509,6 @@ class StageExecutor:
             rows += len(self.frames[j]) + len(self.canvas)
         return rows
 
-    def _prepare(self, j, anchors):
-        self.stages[j].prepare([self.keys[a] for a in anchors])
-
     def _requests_of(self, a, key):
         """Return a stage request selector, or None if every request is selected.
 
@@ -930,7 +927,11 @@ class StageExecutor:
 
     def _decide_waiting(self):
         """Run each gated stage's conditions over the documents waiting at it."""
-        for settlement in self.sched.decide_waiting(self._prepare):
+        def prepare(j, anchors):
+            """Prepare the documents waiting at one stage."""
+            self.stages[j].prepare([self.keys[a] for a in anchors])
+
+        for settlement in self.sched.decide_waiting(prepare):
             self._event(settlement)
 
     def _report_next(self, partial=False):
