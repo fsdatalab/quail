@@ -20,7 +20,7 @@ from typing import Any, ClassVar
 from quail.backends.quail.executor.chunk import InputStaging
 from quail.backends.quail.executor.stages import Stage, frame_writes
 from quail.backends.quail.executor.state import QueryExecutionState
-from quail.common.expressions import effective_selectivity
+from quail.common.expressions import DEFAULT_SELECTIVITY
 from quail.common.tokens import prefix_tree
 from quail.physical import AiFilter, AiJoin, Filter
 from quail.progress import detail
@@ -376,7 +376,8 @@ def survival(operators) -> float:
     for operator in operators:
         for node in operator.nodes:
             if isinstance(node, (AiFilter, AiJoin, Filter)):
-                fraction *= effective_selectivity(node.selectivity)
+                selectivity = node.selectivity
+                fraction *= DEFAULT_SELECTIVITY if selectivity is None else selectivity
     return fraction
 
 

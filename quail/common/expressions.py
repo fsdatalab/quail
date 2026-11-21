@@ -48,11 +48,6 @@ class SimilarCallWarning(UserWarning):
     """Two AI calls of a query differ by a typo, so the model answers each."""
 
 
-def effective_selectivity(selectivity: float | None) -> float:
-    """Return the selectivity the planner uses: the given one or the default."""
-    return DEFAULT_SELECTIVITY if selectivity is None else selectivity
-
-
 def parse_expression(sql: str, rows, alias: str = "", provider: str = ""):
     """Return the Expression of SQL text over the columns of rows.
 
