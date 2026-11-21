@@ -19,7 +19,7 @@ instead of starting NCCL or gloo.
 import json
 from pathlib import Path
 
-from quail.backends.quail.executor.models.lfm3 import is_lfm3, load_lfm3
+from quail.backends.quail.executor.models.lfm3 import LANGUAGE_MODEL, load_lfm3
 from quail.backends.quail.executor.moe_configs import write_configs
 from quail.specs.files import resolve_model_path
 
@@ -316,7 +316,9 @@ def load_model(model_name: str, revision: str | None = None, *,
             Path(tempfile.gettempdir()) / "quail-moe-configs", base)
         os.environ["VLLM_TUNED_CONFIG_FOLDER"] = str(folder)
     model_path = resolve_model_path(model_name, revision)
-    if is_lfm3(model_path):
+    config = Path(model_path) / "config.json"
+    if (config.is_file() and json.loads(config.read_text()).get(
+        "model_type") in LANGUAGE_MODEL):
         # vLLM has no LFM3 model; its loader would also refuse the config
         model = load_lfm3(model_path, quantize_fp8=quantize_fp8)
     else:

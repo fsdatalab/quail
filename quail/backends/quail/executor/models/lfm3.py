@@ -37,13 +37,6 @@ LAYER_TENSORS = {
 }
 
 
-def is_lfm3(path) -> bool:
-    """Whether a checkpoint directory holds an LFM3 or LFM3-VL model."""
-    config = Path(path) / "config.json"
-    return (config.is_file() and json.loads(config.read_text()).get(
-        "model_type") in LANGUAGE_MODEL)
-
-
 def text_tensors(layer_types, language_model) -> list[str]:
     """Every tensor the text pass reads, by its name in the checkpoint.
 
