@@ -36,13 +36,6 @@ def _metrics(node_metrics) -> dict:
     }
 
 
-def _model_spec(model: str):
-    from quail.specs import MODELS
-
-    spec = MODELS.get(model)
-    return None if spec is None else asdict(spec)
-
-
 def explain(logical, operators, physical, *, verbose: bool = False, result=None,
             usd_per_hour: float | None = None, rules=None) -> str:
     """Format DataFusion's plan of a region and its physical operator tree.
@@ -83,7 +76,10 @@ def explain(logical, operators, physical, *, verbose: bool = False, result=None,
             "graph": json.loads(physical.graph.to_json()),
             "estimates": list((physical.estimates or {}).items()),
         }
-        request["model_spec"] = _model_spec(physical.model)
+        from quail.specs import MODELS
+
+        spec = MODELS.get(physical.model)
+        request["model_spec"] = None if spec is None else asdict(spec)
         if result is not None:
             request["run"] = {"report": result.report,
                               "metrics": _metrics(result.node_metrics)}
