@@ -119,21 +119,6 @@ def execution_context(state, payload, graph: PhysicalGraph) -> ExecutionContext:
     )
 
 
-def execution_measurements(context: ExecutionContext) -> dict:
-    """Return one GPU's KV counters and memory report for the query so far."""
-    gpu = context.state["gpu"]
-    arena = gpu.arena
-    return {
-        "kv_manager": {
-            **context.state["kv_stats"],
-            "evicted_keys": arena.evicted_keys,
-            "evicted_pages": arena.evicted_pages,
-            "evicted_prefix_tokens": arena.evicted_prefix_tokens,
-        },
-        "memory": memory_report(gpu),
-    }
-
-
 # the tables of a runtime payload, each a mapping from alias
 _PAYLOAD_TABLES = ("documents", "texts", "columns", "source_rows")
 
@@ -188,7 +173,18 @@ def serve_region(state, payload, graph: PhysicalGraph, end, wanted,
             pipeline.images = None
         for key in arena.resident_keys():
             arena.free_key(key)
-    end.ran(*ran_message(results, execution_measurements(context)))
+    gpu = context.state["gpu"]
+    arena = gpu.arena
+    measurements = {
+        "kv_manager": {
+            **context.state["kv_stats"],
+            "evicted_keys": arena.evicted_keys,
+            "evicted_pages": arena.evicted_pages,
+            "evicted_prefix_tokens": arena.evicted_prefix_tokens,
+        },
+        "memory": memory_report(gpu),
+    }
+    end.ran(*ran_message(results, measurements))
 
 
 def answer_region(hint, sinks, question: str):
