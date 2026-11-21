@@ -38,20 +38,19 @@ def verification_blocks(counts, stream_width, num_streams, num_options, num_keys
             raise ValueError("one copy verification position exceeds its workspace")
         end = start + 1
         peak = base + steps * 192 * num_columns
-        if steps == num_steps:
-            while end < len(order):
-                row = order[end]
-                num_next_steps = max(num_steps, int(counts[row]))
-                next_width = max(width, int(widths[row]))
-                num_next_columns = max(num_columns, int(num_streams[row]))
-                per_row = (64 * next_width + options
-                           + num_next_steps * (per_position + 192 * num_next_columns))
-                if padding + (end + 1 - start) * per_row > workspace_bytes:
-                    break
-                end += 1
-                steps = num_steps = num_next_steps
-                width, num_columns = next_width, num_next_columns
-                peak = padding + (end - start) * per_row
+        while steps == num_steps and end < len(order):
+            row = order[end]
+            num_next_steps = max(num_steps, int(counts[row]))
+            next_width = max(width, int(widths[row]))
+            num_next_columns = max(num_columns, int(num_streams[row]))
+            per_row = (64 * next_width + options
+                + num_next_steps * (per_position + 192 * num_next_columns))
+            if padding + (end + 1 - start) * per_row > workspace_bytes:
+                break
+            end += 1
+            steps = num_steps = num_next_steps
+            width, num_columns = next_width, num_next_columns
+            peak = padding + (end - start) * per_row
         yield order[start:end], steps, peak
         start = end
 
