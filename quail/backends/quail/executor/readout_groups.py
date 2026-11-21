@@ -41,14 +41,6 @@ class ReadoutGroups:
             values[key] = self.readout_of[key].result(handle)
         return values
 
-    def _select_rows(self, normed, spans_j):
-        index = np.concatenate([np.arange(start, end, dtype=np.int64)
-                                for start, end in spans_j])
-        if hasattr(normed, "index_select"):
-            return normed.index_select(
-                0, self.torch.from_numpy(index).to(normed.device, non_blocking=True))
-        return [normed[r] for r in index]
-
     def submit(self, normed, entries, rows_per_answer):
         """Submit answer rows to readouts and return handles by readout group.
 
@@ -79,7 +71,14 @@ class ReadoutGroups:
             if not spans_key:
                 continue
             readout = self.readout_of[key]
-            selected = self._select_rows(normed, spans_key)
+            index = np.concatenate([np.arange(start, end, dtype=np.int64)
+                for start, end in spans_key])
+            if hasattr(normed, "index_select"):
+                selected = normed.index_select(0,
+                    self.torch.from_numpy(index).to(
+                        normed.device, non_blocking=True))
+            else:
+                selected = [normed[r] for r in index]
             if not counts[key]:
                 handles.append((key, readout.submit(selected)))
             else:
