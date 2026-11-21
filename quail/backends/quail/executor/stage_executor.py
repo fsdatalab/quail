@@ -573,10 +573,10 @@ class StageExecutor:
                 if self.arena.is_resident(key)
                 else self.arena.page_cost(capacity - shared))
             if not self.answer_admission.allows(
-                    anchor, self.arena.free_pages, prompt_pages):
-                if self.answer_admission.waits():
-                    return False
-                # No answer can free pages: start with one page and grow.
+                anchor, self.arena.free_pages, prompt_pages
+            ) and self.answer_admission.waits():
+                return False
+            # No answer can free pages: start with one page and grow.
         if not self.arena.reserve(
                 key, prefix, capacity_tokens=capacity, borrow=borrowed,
                 extension=self._extends, share_points=points):
