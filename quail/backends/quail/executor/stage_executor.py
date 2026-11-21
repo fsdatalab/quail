@@ -2,7 +2,6 @@
 
 import os
 import time
-from functools import partial
 from itertools import groupby
 
 import numpy as np
@@ -17,7 +16,6 @@ from quail.backends.quail.executor.admission import (
 from quail.backends.quail.executor.readout_groups import ReadoutGroups
 from quail.backends.quail.executor.stages import (
     PendingAnswers,
-    _advance_stage,
     frame_writes,
     question_ends,
 )
@@ -355,6 +353,14 @@ class StageExecutor:
 
         self.asking = any(stage.requests is not None or stage.own_suffixes
             for stage in self.stages)
+
+        def advance(a, j, row):
+            """Apply the stage's decision after its complete row has returned."""
+            stage = stages[j]
+            if stage.decide is None:
+                return bool(any(row) if stage.readout.dtype is None else np.any(row))
+            return bool(stage.decide(a, row))
+
         try:
             stop_width = 1
             if stop_groups is not None and self.prefixes:
@@ -383,7 +389,7 @@ class StageExecutor:
                 frame_canvas_tokens=len(self.canvas),
                 page_cost=self.arena.page_cost if self.paged else (lambda *args: 0),
                 tree=prefix_tree,
-                advance=partial(_advance_stage, stages),
+                advance=advance,
                 frame_writes=self.writes,
                 limit=limit, survival=survival,
                 stop_groups=stop_groups,

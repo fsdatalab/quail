@@ -208,14 +208,6 @@ def frame_writes(stages) -> list:
     return writes
 
 
-def _advance_stage(stages, a, j, row):
-    """Apply the stage's decision after its complete row has returned."""
-    stage = stages[j]
-    if stage.decide is None:
-        return bool(any(row) if stage.readout.dtype is None else np.any(row))
-    return bool(stage.decide(a, row))
-
-
 def question_ends(questions, slots=(0,)) -> np.ndarray:
     """The mask of each question's read rows in a suffix of these questions.
 
