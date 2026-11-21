@@ -43,16 +43,6 @@ pub struct PlanPricer {
 
 type Priced = Vec<(String, NodePrice, Map<String, Value>)>;
 
-fn set(priced: &mut Priced, node_id: &str, price: NodePrice, entry: Map<String, Value>) {
-    match priced.iter_mut().find(|(found, _, _)| found == node_id) {
-        Some(slot) => {
-            slot.1 = price;
-            slot.2 = entry;
-        }
-        None => priced.push((node_id.to_string(), price, entry)),
-    }
-}
-
 fn spec_seconds(node: &PhysicalNode) -> Option<f64> {
     match node {
         PhysicalNode::AiScore(node) => node.attributes.spec.as_ref().map(|s| s.estimated_seconds),
@@ -350,7 +340,10 @@ impl PlanPricer {
         }
         if context.model.attention_mask == "set" {
             for (node_id, price, entry) in self.set_passes(context, nodes)? {
-                set(&mut out, &node_id, price, entry);
+                match out.iter_mut().find(|(found, _, _)| *found == node_id) {
+                    Some(slot) => *slot = (node_id, price, entry),
+                    None => out.push((node_id, price, entry)),
+                }
             }
             for node in nodes {
                 if let PhysicalNode::AiJoin(_) = node {

@@ -18,6 +18,7 @@ use crate::cost::sol::speed_of_light;
 use crate::cost::statistics::int_true_divide;
 use crate::cost::work::{Work, ask, scan};
 use crate::physical::{ModelCall, Prompt, ValueExpression};
+use Quantity::Scalar;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -105,10 +106,6 @@ fn not_priced<T>(message: impl Into<String>) -> Result<T, CompileError> {
     )))
 }
 
-fn round_to(value: f64, digits: usize) -> f64 {
-    format!("{value:.digits$}").parse().expect("a float")
-}
-
 fn label_name(found: &Operators, call: &ModelCall) -> String {
     found
         .classifies
@@ -138,14 +135,10 @@ struct PairRelation {
 
 fn work_with(state_written: f64, state_read: f64) -> Work {
     Work {
-        state_written: Quantity::Scalar(state_written),
-        state_read: Quantity::Scalar(state_read),
+        state_written: Scalar(state_written),
+        state_read: Scalar(state_read),
         ..Work::default()
     }
-}
-
-fn scalar(value: f64) -> Quantity {
-    Quantity::Scalar(value)
 }
 
 /// Each alias's partner label and anchor frame tokens, and the tail.
@@ -419,7 +412,9 @@ fn stage(
         Value::from(if rows.is_empty() {
             0.0
         } else {
-            round_to(passed.len() as f64 / rows.len() as f64, 6)
+            format!("{:.6}", passed.len() as f64 / rows.len() as f64)
+                .parse::<f64>()
+                .expect("a float")
         }),
     );
     record.insert("fresh_tokens".into(), Value::from(work.tokens.total()));
@@ -427,10 +422,6 @@ fn stage(
 }
 
 impl<'a, 'c> Estimate<'a, 'c> {
-    fn lower(&self, prompt: &Prompt) -> Result<LoweredPrompt, CompileError> {
-        self.context.lowered(prompt)
-    }
-
     fn passes(&self, prompt: &Prompt, assignment: &[(&str, i64)]) -> Result<bool, CompileError> {
         let assignment: Vec<_> = assignment
             .iter()
@@ -459,7 +450,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
             return Work::default();
         }
         Work {
-            pairs: scalar((tokens * (tokens - 1) / 2) as f64),
+            pairs: Scalar((tokens * (tokens - 1) / 2) as f64),
             ..Work::default()
         }
     }
@@ -470,15 +461,15 @@ impl<'a, 'c> Estimate<'a, 'c> {
         let prefix = self.pre + data.tokens[row as usize];
         let shared = data.shared[row as usize];
         if shared == 0 {
-            return &(&scan(&scalar(prefix as f64), &scalar(suffix as f64), self.window)
+            return &(&scan(&Scalar(prefix as f64), &Scalar(suffix as f64), self.window)
                 + &self.block_work(prefix))
                 + &self.block_work(suffix);
         }
         let resident = self.pre + shared;
         // the document saves its own state after reading the parent's
         &ask(
-            &scalar(resident as f64),
-            &scalar((prefix - resident + suffix) as f64),
+            &Scalar(resident as f64),
+            &Scalar((prefix - resident + suffix) as f64),
             self.window,
         ) + &work_with(1.0, 0.0)
     }
@@ -498,7 +489,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
                 self.first_use(alias, *row, suffix)
             } else {
                 let prefix = self.pre + self.aliases[alias].tokens[*row as usize];
-                &ask(&scalar(prefix as f64), &scalar(suffix as f64), self.window)
+                &ask(&Scalar(prefix as f64), &Scalar(suffix as f64), self.window)
                     + &self.block_work(suffix)
             };
             work = &work + &step;
@@ -574,7 +565,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
             let prefix = self.pre + self.aliases[anchor].tokens[*row as usize];
             if resident.contains(row) {
                 // the frame's state is saved for every partner to start from
-                work = &(&work + &ask(&scalar(prefix as f64), &scalar(frame as f64), self.window))
+                work = &(&work + &ask(&Scalar(prefix as f64), &Scalar(frame as f64), self.window))
                     + &work_with(1.0, 0.0);
             } else {
                 work = &work + &self.first_use(anchor, *row, frame);
@@ -833,7 +824,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
         stages: &mut Vec<Map<String, Value>>,
     ) -> Result<(Vec<i64>, Work), CompileError> {
         let prompt = &asked_call(&predicate.expression).prompt;
-        let tail = self.lower(prompt)?.tail_token_ids.len() as i64;
+        let tail = self.context.lowered(prompt)?.tail_token_ids.len() as i64;
         let asked: Vec<i64> = match predicate
             .disjunction
             .as_ref()
@@ -899,7 +890,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
         stages: &mut Vec<Map<String, Value>>,
     ) -> Result<(Vec<i64>, Work), CompileError> {
         let call = &column.call;
-        let tail = self.lower(&call.prompt)?.tail_token_ids.len() as i64;
+        let tail = self.context.lowered(&call.prompt)?.tail_token_ids.len() as i64;
         let work = self.question_work(alias, rows, tail, first);
         self.answer_rows += rows.len() as f64;
         let name = label_name(self.found, call);
@@ -977,7 +968,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
         stages: &mut Vec<Map<String, Value>>,
     ) -> Result<(Vec<i64>, Work), CompileError> {
         let call = &column.call;
-        let tail = self.lower(&call.prompt)?.tail_token_ids.len() as i64;
+        let tail = self.context.lowered(&call.prompt)?.tail_token_ids.len() as i64;
         let mut work = self.question_work(alias, rows, tail, first);
         let tokens = &self.aliases[alias].tokens;
         let documents = if first {
@@ -993,7 +984,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
         );
         work = &work
             + &Work {
-                sae_encoded: scalar(encoded),
+                sae_encoded: Scalar(encoded),
                 ..Work::default()
             };
         let mut record = stage(
@@ -1025,7 +1016,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
         stages: &mut Vec<Map<String, Value>>,
     ) -> Result<(Vec<i64>, Work), CompileError> {
         let call = &column.call;
-        let tail = self.lower(&call.prompt)?.tail_token_ids.len() as i64;
+        let tail = self.context.lowered(&call.prompt)?.tail_token_ids.len() as i64;
         let mut work = self.question_work(alias, rows, tail, first);
         let mut answers = BTreeMap::new();
         for row in rows {
@@ -1053,7 +1044,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
                 tokens = 1;
             }
             let context = self.pre + self.aliases[alias].tokens[*row as usize] + tail;
-            work = &work + &ask(&scalar(context as f64), &scalar(tokens as f64), self.window);
+            work = &work + &ask(&Scalar(context as f64), &Scalar(tokens as f64), self.window);
             answer_rows += tokens;
         }
         self.answer_rows += answer_rows as f64;
@@ -1121,7 +1112,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
             );
         }
         let call = &column.call;
-        let tail = self.lower(&call.prompt)?.tail_token_ids.len() as i64;
+        let tail = self.context.lowered(&call.prompt)?.tail_token_ids.len() as i64;
         let mut work = self.question_work(alias, rows, tail, first);
         let mut answer_rows = 0;
         for row in rows {
@@ -1149,10 +1140,10 @@ impl<'a, 'c> Estimate<'a, 'c> {
             let (fed_f, document_f, tail_f) = (fed as f64, document as f64, tail as f64);
             work = &work
                 + &Work {
-                    tokens: scalar(fed_f),
-                    pairs: scalar(fed_f * (document_f + tail_f) + fed_f * (fed_f + 1.0) / 2.0),
-                    kv_written: scalar(fed_f),
-                    kv_read: scalar(
+                    tokens: Scalar(fed_f),
+                    pairs: Scalar(fed_f * (document_f + tail_f) + fed_f * (fed_f + 1.0) / 2.0),
+                    kv_written: Scalar(fed_f),
+                    kv_read: Scalar(
                         document_reads as f64 * document_f
                             + fed_f * tail_f
                             + fed_f * (fed_f - 1.0) / 2.0,
@@ -1275,7 +1266,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
             anchor,
             &[partner.to_string()],
             &local,
-            &self.lower(&call.prompt)?,
+            &self.context.lowered(&call.prompt)?,
             &anchor_rows,
             &BTreeSet::new(),
             Some(&kept),
@@ -1745,7 +1736,7 @@ fn search_joins(
                     );
                     for prompt in &prompts {
                         if !estimate.anchor_fits(
-                            &estimate.lower(prompt)?,
+                            &estimate.context.lowered(prompt)?,
                             anchor,
                             &stage_aliases,
                             &survivors,
@@ -1772,7 +1763,7 @@ fn search_joins(
                         anchor,
                         &partners,
                         &survivors,
-                        &estimate.lower(join_prompt)?,
+                        &estimate.context.lowered(join_prompt)?,
                         if cached.contains(anchor) {
                             &survivors[anchor]
                         } else {

@@ -173,11 +173,6 @@ fn role(node: &AiNode) -> Role {
     Role::Join
 }
 
-/// The `AiNode` that is an AI join or gate, if `plan` is one.
-fn ai_join(plan: &LogicalPlan) -> Option<&AiNode> {
-    as_node::<AiNode>(plan).filter(|node| role(node) == Role::Join)
-}
-
 fn mover(node: &LogicalPlan) -> Option<Mover> {
     if let Some(ai) = as_node::<AiNode>(node) {
         // moving a node with a fetch below an operator moves the operator
@@ -239,19 +234,6 @@ fn mover(node: &LogicalPlan) -> Option<Mover> {
     None
 }
 
-/// An `ORDER BY` with a `LIMIT`, as a limit over a sort or a sort that
-/// keeps its first rows: the sort.
-fn top_rows(plan: &LogicalPlan) -> Option<&Sort> {
-    match plan {
-        LogicalPlan::Limit(limit) => match limit.input.as_ref() {
-            LogicalPlan::Sort(sort) if sort.fetch.is_none() => Some(sort),
-            _ => None,
-        },
-        LogicalPlan::Sort(sort) if sort.fetch.is_some() => Some(sort),
-        _ => None,
-    }
-}
-
 fn sorted(expr: Vec<SortExpr>, input: LogicalPlan, fetch: Option<usize>) -> LogicalPlan {
     LogicalPlan::Sort(Sort {
         expr,
@@ -263,8 +245,13 @@ fn sorted(expr: Vec<SortExpr>, input: LogicalPlan, fetch: Option<usize>) -> Logi
 /// Move the AI column below an `ORDER BY ... LIMIT` above it, through a
 /// SELECT list between them, when the sort does not read its answer.
 fn lift_above_limit(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
-    let Some(sort) = top_rows(&plan) else {
-        return Ok(Transformed::no(plan));
+    let sort = match &plan {
+        LogicalPlan::Limit(limit) => match limit.input.as_ref() {
+            LogicalPlan::Sort(sort) if sort.fetch.is_none() => sort,
+            _ => return Ok(Transformed::no(plan)),
+        },
+        LogicalPlan::Sort(sort) if sort.fetch.is_some() => sort,
+        _ => return Ok(Transformed::no(plan)),
     };
     let (projection, below) = match sort.input.as_ref() {
         LogicalPlan::Projection(projection) => (Some(projection), projection.input.as_ref()),
@@ -378,7 +365,10 @@ fn push_down(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
                 None
             }
         }
-        LogicalPlan::Extension(_) if let Some(join) = ai_join(&input) => {
+        LogicalPlan::Extension(_)
+            if let Some(join) =
+                as_node::<AiNode>(&input).filter(|node| role(node) == Role::Join) =>
+        {
             let sides = join_sides(&join.input);
             let fits = sides.is_some_and(|(left, right)| {
                 moving.tables.is_subset(&left) || moving.tables.is_subset(&right)

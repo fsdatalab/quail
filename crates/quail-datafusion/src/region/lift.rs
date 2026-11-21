@@ -182,7 +182,15 @@ fn inline_computed_columns(plan: LogicalPlan) -> Result<LogicalPlan> {
             .filter(|(expr, _)| !matches!(expr, Expr::Column(_)) && plain(expr))
             .map(|(expr, field)| (field.name().clone(), expr.clone().unalias()))
             .collect();
-        if computed.is_empty() || computed.len() != below.expr.len() - passed(below) {
+        if computed.is_empty()
+            || computed.len()
+                != below.expr.len()
+                    - below
+                        .expr
+                        .iter()
+                        .filter(|expr| matches!(expr, Expr::Column(_)))
+                        .count()
+        {
             return Ok(Transformed::no(above));
         }
         // the columns the lower projection passes, then those its values read
@@ -228,15 +236,6 @@ fn inline_computed_columns(plan: LogicalPlan) -> Result<LogicalPlan> {
     .map(|inlined| inlined.data)
 }
 
-/// How many items of a projection are columns.
-fn passed(projection: &Projection) -> usize {
-    projection
-        .expr
-        .iter()
-        .filter(|expr| matches!(expr, Expr::Column(_)))
-        .count()
-}
-
 /// By answer column, the answer of the `AiNode` that adds it and the
 /// tables that node's call reads.
 type Answers = BTreeMap<String, (String, BTreeSet<String>)>;
@@ -274,7 +273,13 @@ fn is_row_test(term: &Expr, answers: &Answers, join_key: bool) -> bool {
                 ))
         })
         .unwrap_or(true);
-    if special || (join_key && is_column_equality(term)) {
+    if special
+        || (join_key
+            && matches!(term, Expr::BinaryExpr(binary)
+            if binary.op == datafusion::logical_expr::Operator::Eq
+                && matches!((binary.left.as_ref(), binary.right.as_ref()),
+                    (Expr::Column(left), Expr::Column(right)) if left.relation != right.relation)))
+    {
         return false;
     }
     let mut tables: BTreeSet<String> = BTreeSet::new();
@@ -293,14 +298,6 @@ fn is_row_test(term: &Expr, answers: &Answers, join_key: bool) -> bool {
         }
     }
     tables.len() > 1 || calls.len() > 1
-}
-
-/// Whether a term is `a.x = b.y`, an equality of two tables' columns.
-fn is_column_equality(term: &Expr) -> bool {
-    matches!(term, Expr::BinaryExpr(binary)
-        if binary.op == datafusion::logical_expr::Operator::Eq
-            && matches!((binary.left.as_ref(), binary.right.as_ref()),
-                (Expr::Column(left), Expr::Column(right)) if left.relation != right.relation))
 }
 
 /// `plan` without its row tests, which are added to `lifted` in plan

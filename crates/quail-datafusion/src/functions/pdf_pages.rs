@@ -339,11 +339,6 @@ fn page_image<'a>(
             ..Default::default()
         },
     );
-    png_bytes(&pixmap)
-}
-
-/// A pixmap on an opaque background as an 8-bit RGB PNG.
-fn png_bytes(pixmap: &Pixmap) -> Option<Vec<u8>> {
     let rgb: Vec<u8> = pixmap
         .data_as_u8_slice()
         .as_chunks::<4>()

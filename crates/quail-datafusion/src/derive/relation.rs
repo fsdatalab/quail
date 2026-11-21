@@ -62,14 +62,6 @@ struct OrTerm {
     short_circuit: bool,
 }
 
-/// Whether a term is `a.x = b.y`, an equality of two tables' columns.
-fn is_column_equality(term: &Expr) -> bool {
-    matches!(term, Expr::BinaryExpr(binary)
-        if binary.op == datafusion::logical_expr::Operator::Eq
-            && matches!((binary.left.as_ref(), binary.right.as_ref()),
-                (Expr::Column(left), Expr::Column(right)) if left.relation != right.relation))
-}
-
 impl Relation {
     /// Whether `answer` is the answer of an AI.IF that an OR tests.
     pub(super) fn in_or(&self, answer: &str) -> bool {
@@ -112,7 +104,12 @@ impl Relation {
                 let term = walk.through(&term);
                 // DataFusion pushes a WHERE test of the two sides into the
                 // join; an equality of their columns is the join's key
-                if is_column_equality(&term) {
+                if matches!(&term, Expr::BinaryExpr(binary)
+                    if binary.op == datafusion::logical_expr::Operator::Eq
+                        && matches!((binary.left.as_ref(), binary.right.as_ref()),
+                            (Expr::Column(left), Expr::Column(right))
+                                if left.relation != right.relation))
+                {
                     equalities.push(binder.bind_equality(&term, &joined)?);
                 } else {
                     relation.bind_term(binder, &term, None)?;
@@ -564,15 +561,6 @@ fn bind_answers(
     }
     Ok(())
 }
-/// A list of names as Python writes a tuple of them.
-fn repr_tuple(items: &[String]) -> String {
-    let parts: Vec<String> = items.iter().map(|item| repr_str(item)).collect();
-    match parts.as_slice() {
-        [one] => format!("({one},)"),
-        _ => format!("({})", parts.join(", ")),
-    }
-}
-
 /// An EXISTS or NOT EXISTS gate over the table `inner`.
 ///
 /// # Errors
@@ -646,10 +634,14 @@ fn join_spec(
     if let Some(anchor) = &spec.anchor
         && !aliases.contains(anchor)
     {
+        let parts: Vec<String> = aliases.iter().map(|alias| repr_str(alias)).collect();
+        let names = match parts.as_slice() {
+            [one] => format!("({one},)"),
+            _ => format!("({})", parts.join(", ")),
+        };
         return compile_error(format!(
-            "anchor {} is not a table of this join ({})",
+            "anchor {} is not a table of this join ({names})",
             repr_str(anchor),
-            repr_tuple(aliases)
         ));
     }
     for alias in &tables[1..] {

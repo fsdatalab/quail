@@ -44,21 +44,6 @@ fn numeric_literal(expr: &Expr, to: &DataType) -> Option<ScalarValue> {
     }
 }
 
-/// An integer SQL literal, or None.
-fn integer_of(expr: &Expr) -> Option<i64> {
-    let Expr::Literal(value, _) = expr else {
-        return None;
-    };
-    match value
-        .data_type()
-        .is_integer()
-        .then(|| value.cast_to(&DataType::Int64))?
-    {
-        Ok(ScalarValue::Int64(value)) => value,
-        _ => None,
-    }
-}
-
 /// The (key, value) pairs of an option object, `named_struct(k, v, ...)`.
 fn object_fields(expr: &Expr) -> Option<Vec<(String, &Expr)>> {
     if !is_call(expr, "named_struct") {
@@ -480,15 +465,19 @@ impl Binder {
             return compile_error("AI.MAP needs an instruction string as its second argument.");
         };
         let limit = match args.get(2) {
-            None => DEFAULT_MAP_ANSWER_TOKENS,
-            Some(found) => match integer_of(found) {
-                Some(limit) if (1..=MAX_MAP_ANSWER_TOKENS).contains(&limit) => limit,
-                _ => {
-                    return compile_error(format!(
-                        "The AI.MAP token limit must be an integer from 1 to {MAX_MAP_ANSWER_TOKENS}."
-                    ));
+            None => Some(DEFAULT_MAP_ANSWER_TOKENS),
+            Some(Expr::Literal(value, _)) if value.data_type().is_integer() => {
+                match value.cast_to(&DataType::Int64) {
+                    Ok(ScalarValue::Int64(value)) => value,
+                    _ => None,
                 }
-            },
+            }
+            _ => None,
+        };
+        let Some(limit) = limit.filter(|limit| (1..=MAX_MAP_ANSWER_TOKENS).contains(limit)) else {
+            return compile_error(format!(
+                "The AI.MAP token limit must be an integer from 1 to {MAX_MAP_ANSWER_TOKENS}."
+            ));
         };
         let reference = self.bind_document_value(&args[0])?;
         let prompt = prompts::bind(

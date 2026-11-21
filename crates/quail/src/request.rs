@@ -68,18 +68,6 @@ fn column(table: &Table, name: &str) -> Result<Option<ArrayRef>, CompileError> {
         .map_err(arrow_error)
 }
 
-/// One array split into chunks of `lengths` rows, without a copy.
-fn split(values: &ArrayRef, lengths: &[usize]) -> Chunks {
-    let mut offset = 0;
-    (lengths.iter())
-        .map(|length| {
-            let chunk = values.slice(offset, *length);
-            offset += length;
-            chunk
-        })
-        .collect()
-}
-
 /// A table of one batch per chunk; every column has the same chunks.
 fn table_of(columns: Vec<(String, Chunks)>) -> Result<Table, CompileError> {
     let fields: Vec<Field> = columns
@@ -262,7 +250,16 @@ pub fn request_tables(
                 false => columns.1.iter().map(RecordBatch::num_rows).collect(),
             };
             let first = first_documents(tokens, columns, rows)?;
-            values.push((FIRST_DOCUMENT.into(), split(&first, &lengths)));
+            let mut offset = 0;
+            let chunks = lengths
+                .iter()
+                .map(|length| {
+                    let chunk = first.slice(offset, *length);
+                    offset += length;
+                    chunk
+                })
+                .collect();
+            values.push((FIRST_DOCUMENT.into(), chunks));
         }
         // the executor reads an image document's pixels from the first
         // binary column: the document's values, such as p.u['image']

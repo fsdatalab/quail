@@ -137,11 +137,27 @@ pub fn expression(
             "DataFusion must evaluate this expression outside the model region.",
         )
     })?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let written = text(&positional);
+    let mut out = String::new();
+    let mut chars = written.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' => out.push_str("{{"),
+            '}' => out.push_str("}}"),
+            OPEN => {
+                out.push('{');
+                out.extend(chars.by_ref().take_while(|digit| *digit != CLOSE));
+                out.push('}');
+            }
+            other => out.push(other),
+        }
+    }
     Ok(Expression {
-        encoded: base64::engine::general_purpose::STANDARD.encode(bytes),
+        encoded,
         columns,
         types,
-        text: template(&positional),
+        text: out,
     })
 }
 
@@ -427,32 +443,6 @@ impl PhysicalValue {
 }
 
 // ---------------------------------------------------------------- text
-
-/// The text of an expression whose columns are positional, with `{i}`
-/// for column `i` and doubled braces elsewhere.
-fn template(expr: &Expr) -> String {
-    let written = text(expr);
-    let mut out = String::new();
-    let mut chars = written.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '{' => out.push_str("{{"),
-            '}' => out.push_str("}}"),
-            OPEN => {
-                out.push('{');
-                for digit in chars.by_ref() {
-                    if digit == CLOSE {
-                        break;
-                    }
-                    out.push(digit);
-                }
-                out.push('}');
-            }
-            other => out.push(other),
-        }
-    }
-    out
-}
 
 /// A literal as Python writes it: strings quoted, `True`, `None`.
 fn literal_text(value: &ScalarValue) -> String {

@@ -58,44 +58,38 @@ impl FunctionRewrite for SnowflakeRegexpLike {
             return Ok(Transformed::no(expr));
         };
         // the analyzer may run twice: an anchored pattern stays as it is
-        if func.name() != "regexp_like" || args.len() < 2 || is_anchored(&args[1]) {
+        if func.name() != "regexp_like"
+            || args.len() < 2
+            || match &args[1] {
+                Expr::Literal(ScalarValue::Utf8(Some(text)), _) => {
+                    text.starts_with(ANCHOR_START) && text.ends_with(ANCHOR_END)
+                }
+                Expr::BinaryExpr(concat) => *concat.right == lit(ANCHOR_END),
+                _ => false,
+            }
+        {
             return Ok(Transformed::no(Expr::ScalarFunction(ScalarFunction {
                 func,
                 args,
             })));
         }
-        args[1] = anchored(args[1].clone());
+        let pattern = args[1].clone();
+        args[1] = if let Expr::Literal(ScalarValue::Utf8(Some(text)), _) = &pattern {
+            lit(format!("{ANCHOR_START}{text}{ANCHOR_END}"))
+        } else {
+            let concat = |left: Expr, right: Expr| {
+                Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(left),
+                    Operator::StringConcat,
+                    Box::new(right),
+                ))
+            };
+            concat(concat(lit(ANCHOR_START), pattern), lit(ANCHOR_END))
+        };
         Ok(Transformed::yes(Expr::ScalarFunction(ScalarFunction {
             func,
             args,
         })))
-    }
-}
-
-/// `pattern` anchored at both ends of the value: a string literal
-/// rewritten, any other pattern concatenated, so a null stays null.
-fn anchored(pattern: Expr) -> Expr {
-    if let Expr::Literal(ScalarValue::Utf8(Some(text)), _) = &pattern {
-        return lit(format!("{ANCHOR_START}{text}{ANCHOR_END}"));
-    }
-    let concat = |left: Expr, right: Expr| {
-        Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(left),
-            Operator::StringConcat,
-            Box::new(right),
-        ))
-    };
-    concat(concat(lit(ANCHOR_START), pattern), lit(ANCHOR_END))
-}
-
-/// Whether [`anchored`] wrote `pattern`.
-fn is_anchored(pattern: &Expr) -> bool {
-    match pattern {
-        Expr::Literal(ScalarValue::Utf8(Some(text)), _) => {
-            text.starts_with(ANCHOR_START) && text.ends_with(ANCHOR_END)
-        }
-        Expr::BinaryExpr(concat) => *concat.right == lit(ANCHOR_END),
-        _ => false,
     }
 }
 

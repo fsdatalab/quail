@@ -84,16 +84,6 @@ pub(crate) fn holds_images(data_type: &DataType) -> bool {
     }
 }
 
-/// The width and height a PNG's header gives, or None for other bytes.
-fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
-    if bytes.len() < 24 || !bytes.starts_with(PNG_SIGNATURE) || &bytes[12..16] != b"IHDR" {
-        return None;
-    }
-    let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
-    let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
-    Some((width, height))
-}
-
 /// The width and height a JPEG's frame header gives, or None for other
 /// bytes.
 fn jpeg_size(bytes: &[u8]) -> Option<(u32, u32)> {
@@ -138,7 +128,15 @@ fn jpeg_size(bytes: &[u8]) -> Option<(u32, u32)> {
 /// The bytes are not a PNG or a JPEG, or the image has no pixels or is
 /// over 200 times as long as it is wide.
 pub fn image_size(bytes: &[u8], sizing: ImageSizing) -> Result<(u32, u32), CompileError> {
-    let Some((width, height)) = png_size(bytes).or_else(|| jpeg_size(bytes)) else {
+    let size = if bytes.len() >= 24 && bytes.starts_with(PNG_SIGNATURE) && &bytes[12..16] == b"IHDR"
+    {
+        let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+        let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
+        Some((width, height))
+    } else {
+        jpeg_size(bytes)
+    };
+    let Some((width, height)) = size else {
         return Err(CompileError::new(
             "an image document must be a PNG or a JPEG, such as a page AI.PDF_PAGES renders",
         ));
@@ -163,11 +161,6 @@ pub fn image_size(bytes: &[u8], sizing: ImageSizing) -> Result<(u32, u32), Compi
         sides = [height, width].map(|side| (side * beta / factor).ceil() * factor);
     }
     Ok((sides[1] as u32, sides[0] as u32))
-}
-
-/// Whether a document part's bytes are an image rather than text.
-fn is_image(bytes: &[u8]) -> bool {
-    bytes.starts_with(PNG_SIGNATURE) || bytes.starts_with(JPEG_SIGNATURE)
 }
 
 /// The first token id of each image a planner has seen, by its bytes.
@@ -227,7 +220,7 @@ pub(crate) fn image_token_lists(
     let mut lists = LargeListBuilder::new(Int32Builder::new());
     // one part's tokens: an image's tokens, or else its UTF-8 text's
     let mut part = |bytes: &[u8], tokens: &mut Int32Builder, text: bool| {
-        if text && !is_image(bytes) {
+        if text && !(bytes.starts_with(PNG_SIGNATURE) || bytes.starts_with(JPEG_SIGNATURE)) {
             let text = std::str::from_utf8(bytes).map_err(|_| {
                 CompileError::new("a document part is neither an image nor UTF-8 text")
             })?;

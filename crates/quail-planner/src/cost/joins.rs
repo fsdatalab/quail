@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use crate::cost::quantity::{Quantity, python_sum};
 use crate::cost::statistics::{AliasStats, int_true_divide};
 use crate::cost::work::{Work, triangle};
+use Quantity::Scalar;
 
 /// One join with the token counts the cost model prices it by.
 #[derive(Debug, Clone, PartialEq)]
@@ -38,15 +39,11 @@ pub struct PricedJoin {
 }
 
 fn tri(tokens: f64) -> f64 {
-    triangle(&Quantity::Scalar(tokens), 0).total()
+    triangle(&Scalar(tokens), 0).total()
 }
 
 fn tri_window(tokens: f64, window: i64) -> f64 {
-    triangle(&Quantity::Scalar(tokens), window).total()
-}
-
-fn scalar(value: f64) -> Quantity {
-    Quantity::Scalar(value)
+    triangle(&Scalar(tokens), window).total()
 }
 
 /// The tokens of the longest input one join orientation makes.
@@ -82,12 +79,12 @@ pub fn partner_stream_work(anchor_prefix: f64, suffixes: &[f64], window: i64) ->
     };
     let cap = (window - 1) as f64;
     Work {
-        tokens: scalar(tokens),
-        pairs: scalar(anchor_prefix * tokens + python_sum(suffixes.iter().map(|s| tri(*s)))),
-        kv_written: scalar(tokens),
-        kv_read: scalar(anchor_prefix),
-        sliding_pairs: scalar(sliding_pairs),
-        sliding_kv_read: scalar(if window == 0 {
+        tokens: Scalar(tokens),
+        pairs: Scalar(anchor_prefix * tokens + python_sum(suffixes.iter().map(|s| tri(*s)))),
+        kv_written: Scalar(tokens),
+        kv_read: Scalar(anchor_prefix),
+        sliding_pairs: Scalar(sliding_pairs),
+        sliding_kv_read: Scalar(if window == 0 {
             0.0
         } else if cap < anchor_prefix {
             cap
@@ -151,22 +148,22 @@ pub fn stage_work(
     let window_pairs = |offset: f64| stats.window_pairs(offset);
     let start = if resident {
         Work {
-            tokens: scalar((count * frame_wide) as f64),
-            pairs: scalar((frame_wide * prefix_sum) as f64 + count as f64 * tri(frame as f64)),
-            kv_written: scalar((count * frame_wide) as f64),
-            kv_read: scalar(prefix_sum as f64),
-            sliding_pairs: scalar(if window != 0 {
+            tokens: Scalar((count * frame_wide) as f64),
+            pairs: Scalar((frame_wide * prefix_sum) as f64 + count as f64 * tri(frame as f64)),
+            kv_written: Scalar((count * frame_wide) as f64),
+            kv_read: Scalar(prefix_sum as f64),
+            sliding_pairs: Scalar(if window != 0 {
                 window_pairs((pre + frame_wide) as f64) - window_pairs(pre as f64)
             } else {
                 0.0
             }),
-            sliding_kv_read: scalar(if window != 0 {
+            sliding_kv_read: Scalar(if window != 0 {
                 stats.window_reads(pre as f64)
             } else {
                 0.0
             }),
-            state_read: scalar(count as f64),
-            state_written: scalar(count as f64),
+            state_read: Scalar(count as f64),
+            state_written: Scalar(count as f64),
             ..Work::default()
         }
     } else {
@@ -174,36 +171,36 @@ pub fn stage_work(
         let scan_squared =
             prefix_squared + 2 * frame_wide * prefix_sum + count * frame_wide * frame_wide;
         Work {
-            tokens: scalar(scan_sum as f64),
-            pairs: scalar(int_true_divide(scan_squared + scan_sum, 2)),
-            kv_written: scalar(scan_sum as f64),
-            sliding_pairs: scalar(if window != 0 {
+            tokens: Scalar(scan_sum as f64),
+            pairs: Scalar(int_true_divide(scan_squared + scan_sum, 2)),
+            kv_written: Scalar(scan_sum as f64),
+            sliding_pairs: Scalar(if window != 0 {
                 window_pairs((pre + frame_wide) as f64)
             } else {
                 0.0
             }),
-            state_written: scalar(count as f64),
+            state_written: Scalar(count as f64),
             ..Work::default()
         }
     };
     let read = (prefix_sum + count * frame_wide) as f64;
     let stream = Work {
-        tokens: scalar(count as f64 * per_anchor * u),
-        pairs: scalar(per_anchor * (u * read + count as f64 * tri(u))),
-        kv_written: scalar(count as f64 * per_anchor * u),
-        kv_read: scalar(read),
-        sliding_pairs: scalar(if window != 0 {
+        tokens: Scalar(count as f64 * per_anchor * u),
+        pairs: Scalar(per_anchor * (u * read + count as f64 * tri(u))),
+        kv_written: Scalar(count as f64 * per_anchor * u),
+        kv_read: Scalar(read),
+        sliding_pairs: Scalar(if window != 0 {
             let offset = (pre + frame_wide) as f64;
             per_anchor * (window_pairs(offset + u) - window_pairs(offset))
         } else {
             0.0
         }),
-        sliding_kv_read: scalar(if window != 0 {
+        sliding_kv_read: Scalar(if window != 0 {
             stats.window_reads((pre + frame_wide) as f64)
         } else {
             0.0
         }),
-        state_read: scalar(count as f64 * per_anchor),
+        state_read: Scalar(count as f64 * per_anchor),
         ..Work::default()
     };
     Ok(&(&start + &stream) * fraction)
@@ -248,15 +245,15 @@ pub fn packed_join_work(
     let state_squared = stats.squared + 2 * head * total + head * head * count;
     let tokens = state_sum as f64 + count as f64 * questions;
     let pass_work = Work {
-        tokens: scalar(tokens),
-        pairs: scalar(
+        tokens: Scalar(tokens),
+        pairs: Scalar(
             state_squared as f64
                 + 2.0 * questions * state_sum as f64
                 + count as f64 * asked * question * question,
         ),
-        kv_written: scalar(tokens),
-        kv_read: scalar(if asked <= 1.0 { tokens } else { 2.0 * tokens }),
-        sliding_pairs: scalar(if window != 0 {
+        kv_written: Scalar(tokens),
+        kv_read: Scalar(if asked <= 1.0 { tokens } else { 2.0 * tokens }),
+        sliding_pairs: Scalar(if window != 0 {
             stats.window_pairs(head as f64 + questions)
         } else {
             0.0

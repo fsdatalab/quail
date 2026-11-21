@@ -206,7 +206,13 @@ pub(super) fn precompute_plain_expressions(plan: LogicalPlan) -> Result<LogicalP
 /// model, has a subquery, or reads several tables or none.
 fn plain_table(term: &Expr) -> Option<TableReference> {
     let special = term
-        .exists(|inner| Ok(is_quail_call(inner) || is_subquery_expr(inner)))
+        .exists(|inner| {
+            Ok(is_quail_call(inner)
+                || matches!(
+                    inner,
+                    Expr::Exists(_) | Expr::InSubquery(_) | Expr::ScalarSubquery(_)
+                ))
+        })
         .unwrap_or(true);
     if special {
         return None;
@@ -219,13 +225,6 @@ fn plain_table(term: &Expr) -> Option<TableReference> {
     tables
         .all(|table| table.as_ref() == Some(&first))
         .then_some(first)
-}
-
-fn is_subquery_expr(expr: &Expr) -> bool {
-    matches!(
-        expr,
-        Expr::Exists(_) | Expr::InSubquery(_) | Expr::ScalarSubquery(_)
-    )
 }
 
 /// The one table a subtree reads, or None when it reads several or none.

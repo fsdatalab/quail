@@ -153,14 +153,6 @@ impl Connection {
 
 /// What Quail asks of a worker.
 impl Connection {
-    /// What Quail plans the regions of `config` with.
-    fn describe(&mut self, config: &Value) -> Result<Value> {
-        self.send(&json!({"describe": config}))?;
-        self.flush()?;
-        let mut header = self.receive()?;
-        Ok(header["described"].take())
-    }
-
     /// Prepare the worker's GPU for a plan; returns its boot record.
     fn boot(&mut self, setup: &Value) -> Result<Value> {
         self.send(&json!({"boot": setup}))?;
@@ -599,7 +591,11 @@ impl Workers {
     /// its connection fails.
     pub fn describe(&self, config: &Value) -> Result<Value> {
         let worker = (self.connections.first()).ok_or_else(|| failure("there is no GPU worker"))?;
-        worker.lock().expect("the worker lock").describe(config)
+        let mut worker = worker.lock().expect("the worker lock");
+        worker.send(&json!({"describe": config}))?;
+        worker.flush()?;
+        let mut header = worker.receive()?;
+        Ok(header["described"].take())
     }
 
     /// Prepare every worker's GPU for a plan, at the same time; returns

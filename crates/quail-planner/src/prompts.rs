@@ -346,17 +346,6 @@ fn prompt(template: String, args: &[ValueExpression], kind: &str) -> Prompt {
 /// The model's chat-turn text: before the preamble, and after the answer cue.
 pub type Turn = (String, String);
 
-fn filter_question_segments(tail: &str, layout: &PromptLayout) -> Vec<String> {
-    let content = tail.trim_start_matches('\n');
-    let separator = &tail[..tail.len() - content.len()];
-    let separator = if separator.is_empty() {
-        "\n\n"
-    } else {
-        separator
-    };
-    layout.question_segments(content, separator)
-}
-
 /// Build a filter Prompt from a template and column arguments.
 pub fn bind_prompt(
     template: &str,
@@ -378,7 +367,15 @@ pub fn bind_prompt(
     let mut segments = Vec::new();
     let tail = match leading_placeholder(&tail) {
         Some(length) => {
-            segments = filter_question_segments(&tail[length..], layout);
+            let question = &tail[length..];
+            let content = question.trim_start_matches('\n');
+            let separator = &question[..question.len() - content.len()];
+            let separator = if separator.is_empty() {
+                "\n\n"
+            } else {
+                separator
+            };
+            segments = layout.question_segments(content, separator);
             segments.last_mut().expect("a segment").push_str(&turn.1);
             format!("{}{}", &tail[..length], segments.concat())
         }
@@ -396,32 +393,6 @@ pub fn bind_prompt(
 
 fn answer_prefix(turn: &Turn) -> &'static str {
     if turn.1.is_empty() { LABEL_PREFIX } else { "" }
-}
-
-fn render_categories(labels: &[String], descriptions: &[String], letters: &[String]) -> String {
-    let empty = vec![String::new(); labels.len()];
-    let descriptions = if descriptions.is_empty() {
-        &empty
-    } else {
-        descriptions
-    };
-    let mut text = CATEGORIES_HEADER.to_string();
-    if !letters.is_empty() {
-        for ((letter, label), description) in letters.iter().zip(labels).zip(descriptions) {
-            text.push_str(&format!("\n- {letter}: {label}"));
-            if !description.is_empty() {
-                text.push_str(&format!(" ({description})"));
-            }
-        }
-        return text;
-    }
-    for (label, description) in labels.iter().zip(descriptions) {
-        text.push_str(&format!("\n- {label}"));
-        if !description.is_empty() {
-            text.push_str(&format!(": {description}"));
-        }
-    }
-    text
 }
 
 fn render_classify_question(
@@ -449,10 +420,29 @@ fn render_classify_question(
     } else {
         LETTERS_INSTRUCTION
     };
-    format!(
-        "{separator}{instruction}{content}{}{ANSWER_CUE}",
-        render_categories(labels, descriptions, letters)
-    )
+    let empty = vec![String::new(); labels.len()];
+    let descriptions = if descriptions.is_empty() {
+        &empty
+    } else {
+        descriptions
+    };
+    let mut categories = CATEGORIES_HEADER.to_string();
+    if !letters.is_empty() {
+        for ((letter, label), description) in letters.iter().zip(labels).zip(descriptions) {
+            categories.push_str(&format!("\n- {letter}: {label}"));
+            if !description.is_empty() {
+                categories.push_str(&format!(" ({description})"));
+            }
+        }
+    } else {
+        for (label, description) in labels.iter().zip(descriptions) {
+            categories.push_str(&format!("\n- {label}"));
+            if !description.is_empty() {
+                categories.push_str(&format!(": {description}"));
+            }
+        }
+    }
+    format!("{separator}{instruction}{content}{categories}{ANSWER_CUE}")
 }
 
 /// d1's option codes: the labels when each is one letter, else A to Z, then AA, AB, ...

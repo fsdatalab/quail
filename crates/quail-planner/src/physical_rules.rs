@@ -221,18 +221,6 @@ fn set_pass_groups(
     Ok(groups)
 }
 
-fn set_pass_group(node: &mut PhysicalNode, group: i64) {
-    match node {
-        PhysicalNode::AiFilter(node) => node.attributes.pass_group = group,
-        PhysicalNode::AiScore(node) => node.attributes.pass_group = group,
-        PhysicalNode::AiClassify(node) => node.attributes.pass_group = group,
-        PhysicalNode::AiExtract(node) => node.attributes.pass_group = group,
-        PhysicalNode::AiMap(node) => node.attributes.pass_group = group,
-        PhysicalNode::AiSaeFeatures(node) => node.attributes.pass_group = group,
-        _ => {}
-    }
-}
-
 fn pack_set_passes(graph: &PhysicalGraph, context: &PlanningContext) -> Rewrite {
     if context.model.attention_mask != "set"
         || !graph
@@ -245,15 +233,20 @@ fn pack_set_passes(graph: &PhysicalGraph, context: &PlanningContext) -> Rewrite 
     let groups = set_pass_groups(&graph.nodes, context)?;
     let mut nodes = graph.nodes.clone();
     for node in &mut nodes {
-        if let Some(group) = groups.get(node.id()) {
-            set_pass_group(node, *group);
+        let Some(&group) = groups.get(node.id()) else {
+            continue;
+        };
+        match node {
+            PhysicalNode::AiFilter(node) => node.attributes.pass_group = group,
+            PhysicalNode::AiScore(node) => node.attributes.pass_group = group,
+            PhysicalNode::AiClassify(node) => node.attributes.pass_group = group,
+            PhysicalNode::AiExtract(node) => node.attributes.pass_group = group,
+            PhysicalNode::AiMap(node) => node.attributes.pass_group = group,
+            PhysicalNode::AiSaeFeatures(node) => node.attributes.pass_group = group,
+            _ => {}
         }
     }
     Ok(Some(with_nodes(graph, nodes)))
-}
-
-fn tokens_of(values: &[Value]) -> Vec<i64> {
-    values.iter().filter_map(Value::as_i64).collect()
 }
 
 /// The tables a set-attention node reads and the tokens after their
@@ -294,7 +287,7 @@ fn document_tails(node: &PhysicalNode) -> Vec<(String, Vec<i64>, Vec<i64>)> {
             let frame = spec
                 .join_layout
                 .as_ref()
-                .map(|layout| tokens_of(&layout.0))
+                .map(|layout| layout.0.iter().filter_map(Value::as_i64).collect())
                 .unwrap_or_default();
             vec![
                 (spec.aliases[0].clone(), head.clone(), frame),
