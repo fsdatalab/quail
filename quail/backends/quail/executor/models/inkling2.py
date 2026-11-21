@@ -736,7 +736,15 @@ class Inkling2Pipeline(ModelPipeline):
             num_warps=8 if prefill else 4, num_stages=3 if prefill else 2)
 
     def stage(self, buffers, chunk):
-        """Copy the chunk's convolution taps and state writes into buffers."""
+        """Copy the chunk's convolution taps and state writes into buffers.
+
+        A None chunk leaves every row reading zero taps and writing no
+        state.
+        """
+        if chunk is None:
+            buffers.taps.fill_(kernels.ZERO_TAP)
+            buffers.write_slots.fill_(-1)
+            return
         plan = self._plan(chunk)
         n, writes = chunk.tokens, plan["write_slots"].shape[0]
         buffers.taps[:n].copy_(plan["taps"])

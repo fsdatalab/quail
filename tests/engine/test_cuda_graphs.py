@@ -241,3 +241,29 @@ def test_a_pass_captures_its_own_bucket_once_and_runs_eagerly_past_the_reserve()
     assert captured == [4]
     assert graphs.replays == 2
     assert graphs.passes == 4
+
+
+def test_a_capture_clears_the_pipelines_staged_inputs_before_its_eager_pass(
+        monkeypatch):
+    from contextlib import nullcontext
+
+    model = pipeline()
+    model.layers = []
+    model.forward_context = lambda num_tokens: nullcontext()
+    seen = []
+    model.stage = lambda buffers, chunk: seen.append(("stage", chunk))
+    model.piece = lambda index, buffers: seen.append(("piece", index))
+    stream = SimpleNamespace(wait_stream=lambda other: None,
+                             synchronize=lambda: None)
+    for name, value in (("current_stream", lambda: stream),
+                        ("stream", lambda s: nullcontext()),
+                        ("CUDAGraph", lambda: SimpleNamespace()),
+                        ("graph", lambda graph, **kw: nullcontext()),
+                        ("memory_snapshot", lambda: [])):
+        monkeypatch.setattr(torch.cuda, name, value)
+    graphs = PiecewiseGraphs(model, token_buckets=(4,), memory_bytes=1000)
+    graphs.stream = stream
+    graphs.capture(CapturedPieces(PiecewiseBuffers(model, 4, device="cpu"),
+                                  None))
+    # the eager pass, then the capture, of the one piece
+    assert seen == [("stage", None), ("piece", 0), ("piece", 0)]

@@ -326,9 +326,9 @@ class PiecewiseGraphs:
         """Capture one bucket's pieces into the shared pool.
 
         Each piece runs once eagerly before its capture, so the KV write
-        mappings are masked first; they may still hold a real pass's
-        pages. The partial-page tail variant is captured only when a
-        pass needs it.
+        mappings and the pipeline's staged inputs are cleared first; they
+        may still hold a real pass's pages and state slots. The
+        partial-page tail variant is captured only when a pass needs it.
         """
         engine = self.pipeline.engine
         torch = engine.torch
@@ -343,6 +343,7 @@ class PiecewiseGraphs:
             buffers.writes.copy(None)
             if buffers.sliding_writes is not None:
                 buffers.sliding_writes.copy(None)
+            self.pipeline.stage(buffers, None)
             num_pieces = len(self.pipeline.layers) + 1
             with (torch.cuda.stream(stream), torch.inference_mode(),
                   self.pipeline.forward_context(buffers.num_tokens)):
