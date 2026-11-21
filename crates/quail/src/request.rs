@@ -193,13 +193,6 @@ fn document_values(document: &ScanColumn, columns: &Table) -> Result<Option<Chun
     Ok(Some(chunks))
 }
 
-/// The text of a scan's documents, when the scan's columns hold every
-/// column the document reads; None for image documents.
-fn texts(document: &ScanColumn, columns: &Table) -> Result<Option<Chunks>, CompileError> {
-    Ok(document_values(document, columns)?
-        .filter(|chunks| !crate::images::holds_images(chunks[0].data_type())))
-}
-
 /// The tables a region's workers read, by name: `documents:<alias>`
 /// for each scan of the plan, `texts:<alias>` where the scan's columns
 /// hold its documents' text, and `columns:<alias>` with the value
@@ -242,9 +235,10 @@ pub fn request_tables(
         tables.push((format!("documents:{alias}"), tokens.clone()));
         let document = (operators.scans.iter()).find(|found| &found.alias == alias);
         if let Some(text) = document
-            .map(|found| texts(&found.column, columns))
+            .map(|found| document_values(&found.column, columns))
             .transpose()?
             .flatten()
+            .filter(|chunks| !crate::images::holds_images(chunks[0].data_type()))
         {
             tables.push((
                 format!("texts:{alias}"),
