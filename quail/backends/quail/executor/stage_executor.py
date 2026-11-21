@@ -980,7 +980,7 @@ class StageExecutor:
         """
         skipped = self.sched.take_skipped()
         for a in skipped:
-            self.borrowing.skip(a)
+            self.borrowing.skipped.add(a)
             parent = (self.borrowing.tree_parent[a]
                       if a < len(self.borrowing.tree_parent) else None)
             if parent is not None:

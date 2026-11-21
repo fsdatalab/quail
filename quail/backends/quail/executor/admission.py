@@ -109,10 +109,6 @@ class Borrowing:
         self.tree_parent[document] = None
         self.tree_shared[document] = 0
 
-    def skip(self, document):
-        """The document never runs a chunk, so its borrowers pack whole."""
-        self.skipped.add(document)
-
     def borrowers(self):
         """Per document, how many documents the tree has borrow from it."""
         counts = [0] * len(self.tree_parent)
@@ -582,7 +578,7 @@ class JoinAdmission:
             self._stage[a] = _DONE
             self._settled.append(Settlement(
                 "finished" if k == 1 else "dropped", a, False))
-            self.borrowing.skip(a)
+            self.borrowing.skipped.add(a)
             return a
         first = self.frame_rows[j] + self._suffix(a, j, 0)
         if self.temporary_suffix_pages:
