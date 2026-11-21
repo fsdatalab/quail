@@ -515,4 +515,3 @@ def ngram_vllm_backend() -> RequestBackend:
         engine=NgramVLLMEngine(),
         filter_submission="operator-at-a-time",
     )
-

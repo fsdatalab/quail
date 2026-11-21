@@ -68,11 +68,11 @@ def read_models(directory: Path = DATA / "models") -> dict[str, ModelSpec]:
 
 
 @cache
-def read_devices(directory: Path = DATA / "devices") -> dict[str, DeviceSpec]:
-    """Return every device spec in a directory, by name.
+def read_devices() -> dict[str, DeviceSpec]:
+    """Return every built-in device spec, by name.
 
     Raises:
         ValueError: A file's name differs from its spec's name, or a
             key is not a DeviceSpec field.
     """
-    return _read(DeviceSpec, "devices", directory)
+    return _read(DeviceSpec, "devices", DATA / "devices")

@@ -84,4 +84,3 @@ def explain(logical, operators, physical, *, verbose: bool = False, result=None,
             request["run"] = {"report": result.report,
                               "metrics": _metrics(result.node_metrics)}
     return _quail_native.explain_plan(_json(request))
-
