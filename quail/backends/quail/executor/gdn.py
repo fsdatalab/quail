@@ -489,8 +489,9 @@ def gated_delta_kernel(q, k, v, g, beta, state, cu_seqlens, scale, *,
     without repeating them. The backend is chosen by gdn_prefill_backend().
     """
     if gdn_prefill_backend() == "flashinfer":
+        # FlashInfer's SM90 chunked-prefill kernel rejects int32 bounds.
         return _flashinfer_delta_rule(
-            q, k, v, g, beta, state, cu_seqlens, output_final_state,
+            q, k, v, g, beta, state, cu_seqlens.long(), output_final_state,
             g_is_exp=g_is_exp)
     from vllm.third_party.flash_linear_attention.ops import (
         chunk_gated_delta_rule,
