@@ -134,7 +134,12 @@ pub fn collect_answers(
             continue;
         };
         if let Some(answer) = &port.answer {
-            let mut selected = select(table, &answer.columns)?;
+            let indices = answer
+                .columns
+                .iter()
+                .map(|name| table.schema().index_of(name).map_err(arrow_error))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut selected = table.project(&indices).map_err(arrow_error)?;
             if answer.kind == "classifies"
                 && let Ok(index) = selected.schema().index_of(&answer.name)
             {
@@ -203,7 +208,8 @@ pub fn collect_answers(
     let mut stages = Vec::new();
     for (alias, relations) in &filter_relations {
         let table = concat(relations)?;
-        let positions = int_column(&table, 1)?;
+        let column = cast(table.column(1), &DataType::Int64).map_err(arrow_error)?;
+        let positions = column.as_primitive::<arrow::datatypes::Int64Type>();
         // predicates in the order their first answers appear
         let mut order: Vec<i64> = Vec::new();
         for position in positions.iter().flatten() {
@@ -426,22 +432,8 @@ pub fn execution_report(
     Value::Object(report)
 }
 
-fn select(table: &RecordBatch, columns: &[String]) -> Result<RecordBatch, Error> {
-    let indices = columns
-        .iter()
-        .map(|name| table.schema().index_of(name).map_err(arrow_error))
-        .collect::<Result<Vec<_>, _>>()?;
-    table.project(&indices).map_err(arrow_error)
-}
-
 fn concat(tables: &[RecordBatch]) -> Result<RecordBatch, Error> {
     arrow::compute::concat_batches(&tables[0].schema(), tables).map_err(arrow_error)
-}
-
-/// A column of integers, as int64.
-fn int_column(table: &RecordBatch, index: usize) -> Result<arrow::array::Int64Array, Error> {
-    let column = cast(table.column(index), &DataType::Int64).map_err(arrow_error)?;
-    Ok(column.as_primitive::<arrow::datatypes::Int64Type>().clone())
 }
 
 /// The number of true answers in an answer table: its last column.
