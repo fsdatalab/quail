@@ -81,8 +81,8 @@ class ReadoutGroups:
                 selected = [normed[r] for r in index]
             if not counts[key]:
                 handles.append((key, readout.submit(selected)))
-            else:
-                lengths = counts[key]
-                lengths = lengths[0] if len(lengths) == 1 else np.concatenate(lengths)
-                handles.append((key, readout.submit(selected, rows_per_answer=lengths)))
+                continue
+            lengths = counts[key]
+            lengths = lengths[0] if len(lengths) == 1 else np.concatenate(lengths)
+            handles.append((key, readout.submit(selected, rows_per_answer=lengths)))
         return handles

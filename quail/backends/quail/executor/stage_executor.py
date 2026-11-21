@@ -2,7 +2,6 @@
 
 import os
 import time
-from functools import partial
 from itertools import groupby
 
 import numpy as np
@@ -17,10 +16,8 @@ from quail.backends.quail.executor.admission import (
 from quail.backends.quail.executor.readout_groups import ReadoutGroups
 from quail.backends.quail.executor.stages import (
     PendingAnswers,
-    _advance_stage,
     frame_writes,
     question_ends,
-    state_share_points,
 )
 from quail.progress import Progress, detail, logger
 
@@ -356,6 +353,14 @@ class StageExecutor:
 
         self.asking = any(stage.requests is not None or stage.own_suffixes
             for stage in self.stages)
+
+        def advance(a, j, row):
+            """Apply the stage's decision after its complete row has returned."""
+            stage = stages[j]
+            if stage.decide is None:
+                return bool(any(row) if stage.readout.dtype is None else np.any(row))
+            return bool(stage.decide(a, row))
+
         try:
             stop_width = 1
             if stop_groups is not None and self.prefixes:
@@ -384,7 +389,7 @@ class StageExecutor:
                 frame_canvas_tokens=len(self.canvas),
                 page_cost=self.arena.page_cost if self.paged else (lambda *args: 0),
                 tree=prefix_tree,
-                advance=partial(_advance_stage, stages),
+                advance=advance,
                 frame_writes=self.writes,
                 limit=limit, survival=survival,
                 stop_groups=stop_groups,
@@ -444,9 +449,16 @@ class StageExecutor:
             # a small pool keeps only the lengths that save the most
             base = 1 + int(self._extends)
             room = max(0, (self.arena.num_state_slots - base) // 3)
-            self.share_points = state_share_points(
-                self.borrowing.tree_parent, self.borrowing.tree_shared,
-                limit=room)
+            parents, shared = self.borrowing.tree_parent, self.borrowing.tree_shared
+            counts = [{} for _ in parents]
+            for parent, count in zip(parents, shared):
+                if parent is not None and count:
+                    counts[parent][count] = counts[parent].get(count, 0) + 1
+            points = []
+            for found in counts:
+                keep = sorted(found, key=lambda n: (-found[n] * n, n))
+                points.append(tuple(sorted(keep[:room])))
+            self.share_points = points
             need = base + max(map(len, self.share_points), default=0)
             if self.arena.num_state_slots < need:
                 raise ValueError(
@@ -502,9 +514,6 @@ class StageExecutor:
         if self.writes[j] and start == 0:
             rows += len(self.frames[j]) + len(self.canvas)
         return rows
-
-    def _prepare(self, j, anchors):
-        self.stages[j].prepare([self.keys[a] for a in anchors])
 
     def _requests_of(self, a, key):
         """Return a stage request selector, or None if every request is selected.
@@ -573,10 +582,10 @@ class StageExecutor:
                 if self.arena.is_resident(key)
                 else self.arena.page_cost(capacity - shared))
             if not self.answer_admission.allows(
-                    anchor, self.arena.free_pages, prompt_pages):
-                if self.answer_admission.waits():
-                    return False
-                # No answer can free pages: start with one page and grow.
+                anchor, self.arena.free_pages, prompt_pages
+            ) and self.answer_admission.waits():
+                return False
+            # No answer can free pages: start with one page and grow.
         if not self.arena.reserve(
                 key, prefix, capacity_tokens=capacity, borrow=borrowed,
                 extension=self._extends, share_points=points):
@@ -867,18 +876,16 @@ class StageExecutor:
 
     def _event(self, settlement):
         # Progress counts settled documents: a dropped one is done too.
-        self.finished += int(settlement.anchor not in self.sched.dependencies)
-        if settlement.kind != "finished":
-            if self.arena.is_resident(self.keys[settlement.anchor]):
-                self.arena.free_key(self.keys[settlement.anchor])
-            return
         anchor = settlement.anchor
-        if self.on_settled is None or anchor in self.sched.dependencies:
-            if self.arena.is_resident(self.keys[anchor]):
-                self.arena.free_key(self.keys[anchor])
-        else:
+        self.finished += int(anchor not in self.sched.dependencies)
+        if settlement.kind == "finished" and (
+            self.on_settled is not None
+            and anchor not in self.sched.dependencies):
             self.on_settled(
                 anchor, settlement.survived, self.sched.answers[-1].get(anchor, []))
+            return
+        if self.arena.is_resident(self.keys[anchor]):
+            self.arena.free_key(self.keys[anchor])
 
     def _record(self, a, j, start, end, rows) -> list:
         """Report a group's answers once the next stage's inputs are ready."""
@@ -926,7 +933,11 @@ class StageExecutor:
 
     def _decide_waiting(self):
         """Run each gated stage's conditions over the documents waiting at it."""
-        for settlement in self.sched.decide_waiting(self._prepare):
+        def prepare(j, anchors):
+            """Prepare the documents waiting at one stage."""
+            self.stages[j].prepare([self.keys[a] for a in anchors])
+
+        for settlement in self.sched.decide_waiting(prepare):
             self._event(settlement)
 
     def _report_next(self, partial=False):

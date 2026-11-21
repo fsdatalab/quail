@@ -208,14 +208,6 @@ def frame_writes(stages) -> list:
     return writes
 
 
-def _advance_stage(stages, a, j, row):
-    """Apply the stage's decision after its complete row has returned."""
-    stage = stages[j]
-    if stage.decide is None:
-        return bool(any(row) if stage.readout.dtype is None else np.any(row))
-    return bool(stage.decide(a, row))
-
-
 def question_ends(questions, slots=(0,)) -> np.ndarray:
     """The mask of each question's read rows in a suffix of these questions.
 
@@ -233,31 +225,6 @@ def question_ends(questions, slots=(0,)) -> np.ndarray:
     for slot in slots:
         mask[ends + slot] = True
     return mask
-
-
-def state_share_points(parents, shared, limit=None):
-    """The token counts at which each document's borrowers start.
-
-    Args:
-        parents: Per document, the document it borrows from or None.
-        shared: Per document, the tokens it borrows from its parent.
-        limit: Most counts to keep per document, or None for all. The
-            counts that save the most tokens (borrowers times length)
-            are kept; a borrower at another count computes its prefix.
-
-    Returns:
-        Per document, the sorted distinct counts its borrowers start
-        from; an empty tuple for a document nobody borrows from.
-    """
-    counts = [{} for _ in parents]
-    for parent, count in zip(parents, shared):
-        if parent is not None and count:
-            counts[parent][count] = counts[parent].get(count, 0) + 1
-    points = []
-    for found in counts:
-        keep = sorted(found, key=lambda n: (-found[n] * n, n))
-        points.append(tuple(sorted(keep if limit is None else keep[:limit])))
-    return points
 
 
 @dataclass

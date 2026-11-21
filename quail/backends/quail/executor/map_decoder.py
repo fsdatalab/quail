@@ -151,48 +151,47 @@ class MapDecoder:
                 len(self.map), dtype=self.torch.int64, device=self.device)
         pending, self.copy_inputs = self.copy_inputs, []
         for first, slots, documents, specs in pending:
-            self._configure_copy(first, slots, documents, specs)
+            from quail.backends.quail.executor.extract.copy import (
+                CopyConstraint,
+                StreamRows,
+            )
+            from quail.backends.quail.executor.readout import AsyncTopLogprobs
+            from quail.common.draft_policy import LIVE_BUCKETS
 
-    def _configure_copy(self, first, slots, documents, specs):
-        from quail.backends.quail.executor.extract.copy import (
-            CopyConstraint,
-            StreamRows,
-        )
-        from quail.backends.quail.executor.readout import AsyncTopLogprobs
-        from quail.common.draft_policy import LIVE_BUCKETS
-
-        key = specs[0].top_tokens, tuple(documents.vocabulary.tokenizer.stop_ids)
-        if key not in self.copy_readouts:
-            self.copy_readouts[key] = (AsyncTopLogprobs(
-                self.torch, self.torch.nn.functional, self.head, key[0], [key[1]]), [])
-        _, questions = self.copy_readouts[key]
-        questions.extend(range(first, first + len(specs)))
-        constraint = CopyConstraint(self.torch, self.device, documents, specs[0])
-        self.copy_words = max(self.copy_words, constraint.mask_words)
-        self.copy_trace_words = max(self.copy_trace_words, constraint.trace_width)
-        self.copy_trace = constraint.trace or self.copy_trace
-        index = np.zeros(len(self.map), dtype=np.int64)
-        index[slots.flatten()] = np.arange(slots.size)
-        group = SimpleNamespace(
-            constraint=constraint, key=key,
-            questions=np.arange(first, first + len(specs)), index=index,
-            rows=StreamRows(constraint, slots.size),
-            widths=np.full(slots.size, constraint.max_positions, dtype=np.int64),
-            source=self.torch.zeros(slots.size, dtype=self.torch.int64,
-                device=self.device),
-            masks=np.zeros((slots.size, constraint.mask_words), dtype=np.int64),
-            prepared_written=np.full(slots.size, -1, dtype=np.int64),
-            prepared_drafts=np.zeros(slots.size, dtype=np.int64),
-            lookahead=np.full(slots.size, -1, dtype=np.int64))
-        self.copy_groups.append(group)
-        for q, spec in enumerate(specs):
-            self.copy_document[slots[q]] = np.arange(len(documents.documents))
-            self.copy_constraints[first + q] = SimpleNamespace(
-                constraint=constraint, spec=spec, group=group,
-                sources=np.full(len(self.map), -1, dtype=np.int64),
-                masks=group.masks[q * slots.shape[1]:(q + 1) * slots.shape[1]],
-                trials=np.zeros(len(LIVE_BUCKETS)), accepts=np.zeros(len(LIVE_BUCKETS)),
-                rho=np.array([document.rho for document in documents.documents]))
+            key = specs[0].top_tokens, tuple(documents.vocabulary.tokenizer.stop_ids)
+            if key not in self.copy_readouts:
+                self.copy_readouts[key] = (AsyncTopLogprobs(
+                    self.torch, self.torch.nn.functional, self.head,
+                    key[0], [key[1]]), [])
+            _, questions = self.copy_readouts[key]
+            questions.extend(range(first, first + len(specs)))
+            constraint = CopyConstraint(self.torch, self.device, documents, specs[0])
+            self.copy_words = max(self.copy_words, constraint.mask_words)
+            self.copy_trace_words = max(self.copy_trace_words, constraint.trace_width)
+            self.copy_trace = constraint.trace or self.copy_trace
+            index = np.zeros(len(self.map), dtype=np.int64)
+            index[slots.flatten()] = np.arange(slots.size)
+            group = SimpleNamespace(
+                constraint=constraint, key=key,
+                questions=np.arange(first, first + len(specs)), index=index,
+                rows=StreamRows(constraint, slots.size),
+                widths=np.full(slots.size, constraint.max_positions, dtype=np.int64),
+                source=self.torch.zeros(slots.size, dtype=self.torch.int64,
+                    device=self.device),
+                masks=np.zeros((slots.size, constraint.mask_words), dtype=np.int64),
+                prepared_written=np.full(slots.size, -1, dtype=np.int64),
+                prepared_drafts=np.zeros(slots.size, dtype=np.int64),
+                lookahead=np.full(slots.size, -1, dtype=np.int64))
+            self.copy_groups.append(group)
+            for q, spec in enumerate(specs):
+                self.copy_document[slots[q]] = np.arange(len(documents.documents))
+                self.copy_constraints[first + q] = SimpleNamespace(
+                    constraint=constraint, spec=spec, group=group,
+                    sources=np.full(len(self.map), -1, dtype=np.int64),
+                    masks=group.masks[q * slots.shape[1]:(q + 1) * slots.shape[1]],
+                    trials=np.zeros(len(LIVE_BUCKETS)),
+                    accepts=np.zeros(len(LIVE_BUCKETS)),
+                    rho=np.array([document.rho for document in documents.documents]))
 
     def survival_curves(self):
         """Return each map's survival curve over its answers so far."""

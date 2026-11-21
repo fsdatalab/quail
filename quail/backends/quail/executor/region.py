@@ -278,6 +278,16 @@ class RegionExecution:
             (lambda anchor: hinted(keys[anchor])) if hinting() else None)
         self._routes = _Routes(operators)
         self._answered = []
+
+        def on_answers(anchor, stage, start, end, answers) -> None:
+            """Hand an operator one request group's answers."""
+            routes = self._routes
+            index = routes.owner[stage]
+            operator = routes.operators[index]
+            if operator.answered(anchor, stage - routes.slices[index][0], start, end,
+                answers) and operator not in self._answered:
+                self._answered.append(operator)
+
         with ExitStack() as resources:
             for operator in operators:
                 resources.enter_context(operator.execution_context())
@@ -290,7 +300,7 @@ class RegionExecution:
                 prefix_tree=tree, stats=stats, limit=settings.limit,
                 survival=survival(operators),
                 paged=paged, label=settings.label, on_chunk=self._on_chunk,
-                on_answers=(None if finished_rows() is None else self._on_answers),
+                on_answers=(None if finished_rows() is None else on_answers),
                 stop_groups=settings.stop_groups,
                 appended_tokens=max(operator.appended_tokens
                     for operator in operators) or None,
@@ -349,20 +359,6 @@ class RegionExecution:
                     if stop is not None:
                         decoder.answer_stops[operator.first + q] = stop
         return decoder
-
-    def _on_answers(self, anchor, stage, start, end, answers) -> None:
-        """Hand an operator the answers one group of an anchor's requests got.
-
-        An operator whose rows are an anchor's requests, such as a score
-        of pairs, finishes each row with its answer, before the anchor
-        settles; the region reports those rows after the chunk.
-        """
-        routes = self._routes
-        index = routes.owner[stage]
-        operator = routes.operators[index]
-        if operator.answered(anchor, stage - routes.slices[index][0], start, end,
-                answers) and operator not in self._answered:
-            self._answered.append(operator)
 
     def _on_chunk(self, transitions) -> None:
         """Settle documents in the operators they left; send finished rows.

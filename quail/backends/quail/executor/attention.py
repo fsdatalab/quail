@@ -395,15 +395,6 @@ def flash_attention_version(capability: tuple[int, int]) -> int:
     raise ValueError(f"Quail does not support CUDA capability {capability}")
 
 
-def deep_gemm_supported(capability: tuple[int, int]) -> bool:
-    """Whether vLLM 0.29.0 enables DeepGEMM on this CUDA capability.
-
-    Matches CudaPlatform.support_deep_gemm: 9.0, 10.x, and 12.x.
-    """
-    major, _minor = capability
-    return capability == (9, 0) or major in (10, 12)
-
-
 def merge_partial(out, lse, index, out_c, lse_c) -> None:
     """Merge attention over two disjoint key sets into the selected rows.
 
@@ -455,7 +446,8 @@ class Engine:
 
         capability = torch.cuda.get_device_capability()
         self.fa_version = flash_attention_version(capability)
-        self.use_deep_gemm = deep_gemm_supported(capability)
+        major, _minor = capability
+        self.use_deep_gemm = capability == (9, 0) or major in (10, 12)
         self.torch = torch
         self.arena = arena
         self.rotary = rotary
@@ -1110,23 +1102,6 @@ class Engine:
             UE8M0=self.use_ue8m0)
         return q, scales
 
-    def custom_qk_norm_rope(self, qkv, positions, attn):
-        n = qkv.shape[0]
-        qw = self.num_q_heads * self.head_dim
-        kw = self.num_kv_heads * self.head_dim
-        q = self.torch.empty((n, qw), dtype=self.torch.bfloat16,
-            device="cuda")
-        k = self.torch.empty((n, kw), dtype=self.torch.bfloat16,
-            device="cuda")
-        self._triton_kernels()["qk"][(n,)](
-            qkv, q, k, self.rotary.cos_sin_cache, positions,
-            attn.q_norm.weight, attn.k_norm.weight,
-            qkv.stride(0), q.stride(0), k.stride(0),
-            attn.q_norm.variance_epsilon,
-            QH=self.num_q_heads, KH=self.num_kv_heads,
-            HD=self.head_dim, HALF=self.head_dim // 2)
-        return q, k
-
     # ---- the vLLM-kernel path (kernels="vllm") ----------------------
     # The same ops the engine's compiled graph runs, called eagerly.
 
@@ -1251,7 +1226,21 @@ class Engine:
     def qk_norm_rope(self, qkv, positions, attn):
         """Per-head normed and rotated q and k from the fused qkv output."""
         if self.kernels == "quail":
-            return self.custom_qk_norm_rope(qkv, positions, attn)
+            n = qkv.shape[0]
+            qw = self.num_q_heads * self.head_dim
+            kw = self.num_kv_heads * self.head_dim
+            q = self.torch.empty((n, qw), dtype=self.torch.bfloat16,
+                device="cuda")
+            k = self.torch.empty((n, kw), dtype=self.torch.bfloat16,
+                device="cuda")
+            self._triton_kernels()["qk"][(n,)](
+                qkv, q, k, self.rotary.cos_sin_cache, positions,
+                attn.q_norm.weight, attn.k_norm.weight,
+                qkv.stride(0), q.stride(0), k.stride(0),
+                attn.q_norm.variance_epsilon,
+                QH=self.num_q_heads, KH=self.num_kv_heads,
+                HD=self.head_dim, HALF=self.head_dim // 2)
+            return q, k
         return self.vllm_qk_norm_rope(qkv, positions, attn)
 
     def attention(self, q, k, v, chunk, *, output=None):
