@@ -84,16 +84,6 @@ pub(crate) fn holds_images(data_type: &DataType) -> bool {
     }
 }
 
-/// The width and height a PNG's header gives, or None for other bytes.
-fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
-    if bytes.len() < 24 || !bytes.starts_with(PNG_SIGNATURE) || &bytes[12..16] != b"IHDR" {
-        return None;
-    }
-    let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
-    let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
-    Some((width, height))
-}
-
 /// The width and height a JPEG's frame header gives, or None for other
 /// bytes.
 fn jpeg_size(bytes: &[u8]) -> Option<(u32, u32)> {
@@ -138,7 +128,15 @@ fn jpeg_size(bytes: &[u8]) -> Option<(u32, u32)> {
 /// The bytes are not a PNG or a JPEG, or the image has no pixels or is
 /// over 200 times as long as it is wide.
 pub fn image_size(bytes: &[u8], sizing: ImageSizing) -> Result<(u32, u32), CompileError> {
-    let Some((width, height)) = png_size(bytes).or_else(|| jpeg_size(bytes)) else {
+    let size = if bytes.len() >= 24 && bytes.starts_with(PNG_SIGNATURE) && &bytes[12..16] == b"IHDR"
+    {
+        let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+        let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
+        Some((width, height))
+    } else {
+        jpeg_size(bytes)
+    };
+    let Some((width, height)) = size else {
         return Err(CompileError::new(
             "an image document must be a PNG or a JPEG, such as a page AI.PDF_PAGES renders",
         ));
