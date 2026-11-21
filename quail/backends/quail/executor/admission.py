@@ -927,7 +927,15 @@ class JoinAdmission:
                 settlements.append(Settlement("dropped", a, False))
         if last and complete:
             self._stage[a] = _DONE
-            self._count_survivor(self.dependencies[a][0] if dependent else a)
+            document = self.dependencies[a][0] if dependent else a
+            if (
+                self._stage[document] == _DONE and self._true[document][-1]
+                and document not in self._counted
+                and all(self._stage[b] == _DONE
+                    for stage in range(len(self.stages))
+                    for b in self.dependents.get((document, stage), ()))):
+                self._counted.add(document)
+                self.survivors += 1
             survived = bool(self._true[a][j])
             transitions.append((a, j, survived))
             settlements.append(Settlement("finished", a, survived))
@@ -1032,21 +1040,6 @@ class JoinAdmission:
         """Anchors admitted and not yet settled."""
         return sum(1 for a, stage in enumerate(self._stage)
                    if stage >= 0 and a not in self.dependencies)
-
-    def _count_survivor(self, document) -> None:
-        """Count a document toward the limit once it and its branches ended.
-
-        Each branch settles and frees its pages at its own end; only the
-        count waits, so a limit never takes a document with an answer
-        still being written.
-        """
-        if (self._stage[document] != _DONE or not self._true[document][-1]
-                or document in self._counted):
-            return
-        if all(self._stage[a] == _DONE for stage in range(len(self.stages))
-               for a in self.dependents.get((document, stage), ())):
-            self._counted.add(document)
-            self.survivors += 1
 
     def limit_reached(self) -> bool:
         """Return whether enough documents survived to stop new admissions."""
