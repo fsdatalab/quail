@@ -135,10 +135,10 @@ def payload_tables(tables: dict) -> dict:
                 else ArrowTokenDocuments(table.column("tokens"),
                     table.column("offsets") if "offsets" in table.column_names
                     else None))
-        else:
-            payload[kind][alias] = (
-                table.column("text") if kind == "texts"
-                else table.column("row") if kind == "source_rows" else table)
+            continue
+        payload[kind][alias] = (
+            table.column("text") if kind == "texts"
+            else table.column("row") if kind == "source_rows" else table)
     return payload
 
 
