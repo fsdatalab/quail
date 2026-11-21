@@ -83,31 +83,6 @@ def png_size(png: bytes) -> tuple[int, int]:
     return (int.from_bytes(png[16:20], "big"), int.from_bytes(png[20:24], "big"))
 
 
-def pixel_patches(torch, rgb, patch_pixels: int, merge: int):
-    """An image's pixels as the vision encoder's patches, in Qwen's order.
-
-    Args:
-        torch: The torch module.
-        rgb: The image, (height, width, 3) uint8 on the GPU.
-        patch_pixels: The side of one patch, in pixels.
-        merge: The patches merged along each side of one image token.
-
-    Returns:
-        (patches, grid): (rows * columns * 4, 1536) float32 patches, and
-        the (1, height, width) patch grid, as Qwen2VLImageProcessor
-        writes them.
-    """
-    height, width, _ = rgb.shape
-    grid_h, grid_w = height // patch_pixels, width // patch_pixels
-    x = rgb.permute(2, 0, 1).float().div(255.0).sub(0.5).div(0.5)
-    x = x.unsqueeze(0).expand(TEMPORAL_PATCH, -1, -1, -1)
-    x = x.reshape(1, TEMPORAL_PATCH, 3, grid_h // merge, merge, patch_pixels,
-                  grid_w // merge, merge, patch_pixels)
-    x = x.permute(0, 3, 6, 4, 7, 2, 1, 5, 8)
-    patches = x.reshape(grid_h * grid_w, 3 * TEMPORAL_PATCH * patch_pixels ** 2)
-    return patches, (1, grid_h, grid_w)
-
-
 def decode_image(image: Image, token_pixels: int) -> np.ndarray:
     """An image's pixels at the size the model reads, as (height, width, 3) uint8.
 
@@ -283,7 +258,7 @@ class RegionImages:
             return
         import time
 
-        device = visual_device(visual)
+        device = next(visual.parameters()).device
         patches, grids = [], []
         for first in firsts:
             waited = time.perf_counter()
@@ -293,10 +268,20 @@ class RegionImages:
                       else pixels.result())
             self.decode_wait_s += time.perf_counter() - waited
             rgb = torch.from_numpy(pixels.copy()).to(device)
-            found, grid = pixel_patches(torch, rgb, self.patch_pixels, self.merge)
+            patch_pixels, merge = self.patch_pixels, self.merge
+            height, width, _ = rgb.shape
+            grid_h, grid_w = height // patch_pixels, width // patch_pixels
+            x = rgb.permute(2, 0, 1).float().div(255.0).sub(0.5).div(0.5)
+            x = x.unsqueeze(0).expand(TEMPORAL_PATCH, -1, -1, -1)
+            x = x.reshape(1, TEMPORAL_PATCH, 3, grid_h // merge, merge, patch_pixels,
+                grid_w // merge, merge, patch_pixels)
+            x = x.permute(0, 3, 6, 4, 7, 2, 1, 5, 8)
+            found = x.reshape(
+                grid_h * grid_w, 3 * TEMPORAL_PATCH * patch_pixels ** 2)
+            grid = (1, grid_h, grid_w)
             patches.append(found)
             grids.append(grid)
-        pixel_values = torch.cat(patches).to(visual_dtype(visual))
+        pixel_values = torch.cat(patches).to(next(visual.parameters()).dtype)
         grid_thw = torch.tensor(grids, dtype=torch.int64, device=device)
         timed = pixel_values.is_cuda
         if timed:
@@ -436,11 +421,3 @@ def _binary_column(table: pa.Table):
                             and (binary(kind.value_type) or pages(kind.value_type))):
             return table.column(index)
     return None
-
-
-def visual_device(visual):
-    return next(visual.parameters()).device
-
-
-def visual_dtype(visual):
-    return next(visual.parameters()).dtype

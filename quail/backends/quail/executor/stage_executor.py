@@ -50,19 +50,6 @@ def answer_admission_mode() -> str:
     return mode
 
 
-def attention_path(pipeline, requested, default_attention="unified") -> str:
-    """The path a filter stream or join runs: the plan's request where the model has it.
-
-    None asks for the default_attention. A model without tree attention, and a
-    canvas model (whose rows the tree path does not pack), run unified.
-    """
-    if requested is None:
-        requested = default_attention
-    if requested == "tree" and pipeline.tree_attention and not pipeline.canvas_ids:
-        return "tree"
-    return "unified"
-
-
 def forward_chunk(pipeline, arena, chunk):
     """Run the forward pass, then release the chunk's temporary pages.
 
@@ -104,16 +91,6 @@ def borrow_check(arena, keys, borrowing):
             return arena.can_borrow(keys[parent], shared)
         return arena.origin(borrowing.shared(parent)) <= arena.origin(shared)
     return can_borrow
-
-
-def lowest_borrows(borrowing):
-    """Per document, the fewest tokens any of its borrowers shares."""
-    lowest = {}
-    for document, parent in enumerate(borrowing.tree_parent):
-        if parent is not None:
-            shared = borrowing.tree_shared[document]
-            lowest[parent] = min(lowest.get(parent, shared), shared)
-    return lowest
 
 
 class StageExecutor:
@@ -306,8 +283,14 @@ class StageExecutor:
         # Stages packing label paths always need tree attention.
         if any(stage.paths is not None for stage in self.stages):
             attention_mode = "tree"
-        self.mode = attention_path(
-            self.pipeline, attention_mode, default_attention=default_attention)
+        if attention_mode is None:
+            attention_mode = default_attention
+        if (
+            attention_mode == "tree" and self.pipeline.tree_attention
+            and not self.pipeline.canvas_ids):
+            self.mode = "tree"
+        else:
+            self.mode = "unified"
         self.canvas = tuple(self.pipeline.canvas_ids)
         self.answer_row = self.pipeline.canvas_answer_row
         self.canvas_rows = [len(self.canvas) if stage.canvas is None
@@ -360,7 +343,13 @@ class StageExecutor:
                     # built for another prefix; it is fed afresh
                     self.arena.free_key(key)
                     continue
-                resident[a] = self._held_pages(key, self.prefix_lengths[a])
+                # the admission prices a document at page_cost(prefix + extra)
+                # less what it holds; a trimmed window holds fewer sliding
+                # pages than that price assumes, so count what growing takes
+                capacity = self.prefix_lengths[a] + self.capacity_extra
+                resident[a] = (
+                    self.arena.page_cost(capacity)
+                    - self.arena.growth_cost(key, capacity))
         # Pin resident documents while fresh admissions evict retained KV.
         for a in resident:
             self.arena.pin(self.keys[a])
@@ -368,6 +357,16 @@ class StageExecutor:
         self.asking = any(stage.requests is not None or stage.own_suffixes
                           for stage in self.stages)
         try:
+            stop_width = 1
+            if stop_groups is not None and self.prefixes:
+                groups = len({
+                    group for groups in stop_groups if groups is not None
+                    for group in (groups if isinstance(groups, tuple)
+                        else (groups,))}) or 1
+                mean = (sum(self.prefix_lengths) / len(self.prefix_lengths)
+                    + float(np.mean(self.suffixes[0].lengths)))
+                per_chunk = max(1, int(budget // max(1.0, mean)))
+                stop_width = max(1, -(-per_chunk // groups))
             self.sched = JoinAdmission(
                 self.prefix_lengths,
                 [s.lengths + rows
@@ -389,8 +388,7 @@ class StageExecutor:
                 frame_writes=self.writes,
                 limit=limit, survival=survival,
                 stop_groups=stop_groups,
-                stop_width=max(self._stop_width(stop_groups, budget),
-                               num_key_survivors),
+                stop_width=max(stop_width, num_key_survivors),
                 num_key_survivors=num_key_survivors,
                 skip=skip,
                 extra_tokens=self.capacity_extra,
@@ -460,7 +458,12 @@ class StageExecutor:
                 self.borrowing.can_borrow)
         # The admission detaches residents from borrowing: they pack no prefix.
         self.borrowers = self.borrowing.borrowers()
-        self.lowest_borrow = lowest_borrows(self.borrowing)
+        lowest = {}
+        for document, parent in enumerate(self.borrowing.tree_parent):
+            if parent is not None:
+                shared = self.borrowing.tree_shared[document]
+                lowest[parent] = min(lowest.get(parent, shared), shared)
+        self.lowest_borrow = lowest
         self.held = [self.keys[a] for a, n in enumerate(self.borrowers) if n]
 
         self._held_parents = set()
@@ -485,23 +488,6 @@ class StageExecutor:
 
         self.readouts = ReadoutGroups(self.torch, self.stages)
 
-    def _stop_width(self, stop_groups, budget) -> int:
-        """Anchors of one stop key group in flight at once.
-
-        One per group is the most a group can save, but with fewer
-        groups than a chunk holds it would leave the chunk mostly
-        empty, so the width grows to keep about one chunk in flight.
-        """
-        if stop_groups is None or not self.prefixes:
-            return 1
-        groups = len({group for groups in stop_groups if groups is not None
-                      for group in (groups if isinstance(groups, tuple)
-                                    else (groups,))}) or 1
-        mean = (sum(self.prefix_lengths) / len(self.prefix_lengths)
-                + float(np.mean(self.suffixes[0].lengths)))
-        per_chunk = max(1, int(budget // max(1.0, mean)))
-        return max(1, -(-per_chunk // groups))
-
     def _suffixes_of(self, j, a):
         """Return the suffixes document a requests at stage j."""
         return (self.own[(j, a)].suffixes if self.stages[j].own_suffixes
@@ -516,14 +502,6 @@ class StageExecutor:
         if self.writes[j] and start == 0:
             rows += len(self.frames[j]) + len(self.canvas)
         return rows
-
-    def _held_pages(self, key, prefix_tokens):
-        # the admission prices a document at page_cost(prefix + extra)
-        # less what it holds; a trimmed window holds fewer sliding
-        # pages than that price assumes, so count what growing takes
-        capacity = prefix_tokens + self.capacity_extra
-        return (self.arena.page_cost(capacity)
-                - self.arena.growth_cost(key, capacity))
 
     def _prepare(self, j, anchors):
         self.stages[j].prepare([self.keys[a] for a in anchors])
@@ -603,10 +581,6 @@ class StageExecutor:
                 key, prefix, capacity_tokens=capacity, borrow=borrowed,
                 extension=self._extends, share_points=points):
             return False
-        return self._reserved(anchor, key, parent)
-
-    def _reserved(self, anchor, key, parent):
-        """Commit answer demand and hold the KV an admitted document reads and lends."""
         if self.answer_admission is not None:
             self.answer_admission.admit(anchor)
         if parent is not None:
@@ -891,7 +865,13 @@ class StageExecutor:
                     shared_tokens=self.borrowing.shared(a))
         return chunk, entries, [(row, a) for row, a, _ in firsts]
 
-    def _settle(self, settlement):
+    def _event(self, settlement):
+        # Progress counts settled documents: a dropped one is done too.
+        self.finished += int(settlement.anchor not in self.sched.dependencies)
+        if settlement.kind != "finished":
+            if self.arena.is_resident(self.keys[settlement.anchor]):
+                self.arena.free_key(self.keys[settlement.anchor])
+            return
         anchor = settlement.anchor
         if self.on_settled is None or anchor in self.sched.dependencies:
             if self.arena.is_resident(self.keys[anchor]):
@@ -899,44 +879,6 @@ class StageExecutor:
         else:
             self.on_settled(
                 anchor, settlement.survived, self.sched.answers[-1].get(anchor, []))
-
-    def _event(self, settlement):
-        # Progress counts settled documents: a dropped one is done too.
-        self.finished += int(settlement.anchor not in self.sched.dependencies)
-        if settlement.kind == "finished":
-            self._settle(settlement)
-        elif self.arena.is_resident(self.keys[settlement.anchor]):
-            self.arena.free_key(self.keys[settlement.anchor])
-
-    def _report(self, entry):
-        if entry.values is None:
-            entry.values = self.readouts.results(entry.handles)
-            entry.positions = np.zeros(len(self.readouts), dtype=np.int64)
-        groups = entry.groups[entry.at:entry.at + entry.step]
-        values, position = entry.values, entry.positions
-        transitions = []
-        for a, j, start, end, _ in groups:
-            key = self.readouts.group_key[j]
-            if self.writes[j] and start == 0 and not self._merged(j, start, end):
-                position[key] += 1        # the frame entry's answer means nothing
-            count = end - start
-            rows = values[key][position[key]:position[key] + count]
-            position[key] += count
-            if j in self.answer_maps:
-                # the row stands until the decoder ends the answer
-                self.deferred[a] = (j, start, end, rows)
-                continue
-            transitions.extend(self._record(a, j, start, end, rows))
-        entry.at += len(groups)
-        transitions.extend(self._record_answers())
-        self._decide_waiting()
-        self.progress.update(
-            self.progress.done + sum(end - start for _, _, start, end, _ in groups)
-            if self.counting_answers else self.finished)
-        # with on_answers, answers may finish rows before any document moves
-        if (transitions or self.on_answers is not None) and self.on_chunk is not None:
-            self.on_chunk(transitions)
-        self._release_skipped()
 
     def _record(self, a, j, start, end, rows) -> list:
         """Report a group's answers once the next stage's inputs are ready."""
@@ -995,7 +937,34 @@ class StageExecutor:
             if partial and self.split_answers and all(
                     self.stages[j].append for _, j, _, _, _ in entry.groups):
                 entry.step = (entry.step + 1) // 2
-        self._report(entry)
+        if entry.values is None:
+            entry.values = self.readouts.results(entry.handles)
+            entry.positions = np.zeros(len(self.readouts), dtype=np.int64)
+        groups = entry.groups[entry.at:entry.at + entry.step]
+        values, position = entry.values, entry.positions
+        transitions = []
+        for a, j, start, end, _ in groups:
+            key = self.readouts.group_key[j]
+            if self.writes[j] and start == 0 and not self._merged(j, start, end):
+                position[key] += 1        # the frame entry's answer means nothing
+            count = end - start
+            rows = values[key][position[key]:position[key] + count]
+            position[key] += count
+            if j in self.answer_maps:
+                # the row stands until the decoder ends the answer
+                self.deferred[a] = (j, start, end, rows)
+                continue
+            transitions.extend(self._record(a, j, start, end, rows))
+        entry.at += len(groups)
+        transitions.extend(self._record_answers())
+        self._decide_waiting()
+        self.progress.update(
+            self.progress.done + sum(end - start for _, _, start, end, _ in groups)
+            if self.counting_answers else self.finished)
+        # with on_answers, answers may finish rows before any document moves
+        if (transitions or self.on_answers is not None) and self.on_chunk is not None:
+            self.on_chunk(transitions)
+        self._release_skipped()
         if entry.at == len(entry.groups):
             self.outstanding.pop(0)
 
@@ -1011,7 +980,7 @@ class StageExecutor:
         """
         skipped = self.sched.take_skipped()
         for a in skipped:
-            self.borrowing.skip(a)
+            self.borrowing.skipped.add(a)
             parent = (self.borrowing.tree_parent[a]
                       if a < len(self.borrowing.tree_parent) else None)
             if parent is not None:

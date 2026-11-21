@@ -1,23 +1,5 @@
 """GPU memory snapshots shared by local and distributed execution."""
 
-def memory_breakdown(weights_bytes: int, pools: dict, peak_bytes: int) -> dict:
-    """Split the peak allocated bytes into weights, KV, state, and the rest.
-
-    Args:
-        weights_bytes: Bytes allocated after the model loaded.
-        pools: The pool_bytes of the arena.
-        peak_bytes: The process's peak allocated bytes, which includes
-            kernel warm-up and every query run so far.
-
-    Returns:
-        The four numbers and the peak. "other" is the peak minus the
-        three pools: activations, temporary copies, and warm-up.
-    """
-    other = peak_bytes - weights_bytes - pools["kv"] - pools["state"]
-    return {"weights": weights_bytes, "kv": pools["kv"],
-            "state": pools["state"], "other": other, "peak": peak_bytes}
-
-
 def memory_report(gpu) -> dict:
     """Collect one worker's cumulative query memory measurements."""
     arena = gpu.arena
@@ -31,6 +13,9 @@ def memory_report(gpu) -> dict:
         "peak_gib": peak / 2**30,
     }
     if hasattr(gpu, "pool_bytes"):
-        report["memory_bytes"] = memory_breakdown(
-            gpu.weights_bytes, gpu.pool_bytes, peak)
+        weights_bytes, pools = gpu.weights_bytes, gpu.pool_bytes
+        other = peak - weights_bytes - pools["kv"] - pools["state"]
+        report["memory_bytes"] = {
+            "weights": weights_bytes, "kv": pools["kv"],
+            "state": pools["state"], "other": other, "peak": peak}
     return report

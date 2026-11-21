@@ -22,14 +22,14 @@ from typing import Any
 
 import numpy as np
 
-from quail.backends.quail.executor.map_decoder import map_decoder
+from quail.backends.quail.executor.map_decoder import MapDecoder
 from quail.backends.quail.executor.model_operator import (
-    close_operators,
     execution_prefix_tree,
     gated_stages,
     input_staging,
     settle_documents,
     stage_slices,
+    stage_spans,
     survival,
 )
 from quail.backends.quail.executor.stages import Stage
@@ -85,15 +85,6 @@ class ChainRun:
     stop_groups: Any = None
     num_key_survivors: int = 1
     skip: Any = None
-
-
-def _chain_label(nodes) -> str:
-    """Name a chain by what it does: "classify ×3 over t" or "filter → map over r"."""
-    kinds = [node.type_name.rsplit("ai_", 1)[-1] for node in nodes]
-    steps = [kind if (count := len(list(group))) == 1 else f"{kind} ×{count}"
-             for kind, group in groupby(kinds)]
-    alias = (nodes[0].document_aliases or ("",))[0]
-    return f"{' → '.join(steps)} over {alias}"
 
 
 def pipeline_rows(first, inputs):
@@ -180,25 +171,44 @@ class RegionExecution:
                     and nodes[0].document_aliases):
                 return SetChain(query, nodes, inputs, self.context).execute()
         self.nodes, self.inputs, self._ids = tuple(nodes), inputs, None
-        self.operators = self._chain(self.nodes)
-        if not any(operator.stages for operator in self.operators):
-            return self._run_answered()
-        return self._run_stages()
-
-    def _chain(self, nodes) -> list:
-        """Build the chain's operators, grouping nodes an operator combines."""
         types = self.model.operator_types
 
         def group_key(node):
             return (node.type_name,
-                    None if types[node.type_name].combine else node.node_id)
+                None if types[node.type_name].combine else node.node_id)
 
         operators = []
-        for _, group in groupby(nodes, group_key):
+        for _, group in groupby(self.nodes, group_key):
             members = list(group)
             operators.append(types[members[0].type_name].build(
                 self, members, tuple(operators)))
-        return operators
+        self.operators = operators
+        if not any(operator.stages for operator in self.operators):
+            own = operators[0].layout(self)
+            operators[0].push(np.arange(len(
+                own.prefixes if own is not None else self.document_ids())))
+            results = {}
+            for operator in operators:
+                operator.finish_input()
+                results.update(operator.close(0, [], {}, 0))
+            return results
+        table = self._table()
+        first, operators = self.nodes[0], self.operators
+        kinds = [node.type_name.rsplit("ai_", 1)[-1] for node in self.nodes]
+        steps = [kind if (count := len(list(group))) == 1 else f"{kind} ×{count}"
+            for kind, group in groupby(kinds)]
+        alias = (self.nodes[0].document_aliases or ("",))[0]
+        settings = ChainRun(
+            label=f"{' → '.join(steps)} over {alias}",
+            limit=self.context.state.get("filter_limit"),
+            attention=(first.attention or None
+                if isinstance(first, (AiFilter, AiJoin)) else None))
+        if self.one_family:
+            settings = type(operators[0]).alone(self, operators, table, settings)
+        last = max(index for index, node in enumerate(self.nodes)
+            if node.backend is not None)
+        return self.run_operators(self.operators, table, settings,
+            keep_kv=self.nodes[last].keep_kv)
 
     def _table(self) -> RegionDocuments:
         """The chain's documents: the first operator's own, or the table's."""
@@ -211,44 +221,6 @@ class RegionExecution:
         return RegionDocuments(prefixes, DocumentKeys(alias, ids),
                                execution_prefix_tree(first, prefixes,
                                                      self.query.loaded_model.arena))
-
-    def _run_answered(self) -> dict:
-        """Run a chain whose operators answer as documents are pushed.
-
-        Each operator takes every document the one before it kept once
-        that one has finished, and closes before the next starts.
-        """
-        operators = self.operators
-        own = operators[0].layout(self)
-        operators[0].push(np.arange(len(
-            own.prefixes if own is not None else self.document_ids())))
-        results = {}
-        for operator in operators:
-            operator.finish_input()
-            results.update(operator.close(0, [], {}, 0))
-        return results
-
-    def send_finished(self, operator) -> None:
-        """Report the operator's finished rows to the region's FinishedRows."""
-        report(operator.take_finished())
-
-    def _chain_run(self, table) -> ChainRun:
-        """The GPU loop's settings for this chain."""
-        first, operators = self.nodes[0], self.operators
-        settings = ChainRun(
-            label=_chain_label(self.nodes),
-            limit=self.context.state.get("filter_limit"),
-            attention=(first.attention or None
-                       if isinstance(first, (AiFilter, AiJoin)) else None))
-        if self.one_family:
-            settings = type(operators[0]).alone(self, operators, table, settings)
-        return settings
-
-    def _run_stages(self) -> dict:
-        """Run the chain's stages in one GPU loop and close its operators."""
-        table = self._table()
-        return self.run_operators(self.operators, table, self._chain_run(table),
-                                  keep_kv=self._keep_kv())
 
     def run_operators(self, operators, table, settings=None, *,
                       keep_kv=False) -> dict:
@@ -326,13 +298,20 @@ class RegionExecution:
             every, spans, tokens = self.executor.run()
         for operator in operators[1:]:
             operator.finish_input()
-        return close_operators(operators, every, spans, tokens, stats)
-
-    def _keep_kv(self) -> bool:
-        """Whether the chain's last model node retains its documents' KV."""
-        last = max(index for index, node in enumerate(self.nodes)
-                   if node.backend is not None)
-        return self.nodes[last].keep_kv
+        slices = stage_slices(operators)
+        own = [operator.read_answers(every[low:high])
+            for operator, (low, high) in zip(operators, slices)]
+        staged = [index for index, operator in enumerate(operators)
+            if operator.stages]
+        remainder = tokens - sum(own[index] or 0 for index in staged[1:])
+        results = {}
+        for index, (operator, (low, high)) in enumerate(zip(operators, slices)):
+            results.update(operator.close(
+                remainder if staged and index == staged[0] else (own[index] or 0),
+                stage_spans(spans, low, high),
+                stats if staged and index == staged[0] else {},
+                low))
+        return results
 
     def _decoder(self, operators, num_anchors):
         """The MapDecoder writing the answers of the chain's maps, or None."""
@@ -342,7 +321,19 @@ class RegionExecution:
         expected_tokens = [expected for operator in operators
                            if operator.answer_limits
                            for expected in operator.expected_answer_tokens]
-        decoder = map_decoder(self.query, limits, num_anchors, expected_tokens)
+        state = self.query
+        from quail.backends.quail.executor.model_loading import full_output_head
+        from quail.common.budgets import copy_verification_workspace_bytes
+
+        decoder = MapDecoder(
+            state.torch, full_output_head(state.loaded_model.model),
+            num_anchors, limits, state.loaded_model.tokenizer.stop_ids,
+            state.loaded_model.arena.page_tokens,
+            expected_tokens=expected_tokens,
+            workspace_bytes=copy_verification_workspace_bytes(
+                state.loaded_model.model_spec, state.chunk_tokens),
+            row_budget=state.chunk_tokens)
+        decoder.tokenizer = state.loaded_model.tokenizer
         for operator in operators:
             if operator.answer_limits:
                 operator.decoder = decoder
@@ -387,7 +378,7 @@ class RegionExecution:
             if passed and index + 1 < len(routes.operators):
                 routes.operators[index + 1].push([anchor])
         for operator in touched:
-            self.send_finished(operator)
+            report(operator.take_finished())
 
 
 class HintGate:
@@ -416,12 +407,3 @@ class _Routes:
         self.slices = stage_slices(operators)
         self.owner = [index for index, (low, high) in enumerate(self.slices)
                       for _ in range(low, high)]
-
-
-
-def region_of(model, context) -> RegionExecution:
-    """Return the context's RegionExecution for the model, created on first use."""
-    region = context.state.get("region")
-    if region is None or region.model is not model:
-        region = context.state["region"] = RegionExecution(model, context)
-    return region
