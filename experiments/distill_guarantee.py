@@ -1,4 +1,4 @@
-"""Guaranteed escalation thresholds and SoL cost for a distilled IMDB-1 filter.
+r"""Guaranteed escalation thresholds and SoL cost for a distilled IMDB-1 filter.
 
 Simulates the distilled filter's calibration step offline, from the
 student scores the learning-curve cell saved for 5,000 held-out reviews.
@@ -36,6 +36,9 @@ Inputs, pulled from the results volume into one directory:
     T=distillation/answer_trace/20261119T221615Z-db4b2ebe
     modal volume get quail-results $R/records.json $W/
     modal volume get quail-results $R/probes.json $W/
+    modal volume get quail-results \
+        distillation/learning_curves/20261120T040959Z-imdb1-sf05/records.json \
+        $W/records_margin_state.json
     modal volume get quail-results $T/answer_trace/imdb/IMDB-1 $W/trace
     modal volume get quail-results \
         $T/quail/imdb/IMDB-1/prompt_pieces.json $W/
@@ -62,7 +65,7 @@ EPSILON = 0.05
 DELTA = 0.1
 NUM_CALIBRATION = (200, 500, 1000)
 NUM_SPLITS = 200
-SETUPS = ("margin", "bits", "frozen_answer_probe", "zero_shot")
+SETUPS = ("margin", "bits", "margin_state", "frozen_answer_probe", "zero_shot")
 TEACHER = "qwen3.8-27b-fp8"
 STUDENT = "decision-2.0-kai-0.6b-bf16"
 DEVICE = "h100-sxm"
@@ -199,8 +202,11 @@ def main():
     per_row = (float(np.mean([teacher_seconds(t) for t in teacher_lengths])),
                float(np.mean([student_seconds(t) for t in student_lengths])))
     positive = data["margins"][data["test"]] > 0
-    runs = (json.loads((args.directory / "records.json").read_text())["records"]
-            + json.loads((args.directory / "probes.json").read_text())["records"])
+    runs = {}
+    for name in ("records.json", "probes.json", "records_margin_state.json"):
+        for record in json.loads((args.directory / name).read_text())["records"]:
+            runs[record["setup"], record["num_labels"], record["seed"]] = record
+    runs = list(runs.values())
     rng = np.random.default_rng(0)
     splits = {num: [rng.permutation(len(positive)) for _ in range(NUM_SPLITS)]
               for num in NUM_CALIBRATION}
