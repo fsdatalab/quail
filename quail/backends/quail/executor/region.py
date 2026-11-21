@@ -193,10 +193,28 @@ class RegionExecution:
                 self, members, tuple(operators)))
         self.operators = operators
         if not any(operator.stages for operator in self.operators):
-            return self._run_answered()
+            operators = self.operators
+            own = operators[0].layout(self)
+            operators[0].push(np.arange(len(
+                own.prefixes if own is not None else self.document_ids())))
+            results = {}
+            for operator in operators:
+                operator.finish_input()
+                results.update(operator.close(0, [], {}, 0))
+            return results
         table = self._table()
-        return self.run_operators(self.operators, table, self._chain_run(table),
-            keep_kv=self._keep_kv())
+        first, operators = self.nodes[0], self.operators
+        settings = ChainRun(
+            label=_chain_label(self.nodes),
+            limit=self.context.state.get("filter_limit"),
+            attention=(first.attention or None
+                       if isinstance(first, (AiFilter, AiJoin)) else None))
+        if self.one_family:
+            settings = type(operators[0]).alone(self, operators, table, settings)
+        last = max(index for index, node in enumerate(self.nodes)
+            if node.backend is not None)
+        return self.run_operators(self.operators, table, settings,
+            keep_kv=self.nodes[last].keep_kv)
 
     def _table(self) -> RegionDocuments:
         """The chain's documents: the first operator's own, or the table's."""
@@ -210,37 +228,9 @@ class RegionExecution:
                                execution_prefix_tree(first, prefixes,
                                                      self.query.loaded_model.arena))
 
-    def _run_answered(self) -> dict:
-        """Run a chain whose operators answer as documents are pushed.
-
-        Each operator takes every document the one before it kept once
-        that one has finished, and closes before the next starts.
-        """
-        operators = self.operators
-        own = operators[0].layout(self)
-        operators[0].push(np.arange(len(
-            own.prefixes if own is not None else self.document_ids())))
-        results = {}
-        for operator in operators:
-            operator.finish_input()
-            results.update(operator.close(0, [], {}, 0))
-        return results
-
     def send_finished(self, operator) -> None:
         """Report the operator's finished rows to the region's FinishedRows."""
         report(operator.take_finished())
-
-    def _chain_run(self, table) -> ChainRun:
-        """The GPU loop's settings for this chain."""
-        first, operators = self.nodes[0], self.operators
-        settings = ChainRun(
-            label=_chain_label(self.nodes),
-            limit=self.context.state.get("filter_limit"),
-            attention=(first.attention or None
-                       if isinstance(first, (AiFilter, AiJoin)) else None))
-        if self.one_family:
-            settings = type(operators[0]).alone(self, operators, table, settings)
-        return settings
 
     def run_operators(self, operators, table, settings=None, *,
                       keep_kv=False) -> dict:
@@ -319,12 +309,6 @@ class RegionExecution:
         for operator in operators[1:]:
             operator.finish_input()
         return close_operators(operators, every, spans, tokens, stats)
-
-    def _keep_kv(self) -> bool:
-        """Whether the chain's last model node retains its documents' KV."""
-        last = max(index for index, node in enumerate(self.nodes)
-                   if node.backend is not None)
-        return self.nodes[last].keep_kv
 
     def _decoder(self, operators, num_anchors):
         """The MapDecoder writing the answers of the chain's maps, or None."""
