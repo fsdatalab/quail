@@ -8,7 +8,7 @@ use crate::cost::filters::filter_work;
 use crate::cost::joins::PricedJoin;
 use crate::cost::score::ScoreCost;
 use crate::cost::work::Work;
-use crate::physical::{Equality, FilterPredicate, Prompt};
+use crate::physical::{FilterPredicate, Prompt};
 
 use crate::context::PlanningContext;
 use crate::error::{CompileError, compile_error};
@@ -119,15 +119,6 @@ pub fn prepare_filter_costs(
     Ok(prepared)
 }
 
-fn priced_key(condition: &Equality) -> (String, String, String, String) {
-    (
-        argument_alias(&condition.left),
-        column_name(&condition.left, false),
-        argument_alias(&condition.right),
-        column_name(&condition.right, false),
-    )
-}
-
 /// The joins as the cost model prices them, in written order.
 ///
 /// `pair_fractions` maps a written position to the fraction of the
@@ -152,7 +143,17 @@ pub fn join_specs(
         } else {
             pair_fractions.get(&position).copied().unwrap_or(1.0)
         };
-        let on: Vec<_> = conditions.iter().map(priced_key).collect();
+        let on: Vec<_> = conditions
+            .iter()
+            .map(|condition| {
+                (
+                    argument_alias(&condition.left),
+                    column_name(&condition.left, false),
+                    argument_alias(&condition.right),
+                    column_name(&condition.right, false),
+                )
+            })
+            .collect();
         let call = asked_call(&join.predicate);
         if call.kind == "score" {
             let (parts, cost) = score_statistics(&call.prompt, context, chunk, None)?;
