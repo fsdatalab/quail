@@ -60,9 +60,6 @@ impl Precision {
     }
 }
 
-fn text(value: &str) -> String {
-    value.to_string()
-}
 fn fp8() -> Precision {
     Precision::Fp8
 }
@@ -70,19 +67,19 @@ fn bf16() -> Precision {
     Precision::Bf16
 }
 fn qwen3() -> String {
-    text("qwen3")
+    "qwen3".to_string()
 }
 fn generative() -> String {
-    text("generative")
+    "generative".to_string()
 }
 fn causal() -> String {
-    text("causal")
+    "causal".to_string()
 }
 fn raw_v1() -> String {
-    text("raw-v1")
+    "raw-v1".to_string()
 }
 fn ai_if() -> String {
-    text("ai-if")
+    "ai-if".to_string()
 }
 fn two() -> f64 {
     2.0
