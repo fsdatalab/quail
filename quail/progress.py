@@ -8,7 +8,6 @@ log, every message is one plain line, details included, and a count
 logs a line at each tenth of its total.
 """
 
-import contextlib
 import logging
 import os
 import sys
@@ -168,7 +167,7 @@ def progress_sink():
 
 
 def say(message: str, *, done: bool = False) -> None:
-    """Log one progress message at INFO, unless inside quiet().
+    """Log one progress message at INFO, unless suppressed during warmup.
 
     Args:
         message: The step, such as "model ready".
@@ -182,17 +181,6 @@ def detail(message: str) -> None:
     """Log a detail of the step before it, which a terminal leaves out."""
     if not _QUIET:
         logger.info(message, extra={"detail": True})
-
-
-@contextlib.contextmanager
-def quiet():
-    """Suppress progress messages, for warmup passes that reuse the loops."""
-    global _QUIET
-    _QUIET += 1
-    try:
-        yield
-    finally:
-        _QUIET -= 1
 
 
 class Progress:

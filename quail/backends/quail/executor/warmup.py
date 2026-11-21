@@ -2,11 +2,12 @@
 
 import time
 
+from quail import progress
 from quail.backends.quail.executor.model_loading import full_output_head
 from quail.backends.quail.executor.readout import AsyncSlotMargins
 from quail.backends.quail.executor.stage_executor import StageExecutor
 from quail.backends.quail.executor.stages import Stage, filter_stages
-from quail.progress import Progress, logger, quiet
+from quail.progress import Progress, logger
 
 # ------------------------------------------------------------- warmup
 #
@@ -403,7 +404,8 @@ def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
     import json
     import os
 
-    with quiet():
+    progress._QUIET += 1
+    try:
         root = os.path.expanduser(os.environ.get(
             "QUAIL_CACHE_DIR", "~/.cache/quail/kernels"))
         safe = model_name.replace("/", "--")
@@ -447,5 +449,7 @@ def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
         logger.info("kernels ready in %s s (%s pass, %s s waiting for compilation)",
             warm_s, tier, wait_s)
         return dict(tier=tier, warm_s=warm_s, wait_s=wait_s)
+    finally:
+        progress._QUIET -= 1
 
 
