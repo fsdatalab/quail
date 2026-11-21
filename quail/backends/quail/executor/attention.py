@@ -1102,23 +1102,6 @@ class Engine:
             UE8M0=self.use_ue8m0)
         return q, scales
 
-    def custom_qk_norm_rope(self, qkv, positions, attn):
-        n = qkv.shape[0]
-        qw = self.num_q_heads * self.head_dim
-        kw = self.num_kv_heads * self.head_dim
-        q = self.torch.empty((n, qw), dtype=self.torch.bfloat16,
-            device="cuda")
-        k = self.torch.empty((n, kw), dtype=self.torch.bfloat16,
-            device="cuda")
-        self._triton_kernels()["qk"][(n,)](
-            qkv, q, k, self.rotary.cos_sin_cache, positions,
-            attn.q_norm.weight, attn.k_norm.weight,
-            qkv.stride(0), q.stride(0), k.stride(0),
-            attn.q_norm.variance_epsilon,
-            QH=self.num_q_heads, KH=self.num_kv_heads,
-            HD=self.head_dim, HALF=self.head_dim // 2)
-        return q, k
-
     # ---- the vLLM-kernel path (kernels="vllm") ----------------------
     # The same ops the engine's compiled graph runs, called eagerly.
 
@@ -1243,7 +1226,21 @@ class Engine:
     def qk_norm_rope(self, qkv, positions, attn):
         """Per-head normed and rotated q and k from the fused qkv output."""
         if self.kernels == "quail":
-            return self.custom_qk_norm_rope(qkv, positions, attn)
+            n = qkv.shape[0]
+            qw = self.num_q_heads * self.head_dim
+            kw = self.num_kv_heads * self.head_dim
+            q = self.torch.empty((n, qw), dtype=self.torch.bfloat16,
+                device="cuda")
+            k = self.torch.empty((n, kw), dtype=self.torch.bfloat16,
+                device="cuda")
+            self._triton_kernels()["qk"][(n,)](
+                qkv, q, k, self.rotary.cos_sin_cache, positions,
+                attn.q_norm.weight, attn.k_norm.weight,
+                qkv.stride(0), q.stride(0), k.stride(0),
+                attn.q_norm.variance_epsilon,
+                QH=self.num_q_heads, KH=self.num_kv_heads,
+                HD=self.head_dim, HALF=self.head_dim // 2)
+            return q, k
         return self.vllm_qk_norm_rope(qkv, positions, attn)
 
     def attention(self, q, k, v, chunk, *, output=None):
