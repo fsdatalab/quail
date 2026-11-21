@@ -38,7 +38,6 @@ from quail.execution.answer_stops import answer_stop
 from quail.execution.finished import (
     finished_rows,
     hinted,
-    hinted_out,
     hinting,
     region_hint,
     report,
@@ -275,7 +274,8 @@ class RegionExecution:
             dependencies))
         decoder = self._decoder(operators, len(prefixes))
         stats = {}
-        skip = settings.skip or hinted_out(keys)
+        skip = settings.skip or (
+            (lambda anchor: hinted(keys[anchor])) if hinting() else None)
         self._routes = _Routes(operators)
         self._answered = []
         with ExitStack() as resources:

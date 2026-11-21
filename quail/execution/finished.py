@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import threading
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Iterable
 
 import numpy as np
 import pyarrow as pa
@@ -218,17 +218,3 @@ def hinted(key) -> bool:
     """
     return (isinstance(key, tuple) and len(key) == 2
             and not keeps(key[0], int(key[1])))
-
-
-def hinted_out(keys: Sequence) -> Callable[[int], bool] | None:
-    """Callable(anchor) -> whether the region's hint drops that document.
-
-    Args:
-        keys: Each anchor's arena key, (alias, document) for a document.
-
-    Returns:
-        None when the hint holds the rows of no table the region reads.
-    """
-    if not hinting():
-        return None
-    return lambda anchor: hinted(keys[anchor])
