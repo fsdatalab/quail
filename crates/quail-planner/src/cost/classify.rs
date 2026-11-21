@@ -106,24 +106,6 @@ fn canvas_work(work: Work, canvas_rows: i64) -> Work {
     work
 }
 
-#[allow(clippy::too_many_arguments)]
-fn rounds_work(
-    prefix: &Quantity,
-    shared: &Quantity,
-    frame_tokens: i64,
-    runs: &[i64],
-    resident: bool,
-    window: i64,
-    canvas_rows: i64,
-) -> Work {
-    let first_tail = frame_tokens + runs[0];
-    let work = first_work(prefix, shared, first_tail, resident, window);
-    let context = prefix + first_tail as f64;
-    let later: Vec<f64> = runs[1..].iter().map(|run| *run as f64).collect();
-    let rounds = decode(&context, &later, window).total();
-    &work + &canvas_work(rounds, canvas_rows)
-}
-
 /// The inputs of one classification estimate besides its suffixes.
 #[derive(Debug, Clone)]
 pub struct ClassifyInputs<'a> {
@@ -184,15 +166,12 @@ pub fn estimate_suffixes(
             let (mut suffix_tokens, mut rows) = (0.0, 0.0);
             for (fed, count) in counted {
                 let share = count as f64 / runs.len() as f64;
-                let label = rounds_work(
-                    &prefix,
-                    &shared,
-                    inputs.frame_tokens,
-                    fed,
-                    inputs.resident,
-                    window,
-                    canvas_rows,
-                );
+                let first_tail = inputs.frame_tokens + fed[0];
+                let first = first_work(&prefix, &shared, first_tail, inputs.resident, window);
+                let context = &prefix + first_tail as f64;
+                let later: Vec<f64> = fed[1..].iter().map(|run| *run as f64).collect();
+                let rounds = decode(&context, &later, window).total();
+                let label = &first + &canvas_work(rounds, canvas_rows);
                 work = &work + &(&label * share);
                 suffix_tokens += fed.iter().sum::<i64>() as f64 * share;
                 rows += fed.len() as f64 * share;
