@@ -130,8 +130,8 @@ class GenericRunner:
                 for member in pipeline:
                     if isinstance(member, MODEL_NODES):
                         pipelines[member.node_id] = (member,)
-                    else:
-                        pipelines.pop(member.node_id, None)
+                        continue
+                    pipelines.pop(member.node_id, None)
         ordered = graph.topological_nodes()
         # A key stops at the last filter carrying it. An earlier filter may
         # stop there only in the same pipeline, which counts its last member.
