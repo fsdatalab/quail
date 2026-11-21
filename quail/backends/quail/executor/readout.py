@@ -555,6 +555,81 @@ class DecisionHead:
         return bilinear / math.sqrt(self.head_dim) + mlp
 
 
+class LetterReadout:
+    """The slot_lm readout of mammoth-1 and elephant-1, in fp32.
+
+    Every option is scored at the prompt's last row: option i's score is
+    the last row times the output head's row of option i's letter. The
+    readout implements the DecisionHead interface, so decision readouts
+    read every option at offset 0.
+
+    Args:
+        F: torch.nn.functional.
+        weight: The (letters, hidden) rows of the output head.
+    """
+
+    def __init__(self, F, weight):
+        self.F = F
+        self.weight = weight.float()
+
+    @classmethod
+    def load(cls, torch, F, path, letters=None, *, turn_suffix="",
+             device="cuda"):
+        """Read the output head's rows of the option letters.
+
+        Args:
+            torch: The torch module.
+            F: torch.nn.functional.
+            path: The checkpoint directory, with tokenizer.json and
+                either a safetensors index naming lm_head.weight's shard
+                or one model.safetensors holding it.
+            letters: The option letters in option order, or None to
+                select MAX_LETTERS codes with code_letters.
+            turn_suffix: The assistant turn opener code_letters checks.
+            device: Where the readout lives.
+        """
+        import json
+
+        from safetensors import safe_open
+        from tokenizers import Tokenizer
+
+        from quail.physical.lowering import MAX_LETTERS, code_letters
+
+        path = Path(path)
+        tokenizer = Tokenizer.from_file(str(path / "tokenizer.json"))
+
+        def encode(text):
+            return tokenizer.encode(text, add_special_tokens=False).ids
+
+        if letters is None:
+            letters = code_letters(MAX_LETTERS, encode, turn_suffix)
+        ids = [encode(letter) for letter in letters]
+        assert all(len(token) == 1 for token in ids)
+        index_path = path / "model.safetensors.index.json"
+        shard = (json.loads(index_path.read_text())["weight_map"]["lm_head.weight"]
+                 if index_path.exists() else "model.safetensors")
+        with safe_open(str(path / shard), framework="pt") as tensors:
+            head = tensors.get_slice("lm_head.weight")
+            rows = torch.cat([head[token:token + 1] for (token,) in ids])
+        return cls(F, rows.to(device))
+
+    def reordered(self, order):
+        """Return a LetterReadout with rows taken in the given order."""
+        return type(self)(self.F, self.weight[list(order)])
+
+    def scores(self, options, last):
+        """Per prompt, one score per option.
+
+        Args:
+            options: (prompts, options, hidden) rows; only their count is read.
+            last: (prompts, hidden) last rows of the prompts.
+
+        Returns:
+            (prompts, options) float32 scores.
+        """
+        return self.F.linear(last.float(), self.weight[:options.shape[1]])
+
+
 class DecisionRows:
     """The rows a decision head reads from each answer's trailing rows.
 
@@ -615,7 +690,11 @@ class AsyncDecisions(DecisionRows):
         return self._copy((scores[:, 1] > scores[:, 0]).to(self.torch.uint8),
                           self.torch.uint8)
 
-    result = staticmethod(AsyncAnswers.result)
+    @staticmethod
+    def result(handle):
+        event, host = handle
+        event.synchronize()
+        return [int(b) for b in host.tolist()]
 
 
 class AsyncDecisionScores(DecisionRows):

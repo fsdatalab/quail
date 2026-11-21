@@ -43,7 +43,9 @@ Every model in the table supports `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`,
 | Qwen3 32B | `qwen3-32b-fp8` | FP8 |
 | Qwen3.5 4B | `qwen3.5-4b-bf16` | BF16 |
 | Qwen3.5 4B | `qwen3.5-4b-fp8` | FP8 and BF16 |
+| Qwen3.5 9B | `qwen3.5-9b-bf16` | BF16 |
 | Qwen3.5 27B | `qwen3.5-27b-fp8` | FP8 |
+| Qwen3.5 27B | `qwen3.5-27b-bf16` | BF16 |
 | Qwen3.6 35B-A3B | `qwen3.6-35b-a3b-fp8` | FP8 |
 | Qwen3.8 27B | `qwen3.8-27b-fp8` | FP8 |
 | Qwen3.8 27B | `qwen3.8-27b-nvfp4` | NVFP4 and FP8; B200 only |
@@ -63,6 +65,8 @@ tensor cores of a B200.
 | --- | --- | --- |
 | DiffusionGemma 26B-A4B | `diffusion-gemma-26b-a4b-fp8` | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY` |
 | Decision 2.0 Kai 0.6B | `decision-2.0-kai-0.6b-bf16` | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY` |
+| Base Labs mammoth-1 | `mammoth-1-bf16` | `AI.IF` filters, `AI.SCORE`, `AI.CLASSIFY`; H100 SXM and B200 only |
+| Base Labs elephant-1 | `elephant-1-bf16` | `AI.IF` filters, `AI.SCORE`, `AI.CLASSIFY`; H100 SXM and B200 only |
 | Qwen3 Reranker 0.6B | `qwen3-reranker-0.6b-bf16` | `AI.SCORE` |
 | Qwen3 Reranker 4B | `qwen3-reranker-4b-bf16` | `AI.SCORE` |
 | d1-2B | `d1-2b-bf16` | `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`, `AI.EXTRACT`, `AI.EXTRACT_SPAN` |
@@ -80,6 +84,28 @@ Decision 2.0 Kai and the Qwen3 rerankers score supplied answers instead of
 writing text. Check their scores against labeled examples before choosing a
 threshold.
 
+### mammoth-1 and elephant-1
+
+mammoth-1 and elephant-1 are Base Labs' decision models, fine-tunes of
+Qwen3.5 27B and Qwen3.5 9B. They answer a question about a document with a
+probability for every option, read from the output head's logits of the
+option letters.
+
+Full-attention layers read each prompt as two blocks. Block one holds the
+system turn and the document, and reads every token in block one in both
+directions. Block two holds the question and its options, and reads every
+token in both blocks. Quail runs the two-block mask directly: each document
+and its system turn are computed once, and every question about the document
+reads the saved KV. Documents cannot share KV with one another because each
+document's block includes the system turn.
+
+They run on H100 SXM and B200 and read one document per prompt, so Quail refuses
+joins and prompts over two tables.
+
+```python
+config = quail.EngineConfig(model="mammoth-1-bf16", device="h100-sxm")
+```
+
 ## GPUs
 
 Set `device` to the value for your GPU:
@@ -88,7 +114,7 @@ Set `device` to the value for your GPU:
 | --- | --- | --- |
 | NVIDIA H100 SXM | `h100-sxm` | All supported models except `qwen3.8-27b-nvfp4` |
 | NVIDIA B200 | `b200` | All supported models |
-| NVIDIA RTX PRO 6000 Blackwell Server Edition | `rtx-pro-6000-blackwell-server` | All supported models except `qwen3.8-27b-nvfp4` |
+| NVIDIA RTX PRO 6000 Blackwell Server Edition | `rtx-pro-6000-blackwell-server` | All supported models except `qwen3.8-27b-nvfp4`, mammoth-1, and elephant-1 |
 | NVIDIA L40S | `l40s` | Qwen3, Qwen3 rerankers, Decision 2.0 Kai, LFM2, and d1-2B |
 
 The L40S cannot run DiffusionGemma or the Qwen3.5, Qwen3.6, and Qwen3.8

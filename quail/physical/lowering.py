@@ -203,6 +203,23 @@ def option_aliases(codes, tokenizer) -> tuple[str, ...]:
     return tuple(found)
 
 
+# Jev's limit on one choice's options; the planner's MAX_LETTERS
+MAX_LETTERS = 255
+
+
+def code_letters(count: int, tokenizer, opener: str) -> tuple[str, ...]:
+    """The codes a coded prompt lists its labels under, in option order.
+
+    Each is one token of its own, a token no earlier code took, and still
+    the same single token right after `opener`, the text the answer follows.
+
+    Raises:
+        CompileError: The tokenizer keeps fewer than count codes.
+    """
+    found, _ = _call("code_letters", [count, opener], tokenizer)
+    return tuple(found)
+
+
 def option_spellings(codes, tokenizer) -> tuple[tuple, ...]:
     """Per option, the token ids d1 scores: its code, then " code" when one token."""
     found, vocabulary = _call("option_spellings", [list(codes)], tokenizer)

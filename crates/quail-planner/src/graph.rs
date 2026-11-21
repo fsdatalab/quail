@@ -24,6 +24,7 @@ use crate::expressions::asked_call;
 use crate::expressions::{argument_alias, call_aliases, condition_columns, repr_str};
 use crate::operators::{ColumnTest, Operators, SemanticColumn};
 use crate::pricing::PlanPricer;
+use crate::prompts::prompt_layout;
 use crate::results::limit_node;
 use crate::retention::{group_sequence, streamed_aliases};
 use crate::scores::score_spec;
@@ -137,9 +138,15 @@ fn score_input_tokens(
 ) -> Result<(i64, i64), CompileError> {
     let parts = &spec.prompt_token_parts;
     let canvas = context.model.canvas_tokens;
+    let close = prompt_layout(&context.model.prompt_layout)?.document_close;
+    let close_tokens = if close.is_empty() {
+        0
+    } else {
+        (context.tokenizer)(close)?.len() as i64
+    };
     let mut longest = Vec::new();
     for alias in &spec.aliases {
-        longest.push(context.lengths(alias)?.iter().copied().max().unwrap_or(0));
+        longest.push(context.lengths(alias)?.iter().copied().max().unwrap_or(0) + close_tokens);
     }
     if spec.aliases.len() == 1 {
         return Ok((
@@ -1483,6 +1490,13 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
             if model.answer_canvas.is_some() {
                 settings.insert("canvas_draws".into(), Value::from(context.canvas_draws));
             }
+        }
+        let close = prompt_layout(&model.prompt_layout)?.document_close;
+        if !close.is_empty() {
+            settings.insert(
+                "document_close".into(),
+                Value::from((context.tokenizer)(close)?),
+            );
         }
         let last = self.nodes.last().expect("a node");
         let root = port_of(last.id(), last.outputs()[0].0.clone());

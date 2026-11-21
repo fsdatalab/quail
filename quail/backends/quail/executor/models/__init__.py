@@ -32,6 +32,11 @@ def build_pipeline(spec, model, arena, **kwargs) -> ModelPipeline:
         raise ValueError(
             f"no forward pass for architecture {spec.arch!r}; "
             f"known: {sorted(PIPELINES)}") from None
+    mask = "document_isolated" if spec.bidirectional else "causal"
+    if mask not in cls.masks:
+        raise ValueError(f"the {spec.arch} forward pass runs only the "
+                         f"{', '.join(cls.masks)} mask, not {spec.name}'s "
+                         f"{mask}")
     return cls(model, arena, spec=spec, **kwargs)
 
 

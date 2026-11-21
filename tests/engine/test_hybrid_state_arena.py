@@ -36,3 +36,19 @@ def test_a_full_pool_evicts_the_lowest_priority_document_with_its_slot():
     assert arena.is_resident(("a", 1))
     assert arena.evicted_keys == 1
     assert arena.num_state_slots == 2
+
+
+def test_row_class_warmup_skips_an_arena_with_too_few_checkpoint_slots():
+    from types import SimpleNamespace
+
+    from quail.backends.quail.executor.warmup import _warm_row_classes
+
+    # mammoth-1 on an H100 has about 25 checkpoint slots; 17 readers
+    # need 2 each and the filler 1
+    for slots in (1, 34):
+        activated = []
+        arena = SimpleNamespace(
+            num_state_slots=slots,
+            activate=lambda key, *_, found=activated, **__: found.append(key))
+        _warm_row_classes(None, arena, pipeline=None, attention_mode="unified")
+        assert activated == []

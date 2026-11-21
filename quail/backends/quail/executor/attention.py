@@ -367,6 +367,13 @@ def triton_splitkv_decode(q3, kp, vp, cu_q, max_q, seqused_k, max_seqused_k,
 # Only pipelines that set tree_attention run the tree path.
 ATTENTION_PATHS = ("unified", "tree")
 
+# Which keys a unified chunk's rows read. "causal" reads earlier rows.
+# "document_isolated" serves a bidirectional model: it packs the document
+# as its own sequence, so its KV never reads a question and any number of
+# questions reuse it, and each row reads every row of its sequence, a
+# question reading the document and itself.
+MASKS = ("causal", "document_isolated")
+
 
 def flash_attention_version(capability: tuple[int, int]) -> int:
     """Select the attention implementation for a supported CUDA architecture.
@@ -1469,10 +1476,12 @@ class Engine:
 
     def attention_unified(self, q3, k3, v3, meta, *, softmax_scale=None,
                           window=None, output=None):
-        """Write current KV to its cache slots, then one causal paged attention call.
+        """Write current KV to its cache slots, then one paged attention call.
 
-        The call reads retained and current KV together. Takes
-        (rows, heads, dim) tensors and returns (rows, heads * dim).
+        The call reads retained and current KV together. It is causal
+        unless the chunk was packed with a non-causal mask, in which
+        each row reads every key of its sequence. Takes (rows, heads,
+        dim) tensors and returns (rows, heads * dim).
 
         When meta["unified"] is None (no arena pages), falls back to
         a plain varlen causal call with no scatter or paged read.
@@ -1549,7 +1558,7 @@ class Engine:
         else:
             out = self._paged(
                 q3, kp, vp, unified["cu_q"], unified["max_q"], pool["used"],
-                pool["max_used"], pool["table"], causal=True,
+                pool["max_used"], pool["table"], causal=unified["causal"],
                 softmax_scale=softmax_scale, window=behind, metadata=pool,
                 output=output)
         if canvas is not None:

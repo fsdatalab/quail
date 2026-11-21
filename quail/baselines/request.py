@@ -199,6 +199,10 @@ class RequestBackend:
             return SupportResult.reject(
                 f"the {label} request backends use one model copy on one GPU"
             )
+        if model.bidirectional:
+            return SupportResult.reject(
+                f"{label} does not support model {model.name!r}: it runs "
+                f"causal attention, not the {model.attention_mask} mask")
         if model.arch in UNSERVED_ARCHS:
             return SupportResult.reject(
                 f"{label} does not support model {model.name!r}: it has no "

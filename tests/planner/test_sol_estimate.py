@@ -12,7 +12,7 @@ import quail
 from quail.api.config import EngineConfig
 from quail.catalog import DocumentProvider
 from quail.physical import decode_plan_value
-from quail.specs import DIFFUSION_GEMMA_26B_FP8, H100_USD_PER_HOUR
+from quail.specs import DIFFUSION_GEMMA_26B_FP8, H100_USD_PER_HOUR, MODELS
 
 FILTER = "Judge the review.\n\n{0}\nAnswer TRUE or FALSE."
 JOIN = "Judge the pair.\n\n{0}\nAspect: {1}\nAnswer TRUE or FALSE."
@@ -61,6 +61,36 @@ def _answer(prompt, assignment):
     if len(prompt.args) == 1:
         return assignment["r"] != 1
     return (assignment["r"], assignment["a"]) == (0, 0)
+
+
+def test_a_bidirectional_model_reads_each_document_block_whole(tmp_path):
+    causal = MODELS["qwen3.5-4b-bf16"]
+    bidirectional = replace(causal, attention_mask="document_isolated")
+    with _session(tmp_path) as sess:
+        query = sess.sql(
+            f"SELECT r.id FROM reviews r "
+            f"WHERE AI_FILTER(PROMPT({_quoted(FILTER)}, r.body))")
+        lowered = quail.lower_prompt(_filter_prompt(query, "r"), sess.tokenizer)
+        unshared = quail.speed_of_light_estimate(
+            query, _answer, model=causal, credit_shared_prefixes=False)
+        block = quail.speed_of_light_estimate(query, _answer,
+                                              model=bidirectional)
+        with pytest.raises(ValueError, match="no prefix is shared"):
+            quail.speed_of_light_estimate(query, _answer, model=bidirectional,
+                                          credit_shared_prefixes=True)
+
+    # no sharing across documents; each document block and each question
+    # block reads all of its keys, not the causal half
+    def extra(tokens):
+        return tokens * (tokens - 1) / 2
+
+    question = lowered.tail_tokens
+    blocks = sum(extra(lowered.preamble_tokens + length) + extra(question)
+                 for length in _lengths(REVIEWS))
+    assert not block.credit_shared_prefixes
+    assert block.fresh_tokens == unshared.fresh_tokens
+    assert block.work.pairs == unshared.work.pairs + blocks
+    assert block.seconds >= unshared.seconds
 
 
 def test_distinct_prefix_estimates_for_filters_and_joins(tmp_path):

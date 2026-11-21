@@ -1,0 +1,25 @@
+# The same layer layout as qwen3.5-4b-bf16: every fourth layer is
+# attention (layers 3, 7, ..., 31); the other 24 are Gated DeltaNet.
+base = "qwen3.5-4b-bf16"
+name = "qwen3.5-9b-bf16"
+params = 6_919_290_880  # attention, Gated DeltaNet, and MLP
+                        # projections plus the convolution weights;
+                        # norms and the embedding excluded
+hidden = 4096
+ffn_width = 24576  # gate_up output: 2 x 12288 intermediate
+hf_name = "Qwen/Qwen3.5-9B"
+revision = "c202236235762e1c871ad0ccb60c8ee5ba337b9a"
+w_mem_bytes = 18_194_128_000  # estimated, not measured: the
+                              # 17,907,606,528 bytes of the text
+                              # tensors vLLM loads (the MTP layers
+                              # excluded), times the 1.016 that
+                              # qwen3.5-4b-bf16 measured
+tied_head = false
+max_num_seqs = 2_047  # the Gated DeltaNet decode grid cap, as for
+                      # qwen3.5-4b; started with 3,024 state blocks,
+                      # /results/ablations/
+                      # qwen3.5-9b-bf16-vllm-limits-2047.json
+# the vision tower's bf16 weights (0.91 GB, from the checkpoint),
+# 1 GiB for an encoder call of 32,768 patches, and a full chunk's
+# image embeddings; an estimate, not a measurement
+vision_mem_bytes = 2_960_000_000

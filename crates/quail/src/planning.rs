@@ -21,7 +21,9 @@ use arrow::row::{RowConverter, SortField};
 use quail_datafusion::derive::expressions::PhysicalValue;
 use quail_planner::context::PlanningContext;
 use quail_planner::error::{CompileError, Refusal};
-use quail_planner::inputs::{HfTokenizer, PrefixIndex, TokenStore, TokenStoreWriter, last_tokens};
+use quail_planner::inputs::{
+    HfTokenizer, PrefixIndex, PrefixTree, TokenStore, TokenStoreWriter, last_tokens,
+};
 use quail_planner::operators::Operators;
 use quail_planner::operators::{Scan, ScanColumn};
 use quail_planner::optimize::Selected;
@@ -236,7 +238,18 @@ impl Planner {
                         .collect(),
                 );
             }
-            let tree = PrefixIndex::new(&documents).tree(page_tokens);
+            // a document_isolated model reads each document as one block,
+            // so a shared prefix's KV differs from document to document
+            let tree = if settings.model["attention_mask"] == "document_isolated" {
+                let count = store.lengths().len();
+                PrefixTree {
+                    order: (0..count).collect(),
+                    parent: vec![None; count],
+                    shared: vec![0; count],
+                }
+            } else {
+                PrefixIndex::new(&documents).tree(page_tokens)
+            };
             reader_groups.insert(
                 scan.alias.clone(),
                 tree.reader_groups(store.lengths())

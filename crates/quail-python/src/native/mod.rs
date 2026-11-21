@@ -681,6 +681,11 @@ fn prompt_lowering<'py>(
             &from_json::<Vec<String>>(&get(0))?,
             &tokens,
         )),
+        "code_letters" => lowering_result(lower::code_letters(
+            from_json::<usize>(&get(0))?,
+            &tokens,
+            &from_json::<String>(&get(1))?,
+        )),
         "read_slot_offsets" => lowering_result(lower::read_slot_offsets(
             &from_json::<String>(&get(0))?,
             &from_json::<Vec<String>>(&get(1))?,

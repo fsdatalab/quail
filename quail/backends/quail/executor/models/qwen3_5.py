@@ -43,6 +43,7 @@ class Qwen35Pipeline(ModelPipeline):
     warm_row_classes = False
     warm_joins = False
     gemm_warmup = False
+    masks = ("causal", "document_isolated")
     # the vision encoder, and the images the running region's documents
     # hold (executor/images.py)
     visual = None
@@ -50,6 +51,7 @@ class Qwen35Pipeline(ModelPipeline):
 
     def __init__(self, model, arena, *, spec, kernels="quail",
                  engine_class=Engine):
+        self.mask = "document_isolated" if spec.bidirectional else "causal"
         text = getattr(model, "language_model", model)
         self.spec = spec
         self.visual = getattr(model, "visual", None)

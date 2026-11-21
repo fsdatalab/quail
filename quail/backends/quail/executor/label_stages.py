@@ -304,15 +304,21 @@ class ClassifyStages:
         For individual documents the question is the frame and the one
         request is every option block and the closing line. For joined
         rows the anchor's note and the partner's label are the frame and
-        each partner's request is its document and the whole tail.
+        each partner's request is its document and the whole tail. A
+        model with coded options has no frame and no option blocks: its
+        request is the whole tail, and every label is read at its last row.
         """
         head = state.loaded_model.decision_head
         if head is None:
             raise ValueError("the decision_choice rule needs a decision model")
         _, tail = spec.prompt_token_parts
         frame, request = list(tail[:spec.frame_tokens]), list(tail[spec.frame_tokens:])
-        ends = np.cumsum([len(block) for block in spec.label_token_ids])
-        offsets = [len(request) - int(end) for end in ends] + [0]
+        if spec.label_token_ids:
+            ends = np.cumsum([len(block) for block in spec.label_token_ids])
+            offsets = [len(request) - int(end) for end in ends] + [0]
+        else:
+            # coded options: every label is read at the request's last row
+            offsets = [0] * (len(spec.labels) + 1)
         self.readout = readout = AsyncDecisionChoices(state.torch, head, offsets)
         self.labels = np.full(count, None, dtype=object)
         if spec.probabilities:

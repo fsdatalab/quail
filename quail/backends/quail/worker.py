@@ -28,11 +28,13 @@ from quail.backends.quail.executor.readout import (
     AsyncDecisions,
     AsyncDecisionScores,
     DecisionHead,
+    LetterReadout,
 )
 from quail.backends.quail.executor.warmup import warm_kernels
 from quail.backends.quail.graph import payload_tables, serve_region
 from quail.backends.resources import freeze_loaded_objects, release_models
 from quail.common import budgets
+from quail.common.tokens import close_documents
 from quail.physical.plan import graph_from_envelope
 from quail.progress import (
     say,
@@ -76,6 +78,7 @@ class LoadedGpu:
                                 moe_backend=spec.moe_backend,
                                 text_only=spec.vision_tower,
                                 images=(spec.vision_tower
+                                        and spec.role != "decision"
                                         and not spec.checkpoint_layers),
                                 num_layers=(spec.layers if spec.checkpoint_layers
                                             else None),
@@ -116,8 +119,14 @@ class LoadedGpu:
         if spec.role == "decision":
             path = resolve_model_path(model_path or spec.hf_name,
                                       None if model_path else spec.revision)
-            self.decision_head = DecisionHead.load(torch, F, path)
-            self.decision_offsets = decision_offsets(spec, path)
+            if spec.readout == "slot_lm":
+                # every option read at the prompt's last row
+                self.decision_head = LetterReadout.load(
+                    torch, F, path, turn_suffix=spec.turn_suffix)
+                self.decision_offsets = (0, 0, 0)
+            else:
+                self.decision_head = DecisionHead.load(torch, F, path)
+                self.decision_offsets = decision_offsets(spec, path)
         self.pipeline = build_pipeline(spec, self.model, self.arena)
         self.pipeline.piecewise_graphs = PiecewiseGraphs.for_specs(
             self.pipeline, spec, device)
@@ -171,10 +180,13 @@ class LoadedGpu:
         rows = AnswerRows(self.torch, self.F, self.model, true_ids, false_ids)
         async_scores = None
         if self.decision_head is not None:
+            # a filter lists yes (A) then no (B); yes/no readouts take no first
+            yes_no = (self.decision_head.reordered((1, 0))
+                      if self.spec.readout == "slot_lm" else self.decision_head)
             self.async_ans = AsyncDecisions(
-                self.torch, self.decision_head, self.decision_offsets)
+                self.torch, yes_no, self.decision_offsets)
             async_scores = AsyncDecisionScores(
-                self.torch, self.decision_head, self.decision_offsets)
+                self.torch, yes_no, self.decision_offsets)
         else:
             self.async_ans = AsyncAnswers(self.torch, rows)
         self.chunk_tokens = chunk_tokens
@@ -351,7 +363,8 @@ def _execution_state(gpu, payload, registry) -> dict:
     """Return the executor's state for one GPU and query."""
     return {
         "gpu": gpu,
-        "documents": payload["documents"],
+        "documents": close_documents(payload["documents"],
+                                     payload.get("document_close", ())),
         "texts": payload.get("texts", {}),
         "columns": payload.get("columns", {}),
         "runtimes": registry.runtimes,

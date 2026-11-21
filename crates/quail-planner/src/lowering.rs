@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{CompileError, compile_error};
 use crate::expressions::{argument_alias, repr_str};
-use crate::prompts::{Turn, bind_classify_prompt, bind_join_prompt, bind_prompt, prompt_layout};
+use crate::prompts::{
+    Turn, bind_classify_prompt, bind_join_prompt, bind_prompt, code_candidates, prompt_layout,
+};
 
 /// Text -> token ids, without special tokens.
 pub type Tokenizer<'a> = dyn Fn(&str) -> Result<Vec<i64>, CompileError> + 'a;
@@ -19,7 +21,7 @@ pub type Tokenizer<'a> = dyn Fn(&str) -> Result<Vec<i64>, CompileError> + 'a;
 pub type Decoder<'a> = dyn Fn(&[i64]) -> Result<String, CompileError> + 'a;
 
 /// AI.CLASSIFY's most labels; Jev's limit on one choice's options.
-pub const MAX_LETTERS: usize = 255;
+pub use crate::prompts::MAX_LETTERS;
 
 /// A set-attention question's state tail length and later-question header:
 /// the tokens of the tail's first segment, which the state keeps, and the
@@ -179,17 +181,52 @@ pub fn choice_letters(
     Ok(letters)
 }
 
+/// The codes a coded prompt lists its labels under.
+///
+/// Decision 3.0's rule (`d3_format.answer_codes`), shared by Base Labs'
+/// models: candidates in `code_candidates` order, each kept when it is
+/// one token of its own, a token no earlier code took, and still the
+/// same single token right after the assistant turn opens.
+///
+/// # Errors
+///
+/// The tokenizer keeps fewer than `count` codes, or it fails.
+pub fn code_letters(
+    count: usize,
+    tokenizer: &Tokenizer,
+    opener: &str,
+) -> Result<Vec<String>, CompileError> {
+    let opened = tokenizer(opener)?;
+    let (mut letters, mut taken) = (Vec::new(), BTreeSet::new());
+    for code in code_candidates() {
+        let ids = tokenizer(&code)?;
+        if ids.len() != 1 || taken.contains(&ids[0]) {
+            continue;
+        }
+        let mut expected = opened.clone();
+        expected.push(ids[0]);
+        if tokenizer(&format!("{opener}{code}"))? != expected {
+            continue;
+        }
+        taken.insert(ids[0]);
+        letters.push(code);
+        if letters.len() == count {
+            return Ok(letters);
+        }
+    }
+    compile_error(format!(
+        "the tokenizer keeps {} one-token codes; the prompt names {count} labels",
+        letters.len()
+    ))
+}
+
 fn option_fallbacks() -> Vec<String> {
-    let letters: Vec<String> = ('A'..='Z').map(String::from).collect();
-    let mut found = letters.clone();
+    let candidates = code_candidates();
+    let mut found = candidates[..26].to_vec();
     found.extend((0..100).map(|index| format!("{index:02}")));
     found.extend(('a'..='z').map(String::from));
     found.extend((0..200).map(|index| format!("#{index}")));
-    for first in &letters {
-        for second in &letters {
-            found.push(format!("{first}{second}"));
-        }
-    }
+    found.extend_from_slice(&candidates[26..]);
     found
 }
 
@@ -335,6 +372,11 @@ pub fn lower_prompt(prompt: &Prompt, tokenizer: &Tokenizer) -> Result<LoweredPro
         if codes != prompt.letters {
             return lower_prompt(&rebind(&codes)?, tokenizer);
         }
+    }
+    if prompt.kind == "label" && prompt.letters.is_empty() && layout.options_label.is_some() {
+        // the codes a coded classification lists depend on the tokenizer
+        let codes = code_letters(prompt.categories.len(), tokenizer, &prompt.turn.1)?;
+        return lower_prompt(&rebind(&codes)?, tokenizer);
     }
     let mut lettered = None;
     if prompt.kind == "label"
@@ -565,6 +607,9 @@ pub fn classify_prompt_tokens(
 
 /// A decision classification's tail tokens, frame length, and option blocks.
 ///
+/// A layout with coded options has no frame and no blocks: the whole
+/// tail is one request, and every option is read at its last row.
+///
 /// # Errors
 ///
 /// The tokenizer fails.
@@ -572,6 +617,12 @@ pub fn choice_token_parts(
     lowered: &LoweredPrompt,
     tokenizer: &Tokenizer,
 ) -> Result<ChoiceTokens, CompileError> {
+    if prompt_layout(&lowered.prompt.layout)?
+        .options_label
+        .is_some()
+    {
+        return Ok((lowered.tail_token_ids.clone(), 0, Vec::new()));
+    }
     let segments = &lowered.prompt.tail_segments;
     let frame = tokenizer(&segments[0])?.len() as i64;
     let mut blocks = Vec::new();

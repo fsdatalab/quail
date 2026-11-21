@@ -370,7 +370,7 @@ def speed_of_light_estimate(
     model: ModelSpec | None = None,
     device: DeviceSpec | None = None,
     chunk_tokens: int | None = None,
-    credit_shared_prefixes: bool = True,
+    credit_shared_prefixes: bool | None = None,
 ) -> SpeedOfLightEstimate:
     """Return the ideal time of one query on one device.
 
@@ -392,15 +392,26 @@ def speed_of_light_estimate(
         credit_shared_prefixes: True computes each distinct token
             prefix once across documents and aliases of one column.
             False computes each alias's document once and reuses it
-            only across that document's own questions.
+            only across that document's own questions. None, the
+            default, is False for a bidirectional model, which reads
+            each document as one block of all-pairs attention, and True
+            otherwise.
 
     Raises:
         NotImplementedError: The plan holds an operator the estimate
             does not price, named in the message.
-        ValueError: The query classifies and no label oracle was given.
+        ValueError: The query classifies and no label oracle was
+            given, or credit_shared_prefixes is True for a
+            bidirectional model.
     """
     model = model or query.session.model
     device = device or query.session.device
+    if credit_shared_prefixes is None:
+        credit_shared_prefixes = not model.bidirectional
+    elif credit_shared_prefixes and model.bidirectional:
+        raise ValueError(
+            f"{model.name} reads each document as one bidirectional block, "
+            f"so no prefix is shared across documents")
     chunk = (budgets.chunk_budget(model, device) if chunk_tokens is None
              else chunk_tokens)
     stores = query.token_inputs()

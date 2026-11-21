@@ -293,12 +293,13 @@ class ScoreOperator(SingleNodeOperator):
         if (len(spec.aliases) == 1 and spec.draws > 1
                 and state.loaded_model.pipeline.canvas_ids):
             self._drawn(documents)
-        elif len(spec.aliases) == 1 and (spec.share_prefixes
-                                         or (self.skip is not None and parts[1])):
-            # admission skips whole documents, so a score that skips rows
-            # gives each document its own prefix, sharing the prompt
-            # head's pages; with no prompt after the document, it asks
-            # every row
+        elif len(spec.aliases) == 1 and (
+                state.loaded_model.pipeline.mask != "causal"
+                or spec.share_prefixes
+                or (self.skip is not None and parts[1])):
+            # admission skips whole documents, and a non-causal mask reads each
+            # document block whole, so each document takes its own prefix; with
+            # no prompt after the document, a skipped causal score asks every row
             self._shared(documents)
         else:
             self._grouped(documents)
@@ -381,13 +382,21 @@ class ScoreOperator(SingleNodeOperator):
             return True
 
         prefixes = DocumentPrefixes(head, documents[alias], document_ids)
-        self.stages = [Stage(suffixes=[[tail[-1]]], readout=score_readout(self.state),
-                             frame=list(tail[:-1]), decide=keep, single=True,
+        # the question is the frame and its last token the cue; a mask
+        # that keeps no question KV reads the whole tail as the suffix and
+        # shares no prefix, since a prefix's KV depends on the document
+        causal = self.state.loaded_model.pipeline.mask == "causal"
+        frame, cue = ((list(tail[:-1]), [tail[-1]]) if causal
+                      else ([], list(tail)))
+        self.stages = [Stage(suffixes=[cue], readout=score_readout(self.state),
+                             frame=frame, decide=keep, single=True,
                              label=f"score {spec.name}")]
         self.total = sum(len(head) + len(documents[alias][document_id]) + len(tail)
                          for document_id in document_ids)
-        self.table = _table(prefixes, self._keys(prefixes), shared_prefix_tree(
-            spec.name, prefixes, self.state.loaded_model.arena))
+        tree = (shared_prefix_tree(spec.name, prefixes,
+                                   self.state.loaded_model.arena)
+                if causal else None)
+        self.table = _table(prefixes, self._keys(prefixes), tree)
 
     def _drawn(self, documents) -> None:
         """Score documents with reproducible diffusion draws.

@@ -127,6 +127,10 @@ pub struct ModelSpec {
     pub arch: String,
     #[serde(default = "generative")]
     pub role: String,
+    /// A decision model's head: empty is Decision 2.0's option head,
+    /// "slot_lm" the output head's logits of the option letters.
+    #[serde(default)]
+    pub readout: String,
     #[serde(default)]
     pub decision_head_dim: i64,
     #[serde(default)]
@@ -235,6 +239,13 @@ impl ModelSpec {
             self.layer_kind(layer),
             "full_attention" | "sliding_attention"
         )
+    }
+
+    /// Whether the full-attention layers read whole blocks, earlier and
+    /// later tokens, as a "document_isolated" model's do; its Gated
+    /// DeltaNet layers stay causal.
+    pub fn bidirectional(&self) -> bool {
+        self.attention_mask == "document_isolated"
     }
 
     /// Whether a document's KV can be kept and read again.

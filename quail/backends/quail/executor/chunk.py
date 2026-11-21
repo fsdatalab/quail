@@ -11,7 +11,7 @@ from typing import Any
 
 import numpy as np
 
-from quail.backends.quail.executor.attention import ATTENTION_PATHS
+from quail.backends.quail.executor.attention import ATTENTION_PATHS, MASKS
 from quail.backends.quail.executor.gdn import plan_phases
 
 
@@ -504,7 +504,7 @@ class _PoolBuilder:
 
 def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                attention_mode, staging=None, canvas=(), answer_row=0,
-               decode=None):
+               decode=None, mask="causal"):
     """Pack scheduled document groups into tensors for one forward pass.
 
     Groups remain in scheduler order. Each group contains key, prefix, f
@@ -524,6 +524,12 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
     attention cannot mix paged and unpaged groups. Canvas rows use unified
     attention and their KV is not retained.
 
+    A non-causal mask (see attention.MASKS) reads each document whole:
+    no group borrows a prefix or keeps suffix KV, and a document and each
+    suffix are their own sequences, each row reading every row of its
+    sequence. It runs the unified path over paged groups only, with no
+    decode rows.
+
     Args:
         torch: Torch module.
         arena: KV arena holding document pages.
@@ -537,12 +543,14 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         decode: DecodeRows to pack after the groups, or None. They run
             the unified path; their input ids are placeholders the
             caller fills on the GPU.
+        mask: The keys each row reads, one of attention.MASKS.
 
     Returns:
         A Chunk containing token tensors, attention metadata, and readout rows.
 
     Raises:
-        ValueError: The attention path, canvas row, or group layout is invalid.
+        ValueError: The attention path, mask, canvas row, or group layout
+            is invalid.
         ArenaFullError: The arena has too few free pages for suffixes.
     """
     def stage(name, values, dtype):
@@ -554,6 +562,11 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         raise ValueError(
             f"attention_mode must be one of {ATTENTION_PATHS}, "
             f"got {attention_mode!r}")
+    if mask not in MASKS:
+        raise ValueError(f"mask must be one of {MASKS}, got {mask!r}")
+    if mask != "causal" and (attention_mode != "unified" or decode is not None):
+        raise ValueError(f"the {mask} mask runs the unified path with no "
+                         f"decode rows")
     canvas = tuple(canvas)
     if attention_mode != "unified" and (
             canvas or any(g.get("canvas") is not None for g in groups)):
@@ -713,11 +726,11 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             elif n and g.get("read_mask") is not None:
                 # the marked rows of the one suffix carry the answers
                 id_parts.append(sufs.ids)
-                mask = np.asarray(g["read_mask"], dtype=bool)
-                if n != 1 or len(mask) != total:
+                marked = np.asarray(g["read_mask"], dtype=bool)
+                if n != 1 or len(marked) != total:
                     raise ValueError(
                         f"group {key!r}: read_mask marks one suffix's rows")
-                reads = s_row0 + np.flatnonzero(mask)
+                reads = s_row0 + np.flatnonzero(marked)
                 state_reads = g.get("state_reads")
                 if state_reads is not None:
                     # a pointer read's document rows, read before its slots
@@ -897,8 +910,14 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
 
     unified = None
     temporary_keys = []
-    if attention_mode == "unified" and (unified_groups or decode is not None):
+    if attention_mode == "unified" and (
+            unified_groups or decode is not None
+            or (mask != "causal" and layout)):
         if len(unified_groups) != len(layout):
+            if mask != "causal":
+                raise ValueError(
+                    f"the {mask} mask reads each document from its "
+                    f"pages; every group needs pages")
             raise ValueError(
                 "a unified chunk cannot mix paged and unpaged "
                 "groups: the one paged call covers every row or "
@@ -931,6 +950,16 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 direct = len(begins) == 1 and all(
                     logical_start + count - view.start <= view.rows.numel()
                     for view in views)
+                if mask != "causal":
+                    if spec["start"]:
+                        raise ValueError(
+                            f"group {key!r}: the {mask} mask reads each "
+                            f"document whole, so it cannot borrow a prefix")
+                    if spec["keeps"]:
+                        raise ValueError(
+                            f"group {key!r}: the {mask} mask keeps no suffix "
+                            f"KV; a kept token would read later questions")
+                    direct = False
                 suffix_total = int((ends - begins).sum())
                 if spec["keeps"] and not direct:
                     raise ValueError(
@@ -1012,6 +1041,7 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                      for index, pool in enumerate(pools)]
             unified = dict(
                 built[0],
+                causal=mask == "causal",
                 cu_q=stage("unified_cu_q", cu_q, torch.int32),
                 cu_q_host=cu_q,
                 max_q=max(b - a for a, b in zip(cu_q, cu_q[1:])),

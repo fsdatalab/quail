@@ -565,8 +565,8 @@ class JoinAdmission:
             if fresh + first > self.chunk_budget:
                 raise OversizedDocumentError(a, (
                     f"its {fresh}-token prefix and {first}-token first request "
-                    f"exceed the {self.chunk_budget}-token forward pass, and an "
-                    f"unpaged run does not split a prefix across passes"))
+                    f"exceed the {self.chunk_budget}-token forward pass without "
+                    f"chunked prefill"))
         carried = 0 if resident_pages is not None else prefix
         self.prefix.append(prefix)
         self._lists.append(lists)

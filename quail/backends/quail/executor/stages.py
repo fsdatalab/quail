@@ -178,17 +178,19 @@ def shared_preamble_tokens(question_ids) -> int:
     return p
 
 
-def filter_stages(question_ids, readout) -> list:
+def filter_stages(question_ids, readout, frames=True) -> list:
     """Build one filter stage per question with a shared prompt frame.
 
     The preamble common to every question is written into the
     document's KV once, at the first stage; each stage's suffix is its
-    question past the preamble.
+    question past the preamble. With frames=False, for a mask that
+    keeps no question KV, nothing is written and each suffix is its
+    whole question.
 
     Raises:
         ValueError: A question has no tokens past the shared preamble.
     """
-    p = shared_preamble_tokens(question_ids)
+    p = shared_preamble_tokens(question_ids) if frames else 0
     frame = list(question_ids[0][:p])
     stages = []
     for index, question in enumerate(question_ids):
