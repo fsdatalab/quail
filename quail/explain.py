@@ -85,25 +85,3 @@ def explain(logical, operators, physical, *, verbose: bool = False, result=None,
                               "metrics": _metrics(result.node_metrics)}
     return _quail_native.explain_plan(_json(request))
 
-
-def physical_tree(graph, *, verbose: bool = False, node_metrics=None,
-                  report=None) -> str:
-    """Format an executed graph with each node's measured rows and time.
-
-    Args:
-        graph: The executed physical graph.
-        verbose: Include node ids, ports, and fields.
-        node_metrics: Measured metrics by node id.
-        report: The execution report, for each predicate's measurements.
-
-    Returns:
-        The tree text.
-    """
-    request = {
-        "tree_only": True,
-        "verbose": verbose,
-        "physical": {"graph": json.loads(graph.to_json())},
-        "run": {"report": report or {},
-                "metrics": _metrics(node_metrics or {})},
-    }
-    return _quail_native.explain_plan(_json(request))

@@ -399,7 +399,9 @@ class QueryResult:
 
     def explain(self, *, verbose: bool = False) -> str:
         """Return the executed operator tree with measured rows and time."""
-        from quail.explain import physical_tree
+        import _quail_native
+
+        from quail.explain import _json, _metrics
 
         if self.plan is None:
             if self.region_results:
@@ -407,8 +409,14 @@ class QueryResult:
                     f"model region {key + 1}:\n{region.explain(verbose=verbose)}"
                     for key, region in sorted(self.region_results.items()))
             return "no physical plan was executed"
-        tree = physical_tree(self.plan, verbose=verbose,
-                             node_metrics=self.node_metrics, report=self.report)
+        request = {
+            "tree_only": True,
+            "verbose": verbose,
+            "physical": {"graph": json.loads(self.plan.to_json())},
+            "run": {"report": self.report or {},
+                "metrics": _metrics(self.node_metrics or {})},
+        }
+        tree = _quail_native.explain_plan(_json(request))
         if self.datafusion_plan is None:
             return tree
         return f"DataFusion:\n{self.datafusion_plan}\n\nmodel region:\n{tree}"
