@@ -11,7 +11,7 @@ use crate::physical::{
     AiClassifyAttributes, AiExtractAttributes, AiFilterAttributes, AiJoinAttributes,
     AiMapAttributes, AiSaeFeaturesAttributes, AiScoreAttributes, Asked, BarrierAttributes,
     ClassifySpec, ColumnRef, Expression, FilterAttributes, HashJoinAttributes, ModelCall, Node,
-    PhysicalNode, PortRef, Prompt, ScanAttributes, ScoreSpec, ValueExpression, input_ports, port,
+    PhysicalNode, PortRef, Prompt, ScanAttributes, ValueExpression, input_ports, port,
 };
 use serde_json::{Map, Value};
 
@@ -130,34 +130,6 @@ pub fn hash_join_nodes(
     nodes
 }
 
-/// The longest input of a score: its resident prefix and streamed suffix
-/// tokens, as `score_input_tokens`.
-fn score_input_tokens(
-    spec: &ScoreSpec,
-    context: &PlanningContext,
-) -> Result<(i64, i64), CompileError> {
-    let parts = &spec.prompt_token_parts;
-    let canvas = context.model.canvas_tokens;
-    let close = prompt_layout(&context.model.prompt_layout)?.document_close;
-    let close_tokens = if close.is_empty() {
-        0
-    } else {
-        (context.tokenizer)(close)?.len() as i64
-    };
-    let mut longest = Vec::new();
-    for alias in &spec.aliases {
-        longest.push(context.lengths(alias)?.iter().copied().max().unwrap_or(0) + close_tokens);
-    }
-    if spec.aliases.len() == 1 {
-        return Ok((
-            parts[0].len() as i64,
-            longest[0] + parts[1].len() as i64 + canvas,
-        ));
-    }
-    let prefix = parts[0].len() as i64 + longest[0] + parts[1].len() as i64;
-    Ok((prefix, longest[1] + parts[2].len() as i64 + canvas))
-}
-
 /// What the AI joins leave for the operators after them, as `JoinPorts`.
 #[derive(Debug, Default)]
 struct JoinPorts {
@@ -271,30 +243,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
     }
 
     fn build(mut self) -> Result<Planned, CompileError> {
-        self.prepare()?;
-        let ports = self.emit_scans();
-        let emitted = (|| -> Result<_, CompileError> {
-            let ports = self.emit_documents(ports)?;
-            let (mut ports, joins) = self.emit_joins(ports)?;
-            self.emit_join_answers(&joins)?;
-            self.emit_after_joins(&mut ports)?;
-            let score_pairs = self.emit_pair_scores(&ports, &joins)?;
-            Ok((ports, joins, score_pairs))
-        })();
-        let (ports, joins, score_pairs) = match emitted {
-            Ok(found) => found,
-            Err(error) => {
-                return match error.refusal() {
-                    Some(refusal) => Ok(Err(refusal.clone())),
-                    None => Err(error),
-                };
-            }
-        };
-        self.emit_result(&ports, &joins, score_pairs);
-        self.finish().map(Ok)
-    }
-
-    fn prepare(&mut self) -> Result<(), CompileError> {
         let sequence = &self.order.join_sequence;
         self.sequence_groups = group_sequence(sequence);
         for group in &self.sequence_groups {
@@ -338,7 +286,31 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                 index: 0,
             });
         }
-        Ok(())
+        let ports = self.emit_scans();
+        let emitted = (|| -> Result<_, CompileError> {
+            let ports = self.emit_documents(ports)?;
+            let (mut ports, joins) = self.emit_joins(ports)?;
+            self.emit_join_answers(&joins)?;
+            self.emit_after_joins(&mut ports)?;
+            let score_pairs = self.emit_pair_scores(&ports, &joins)?;
+            Ok((ports, joins, score_pairs))
+        })();
+        let (ports, joins, score_pairs) = match emitted {
+            Ok(found) => found,
+            Err(error) => {
+                return match error.refusal() {
+                    Some(refusal) => Ok(Err(refusal.clone())),
+                    None => Err(error),
+                };
+            }
+        };
+        let rows = match (score_pairs, joins.answers.first()) {
+            (Some(pairs), _) => pairs,
+            (None, Some(answers)) => answers.clone(),
+            (None, None) => ports[&self.operators.scans[0].alias].clone(),
+        };
+        self.nodes.extend(limit_node(self.operators, &rows));
+        self.finish().map(Ok)
     }
 
     fn emit_scans(&mut self) -> BTreeMap<String, PortRef> {
@@ -497,15 +469,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         Ok(port)
     }
 
-    fn filter_order(&self, alias: &str) -> &[usize] {
-        self.order
-            .filter_orders
-            .iter()
-            .find(|(found, _)| found == alias)
-            .map(|(_, positions)| positions.as_slice())
-            .unwrap_or(&[])
-    }
-
     fn filters_of(&self, alias: &str) -> &[crate::physical::FilterPredicate] {
         self.operators
             .filters
@@ -525,7 +488,13 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         port: PortRef,
         followed: bool,
     ) -> Result<PortRef, CompileError> {
-        let order = self.filter_order(alias).to_vec();
+        let order = self
+            .order
+            .filter_orders
+            .iter()
+            .find(|(found, _)| found == alias)
+            .map(|(_, positions)| positions.clone())
+            .unwrap_or_default();
         let mut port = port;
         for (position, asked) in positions.iter().zip(asked) {
             let predicate = self.filters_of(alias)[*position].clone();
@@ -620,7 +589,29 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
             pair_fraction,
             prefix_groups,
         )?;
-        let (prefix, suffix) = score_input_tokens(&spec, context)?;
+        let parts = &spec.prompt_token_parts;
+        let canvas = context.model.canvas_tokens;
+        let close = prompt_layout(&context.model.prompt_layout)?.document_close;
+        let close_tokens = if close.is_empty() {
+            0
+        } else {
+            (context.tokenizer)(close)?.len() as i64
+        };
+        let mut longest = Vec::new();
+        for alias in &spec.aliases {
+            longest.push(context.lengths(alias)?.iter().copied().max().unwrap_or(0) + close_tokens);
+        }
+        let (prefix, suffix) = if spec.aliases.len() == 1 {
+            (
+                parts[0].len() as i64,
+                longest[0] + parts[1].len() as i64 + canvas,
+            )
+        } else {
+            (
+                parts[0].len() as i64 + longest[0] + parts[1].len() as i64,
+                longest[1] + parts[2].len() as i64 + canvas,
+            )
+        };
         let what = if spec.aliases.len() == 1 {
             format!("a document in {}", repr_str(&spec.aliases[0]))
         } else {
@@ -1386,23 +1377,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
             }
         }
         Ok(score_pairs)
-    }
-
-    /// End the plan with the Limit of the region's fetch, which reads
-    /// the region's rows: the scored pairs, the one full join's answers,
-    /// or the surviving rows of the first table.
-    fn emit_result(
-        &mut self,
-        ports: &BTreeMap<String, PortRef>,
-        joins: &JoinPorts,
-        score_pairs: Option<PortRef>,
-    ) {
-        let rows = match (score_pairs, joins.answers.first()) {
-            (Some(pairs), _) => pairs,
-            (None, Some(answers)) => answers.clone(),
-            (None, None) => ports[&self.operators.scans[0].alias].clone(),
-        };
-        self.nodes.extend(limit_node(self.operators, &rows));
     }
 
     /// Build the plan and price it.
