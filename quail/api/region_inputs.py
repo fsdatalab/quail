@@ -37,11 +37,6 @@ def input_scans(facts: dict, catalog) -> dict:
             if scan["provider"] not in catalog}
 
 
-def scan_schema(scan: dict) -> pa.Schema:
-    """Return the Arrow schema a scan's facts carry."""
-    return pa.ipc.read_schema(pa.py_buffer(base64.b64decode(scan["schema_ipc"])))
-
-
 def source_rows(catalog, name: str, table) -> pa.Array | None:
     """Each row's position in the registered table an input filters.
 
@@ -97,7 +92,8 @@ def region_query(session, operators: str, *, tables: dict | None = None,
                 order = pc.sort_indices(found)
                 table, rows[name] = table.take(order), pc.take(found, order)
         else:
-            table = scan_schema(scan).empty_table()
+            table = pa.ipc.read_schema(pa.py_buffer(
+                base64.b64decode(scan["schema_ipc"]))).empty_table()
         providers[name] = MemoryTableProvider(table, id_col="",
                                               identity=f"input:{name}")
     catalog = Catalog(providers)

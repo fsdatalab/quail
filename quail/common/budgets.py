@@ -45,9 +45,9 @@ def pages(tokens: int, page_tokens: int = PAGE_TOKENS) -> int:
     return _quail_native.pages(tokens, page_tokens)
 
 
-def execution_pages(chunk_tokens: int, page_tokens: int = PAGE_TOKENS) -> int:
+def execution_pages(chunk_tokens: int) -> int:
     """Return the KV pages kept free for two chunks of execution."""
-    return _quail_native.execution_pages(chunk_tokens, page_tokens)
+    return _quail_native.execution_pages(chunk_tokens, PAGE_TOKENS)
 
 
 def chunk_budget(model: ModelSpec, device: DeviceSpec) -> int:

@@ -41,7 +41,8 @@ class Rows:
         (length,) = lengths
         values = self.values
         if values.num_columns == 0 and values.num_rows != length:
-            values = pa.table({}).slice(0, 0) if length == 0 else _empty(length)
+            values = (pa.table({}).slice(0, 0) if length == 0 else
+                pa.table({"_": pa.nulls(length)}).drop_columns(["_"]))
         if values.num_rows != length:
             raise ValueError(
                 f"{values.num_rows} value rows for {length} id rows")
@@ -140,16 +141,6 @@ def extraction_rows(alias, name, span_name, document_ids, answers, spans) -> Row
                 pa.table({name: pa.array(answers, pa.string()), span_name: span_array}))
 
 
-def as_table(value):
-    """Return rows as their table, and any other value as it is."""
-    return value.table() if isinstance(value, Rows) else value
-
-
 def rows_of(value, alias: str) -> Rows:
     """Return a port's value as rows: itself, or the ids of one table."""
     return value if isinstance(value, Rows) else Rows({alias: value})
-
-
-def _empty(length: int) -> pa.Table:
-    """A table of the length with no columns."""
-    return pa.table({"_": pa.nulls(length)}).drop_columns(["_"])

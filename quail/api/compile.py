@@ -35,13 +35,6 @@ REGULAR_PREDICATES = (
     "function of columns")
 
 
-def _sql_text(expression: str) -> str:
-    """A DataFusion expression as SQL writes it: literals quoted, AI calls dotted."""
-    expression = re.sub(r'Utf8\("((?:[^"\\]|\\.)*)"\)', r"'\1'", expression)
-    expression = re.sub(r"Int64\((-?\d+)\)", r"\1", expression)
-    return re.sub(r"\bai_(\w+)\(", lambda match: f"AI_{match[1].upper()}(", expression)
-
-
 def compile_message(error: Exception, sql: str) -> str:
     """A DataFusion error's message, in the front end's words where it has them."""
     text = str(error).strip()
@@ -70,6 +63,10 @@ def compile_message(error: Exception, sql: str) -> str:
         return f"{found[1]} is in SELECT but not in GROUP BY and not aggregated"
     non_boolean = r"Cannot create filter with non-boolean predicate '(.*)' returning"
     if found := re.match(non_boolean, text):
-        return (f"{_sql_text(found[1])} is not supported; a regular predicate is "
-                f"{REGULAR_PREDICATES}")
+        expression = re.sub(r'Utf8\("((?:[^"\\]|\\.)*)"\)', r"'\1'", found[1])
+        expression = re.sub(r"Int64\((-?\d+)\)", r"\1", expression)
+        expression = re.sub(r"\bai_(\w+)\(",
+            lambda match: f"AI_{match[1].upper()}(", expression)
+        return (f"{expression} is not supported; a regular predicate is "
+            f"{REGULAR_PREDICATES}")
     return text

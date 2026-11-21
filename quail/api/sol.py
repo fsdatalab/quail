@@ -315,53 +315,6 @@ class _Oracles:
         return json.dumps(_shared_tokens(self._stores[alias].tokens, json.loads(rows)))
 
 
-def _estimate_inputs(query, stores, chunk: int, credit: bool) -> dict:
-    """What the estimate reads from the query's tables.
-
-    Returns:
-        Each scanned table's column, token lengths, and shared prefix
-        tokens; each stop key's values per row; and each join's allowed
-        pairs, by the rows of each side.
-    """
-    facts = query.facts()
-    aliases = []
-    for scan in facts["scans"]:
-        store = stores[scan["alias"]]
-        tokens = [int(length) for length in store.lengths]
-        column = scan["column_name"]
-        aliases.append({
-            "alias": scan["alias"],
-            "column": f"{scan['provider']}.{column}",
-            "tokens": tokens,
-            "shared": _shared_tokens(store.tokens) if credit else [0] * len(tokens)})
-    stop_groups = {}
-    for alias, key in facts["stop_keys"].items():
-        columns = [stores[alias].column(name).to_pylist() for name in key]
-        stop_groups[alias] = [_plain(list(values)) for values in zip(*columns)]
-    allowed_pairs = {}
-    for join in facts["join_conditions"]:
-        position = join["position"]
-        left_alias, right_alias = join["left_alias"], join["right_alias"]
-        conditions = [(decode_plan_value(json.dumps(left)),
-                       decode_plan_value(json.dumps(right)))
-                      for left, right in join["pairs"]]
-        pairs = pair_table(
-            left_alias, [left.evaluate(stores[left_alias])
-                         for left, _ in conditions],
-            right_alias, [right.evaluate(stores[right_alias])
-                          for _, right in conditions])
-        allowed_pairs[str(position)] = {
-            alias: [[int(key), [int(row) for row in groups.rows[
-                groups.offsets[index]:groups.offsets[index + 1]]]]
-                    for index, key in enumerate(groups.keys)]
-            for alias, groups in (
-                (left_alias, partner_map(pairs, left_alias, right_alias)),
-                (right_alias, partner_map(pairs, right_alias, left_alias)))}
-    return {"aliases": aliases, "stop_groups": stop_groups,
-            "allowed_pairs": allowed_pairs, "order": query.order,
-            "credit_shared": credit, "chunk_tokens": chunk}
-
-
 def speed_of_light_estimate(
     query,
     answer: AnswerOracle,
@@ -416,7 +369,45 @@ def speed_of_light_estimate(
              else chunk_tokens)
     stores = query.token_inputs()
     try:
-        inputs = _estimate_inputs(query, stores, chunk, credit_shared_prefixes)
+        facts = query.facts()
+        aliases = []
+        for scan in facts["scans"]:
+            store = stores[scan["alias"]]
+            tokens = [int(length) for length in store.lengths]
+            column = scan["column_name"]
+            aliases.append({
+                "alias": scan["alias"],
+                "column": f"{scan['provider']}.{column}",
+                "tokens": tokens,
+                "shared": _shared_tokens(store.tokens)
+                    if credit_shared_prefixes else [0] * len(tokens)})
+        stop_groups = {}
+        for alias, key in facts["stop_keys"].items():
+            columns = [stores[alias].column(name).to_pylist() for name in key]
+            stop_groups[alias] = [_plain(list(values))
+                for values in zip(*columns)]
+        allowed_pairs = {}
+        for join in facts["join_conditions"]:
+            position = join["position"]
+            left_alias, right_alias = join["left_alias"], join["right_alias"]
+            conditions = [(decode_plan_value(json.dumps(left)),
+                decode_plan_value(json.dumps(right)))
+                for left, right in join["pairs"]]
+            pairs = pair_table(
+                left_alias, [left.evaluate(stores[left_alias])
+                    for left, _ in conditions],
+                right_alias, [right.evaluate(stores[right_alias])
+                    for _, right in conditions])
+            allowed_pairs[str(position)] = {
+                alias: [[int(key), [int(row) for row in groups.rows[
+                    groups.offsets[index]:groups.offsets[index + 1]]]]
+                    for index, key in enumerate(groups.keys)]
+                for alias, groups in (
+                    (left_alias, partner_map(pairs, left_alias, right_alias)),
+                    (right_alias, partner_map(pairs, right_alias, left_alias)))}
+        inputs = {"aliases": aliases, "stop_groups": stop_groups,
+            "allowed_pairs": allowed_pairs, "order": query.order,
+            "credit_shared": credit_shared_prefixes, "chunk_tokens": chunk}
     except (NotImplementedError, ValueError):
         # an operator the estimate cannot price; Rust names it
         inputs = {"aliases": [], "stop_groups": {}, "allowed_pairs": {},

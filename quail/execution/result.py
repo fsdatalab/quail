@@ -5,7 +5,7 @@ from __future__ import annotations
 import itertools
 import json
 import weakref
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 
 import pyarrow as pa
 from pyarrow import acero
@@ -257,9 +257,7 @@ def build_result_declaration(
 
 
 def bounded_reader(source: pa.RecordBatchReader, limit: int | None = None,
-                   batch_rows: int = DEFAULT_BATCH_ROWS, *,
-                   schema: pa.Schema | None = None,
-                   project: Callable | None = None) -> pa.RecordBatchReader:
+    batch_rows: int = DEFAULT_BATCH_ROWS) -> pa.RecordBatchReader:
     """Return a reader of at most limit rows that owns the source reader.
 
     The source is read only while rows are still wanted, so a limit
@@ -270,8 +268,6 @@ def bounded_reader(source: pa.RecordBatchReader, limit: int | None = None,
         source: The reader of the rows.
         limit: Maximum rows to return, or every row when None.
         batch_rows: Maximum rows in each returned batch.
-        schema: The returned batches' schema, when project changes it.
-        project: A function from a source batch to a returned batch.
     """
     if batch_rows <= 0:
         raise ValueError("batch_rows must be positive")
@@ -289,8 +285,7 @@ def bounded_reader(source: pa.RecordBatchReader, limit: int | None = None,
                     batch = batch[:remaining]
                     remaining -= len(batch)
                 for offset in range(0, len(batch), batch_rows):
-                    part = batch.slice(offset, batch_rows)
-                    yield part if project is None else project(part)
+                    yield batch.slice(offset, batch_rows)
         finally:
             close()
 
@@ -299,7 +294,7 @@ def bounded_reader(source: pa.RecordBatchReader, limit: int | None = None,
     close = weakref.finalize(iterator, source.close)
     # the C stream releases the iterator on close; from_batches alone does not
     return pa.RecordBatchReader.from_stream(pa.RecordBatchReader.from_batches(
-        source.schema if schema is None else schema, iterator))
+        source.schema, iterator))
 
 
 def iter_rows(table: pa.Table):
@@ -399,7 +394,9 @@ class QueryResult:
 
     def explain(self, *, verbose: bool = False) -> str:
         """Return the executed operator tree with measured rows and time."""
-        from quail.explain import physical_tree
+        import _quail_native
+
+        from quail.explain import _json, _metrics
 
         if self.plan is None:
             if self.region_results:
@@ -407,8 +404,14 @@ class QueryResult:
                     f"model region {key + 1}:\n{region.explain(verbose=verbose)}"
                     for key, region in sorted(self.region_results.items()))
             return "no physical plan was executed"
-        tree = physical_tree(self.plan, verbose=verbose,
-                             node_metrics=self.node_metrics, report=self.report)
+        request = {
+            "tree_only": True,
+            "verbose": verbose,
+            "physical": {"graph": json.loads(self.plan.to_json())},
+            "run": {"report": self.report or {},
+                "metrics": _metrics(self.node_metrics or {})},
+        }
+        tree = _quail_native.explain_plan(_json(request))
         if self.datafusion_plan is None:
             return tree
         return f"DataFusion:\n{self.datafusion_plan}\n\nmodel region:\n{tree}"

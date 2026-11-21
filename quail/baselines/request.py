@@ -14,9 +14,8 @@ from quail.baselines.execution import RequestModelExecution
 from quail.baselines.images import ImagePrompts
 from quail.execution.metrics import scalar_node_metrics
 from quail.execution.runner import ExecutionContext, GenericRunner, compute_subgraph
-from quail.execution.runtimes import ModelNodeRuntime
 from quail.execution.types import PhysicalResponse, export_physical_outputs
-from quail.physical import RequestExecution, Scan
+from quail.physical import Scan
 from quail.specs import DEVICES, SupportResult
 
 
@@ -111,22 +110,7 @@ def _run_request_graph(context, backend, engine_state, boot, model_execution,
     )
 
 
-def request_runtimes() -> dict:
-    """Return runtimes for the request backends' physical node."""
-    return {RequestExecution.runtime_key: ModelNodeRuntime()}
-
-
 SUPPORTED_DEVICES = frozenset(DEVICES)
-
-
-def _warm_boot() -> dict:
-    return {
-        "kind": "warm",
-        "llm_init_s": 0.0,
-        "weight_load_s": None,
-        "kv_profile_s": None,
-        "boot_s": 0.0,
-    }
 
 
 # Architectures the request backends do not serve: vLLM 0.29 has no
@@ -233,7 +217,13 @@ class RequestBackend:
         """Boot the engine into the runtime state, or reuse the one there."""
         engine = context.runtime_state.get("engine")
         if engine is not None:
-            return engine, _warm_boot()
+            return engine, {
+                "kind": "warm",
+                "llm_init_s": 0.0,
+                "weight_load_s": None,
+                "kv_profile_s": None,
+                "boot_s": 0.0,
+            }
         envelope = context.request.plan
         model = context.registry.model(envelope["model"])
         allowed_ids = sorted(set(

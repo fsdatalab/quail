@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from dataclasses import asdict
 
 import _quail_native
 import pyarrow as pa
@@ -103,11 +104,24 @@ class Engine:
         None when the session's backend refuses its configuration, so the
         region's query reports the refusal.
         """
-        from quail.api.query import backend_refusal, planning_settings
+        from quail.api.query import backend_refusal
 
         if backend_refusal(self.session) is not None:
             return None
-        return json.dumps(planning_settings(self.session, self._order))
+        session = self.session
+        config = session.config
+        backend = session.registry.backend(config.backend)
+        return json.dumps({
+            "model": asdict(session.model),
+            "device": asdict(session.device),
+            "gpus": config.gpus, "canvas_draws": config.canvas_draws,
+            "gpu_timing": config.gpu_timing,
+            "attention": config.attention, "order": self._order,
+            "backend": config.backend,
+            "physical_rules": [rule.name for rule in
+                session.registry.physical_rules.values()],
+            "request": getattr(backend, "request_settings", None),
+        })
 
     def execute(self, planned: tuple[str, dict], tables: dict | None = None,
                 on_rows: Callable | None = None, hint=None) -> pa.Table | None:

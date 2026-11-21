@@ -7,19 +7,13 @@ import time
 import numpy as np
 import pyarrow as pa
 
-from quail.common.pairs import (
-    allowed_members,
-    members_by_partner,
-    pair_partner,
-    partner_map,
-)
 from quail.execution.labels import match_label
 from quail.execution.result import (
     answer_table,
     filter_answer_table,
 )
 from quail.execution.rows import Rows
-from quail.execution.spans import held_prefix, read_phrase
+from quail.execution.spans import held_prefix
 
 # the order shuffled map submission sends prompts in
 SHUFFLE_SEED = 0
@@ -408,7 +402,7 @@ def read_extractions(outputs, texts, wall_s: float) -> dict:
     answers, spans = [], []
     unanswered = unaligned = cut = 0
     for output, document in zip(outputs, texts):
-        phrase = read_phrase(output.outputs[0].text or "")
+        phrase = (output.outputs[0].text or "").strip() or None
         held = None if phrase is None else held_prefix(document, phrase)
         if phrase is None:
             unanswered += 1
@@ -429,15 +423,6 @@ def read_extractions(outputs, texts, wall_s: float) -> dict:
         "unaligned": unaligned,
         "cut": cut,
     }
-
-
-def allowed_members_by_anchor(anchor, partners, anchor_ids, members, pairs) -> list:
-    """Per anchor, the member indices its equality conditions allow."""
-    position = partners.index(pair_partner(anchor, partners))
-    by_partner = members_by_partner(members, position)
-    rows = partner_map(pairs, anchor, partners[position])
-    return [allowed_members(rows, by_partner, anchor_id)
-            for anchor_id in anchor_ids]
 
 
 def join_answers(spec, rows, answers, anchor, partners) -> pa.Table:

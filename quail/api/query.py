@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import warnings
-from dataclasses import asdict, replace
+from dataclasses import replace
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import _quail_native
@@ -18,7 +18,7 @@ from quail.common.tokens import ScanInput, TokenStore
 from quail.execution.finished import finished_table
 from quail.execution.metrics import NodeMetrics, NodeResult, scalar_node_metrics
 from quail.execution.result import QueryResult
-from quail.execution.rows import as_table
+from quail.execution.rows import Rows
 from quail.execution.runner import compute_subgraph
 from quail.execution.types import PhysicalRequest, document_input
 from quail.explain import explain
@@ -51,28 +51,6 @@ def backend_refusal(session) -> Refusal | None:
             constraint="unsupported_backend_configuration", needed=1,
             available=0, unit="configurations")
     return None
-
-
-def planning_settings(session, order: str | None) -> dict:
-    """The configuration Rust plans a region for.
-
-    Args:
-        session: The session whose model, device, and backend plan it.
-        order: The stage order rule, 'by_cost' or 'as_written', or None.
-    """
-    config = session.config
-    backend = session.registry.backend(config.backend)
-    return {
-        "model": asdict(session.model),
-        "device": asdict(session.device),
-        "gpus": config.gpus, "canvas_draws": config.canvas_draws,
-        "gpu_timing": config.gpu_timing,
-        "attention": config.attention, "order": order,
-        "backend": config.backend,
-        "physical_rules": [rule.name for rule in
-                           session.registry.physical_rules.values()],
-        "request": getattr(backend, "request_settings", None),
-    }
 
 
 @runtime_checkable
@@ -544,7 +522,11 @@ class RegionQuery:
         report = json.loads(_quail_native.execution_report(
             plan.backend, plan.estimated_seconds, plan.settings.get("order_rule"),
             json.dumps(out, default=str), coordinator_wall))
-        tables = _output_tables(response.outputs)
+        tables = {}
+        for ref, value in response.outputs.items():
+            table = value.table() if isinstance(value, Rows) else value
+            if isinstance(table, pa.Table):
+                tables[(ref.node_id, ref.port)] = table
         if relation is None:
             relation = self._built_rows(tables, finished)
         result = QueryResult.from_table(relation, report=report)
@@ -573,7 +555,18 @@ class RegionQuery:
         }
         if observer_reports:
             report["observers"] = observer_reports
-        self._collect_answers(result, plan, tables)
+        answers, survivors, true_joins, stages = _quail_native.collect_answers(
+            json.dumps(self._answer_request(plan)), tables)
+        result.answer_tables = {kind: {} for kind in (
+            "filters", "joins", "classifies", "scores", "extracts", "features",
+            "maps")}
+        for kind, key, table in answers:
+            key = tuple(key) if isinstance(key, list) else key
+            result.answer_tables[kind][key] = table
+        result.survivor_indices = {alias: table.column(0).combine_chunks()
+            for alias, table in survivors}
+        result.true_join_tables = dict(true_joins)
+        result.report["stages"] = json.loads(stages)
         return result
 
     def _built_rows(self, tables: dict, finished=None) -> pa.Table:
@@ -637,42 +630,6 @@ class RegionQuery:
             "num_documents": {alias: len(tokens)
                               for alias, tokens in self._document_tokens.items()},
             "source_rows": source_rows}
-
-    def _collect_answers(self, result, plan, tables) -> None:
-        """Attach the answers, survivors, and stages Rust reads from outputs.
-
-        Each model operator's answers, the surviving documents, and each
-        predicate's measured selectivity; documents are numbered by their
-        row in the registered table.
-
-        Args:
-            result: The QueryResult to attach them to.
-            plan: The executed physical plan.
-            tables: Each output relation, by (node id, port).
-        """
-        answers, survivors, true_joins, stages = _quail_native.collect_answers(
-            json.dumps(self._answer_request(plan)), tables)
-        result.answer_tables = {kind: {} for kind in (
-            "filters", "joins", "classifies", "scores", "extracts", "features",
-            "maps")}
-        for kind, key, table in answers:
-            key = tuple(key) if isinstance(key, list) else key
-            result.answer_tables[kind][key] = table
-        result.survivor_indices = {alias: table.column(0).combine_chunks()
-                                   for alias, table in survivors}
-        result.true_join_tables = dict(true_joins)
-        result.report["stages"] = json.loads(stages)
-
-
-def _output_tables(outputs) -> dict:
-    """Return each output relation that is an Arrow table, by (node id, port)."""
-    tables = {}
-    for ref, value in outputs.items():
-        table = as_table(value)
-        if isinstance(table, pa.Table):
-            tables[(ref.node_id, ref.port)] = table
-    return tables
-
 
 def _observe(graph, outputs, metrics, observers) -> None:
     """Show each observer every node whose outputs the run returned."""

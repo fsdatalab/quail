@@ -99,7 +99,16 @@ class Guarded:
             if self.node.answer is not None:
                 return self._answered(result)
             if self.node.disjunction is None or self.node.closes_disjunction:
-                return self._filtered(result)
+                alias = self.node.alias
+                port = f"rows:{alias}"
+                survivors = result.outputs[port].ids[alias] if isinstance(
+                    result.outputs[port], Rows) else result.outputs[port]
+                passed = pc.is_in(self.rows.ids[alias], value_set=survivors)
+                kept = pc.or_(pc.and_(self.asked, passed), self.passes)
+                rows = Rows({alias: self.rows.ids[alias]}).filter(kept)
+                metrics = replace(result.metrics, input_rows=self.rows.num_rows,
+                    output_rows=rows.num_rows)
+                return NodeResult({**result.outputs, port: rows}, metrics)
             return self._undecided(result)
         port = self.node.rows_port
         answered = result.outputs[port]
@@ -160,20 +169,6 @@ class Guarded:
         metrics = replace(result.metrics, input_rows=self.rows.num_rows,
                           output_rows=rows.num_rows)
         return NodeResult({**result.outputs, port: rows}, metrics)
-
-    def _filtered(self, result: NodeResult) -> NodeResult:
-        """Keep the asked rows that passed and the rows a term of the OR passed."""
-        alias = self.node.alias
-        port = f"rows:{alias}"
-        survivors = result.outputs[port].ids[alias] if isinstance(
-            result.outputs[port], Rows) else result.outputs[port]
-        passed = pc.is_in(self.rows.ids[alias], value_set=survivors)
-        kept = pc.or_(pc.and_(self.asked, passed), self.passes)
-        rows = Rows({alias: self.rows.ids[alias]}).filter(kept)
-        metrics = replace(result.metrics, input_rows=self.rows.num_rows,
-                          output_rows=rows.num_rows)
-        return NodeResult({**result.outputs, port: rows}, metrics)
-
 
 @dataclass
 class NullPairs:

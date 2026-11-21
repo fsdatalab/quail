@@ -36,13 +36,6 @@ def _metrics(node_metrics) -> dict:
     }
 
 
-def _model_spec(model: str):
-    from quail.specs import MODELS
-
-    spec = MODELS.get(model)
-    return None if spec is None else asdict(spec)
-
-
 def explain(logical, operators, physical, *, verbose: bool = False, result=None,
             usd_per_hour: float | None = None, rules=None) -> str:
     """Format DataFusion's plan of a region and its physical operator tree.
@@ -83,31 +76,11 @@ def explain(logical, operators, physical, *, verbose: bool = False, result=None,
             "graph": json.loads(physical.graph.to_json()),
             "estimates": list((physical.estimates or {}).items()),
         }
-        request["model_spec"] = _model_spec(physical.model)
+        from quail.specs import MODELS
+
+        spec = MODELS.get(physical.model)
+        request["model_spec"] = None if spec is None else asdict(spec)
         if result is not None:
             request["run"] = {"report": result.report,
                               "metrics": _metrics(result.node_metrics)}
-    return _quail_native.explain_plan(_json(request))
-
-
-def physical_tree(graph, *, verbose: bool = False, node_metrics=None,
-                  report=None) -> str:
-    """Format an executed graph with each node's measured rows and time.
-
-    Args:
-        graph: The executed physical graph.
-        verbose: Include node ids, ports, and fields.
-        node_metrics: Measured metrics by node id.
-        report: The execution report, for each predicate's measurements.
-
-    Returns:
-        The tree text.
-    """
-    request = {
-        "tree_only": True,
-        "verbose": verbose,
-        "physical": {"graph": json.loads(graph.to_json())},
-        "run": {"report": report or {},
-                "metrics": _metrics(node_metrics or {})},
-    }
     return _quail_native.explain_plan(_json(request))

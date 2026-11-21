@@ -4,7 +4,6 @@ import _quail_native
 
 from quail.backends import QuailBackend
 from quail.backends.quail import quail_runtimes
-from quail.baselines import register_baselines
 from quail.execution.runtimes import built_in_runtimes
 from quail.extensions import ExtensionRegistry, LogicalRule, PhysicalRule
 from quail.specs import DEVICES, MODELS
@@ -60,4 +59,31 @@ def built_in_registry(logical_rules=LOGICAL_RULES,
         for runtime_key, runtime in runtimes.items():
             registry.register_runtime(runtime, key=runtime_key)
     # the comparison backends, for the benchmark runner and the server
-    return register_baselines(registry)
+    from quail.baselines.request import RequestBackend
+    from quail.baselines.vllm import (
+        DefaultVLLMEngine,
+        VLLMEngine,
+        ngram_vllm_backend,
+        stock_vllm_backend,
+    )
+    from quail.execution.runtimes import ModelNodeRuntime
+    from quail.physical import RequestExecution
+
+    for backend in (
+        stock_vllm_backend(),
+        RequestBackend(
+            name="pipelined_vllm", engine=VLLMEngine(),
+            filter_submission="pipelined", answer_submission="pipelined"),
+        RequestBackend(
+            name="shuffled_vllm", engine=VLLMEngine(),
+            filter_submission="operator-at-a-time",
+            answer_submission="shuffled"),
+        ngram_vllm_backend(),
+        RequestBackend(
+            name="dumb_vllm", engine=DefaultVLLMEngine(),
+            filter_submission="operator-at-a-time"),
+    ):
+        registry.register_backend(backend)
+    registry.register_runtime(
+        ModelNodeRuntime(), key=RequestExecution.runtime_key)
+    return registry

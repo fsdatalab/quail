@@ -37,13 +37,6 @@ class RefusalError(RuntimeError):
             + " ".join(refusal.reasons))
 
 
-def _estimates(estimates: dict) -> dict:
-    """The per-node estimates with their member lists as tuples."""
-    return {node_id: {key: tuple(value) if isinstance(value, list) else value
-                      for key, value in entry.items()}
-            for node_id, entry in estimates.items()}
-
-
 def graph_from_envelope(envelope: Mapping[str, Any]) -> PhysicalGraph:
     """Read and validate the graph of a plan envelope.
 
@@ -79,7 +72,11 @@ def plan_from_json(found: dict):
         backend=envelope["backend"],
         estimated_seconds=found.get("estimated_seconds", 0.0),
         nodes=graph.nodes, settings=settings, root=graph.root,
-        estimates=_estimates(found.get("estimates", {})), pricing=pricing,
+        estimates={
+            node_id: {key: tuple(value) if isinstance(value, list) else value
+                for key, value in entry.items()}
+            for node_id, entry in found.get("estimates", {}).items()},
+        pricing=pricing,
         operators=found.get("operators"))
 
 
