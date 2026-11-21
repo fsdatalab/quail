@@ -179,47 +179,6 @@ def scored_rows(node, rows, values, probabilities=None):
     return scored
 
 
-def scored_result(node, rows, values, priors, *, fresh_tokens, cached_tokens=0,
-                  suffix_tokens=0, borrowed_tokens=0, pack_s=0.0, gpu_s=0.0,
-                  chunks=0, probabilities=None) -> NodeResult:
-    """The NodeResult of a score or classification of rows, in row order.
-
-    Args:
-        node: The AiScore or AiClassify.
-        rows: The rows asked, one column per alias.
-        values: Their scores or labels.
-        priors: alias -> the Rows whose values the rows keep.
-        fresh_tokens: Token positions the model computed.
-        cached_tokens: Token positions read from KV.
-        suffix_tokens: A classification's tokens after the documents.
-        borrowed_tokens: Prefix tokens read from another document's KV.
-        pack_s: Host seconds spent building chunks.
-        gpu_s: Forward-pass GPU seconds.
-        chunks: Timed forward passes.
-        probabilities: A classification's label probabilities per row,
-            or None.
-    """
-    spec = node.spec
-    count = len(rows)
-    outputs = scored_outputs(node, scored_rows(node, rows, values, probabilities),
-                             priors)
-    output = outputs[node.rows_port]
-    return NodeResult(outputs, NodeMetrics(
-        input_rows=count,
-        output_rows=(output.num_rows if isinstance(spec, ClassifySpec) else count),
-        evaluated_documents=count if len(spec.aliases) == 1 else 0,
-        evaluated_document_pairs=count if len(spec.aliases) == 2 else 0,
-        fresh_tokens=fresh_tokens, cached_tokens=cached_tokens,
-        gpu_s=gpu_s, chunks=chunks,
-        extension={
-            "output": spec.name, "aliases": list(spec.aliases),
-            "input_rows": len(output),
-            "borrowed_prefix_tokens": borrowed_tokens,
-            **({"suffix_tokens": suffix_tokens, "pack_s": pack_s}
-               if isinstance(spec, ClassifySpec) else {}),
-        }))
-
-
 def score_readout(state) -> AsyncScores:
     """Return the score readout for the current model."""
     if state.score_readout is not None:
@@ -519,12 +478,33 @@ class ScoreOperator(SingleNodeOperator):
         return self._total()
 
     def result(self, fresh_tokens, gpu_s, chunks, stats) -> NodeResult:
+        """Build the score result and measured costs for rows not skipped."""
         asked = ~self.skipped
-        return scored_result(
-            self.node, self.rows[asked], self.scores[asked], self.priors,
-            fresh_tokens=fresh_tokens, cached_tokens=self._total() - fresh_tokens,
-            borrowed_tokens=stats.get("borrowed_tokens", 0),
-            pack_s=stats.get("pack_s", 0.0), gpu_s=gpu_s, chunks=chunks)
+        node = self.node
+        rows, values = self.rows[asked], self.scores[asked]
+        cached_tokens = self._total() - fresh_tokens
+        borrowed_tokens = stats.get("borrowed_tokens", 0)
+        pack_s = stats.get("pack_s", 0.0)
+        spec = node.spec
+        count = len(rows)
+        outputs = scored_outputs(node, scored_rows(node, rows, values),
+            self.priors)
+        output = outputs[node.rows_port]
+        return NodeResult(outputs, NodeMetrics(
+            input_rows=count,
+            output_rows=(output.num_rows
+                if isinstance(spec, ClassifySpec) else count),
+            evaluated_documents=count if len(spec.aliases) == 1 else 0,
+            evaluated_document_pairs=count if len(spec.aliases) == 2 else 0,
+            fresh_tokens=fresh_tokens, cached_tokens=cached_tokens,
+            gpu_s=gpu_s, chunks=chunks,
+            extension={
+                "output": spec.name, "aliases": list(spec.aliases),
+                "input_rows": len(output),
+                "borrowed_prefix_tokens": borrowed_tokens,
+                **({"suffix_tokens": 0, "pack_s": pack_s}
+                    if isinstance(spec, ClassifySpec) else {}),
+            }))
 
 
 def _table(prefixes, keys, tree=None):
