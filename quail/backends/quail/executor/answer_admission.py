@@ -336,7 +336,7 @@ class HeadroomAdmission:
         """Per slot, E[L - t | L > t] from its bucket curve, t its written tokens."""
         decoder = self.decoder
         remaining = np.zeros(len(self.prefix))
-        running = self._running()
+        running = np.flatnonzero((decoder.map >= 0) & ~decoder.paused)
         if not len(running):
             return remaining
         curves = self.curves.buckets[self.curves.slot_row[running]]
@@ -405,16 +405,6 @@ class HeadroomAdmission:
         held = self.decoder.kv.num_pages[slots] * page_tokens
         return np.maximum(0, -(-(self.reach[slots] - held) // page_tokens))
 
-    def _running(self):
-        decoder = self.decoder
-        return np.flatnonzero((decoder.map >= 0) & ~decoder.paused)
-
-    def _available(self, slots):
-        """Answer tokens the slots' allocated pages cover."""
-        decoder = self.decoder
-        return (decoder.kv.num_pages[slots] * decoder.page_tokens
-                - decoder.origin[slots])
-
     def _children(self, anchor):
         """The anchor, if a root, and its branches."""
         return self.child_order[self.child_start[anchor]:self.child_start[anchor + 1]]
@@ -456,8 +446,10 @@ class HeadroomAdmission:
         decoder = self.decoder
         maps = decoder.map[running]
         self.held_slots = running
-        self.held_risk = self._risk(running, maps, decoder.written[maps, running],
-                                    self._available(running), decoder.origin[running])
+        self.held_risk = self._risk(
+            running, maps, decoder.written[maps, running],
+            decoder.kv.num_pages[running] * decoder.page_tokens
+            - decoder.origin[running], decoder.origin[running])
         self.held_base = decoder.kv.num_pages[running].astype(np.int64)
         if free_pages is None:
             self._hold(np.argmin(self.held_risk, axis=1), None)
