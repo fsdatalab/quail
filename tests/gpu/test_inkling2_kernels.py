@@ -75,6 +75,7 @@ def test_relative_attention_matches_dense_attention(window):
         out = torch.empty_like(q)
         kernels.rel_attention(torch, q, kp, vp, rel, sink, proj, out, tiles,
                               cu_q, used, table, window=window,
+                              max_keys=max(u for _, u in shapes),
                               block_rows=block_rows)
         for index, (rows, keys) in enumerate(shapes):
             pages = table[index, :pages_per[index]].long()
@@ -92,14 +93,14 @@ def test_the_block_mix_matches_its_definition():
 
     torch.manual_seed(1)
     rows, hidden = 37, 2304
-    blocks = torch.randn(4, rows, hidden, device="cuda", dtype=torch.bfloat16)
+    blocks = torch.randn(rows, 4, hidden, device="cuda", dtype=torch.bfloat16)
     partial = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
     addend = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
     query = torch.randn(3, hidden, device="cuda") * hidden ** -0.5
     weight = torch.rand(3, hidden, device="cuda", dtype=torch.bfloat16) + 0.5
     out = kernels.mix(torch, blocks, 2, partial, query, addend=addend,
                       weight=weight)
-    states = torch.stack([blocks[0].float(), blocks[1].float(),
+    states = torch.stack([blocks[:, 0].float(), blocks[:, 1].float(),
                           partial.float() + addend.float()], dim=1)
     normed = states * torch.rsqrt(states.pow(2).mean(-1, keepdim=True) + 1e-6)
     weights = torch.einsum("rsh,qh->rqs", normed, query).softmax(-1)
@@ -189,3 +190,65 @@ def test_nvfp4_rows_round_trip_and_the_expert_gemm_matches_dequantized_math():
         error = ((out[part].float() - expected).norm()
                  / expected.norm().clamp(min=1e-6)).item()
         assert error < 1e-2, (e, error)
+
+
+def test_an_nvfp4_projection_row_ignores_the_other_rows_of_its_pass():
+    from vllm import _custom_ops as ops
+
+    from quail.backends.quail.executor.models import inkling2_kernels as kernels
+
+    torch.manual_seed(3)
+    hidden, width = 2304, 512
+    x = torch.randn(4, hidden, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(width, hidden, device="cuda", dtype=torch.bfloat16)
+    scale = 6.0 * 448.0 / weight.abs().amax().float()
+    values, scales = ops.scaled_fp4_quant(weight, scale)
+
+    def project(rows):
+        q, sf, row_scale = kernels.quantize_rows(torch, rows)
+        out = ops.cutlass_scaled_fp4_mm(q, values, sf, scales, 1.0 / scale,
+                                        torch.bfloat16)
+        return out * row_scale[:, None]
+
+    # a padding row a thousand times larger than the real rows
+    padded = torch.cat([x, 1000 * x[:1]])
+    alone, beside = project(x), project(padded)[:4]
+    assert torch.equal(alone, beside)
+    expected = x.float() @ weight.float().t()
+    relative = ((alone.float() - expected).norm() / expected.norm()).item()
+    assert relative < 0.15, relative
+
+
+def test_the_message_gates_match_their_definition():
+    from quail.backends.quail.executor.models import inkling2_kernels as kernels
+
+    torch.manual_seed(3)
+    gates, rows, hidden = 3, 29, 2304
+    raw = torch.randn(gates, rows, hidden, device="cuda")
+    prev_block = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+    prev_out = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+    query = torch.randn(gates, hidden, device="cuda") * hidden ** -0.5
+    gains = torch.randn(gates, rows, 2 * hidden, device="cuda")
+    weight = torch.rand(gates, hidden, device="cuda", dtype=torch.bfloat16) + 0.5
+
+    def norm(x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6)
+
+    states = torch.stack([norm(prev_block.float()), norm(prev_out.float())], 1)
+    scores = torch.einsum("rsh,gh->grs", states, query).softmax(-1)
+    message = torch.einsum("grs,rsh->grh", scores, states)
+    inputs = kernels.gate_inputs(torch, raw, prev_block, prev_out, query)
+    expected = torch.cat([norm(raw), norm(message)], -1)
+    assert (inputs.float() - expected).abs().max().item() < 3e-2
+    out = kernels.gate_apply(torch, raw, prev_block, prev_out, query, gains,
+                             weight)
+    mixed = ((1 - gains[..., :hidden].tanh()) * raw
+             + gains[..., hidden:].tanh() * message)
+    expected = norm(mixed) * weight.float()[:, None, :]
+    assert (out.float() - expected).abs().max().item() < 3e-2
+    shared = kernels.gate_apply(torch, raw[0], prev_block, prev_out, query,
+                                gains, weight)
+    mixed = ((1 - gains[..., :hidden].tanh()) * raw[0]
+             + gains[..., hidden:].tanh() * message)
+    expected = norm(mixed) * weight.float()[:, None, :]
+    assert (shared.float() - expected).abs().max().item() < 3e-2

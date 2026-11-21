@@ -137,44 +137,47 @@ def _kernels() -> dict:
         return (ea * a + eb * b) / (ea + eb)
 
     @triton.jit
-    def gate_inputs(hidden_ptr, stride_h, prev_block_ptr, prev_out_ptr,
-                    stride_prev, query_ptr, out_ptr, stride_o, eps,
-                    H: tl.constexpr, HP: tl.constexpr):
-        # [norm(hidden) | norm(message)] in bf16, the gate's down input
+    def gate_inputs(hidden_ptr, stride_hg, stride_h, prev_block_ptr,
+                    prev_out_ptr, stride_prev, query_ptr, out_ptr, stride_og,
+                    stride_o, eps, H: tl.constexpr, HP: tl.constexpr):
+        # [norm(hidden) | norm(message)] in bf16 for gate program_id(1)
         row = tl.program_id(0).to(tl.int64)
+        gate = tl.program_id(1)
         offs = tl.arange(0, HP)
         mask = offs < H
-        h = tl.load(hidden_ptr + row * stride_h + offs, mask=mask,
-                    other=0.0).to(tl.float32)
-        m = _message(prev_block_ptr, prev_out_ptr, stride_prev, query_ptr,
-                     row, offs, mask, eps, H)
+        h = tl.load(hidden_ptr + gate * stride_hg + row * stride_h + offs,
+                    mask=mask, other=0.0).to(tl.float32)
+        m = _message(prev_block_ptr, prev_out_ptr, stride_prev,
+                     query_ptr + gate * H, row, offs, mask, eps, H)
         h = h * tl.math.rsqrt(tl.sum(h * h, axis=0) / H + eps)
         m = m * tl.math.rsqrt(tl.sum(m * m, axis=0) / H + eps)
-        tl.store(out_ptr + row * stride_o + offs, h.to(tl.bfloat16), mask=mask)
-        tl.store(out_ptr + row * stride_o + H + offs, m.to(tl.bfloat16),
-                 mask=mask)
+        out = out_ptr + gate * stride_og + row * stride_o
+        tl.store(out + offs, h.to(tl.bfloat16), mask=mask)
+        tl.store(out + H + offs, m.to(tl.bfloat16), mask=mask)
 
     @triton.jit
-    def gate_apply(hidden_ptr, stride_h, prev_block_ptr, prev_out_ptr,
-                   stride_prev, query_ptr, gains_ptr, stride_g, weight_ptr,
-                   out_ptr, stride_o, eps, H: tl.constexpr, HP: tl.constexpr):
+    def gate_apply(hidden_ptr, stride_hg, stride_h, prev_block_ptr,
+                   prev_out_ptr, stride_prev, query_ptr, gains_ptr,
+                   stride_gg, stride_g, weight_ptr, out_ptr, stride_og,
+                   stride_o, eps, H: tl.constexpr, HP: tl.constexpr):
         # norm((1 - tanh(f)) * hidden + tanh(g) * message) * weight
         row = tl.program_id(0).to(tl.int64)
+        gate = tl.program_id(1)
         offs = tl.arange(0, HP)
         mask = offs < H
-        h = tl.load(hidden_ptr + row * stride_h + offs, mask=mask,
-                    other=0.0).to(tl.float32)
-        m = _message(prev_block_ptr, prev_out_ptr, stride_prev, query_ptr,
-                     row, offs, mask, eps, H)
-        forget = libdevice.tanh(tl.load(gains_ptr + row * stride_g + offs,
-                                        mask=mask, other=0.0))
-        gain = libdevice.tanh(tl.load(gains_ptr + row * stride_g + H + offs,
-                                      mask=mask, other=0.0))
+        h = tl.load(hidden_ptr + gate * stride_hg + row * stride_h + offs,
+                    mask=mask, other=0.0).to(tl.float32)
+        m = _message(prev_block_ptr, prev_out_ptr, stride_prev,
+                     query_ptr + gate * H, row, offs, mask, eps, H)
+        gains = gains_ptr + gate * stride_gg + row * stride_g
+        forget = libdevice.tanh(tl.load(gains + offs, mask=mask, other=0.0))
+        gain = libdevice.tanh(tl.load(gains + H + offs, mask=mask, other=0.0))
         out = (1.0 - forget) * h + gain * m
-        w = tl.load(weight_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(weight_ptr + gate * H + offs, mask=mask,
+                    other=0.0).to(tl.float32)
         out = out * tl.math.rsqrt(tl.sum(out * out, axis=0) / H + eps) * w
-        tl.store(out_ptr + row * stride_o + offs, out.to(tl.bfloat16),
-                 mask=mask)
+        tl.store(out_ptr + gate * stride_og + row * stride_o + offs,
+                 out.to(tl.bfloat16), mask=mask)
 
     @triton.jit
     def rms_norm(x_ptr, stride_x, weight_ptr, out_ptr, stride_o, eps,
@@ -346,22 +349,24 @@ def _kernels() -> dict:
         acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
         return m_new, l_i, acc
 
-    @triton.jit(do_not_specialize=["window"])
+    @triton.jit(do_not_specialize=["window", "splits"])
     def rel_attention(q_ptr, k_ptr, v_ptr, profile_ptr, sink_ptr, out_ptr,
-                      tile_seq_ptr, tile_q0_ptr, cu_q_ptr, used_ptr,
-                      table_ptr, stride_q0, stride_q1, stride_s0, stride_o0,
-                      stride_o1, stride_k0, stride_k1, stride_k2, stride_v0,
-                      stride_v1, stride_v2, stride_bt, scale_log2, window,
-                      GROUP: tl.constexpr, HEADS: tl.constexpr,
-                      BM: tl.constexpr, BN: tl.constexpr, D: tl.constexpr,
+                      part_acc_ptr, part_ml_ptr, tile_seq_ptr, tile_q0_ptr,
+                      cu_q_ptr, used_ptr, table_ptr, stride_q0, stride_q1,
+                      stride_s0, stride_o0, stride_o1, stride_k0, stride_k1,
+                      stride_k2, stride_v0, stride_v1, stride_v2, stride_bt,
+                      scale_log2, window, splits, GROUP: tl.constexpr,
+                      HEADS: tl.constexpr, BM: tl.constexpr,
+                      BN: tl.constexpr, D: tl.constexpr,
                       EXTENT: tl.constexpr, PAGE: tl.constexpr,
-                      HAS_WINDOW: tl.constexpr):
+                      HAS_WINDOW: tl.constexpr, SPLIT: tl.constexpr):
         # profile holds each row and head's bias by distance, longest
         # first, (rows, heads, EXTENT): a row's bias over a key tile is one
         # ascending run, so its loads coalesce
         LOG2E: tl.constexpr = 1.4426950408889634
         TQ: tl.constexpr = BM // GROUP
-        tile = tl.program_id(0)
+        tile = tl.program_id(0) // splits
+        split = tl.program_id(0) % splits
         kv_head = tl.program_id(1)
         seq = tl.load(tile_seq_ptr + tile)
         q0 = tl.load(tile_q0_ptr + tile)
@@ -384,8 +389,13 @@ def _kernels() -> dict:
         sink = tl.load(sink_ptr + q_row * stride_s0 + head, mask=row_ok,
                        other=0.0).to(tl.float32)
         profile_row = profile_ptr + (q_row * HEADS + head) * EXTENT
-        m_i = sink * LOG2E
-        l_i = tl.zeros((BM,), dtype=tl.float32) + 1.0
+        # the sink is one more logit, with a zero value, counted once
+        if split == 0:
+            m_i = sink * LOG2E
+            l_i = tl.zeros((BM,), dtype=tl.float32) + 1.0
+        else:
+            m_i = tl.zeros((BM,), dtype=tl.float32) - float("inf")
+            l_i = tl.zeros((BM,), dtype=tl.float32)
         acc = tl.zeros((BM, D), dtype=tl.float32)
         first_q = base + q0
         last_q = base + tl.minimum(q0 + TQ, q_len) - 1
@@ -397,23 +407,57 @@ def _kernels() -> dict:
         # within EXTENT - 1 of the first query
         behind = tl.maximum(first_q - EXTENT - BN + 2 - start, 0)
         near = start + tl.cdiv(behind, BN) * BN
+        # this split's share of the key tiles
+        per = tl.cdiv(tl.cdiv(last_q + 1 - start, BN), splits) * BN
+        lo_key = start + split * per
+        hi_key = tl.minimum(lo_key + per, last_q + 1)
+        far_end = tl.minimum(near, hi_key)
+        near_start = tl.maximum(near, lo_key)
         bt_row = table_ptr + seq.to(tl.int64) * stride_bt
-        for n0 in range(start, near, BN):
+        for n0 in range(lo_key, far_end, BN):
             m_i, l_i, acc = _attend_tile(
                 q, k_ptr, v_ptr, bt_row, n0, kv_head, qpos, row_ok, used,
                 window, profile_row, m_i, l_i, acc, scale_log2, stride_k0,
                 stride_k1, stride_k2, stride_v0, stride_v1, stride_v2, BN, D,
                 EXTENT, PAGE, HAS_WINDOW, False)
-        for n0 in range(near, last_q + 1, BN):
+        for n0 in range(near_start, hi_key, BN):
             m_i, l_i, acc = _attend_tile(
                 q, k_ptr, v_ptr, bt_row, n0, kv_head, qpos, row_ok, used,
                 window, profile_row, m_i, l_i, acc, scale_log2, stride_k0,
                 stride_k1, stride_k2, stride_v0, stride_v1, stride_v2, BN, D,
                 EXTENT, PAGE, HAS_WINDOW, True)
-        out = acc / l_i[:, None]
-        tl.store(out_ptr + q_row[:, None] * stride_o0
-                 + head[:, None] * stride_o1 + offs_d[None, :],
-                 out.to(tl.bfloat16), mask=row_ok[:, None])
+        if SPLIT:
+            slot = (q_row * HEADS + head) * splits + split
+            tl.store(part_acc_ptr + slot[:, None] * D + offs_d[None, :], acc,
+                     mask=row_ok[:, None])
+            tl.store(part_ml_ptr + slot * 2, m_i, mask=row_ok)
+            tl.store(part_ml_ptr + slot * 2 + 1, l_i, mask=row_ok)
+        else:
+            out = acc / l_i[:, None]
+            tl.store(out_ptr + q_row[:, None] * stride_o0
+                     + head[:, None] * stride_o1 + offs_d[None, :],
+                     out.to(tl.bfloat16), mask=row_ok[:, None])
+
+    @triton.jit(do_not_specialize=["splits"])
+    def merge_splits(part_acc_ptr, part_ml_ptr, out_ptr, stride_o0,
+                     stride_o1, splits, HEADS: tl.constexpr,
+                     D: tl.constexpr, MAX_SPLITS: tl.constexpr):
+        # one row and head: the splits' softmax states, merged
+        row = tl.program_id(0).to(tl.int64)
+        head = tl.program_id(1)
+        offs_s = tl.arange(0, MAX_SPLITS)
+        offs_d = tl.arange(0, D)
+        slot = (row * HEADS + head) * splits + offs_s
+        ok = offs_s < splits
+        m = tl.load(part_ml_ptr + slot * 2, mask=ok, other=-float("inf"))
+        sums = tl.load(part_ml_ptr + slot * 2 + 1, mask=ok, other=0.0)
+        top = tl.max(m, axis=0)
+        w = tl.where(ok, tl.math.exp2(m - top), 0.0)
+        acc = tl.load(part_acc_ptr + slot[:, None] * D + offs_d[None, :],
+                      mask=ok[:, None], other=0.0)
+        out = tl.sum(acc * w[:, None], axis=0) / tl.sum(sums * w, axis=0)
+        tl.store(out_ptr + row * stride_o0 + head * stride_o1 + offs_d,
+                 out.to(tl.bfloat16))
 
     @triton.jit
     def _e2m1(x):
@@ -661,11 +705,26 @@ def _kernels() -> dict:
         tl.store(out_ptr + (w * 3 + j) * C + cols, value.to(tl.bfloat16),
                  mask=mask)
 
+    @triton.jit
+    def scatter_state(values_ptr, slots_ptr, state_ptr, stride_slot,
+                      stride_tap, C, BLOCK: tl.constexpr):
+        # state[slots[w], j] = values[w, j]; a negative slot is padding
+        w = tl.program_id(0).to(tl.int64)
+        j = tl.program_id(1)
+        cols = tl.program_id(2) * BLOCK + tl.arange(0, BLOCK)
+        slot = tl.load(slots_ptr + w)
+        mask = (cols < C) & (slot >= 0)
+        value = tl.load(values_ptr + (w * 3 + j) * C + cols, mask=mask)
+        tl.store(state_ptr + slot * stride_slot + j * stride_tap + cols, value,
+                 mask=mask)
+
     _KERNELS.update(
+        scatter_state=scatter_state,
         mix=mix, gate_inputs=gate_inputs, gate_apply=gate_apply,
         rms_norm=rms_norm, short_conv=short_conv, kv_conv=kv_conv,
         clip_heads=clip_heads, gate_attention=gate_attention,
-        rel_attention=rel_attention, quantize_tokens=quantize_tokens,
+        rel_attention=rel_attention, merge_splits=merge_splits,
+        quantize_tokens=quantize_tokens,
         swiglu_quantize=swiglu_quantize, combine=combine,
         gather_state=gather_state)
     return _KERNELS
@@ -688,7 +747,7 @@ def mix(torch, blocks, num_blocks, partial, query, *, addend=None,
 
     Args:
         torch: The torch module.
-        blocks: (max blocks, rows, hidden) bf16; the first num_blocks hold
+        blocks: (rows, max blocks, hidden) bf16; the first num_blocks hold
             completed blocks.
         num_blocks: Completed blocks the mix reads.
         partial: (rows, hidden) partial block, or None.
@@ -702,51 +761,82 @@ def mix(torch, blocks, num_blocks, partial, query, *, addend=None,
     Returns:
         (queries, rows, hidden): bf16 when normed, else fp32.
     """
-    rows, hidden = blocks.shape[1], blocks.shape[2]
+    rows, hidden = blocks.shape[0], blocks.shape[2]
     nq = query.shape[0]
     dtype = torch.bfloat16 if weight is not None else torch.float32
     out = torch.empty((nq, rows, hidden), dtype=dtype, device=blocks.device)
     if rows == 0:
         return out
     has_partial = partial is not None
-    partial = partial if has_partial else blocks[0]
+    partial = partial if has_partial else blocks[:, 0]
     addend_t = addend if addend is not None else partial
     _kernels()["mix"][(rows,)](
-        blocks, blocks.stride(0), blocks.stride(1), partial, partial.stride(0),
+        blocks, blocks.stride(1), blocks.stride(0), partial, partial.stride(0),
         addend_t, addend_t.stride(0), query,
         weight if weight is not None else query, out, out.stride(0),
         out.stride(1), eps, H=hidden, HP=_hp(hidden), NB=num_blocks,
         NS=num_blocks + int(has_partial), NQ=nq,
-        HAS_ADDEND=addend is not None,
-        NORM=weight is not None, num_warps=16)
+        HAS_ADDEND=addend is not None, NORM=weight is not None, num_warps=16)
     return out
 
 
+def _gate_hidden(hidden):
+    """The gate and row strides of a shared or per-gate hidden tensor."""
+    if hidden.dim() == 2:
+        return 0, hidden.stride(0)
+    return hidden.stride(0), hidden.stride(1)
+
+
 def gate_inputs(torch, hidden, prev_block, prev_out, query, eps=1e-6):
-    """[norm(hidden) | norm(message)] in bf16, (rows, 2 * width)."""
-    rows, width = hidden.shape
-    out = torch.empty((rows, 2 * width), dtype=torch.bfloat16,
-                      device=hidden.device)
+    """Each gate's [norm(hidden) | norm(message)] in bf16, (gates, rows, 2w).
+
+    Args:
+        torch: The torch module.
+        hidden: (rows, width) shared by every gate, or (gates, rows, width).
+        prev_block: (rows, width) the previous pass's last block.
+        prev_out: (rows, width) the previous pass's output.
+        query: (gates, width) fp32 message queries, pre-scaled.
+        eps: The norms' epsilon.
+    """
+    gates, width = query.shape
+    rows = prev_block.shape[0]
+    out = torch.empty((gates, rows, 2 * width), dtype=torch.bfloat16,
+                      device=prev_block.device)
     if rows:
-        _kernels()["gate_inputs"][(rows,)](
-            hidden, hidden.stride(0), prev_block, prev_out,
-            prev_block.stride(0), query, out, out.stride(0), eps, H=width,
-            HP=_hp(width), num_warps=16)
+        stride_hg, stride_h = _gate_hidden(hidden)
+        _kernels()["gate_inputs"][(rows, gates)](
+            hidden, stride_hg, stride_h, prev_block, prev_out,
+            prev_block.stride(0), query, out, out.stride(0), out.stride(1),
+            eps, H=width, HP=_hp(width), num_warps=16)
     return out
 
 
 def gate_apply(torch, hidden, prev_block, prev_out, query, gains, weight,
-               eps=1e-6, out=None):
-    """The gated, RMS-normed input in bf16, (rows, width)."""
-    rows, width = hidden.shape
-    if out is None:
-        out = torch.empty((rows, width), dtype=torch.bfloat16,
-                          device=hidden.device)
+               eps=1e-6):
+    """Each gate's gated, RMS-normed input in bf16, (gates, rows, width).
+
+    Args:
+        torch: The torch module.
+        hidden: (rows, width) shared by every gate, or (gates, rows, width).
+        prev_block: (rows, width) the previous pass's last block.
+        prev_out: (rows, width) the previous pass's output.
+        query: (gates, width) fp32 message queries, pre-scaled.
+        gains: (gates, rows, 2 * width) fp32 forget and message gains
+            before their tanh.
+        weight: (gates, width) RMS norm weights.
+        eps: The norms' epsilon.
+    """
+    gates, width = query.shape
+    rows = prev_block.shape[0]
+    out = torch.empty((gates, rows, width), dtype=torch.bfloat16,
+                      device=prev_block.device)
     if rows:
-        _kernels()["gate_apply"][(rows,)](
-            hidden, hidden.stride(0), prev_block, prev_out,
-            prev_block.stride(0), query, gains, gains.stride(0), weight, out,
-            out.stride(0), eps, H=width, HP=_hp(width), num_warps=16)
+        stride_hg, stride_h = _gate_hidden(hidden)
+        _kernels()["gate_apply"][(rows, gates)](
+            hidden, stride_hg, stride_h, prev_block, prev_out,
+            prev_block.stride(0), query, gains, gains.stride(0),
+            gains.stride(1), weight, out, out.stride(0), out.stride(1), eps,
+            H=width, HP=_hp(width), num_warps=16)
     return out
 
 
@@ -867,8 +957,8 @@ def attention_tiles(cu_q_host, rows_per_tile):
 
 
 def rel_attention(torch, q3, kp, vp, rel, sink, proj, out, tiles, cu_q, used,
-                  table, *, window, block_rows=128, block_keys=32, num_warps=8,
-                  num_stages=3):
+                  table, *, window, max_keys, block_rows=128, block_keys=32,
+                  num_warps=8, num_stages=3):
     """Causal paged attention with the relative bias and sink logits.
 
     Args:
@@ -886,6 +976,7 @@ def rel_attention(torch, q3, kp, vp, rel, sink, proj, out, tiles, cu_q, used,
         used: Keys per sequence, its queries' included.
         table: Each sequence's arena pages.
         window: Keys each row sees, or 0 for every earlier key.
+        max_keys: The most keys any sequence holds.
         block_rows: Rows per query tile, three heads of each token.
         block_keys: Keys per key tile.
         num_warps: Warps per program.
@@ -900,15 +991,46 @@ def rel_attention(torch, q3, kp, vp, rel, sink, proj, out, tiles, cu_q, used,
     # each row and head's bias by distance, longest first, rounded to
     # bf16 as the reference's bias is
     profile = torch.mm(rel.reshape(rows * heads, rank), proj.flip(1))
-    _kernels()["rel_attention"][(tiles[0].numel(), kv_heads)](
-        q3, kp, vp, profile, sink, out, tiles[0], tiles[1], cu_q, used,
-        table, q3.stride(0), q3.stride(1), sink.stride(0), out.stride(0),
-        out.stride(1), kp.stride(0), kp.stride(1), kp.stride(2),
-        vp.stride(0), vp.stride(1), vp.stride(2), table.stride(0),
-        dim ** -0.5 * 1.4426950408889634, int(window), GROUP=group,
-        HEADS=heads, BM=block_rows, BN=block_keys, D=dim, EXTENT=extent, PAGE=page,
-        HAS_WINDOW=window > 0, num_warps=num_warps, num_stages=num_stages)
+    num_tiles = tiles[0].numel()
+    splits = num_splits(num_tiles * kv_heads, max_keys, window)
+    if splits > 1:
+        part_acc = torch.empty((rows * heads * splits, dim),
+                               dtype=torch.float32, device=q3.device)
+        part_ml = torch.empty((rows * heads * splits, 2), dtype=torch.float32,
+                              device=q3.device)
+    else:
+        part_acc = part_ml = out
+    _kernels()["rel_attention"][(num_tiles * splits, kv_heads)](
+        q3, kp, vp, profile, sink, out, part_acc, part_ml, tiles[0],
+        tiles[1], cu_q, used, table, q3.stride(0), q3.stride(1),
+        sink.stride(0), out.stride(0), out.stride(1), kp.stride(0),
+        kp.stride(1), kp.stride(2), vp.stride(0), vp.stride(1), vp.stride(2),
+        table.stride(0), dim ** -0.5 * 1.4426950408889634, int(window),
+        splits, GROUP=group, HEADS=heads, BM=block_rows, BN=block_keys, D=dim,
+        EXTENT=extent, PAGE=page, HAS_WINDOW=window > 0, SPLIT=splits > 1,
+        num_warps=num_warps, num_stages=num_stages)
+    if splits > 1:
+        _kernels()["merge_splits"][(rows, heads)](
+            part_acc, part_ml, out, out.stride(0), out.stride(1), splits,
+            HEADS=heads, D=dim, MAX_SPLITS=MAX_SPLITS, num_warps=4)
     return out
+
+
+# at most this many programs share one query tile's keys
+MAX_SPLITS = 16
+# programs that fill a B200 several times over
+TARGET_PROGRAMS = 4 * 148
+# the fewest keys a split reads
+SPLIT_KEYS = 512
+
+
+def num_splits(programs, max_keys, window) -> int:
+    """Key splits per query tile: enough programs to fill the GPU."""
+    keys = min(max_keys, window) if window else max_keys
+    if programs >= TARGET_PROGRAMS or keys < 2 * SPLIT_KEYS:
+        return 1
+    return int(max(1, min(MAX_SPLITS, -(-TARGET_PROGRAMS // programs),
+                          keys // SPLIT_KEYS)))
 
 
 def triton_cdiv(a, b):
@@ -961,6 +1083,25 @@ def quantize_tokens(torch, x, c_map, ids, offsets, sf_offsets, *, nvfp4,
     return (q, sf, row_scale) if nvfp4 else (bf16, None, None)
 
 
+def quantize_rows(torch, x):
+    """Quantize each row of x to NVFP4 with its own outer scale.
+
+    Returns:
+        (packed (rows, K/2) uint8, swizzled scales fp8, row scales
+        (rows,) fp32), for a dense NVFP4 GEMM whose output rows the row
+        scales multiply.
+    """
+    rows = x.shape[0]
+    device = x.device
+    ids = torch.zeros((rows, 1), dtype=torch.int32, device=device)
+    c_map = torch.arange(rows, dtype=torch.int32, device=device)
+    # built on the device, since a graph capture allows no host copy
+    offsets = torch.arange(2, dtype=torch.int32, device=device) * rows
+    sf_offsets = torch.zeros(2, dtype=torch.int32, device=device)
+    return quantize_tokens(torch, x, c_map, ids, offsets, sf_offsets,
+                           nvfp4=True, sf_rows=rows)
+
+
 def swiglu_quantize(torch, gate_up, row_scale, gamma, expert, offsets,
                     sf_offsets, *, nvfp4, sf_rows, gate_cap, up_cap):
     """The softcapped SwiGLU of interleaved gate/up rows, quantized."""
@@ -998,15 +1139,30 @@ def combine(torch, down, row_scale, c_map, tokens, topk):
     return out
 
 
-def gather_state(torch, x, srcs, state):
-    """(writes, 3, channels) bf16 values of each write's three sources."""
-    writes = srcs.shape[0]
+def save_state(torch, x, slots, sources, state):
+    """Write each slot's three new convolution columns into its saved state.
+
+    The columns are gathered before any is written, since a slot's new
+    columns can come from another written slot's old ones.
+
+    Args:
+        torch: The torch module.
+        x: (rows, channels) convolution inputs of this chunk.
+        slots: (writes,) int64 slots; a negative slot is padding.
+        sources: (writes, 3) int32 tap sources of each slot's columns.
+        state: (slots, 3, channels) this convolution's saved columns.
+    """
+    writes = slots.shape[0]
+    if writes == 0:
+        return
     channels = x.shape[1]
-    out = torch.empty((writes, 3, channels), dtype=torch.bfloat16,
-                      device=x.device)
-    if writes:
-        block = 1024
-        _kernels()["gather_state"][(writes, 3, triton_cdiv(channels, block))](
-            x, x.stride(0), srcs, state, state.stride(0), state.stride(1), out,
-            channels, BLOCK=block, num_warps=4)
-    return out
+    values = torch.empty((writes, 3, channels), dtype=torch.bfloat16,
+                         device=x.device)
+    block = 1024
+    grid = (writes, 3, triton_cdiv(channels, block))
+    _kernels()["gather_state"][grid](
+        x, x.stride(0), sources, state, state.stride(0), state.stride(1),
+        values, channels, BLOCK=block, num_warps=4)
+    _kernels()["scatter_state"][grid](
+        values, slots, state, state.stride(0), state.stride(1), channels,
+        BLOCK=block, num_warps=4)

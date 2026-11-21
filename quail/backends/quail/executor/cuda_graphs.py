@@ -177,6 +177,7 @@ class CapturedPieces:
     def forward(self, pipeline, chunk):
         """Replay pieces separated by eager token mixers; copy selected outputs."""
         self.buffers.copy(chunk)
+        pipeline.stage(self.buffers, chunk)
         graphs = (self.tail_graphs if self.buffers.has_tails
                   and self.tail_graphs is not None else self.graphs)
         chunk.meta["layer"] = 0

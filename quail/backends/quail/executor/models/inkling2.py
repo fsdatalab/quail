@@ -33,6 +33,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from quail.backends.quail.executor.attention import Engine
+from quail.backends.quail.executor.cuda_graphs import PiecewiseBuffers
 from quail.backends.quail.executor.models import inkling2_kernels as kernels
 from quail.backends.quail.executor.models.base import ModelPipeline
 
@@ -43,6 +44,9 @@ SKIPPED_PARTS = ("model.visual.",)
 # output, expert output
 STATE_CHANNELS = {"k": (0, 1024), "v": (1024, 2048), "attn": (2048, 4352),
                   "mlp": (4352, 6656)}
+# NVFP4's largest value times fp8 e4m3's: a global scale maps a tensor's
+# largest magnitude here
+FP4_RANGE = 6.0 * 448.0
 # the message gates of a loop layer, by checkpoint controller name
 GATES = (("q", "attn"), ("k", "k"), ("v", "v"), ("mlp", "mlp"))
 
@@ -110,8 +114,38 @@ def _dequantize_mxfp8(torch, weight, scale):
     return out
 
 
-def load_inkling2(path, device="cuda"):
+def _fp4_weight(torch, sides):
+    """NVFP4 weights of stacked projections, each side padded to 128 rows.
+
+    The swizzled block scales come in tiles of 128 rows, so a side that
+    starts on a tile can be sliced out of the stack and multiplied alone.
+
+    Returns:
+        Namespace with the packed values, block scales, the GEMM alpha
+        that undoes the global scale, and each side's first row in the
+        stack.
+    """
+    from vllm import _custom_ops as ops
+
+    padded = [torch.cat([side, side.new_zeros(-side.shape[0] % 128,
+                                              side.shape[1])])
+              for side in sides]
+    weight = torch.cat(padded).contiguous()
+    scale = FP4_RANGE / weight.abs().amax().float().clamp(min=1e-12)
+    values, scales = ops.scaled_fp4_quant(weight, scale)
+    starts = np.cumsum([0] + [side.shape[0] for side in padded]).tolist()
+    return SimpleNamespace(values=values, scales=scales, alpha=1.0 / scale,
+                           starts=starts)
+
+
+def load_inkling2(path, device="cuda", *, quantize_fp4=False):
     """Load an Inkling 2 Mini checkpoint's language model onto the GPU.
+
+    Args:
+        path: The local checkpoint directory.
+        device: Where the weights go.
+        quantize_fp4: Quantize the bf16 attention projections to
+            NVFP4 as they load.
 
     Raises:
         ValueError: The checkpoint lacks a tensor the pass reads.
@@ -183,6 +217,12 @@ def load_inkling2(path, device="cuda"):
         layer.side_rows = np.cumsum([0] + [sum(w) for w in widths]).tolist()
         layer.q_widths, layer.k_widths, layer.v_widths = widths
         layer.wo = take(own("attn.wo_ud.weight"))
+        layer.fp4 = None
+        if quantize_fp4:
+            sides = [torch.cat(side) for side in (q_side, k_side, v_side)]
+            layer.fp4 = _fp4_weight(torch, sides)
+            layer.wo_fp4 = _fp4_weight(torch, [layer.wo])
+            del layer.w_all, layer.wo
         layer.q_scale = take(own("attn.q_l2_clip.scale"))
         layer.rel_scale = take(own("attn.rel_l2_clip.scale"))
         layer.rel_proj = take(own("attn.rel_logits_proj.proj")).contiguous()
@@ -222,15 +262,24 @@ def load_inkling2(path, device="cuda"):
                        "k": kv_queries[2 * position],
                        "v": kv_queries[2 * position + 1],
                        "mlp": queries[2 * position + 1]}
-            layer.gates = {}
+            gates = {}
             for name, controller in GATES:
                 down = take(own(f"controllers.{controller}.down_weight"))
                 forget = take(own(f"controllers.{controller}.forget_weight"))
                 gain = take(own(f"controllers.{controller}.gain_weight"))
-                layer.gates[name] = SimpleNamespace(
-                    down=down.contiguous(),
-                    gains=torch.cat([forget, gain]).contiguous(),
-                    query=message[name].contiguous())
+                gates[name] = (down, torch.cat([forget, gain]),
+                               message[name])
+
+            def stacked(names, gates=gates):
+                # the gates of names, batched: (gates, ...) weights, already
+                # transposed for x @ w
+                return SimpleNamespace(
+                    down_t=torch.stack([gates[n][0].t() for n in names]),
+                    gains_t=torch.stack([gates[n][1].t() for n in names]),
+                    query=torch.stack([gates[n][2] for n in names]))
+
+            layer.gates = {"qkv": stacked(("q", "k", "v")),
+                           "mlp": stacked(("mlp",))}
         layers.append(layer)
     embed = take("embed.weight")
     embed_norm = take("embed_norm.weight")
@@ -296,6 +345,48 @@ def conv_taps(phases, rows):
     return taps, slots, sources
 
 
+def visit_schedule(layers, loop):
+    """Each visit in run order, and the completed blocks after the last.
+
+    A visit names its layer, its index among the visits (its arena
+    layer and state layer), the completed blocks before it, whether it
+    reads loop messages, and whether it saves the state before the loop
+    ("save") or restarts a pass from it ("restart").
+
+    Returns:
+        (visits, final completed blocks).
+    """
+    start, end = loop["core_start"], loop["core_end"]
+    visits = []
+    num_blocks = 0
+    before = None
+
+    def add(layer, *, looped=False, enter=None):
+        nonlocal num_blocks
+        visits.append(SimpleNamespace(index=len(visits), layer=layer,
+                                      blocks=num_blocks, looped=looped,
+                                      enter=enter))
+        if layer.boundary:
+            num_blocks += 1
+
+    for layer in layers[:start]:
+        add(layer)
+    for loop_pass in range(loop["num_passes"]):
+        for position, layer in enumerate(layers[start:end]):
+            enter = None
+            if position == 0:
+                if loop_pass == 0:
+                    before = num_blocks
+                    enter = "save"
+                else:
+                    num_blocks = before
+                    enter = "restart"
+            add(layer, looped=loop_pass > 0, enter=enter)
+    for layer in layers[end:]:
+        add(layer)
+    return visits, num_blocks
+
+
 class Inkling2Pipeline(ModelPipeline):
     """Forward passes for Inkling 2 Mini checkpoints loaded by load_inkling2.
 
@@ -342,51 +433,66 @@ class Inkling2Pipeline(ModelPipeline):
         self.max_chunk_tokens = (2**31 - 1) // (8 * 2 * self.hidden)
         # whether torch.mm takes out_dtype for bf16 inputs; probed once
         self._fp32_out = None
+        self.schedule, self.final_blocks = visit_schedule(model.layers,
+                                                          self.loop)
+        # the piecewise graphs capture one piece per visit, plus the last
+        self.layers = self.schedule
+        self.final_norm = SimpleNamespace(weight=model.final_norm)
 
     # ---- small pieces ---------------------------------------------
 
-    def _gate(self, gate, raw, messages, weight):
-        """A loop message gate, then the RMS norm with weight, in bf16."""
+    def _gates(self, gates, hidden, messages, weight):
+        """Loop message gates, each then RMS-normed with its weight, in bf16.
+
+        Args:
+            gates: Batched gate weights (loader's stacked).
+            hidden: (rows, width) shared by every gate, or (gates, rows,
+                width).
+            messages: (previous pass's last block, its output).
+            weight: (gates, width) RMS norm weights.
+
+        Returns:
+            (gates, rows, width) gated inputs.
+        """
         torch = self.torch
         prev_block, prev_out = messages
-        inputs = kernels.gate_inputs(torch, raw, prev_block, prev_out,
-                                     gate.query, self.eps)
+        inputs = kernels.gate_inputs(torch, hidden, prev_block, prev_out,
+                                     gates.query, self.eps)
         # the down output is rounded to bf16 and the gain weights are bf16
         # values, so a bf16 GEMM accumulating in fp32 forms the same products
-        down = torch.mm(inputs, gate.down.t())
-        gains = self._mm_fp32(down, gate.gains)
-        return kernels.gate_apply(torch, raw, prev_block, prev_out,
-                                  gate.query, gains, weight, self.eps)
+        down = torch.bmm(inputs, gates.down_t)
+        gains = self._mm_fp32(down, gates.gains_t)
+        return kernels.gate_apply(torch, hidden, prev_block, prev_out,
+                                  gates.query, gains, weight, self.eps)
 
-    def _write_state(self, x, taps, state, part):
+    def _save_state(self, x, run, state, part):
         """Save the new convolution columns of the slots this chunk writes."""
-        slots, sources = taps["write_slots"], taps["write_sources"]
-        if slots.numel() == 0:
-            return
         first, last = STATE_CHANNELS[part]
-        view = state[:, :, first:last]
-        view[slots] = kernels.gather_state(self.torch, x, sources, view)
+        kernels.save_state(self.torch, x, run.write_slots, run.write_sources,
+                           state[:, :, first:last])
 
     def _mm_fp32(self, x, weight):
-        """Return x @ weight.T for bf16 operands, accumulated in fp32.
+        """Return x @ weight for bf16 operands, accumulated in fp32.
 
+        A 2-D x multiplies a 2-D weight; a 3-D x a batch of weights.
         Products of two bf16 values are exact in fp32, so the fp32 GEMM
         fallback forms the same products.
         """
         torch = self.torch
+        product = torch.mm if x.dim() == 2 else torch.bmm
         if self._fp32_out is None:
             try:
-                torch.mm(x[:1], weight.t(), out_dtype=torch.float32)
+                product(x[..., :1, :], weight, out_dtype=torch.float32)
                 self._fp32_out = True
             except (TypeError, RuntimeError):
                 self._fp32_out = False
         if self._fp32_out:
-            return torch.mm(x, weight.t(), out_dtype=torch.float32)
-        return torch.mm(x.float(), weight.float().t())
+            return product(x, weight, out_dtype=torch.float32)
+        return product(x.float(), weight.float())
 
     def _router(self, layer, x):
         torch = self.torch
-        logits = self._mm_fp32(x, layer.router)
+        logits = self._mm_fp32(x, layer.router.t())
         scores = logits.sigmoid()
         ids = torch.topk(scores + layer.router_bias,
                          self.config["num_experts_per_tok"], dim=-1,
@@ -469,17 +575,41 @@ class Inkling2Pipeline(ModelPipeline):
             return tuple(mixed)
         raw = kernels.mix(torch, blocks, num_blocks, h, layer.attn_query,
                           eps=self.eps)
-        inputs = []
-        for part, (name, _) in enumerate(GATES[:3]):
-            source = raw[0] if layer.is_local else raw[part]
-            weight = layer.attn_norm[0 if layer.is_local else part]
-            inputs.append(self._gate(layer.gates[name], source, messages,
-                                     weight))
-        return tuple(inputs)
+        if layer.is_local:
+            # one input feeds the query, key, and value gates
+            hidden = raw[0]
+            weight = layer.attn_norm.expand(3, -1).contiguous()
+        else:
+            hidden, weight = raw, layer.attn_norm
+        return tuple(self._gates(layer.gates["qkv"], hidden, messages,
+                                 weight))
+
+    def _fp4_linear(self, x, weight, first=0, last=None):
+        """Return x @ rows [first, last) of an NVFP4 weight, in bf16.
+
+        Each activation row takes its own scale, so a row's result does
+        not depend on the other rows of the pass, padding included.
+        """
+        from vllm import _custom_ops as ops
+
+        torch = self.torch
+        values, scales, row_scale = kernels.quantize_rows(torch, x)
+        last = weight.starts[-1] if last is None else last
+        out = ops.cutlass_scaled_fp4_mm(
+            values, weight.values[first:last], scales,
+            weight.scales[first:last], weight.alpha, torch.bfloat16)
+        return out.mul_(row_scale[:, None])
 
     def _projections(self, layer, inputs):
         """(q side, k side, v side) projection outputs."""
         torch = self.torch
+        if layer.fp4 is not None:
+            starts = layer.fp4.starts
+            if len(inputs) == 1:
+                out = self._fp4_linear(inputs[0], layer.fp4)
+                return tuple(out[:, starts[i]:starts[i + 1]] for i in range(3))
+            return tuple(self._fp4_linear(inputs[i], layer.fp4, starts[i],
+                                          starts[i + 1]) for i in range(3))
         if len(inputs) == 1:
             out = torch.mm(inputs[0], layer.w_all.t())
             bounds = layer.side_rows
@@ -489,97 +619,198 @@ class Inkling2Pipeline(ModelPipeline):
             torch.mm(inputs[i], layer.w_all[bounds[i]:bounds[i + 1]].t())
             for i in range(3))
 
-    def _visit(self, visit, layer, residual, blocks, num_blocks, chunk, plan,
-               messages):
+    def _keep(self, run, name, value):
+        """Set a tensor the next piece or token mixer reads.
+
+        Captured pieces read and write fixed buffers, so a buffer is
+        copied into; an eager pass keeps the tensor itself.
+        """
+        target = getattr(run, name, None)
+        if isinstance(run, PiecewiseBuffers):
+            target.copy_(value)
+            return target
+        setattr(run, name, value)
+        return value
+
+    def _pre(self, visit, run):
+        """A visit's work up to attention: inputs, projections, keys, values.
+
+        Leaves the queries, relative states, sink logits, and output gates
+        for the token mixer and the next piece, and writes the visit's KV.
+        """
         torch, spec, config = self.torch, self.spec, self.config
-        n = residual.shape[0]
+        layer = visit.layer
         heads, kv_heads, dim = spec.num_q_heads, spec.num_kv_heads, spec.d_head
-        rank = config["d_rel"]
-        inputs = self._attention_inputs(layer, residual, blocks, num_blocks,
-                                        messages)
+        if visit.enter == "save":
+            self._keep(run, "before", run.residual)
+        elif visit.enter == "restart":
+            # the next pass rewrites the block its messages read
+            self._keep(run, "prev_block",
+                       run.blocks[:, visit.blocks + 1].clone())
+            self._keep(run, "prev_out", run.residual)
+            self._keep(run, "residual", run.before)
+        messages = (run.prev_block, run.prev_out) if visit.looped else None
+        inputs = self._attention_inputs(layer, run.residual, run.blocks,
+                                        visit.blocks, messages)
         q_side, k_side, v_side = self._projections(layer, inputs)
         q_width, gate_width, rel_width, _ = layer.q_widths
+        rel_first = q_width + gate_width
+        sink_first = rel_first + rel_width
         log_scale = (None if layer.is_local else
                      (config["log_scaling_alpha"],
                       float(config["log_scaling_n_floor"])))
-        q = kernels.clip_heads(torch, q_side[:, :q_width], layer.q_scale,
-                               chunk.positions, heads=heads, head_dim=dim,
-                               clip=config["qk_l2_clip_threshold"],
-                               log_scale=log_scale)
-        rel_first = q_width + gate_width
-        rel = kernels.clip_heads(
-            torch, q_side[:, rel_first:rel_first + rel_width],
-            layer.rel_scale, chunk.positions, heads=heads, head_dim=rank,
-            clip=config["rel_l2_clip_threshold"], log_scale=log_scale)
-        sink = q_side[:, rel_first + rel_width:]
-        state = self.arena.conv_state[:, visit]
+        self._keep(run, "q3", kernels.clip_heads(
+            torch, q_side[:, :q_width], layer.q_scale, run.positions,
+            heads=heads, head_dim=dim, clip=config["qk_l2_clip_threshold"],
+            log_scale=log_scale))
+        self._keep(run, "rel", kernels.clip_heads(
+            torch, q_side[:, rel_first:sink_first], layer.rel_scale,
+            run.positions, heads=heads, head_dim=config["d_rel"],
+            clip=config["rel_l2_clip_threshold"], log_scale=log_scale))
+        self._keep(run, "sink", q_side[:, sink_first:sink_first + heads])
+        self._keep(run, "gate", q_side[:, q_width:rel_first])
+        state = self.arena.conv_state[:, visit.index]
         kv_width = kv_heads * dim
-        taps = plan["taps"]
         k_in, v_in = k_side[:, :kv_width], v_side[:, :kv_width]
         dynamic = not layer.is_local
         k3 = kernels.kv_conv(
-            torch, k_in, taps, state[:, :, 0:1024], layer.k_conv,
+            torch, k_in, run.taps, state[:, :, 0:1024], layer.k_conv,
             heads=kv_heads, head_dim=dim,
             dynamic=k_side[:, kv_width:] if dynamic else None, is_key=True,
             clip=config["qk_l2_clip_threshold"], eps=self.eps)
         v3 = kernels.kv_conv(
-            torch, v_in, taps, state[:, :, 1024:2048], layer.v_conv,
+            torch, v_in, run.taps, state[:, :, 1024:2048], layer.v_conv,
             heads=kv_heads, head_dim=dim,
             dynamic=v_side[:, kv_width:] if dynamic else None, is_key=False,
             clip=0.0, eps=self.eps)
-        self._write_state(k_in, plan, state, "k")
-        self._write_state(v_in, plan, state, "v")
-        meta = chunk.meta
-        meta["layer"] = visit
-        self.engine.write_kv(k3, v3, meta)
-        kp, vp = self.arena.paged_kv(visit)
-        unified = meta["unified"]
-        attn = torch.empty((n, heads, dim), dtype=torch.bfloat16,
-                           device=residual.device)
-        kernels.rel_attention(
-            torch, q, kp, vp, rel, sink, layer.rel_proj, attn,
-            plan["tiles"], unified["cu_q"], unified["used"], unified["table"],
-            window=self.window if layer.is_local else 0,
-            block_rows=plan["block_rows"],
-            num_warps=8 if plan["block_rows"] >= 64 else 4,
-            num_stages=3 if plan["block_rows"] >= 64 else 2)
-        gated = kernels.gate_attention(
-            torch, attn.view(n, heads * dim), q_side[:, q_width:rel_first])
-        projected = torch.mm(gated, layer.wo.t())
-        attn_out = kernels.short_conv(torch, projected, taps,
+        self._save_state(k_in, run, state, "k")
+        self._save_state(v_in, run, state, "v")
+        run.write_kv(self.engine, k3, v3, visit.index)
+
+    def _post(self, visit, run):
+        """A visit's work after attention: output, experts, residual stream."""
+        torch, spec = self.torch, self.spec
+        layer = visit.layer
+        n = run.residual.shape[0]
+        width = spec.num_q_heads * spec.d_head
+        state = self.arena.conv_state[:, visit.index]
+        gated = kernels.gate_attention(torch, run.attn.view(n, width),
+                                       run.gate)
+        projected = (self._fp4_linear(gated, layer.wo_fp4)
+                     if layer.fp4 is not None
+                     else torch.mm(gated, layer.wo.t()))
+        attn_out = kernels.short_conv(torch, projected, run.taps,
                                       state[:, :, 2048:4352], layer.attn_conv)
-        self._write_state(projected, plan, state, "attn")
+        self._save_state(projected, run, state, "attn")
+        num_blocks = visit.blocks
         if layer.boundary:
-            blocks[num_blocks].copy_(residual)
+            run.blocks[:, num_blocks].copy_(run.residual)
             num_blocks += 1
             partial, addend = attn_out, None
         else:
-            partial, addend = residual, attn_out
-        if messages is None:
-            mlp_in = kernels.mix(torch, blocks, num_blocks, partial,
+            partial, addend = run.residual, attn_out
+        if visit.looped:
+            raw = kernels.mix(torch, run.blocks, num_blocks, partial,
+                              layer.mlp_query, addend=addend, eps=self.eps)[0]
+            mlp_in = self._gates(layer.gates["mlp"], raw,
+                                 (run.prev_block, run.prev_out),
+                                 layer.mlp_norm)[0]
+        else:
+            mlp_in = kernels.mix(torch, run.blocks, num_blocks, partial,
                                  layer.mlp_query, addend=addend,
                                  weight=layer.mlp_norm, eps=self.eps)[0]
-        else:
-            raw = kernels.mix(torch, blocks, num_blocks, partial,
-                              layer.mlp_query, addend=addend, eps=self.eps)[0]
-            mlp_in = self._gate(layer.gates["mlp"], raw, messages,
-                                layer.mlp_norm[0])
         expert_out = self._experts(layer, mlp_in)
         if layer.boundary:
-            out = kernels.short_conv(torch, expert_out, taps,
+            out = kernels.short_conv(torch, expert_out, run.taps,
                                      state[:, :, 4352:6656], layer.mlp_conv,
                                      residual=attn_out)
         else:
-            out = kernels.short_conv(torch, expert_out, taps,
+            out = kernels.short_conv(torch, expert_out, run.taps,
                                      state[:, :, 4352:6656], layer.mlp_conv,
-                                     residual=residual, addend=attn_out)
-        self._write_state(expert_out, plan, state, "mlp")
-        return out, num_blocks
+                                     residual=run.residual, addend=attn_out)
+        self._save_state(expert_out, run, state, "mlp")
+        self._keep(run, "residual", out)
+
+    # ---- pieces between token mixers ----------------------------------
+
+    def boundary(self, num_tokens, device):
+        """The tensors pieces and token mixers pass to each other, by row."""
+        torch, spec = self.torch, self.spec
+        heads, dim = spec.num_q_heads, spec.d_head
+
+        def rows(*shape, dtype=torch.bfloat16, fill=None):
+            tensor = torch.zeros((num_tokens, *shape), dtype=dtype,
+                                 device=device)
+            return tensor if fill is None else tensor.fill_(fill)
+
+        return dict(
+            blocks=rows(4, self.hidden), before=rows(self.hidden),
+            prev_block=rows(self.hidden), prev_out=rows(self.hidden),
+            q3=rows(heads, dim), rel=rows(heads, self.config["d_rel"]),
+            sink=rows(heads), gate=rows(heads * dim), attn=rows(heads, dim),
+            # padding rows read no taps and write no state
+            taps=rows(3, dtype=torch.int32, fill=kernels.ZERO_TAP),
+            write_slots=rows(dtype=torch.int64, fill=-1),
+            write_sources=rows(3, dtype=torch.int32, fill=kernels.ZERO_TAP))
+
+    def piece(self, index, buffers):
+        """The previous visit's work after attention, then the next's up to it."""
+        torch, model = self.torch, self.model
+        if index == 0:
+            embedded = torch.nn.functional.embedding(buffers.ids, model.embed)
+            self._keep(buffers, "residual", kernels.rms_norm(
+                torch, embedded, model.embed_norm, self.eps))
+        else:
+            self._post(self.schedule[index - 1], buffers)
+        if index == len(self.schedule):
+            blocks, residual = buffers.blocks, buffers.residual
+            final = getattr(buffers, "final", None)
+            if final is not None:
+                blocks = blocks.index_select(0, final)
+                residual = residual.index_select(0, final)
+            self._keep(buffers, "output", kernels.mix(
+                torch, blocks, self.final_blocks, residual,
+                model.output_query, weight=model.final_norm,
+                eps=self.eps)[0])
+            return
+        self._pre(self.schedule[index], buffers)
+
+    def mixer(self, index, buffers, chunk):
+        """Visit index's attention over the chunk's real rows."""
+        torch = self.torch
+        layer = self.schedule[index].layer
+        plan = chunk.meta["inkling_plan"]
+        unified = chunk.meta["unified"]
+        n = chunk.tokens
+        kp, vp = self.arena.paged_kv(index)
+        if not isinstance(buffers, PiecewiseBuffers):
+            buffers.attn = torch.empty_like(buffers.q3)
+        prefill = plan["block_rows"] >= 64
+        kernels.rel_attention(
+            torch, buffers.q3[:n], kp, vp, buffers.rel[:n], buffers.sink[:n],
+            layer.rel_proj, buffers.attn[:n], plan["tiles"], unified["cu_q"],
+            unified["used"], unified["table"],
+            window=self.window if layer.is_local else 0,
+            max_keys=unified["max_used"], block_rows=plan["block_rows"],
+            num_warps=8 if prefill else 4, num_stages=3 if prefill else 2)
+
+    def stage(self, buffers, chunk):
+        """Copy the chunk's convolution taps and state writes into buffers."""
+        plan = self._plan(chunk)
+        n, writes = chunk.tokens, plan["write_slots"].shape[0]
+        buffers.taps[:n].copy_(plan["taps"])
+        buffers.taps[n:].fill_(kernels.ZERO_TAP)
+        buffers.write_slots[:writes].copy_(plan["write_slots"])
+        buffers.write_slots[writes:].fill_(-1)
+        buffers.write_sources[:writes].copy_(plan["write_sources"])
 
     # ---- the chunk --------------------------------------------------
 
     def _plan(self, chunk):
-        """The chunk's convolution taps and attention tiles, on the GPU."""
+        """The chunk's convolution taps, state writes, and attention tiles.
+
+        Also kept in chunk.meta for the token mixers.
+        """
         torch = self.torch
         meta = chunk.meta
         if meta.get("gdn") is None or meta.get("unified") is None:
@@ -598,46 +829,34 @@ class Inkling2Pipeline(ModelPipeline):
             return torch.from_numpy(np.ascontiguousarray(array)).to(
                 device=device, dtype=dtype)
 
-        return dict(taps=gpu(taps, torch.int32),
+        plan = dict(taps=gpu(taps, torch.int32),
                     write_slots=gpu(slots, torch.int64),
                     write_sources=gpu(sources, torch.int32),
                     tiles=(gpu(seqs, torch.int32), gpu(firsts, torch.int32)),
                     block_rows=block_rows)
+        meta["inkling_plan"] = plan
+        return plan
 
     def forward_chunk(self, chunk):
-        torch = self.torch
-        model = self.model
+        """Run the chunk eagerly through the same pieces and token mixers."""
         plan = self._plan(chunk)
+        meta = chunk.meta
         n = chunk.tokens
-        h = kernels.rms_norm(
-            torch, torch.nn.functional.embedding(chunk.input_ids, model.embed),
-            model.embed_norm, self.eps)
-        blocks = torch.empty((4, n, self.hidden), dtype=torch.bfloat16,
-                             device=h.device)
-        start, end = self.loop["core_start"], self.loop["core_end"]
-        passes = self.loop["num_passes"]
-        num_blocks = 0
-        visit = 0
-        for layer in model.layers[:start]:
-            h, num_blocks = self._visit(visit, layer, h, blocks, num_blocks,
-                                        chunk, plan, None)
-            visit += 1
-        before_h, before_blocks = h, num_blocks
-        messages = None
-        for loop_pass in range(passes):
-            if loop_pass:
-                # the next pass rewrites the blocks it reads its messages from
-                messages = (blocks[before_blocks + 1].clone(), h)
-                h, num_blocks = before_h, before_blocks
-            for layer in model.layers[start:end]:
-                h, num_blocks = self._visit(visit, layer, h, blocks,
-                                            num_blocks, chunk, plan, messages)
-                visit += 1
-        for layer in model.layers[end:]:
-            h, num_blocks = self._visit(visit, layer, h, blocks, num_blocks,
-                                        chunk, plan, None)
-            visit += 1
-        final = chunk.final_indices
-        return kernels.mix(torch, blocks.index_select(1, final), num_blocks,
-                           h.index_select(0, final), model.output_query,
-                           weight=model.final_norm, eps=self.eps)[0]
+
+        def write_kv(engine, k, v, layer):
+            meta["layer"] = layer
+            engine.write_kv(k, v, meta)
+
+        run = SimpleNamespace(
+            ids=chunk.input_ids, positions=chunk.positions,
+            blocks=self.torch.empty((n, 4, self.hidden),
+                                    dtype=self.torch.bfloat16,
+                                    device=chunk.input_ids.device),
+            taps=plan["taps"], write_slots=plan["write_slots"],
+            write_sources=plan["write_sources"], final=chunk.final_indices,
+            write_kv=write_kv)
+        for index in range(len(self.schedule) + 1):
+            self.piece(index, run)
+            if index < len(self.schedule):
+                self.mixer(index, run, chunk)
+        return run.output

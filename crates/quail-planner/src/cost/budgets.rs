@@ -28,7 +28,12 @@ pub const SPLIT_EXTRA_TOKENS: i64 = 64;
 /// Below this many dense parameters a model runs unified attention only.
 pub const TREE_ATTENTION_MIN_PARAMS: f64 = 2e9;
 /// Families whose pipelines split their forward pass into captured pieces.
-pub const GRAPH_ARCHS: [&str; 2] = ["qwen3", "qwen3_5"];
+pub const GRAPH_ARCHS: [&str; 3] = ["qwen3", "qwen3_5", "inkling2_loop"];
+/// Families whose experts run inside captured pieces.
+pub const EXPERT_GRAPH_ARCHS: [&str; 1] = ["inkling2_loop"];
+/// The largest pass a model with experts captures; a larger pass keeps
+/// the GPU busy without graphs.
+pub const EXPERT_GRAPH_MAX_TOKENS: i64 = 512;
 
 /// CUDA graph capture sizes, in tokens per pass.
 pub fn graph_token_buckets_all() -> Vec<i64> {
@@ -106,16 +111,20 @@ pub fn kernel_index_cap(model: &ModelSpec) -> i64 {
     floor_divide_int(INT32_MAX, width)
 }
 
-/// CUDA graph capture sizes of a dense Qwen3 or Qwen3.5 model.
+/// CUDA graph capture sizes of a model whose pipeline captures pieces.
 pub fn graph_token_buckets(model: &ModelSpec) -> Vec<i64> {
-    if !GRAPH_ARCHS.contains(&model.arch.as_str())
-        || model.experts != 0
+    let arch = model.arch.as_str();
+    if !GRAPH_ARCHS.contains(&arch)
+        || (model.experts != 0 && !EXPERT_GRAPH_ARCHS.contains(&arch))
         || model.sae.is_some()
         || model.canvas_tokens != 0
     {
         return Vec::new();
     }
-    let cap = kernel_index_cap(model);
+    let mut cap = kernel_index_cap(model);
+    if model.experts != 0 {
+        cap = cap.min(EXPERT_GRAPH_MAX_TOKENS);
+    }
     graph_token_buckets_all()
         .into_iter()
         .filter(|size| *size <= cap)

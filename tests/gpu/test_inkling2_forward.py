@@ -9,7 +9,8 @@ convolution kernels, so the logits differ slightly.
 
 Quail packs each review as a document and asks one question in a first
 chunk, then asks a second question in a later chunk from the document's
-saved KV and convolution checkpoint. The reference runs each whole
+saved KV and convolution checkpoint. The later chunk replays CUDA graphs
+of the work between attention calls. The reference runs each whole
 sequence. The test checks that the next token and the TRUE-against-FALSE
 margin agree.
 
@@ -29,6 +30,9 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(),
                                 reason="needs a CUDA device")
 
 MODEL = "inkling-2-mini"
+# the checkpoint's bf16 attention projections, and the same projections
+# quantized to NVFP4 as they load
+SPECS = ["inkling-2-mini", "inkling-2-mini-nvfp4-attention"]
 # transformers at the Inkling 2 Mini commit, installed by
 # experiments/run_gpu_tests.py's image
 REFERENCE_PACKAGES = "/opt/inkling-reference"
@@ -49,18 +53,18 @@ REVIEWS = [
     "Loud, long, and lifeless. The stunts are impressive; the "
     "performances are not. Skip it unless explosions are enough.",
 ]
-# the largest difference between the two sides' TRUE-against-FALSE
-# margins this test accepts, in logits, where the reference is not sure of
-# the answer: NVFP4 activations against bf16 ones move such a margin by
-# up to about 1.6
+# the largest mean difference between the two sides' TRUE-against-FALSE
+# margins this test accepts, in logits, over the sequences whose answer the
+# reference is not sure of (a margin under CERTAIN_MARGIN logits). NVFP4
+# activations against bf16 ones move such a margin by about 1 logit on
+# average; one near a tie can move by 3 or more as NVFP4 roundings flip.
 MARGIN_TOLERANCE = 2.0
-# a margin beyond this many logits is certain on both sides, and the
-# quantized tail of the logits moves it by up to 3 logits
 CERTAIN_MARGIN = 8.0
-# the largest KL divergence of Quail's next-token distribution from the
-# reference's, in nats: a sequence whose answer the reference is unsure of
-# moves most, up to about 0.35, as a few NVFP4 roundings flip
-KL_TOLERANCE = 0.5
+# the KL divergence of Quail's next-token distribution from the
+# reference's, in nats: the median over sequences, and the most any one
+# sequence near a tie may reach
+MEDIAN_KL_TOLERANCE = 0.05
+KL_TOLERANCE = 1.5
 
 
 def _spec():
@@ -121,14 +125,15 @@ def reference(tmp_path_factory):
     return torch.load(path)
 
 
-@pytest.fixture(scope="module")
-def quail(reference):
+@pytest.fixture(scope="module", params=SPECS)
+def quail(reference, request):
     """Quail's last-row logits of the same sequences, in the same order.
 
     Built after the reference so the two model copies never share the GPU.
     """
     from quail.backends.quail.executor.arena import KVArena
     from quail.backends.quail.executor.chunk import pack_chunk
+    from quail.backends.quail.executor.cuda_graphs import PiecewiseGraphs
     from quail.backends.quail.executor.model_loading import (
         cap_logits,
         full_output_head,
@@ -136,11 +141,12 @@ def quail(reference):
         logit_softcap,
     )
     from quail.backends.quail.executor.models import build_pipeline
-    from quail.specs import B200
+    from quail.specs import B200, MODELS
 
-    spec = _spec()
+    spec = MODELS[request.param]
     model = load_model(spec.hf_name, spec.revision,
-                       answer_token_ids=list(_answer_ids()))
+                       answer_token_ids=list(_answer_ids()),
+                       quantize_fp4=spec.weight_precision == "fp4")
     arena = KVArena(num_layers=spec.layers, num_pages=1024,
                     page_tokens=B200.page_tokens,
                     num_kv_heads=spec.num_kv_heads, d_head=spec.d_head,
@@ -150,6 +156,9 @@ def quail(reference):
                     conv_state_shape=(spec.layers, spec.conv_width - 1,
                                       spec.conv_state_channels))
     pipeline = build_pipeline(spec, model, arena)
+    graphs = PiecewiseGraphs.for_specs(pipeline, spec, B200)
+    with torch.inference_mode():
+        graphs.prepare()
     head, cap = full_output_head(model), logit_softcap(model)
     sequences = _sequences()
     logits = [[None, None] for _ in sequences]
@@ -166,13 +175,16 @@ def quail(reference):
                                suffixes=[suffix]))
         chunk = pack_chunk(torch, arena, groups, attention_mode="unified")
         with torch.inference_mode():
-            final = pipeline.forward_chunk(chunk)
+            final = graphs.forward(chunk)
             rows = cap_logits(torch.nn.functional.linear(final, head).float(),
                               cap).cpu()
         for index in range(len(sequences)):
             logits[index][question] = rows[index]
         for key in chunk.temporary_keys:
             arena.free_key(key)
+    # the documents' chunk exceeds the largest bucket and runs eagerly;
+    # the resident documents' chunk replays
+    assert graphs.replays == 1
     return torch.stack([row for pair in logits for row in pair])
 
 
@@ -194,8 +206,9 @@ def test_next_tokens_and_answer_margins_agree_with_transformers(reference,
           [round(v, 4) for v in kl.tolist()])
     assert all(a == b for a, b in top)
     assert all((a > 0) == (b > 0) for a, b in margins)
-    assert all(abs(a - b) < MARGIN_TOLERANCE for a, b in margins
-               if abs(a) < CERTAIN_MARGIN)
+    unsure = [abs(a - b) for a, b in margins if abs(a) < CERTAIN_MARGIN]
+    assert sum(unsure) / len(unsure) < MARGIN_TOLERANCE
+    assert kl.median().item() < MEDIAN_KL_TOLERANCE
     assert kl.max().item() < KL_TOLERANCE
 
 
