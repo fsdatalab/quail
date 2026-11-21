@@ -173,6 +173,7 @@ class _Rows:
     def __init__(self):
         # each an array, or a run as (first, count)
         self.parts = []
+        self.append = self.parts.append
 
     def __bool__(self):
         return bool(self.parts)
@@ -180,10 +181,6 @@ class _Rows:
     def run(self, first, count):
         """Add the count rows that start at first."""
         self.parts.append((first, count))
-
-    def append(self, rows):
-        """Add an array of rows."""
-        self.parts.append(rows)
 
     def joined(self):
         """Return every row added so far, in order, as one int64 array."""
