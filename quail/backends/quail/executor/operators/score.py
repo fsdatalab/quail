@@ -127,19 +127,17 @@ def scored_outputs(node, scored, priors) -> dict:
     return {node.rows_port: scored}
 
 
-def finished_scores(node, rows, values, probabilities=None) -> list:
+def finished_scores(node, rows, values) -> list:
     """The finished rows of a score or classification: ids and answers.
 
     Args:
         node: The AiScore or AiClassify.
         rows: The rows answered, one column per alias.
         values: Their scores or labels.
-        probabilities: A classification's label probabilities per row,
-            or None.
     """
     if not len(rows) or finished_rows() is None:
         return []
-    scored = scored_rows(node, rows, values, probabilities)
+    scored = scored_rows(node, rows, values, None)
     if isinstance(node.spec, ClassifySpec):
         # a document whose decoded answer names no label leaves the query
         scored = scored.filter(pc.is_valid(scored.column(node.spec.name)))
