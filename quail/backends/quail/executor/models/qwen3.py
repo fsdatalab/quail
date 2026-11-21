@@ -46,12 +46,9 @@ class Qwen3Pipeline(ModelPipeline):
         """Normalize and project rows into rotary Q, K, V and the residual."""
         engine = self.engine
         attn = layer.self_attn
+        q_in, q_scale = engine.norm_quant(hidden, layer.input_layernorm, residual)
         if residual is None:
             residual = hidden
-            q_in, q_scale = engine.norm_quant(hidden, layer.input_layernorm)
-        else:
-            q_in, q_scale = engine.norm_quant(
-                hidden, layer.input_layernorm, residual)
         qkv = engine.gemm(q_in, q_scale, attn.qkv_proj)
         q, k = engine.qk_norm_rope(qkv, positions, attn)
         v = qkv[:, (engine.num_q_heads + engine.num_kv_heads) * engine.head_dim:]
