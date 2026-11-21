@@ -28,6 +28,7 @@ from quail.backends.quail.executor.models.qwen3_5_kernels import (
     nvfp4_mlp,
     qkv_gemma_norm_rope_gate,
     sigmoid_gate,
+    silu_mul,
 )
 from quail.backends.quail.executor.moe import init_moe_workspace
 from quail.common.budgets import kernel_index_cap
@@ -239,7 +240,10 @@ class Qwen35Pipeline(ModelPipeline):
         if x.is_cuda and is_nvfp4(mlp.gate_up_proj) and is_nvfp4(mlp.down_proj):
             return nvfp4_mlp(x, mlp.gate_up_proj, mlp.down_proj)
         gate_up = self._linear(x, mlp.gate_up_proj)
-        return self._linear(mlp.act_fn(gate_up), mlp.down_proj)
+        act = (silu_mul(gate_up) if gate_up.is_cuda
+               and type(mlp.act_fn).__name__ == "SiluAndMul"
+               else mlp.act_fn(gate_up))
+        return self._linear(act, mlp.down_proj)
 
     def _norm(self, norm, x, residual, *, inplace_x=False):
         """One Gemma-style norm with the residual add, as (normed, residual)."""

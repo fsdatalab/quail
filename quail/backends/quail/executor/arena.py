@@ -122,6 +122,7 @@ class KVArena:
         # one checkpoint per slot: the recurrent state in fp32 and the
         # convolution columns in bf16, each across every GDN layer
         self.gdn_state = self.gdn_state_rows = self.conv_state = None
+        self.gdn_scratch = self.conv_scratch = None
         if num_state_slots:
             # vLLM's recurrent decode kernel reads state index 0 as no
             # state, so slot s is row s + 1 and row 0 stays unused
@@ -165,6 +166,7 @@ class KVArena:
         page_tokens = self.page_tokens
         self.k = self.v = None
         self.gdn_state = self.gdn_state_rows = self.conv_state = None
+        self.gdn_scratch = self.conv_scratch = None
         self._build(num_pages, page_tokens, num_sliding_pages, num_state_slots)
 
     # ---- checkpoints ---------------------------------------------------
