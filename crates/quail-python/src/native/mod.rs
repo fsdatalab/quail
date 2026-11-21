@@ -905,7 +905,9 @@ fn plan_operator<'py>(
                             "estimates": selected.plan.estimates,
                             "alternative": selected.alternative,
                         }),
-                        Err(refusal) => refusal_fields(&refusal),
+                        Err(refusal) => serde_json::json!({
+                            "refusal": crate::planning::refusal_json(&refusal)
+                        }),
                     },
                 ),
             )
@@ -918,11 +920,6 @@ fn plan_operator<'py>(
 
 fn json_value<T: serde::de::DeserializeOwned>(found: serde_json::Value) -> PyResult<T> {
     serde_json::from_value(found).map_err(|error| PyValueError::new_err(error.to_string()))
-}
-
-/// A refusal, as the test helpers compare it.
-fn refusal_fields(refusal: &quail_planner::error::Refusal) -> serde_json::Value {
-    serde_json::json!({"refusal": crate::planning::refusal_json(refusal)})
 }
 
 /// The token lists of a pyarrow Table's first column, as int32 lists.
