@@ -70,9 +70,9 @@ class Session:
             from quail.remote.client import RemoteConnection
 
             self._remote = RemoteConnection(endpoint)
-        else:
-            self.datafusion = _quail_native.DataFusionContext()
-            _ = self.tokenizer
+            return
+        self.datafusion = _quail_native.DataFusionContext()
+        _ = self.tokenizer
 
     @property
     def endpoint(self) -> str | None:
