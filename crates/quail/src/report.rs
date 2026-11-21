@@ -71,10 +71,6 @@ fn added(left: &Value, right: &Value) -> Value {
     }
 }
 
-fn is_count(value: &Value) -> bool {
-    value.is_number()
-}
-
 /// One node's metrics from two workers: counters add, the peak is the
 /// larger, and an extension keeps the later worker's descriptive values.
 fn merged_metrics(left: &Map<String, Value>, right: &Map<String, Value>) -> Map<String, Value> {
@@ -103,7 +99,7 @@ fn merged_metrics(left: &Map<String, Value>, right: &Map<String, Value>) -> Map<
         .unwrap_or(&empty);
     for (name, value) in later {
         let value = match earlier.get(&name) {
-            Some(before) if is_count(&value) => added(before, &value),
+            Some(before) if value.is_number() => added(before, &value),
             _ => value,
         };
         kept.insert(name, value);
@@ -363,7 +359,7 @@ pub fn region_report(
                 .into_iter()
                 .flatten()
             {
-                if is_count(value) {
+                if value.is_number() {
                     scalars.insert(name.clone(), value.clone());
                 }
             }
