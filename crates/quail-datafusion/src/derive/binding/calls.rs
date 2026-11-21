@@ -70,12 +70,6 @@ fn object_fields(expr: &Expr) -> Option<Vec<(String, &Expr)>> {
         .collect()
 }
 
-fn sorted_keys(keys: &[&str]) -> String {
-    let mut keys: Vec<String> = keys.iter().map(|key| repr_str(key)).collect();
-    keys.sort();
-    format!("[{}]", keys.join(", "))
-}
-
 fn number_of(expr: &Expr) -> Option<f64> {
     match numeric_literal(expr, &DataType::Float64)? {
         ScalarValue::Float64(value) => value,
@@ -96,10 +90,12 @@ pub(super) fn parse_options(
     let mut options = Options::default();
     for (key, value) in fields {
         if !allowed.contains(&key.as_str()) {
+            let mut keys: Vec<String> = allowed.iter().map(|key| repr_str(key)).collect();
+            keys.sort();
             return compile_error(format!(
-                "Unknown option {} must be replaced with one of {}.",
+                "Unknown option {} must be replaced with one of [{}].",
                 repr_str(&key),
-                sorted_keys(allowed)
+                keys.join(", ")
             ));
         }
         if key == "selectivity" {
@@ -149,32 +145,6 @@ impl Binder {
         Ok(value)
     }
 
-    fn prompt_arguments(
-        &mut self,
-        prompt: &Expr,
-        function: &str,
-    ) -> Result<(String, Vec<ValueExpression>), CompileError> {
-        if !is_call(prompt, "prompt") {
-            return compile_error(format!(
-                "{} needs a PROMPT as its first argument.",
-                if function == "ai_filter" {
-                    "AI.IF".to_string()
-                } else {
-                    function.replacen("ai_", "AI.", 1).to_uppercase()
-                }
-            ));
-        }
-        let args = arguments(prompt);
-        let Some(template) = args.first().and_then(string_literal) else {
-            return compile_error("PROMPT needs a string template as its first argument.");
-        };
-        let mut references = Vec::new();
-        for argument in &args[1..] {
-            references.push(self.bind_document_value(argument)?);
-        }
-        Ok((template, references))
-    }
-
     /// Bind an AI_FILTER or AI.SCORE prompt: (prompt, aliases).
     #[allow(clippy::too_many_arguments)]
     fn bind_ai_call(
@@ -184,7 +154,24 @@ impl Binder {
         join: Option<bool>,
         classify: Option<(&[String], &[String], &str)>,
     ) -> Result<(quail_planner::physical::Prompt, Vec<String>), CompileError> {
-        let (template, references) = self.prompt_arguments(prompt_expr, function)?;
+        if !is_call(prompt_expr, "prompt") {
+            return compile_error(format!(
+                "{} needs a PROMPT as its first argument.",
+                if function == "ai_filter" {
+                    "AI.IF".to_string()
+                } else {
+                    function.replacen("ai_", "AI.", 1).to_uppercase()
+                }
+            ));
+        }
+        let args = arguments(prompt_expr);
+        let Some(template) = args.first().and_then(string_literal) else {
+            return compile_error("PROMPT needs a string template as its first argument.");
+        };
+        let mut references = Vec::new();
+        for argument in &args[1..] {
+            references.push(self.bind_document_value(argument)?);
+        }
         self.bind_prompt(template, references, function, join, classify)
     }
 
