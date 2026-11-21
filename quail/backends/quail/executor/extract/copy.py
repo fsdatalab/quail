@@ -483,43 +483,41 @@ class CopyConstraint:
             positions, needed = positions[pending], needed[pending]
             if not len(positions):
                 break
-            self._extend_windows(positions)
+            self.prepare_documents()
+            documents = self.position_documents[positions]
+            sizes = np.where(self.window_started[positions], self.spec.window_chars,
+                self.spec.first_window_chars)
+            text, left, cuts = self.windows.windows(
+                documents, self.window_ends[positions], sizes)
+            self.window_started[positions] = True
+            self.window_ends[positions] = cuts
+            tokens, offsets, boundaries = self.vocabulary.encode_packed(text)
+            counts = np.diff(boundaries)
+            owner = np.repeat(np.arange(len(positions)), counts)
+            columns = (np.arange(len(tokens)) - np.repeat(boundaries[:-1], counts)
+                + self.position_lengths[positions[owner]])
+            rows = self.position_rows[positions[owner]]
+            valid = columns < self.continuations_host.shape[1] - 1
+            self.continuations_host[rows[valid], columns[valid]] = tokens[valid]
+            valid = columns + 1 < self.ends.shape[1]
+            end = np.minimum(self.windows.ends[left[owner] + offsets[:, 1] - 1]
+                - self.windows.offsets[documents[owner]], cuts[owner])
+            self.ends[rows[valid], columns[valid] + 1] = end[valid]
+            self.position_lengths[positions] = np.minimum(
+                self.position_lengths[positions] + counts,
+                self.continuations_host.shape[1] - 1)
+            self.exhausted[positions] = (
+                (cuts + self.windows.offsets[documents]
+                    == self.windows.limits[documents])
+                | (counts == 0)
+                | (self.position_lengths[positions]
+                    == self.continuations_host.shape[1] - 1))
 
     def prepare_documents(self):
         """Index normalized text while the documents' prefill is in flight."""
         if self.windows is None:
             self.windows = TextWindows([
                 document.text for document in self.documents.documents])
-
-    def _extend_windows(self, positions):
-        self.prepare_documents()
-        documents = self.position_documents[positions]
-        sizes = np.where(self.window_started[positions], self.spec.window_chars,
-            self.spec.first_window_chars)
-        text, left, cuts = self.windows.windows(
-            documents, self.window_ends[positions], sizes)
-        self.window_started[positions] = True
-        self.window_ends[positions] = cuts
-        tokens, offsets, boundaries = self.vocabulary.encode_packed(text)
-        counts = np.diff(boundaries)
-        owner = np.repeat(np.arange(len(positions)), counts)
-        columns = (np.arange(len(tokens)) - np.repeat(boundaries[:-1], counts)
-            + self.position_lengths[positions[owner]])
-        rows = self.position_rows[positions[owner]]
-        valid = columns < self.continuations_host.shape[1] - 1
-        self.continuations_host[rows[valid], columns[valid]] = tokens[valid]
-        valid = columns + 1 < self.ends.shape[1]
-        end = np.minimum(self.windows.ends[left[owner] + offsets[:, 1] - 1]
-            - self.windows.offsets[documents[owner]], cuts[owner])
-        self.ends[rows[valid], columns[valid] + 1] = end[valid]
-        self.position_lengths[positions] = np.minimum(
-            self.position_lengths[positions] + counts,
-            self.continuations_host.shape[1] - 1)
-        self.exhausted[positions] = (
-            (cuts + self.windows.offsets[documents] == self.windows.limits[documents])
-            | (counts == 0)
-            | (self.position_lengths[positions]
-                == self.continuations_host.shape[1] - 1))
 
     def _upload(self):
         positions = np.flatnonzero(self.changed)
