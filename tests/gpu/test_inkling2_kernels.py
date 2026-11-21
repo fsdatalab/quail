@@ -63,7 +63,6 @@ def test_relative_attention_matches_dense_attention(window):
     q = q / q.float().norm(dim=-1, keepdim=True).to(q.dtype) * 4
     rel = torch.randn(total, HEADS, RANK, device="cuda", dtype=torch.bfloat16)
     sink = torch.randn(total, HEADS, device="cuda", dtype=torch.bfloat16)
-    gate = torch.randn(total, HEADS * DIM, device="cuda", dtype=torch.bfloat16)
     proj = torch.randn(RANK, EXTENT, device="cuda", dtype=torch.bfloat16) * 0.3
     cu = [0]
     for rows, _ in shapes:
@@ -74,8 +73,7 @@ def test_relative_attention_matches_dense_attention(window):
         seqs, firsts = kernels.attention_tiles(cu, block_rows // 3)
         tiles = (torch.from_numpy(seqs).cuda(), torch.from_numpy(firsts).cuda())
         out = torch.empty_like(q)
-        kernels.rel_attention(torch, q, kp, vp, rel, sink, gate, proj, out,
-                              tiles,
+        kernels.rel_attention(torch, q, kp, vp, rel, sink, proj, out, tiles,
                               cu_q, used, table, window=window,
                               max_keys=max(u for _, u in shapes),
                               block_rows=block_rows)
@@ -86,8 +84,6 @@ def test_relative_attention_matches_dense_attention(window):
             span = slice(cu[index], cu[index + 1])
             expected = _dense_attention(q[span], k, v, rel[span], sink[span],
                                         proj, window)
-            expected = expected * gate[span].float().view(
-                -1, HEADS, DIM).sigmoid()
             error = (out[span].float() - expected).abs().max().item()
             assert error < 2e-2, (block_rows, index, error)
 

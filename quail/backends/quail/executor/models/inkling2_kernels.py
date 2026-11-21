@@ -21,7 +21,8 @@ the pass computes what the reference computes up to accumulation order.
   with log scaling of long positions on the full-attention layers.
 - rel_attention: causal paged attention with a learned relative bias
   over the last 1,024 distances, a per-token sink logit, and an
-  optional sliding window, times the sigmoid output gate.
+  optional sliding window.
+- gate_attention: the sigmoid output gate of every head.
 - route: each token's top experts and their normalized scores.
 - quantize_tokens, swiglu_quantize, combine: the expert path's
   activation quantization (four-over-six scales), its softcapped
@@ -681,6 +682,18 @@ def _kernels() -> dict:
                  + offs[None, :], y, mask=mask)
 
     @triton.jit
+    def gate_attention(attn_ptr, gate_ptr, stride_gate, out_ptr, N,
+                       BLOCK: tl.constexpr):
+        row = tl.program_id(0).to(tl.int64)
+        cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        mask = cols < N
+        a = tl.load(attn_ptr + row * N + cols, mask=mask, other=0.0)
+        g = tl.load(gate_ptr + row * stride_gate + cols, mask=mask,
+                    other=0.0).to(tl.float32)
+        out = a.to(tl.float32) * tl.sigmoid(g)
+        tl.store(out_ptr + row * N + cols, out.to(tl.bfloat16), mask=mask)
+
+    @triton.jit
     def _attend_tile(q, k_ptr, v_ptr, bt_row, n0, kv_head, qpos, row_ok,
                      used, window, bias_rows, m_i, l_i, acc, scale_log2,
                      stride_k0, stride_k1, stride_k2, stride_v0, stride_v1,
@@ -726,8 +739,7 @@ def _kernels() -> dict:
 
     @triton.jit(do_not_specialize=["window", "splits"])
     def rel_attention(q_ptr, k_ptr, v_ptr, rel_ptr, proj_ptr, sink_ptr,
-                      gate_ptr, stride_g, out_ptr, scratch_ptr, part_acc_ptr,
-                      part_ml_ptr,
+                      out_ptr, scratch_ptr, part_acc_ptr, part_ml_ptr,
                       tile_seq_ptr, tile_q0_ptr, cu_q_ptr, used_ptr,
                       table_ptr, stride_q0, stride_q1, stride_r0, stride_r1,
                       stride_s0, stride_o0, stride_o1, stride_k0, stride_k1,
@@ -835,18 +847,14 @@ def _kernels() -> dict:
             tl.store(part_ml_ptr + slot * 2, m_i, mask=row_ok)
             tl.store(part_ml_ptr + slot * 2 + 1, l_i, mask=row_ok)
         else:
-            # the output gate, sigmoid(gate) per channel
-            gate = tl.load(gate_ptr + q_row[:, None] * stride_g
-                           + head[:, None] * D + offs_d[None, :],
-                           mask=row_ok[:, None], other=0.0).to(tl.float32)
-            out = acc / l_i[:, None] * tl.sigmoid(gate)
+            out = acc / l_i[:, None]
             tl.store(out_ptr + q_row[:, None] * stride_o0
                      + head[:, None] * stride_o1 + offs_d[None, :],
                      out.to(tl.bfloat16), mask=row_ok[:, None])
 
     @triton.jit(do_not_specialize=["splits"])
-    def merge_splits(part_acc_ptr, part_ml_ptr, gate_ptr, stride_g, out_ptr,
-                     stride_o0, stride_o1, splits, HEADS: tl.constexpr,
+    def merge_splits(part_acc_ptr, part_ml_ptr, out_ptr, stride_o0,
+                     stride_o1, splits, HEADS: tl.constexpr,
                      D: tl.constexpr, MAX_SPLITS: tl.constexpr):
         # one row and head: the splits' softmax states, merged
         row = tl.program_id(0).to(tl.int64)
@@ -862,8 +870,6 @@ def _kernels() -> dict:
         acc = tl.load(part_acc_ptr + slot[:, None] * D + offs_d[None, :],
                       mask=ok[:, None], other=0.0)
         out = tl.sum(acc * w[:, None], axis=0) / tl.sum(sums * w, axis=0)
-        gate = tl.load(gate_ptr + row * stride_g + head * D + offs_d)
-        out = out * tl.sigmoid(gate.to(tl.float32))
         tl.store(out_ptr + row * stride_o0 + head * stride_o1 + offs_d,
                  out.to(tl.bfloat16))
 
@@ -1140,7 +1146,7 @@ def _kernels() -> dict:
         scatter_state=scatter_state,
         mix=mix, gate_out=gate_out,
         rms_norm=rms_norm, short_conv=short_conv, kv_conv=kv_conv,
-        clip_heads=clip_heads, route=route,
+        clip_heads=clip_heads, gate_attention=gate_attention, route=route,
         rel_attention=rel_attention, merge_splits=merge_splits,
         quantize_tokens=quantize_tokens,
         swiglu_quantize=swiglu_quantize, combine=combine,
@@ -1384,6 +1390,17 @@ def clip_heads(torch, x, scale, positions, *, heads, head_dim, clip,
     return out
 
 
+def gate_attention(torch, attn, gate):
+    rows, width = attn.shape
+    out = torch.empty_like(attn)
+    if rows:
+        block = 1024
+        _kernels()["gate_attention"][(rows, triton_cdiv(width, block))](
+            attn, gate, gate.stride(0), out, width, BLOCK=block, num_warps=4)
+    return out
+
+
+
 def attention_tiles(cu_q_host, rows_per_tile):
     """(sequence, first query) per query tile, over sequences' query counts."""
     import numpy as np
@@ -1396,11 +1413,10 @@ def attention_tiles(cu_q_host, rows_per_tile):
     return seqs, firsts.astype(np.int32)
 
 
-def rel_attention(torch, q3, kp, vp, rel, sink, gate, proj, out, tiles, cu_q,
-                  used, table, *, window, max_keys, block_rows=64,
-                  block_keys=64,
+def rel_attention(torch, q3, kp, vp, rel, sink, proj, out, tiles, cu_q, used,
+                  table, *, window, max_keys, block_rows=64, block_keys=64,
                   num_warps=8, num_stages=3):
-    """Causal paged attention with the relative bias, sink logits, and gate.
+    """Causal paged attention with the relative bias and sink logits.
 
     Args:
         torch: The torch module.
@@ -1409,8 +1425,6 @@ def rel_attention(torch, q3, kp, vp, rel, sink, gate, proj, out, tiles, cu_q,
         vp: The arena value pool, shaped as kp.
         rel: (rows, heads, rank) relative states.
         sink: (rows, heads) view of the sink logits.
-        gate: (rows, heads * dim) view of the output gate's logits; the
-            output is multiplied by their sigmoid.
         proj: (rank, extent) bf16 bias profiles.
         out: (rows, heads, dim) output.
         tiles: (sequence ids, first queries) on the GPU, from
@@ -1446,8 +1460,7 @@ def rel_attention(torch, q3, kp, vp, rel, sink, gate, proj, out, tiles, cu_q,
     else:
         part_acc = part_ml = out
     _kernels()["rel_attention"][(num_tiles * splits, kv_heads)](
-        q3, kp, vp, rel, proj, sink, gate, gate.stride(0), out, scratch,
-        part_acc, part_ml,
+        q3, kp, vp, rel, proj, sink, out, scratch, part_acc, part_ml,
         tiles[0], tiles[1], cu_q, used, table, q3.stride(0), q3.stride(1),
         rel.stride(0), rel.stride(1), sink.stride(0), out.stride(0),
         out.stride(1), kp.stride(0), kp.stride(1), kp.stride(2), vp.stride(0),
@@ -1459,8 +1472,7 @@ def rel_attention(torch, q3, kp, vp, rel, sink, gate, proj, out, tiles, cu_q,
         num_warps=num_warps, num_stages=num_stages)
     if splits > 1:
         _kernels()["merge_splits"][(rows, heads)](
-            part_acc, part_ml, gate, gate.stride(0), out, out.stride(0),
-            out.stride(1), splits,
+            part_acc, part_ml, out, out.stride(0), out.stride(1), splits,
             HEADS=heads, D=dim, MAX_SPLITS=MAX_SPLITS, num_warps=4)
     return out
 

@@ -741,7 +741,8 @@ class Inkling2Pipeline(ModelPipeline):
         n = run.residual.shape[0]
         width = spec.num_q_heads * spec.d_head
         state = self.arena.conv_state[:, visit.index]
-        gated = run.attn.view(n, width)
+        gated = kernels.gate_attention(torch, run.attn.view(n, width),
+                                       run.gate)
         projected = torch.mm(gated, layer.wo.t())
         attn_out = kernels.short_conv(torch, projected, run.taps,
                                       state[:, :, 2048:4352], layer.attn_conv)
@@ -837,8 +838,8 @@ class Inkling2Pipeline(ModelPipeline):
         prefill = plan["block_rows"] >= 64
         kernels.rel_attention(
             torch, buffers.q3[:n], kp, vp, buffers.rel[:n], buffers.sink[:n],
-            buffers.gate[:n], layer.rel_proj, buffers.attn[:n], plan["tiles"],
-            unified["cu_q"], unified["used"], unified["table"],
+            layer.rel_proj, buffers.attn[:n], plan["tiles"], unified["cu_q"],
+            unified["used"], unified["table"],
             window=self.window if layer.is_local else 0,
             max_keys=unified["max_used"], block_rows=plan["block_rows"],
             block_keys=64 if prefill else 32,
