@@ -408,12 +408,3 @@ class _Routes:
         self.slices = stage_slices(operators)
         self.owner = [index for index, (low, high) in enumerate(self.slices)
                       for _ in range(low, high)]
-
-
-
-def region_of(model, context) -> RegionExecution:
-    """Return the context's RegionExecution for the model, created on first use."""
-    region = context.state.get("region")
-    if region is None or region.model is not model:
-        region = context.state["region"] = RegionExecution(model, context)
-    return region

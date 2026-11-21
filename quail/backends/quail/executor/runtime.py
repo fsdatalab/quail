@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from quail.backends.base import GpuContext
 from quail.backends.quail.executor.operators import operator_types
-from quail.backends.quail.executor.region import region_of
+from quail.backends.quail.executor.region import RegionExecution
 from quail.backends.quail.executor.state import LoadedModelState, QueryExecutionState
 from quail.common.budgets import compute_knee
 from quail.common.decode import DecodeCost
@@ -82,15 +82,15 @@ class QuailModelExecution:
             answer_rows=answer_rows,
             chunk_tokens=chunk_tokens,
             score_readout=async_scores,
-            knee_rows=self._knee_rows(), decode_cost=decode_cost,
+            knee_rows=(0 if device is None
+                else int(compute_knee(self.context.model, device))),
+            decode_cost=decode_cost,
         )
-
-    def _knee_rows(self) -> int:
-        """Rows at which a pass becomes compute-bound, 0 without a device."""
-        device = getattr(self.context, "device", None)
-        return 0 if device is None else int(compute_knee(self.context.model, device))
 
     def execute_pipeline(self, nodes, inputs, context) -> dict:
         """Run a chain of model nodes in the context's region on this GPU."""
-        return region_of(self, context).run(nodes, inputs)
+        region = context.state.get("region")
+        if region is None or region.model is not self:
+            region = context.state["region"] = RegionExecution(self, context)
+        return region.run(nodes, inputs)
 
