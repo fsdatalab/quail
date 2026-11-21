@@ -73,3 +73,21 @@ def test_a_borrower_and_the_questions_read_the_inputs_before_them(torch_stub):
     taps, slots, sources = conv_taps(phases, 34)
     assert values_of(taps, second, saved)[[0, 1, 32, 33]].tolist() == [
         [30, 31, 32], [31, 32, 101], [130, 131, 132], [131, 132, 133]]
+
+
+def test_staging_no_chunk_leaves_no_tap_slot_or_source_of_an_earlier_pass():
+    torch = pytest.importorskip("torch")
+    from types import SimpleNamespace
+
+    from quail.backends.quail.executor.models.inkling2 import Inkling2Pipeline
+
+    pipeline = Inkling2Pipeline.__new__(Inkling2Pipeline)
+    # an earlier pass's rows and writes, left in a shared bucket's buffers
+    buffers = SimpleNamespace(
+        taps=torch.full((4, 3), 7, dtype=torch.int32),
+        write_slots=torch.full((4,), 2, dtype=torch.int64),
+        write_sources=torch.full((4, 3), 5, dtype=torch.int32))
+    pipeline.stage(buffers, None)
+    assert buffers.taps.eq(-1).all()
+    assert buffers.write_slots.eq(-1).all()
+    assert buffers.write_sources.eq(-1).all()

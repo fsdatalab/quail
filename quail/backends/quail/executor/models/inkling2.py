@@ -741,17 +741,17 @@ class Inkling2Pipeline(ModelPipeline):
         A None chunk leaves every row reading zero taps and writing no
         state.
         """
-        if chunk is None:
-            buffers.taps.fill_(kernels.ZERO_TAP)
-            buffers.write_slots.fill_(-1)
-            return
-        plan = self._plan(chunk)
-        n, writes = chunk.tokens, plan["write_slots"].shape[0]
-        buffers.taps[:n].copy_(plan["taps"])
+        n = writes = 0
+        if chunk is not None:
+            plan = self._plan(chunk)
+            n, writes = chunk.tokens, plan["write_slots"].shape[0]
+            buffers.taps[:n].copy_(plan["taps"])
+            buffers.write_slots[:writes].copy_(plan["write_slots"])
+            buffers.write_sources[:writes].copy_(plan["write_sources"])
+        # a padding write's sources are still read before its slot masks it
         buffers.taps[n:].fill_(kernels.ZERO_TAP)
-        buffers.write_slots[:writes].copy_(plan["write_slots"])
         buffers.write_slots[writes:].fill_(-1)
-        buffers.write_sources[:writes].copy_(plan["write_sources"])
+        buffers.write_sources[writes:].fill_(kernels.ZERO_TAP)
 
     # ---- the chunk --------------------------------------------------
 

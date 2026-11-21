@@ -1069,13 +1069,15 @@ def _kernels() -> dict:
         tl.store(out_ptr + token * K + offs, acc.to(tl.bfloat16), mask=mask)
 
     @triton.jit
-    def gather_state(x_ptr, stride_x, srcs_ptr, state_ptr, stride_slot,
-                     stride_tap, out_ptr, C, BLOCK: tl.constexpr):
-        # out[w, j] = the value of tap source srcs[w, j]
+    def gather_state(x_ptr, stride_x, srcs_ptr, slots_ptr, state_ptr,
+                     stride_slot, stride_tap, out_ptr, C,
+                     BLOCK: tl.constexpr):
+        # out[w, j] = the value of tap source srcs[w, j]; a padding write,
+        # with a negative slot, reads nothing
         w = tl.program_id(0).to(tl.int64)
         j = tl.program_id(1)
         cols = tl.program_id(2) * BLOCK + tl.arange(0, BLOCK)
-        mask = cols < C
+        mask = (cols < C) & (tl.load(slots_ptr + w) >= 0)
         src = tl.load(srcs_ptr + w * 3 + j)
         value = _tap(x_ptr, stride_x, state_ptr, stride_slot, stride_tap, src,
                      cols, mask)
@@ -1524,8 +1526,8 @@ def save_state(torch, x, slots, sources, state):
     block = 1024
     grid = (writes, 3, triton_cdiv(channels, block))
     _kernels()["gather_state"][grid](
-        x, x.stride(0), sources, state, state.stride(0), state.stride(1),
-        values, channels, BLOCK=block, num_warps=4)
+        x, x.stride(0), sources, slots, state, state.stride(0),
+        state.stride(1), values, channels, BLOCK=block, num_warps=4)
     _kernels()["scatter_state"][grid](
         values, slots, state, state.stride(0), state.stride(1), channels,
         BLOCK=block, num_warps=4)
