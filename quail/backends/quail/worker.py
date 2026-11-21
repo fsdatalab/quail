@@ -7,6 +7,7 @@ and sends each its partition of a region's stages
 """
 
 import atexit
+import gc
 import json
 import sys
 import time
@@ -32,7 +33,7 @@ from quail.backends.quail.executor.readout import (
 )
 from quail.backends.quail.executor.warmup import warm_kernels
 from quail.backends.quail.graph import payload_tables, serve_region
-from quail.backends.resources import freeze_loaded_objects, release_models
+from quail.backends.resources import release_models
 from quail.common import budgets
 from quail.common.tokens import close_documents
 from quail.physical.plan import graph_from_envelope
@@ -330,7 +331,9 @@ def _boot_gpu(gpu, backend, gpu_context, chunk_tokens, true_ids, false_ids,
                        writes_answers=writes_answers)
         warm_s, warm_tier = gpu.warm(writes_answers)
         if cold:
-            freeze_loaded_objects()
+            # Model objects outlive queries; later collections need not walk them.
+            gc.collect()
+            gc.freeze()
         boot = {
             "kind": "cold" if cold or warm_tier else "warm",
             "load_model_s": round(gpu.load_model_s if cold else 0.0, 2),

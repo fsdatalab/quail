@@ -15,18 +15,6 @@ def _release_vllm_parallel_state() -> None:
     destroy_distributed_environment()
 
 
-def freeze_loaded_objects() -> None:
-    """Collect garbage, then leave every object alive now out of later collections.
-
-    Python's full collections walk every tracked object. After a model
-    loads, the objects of the model, its kernels, and their libraries
-    stay alive for the process's life; frozen, a full collection that
-    falls inside a query walks only the objects made since.
-    """
-    gc.collect()
-    gc.freeze()
-
-
 def release_models(state: dict) -> None:
     """Close every engine in state and return its CUDA memory to the driver.
 
