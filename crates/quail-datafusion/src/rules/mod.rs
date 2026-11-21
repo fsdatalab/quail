@@ -124,17 +124,14 @@ impl OptimizerRule for Recomputed {
 }
 
 fn quail_rule(name: &str) -> Option<Arc<dyn OptimizerRule + Send + Sync>> {
-    unchecked_rule(name).map(|rule| Arc::new(Recomputed(rule)) as _)
-}
-
-fn unchecked_rule(name: &str) -> Option<Arc<dyn OptimizerRule + Send + Sync>> {
-    Some(match name {
+    let rule: Arc<dyn OptimizerRule + Send + Sync> = match name {
         "place_ai_nodes" => Arc::new(crate::rules::placement::PlaceAiNodes),
         name if name.starts_with("derive") => Arc::new(crate::rules::derive::Derive::named(name)?),
         "merge_repeated_ai_calls" => Arc::new(crate::rules::repeated::MergeRepeatedAiCalls),
         LOWERING_RULE => Arc::new(crate::rules::lower::LowerAiCalls),
         _ => return None,
-    })
+    };
+    Some(Arc::new(Recomputed(rule)))
 }
 
 /// The optimizer rule named `name`: one of Quail's, or one of
