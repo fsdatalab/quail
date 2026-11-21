@@ -430,35 +430,86 @@ class Inkling2Pipeline(ModelPipeline):
         self._fc2_scale = None
         self.schedule, self.final_blocks = visit_schedule(model.layers,
                                                           self.loop)
+        self.message = self._message_weights(model.layers)
         # the piecewise graphs capture one piece per visit, plus the last
         self.layers = self.schedule
         self.final_norm = SimpleNamespace(weight=model.final_norm)
 
+    def _message_weights(self, layers):
+        """Every loop gate's message-side down weights and query, stacked.
+
+        Also gives each looped layer its first gate's index in the stack
+        and its gates' hidden-side down weights.
+        """
+        torch, hidden = self.torch, self.hidden
+        down_m, queries = [], []
+        for layer in layers:
+            if layer.gates is None:
+                continue
+            layer.message_gate = {}
+            for kind in ("qkv", "mlp"):
+                gates = layer.gates[kind]
+                layer.message_gate[kind] = len(queries)
+                gates.down_h = gates.down_t[:, :hidden].contiguous()
+                gates.down_h_shared = torch.cat(list(gates.down_h),
+                                                dim=1).contiguous()
+                down_m.extend(gates.down_t[:, hidden:])
+                queries.extend(gates.query)
+        if not queries:
+            return None
+        return SimpleNamespace(
+            down_m=torch.cat(down_m, dim=1).contiguous(),
+            queries_t=torch.stack(queries).t().contiguous())
+
     # ---- small pieces ---------------------------------------------
 
-    def _gates(self, gates, hidden, messages, weight):
+    def _message_products(self, run):
+        """The loop messages' products every looped visit's gates read.
+
+        A loop pass's messages, its last block a and output b, stay fixed
+        for its 12 visits, so their products with every gate's message-side
+        down weights, its query scores, and their sums of squares are formed
+        once per pass.
+        """
+        torch, message = self.torch, self.message
+        a, b = run.prev_block, run.prev_out
+        af, bf = a.float(), b.float()
+        self._keep(run, "msg_pa", self._mm_fp32(a, message.down_m))
+        self._keep(run, "msg_pb", self._mm_fp32(b, message.down_m))
+        self._keep(run, "msg_scores", torch.stack(
+            [af @ message.queries_t, bf @ message.queries_t],
+            dim=-1).flatten(1))
+        self._keep(run, "msg_stats", torch.stack(
+            [(af * af).sum(-1), (bf * bf).sum(-1), (af * bf).sum(-1)],
+            dim=-1))
+
+    def _gates(self, layer, kind, hidden, squares, run, weight):
         """Loop message gates, each then RMS-normed with its weight, in bf16.
 
         Args:
-            gates: Batched gate weights (loader's stacked).
-            hidden: (rows, width) shared by every gate, or (gates, rows,
-                width).
-            messages: (previous pass's last block, its output).
+            layer: The looped layer.
+            kind: "qkv" or "mlp".
+            hidden: (rows, width) bf16 shared by every gate, or (gates,
+                rows, width).
+            squares: (1 or gates, rows) sums of squares of hidden's rows.
+            run: The pass's state, with its message products.
             weight: (gates, width) RMS norm weights.
 
         Returns:
             (gates, rows, width) gated inputs.
         """
-        torch = self.torch
-        prev_block, prev_out = messages
-        inputs = kernels.gate_inputs(torch, hidden, prev_block, prev_out,
-                                     gates.query, self.eps)
-        # the down output is rounded to bf16 and the gain weights are bf16
-        # values, so a bf16 GEMM accumulating in fp32 forms the same products
-        down = torch.bmm(inputs, gates.down_t)
-        gains = self._mm_fp32(down, gates.gains_t)
-        return kernels.gate_apply(torch, hidden, prev_block, prev_out,
-                                  gates.query, gains, weight, self.eps)
+        gates = layer.gates[kind]
+        first = layer.message_gate[kind]
+        rank = gates.down_h.shape[-1]
+        if hidden.dim() == 2:
+            ph = self._mm_fp32(hidden, gates.down_h_shared)
+        else:
+            ph = self._mm_fp32(hidden, gates.down_h)
+        return kernels.gate_out(
+            self.torch, hidden, squares, run.prev_block, run.prev_out, ph,
+            run.msg_pa[:, first * rank:], run.msg_pb[:, first * rank:],
+            run.msg_scores[:, first * 2:], run.msg_stats, gates.gains_t,
+            weight, self.eps)
 
     def _save_state(self, x, run, state, part):
         """Save the new convolution columns of the slots this chunk writes."""
@@ -578,26 +629,29 @@ class Inkling2Pipeline(ModelPipeline):
 
     # ---- one visit --------------------------------------------------
 
-    def _attention_inputs(self, layer, h, blocks, num_blocks, messages):
-        """The normed (q, k, v) inputs, one shared tensor when they agree."""
+    def _attention_inputs(self, layer, h, blocks, num_blocks, run):
+        """The normed (q, k, v) inputs, one shared tensor when they agree.
+
+        run carries the loop messages of a looped visit, else is None.
+        """
         torch = self.torch
         if layer.index == 0:
             return (kernels.rms_norm(torch, h, layer.attn_norm[0], self.eps),)
-        if messages is None:
+        if run is None:
             mixed = kernels.mix(torch, blocks, num_blocks, h,
                                 layer.attn_query, weight=layer.attn_norm,
                                 eps=self.eps)
             return tuple(mixed)
-        raw = kernels.mix(torch, blocks, num_blocks, h, layer.attn_query,
-                          eps=self.eps)
+        raw, squares = kernels.mix(torch, blocks, num_blocks, h,
+                                   layer.attn_query, eps=self.eps,
+                                   squares=True)
         if layer.is_local:
             # one input feeds the query, key, and value gates
             hidden = raw[0]
             weight = layer.attn_norm.expand(3, -1).contiguous()
         else:
             hidden, weight = raw, layer.attn_norm
-        return tuple(self._gates(layer.gates["qkv"], hidden, messages,
-                                 weight))
+        return tuple(self._gates(layer, "qkv", hidden, squares, run, weight))
 
     def _projections(self, layer, inputs):
         """(q side, k side, v side) projection outputs."""
@@ -641,9 +695,10 @@ class Inkling2Pipeline(ModelPipeline):
                        run.blocks[:, visit.blocks + 1].clone())
             self._keep(run, "prev_out", run.residual)
             self._keep(run, "residual", run.before)
-        messages = (run.prev_block, run.prev_out) if visit.looped else None
+            self._message_products(run)
         inputs = self._attention_inputs(layer, run.residual, run.blocks,
-                                        visit.blocks, messages)
+                                        visit.blocks,
+                                        run if visit.looped else None)
         q_side, k_side, v_side = self._projections(layer, inputs)
         q_width, gate_width, rel_width, _ = layer.q_widths
         rel_first = q_width + gate_width
@@ -699,10 +754,10 @@ class Inkling2Pipeline(ModelPipeline):
         else:
             partial, addend = run.residual, attn_out
         if visit.looped:
-            raw = kernels.mix(torch, run.blocks, num_blocks, partial,
-                              layer.mlp_query, addend=addend, eps=self.eps)[0]
-            mlp_in = self._gates(layer.gates["mlp"], raw,
-                                 (run.prev_block, run.prev_out),
+            raw, squares = kernels.mix(torch, run.blocks, num_blocks, partial,
+                                       layer.mlp_query, addend=addend,
+                                       eps=self.eps, squares=True)
+            mlp_in = self._gates(layer, "mlp", raw[0], squares, run,
                                  layer.mlp_norm)[0]
         else:
             mlp_in = kernels.mix(torch, run.blocks, num_blocks, partial,
@@ -734,6 +789,11 @@ class Inkling2Pipeline(ModelPipeline):
 
         return dict(
             blocks=rows(4, self.hidden), before=rows(self.hidden),
+            msg_pa=rows(self.message.down_m.shape[1], dtype=torch.float32),
+            msg_pb=rows(self.message.down_m.shape[1], dtype=torch.float32),
+            msg_scores=rows(2 * self.message.queries_t.shape[1],
+                            dtype=torch.float32),
+            msg_stats=rows(3, dtype=torch.float32, fill=1.0),
             prev_block=rows(self.hidden), prev_out=rows(self.hidden),
             q3=rows(heads, dim), rel=rows(heads, self.config["d_rel"]),
             sink=rows(heads), gate=rows(heads * dim), attn=rows(heads, dim),

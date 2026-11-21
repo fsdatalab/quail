@@ -7,10 +7,11 @@ the pass computes what the reference computes up to accumulation order.
   completed blocks and the running partial block, scored by a learned
   query against each state's RMS-normed values, then the weighted sum
   of the normed states, optionally RMS-normed with a weight.
-- gate_inputs and gate_apply: a loop message gate. The message is a
-  softmax mix of the previous pass's last block and output; the gate
-  mixes it into the hidden state with tanh gains from a rank-64
-  projection of both, then RMS-norms the result.
+- gate_out: a loop message gate. The message is a softmax mix of the
+  previous pass's last block and output; the gate mixes it into the
+  hidden state with tanh gains from a rank-64 projection of both, then
+  RMS-norms the result. The projection is rebuilt from products a loop
+  pass forms once and each row's norms.
 - short_conv: a static causal depthwise convolution of four taps with
   its residual and scale, whose earlier taps come from a tap table
   (conv_taps), optionally added to a residual stream.
@@ -20,11 +21,12 @@ the pass computes what the reference computes up to accumulation order.
   with log scaling of long positions on the full-attention layers.
 - rel_attention: causal paged attention with a learned relative bias
   over the last 1,024 distances, a per-token sink logit, and an
-  optional sliding window.
-- gate_attention: the sigmoid output gate of every head.
-- quantize_tokens, swiglu_quantize, combine: the NVFP4 expert path's
+  optional sliding window, times the sigmoid output gate.
+- route: each token's top experts and their normalized scores.
+- quantize_tokens, swiglu_quantize, combine: the expert path's
   activation quantization (four-over-six scales), its softcapped
-  SwiGLU, and the weighted sum of each token's experts.
+  SwiGLU, and the weighted sum of each token's experts, for passes
+  that do not run FlashInfer's fused MoE.
 """
 
 import math
@@ -46,7 +48,6 @@ def _kernels() -> dict:
         return _KERNELS
     import triton
     import triton.language as tl
-    from triton.language.extra import libdevice
 
     @triton.jit
     def _tap(x_ptr, stride_x, state_ptr, stride_slot, stride_tap, src, cols,
@@ -102,9 +103,10 @@ def _kernels() -> dict:
     @triton.jit
     def mix(blocks_ptr, stride_bb, stride_br, partial_ptr, stride_p,
             addend_ptr, stride_a, query_ptr, weight_ptr, out_ptr, stride_oq,
-            stride_or, eps, H: tl.constexpr, CH: tl.constexpr,
-            NB: tl.constexpr, NS: tl.constexpr, NQ: tl.constexpr,
-            HAS_ADDEND: tl.constexpr, NORM: tl.constexpr):
+            stride_or, squares_ptr, stride_sq, eps, H: tl.constexpr,
+            CH: tl.constexpr, NB: tl.constexpr, NS: tl.constexpr,
+            NQ: tl.constexpr, HAS_ADDEND: tl.constexpr, NORM: tl.constexpr,
+            SQUARES: tl.constexpr):
         # One row of up to five states and three queries. The first pass
         # accumulates the states' pairwise products and each query's
         # products with each state elementwise, reduced once at the end;
@@ -254,7 +256,7 @@ def _kernels() -> dict:
             w02 = p02 * i2
             w03 = p03 * i3
             w04 = p04 * i4
-            if NORM:
+            if NORM or SQUARES:
                 norm_sq = (w00 * w00 * s00
                            + w00 * w01 * s01
                            + w00 * w02 * s02
@@ -280,6 +282,9 @@ def _kernels() -> dict:
                            + w04 * w02 * s24
                            + w04 * w03 * s34
                            + w04 * w04 * s44)
+            if SQUARES:
+                tl.store(squares_ptr + 0 * stride_sq + row, norm_sq)
+            if NORM:
                 scale = tl.math.rsqrt(norm_sq / H + eps)
                 w00 = w00 * scale
                 w01 = w01 * scale
@@ -296,7 +301,7 @@ def _kernels() -> dict:
             w12 = p12 * i2
             w13 = p13 * i3
             w14 = p14 * i4
-            if NORM:
+            if NORM or SQUARES:
                 norm_sq = (w10 * w10 * s00
                            + w10 * w11 * s01
                            + w10 * w12 * s02
@@ -322,6 +327,9 @@ def _kernels() -> dict:
                            + w14 * w12 * s24
                            + w14 * w13 * s34
                            + w14 * w14 * s44)
+            if SQUARES:
+                tl.store(squares_ptr + 1 * stride_sq + row, norm_sq)
+            if NORM:
                 scale = tl.math.rsqrt(norm_sq / H + eps)
                 w10 = w10 * scale
                 w11 = w11 * scale
@@ -338,7 +346,7 @@ def _kernels() -> dict:
             w22 = p22 * i2
             w23 = p23 * i3
             w24 = p24 * i4
-            if NORM:
+            if NORM or SQUARES:
                 norm_sq = (w20 * w20 * s00
                            + w20 * w21 * s01
                            + w20 * w22 * s02
@@ -364,6 +372,9 @@ def _kernels() -> dict:
                            + w24 * w22 * s24
                            + w24 * w23 * s34
                            + w24 * w24 * s44)
+            if SQUARES:
+                tl.store(squares_ptr + 2 * stride_sq + row, norm_sq)
+            if NORM:
                 scale = tl.math.rsqrt(norm_sq / H + eps)
                 w20 = w20 * scale
                 w21 = w21 * scale
@@ -422,110 +433,81 @@ def _kernels() -> dict:
         return alpha, beta, mm
 
     @triton.jit
-    def gate_inputs(hidden_ptr, stride_hg, stride_h, prev_block_ptr,
-                    prev_out_ptr, stride_prev, query_ptr, out_ptr, stride_og,
-                    stride_o, eps, H: tl.constexpr, CH: tl.constexpr):
-        # [norm(hidden) | norm(message)] in bf16 for gate program_id(1); the
-        # first pass sums products in registers, the second writes
-        row = tl.program_id(0).to(tl.int64)
+    def _gate_tile(d, gains, hidden, block, prev, alpha, beta, cols, offs_r,
+                   ok, H: tl.constexpr, R: tl.constexpr):
+        # (1 - tanh f) h + tanh(g) (alpha a + beta b) over columns cols
+        f = tl.dot(d, tl.load(gains + offs_r[:, None] * (2 * H)
+                              + cols[None, :]))
+        g = tl.dot(d, tl.load(gains + offs_r[:, None] * (2 * H) + H
+                              + cols[None, :]))
+        h = tl.load(hidden + cols[None, :], mask=ok[:, None],
+                    other=0.0).to(tl.float32)
+        a = tl.load(block + cols[None, :], mask=ok[:, None],
+                    other=0.0).to(tl.float32)
+        b = tl.load(prev + cols[None, :], mask=ok[:, None],
+                    other=0.0).to(tl.float32)
+        m = alpha[:, None] * a + beta[:, None] * b
+        # the row is rounded to bf16, so the approximate tanh suffices
+        return (1.0 - _tanh_approx(f)) * h + _tanh_approx(g) * m
+
+    @triton.jit
+    def gate_out(hidden_ptr, stride_hg, stride_h, squares_ptr, stride_sg,
+                 prev_block_ptr, prev_out_ptr, stride_prev, ph_ptr, stride_pg,
+                 stride_p, pa_ptr, pb_ptr, stride_m, scores_ptr, stride_s,
+                 stats_ptr, gains_ptr, weight_ptr, out_ptr, stride_og,
+                 stride_o, rows, eps, H: tl.constexpr, R: tl.constexpr,
+                 BM: tl.constexpr, BN: tl.constexpr):
+        # One gate (program_id(1)) of BM rows. Its down projection is
+        # rebuilt from h @ Dh, a @ Dm, and b @ Dm with each row's norms;
+        # the gains GEMM (K = R) then runs on two passes: the first sums
+        # the gated row's squares, the second writes it RMS-normed.
+        r = tl.program_id(0) * BM + tl.arange(0, BM)
         gate = tl.program_id(1)
-        offs = tl.arange(0, CH)
-        hidden = hidden_ptr + gate * stride_hg + row * stride_h
-        block = prev_block_ptr + row * stride_prev
-        prev = prev_out_ptr + row * stride_prev
-        query = query_ptr + gate * H
-        hh = tl.zeros((CH,), dtype=tl.float32)
-        aa = tl.zeros((CH,), dtype=tl.float32)
-        bb = tl.zeros((CH,), dtype=tl.float32)
-        ab = tl.zeros((CH,), dtype=tl.float32)
-        qa = tl.zeros((CH,), dtype=tl.float32)
-        qb = tl.zeros((CH,), dtype=tl.float32)
-        for c in range(0, H, CH):
-            cols = c + offs
-            h = tl.load(hidden + cols).to(tl.float32)
-            a = tl.load(block + cols).to(tl.float32)
-            b = tl.load(prev + cols).to(tl.float32)
-            q = tl.load(query + cols)
-            hh += h * h
-            aa += a * a
-            bb += b * b
-            ab += a * b
-            qa += q * a
-            qb += q * b
-        alpha, beta, mm = _blend(tl.sum(aa, 0), tl.sum(bb, 0), tl.sum(ab, 0),
-                                 tl.sum(qa, 0), tl.sum(qb, 0), eps, H)
-        inv_h = tl.math.rsqrt(tl.sum(hh, 0) / H + eps)
+        ok = r < rows
+        r64 = r.to(tl.int64)
+        offs_c = tl.arange(0, BN)
+        offs_r = tl.arange(0, R)
+        hidden = hidden_ptr + gate * stride_hg + r64[:, None] * stride_h
+        block = prev_block_ptr + r64[:, None] * stride_prev
+        prev = prev_out_ptr + r64[:, None] * stride_prev
+        gains = gains_ptr + gate * (R * 2 * H)
+        stats = stats_ptr + r64 * 3
+        aa = tl.load(stats, mask=ok, other=1.0)
+        bb = tl.load(stats + 1, mask=ok, other=1.0)
+        ab = tl.load(stats + 2, mask=ok, other=0.0)
+        scores = scores_ptr + r64 * stride_s + gate * 2
+        alpha, beta, mm = _blend(aa, bb, ab,
+                                 tl.load(scores, mask=ok, other=0.0),
+                                 tl.load(scores + 1, mask=ok, other=0.0),
+                                 eps, H)
+        hh = tl.load(squares_ptr + gate * stride_sg + r64, mask=ok, other=1.0)
+        inv_h = tl.math.rsqrt(hh / H + eps)
         inv_m = tl.math.rsqrt(mm / H + eps)
-        alpha *= inv_m
-        beta *= inv_m
-        out = out_ptr + gate * stride_og + row * stride_o
-        for c in range(0, H, CH):
-            cols = c + offs
-            h = tl.load(hidden + cols).to(tl.float32)
-            a = tl.load(block + cols).to(tl.float32)
-            b = tl.load(prev + cols).to(tl.float32)
-            tl.store(out + cols, (h * inv_h).to(tl.bfloat16))
-            tl.store(out + H + cols, (alpha * a + beta * b).to(tl.bfloat16))
-
-    @triton.jit
-    def _gate_part(hidden, block, prev, query, gains, start, W: tl.constexpr,
-                   H: tl.constexpr):
-        # columns [start, start + W) of one gate's row: u = (1 - tanh(f)) h,
-        # v = tanh(g), and the previous pass's block a and output b
-        cols = start + tl.arange(0, W)
-        h = tl.load(hidden + cols).to(tl.float32)
-        a = tl.load(block + cols).to(tl.float32)
-        b = tl.load(prev + cols).to(tl.float32)
-        q = tl.load(query + cols)
-        u = (1.0 - libdevice.tanh(tl.load(gains + cols))) * h
-        v = libdevice.tanh(tl.load(gains + H + cols))
-        return u, v, a, b, q
-
-    @triton.jit
-    def gate_apply(hidden_ptr, stride_hg, stride_h, prev_block_ptr,
-                   prev_out_ptr, stride_prev, query_ptr, gains_ptr,
-                   stride_gg, stride_g, weight_ptr, out_ptr, stride_og,
-                   stride_o, eps, H: tl.constexpr, HEAD: tl.constexpr,
-                   TAIL: tl.constexpr):
-        # norm((1 - tanh(f)) h + tanh(g) m) * weight in one pass, the row
-        # held as a power-of-two head and a power-of-two tail
-        row = tl.program_id(0).to(tl.int64)
-        gate = tl.program_id(1)
-        hidden = hidden_ptr + gate * stride_hg + row * stride_h
-        block = prev_block_ptr + row * stride_prev
-        prev = prev_out_ptr + row * stride_prev
-        query = query_ptr + gate * H
-        gains = gains_ptr + gate * stride_gg + row * stride_g
-        u, v, a, b, q = _gate_part(hidden, block, prev, query, gains, 0, HEAD,
-                                   H)
-        aa = tl.sum(a * a, 0)
-        bb = tl.sum(b * b, 0)
-        ab = tl.sum(a * b, 0)
-        qa = tl.sum(q * a, 0)
-        qb = tl.sum(q * b, 0)
-        if TAIL > 0:
-            u2, v2, a2, b2, q2 = _gate_part(hidden, block, prev, query, gains,
-                                            HEAD, TAIL, H)
-            aa += tl.sum(a2 * a2, 0)
-            bb += tl.sum(b2 * b2, 0)
-            ab += tl.sum(a2 * b2, 0)
-            qa += tl.sum(q2 * a2, 0)
-            qb += tl.sum(q2 * b2, 0)
-        alpha, beta, mm = _blend(aa, bb, ab, qa, qb, eps, H)
-        y = u + v * (alpha * a + beta * b)
-        total = tl.sum(y * y, 0)
-        if TAIL > 0:
-            y2 = u2 + v2 * (alpha * a2 + beta * b2)
-            total += tl.sum(y2 * y2, 0)
+        cols_r = gate * R + offs_r
+        ph = tl.load(ph_ptr + gate * stride_pg + r64[:, None] * stride_p
+                     + offs_r[None, :], mask=ok[:, None], other=0.0)
+        pa = tl.load(pa_ptr + r64[:, None] * stride_m + cols_r[None, :],
+                     mask=ok[:, None], other=0.0)
+        pb = tl.load(pb_ptr + r64[:, None] * stride_m + cols_r[None, :],
+                     mask=ok[:, None], other=0.0)
+        # [norm(h) | norm(m)] @ down, rounded to bf16 as the reference's is
+        d = (inv_h[:, None] * ph + inv_m[:, None] * (
+            alpha[:, None] * pa + beta[:, None] * pb)).to(tl.bfloat16)
+        total = tl.zeros((BM,), dtype=tl.float32)
+        for n in range(0, H, BN):
+            y = _gate_tile(d, gains, hidden, block, prev, alpha, beta,
+                           n + offs_c, offs_r, ok, H, R)
+            total += tl.sum(y * y, 1)
         scale = tl.math.rsqrt(total / H + eps)
-        out = out_ptr + gate * stride_og + row * stride_o
-        cols = tl.arange(0, HEAD)
-        w = tl.load(weight_ptr + gate * H + cols).to(tl.float32)
-        tl.store(out + cols, (y * scale * w).to(tl.bfloat16))
-        if TAIL > 0:
-            cols2 = HEAD + tl.arange(0, TAIL)
-            w2 = tl.load(weight_ptr + gate * H + cols2).to(tl.float32)
-            tl.store(out + cols2, (y2 * scale * w2).to(tl.bfloat16))
+        out = out_ptr + gate * stride_og + r64[:, None] * stride_o
+        for n in range(0, H, BN):
+            cols = n + offs_c
+            y = _gate_tile(d, gains, hidden, block, prev, alpha, beta, cols,
+                           offs_r, ok, H, R)
+            w = tl.load(weight_ptr + gate * H + cols).to(tl.float32)
+            tl.store(out + cols[None, :],
+                     (y * scale[:, None] * w[None, :]).to(tl.bfloat16),
+                     mask=ok[:, None])
 
     @triton.jit
     def rms_norm(x_ptr, stride_x, weight_ptr, out_ptr, stride_o, eps,
@@ -1156,7 +1138,7 @@ def _kernels() -> dict:
 
     _KERNELS.update(
         scatter_state=scatter_state,
-        mix=mix, gate_inputs=gate_inputs, gate_apply=gate_apply,
+        mix=mix, gate_out=gate_out,
         rms_norm=rms_norm, short_conv=short_conv, kv_conv=kv_conv,
         clip_heads=clip_heads, route=route,
         rel_attention=rel_attention, merge_splits=merge_splits,
@@ -1178,7 +1160,7 @@ def _warps(width):
 
 
 def mix(torch, blocks, num_blocks, partial, query, *, addend=None,
-        weight=None, eps=1e-6):
+        weight=None, eps=1e-6, squares=False):
     """A block attention residual over each row's states.
 
     Args:
@@ -1191,18 +1173,24 @@ def mix(torch, blocks, num_blocks, partial, query, *, addend=None,
             hidden ** -0.5; one output per query.
         addend: Optional (rows, hidden) added to the partial in fp32.
         weight: (queries, hidden) RMS norm weights; None leaves the mix
-            unnormed in fp32.
+            unnormed.
         eps: The RMS norms' epsilon.
+        squares: With no weight, return the unnormed mix in bf16 and each
+            output row's sum of squares, rather than the mix in fp32.
 
     Returns:
-        (queries, rows, hidden): bf16 when normed, else fp32.
+        (queries, rows, hidden): bf16 when normed, else fp32; or, with
+        squares, (bf16 mix, (queries, rows) fp32 sums of squares).
     """
     rows, hidden = blocks.shape[0], blocks.shape[2]
     nq = query.shape[0]
-    dtype = torch.bfloat16 if weight is not None else torch.float32
+    dtype = (torch.bfloat16 if weight is not None or squares
+             else torch.float32)
     out = torch.empty((nq, rows, hidden), dtype=dtype, device=blocks.device)
+    sums = (torch.empty((nq, rows), dtype=torch.float32, device=blocks.device)
+            if squares else out)
     if rows == 0:
-        return out
+        return (out, sums) if squares else out
     has_partial = partial is not None
     partial = partial if has_partial else blocks[:, 0]
     addend_t = addend if addend is not None else partial
@@ -1210,10 +1198,12 @@ def mix(torch, blocks, num_blocks, partial, query, *, addend=None,
         blocks, blocks.stride(1), blocks.stride(0), partial, partial.stride(0),
         addend_t, addend_t.stride(0), query,
         weight if weight is not None else query, out, out.stride(0),
-        out.stride(1), eps, H=hidden, CH=_chunk(hidden, 256), NB=num_blocks,
+        out.stride(1), sums, sums.stride(0), eps, H=hidden,
+        CH=_chunk(hidden, 256), NB=num_blocks,
         NS=num_blocks + int(has_partial), NQ=nq,
-        HAS_ADDEND=addend is not None, NORM=weight is not None, num_warps=1)
-    return out
+        HAS_ADDEND=addend is not None, NORM=weight is not None,
+        SQUARES=squares, num_warps=1)
+    return (out, sums) if squares else out
 
 
 def _gate_hidden(hidden):
@@ -1223,57 +1213,54 @@ def _gate_hidden(hidden):
     return hidden.stride(0), hidden.stride(1)
 
 
-def gate_inputs(torch, hidden, prev_block, prev_out, query, eps=1e-6):
-    """Each gate's [norm(hidden) | norm(message)] in bf16, (gates, rows, 2w).
+def gate_out(torch, hidden, squares, prev_block, prev_out, ph, pa, pb,
+             scores, stats, gains_t, weight, eps=1e-6):
+    """Each loop message gate's gated, RMS-normed input in bf16.
 
     Args:
         torch: The torch module.
-        hidden: (rows, width) shared by every gate, or (gates, rows, width).
-        prev_block: (rows, width) the previous pass's last block.
-        prev_out: (rows, width) the previous pass's output.
-        query: (gates, width) fp32 message queries, pre-scaled.
-        eps: The norms' epsilon.
-    """
-    gates, width = query.shape
-    rows = prev_block.shape[0]
-    out = torch.empty((gates, rows, 2 * width), dtype=torch.bfloat16,
-                      device=prev_block.device)
-    if rows:
-        stride_hg, stride_h = _gate_hidden(hidden)
-        _kernels()["gate_inputs"][(rows, gates)](
-            hidden, stride_hg, stride_h, prev_block, prev_out,
-            prev_block.stride(0), query, out, out.stride(0), out.stride(1),
-            eps, H=width, CH=_chunk(width, 256), num_warps=1)
-    return out
-
-
-def gate_apply(torch, hidden, prev_block, prev_out, query, gains, weight,
-               eps=1e-6):
-    """Each gate's gated, RMS-normed input in bf16, (gates, rows, width).
-
-    Args:
-        torch: The torch module.
-        hidden: (rows, width) shared by every gate, or (gates, rows, width).
-        prev_block: (rows, width) the previous pass's last block.
-        prev_out: (rows, width) the previous pass's output.
-        query: (gates, width) fp32 message queries, pre-scaled.
-        gains: (gates, rows, 2 * width) fp32 forget and message gains
-            before their tanh.
+        hidden: (rows, width) bf16 shared by every gate, or (gates, rows,
+            width).
+        squares: (1 or gates, rows) fp32 sums of squares of hidden's rows.
+        prev_block: (rows, width) the previous pass's last block, a.
+        prev_out: (rows, width) the previous pass's output, b.
+        ph: hidden @ each gate's hidden-side down weights, fp32, as
+            (rows, gates * rank) for a shared hidden, else
+            (gates, rows, rank).
+        pa: (rows, >= gates * rank) fp32 view of a @ the gates' message-side
+            down weights, gate by gate.
+        pb: The same view of b's.
+        scores: (rows, >= gates * 2) fp32 view of each gate's message
+            query scores (query @ a, query @ b).
+        stats: (rows, 3) fp32 (a @ a, b @ b, a @ b).
+        gains_t: (gates, rank, 2 * width) bf16 forget and message gains.
         weight: (gates, width) RMS norm weights.
         eps: The norms' epsilon.
+
+    Returns:
+        (gates, rows, width) bf16.
     """
-    gates, width = query.shape
+    count, width = weight.shape
+    rank = gains_t.shape[1]
     rows = prev_block.shape[0]
-    out = torch.empty((gates, rows, width), dtype=torch.bfloat16,
+    out = torch.empty((count, rows, width), dtype=torch.bfloat16,
                       device=prev_block.device)
-    if rows:
-        stride_hg, stride_h = _gate_hidden(hidden)
-        _kernels()["gate_apply"][(rows, gates)](
-            hidden, stride_hg, stride_h, prev_block, prev_out,
-            prev_block.stride(0), query, gains, gains.stride(0),
-            gains.stride(1), weight, out, out.stride(0), out.stride(1), eps,
-            H=width, HEAD=_pow2(width + 1) // 2,
-            TAIL=width - _pow2(width + 1) // 2, num_warps=8)
+    if rows == 0:
+        return out
+    stride_hg, stride_h = _gate_hidden(hidden)
+    stride_sg = squares.stride(0) if squares.shape[0] > 1 else 0
+    if ph.dim() == 2:
+        # a shared hidden's products sit side by side
+        stride_pg, stride_p = rank, ph.stride(0)
+    else:
+        stride_pg, stride_p = ph.stride(0), ph.stride(1)
+    block_rows = 64
+    _kernels()["gate_out"][(triton_cdiv(rows, block_rows), count)](
+        hidden, stride_hg, stride_h, squares, stride_sg, prev_block, prev_out,
+        prev_block.stride(0), ph, stride_pg, stride_p, pa, pb, pa.stride(0),
+        scores, scores.stride(0), stats, gains_t, weight, out, out.stride(0),
+        out.stride(1), rows, eps, H=width, R=rank, BM=block_rows, BN=64,
+        num_warps=8)
     return out
 
 

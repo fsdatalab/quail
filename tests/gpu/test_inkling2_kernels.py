@@ -200,35 +200,51 @@ def test_the_message_gates_match_their_definition():
     from quail.backends.quail.executor.models import inkling2_kernels as kernels
 
     torch.manual_seed(3)
-    gates, rows, hidden = 3, 29, 2304
-    raw = torch.randn(gates, rows, hidden, device="cuda")
+    gates, rows, hidden, rank = 3, 29, 2304, 64
+    raw = torch.randn(gates, rows, hidden, device="cuda").bfloat16()
     prev_block = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
     prev_out = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
     query = torch.randn(gates, hidden, device="cuda") * hidden ** -0.5
-    gains = torch.randn(gates, rows, 2 * hidden, device="cuda")
+    down_t = (torch.randn(gates, 2 * hidden, rank, device="cuda")
+              * 0.02).bfloat16()
+    gains_t = (torch.randn(gates, rank, 2 * hidden, device="cuda")
+               * 0.3).bfloat16()
     weight = torch.rand(gates, hidden, device="cuda", dtype=torch.bfloat16) + 0.5
 
     def norm(x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6)
 
-    states = torch.stack([norm(prev_block.float()), norm(prev_out.float())], 1)
-    scores = torch.einsum("rsh,gh->grs", states, query).softmax(-1)
-    message = torch.einsum("grs,rsh->grh", scores, states)
-    inputs = kernels.gate_inputs(torch, raw, prev_block, prev_out, query)
-    expected = torch.cat([norm(raw), norm(message)], -1)
-    assert (inputs.float() - expected).abs().max().item() < 3e-2
-    out = kernels.gate_apply(torch, raw, prev_block, prev_out, query, gains,
-                             weight)
-    mixed = ((1 - gains[..., :hidden].tanh()) * raw
-             + gains[..., hidden:].tanh() * message)
-    expected = norm(mixed) * weight.float()[:, None, :]
-    assert (out.float() - expected).abs().max().item() < 3e-2
-    shared = kernels.gate_apply(torch, raw[0], prev_block, prev_out, query,
-                                gains, weight)
-    mixed = ((1 - gains[..., :hidden].tanh()) * raw[0]
-             + gains[..., hidden:].tanh() * message)
-    expected = norm(mixed) * weight.float()[:, None, :]
-    assert (shared.float() - expected).abs().max().item() < 3e-2
+    a, b = prev_block.float(), prev_out.float()
+    states = torch.stack([norm(a), norm(b)], 1)
+    weights = torch.einsum("rsh,gh->grs", states, query).softmax(-1)
+    message = torch.einsum("grs,rsh->grh", weights, states)
+
+    def expected(hidden_rows):
+        inputs = torch.cat([norm(hidden_rows.float()).expand(gates, -1, -1),
+                            norm(message)], -1)
+        down = (inputs @ down_t.float()).bfloat16().float()
+        gains = down @ gains_t.float()
+        mixed = ((1 - gains[..., :hidden].tanh()) * hidden_rows.float()
+                 + gains[..., hidden:].tanh() * message)
+        return norm(mixed) * weight.float()[:, None, :]
+
+    # the messages' products, as a loop pass forms them once
+    down_m = down_t[:, hidden:].float()
+    pa = torch.cat(list(a @ down_m), -1)
+    pb = torch.cat(list(b @ down_m), -1)
+    scores = torch.stack([a @ query.t(), b @ query.t()], -1).flatten(1)
+    stats = torch.stack([(a * a).sum(-1), (b * b).sum(-1), (a * b).sum(-1)],
+                        -1)
+    ph = torch.bmm(raw.float(), down_t[:, :hidden].float())
+    squares = raw.float().pow(2).sum(-1)
+    out = kernels.gate_out(torch, raw, squares, prev_block, prev_out, ph, pa,
+                           pb, scores, stats, gains_t, weight)
+    assert (out.float() - expected(raw)).abs().max().item() < 3e-2
+    # one hidden row shared by every gate
+    ph = torch.cat(list(raw[0].float() @ down_t[:, :hidden].float()), -1)
+    shared = kernels.gate_out(torch, raw[0], squares[:1], prev_block, prev_out,
+                              ph, pa, pb, scores, stats, gains_t, weight)
+    assert (shared.float() - expected(raw[0])).abs().max().item() < 3e-2
 
 
 def test_the_fused_experts_agree_with_quails_expert_path(monkeypatch):
