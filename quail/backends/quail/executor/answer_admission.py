@@ -122,11 +122,11 @@ def _allocate(risk, budget, price=None):
             if used > budget:
                 low = middle
                 upper[unsettled] = trial
-            else:
-                high = middle
-                lower[unsettled] = trial
-                if used == budget:
-                    break
+                continue
+            high = middle
+            lower[unsettled] = trial
+            if used == budget:
+                break
         chosen = lower
     left = budget - int(chosen.sum())
     while left > 0:
