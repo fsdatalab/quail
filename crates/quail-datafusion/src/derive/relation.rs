@@ -561,15 +561,6 @@ fn bind_answers(
     }
     Ok(())
 }
-/// A list of names as Python writes a tuple of them.
-fn repr_tuple(items: &[String]) -> String {
-    let parts: Vec<String> = items.iter().map(|item| repr_str(item)).collect();
-    match parts.as_slice() {
-        [one] => format!("({one},)"),
-        _ => format!("({})", parts.join(", ")),
-    }
-}
-
 /// An EXISTS or NOT EXISTS gate over the table `inner`.
 ///
 /// # Errors
@@ -643,10 +634,14 @@ fn join_spec(
     if let Some(anchor) = &spec.anchor
         && !aliases.contains(anchor)
     {
+        let parts: Vec<String> = aliases.iter().map(|alias| repr_str(alias)).collect();
+        let names = match parts.as_slice() {
+            [one] => format!("({one},)"),
+            _ => format!("({})", parts.join(", ")),
+        };
         return compile_error(format!(
-            "anchor {} is not a table of this join ({})",
+            "anchor {} is not a table of this join ({names})",
             repr_str(anchor),
-            repr_tuple(aliases)
         ));
     }
     for alias in &tables[1..] {
