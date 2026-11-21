@@ -305,22 +305,6 @@ fn step_rank(seconds: f64, spared: f64) -> f64 {
     }
 }
 
-/// The steps the search places together, in written order: each step
-/// alone, and the terms of one OR as one unit.
-fn units(steps: &[TableStep]) -> Vec<Vec<usize>> {
-    let mut found: Vec<Vec<usize>> = Vec::new();
-    for (index, step) in steps.iter().enumerate() {
-        let same_or = |unit: &&mut Vec<usize>| {
-            step.or_term.is_some() && steps[unit[0]].or_term == step.or_term
-        };
-        match found.iter_mut().find(same_or) {
-            Some(unit) => unit.push(index),
-            None => found.push(vec![index]),
-        }
-    }
-    found
-}
-
 /// The fraction of the rows a unit reads that the steps after it need
 /// not: the rows a filter drops, or the rows no term of an OR passes.
 fn unit_spared(steps: &[TableStep], unit: &[usize]) -> f64 {
@@ -372,12 +356,7 @@ pub fn order_steps(
     context: &PlanningContext,
 ) -> Result<Vec<usize>, CompileError> {
     let ordered = searched_order(steps, rule, count, chunk, context)?;
-    Ok(after_the_answers_read(steps, ordered))
-}
 
-/// `ordered` with each step moved after the steps whose answers its
-/// guard reads, the others kept in order.
-fn after_the_answers_read(steps: &[TableStep], ordered: Vec<usize>) -> Vec<usize> {
     let answers = |step: &TableStep, read: &str| match &step.key {
         StepKey::Name(name) => read
             .strip_prefix(name.as_str())
@@ -402,7 +381,7 @@ fn after_the_answers_read(steps: &[TableStep], ordered: Vec<usize>) -> Vec<usize
     }
     // a cycle of reads keeps the order it had
     placed.extend(waiting);
-    placed
+    Ok(placed)
 }
 
 fn searched_order(
@@ -496,7 +475,16 @@ fn searched_order(
             }
             Ok((next, step_rank(seconds, unit_spared(steps, unit))))
         };
-    let units = units(steps);
+    let mut units: Vec<Vec<usize>> = Vec::new();
+    for (index, step) in steps.iter().enumerate() {
+        let same_or = |unit: &&mut Vec<usize>| {
+            step.or_term.is_some() && steps[unit[0]].or_term == step.or_term
+        };
+        match units.iter_mut().find(same_or) {
+            Some(unit) => unit.push(index),
+            None => units.push(vec![index]),
+        }
+    }
     let starters: Vec<&Vec<usize>> = units
         .iter()
         .filter(|unit| unit_spared(steps, unit) > 0.0)
