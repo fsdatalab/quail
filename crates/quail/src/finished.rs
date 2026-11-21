@@ -465,24 +465,25 @@ impl FinishedRows {
                 Some(order) => take(column.as_ref(), order, None).map_err(arrow_error)?,
                 None => Arc::clone(column),
             };
-            if self.carried(field.name()) {
+            let name = field.name();
+            let labeled = self.columns.iter().any(|column| {
+                matches!(
+                    column,
+                    Column::Answer { name: found, labels: Some(_), .. } if found == name
+                )
+            });
+            if labeled
+                && self
+                    .relations
+                    .iter()
+                    .any(|relation| relation.survivors && relation.seen.contains(name))
+            {
                 column = cast(&column, &DataType::Utf8).map_err(arrow_error)?;
             }
-            fields.push(Field::new(field.name(), column.data_type().clone(), true));
+            fields.push(Field::new(name, column.data_type().clone(), true));
             arrays.push(column);
         }
         packed_batch(fields, arrays, rows.num_rows(), &self.structs)
-    }
-
-    /// Whether a table's surviving documents carry a label column whose
-    /// classification's own rows port is not those survivors.
-    fn carried(&self, name: &str) -> bool {
-        let labeled = self.columns.iter().any(|column| {
-            matches!(column, Column::Answer { name: found, labels: Some(_), .. } if found == name)
-        });
-        labeled
-            && (self.relations.iter())
-                .any(|relation| relation.survivors && relation.seen.contains(name))
     }
 
     /// Keep a batch's new rows in a relation and return the region rows
