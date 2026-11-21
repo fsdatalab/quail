@@ -74,7 +74,14 @@ impl ScalarUDFImpl for ParseDocument {
 /// or unreadable PDF.
 fn document_texts(documents: &ArrayRef) -> Result<ArrayRef> {
     let mut texts = StringBuilder::with_capacity(documents.len(), 0);
-    let mut append = |bytes: Option<&[u8]>| texts.append_option(bytes.and_then(pdf_text));
+    let mut append = |bytes: Option<&[u8]>| {
+        texts.append_option(bytes.and_then(|bytes| {
+            // pdf-extract panics on some malformed files: 3 of ParseBench's 2,037
+            let pages = quietly(|| pdf_extract::extract_text_from_mem_by_pages(bytes))?.ok()?;
+            let pages: Vec<&str> = pages.iter().map(|page| page.trim()).collect();
+            Some(pages.join(PAGE_BREAK))
+        }));
+    };
     match documents.data_type() {
         DataType::Binary => documents.as_binary::<i32>().iter().for_each(&mut append),
         DataType::LargeBinary => documents.as_binary::<i64>().iter().for_each(&mut append),
@@ -82,15 +89,6 @@ fn document_texts(documents: &ArrayRef) -> Result<ArrayRef> {
         other => return exec_err!("AI.PARSE_DOCUMENT reads a binary column, not {other}"),
     }
     Ok(Arc::new(texts.finish()))
-}
-
-/// The text a PDF stores, its pages in order and each page trimmed, or
-/// None when `pdf-extract` cannot read the file.
-fn pdf_text(bytes: &[u8]) -> Option<String> {
-    // pdf-extract panics on some malformed files: 3 of ParseBench's 2,037
-    let pages = quietly(|| pdf_extract::extract_text_from_mem_by_pages(bytes))?.ok()?;
-    let pages: Vec<&str> = pages.iter().map(|page| page.trim()).collect();
-    Some(pages.join(PAGE_BREAK))
 }
 
 /// `AI.PARSE_DOCUMENT` as a DataFusion UDF, also named
