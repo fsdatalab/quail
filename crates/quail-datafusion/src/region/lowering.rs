@@ -79,17 +79,14 @@ fn drop_written_names(plan: LogicalPlan) -> Result<LogicalPlan> {
             _ => None,
         }
     }
-    fn unnamed(expr: Expr) -> Result<Transformed<Expr>> {
-        expr.transform_up(|inner| match written(&inner) {
-            Some(call) => Ok(Transformed::yes(call.clone())),
-            None => Ok(Transformed::no(inner)),
-        })
-    }
     plan.transform_up(|node| {
         let tests = matches!(node, LogicalPlan::Filter(_) | LogicalPlan::Join(_));
         node.map_expressions(|expr| {
             if tests {
-                return unnamed(expr);
+                return expr.transform_up(|inner| match written(&inner) {
+                    Some(call) => Ok(Transformed::yes(call.clone())),
+                    None => Ok(Transformed::no(inner)),
+                });
             }
             match expr {
                 Expr::Alias(mut alias) => match written(&alias.expr) {
@@ -217,7 +214,7 @@ impl Extracted {
         // its calls from a SELECT list below it
         let plan = match plan {
             LogicalPlan::Aggregate(_) | LogicalPlan::Window(_) | LogicalPlan::Sort(_) => {
-                self.extract(plan)?
+                self.extract_calls(plan, false)?
                     .data
                     .map_children(|child| crate::rules::lower::lower_node(child, columns))?
                     .data
@@ -401,12 +398,7 @@ impl Extracted {
     }
 
     /// Move each AI call of an `Aggregate`, `Window`, or `Sort` into a
-    /// `Projection` below it.
-    fn extract(&mut self, node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
-        self.extract_calls(node, false)
-    }
-
-    /// [`Self::extract`]; with `whole`, also a SELECT list's items that
+    /// `Projection` below it; with `whole`, also a SELECT list's items that
     /// are a call and nothing else.
     fn extract_calls(
         &mut self,
