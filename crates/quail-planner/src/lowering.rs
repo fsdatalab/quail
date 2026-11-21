@@ -198,16 +198,6 @@ pub fn code_letters(
     ))
 }
 
-fn option_fallbacks() -> Vec<String> {
-    let candidates = code_candidates();
-    let mut found = candidates[..26].to_vec();
-    found.extend((0..100).map(|index| format!("{index:02}")));
-    found.extend(('a'..='z').map(String::from));
-    found.extend((0..200).map(|index| format!("#{index}")));
-    found.extend_from_slice(&candidates[26..]);
-    found
-}
-
 /// Each option's code as d1 writes it, as `option_aliases`.
 ///
 /// # Errors
@@ -218,7 +208,12 @@ pub fn option_aliases(
     tokenizer: &Tokenizer,
 ) -> Result<Vec<String>, CompileError> {
     let (mut used, mut out) = (BTreeSet::new(), Vec::new());
-    let fallbacks = option_fallbacks();
+    let candidates = code_candidates();
+    let mut fallbacks = candidates[..26].to_vec();
+    fallbacks.extend((0..100).map(|index| format!("{index:02}")));
+    fallbacks.extend(('a'..='z').map(String::from));
+    fallbacks.extend((0..200).map(|index| format!("#{index}")));
+    fallbacks.extend_from_slice(&candidates[26..]);
     let take = |code: &str,
                 used: &mut BTreeSet<i64>,
                 out: &mut Vec<String>|
