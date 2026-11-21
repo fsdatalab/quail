@@ -38,14 +38,8 @@ def _dense_attention(q, k, v, rel, sink, proj, window):
     return torch.einsum("hqk,khd->qhd", weights, vv)
 
 
-@pytest.mark.parametrize("window", [0, 1024])
-def test_relative_attention_matches_dense_attention(window):
-    from quail.backends.quail.executor.models import inkling2_kernels as kernels
-
-    torch.manual_seed(0)
-    # (queries, keys): a long prefill past the window, a short question
-    # after a resident document, and two one-token steps
-    shapes = [(1300, 1500), (40, 700), (1, 2100), (1, 9)]
+def _paged_inputs(shapes):
+    """Random paged KV and query inputs of sequences of (queries, keys)."""
     pages_per = [-(-used // PAGE) for _, used in shapes]
     num_pages = sum(pages_per) + 3
     kp = torch.randn(num_pages, PAGE, KV_HEADS, DIM, device="cuda",
@@ -61,31 +55,94 @@ def test_relative_attention_matches_dense_attention(window):
     total = sum(rows for rows, _ in shapes)
     q = torch.randn(total, HEADS, DIM, device="cuda", dtype=torch.bfloat16)
     q = q / q.float().norm(dim=-1, keepdim=True).to(q.dtype) * 4
-    rel = torch.randn(total, HEADS, RANK, device="cuda", dtype=torch.bfloat16)
-    sink = torch.randn(total, HEADS, device="cuda", dtype=torch.bfloat16)
-    proj = torch.randn(RANK, EXTENT, device="cuda", dtype=torch.bfloat16) * 0.3
     cu = [0]
     for rows, _ in shapes:
         cu.append(cu[-1] + rows)
-    cu_q = torch.tensor(cu, dtype=torch.int32, device="cuda")
-    used = torch.tensor([u for _, u in shapes], dtype=torch.int32, device="cuda")
+    return dict(
+        kp=kp, vp=vp, table=table, pages_per=pages_per, cu=cu, q=q,
+        rel=torch.randn(total, HEADS, RANK, device="cuda",
+                        dtype=torch.bfloat16),
+        sink=torch.randn(total, HEADS, device="cuda", dtype=torch.bfloat16),
+        proj=torch.randn(RANK, EXTENT, device="cuda",
+                         dtype=torch.bfloat16) * 0.3,
+        cu_q=torch.tensor(cu, dtype=torch.int32, device="cuda"),
+        used=torch.tensor([u for _, u in shapes], dtype=torch.int32,
+                          device="cuda"))
+
+
+def _assert_dense(inputs, shapes, out, window, label):
+    """Assert each sequence's rows of out match dense attention."""
+    cu, table = inputs["cu"], inputs["table"]
+    for index, (rows, keys) in enumerate(shapes):
+        pages = table[index, :inputs["pages_per"][index]].long()
+        k = inputs["kp"][pages].reshape(-1, KV_HEADS, DIM)[:keys]
+        v = inputs["vp"][pages].reshape(-1, KV_HEADS, DIM)[:keys]
+        span = slice(cu[index], cu[index + 1])
+        expected = _dense_attention(inputs["q"][span], k, v,
+                                    inputs["rel"][span], inputs["sink"][span],
+                                    inputs["proj"], window)
+        error = (out[span].float() - expected).abs().max().item()
+        assert error < 2e-2, (label, index, error)
+
+
+@pytest.mark.parametrize("window", [0, 1024])
+def test_relative_attention_matches_dense_attention(window):
+    from quail.backends.quail.executor.models import inkling2_kernels as kernels
+
+    torch.manual_seed(0)
+    # (queries, keys): a long prefill past the window, a short question
+    # after a resident document, and two one-token steps
+    shapes = [(1300, 1500), (40, 700), (1, 2100), (1, 9)]
+    inputs = _paged_inputs(shapes)
+    i = inputs
     for block_rows in (16, 64, 128):
-        seqs, firsts = kernels.attention_tiles(cu, block_rows // 3)
+        seqs, firsts = kernels.attention_tiles(i["cu"], block_rows // 3)
         tiles = (torch.from_numpy(seqs).cuda(), torch.from_numpy(firsts).cuda())
-        out = torch.empty_like(q)
-        kernels.rel_attention(torch, q, kp, vp, rel, sink, proj, out, tiles,
-                              cu_q, used, table, window=window,
+        out = torch.empty_like(i["q"])
+        kernels.rel_attention(torch, i["q"], i["kp"], i["vp"], i["rel"],
+                              i["sink"], i["proj"], out, tiles, i["cu_q"],
+                              i["used"], i["table"], window=window,
                               max_keys=max(u for _, u in shapes),
                               block_rows=block_rows)
-        for index, (rows, keys) in enumerate(shapes):
-            pages = table[index, :pages_per[index]].long()
-            k = kp[pages].reshape(-1, KV_HEADS, DIM)[:keys]
-            v = vp[pages].reshape(-1, KV_HEADS, DIM)[:keys]
-            span = slice(cu[index], cu[index + 1])
-            expected = _dense_attention(q[span], k, v, rel[span], sink[span],
-                                        proj, window)
-            error = (out[span].float() - expected).abs().max().item()
-            assert error < 2e-2, (block_rows, index, error)
+        _assert_dense(inputs, shapes, out, window, block_rows)
+
+
+@pytest.mark.parametrize("window", [0, 1024])
+def test_fa4_prefill_and_answer_steps_match_dense_attention(window):
+    import numpy as np
+
+    from quail.backends.quail.executor.models import inkling2_kernels as kernels
+
+    torch.manual_seed(0)
+    # a long prefill past the window, questions after resident documents
+    # that start mid-tile, and one-token steps FA4 skips
+    shapes = [(1300, 1500), (1, 2100), (40, 700), (6, 1035), (1, 9),
+              (200, 200)]
+    inputs = _paged_inputs(shapes)
+    i = inputs
+    lengths = np.diff(i["cu"])
+    decoded = lengths <= 4
+    seqs, firsts = kernels.prefill_tiles(i["cu"], HEADS // KV_HEADS,
+                                         ~decoded)
+    token_seqs, token_q = kernels.attention_tiles(i["cu"], 1, keep=decoded)
+    token_rows = np.asarray(i["cu"])[token_seqs] + token_q
+
+    def gpu(array):
+        return torch.from_numpy(np.ascontiguousarray(array)).cuda().int()
+
+    out = torch.empty_like(i["q"])
+    kernels.prefill_attention(
+        torch, i["q"], i["kp"], i["vp"], i["rel"], i["sink"], i["proj"], out,
+        (gpu(seqs), gpu(firsts)), i["cu_q"],
+        gpu(np.where(decoded, 0, lengths)), i["used"], i["table"],
+        window=window, max_queries=int(lengths.max()))
+    kernels.decode_attention(
+        torch, i["q"], i["kp"], i["vp"], i["rel"], i["sink"],
+        i["proj"].t().contiguous(), out,
+        (gpu(token_seqs), gpu(token_q), gpu(token_rows)), i["cu_q"],
+        i["used"], i["table"], window=window,
+        max_keys=max(u for _, u in shapes))
+    _assert_dense(inputs, shapes, out, window, "fa4")
 
 
 @pytest.mark.parametrize("window", [0, 1024])
@@ -98,44 +155,19 @@ def test_answer_step_attention_matches_dense_attention(window):
     # (queries, keys): one-token steps over long and short contexts, and a
     # three-token step
     shapes = [(1, 2100), (1, 9), (3, 700), (1, 1500)]
-    pages_per = [-(-used // PAGE) for _, used in shapes]
-    num_pages = sum(pages_per) + 3
-    kp = torch.randn(num_pages, PAGE, KV_HEADS, DIM, device="cuda",
-                     dtype=torch.bfloat16)
-    vp = torch.randn_like(kp)
-    order = torch.randperm(num_pages, device="cuda")
-    table = torch.zeros(len(shapes), max(pages_per), dtype=torch.int32,
-                        device="cuda")
-    start = 0
-    for index, count in enumerate(pages_per):
-        table[index, :count] = order[start:start + count].int()
-        start += count
-    total = sum(rows for rows, _ in shapes)
-    q = torch.randn(total, HEADS, DIM, device="cuda", dtype=torch.bfloat16)
-    q = q / q.float().norm(dim=-1, keepdim=True).to(q.dtype) * 4
-    rel = torch.randn(total, HEADS, RANK, device="cuda", dtype=torch.bfloat16)
-    sink = torch.randn(total, HEADS, device="cuda", dtype=torch.bfloat16)
-    proj = torch.randn(RANK, EXTENT, device="cuda", dtype=torch.bfloat16) * 0.3
-    cu = np.cumsum([0] + [rows for rows, _ in shapes])
-    cu_q = torch.tensor(cu, dtype=torch.int32, device="cuda")
-    used = torch.tensor([u for _, u in shapes], dtype=torch.int32, device="cuda")
+    inputs = _paged_inputs(shapes)
+    i = inputs
+    cu = np.asarray(i["cu"])
     seqs, firsts = kernels.attention_tiles(cu, 1)
     tokens = tuple(torch.from_numpy(a.astype(np.int32)).cuda()
                    for a in (seqs, firsts, cu[seqs] + firsts))
-    out = torch.zeros_like(q)
-    kernels.decode_attention(torch, q, kp, vp, rel, sink,
-                             proj.t().contiguous(), out, tokens, cu_q, used,
-                             table, window=window,
+    out = torch.zeros_like(i["q"])
+    kernels.decode_attention(torch, i["q"], i["kp"], i["vp"], i["rel"],
+                             i["sink"], i["proj"].t().contiguous(), out,
+                             tokens, i["cu_q"], i["used"], i["table"],
+                             window=window,
                              max_keys=max(u for _, u in shapes))
-    for index, (rows, keys) in enumerate(shapes):
-        pages = table[index, :pages_per[index]].long()
-        k = kp[pages].reshape(-1, KV_HEADS, DIM)[:keys]
-        v = vp[pages].reshape(-1, KV_HEADS, DIM)[:keys]
-        span = slice(cu[index], cu[index + 1])
-        expected = _dense_attention(q[span], k, v, rel[span], sink[span],
-                                    proj, window)
-        error = (out[span].float() - expected).abs().max().item()
-        assert error < 2e-2, (index, error)
+    _assert_dense(inputs, shapes, out, window, "decode")
 
 
 def test_the_block_mix_matches_its_definition():

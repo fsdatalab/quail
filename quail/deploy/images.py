@@ -69,6 +69,18 @@ module-name = "_quail_native"
 # the model and device spec files quail.specs reads
 SPEC_DATA = Path(__file__).resolve().parents[1] / "specs" / "data"
 
+# FlashAttention 4 at a pinned commit, patched so its SM100 forward
+# kernel adds Inkling's relative bias from tiles a Triton kernel writes
+# (prefill_attention in models/inkling2_kernels.py)
+FA4_REPOSITORY = "https://github.com/Dao-AILab/flash-attention.git"
+FA4_COMMIT = "cc7b69d4b67145f3822bd75344e3877eccd3c34e"
+FA4_PATCH = Path(__file__).parent / "fa4_inkling.patch"
+FA4_SOURCE = "/opt/flash-attention"
+# FA4's dependencies the locked environment lacks; its CuTe DSL and
+# torch come from the lock
+FA4_PACKAGES = ("quack-kernels>=0.5.3", "apache-tvm-ffi>=0.1.11,<0.2",
+                "torch-c-dlpack-ext", "einops")
+
 # local variables copied into the image when set
 FORWARDED_ENV = ("QUAIL_GDN_PREFILL",)
 
@@ -184,6 +196,19 @@ def _with_native_planner(image: modal.Image) -> modal.Image:
                 "python -c 'import _quail_native; _quail_native.LOGICAL_RULES'"))
 
 
+def _with_fa4(image: modal.Image) -> modal.Image:
+    """Install the patched FlashAttention 4 without touching locked packages."""
+    return (image.uv_pip_install(*FA4_PACKAGES, uv_version=UV_VERSION)
+            .add_local_file(FA4_PATCH, f"{FA4_SOURCE}.patch", copy=True)
+            .run_commands(
+                f"git clone -q {FA4_REPOSITORY} {FA4_SOURCE} && cd {FA4_SOURCE}"
+                f" && git checkout -q {FA4_COMMIT}"
+                f" && git apply {FA4_SOURCE}.patch",
+                f"cd {FA4_SOURCE}/flash_attn/cute && "
+                "SETUPTOOLS_SCM_PRETEND_VERSION=4.0.0 /.uv/uv pip install "
+                "--python $(command -v python) --no-deps ."))
+
+
 def gpu_image(*local_dirs: tuple[str, str],
               packages: tuple[str, ...] = (),
               commands: tuple[str, ...] = ()) -> modal.Image:
@@ -200,7 +225,7 @@ def gpu_image(*local_dirs: tuple[str, str],
     image = (_cuda_base().uv_sync(groups=["dev"], uv_version=UV_VERSION)
              .add_local_dir(VLLM_PLUGIN_DIR, "/opt/quail-vllm-plugin", copy=True)
              .uv_pip_install("/opt/quail-vllm-plugin", uv_version=UV_VERSION))
-    image = _with_native_planner(image)
+    image = _with_fa4(_with_native_planner(image))
     if packages:
         image = image.uv_pip_install(*packages, uv_version=UV_VERSION)
     if commands:

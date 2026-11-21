@@ -22,6 +22,9 @@ the pass computes what the reference computes up to accumulation order.
 - rel_attention: causal paged attention with a learned relative bias
   over the last 1,024 distances, a per-token sink logit, and an
   optional sliding window.
+- prefill_attention: the same attention of longer sequences on
+  FlashAttention 4, patched to read the bias tiles bias_tiles writes,
+  then the sink's share of each row (sink_gate).
 - gate_attention: the sigmoid output gate of every head.
 - route: each token's top experts and their normalized scores.
 - quantize_tokens, swiglu_quantize, combine: the expert path's
@@ -37,6 +40,8 @@ import math
 ZERO_TAP = -1
 
 _KERNELS = {}
+# the FA4 score_mod of each KV head count
+_MARKERS = {}
 
 
 def _pow2(n: int) -> int:
@@ -1259,7 +1264,69 @@ def _kernels() -> dict:
         tl.store(state_ptr + slot * stride_slot + j * stride_tap + cols, value,
                  mask=mask)
 
+    @triton.jit
+    def bias_tiles(rel_ptr, stride_r0, stride_r1, proj_ptr, out_ptr,
+                   tile_seq_ptr, first_tile_ptr, cu_q_ptr, used_ptr,
+                   GROUP: tl.constexpr, KV_HEADS: tl.constexpr,
+                   R: tl.constexpr, EXTENT: tl.constexpr, BM: tl.constexpr,
+                   BN: tl.constexpr, SPAN: tl.constexpr, WCH: tl.constexpr):
+        # one FA4 query tile of one KV head: its rows' bias over the key
+        # tiles from its first near tile, column c at key
+        # near_start + c, the layout the patched FA4 kernel reads
+        tile = tl.program_id(0)
+        kv_head = tl.program_id(1)
+        seq = tl.load(tile_seq_ptr + tile)
+        first_row = (tile - tl.load(first_tile_ptr + seq)) * BM
+        q_start = tl.load(cu_q_ptr + seq)
+        q_len = tl.load(cu_q_ptr + seq + 1) - q_start
+        shift = tl.load(used_ptr + seq) - q_len
+        offs_m = tl.arange(0, BM)
+        row = first_row + offs_m
+        token = row // GROUP
+        ok = token < q_len
+        head = kv_head * GROUP + row % GROUP
+        qpos = token + shift
+        qmin = first_row // GROUP + shift
+        qmax = tl.minimum((first_row + BM - 1) // GROUP, q_len - 1) + shift
+        near_start = tl.maximum(qmin - (EXTENT - 1), 0) // BN * BN
+        offs_r = tl.arange(0, R)
+        rel = tl.load(rel_ptr + (q_start + token).to(tl.int64)[:, None]
+                      * stride_r0 + head[:, None] * stride_r1
+                      + offs_r[None, :], mask=ok[:, None], other=0.0)
+        out_row = out_ptr + ((tile * KV_HEADS + kv_head).to(tl.int64) * BM
+                             + offs_m) * SPAN
+        offs_c = tl.arange(0, WCH)
+        for c0 in range(0, qmax - near_start + 1, WCH):
+            d = c0 + offs_c
+            part = tl.load(proj_ptr + offs_r[:, None] * EXTENT + d[None, :],
+                           mask=(d < EXTENT)[None, :], other=0.0)
+            values = tl.dot(rel, part).to(tl.bfloat16)
+            cols = qpos[:, None] - d[None, :] - near_start
+            tl.store(out_row[:, None] + cols, values,
+                     mask=(cols >= 0) & (cols < SPAN) & ok[:, None])
+
+    @triton.jit
+    def sink_gate(o_ptr, lse_ptr, stride_lse, sink_ptr, stride_s0, out_ptr,
+                  stride_o0, stride_o1, HEADS: tl.constexpr,
+                  HP: tl.constexpr, D: tl.constexpr):
+        # the sink's share of each head's softmax mass: o * sigmoid(lse - sink)
+        row = tl.program_id(0).to(tl.int64)
+        heads = tl.arange(0, HP)
+        ok = heads < HEADS
+        lse = tl.load(lse_ptr + heads * stride_lse + row, mask=ok, other=0.0)
+        sink = tl.load(sink_ptr + row * stride_s0 + heads, mask=ok,
+                       other=0.0).to(tl.float32)
+        keep = tl.sigmoid(lse - sink)
+        offs_d = tl.arange(0, D)
+        o = tl.load(o_ptr + (row * HEADS + heads)[:, None] * D
+                    + offs_d[None, :], mask=ok[:, None], other=0.0)
+        tl.store(out_ptr + row * stride_o0 + heads[:, None] * stride_o1
+                 + offs_d[None, :],
+                 (o.to(tl.float32) * keep[:, None]).to(tl.bfloat16),
+                 mask=ok[:, None])
+
     _KERNELS.update(
+        bias_tiles=bias_tiles, sink_gate=sink_gate,
         scatter_state=scatter_state,
         mix=mix, gate_out=gate_out,
         rms_norm=rms_norm, short_conv=short_conv, kv_conv=kv_conv,
@@ -1597,6 +1664,103 @@ def rel_attention(torch, q3, kp, vp, rel, sink, proj, out, tiles, cu_q, used,
         _kernels()["merge_splits"][(rows, heads)](
             part_acc, part_ml, out, out.stride(0), out.stride(1), splits,
             HEADS=heads, D=dim, MAX_SPLITS=MAX_SPLITS, num_warps=4)
+    return out
+
+
+# FA4's query and key tile, and the arena page
+FA4_TILE = 128
+# key tiles the patched FA4 kernel reads bias for: the bias's 1,024
+# distances, a query tile's 43 tokens, and alignment
+FA4_BIAS_TILES = 10
+
+
+def prefill_tiles(cu_q_host, group, keep):
+    """FA4 query tiles: each tile's sequence and each sequence's first tile.
+
+    A tile holds FA4_TILE packed rows, three heads of each token; keep
+    marks the sequences FA4 runs, and the rest get no tiles.
+    """
+    import numpy as np
+
+    lengths = np.where(keep, np.diff(np.asarray(cu_q_host, dtype=np.int64)), 0)
+    counts = -(-lengths * group // FA4_TILE)
+    first = np.concatenate([[0], np.cumsum(counts)[:-1]]).astype(np.int32)
+    seqs = np.repeat(np.arange(len(lengths), dtype=np.int32), counts)
+    return seqs, first
+
+
+def _bias_marker(kv_heads):
+    """The score_mod that turns on the patched FA4 kernel's bias tiles."""
+    marker = _MARKERS.get(kv_heads)
+    if marker is None:
+        import cutlass.cute as cute
+
+        @cute.jit
+        def marker(scores, _batch, _head, _q_index, _kv_index, _seqlen,
+                   _aux):
+            return scores
+
+        marker.inkling_relative_bias = True
+        marker.inkling_kv_heads = kv_heads
+        _MARKERS[kv_heads] = marker
+    return marker
+
+
+def prefill_attention(torch, q3, kp, vp, rel, sink, proj, out, tiles, cu_q,
+                      used_q, used, table, *, window, max_queries):
+    """Causal paged attention of query tiles on FA4, with the relative bias.
+
+    Writes every row of out; rows of sequences FA4 skips hold garbage
+    until decode_attention writes them.
+
+    Args:
+        torch: The torch module.
+        q3: (rows, heads, dim) queries.
+        kp: (pages, FA4_TILE, KV heads, dim) arena key pool.
+        vp: The arena value pool, shaped as kp.
+        rel: (rows, heads, rank) relative states.
+        sink: (rows, heads) view of the sink logits.
+        proj: (rank, extent) bf16 bias profiles.
+        out: (rows, heads, dim) output.
+        tiles: (sequence per tile, first tile per sequence) on the GPU,
+            from prefill_tiles.
+        cu_q: Each sequence's query bounds over the rows.
+        used_q: Queries per sequence FA4 runs, 0 for the rest.
+        used: Keys per sequence, its queries' included.
+        table: Each sequence's arena pages.
+        window: Keys each row sees, or 0 for every earlier key.
+        max_queries: The most queries any sequence FA4 runs holds.
+    """
+    from flash_attn.cute.interface import flash_attn_varlen_func
+
+    rows, heads, dim = q3.shape
+    kv_heads = kp.shape[2]
+    group = heads // kv_heads
+    rank, extent = proj.shape
+    num_tiles = tiles[0].numel()
+    if num_tiles == 0:
+        return out
+    span = FA4_BIAS_TILES * FA4_TILE
+    bias = torch.empty(num_tiles * kv_heads * FA4_TILE, span,
+                       dtype=torch.bfloat16, device=q3.device)
+    _kernels()["bias_tiles"][(num_tiles, kv_heads)](
+        rel, rel.stride(0), rel.stride(1), proj, bias, tiles[0], tiles[1],
+        cu_q, used, GROUP=group, KV_HEADS=kv_heads, R=rank, EXTENT=extent,
+        BM=FA4_TILE, BN=FA4_TILE, SPAN=span, WCH=32, num_warps=4)
+    # FA4 builds the bias's TMA descriptor from these
+    bias.__assumed_align__ = 16
+    bias.__leading_dim__ = 1
+    attended, lse = flash_attn_varlen_func(
+        q3, kp, vp, cu_seqlens_q=cu_q, max_seqlen_q=max_queries,
+        seqused_q=used_q, seqused_k=used, page_table=table,
+        softmax_scale=dim ** -0.5, causal=True,
+        window_size=(window - 1 if window else None, 0),
+        score_mod=_bias_marker(kv_heads), aux_tensors=[bias, tiles[1]],
+        return_lse=True, pack_gqa=True)
+    _kernels()["sink_gate"][(rows,)](
+        attended, lse, lse.stride(0), sink, sink.stride(0), out,
+        out.stride(0), out.stride(1), HEADS=heads, HP=_pow2(heads), D=dim,
+        num_warps=4)
     return out
 
 

@@ -1,0 +1,384 @@
+diff --git a/flash_attn/cute/flash_fwd_sm100.py b/flash_attn/cute/flash_fwd_sm100.py
+index 8da73547..10e10162 100644
+--- a/flash_attn/cute/flash_fwd_sm100.py
++++ b/flash_attn/cute/flash_fwd_sm100.py
+@@ -76,6 +76,7 @@ from flash_attn.cute.tile_scheduler import (
+ from flash_attn.cute.fa_logging import fa_log, fa_printf
+ from flash_attn.cute.utils import smid
+ from flash_attn.cute.utils import AuxData
++from flash_attn.cute import inkling_bias
+ from flash_attn.cute.config import (
+     SM100_LAUNCH_REGISTERS,
+     SM100_MAX_KV_STAGE,
+@@ -280,6 +281,9 @@ class FlashAttentionForwardSm100:
+             not self.is_split_kv or self.head_dim_v_padded < 192 or self.chunked_split_epi
+         ), "SplitKV is not supported for hdim_v >= 192 except 256"
+         self.score_mod = score_mod
++        # Inkling 2's relative bias: a marked score_mod, done in-kernel
++        self.inkling_bias = bool(getattr(score_mod, "inkling_relative_bias", False))
++        self.inkling_kv_heads = int(getattr(score_mod, "inkling_kv_heads", 0))
+         self.mask_mod = mask_mod
+         self.score_vec_size: cutlass.Constexpr = getattr(
+             score_mod, "__vec_size__", 1 if cutlass.const_expr(has_aux_tensors) else 2
+@@ -320,6 +324,10 @@ class FlashAttentionForwardSm100:
+         # checks it fits, and __call__ asserts the resulting SharedStorage does.
+         self.overlap_sO_sQ = config.overlap_sO_sQ
+         self.kv_stage = config.kv_stage
++        if self.inkling_bias:
++            # the q_stage bias slots take the room of q_stage KV stages
++            assert config.kv_stage - self.q_stage >= 2, config
++            self.kv_stage = config.kv_stage - self.q_stage
+         assert 2 <= self.kv_stage <= SM100_MAX_KV_STAGE, f"kv_stage={self.kv_stage}"
+         self.s_stage = 2
+         assert self.s_stage >= self.q_stage
+@@ -948,6 +956,16 @@ class FlashAttentionForwardSm100:
+         self.track_unquantized_sum = self.pv_blockscaled and mLSE is not None
+         self.num_stats = 3 if self.track_unquantized_sum else 2
+ 
++        inkling_slots = cute.cosize(sO_layout) if const_expr(self.inkling_bias) else 0
++        inkling_mbars = 2 * self.q_stage if const_expr(self.inkling_bias) else 0
++        inkling_counts = 2 * self.m_block_size if const_expr(self.inkling_bias) else 0
++        tma_atom_inkling, mInkling = None, None
++        if const_expr(self.inkling_bias):
++            tma_atom_inkling, mInkling = cpasync.make_tiled_tma_atom(
++                cpasync.CopyBulkTensorTileG2SOp(), aux_data.tensors[0],
++                cute.select(sO_layout, mode=[0, 1]), (self.m_block_size, self.n_block_size),
++            )
++
+         @cute.struct
+         class SharedStorage:
+             # m_barriers for pipelines
+@@ -976,6 +994,9 @@ class FlashAttentionForwardSm100:
+             # (CLC HW response, or work_info written by dynamic persistent producer).
+             sched_mbar_ptr: cute.struct.MemRange[Int64, sched_mbar_size]
+             sched_response: cute.struct.MemRange[Int32, sched_response_size]
++            # Inkling bias barriers and per-thread slot counts, in the same padding
++            mbar_inkling: cute.struct.MemRange[Int64, inkling_mbars]
++            sInklingCount: cute.struct.MemRange[cutlass.Uint8, inkling_counts]
+             # Large TMA buffers with 1024-byte alignment
+             sO: cute.struct.Align[
+                 cute.struct.MemRange[self.o_dtype, sO_size], self.buffer_align_bytes
+@@ -991,6 +1012,9 @@ class FlashAttentionForwardSm100:
+             sSFQ: cute.struct.Align[cute.struct.MemRange[cutlass.Float8E8M0FNU, sSFQ_size], 128]
+             sSFK: cute.struct.Align[cute.struct.MemRange[cutlass.Float8E8M0FNU, sSFK_size], 128]
+             sSFP: cute.struct.Align[cute.struct.MemRange[cutlass.Float8E8M0FNU, sfp_size], 128]
++            sInklingBias: cute.struct.Align[
++                cute.struct.MemRange[self.o_dtype, inkling_slots], self.buffer_align_bytes
++            ]
+ 
+         self.shared_storage = SharedStorage
+         smem_capacity = sm100_smem_capacity(self.arch.major * 10 + self.arch.minor)
+@@ -1063,6 +1087,7 @@ class FlashAttentionForwardSm100:
+             mSFQ, mSFK, tma_atom_SFQ, tma_atom_SFK, sSFQ_layout, sSFK_layout,
+             mSFV, tma_atom_SFV, sSFP_layout, sSFV_layout,
+             mV_bf16, tma_atom_V_bf16, sV_bf16_layout, tP_bf16_layout, tiled_mma_pv_bf16,
++            tma_atom_inkling, mInkling,
+         ).launch(
+             grid=grid_dim,
+             block=[self.threads_per_cta, 1, 1],
+@@ -1143,6 +1168,8 @@ class FlashAttentionForwardSm100:
+         sV_bf16_layout: cute.ComposedLayout | None = None,
+         tP_bf16_layout: cute.ComposedLayout | None = None,
+         tiled_mma_pv_bf16: cute.TiledMma | None = None,
++        tma_atom_inkling: cute.CopyAtom | None = None,
++        mInkling: cute.Tensor | None = None,
+     ):
+         """The device kernel implementation of the Fused Multi-Head Attention.
+ 
+@@ -1361,6 +1388,26 @@ class FlashAttentionForwardSm100:
+             )
+ 
+ 
++        inkling = None
++        if const_expr(self.inkling_bias):
++            # one bias slot per Q stage, filled by the load warp, read by its softmax WG
++            inkling_pipes = cutlass_pipeline.PipelineTmaAsync.create(
++                barrier_storage=storage.mbar_inkling.data_ptr(),
++                num_stages=self.q_stage,
++                producer_group=tma_warp,
++                consumer_group=ThreadCooperativeGroup(len(self.softmax0_warp_ids)),
++                tx_count=self.m_block_size * self.n_block_size * self.o_dtype.width // 8,
++                defer_sync=True,
++            )
++            inkling = (
++                storage.sInklingBias.get_tensor(sO_layout.outer, swizzle=sO_layout.inner),
++                inkling_pipes,
++                storage.sInklingCount.get_tensor(cute.make_layout(2 * self.m_block_size)),
++                aux_data.tensors[1],
++                tma_atom_inkling,
++                mInkling,
++            )
++
+         # Cluster arrive after barrier init
+         pipeline_init_arrive(cluster_shape_mn=cta_layout_vmnk, is_relaxed=True)
+ 
+@@ -1567,6 +1614,7 @@ class FlashAttentionForwardSm100:
+                 mSFV=mSFV, sSFV=sSFV, tma_atom_SFV=tma_atom_SFV,
+                 mV_bf16=mV_bf16, sV_bf16=sV_bf16, tma_atom_V_bf16=tma_atom_V_bf16,
+                 thr_mma_pv_bf16=thr_mma_pv_bf16,
++                inkling=inkling,
+             )
+ 
+         # ///////////////////////////////////////////////////////////////////////////////
+@@ -1665,6 +1713,7 @@ class FlashAttentionForwardSm100:
+                 head_divmod=head_divmod,
+                 blocksparse_tensors=blocksparse_tensors,
+                 tile_scheduler=tile_scheduler,
++                inkling=inkling,
+             )
+ 
+             if const_expr(not self.s0_s1_barrier):
+@@ -1760,8 +1809,10 @@ class FlashAttentionForwardSm100:
+         sV_bf16: cute.Tensor | None = None,
+         tma_atom_V_bf16: cute.CopyAtom | None = None,
+         thr_mma_pv_bf16: cute.ThrMma | None = None,
++        inkling=None,
+     ):
+         num_load_threads = len(self.load_warp_ids) * cute.arch.WARP_SIZE
++        inkling_count0, inkling_count1 = Int32(0), Int32(0)
+         tidx = cute.arch.thread_idx()[0] % num_load_threads
+         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+         load_epi_consumer_state = pipeline.make_pipeline_state(
+@@ -2006,6 +2057,11 @@ class FlashAttentionForwardSm100:
+                         paged_kv_manager.load_page_table(n_block_first)
+                     if issue_kv_for_this_warp:
+                         load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # K0
++                        if const_expr(self.inkling_bias):
++                            inkling_count0, inkling_count1 = self._inkling_issue(
++                                inkling, inkling_count0, inkling_count1, n_block_max - 1,
++                                work_m, batch_idx, head_idx_kv, seqlen,
++                            )
+                     # load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx, extra_tx_count=self.tma_copy_bytes["Q"])  # K0
+                     if issue_q_for_this_warp:
+                         load_Q(block=0, stage=0)
+@@ -2036,6 +2092,11 @@ class FlashAttentionForwardSm100:
+                         if issue_kv_for_this_warp:
+                             load_K(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Ki
+                             kv_producer_state.advance()
++                            if const_expr(self.inkling_bias):
++                                inkling_count0, inkling_count1 = self._inkling_issue(
++                                    inkling, inkling_count0, inkling_count1, n_block,
++                                    work_m, batch_idx, head_idx_kv, seqlen,
++                                )
+                             if const_expr(self.use_s_ping_pong):
+                                 # V lags K by one block to match the MMA order QK(i+1) -> PV(i)
+                                 page_idx_v = (
+@@ -2623,6 +2684,7 @@ class FlashAttentionForwardSm100:
+         head_divmod=None,
+         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+         tile_scheduler=None,
++        inkling=None,
+     ):
+         """Compute softmax on attention scores from QK matrix multiplication.
+ 
+@@ -2642,6 +2704,9 @@ class FlashAttentionForwardSm100:
+         )
+         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
+         aux_tensors = aux_data.tensors
++        if const_expr(self.inkling_bias):
++            # each thread's parity of its stage's bias tiles: the slot's phase
++            inkling[2][stage * self.m_block_size + tidx] = cutlass.Uint8(0)
+ 
+         cta_qk_tiler = (self.mma_tiler_qk[0] // thr_mma_qk.thr_id.shape, self.mma_tiler_qk[1])
+         tSAcc = tStS[(None, None), 0, 0, stage]  # (128, 128)
+@@ -2816,6 +2881,7 @@ class FlashAttentionForwardSm100:
+                 aux_data=aux_data,
+                 fastdiv_mods=fastdiv_mods,
+                 head_divmod=head_divmod,
++                inkling=inkling,
+             )
+ 
+             softmax_step_masked = softmax_step
+@@ -3021,6 +3087,7 @@ class FlashAttentionForwardSm100:
+         mask_fn: Optional[Callable] = None,
+         is_first: bool = False,
+         p_dtype: cutlass.Constexpr = None,
++        inkling=None,
+     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
+         """Update online-softmax statistics and publish P for one KV block.
+ 
+@@ -3077,6 +3144,8 @@ class FlashAttentionForwardSm100:
+                 aux_data,
+                 fastdiv_mods,
+                 head_divmod,
++                stage=stage,
++                inkling=inkling,
+             )
+ 
+         if const_expr(mask_fn is not None):
+@@ -4149,8 +4218,79 @@ class FlashAttentionForwardSm100:
+         aux_data: AuxData = AuxData(),
+         fastdiv_mods=(None, None),
+         head_divmod=None,
++        stage=0,
++        inkling=None,
+     ):
+         """Apply score modification for SM100 (constant q_idx)."""
++        if const_expr(self.inkling_bias):
++            sBias, pipes, counts, first_tiles, _, _ = inkling
++            near, _, _ = inkling_bias.tile_geometry(
++                m_block, n_block, seqlen, first_tiles[batch_idx], head_idx,
++                self.m_block_size, self.n_block_size, self.qhead_per_kvhead,
++                self.inkling_kv_heads,
++            )
++            slot = stage * self.m_block_size + thr_tmem_load.thr_idx
++            count = Int32(counts[slot])
++            if near:
++                inkling_bias.add_tile(
++                    tSrS_t2r, thr_mma_qk, thr_tmem_load, sBias[None, None, stage], pipes,
++                    stage, count, softmax.softmax_scale, self.q_stage,
++                )
++                counts[slot] = cutlass.Uint8(count ^ 1)
++            else:
++                for i in cutlass.range_constexpr(cute.size(tSrS_t2r)):
++                    tSrS_t2r[i] = tSrS_t2r[i] * softmax.softmax_scale
++        else:
++            self._apply_score_mod(
++                tSrS_t2r, thr_tmem_load, thr_mma_qk, batch_idx, head_idx, m_block,
++                n_block, softmax, seqlen, aux_data, fastdiv_mods, head_divmod,
++            )
++
++    @cute.jit
++    def _inkling_issue(self, inkling, count0, count1, n_block, work_m, batch_idx, kv_head,
++                       seqlen):
++        """Issue each Q stage's bias tile for n_block; return the slots' use counts."""
++        sBias, pipes, _, first_tiles, tma_atom, mBias = inkling
++        near0, row0, col0 = inkling_bias.tile_geometry(
++            self._q_block(work_m, 0), n_block, seqlen, first_tiles[batch_idx], kv_head,
++            self.m_block_size, self.n_block_size, self.qhead_per_kvhead, self.inkling_kv_heads,
++        )
++        if near0:
++            inkling_bias.issue_tile(
++                tma_atom, mBias, sBias[None, None, 0], pipes, 0, count0, row0, col0,
++                self.m_block_size, self.n_block_size, self.q_stage,
++            )
++            count0 = count0 + 1
++        if const_expr(self.q_stage == 2):
++            near1, row1, col1 = inkling_bias.tile_geometry(
++                self._q_block(work_m, 1), n_block, seqlen, first_tiles[batch_idx], kv_head,
++                self.m_block_size, self.n_block_size, self.qhead_per_kvhead,
++                self.inkling_kv_heads,
++            )
++            if near1:
++                inkling_bias.issue_tile(
++                    tma_atom, mBias, sBias[None, None, 1], pipes, 1, count1, row1, col1,
++                    self.m_block_size, self.n_block_size, self.q_stage,
++                )
++                count1 = count1 + 1
++        return count0, count1
++
++    @cute.jit
++    def _apply_score_mod(
++        self,
++        tSrS_t2r,
++        thr_tmem_load,
++        thr_mma_qk,
++        batch_idx,
++        head_idx,
++        m_block,
++        n_block,
++        softmax,
++        seqlen: SeqlenInfoQK,
++        aux_data: AuxData = AuxData(),
++        fastdiv_mods=(None, None),
++        head_divmod=None,
++    ):
+         # Prepare index tensor with extra partition
+         cS = cute.make_identity_tensor((self.m_block_size, self.n_block_size))
+         cS = cute.domain_offset((m_block * self.m_block_size, n_block * self.n_block_size), cS)
+diff --git a/flash_attn/cute/inkling_bias.py b/flash_attn/cute/inkling_bias.py
+new file mode 100644
+index 00000000..001460a5
+--- /dev/null
++++ b/flash_attn/cute/inkling_bias.py
+@@ -0,0 +1,68 @@
++# Copyright (c) 2026, Quail authors. BSD 3-Clause, as the rest of this package.
++"""Inkling 2's relative attention bias in the SM100 forward kernel.
++
++Every score gets rel[q, head] . proj[:, q - k], zero past EXTENT
++distances. A pre-pass writes each 128-row query tile's bias over its
++near keys, row-aligned, to a global scratch of MAX_TILES key tiles per
++query tile: row (first_tile[seq] + m_block) * KV_HEADS + kv_head in
++units of 128 rows, key tile n at column tile n - n_near. The load warp
++copies a near key tile's bias with TMA into its query stage's
++shared-memory slot, and the softmax warps add it as they scale S.
++"""
++
++import cutlass
++import cutlass.cute as cute
++from cutlass import Float32, Int32, const_expr
++from cutlass.cute.nvgpu import cpasync
++from quack import copy_utils
++
++EXTENT = 1024
++MAX_TILES = 10
++
++
++@cute.jit
++def tile_geometry(m_block, n_block, seqlen, first_tile, kv_head,
++                  M_BLOCK: cutlass.Constexpr, N_BLOCK: cutlass.Constexpr,
++                  GROUP: cutlass.Constexpr, KV_HEADS: cutlass.Constexpr):
++    """(whether the tile has bias, scratch row tile, scratch column tile)."""
++    first_row = m_block * M_BLOCK
++    shift = seqlen.seqlen_k - seqlen.seqlen_q
++    qmin = first_row // GROUP + shift
++    qmax = cutlass.min((first_row + M_BLOCK - 1) // GROUP,
++                       seqlen.seqlen_q - 1) + shift
++    n_near = cutlass.max(qmin - (EXTENT - 1), 0) // N_BLOCK
++    near = ((first_row < seqlen.seqlen_q * GROUP) & (n_block >= n_near)
++            & (n_block * N_BLOCK <= qmax))
++    row_tile = (first_tile + m_block) * KV_HEADS + kv_head
++    return near, row_tile, n_block - n_near
++
++
++@cute.jit
++def issue_tile(tma_atom, mBias, sBias_stage, pipe, slot, count, row_tile,
++               col_tile, M_BLOCK: cutlass.Constexpr, N_BLOCK: cutlass.Constexpr,
++               SLOTS: cutlass.Constexpr):
++    """TMA one bias tile into a stage's slot; count is the slot's uses."""
++    state = cutlass.pipeline.PipelineState(SLOTS, count, Int32(slot),
++                                           (count & 1) ^ 1)
++    gBias = cute.local_tile(mBias, (M_BLOCK, N_BLOCK), (row_tile, col_tile))
++    tBsB, tBgB = cpasync.tma_partition(
++        tma_atom, 0, cute.make_layout(1), cute.group_modes(sBias_stage, 0, 2),
++        cute.group_modes(gBias, 0, 2))
++    pipe.producer_acquire(state)
++    cute.copy(tma_atom, tBgB, tBsB, tma_bar_ptr=pipe.producer_get_barrier(state))
++
++
++@cute.jit
++def add_tile(tSrS, thr_mma_qk, thr_tmem_load, sBias_stage, pipe, slot, count,
++             scale, SLOTS: cutlass.Constexpr):
++    """Wait for a stage's bias tile, add the thread's row, release it."""
++    state = cutlass.pipeline.PipelineState(SLOTS, count, Int32(slot), count & 1)
++    tSsB = thr_mma_qk.get_slice(0).partition_C(sBias_stage)[(None, None), 0, 0]
++    tSsB_t2r = copy_utils.partition_D_position_independent(thr_tmem_load, tSsB)
++    bias = cute.make_rmem_tensor(tSsB_t2r.shape, cutlass.BFloat16)
++    pipe.consumer_wait(state)
++    cute.autovec_copy(tSsB_t2r, bias)
++    for i in cutlass.range_constexpr(cute.size(tSrS)):
++        tSrS[i] = tSrS[i] * scale + bias[i].to(Float32)
++    cute.arch.sync_warp()
++    pipe.consumer_release(state)
+diff --git a/flash_attn/cute/interface.py b/flash_attn/cute/interface.py
+index b097c807..55d19445 100644
+--- a/flash_attn/cute/interface.py
++++ b/flash_attn/cute/interface.py
+@@ -21,6 +21,7 @@ from quack.compile_utils import make_fake_tensor as fake_tensor
+ from flash_attn.cute.cache_utils import get_jit_cache
+ from flash_attn.cute.testing import is_fake_mode
+ from flash_attn.cute.config import (
++    derive_fwd_config,
+     BwdConfig,
+     BwdHeuristicInputs,
+     FwdConfig,
+@@ -951,6 +952,9 @@ def _flash_attn_fwd(
+             has_descale=has_descale,
+         ),
+     )
++    if getattr(score_mod, "inkling_relative_bias", False) and isinstance(config, FwdConfig):
++        # Inkling's bias slots need the room of an O buffer aliased with Q
++        config = derive_fwd_config(config, inputs, overlap_sO_sQ=True)
+     # The config is chosen; from here on the window only reaches the kernels, so use the clamped sides.
+     window_size_left, window_size_right = kernel_window_left, kernel_window_right
+     num_splits = config.num_splits

@@ -49,6 +49,10 @@ FUSED_MIN_TOKENS = 4096
 # a sequence with at most this many new queries in a pass runs its
 # attention one token per program
 DECODE_MAX_QUERIES = 4
+# a chunk whose longer sequences hold at most this many queries runs them
+# in query tiles of SHORT_BLOCK_ROWS rows; a longer one, on FA4
+SHORT_MAX_QUERIES = 5
+SHORT_BLOCK_ROWS = 16
 STATE_CHANNELS = {"k": (0, 1024), "v": (1024, 2048), "attn": (2048, 4352),
                   "mlp": (4352, 6656)}
 # the message gates of a loop layer, by checkpoint controller name
@@ -839,16 +843,23 @@ class Inkling2Pipeline(ModelPipeline):
         kp, vp = self.arena.paged_kv(index)
         if not isinstance(buffers, PiecewiseBuffers):
             buffers.attn = torch.empty_like(buffers.q3)
-        prefill = plan["block_rows"] >= 64
         window = self.window if layer.is_local else 0
         args = (unified["cu_q"], unified["used"], unified["table"])
-        # the query tiles first: their split merge writes every row
-        kernels.rel_attention(
-            torch, buffers.q3[:n], kp, vp, buffers.rel[:n], buffers.sink[:n],
-            layer.rel_proj, buffers.attn[:n], plan["tiles"], *args,
-            window=window, max_keys=unified["max_used"],
-            block_rows=plan["block_rows"], block_keys=64 if prefill else 32,
-            num_warps=8 if prefill else 4, num_stages=3 if prefill else 2)
+        # the query tiles first: they write every row
+        if plan["prefill"] is not None:
+            kernels.prefill_attention(
+                torch, buffers.q3[:n], kp, vp, buffers.rel[:n],
+                buffers.sink[:n], layer.rel_proj, buffers.attn[:n],
+                plan["prefill"], unified["cu_q"], plan["used_q"],
+                unified["used"], unified["table"], window=window,
+                max_queries=plan["max_queries"])
+        else:
+            kernels.rel_attention(
+                torch, buffers.q3[:n], kp, vp, buffers.rel[:n],
+                buffers.sink[:n], layer.rel_proj, buffers.attn[:n],
+                plan["tiles"], *args, window=window,
+                max_keys=unified["max_used"], block_rows=SHORT_BLOCK_ROWS,
+                block_keys=32, num_warps=4, num_stages=2)
         kernels.decode_attention(
             torch, buffers.q3[:n], kp, vp, buffers.rel[:n], buffers.sink[:n],
             layer.rel_proj_t, buffers.attn[:n], plan["tokens"], *args,
@@ -891,12 +902,14 @@ class Inkling2Pipeline(ModelPipeline):
         cu = np.asarray(unified["cu_q_host"], dtype=np.int64)
         lengths = np.diff(cu)
         # answer steps' tokens run one per program; longer sequences, in
-        # query tiles: 16 rows when every one is short, else 64
+        # 16-row query tiles when every one is short, else on FA4
         decoded = lengths <= DECODE_MAX_QUERIES
         longest = int(lengths[~decoded].max()) if (~decoded).any() else 0
-        block_rows = 16 if longest <= 5 else 64
-        seqs, firsts = kernels.attention_tiles(cu, block_rows // group,
-                                               keep=~decoded)
+        on_fa4 = longest > SHORT_MAX_QUERIES
+        seqs, firsts = kernels.attention_tiles(
+            cu, SHORT_BLOCK_ROWS // group, keep=~decoded & (not on_fa4))
+        prefill_seqs, prefill_firsts = kernels.prefill_tiles(
+            cu, group, ~decoded)
         token_seqs, token_q = kernels.attention_tiles(cu, 1, keep=decoded)
         token_rows = cu[token_seqs] + token_q
 
@@ -910,7 +923,11 @@ class Inkling2Pipeline(ModelPipeline):
                     tiles=(gpu(seqs, torch.int32), gpu(firsts, torch.int32)),
                     tokens=(gpu(token_seqs, torch.int32), gpu(token_q, torch.int32),
                             gpu(token_rows, torch.int32)),
-                    block_rows=block_rows)
+                    prefill=((gpu(prefill_seqs, torch.int32),
+                              gpu(prefill_firsts, torch.int32))
+                             if on_fa4 else None),
+                    used_q=gpu(np.where(decoded, 0, lengths), torch.int32),
+                    max_queries=longest)
         meta["inkling_plan"] = plan
         return plan
 
