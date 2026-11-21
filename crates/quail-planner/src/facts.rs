@@ -17,10 +17,10 @@ use crate::plan_statistics::plan_prompts;
 ///   name without the alias, value columns, and the column names of
 ///   its table's schema;
 /// - `value_columns`: alias -> the columns the executor reads by
-///   document id: join equalities, regular predicates, tests of labels
-///   and answers on the table's own columns, DISTINCT stop keys, and
-///   the guards of column operators and AI filters and the
-///   alternatives of AI filters;
+///   document id: join equalities and filters, regular predicates,
+///   tests of labels and answers on the table's own columns, DISTINCT
+///   stop keys, and the guards of column operators and AI filters and
+///   the alternatives of AI filters;
 /// - `stop_keys`: alias -> its DISTINCT stop key;
 /// - `join_conditions`: for each join with equalities, its written
 ///   position, its two aliases, and each equality's sides in that
@@ -44,6 +44,9 @@ pub fn region_facts(found: &Operators) -> Result<Value, crate::error::CompileErr
             {
                 add(&reference.alias, &reference.column);
             }
+        }
+        for reference in join.filter.iter().flat_map(column_references) {
+            add(&reference.alias, &reference.column);
         }
     }
     let schemas: BTreeMap<&str, Vec<String>> = found

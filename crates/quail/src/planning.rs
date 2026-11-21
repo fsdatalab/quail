@@ -592,7 +592,8 @@ fn document_values(
 }
 
 /// The fraction of each join's cross product its equalities keep,
-/// estimated from the first rows of each side, by join position.
+/// estimated from the first rows of each side, by join position. A
+/// join's filter keeps the default selectivity of those pairs.
 fn pair_fractions(
     found: &Operators,
     scans: &[Scan],
@@ -600,8 +601,15 @@ fn pair_fractions(
 ) -> Result<BTreeMap<usize, f64>, CompileError> {
     let mut fractions = BTreeMap::new();
     for (position, join) in found.joins.iter().enumerate() {
+        let kept = match join.filter {
+            Some(_) => quail_planner::constants::DEFAULT_SELECTIVITY,
+            None => 1.0,
+        };
         let conditions = &join.on;
         let Some(first) = conditions.first() else {
+            if join.filter.is_some() {
+                fractions.insert(position, kept);
+            }
             continue;
         };
         let left_alias = quail_planner::expressions::argument_alias(&first.left);
@@ -630,7 +638,7 @@ fn pair_fractions(
         };
         fractions.insert(
             position,
-            estimate_pair_fraction(&sample(&left)?, &sample(&right)?)?,
+            estimate_pair_fraction(&sample(&left)?, &sample(&right)?)? * kept,
         );
     }
     Ok(fractions)

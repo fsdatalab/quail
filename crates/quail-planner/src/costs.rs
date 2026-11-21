@@ -131,7 +131,7 @@ fn priced_key(condition: &Equality) -> (String, String, String, String) {
 /// The joins as the cost model prices them, in written order.
 ///
 /// `pair_fractions` maps a written position to the fraction of the
-/// cross product its equality conditions keep; `canvas` is the rows a
+/// cross product its equality conditions and filter keep; `canvas` is the rows a
 /// diffusion model appends to every pair.
 ///
 /// # Errors
@@ -146,13 +146,8 @@ pub fn join_specs(
 ) -> Result<Vec<PricedJoin>, CompileError> {
     let mut out = Vec::new();
     for (position, join) in joins.iter().enumerate() {
-        let conditions = &join.on;
-        let fraction = if conditions.is_empty() {
-            1.0
-        } else {
-            pair_fractions.get(&position).copied().unwrap_or(1.0)
-        };
-        let on: Vec<_> = conditions.iter().map(priced_key).collect();
+        let fraction = pair_fractions.get(&position).copied().unwrap_or(1.0);
+        let on: Vec<_> = join.on.iter().map(priced_key).collect();
         let call = asked_call(&join.predicate);
         if call.kind == "score" {
             let (parts, cost) = score_statistics(&call.prompt, context, chunk, None)?;

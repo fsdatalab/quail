@@ -6,6 +6,7 @@ use super::walk::{Kind, Walk};
 use super::{ByAlias, push};
 use crate::ai::{AiNode, Semantics, WrittenTest};
 use crate::functions::column_call_kind;
+use crate::region::lift::is_join_filter;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::utils::{conjunction, split_conjunction};
@@ -34,7 +35,12 @@ pub(super) struct Relation {
     /// alias -> the ON equalities of the JOIN of that table that no AI
     /// join has claimed, last JOIN first.
     pub(super) equalities: Vec<(String, Vec<Equality>)>,
-    /// The JOINed tables whose ON equalities an AI join has claimed.
+    /// alias -> the filter terms of the JOIN of that table, each a test
+    /// of two tables' columns, that no AI join has claimed, last JOIN
+    /// first.
+    pub(super) join_filters: Vec<(String, Vec<Expr>)>,
+    /// The JOINed tables whose ON equalities and filters an AI join has
+    /// claimed.
     claimed: Vec<String>,
     /// The FROM table, then the JOINed tables.
     pub(super) tables: Vec<String>,
@@ -107,16 +113,22 @@ impl Relation {
                 .map(|(left, right)| left.clone().eq(right.clone()))
                 .collect();
             terms.extend(join.filter.iter().flat_map(split_conjunction).cloned());
-            let mut equalities = Vec::new();
+            let (mut equalities, mut filters) = (Vec::new(), Vec::new());
             for term in terms {
                 let term = walk.through(&term);
                 // DataFusion pushes a WHERE test of the two sides into the
-                // join; an equality of their columns is the join's key
+                // join; an equality of their columns is the join's key,
+                // and another test of them its filter
                 if is_column_equality(&term) {
                     equalities.push(binder.bind_equality(&term, &joined)?);
+                } else if is_join_filter(&term) {
+                    filters.push(term);
                 } else {
                     relation.bind_term(binder, &term, None)?;
                 }
+            }
+            if !filters.is_empty() {
+                relation.join_filters.insert(0, (joined.clone(), filters));
             }
             if !equalities.is_empty() {
                 relation.equalities.insert(0, (joined, equalities));
@@ -392,9 +404,20 @@ impl Relation {
             selectivity: options.selectivity,
             anchor: options.anchor,
             on: Vec::new(),
+            filter: None,
         };
         let (claimed, equalities) = (&mut self.claimed, &mut self.equalities);
-        let spec = join_spec(spec, &read, &self.tables, claimed, equalities)?;
+        let (mut spec, filters) = join_spec(
+            spec,
+            &read,
+            &self.tables,
+            claimed,
+            equalities,
+            &mut self.join_filters,
+        )?;
+        if let Some(filter) = conjunction(filters) {
+            spec.filter = Some(binder.bind_condition(&negated_inward(filter, false))?);
+        }
         self.joins.insert(id, spec);
         Ok(())
     }
@@ -610,23 +633,25 @@ fn gate(
         selectivity,
         anchor: Some(outer),
         on: Vec::new(),
+        filter: None,
     })
 }
 
 /// An AI join over `aliases`, with the ON equalities of each JOINed
-/// table it is the first to read.
+/// table it is the first to read, and the filter terms of those JOINs.
 ///
 /// # Errors
 ///
 /// The predicate reads a table outside FROM and JOIN, its anchor is not
-/// one of its tables, or an ON equality reads a table it does not.
+/// one of its tables, or an ON condition reads a table it does not.
 fn join_spec(
     mut spec: JoinSpec,
     aliases: &[String],
     tables: &[String],
     claimed: &mut Vec<String>,
     equalities: &mut Vec<(String, Vec<Equality>)>,
-) -> Result<JoinSpec, CompileError> {
+    join_filters: &mut Vec<(String, Vec<Expr>)>,
+) -> Result<(JoinSpec, Vec<Expr>), CompileError> {
     let outside: Vec<String> = aliases
         .iter()
         .filter(|alias| !tables.contains(alias))
@@ -652,15 +677,19 @@ fn join_spec(
             repr_tuple(aliases)
         ));
     }
+    let mut filters: Vec<Expr> = Vec::new();
     for alias in &tables[1..] {
         if aliases.contains(alias) && !claimed.contains(alias) {
             claimed.push(alias.clone());
             if let Some(index) = equalities.iter().position(|(found, _)| found == alias) {
                 spec.on.extend(equalities.remove(index).1);
             }
+            if let Some(index) = join_filters.iter().position(|(found, _)| found == alias) {
+                filters.extend(join_filters.remove(index).1);
+            }
         }
     }
-    if !spec.on.is_empty() && aliases.len() != 2 {
+    if (!spec.on.is_empty() || !filters.is_empty()) && aliases.len() != 2 {
         return unsupported(
             "DataFusion must evaluate join conditions involving more than two model inputs.",
         );
@@ -673,13 +702,27 @@ fn join_spec(
             );
         }
     }
-    Ok(spec)
+    let read_elsewhere = filters.iter().any(|term| {
+        term.column_refs().iter().any(|column| {
+            column
+                .relation
+                .as_ref()
+                .is_none_or(|table| !aliases.contains(&table.to_string()))
+        })
+    });
+    if read_elsewhere {
+        return unsupported(
+            "DataFusion must evaluate a join condition that reads other model inputs.",
+        );
+    }
+    Ok((spec, filters))
 }
 
 /// Refuse JOINs that no AI predicate covers, or that do not connect to
 /// the FROM table.
 pub(super) fn check_joins(
     equalities: &[(String, Vec<Equality>)],
+    join_filters: &[(String, Vec<Expr>)],
     tables: &[String],
     joins: &[&JoinSpec],
     projected: &[(&ModelCall, String)],
@@ -701,6 +744,12 @@ pub(super) fn check_joins(
         }
         return unsupported(&format!(
             "JOIN {alias} ON {first} has no AI predicate over its pairs."
+        ));
+    }
+    if let Some((alias, terms)) = join_filters.first() {
+        return unsupported(&format!(
+            "JOIN {alias} ON {} has no AI predicate over its pairs.",
+            terms[0]
         ));
     }
     let mut predicates: Vec<BTreeSet<String>> = joins
@@ -788,4 +837,5 @@ pub(super) struct JoinSpec {
     pub(super) selectivity: Option<f64>,
     pub(super) anchor: Option<String>,
     pub(super) on: Vec<Equality>,
+    pub(super) filter: Option<ValueExpression>,
 }
