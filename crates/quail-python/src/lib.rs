@@ -57,25 +57,6 @@ pub(crate) fn python_failure(error: PyErr) -> DataFusionError {
     DataFusionError::External(text.into())
 }
 
-/// Add the site-packages of the virtual environment `VIRTUAL_ENV`
-/// names, which an embedded interpreter does not read by itself.
-fn add_virtual_env(py: Python<'_>) -> PyResult<()> {
-    let Some(root) = std::env::var_os("VIRTUAL_ENV").map(PathBuf::from) else {
-        return Ok(());
-    };
-    let Ok(entries) = std::fs::read_dir(root.join("lib")) else {
-        return Ok(());
-    };
-    let site = py.import("site")?;
-    for entry in entries.flatten() {
-        let packages = entry.path().join("site-packages");
-        if packages.is_dir() {
-            site.call_method1("addsitedir", (packages.to_string_lossy().to_string(),))?;
-        }
-    }
-    Ok(())
-}
-
 /// Start Python in this process if it has not started, and add the
 /// virtual environment `VIRTUAL_ENV` names to its path.
 ///
@@ -84,7 +65,23 @@ fn add_virtual_env(py: Python<'_>) -> PyResult<()> {
 /// The environment's site-packages do not load.
 pub fn start_python() -> Result<()> {
     Python::initialize();
-    Python::attach(add_virtual_env).map_err(python_failure)
+    Python::attach(|py| {
+        let Some(root) = std::env::var_os("VIRTUAL_ENV").map(PathBuf::from) else {
+            return Ok(());
+        };
+        let Ok(entries) = std::fs::read_dir(root.join("lib")) else {
+            return Ok(());
+        };
+        let site = py.import("site")?;
+        for entry in entries.flatten() {
+            let packages = entry.path().join("site-packages");
+            if packages.is_dir() {
+                site.call_method1("addsitedir", (packages.to_string_lossy().to_string(),))?;
+            }
+        }
+        Ok(())
+    })
+    .map_err(python_failure)
 }
 
 /// A session whose model regions run on `engine`, a Python object as
