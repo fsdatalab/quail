@@ -20,7 +20,6 @@ from quail.backends.quail.executor.stages import (
     _advance_stage,
     frame_writes,
     question_ends,
-    state_share_points,
 )
 from quail.progress import Progress, detail, logger
 
@@ -444,9 +443,16 @@ class StageExecutor:
             # a small pool keeps only the lengths that save the most
             base = 1 + int(self._extends)
             room = max(0, (self.arena.num_state_slots - base) // 3)
-            self.share_points = state_share_points(
-                self.borrowing.tree_parent, self.borrowing.tree_shared,
-                limit=room)
+            parents, shared = self.borrowing.tree_parent, self.borrowing.tree_shared
+            counts = [{} for _ in parents]
+            for parent, count in zip(parents, shared):
+                if parent is not None and count:
+                    counts[parent][count] = counts[parent].get(count, 0) + 1
+            points = []
+            for found in counts:
+                keep = sorted(found, key=lambda n: (-found[n] * n, n))
+                points.append(tuple(sorted(keep[:room])))
+            self.share_points = points
             need = base + max(map(len, self.share_points), default=0)
             if self.arena.num_state_slots < need:
                 raise ValueError(
