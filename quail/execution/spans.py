@@ -60,8 +60,8 @@ def held_prefix(document: str, phrase: str) -> tuple[str, tuple[int, int]] | Non
         middle = (low + high + 1) // 2
         if _word_span(document, phrase[:ends[middle - 1]]) is None:
             high = middle - 1
-        else:
-            low = middle
+            continue
+        low = middle
     if low == 0:
         return None
     prefix = phrase[:ends[low - 1]].strip()
