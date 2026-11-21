@@ -112,39 +112,6 @@ fn merged_metrics(left: &Map<String, Value>, right: &Map<String, Value>) -> Map<
     merged
 }
 
-fn no_metrics() -> Map<String, Value> {
-    let mut metrics: Map<String, Value> = METRICS
-        .iter()
-        .map(|name| {
-            let zero = if matches!(*name, "wall_s" | "gpu_s") {
-                json!(0.0)
-            } else {
-                json!(0)
-            };
-            ((*name).to_string(), zero)
-        })
-        .collect();
-    metrics.insert("extension".into(), json!({}));
-    metrics
-}
-
-/// A node's metrics as a report lists them: the standard fields, then
-/// each extension metric that is a number.
-fn scalar_metrics(metrics: &Map<String, Value>) -> Value {
-    let mut scalars = Map::new();
-    for name in METRICS {
-        scalars.insert(name.into(), metrics.get(name).cloned().unwrap_or(json!(0)));
-    }
-    if let Some(extension) = metrics.get("extension").and_then(Value::as_object) {
-        for (name, value) in extension {
-            if is_count(value) {
-                scalars.insert(name.clone(), value.clone());
-            }
-        }
-    }
-    Value::Object(scalars)
-}
-
 /// The node and port a worker's output table is tagged with.
 fn tag(table: &Table) -> Option<(&String, &String)> {
     let metadata = table.0.metadata();
@@ -352,9 +319,19 @@ pub fn region_report(
             Ok((schema, batches))
         })
         .collect::<Result<_>>()?;
-    let total = (nodes.iter()).fold(no_metrics(), |sum, (_, metrics)| {
-        merged_metrics(&sum, metrics)
-    });
+    let mut metrics: Map<String, Value> = METRICS
+        .iter()
+        .map(|name| {
+            let zero = if matches!(*name, "wall_s" | "gpu_s") {
+                json!(0.0)
+            } else {
+                json!(0)
+            };
+            ((*name).to_string(), zero)
+        })
+        .collect();
+    metrics.insert("extension".into(), json!({}));
+    let total = (nodes.iter()).fold(metrics, |sum, (_, metrics)| merged_metrics(&sum, metrics));
     let mut report = Map::new();
     report.insert("wall_s".into(), json!((wall * 100.0).round() / 100.0));
     for name in [
@@ -375,7 +352,23 @@ pub fn region_report(
         .collect();
     report.insert("backend_metrics".into(), json!({"inferences": inferences}));
     let measured: Map<String, Value> = (nodes.iter())
-        .map(|(node, metrics)| (node.id().to_string(), scalar_metrics(metrics)))
+        .map(|(node, metrics)| {
+            let mut scalars = Map::new();
+            for name in METRICS {
+                scalars.insert(name.into(), metrics.get(name).cloned().unwrap_or(json!(0)));
+            }
+            for (name, value) in metrics
+                .get("extension")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flatten()
+            {
+                if is_count(value) {
+                    scalars.insert(name.clone(), value.clone());
+                }
+            }
+            (node.id().to_string(), Value::Object(scalars))
+        })
         .collect();
     report.insert("node_metrics".into(), Value::Object(measured));
     let mut joins = Vec::new();
