@@ -128,31 +128,11 @@ pub fn code_candidates() -> Vec<String> {
     codes
 }
 
-/// One coded line per option, each `line` with its code and text.
-///
-/// # Errors
-///
-/// More than `MAX_LETTERS` options.
-fn coded_options(texts: &[String], letters: &[String], line: &str) -> Result<String, CompileError> {
-    if texts.len() > MAX_LETTERS {
-        return compile_error(format!(
-            "a coded prompt takes at most {MAX_LETTERS} options, got {}",
-            texts.len()
-        ));
-    }
-    Ok(letters
-        .iter()
-        .zip(texts)
-        .map(|(letter, text)| line.replace("{letter}", letter).replace("{text}", text))
-        .collect())
-}
-
 // Base Labs' mammoth-1 and elephant-1 (qev/prompt.py in OneJev at
 // 81ce62f): the document in a state block, then the question, its
 // lettered options, and the answer line. A filter asks the yes/no
 // question as two options, yes then no.
 const MAMMOTH_OPTIONS_LABEL: &str = "\n\nOptions:";
-const MAMMOTH_OPTION_LINE: &str = "\n{letter}. {text}";
 // the answer line; "{letters}" becomes the codes, joined by ", "
 const MAMMOTH_CLOSING: &str = "\n\nAnswer with one letter: {letters}.";
 const MAMMOTH_LABEL_CLOSING: &str = "\n\nAnswer with one label: {letters}.";
@@ -486,13 +466,7 @@ fn option_codes(labels: &[String]) -> Vec<String> {
     {
         return stripped.iter().map(|label| label.to_string()).collect();
     }
-    let letters: Vec<String> = ('A'..='Z').map(|c| c.to_string()).collect();
-    let mut codes = letters.clone();
-    for first in &letters {
-        for second in &letters {
-            codes.push(format!("{first}{second}"));
-        }
-    }
+    let mut codes = code_candidates();
     codes.truncate(labels.len());
     codes
 }
@@ -803,19 +777,28 @@ fn choice_segments(
     letters: &[String],
 ) -> Result<Vec<String>, CompileError> {
     if let Some(options_label) = layout.options_label {
-        let texts: Vec<String> = labels
-            .iter()
-            .enumerate()
-            .map(|(index, label)| match descriptions.get(index) {
-                Some(description) if !description.is_empty() => format!("{label}: {description}"),
-                _ => label.clone(),
-            })
-            .collect();
+        if labels.len() > MAX_LETTERS {
+            return compile_error(format!(
+                "a coded prompt takes at most {MAX_LETTERS} options, got {}",
+                labels.len()
+            ));
+        }
         let letters = if letters.is_empty() {
             code_candidates().into_iter().take(labels.len()).collect()
         } else {
             letters.to_vec()
         };
+        let options: String = letters
+            .iter()
+            .zip(labels)
+            .enumerate()
+            .map(|(index, (letter, label))| match descriptions.get(index) {
+                Some(description) if !description.is_empty() => {
+                    format!("\n{letter}. {label}: {description}")
+                }
+                _ => format!("\n{letter}. {label}"),
+            })
+            .collect();
         // mammoth's, the one coded layout: a two-letter code asks for a label
         let closing = if letters.iter().any(|letter| letter.chars().count() > 1) {
             MAMMOTH_LABEL_CLOSING
@@ -828,10 +811,9 @@ fn choice_segments(
             question
         };
         return Ok(vec![format!(
-            "{}{}{question}{options_label}{}{}",
+            "{}{}{question}{options_label}{options}{}",
             layout.question_separator.unwrap_or(JOIN_QUESTION_SEP),
             layout.choice_label.expect("a choice layout"),
-            coded_options(&texts, &letters, MAMMOTH_OPTION_LINE)?,
             closing.replace("{letters}", &letters.join(", "))
         )]);
     }

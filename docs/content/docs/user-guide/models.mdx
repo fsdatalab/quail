@@ -91,13 +91,13 @@ Qwen3.5 27B and Qwen3.5 9B. They answer a question about a document with a
 probability for every option, read from the output head's logits of the
 option letters.
 
-Their attention layers read the prompt as two blocks. The first holds the
-system turn and the document, and reads itself in both directions. The
-second holds the question and its options, and reads itself and the first
-block. Quail runs exactly this mask: each document is computed once, with
-its system turn, and every question about it reads that KV. Because the
-system turn is part of each document's block, documents cannot share KV
-with each other.
+Full-attention layers read each prompt as two blocks. Block one holds the
+system turn and the document, and reads every token in block one in both
+directions. Block two holds the question and its options, and reads every
+token in both blocks. Quail runs the two-block mask directly: each document
+and its system turn are computed once, and every question about the document
+reads the saved KV. Documents cannot share KV with one another because each
+document's block includes the system turn.
 
 They run on H100 SXM and B200 and read one document per prompt, so Quail refuses
 joins and prompts over two tables.

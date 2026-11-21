@@ -12,7 +12,6 @@ from quail.api.config import EngineConfig
 from quail.api.prompts import bind_classify_prompt, bind_prompt
 from quail.backends.quail.executor import model_loading
 from quail.backends.quail.executor.models import build_pipeline
-from quail.backends.quail.executor.models.base import pipeline_mask
 from quail.backends.quail.executor.readout import (
     AsyncDecisions,
     DecisionRows,
@@ -87,8 +86,8 @@ def test_elephant_runs_mammoths_prompt_mask_and_readout_on_the_9b():
         assert getattr(ELEPHANT, field) == getattr(MAMMOTH, field)
     base = MODELS["qwen3.5-9b-bf16"]
     assert (ELEPHANT.layers, ELEPHANT.hidden) == (base.layers, base.hidden)
-    assert pipeline_mask(MAMMOTH) == pipeline_mask(ELEPHANT) == "document_isolated"
-    assert pipeline_mask(base) == "causal"
+    assert MAMMOTH.bidirectional and ELEPHANT.bidirectional
+    assert not base.bidirectional
 
 
 def test_a_causal_forward_pass_refuses_a_bidirectional_model():
@@ -191,8 +190,26 @@ def test_a_mammoth_plan_sends_the_close_and_shares_no_prefix(session):
     assert _text(session, plan.settings["document_close"]) == CLOSE
     assert _text(session, node.question_token_ids) == (
         "Question: Asks for a refund?" + NOUL_OPTIONS + TURN_CLOSE_TEXT)
-    # both documents start "refund", but neither borrows the other's KV
     assert not node.share_prefixes
+
+    # even over a multi-page shared prefix that a causal model shares,
+    # a document_isolated model keeps each document's block unshared
+    shared = pa.table({
+        "id": [1, 2],
+        "body": ["refund order " * 20 + "yesterday",
+                 "refund order " * 20 + "today"],
+    })
+    for model, expected in (("qwen3.5-27b-bf16", True), (MAMMOTH.name, False)):
+        with quail.Session(EngineConfig(model=model, device="h100-sxm"),
+                           tokenizer=TOKENIZER) as other:
+            other.register("documents",
+                           DocumentProvider.from_table(shared, id_col="id"))
+            built = other.sql(
+                "SELECT d.id FROM documents d WHERE "
+                "AI_FILTER(PROMPT('Asks for a refund? {0}', d.body)) AND "
+                "AI_FILTER(PROMPT('Mentions shipping? {0}', d.body))").plan()
+        first = next(n for n in built.nodes if isinstance(n, AiFilter))
+        assert first.share_prefixes is expected
 
 
 def test_a_mammoth_classification_reads_every_label_at_the_last_row(session):

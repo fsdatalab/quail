@@ -211,7 +211,7 @@ def code_letters(count: int, tokenizer, opener: str) -> tuple[str, ...]:
     """The codes a coded prompt lists its labels under, in option order.
 
     Each is one token of its own, a token no earlier code took, and still
-    that one token right after `opener`, the text the answer follows.
+    the same single token right after `opener`, the text the answer follows.
 
     Raises:
         CompileError: The tokenizer keeps fewer than count codes.

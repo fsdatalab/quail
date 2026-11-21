@@ -559,9 +559,9 @@ class LetterReadout:
     """The slot_lm readout of mammoth-1 and elephant-1, in fp32.
 
     Every option is scored at the prompt's last row: option i's score is
-    that row times the output head's row of option i's letter. It
-    answers the DecisionHead interface, so the decision readouts read
-    it with every option's offset 0.
+    the last row times the output head's row of option i's letter. The
+    readout implements the DecisionHead interface, so decision readouts
+    read every option at offset 0.
 
     Args:
         F: torch.nn.functional.
@@ -573,7 +573,8 @@ class LetterReadout:
         self.weight = weight.float()
 
     @classmethod
-    def load(cls, torch, F, path, letters, device="cuda"):
+    def load(cls, torch, F, path, letters=None, *, turn_suffix="",
+             device="cuda"):
         """Read the output head's rows of the option letters.
 
         Args:
@@ -582,24 +583,28 @@ class LetterReadout:
             path: The checkpoint directory, with tokenizer.json and
                 either a safetensors index naming lm_head.weight's shard
                 or one model.safetensors holding it.
-            letters: The option letters, in option order.
+            letters: The option letters in option order, or None to
+                select MAX_LETTERS codes with code_letters.
+            turn_suffix: The assistant turn opener code_letters checks.
             device: Where the readout lives.
-
-        Raises:
-            ValueError: A letter is not one token.
         """
         import json
 
         from safetensors import safe_open
         from tokenizers import Tokenizer
 
+        from quail.physical.lowering import MAX_LETTERS, code_letters
+
         path = Path(path)
         tokenizer = Tokenizer.from_file(str(path / "tokenizer.json"))
-        ids = [tokenizer.encode(letter, add_special_tokens=False).ids
-               for letter in letters]
-        if any(len(token) != 1 for token in ids):
-            raise ValueError(f"the option letters {letters} are not one "
-                             f"token each in {path}")
+
+        def encode(text):
+            return tokenizer.encode(text, add_special_tokens=False).ids
+
+        if letters is None:
+            letters = code_letters(MAX_LETTERS, encode, turn_suffix)
+        ids = [encode(letter) for letter in letters]
+        assert all(len(token) == 1 for token in ids)
         index_path = path / "model.safetensors.index.json"
         shard = (json.loads(index_path.read_text())["weight_map"]["lm_head.weight"]
                  if index_path.exists() else "model.safetensors")
@@ -609,7 +614,7 @@ class LetterReadout:
         return cls(F, rows.to(device))
 
     def reordered(self, order):
-        """Return this readout with its rows taken in the given order."""
+        """Return a LetterReadout with rows taken in the given order."""
         return type(self)(self.F, self.weight[list(order)])
 
     def scores(self, options, last):

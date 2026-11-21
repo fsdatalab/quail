@@ -33,15 +33,6 @@ def overlaid_rows(torch, num_tokens, device, *layouts):
     return views
 
 
-def pipeline_mask(spec) -> str:
-    """Return the mask a pipeline packs its chunks with, one of attention.MASKS.
-
-    A bidirectional spec runs "document_isolated"; any other spec runs
-    "causal".
-    """
-    return "document_isolated" if spec.bidirectional else "causal"
-
-
 class ModelPipeline:
     """The contract between the chunk loop and one model family.
 

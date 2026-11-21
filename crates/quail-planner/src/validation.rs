@@ -249,9 +249,9 @@ fn attention_device_refusal(model: &ModelSpec, device: &DeviceSpec) -> Option<Re
 
 /// A refusal for what a bidirectional model cannot run yet.
 ///
-/// Its prompts read one document each: a join or any prompt over two
-/// tables is laid out in a format the model was not trained on. Its
-/// non-causal attention is checked on H100 only.
+/// Each prompt reads one document: a join or a prompt over two tables
+/// uses a layout the model was not trained on. Non-causal attention is
+/// checked on H100 SXM and B200.
 fn bidirectional_refusal(
     found: &Operators,
     context: &PlanningContext,

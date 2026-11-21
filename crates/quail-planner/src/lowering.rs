@@ -183,10 +183,10 @@ pub fn choice_letters(
 
 /// The codes a coded prompt lists its labels under.
 ///
-/// Decision 3.0's rule (`d3_format.answer_codes`), which Base Labs'
-/// models share: candidates in `code_candidates` order, each kept when it
-/// is one token of its own, a token no earlier code took, and still that
-/// one token right after the assistant turn opens.
+/// Decision 3.0's rule (`d3_format.answer_codes`), shared by Base Labs'
+/// models: candidates in `code_candidates` order, each kept when it is
+/// one token of its own, a token no earlier code took, and still the
+/// same single token right after the assistant turn opens.
 ///
 /// # Errors
 ///
@@ -221,16 +221,12 @@ pub fn code_letters(
 }
 
 fn option_fallbacks() -> Vec<String> {
-    let letters: Vec<String> = ('A'..='Z').map(String::from).collect();
-    let mut found = letters.clone();
+    let candidates = code_candidates();
+    let mut found = candidates[..26].to_vec();
     found.extend((0..100).map(|index| format!("{index:02}")));
     found.extend(('a'..='z').map(String::from));
     found.extend((0..200).map(|index| format!("#{index}")));
-    for first in &letters {
-        for second in &letters {
-            found.push(format!("{first}{second}"));
-        }
-    }
+    found.extend_from_slice(&candidates[26..]);
     found
 }
 

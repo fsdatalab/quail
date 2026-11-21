@@ -241,7 +241,12 @@ impl Planner {
             // a document_isolated model reads each document as one block,
             // so a shared prefix's KV differs from document to document
             let tree = if settings.model["attention_mask"] == "document_isolated" {
-                PrefixTree::unshared(store.lengths().len())
+                let count = store.lengths().len();
+                PrefixTree {
+                    order: (0..count).collect(),
+                    parent: vec![None; count],
+                    shared: vec![0; count],
+                }
             } else {
                 PrefixIndex::new(&documents).tree(page_tokens)
             };

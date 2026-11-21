@@ -1,13 +1,13 @@
 # Base Labs' mammoth-1: a full fine-tune of Qwen3.5 27B with the same
-# shapes, shipped in bf16 with its own output head. Its full-attention
-# layers read the system turn and the document as one block, and each
-# question reads that block and itself; "document_isolated" packs them so.
+# shapes, shipped in bf16 with its own output head. Full-attention
+# layers read the system turn and the document as block one, and each
+# question reads block one and itself; "document_isolated" packs both.
 base = "qwen3.5-27b-bf16"
 name = "mammoth-1-bf16"
 hf_name = "baselabs/mammoth-1"
 revision = "61cec44c281c693992e3d6ebeb44dd3402dfa186"
-# the full-attention layers read the system turn and the document as
-# one block, both ways, and each question reads that block and itself
+# full-attention layers read the system turn and the document as block
+# one, both ways, and each question reads block one and itself
 attention_mask = "document_isolated"
 prompt_layout = "mammoth"
 # Base Labs' system turn, from qev/prompt.py in OneJev at 81ce62f, which

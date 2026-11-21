@@ -6,8 +6,8 @@ base = "qwen3.5-9b-bf16"
 name = "elephant-1-bf16"
 hf_name = "baselabs/elephant-1"
 revision = "b3f8a93462fb1051a9de031e94a7ff380e254072"
-# the full-attention layers read the system turn and the document as
-# one block, both ways, and each question reads that block and itself
+# full-attention layers read the system turn and the document as block
+# one, both ways, and each question reads block one and itself
 attention_mask = "document_isolated"
 prompt_layout = "mammoth"
 # Base Labs' system turn, from qev/prompt.py in OneJev at 81ce62f, which

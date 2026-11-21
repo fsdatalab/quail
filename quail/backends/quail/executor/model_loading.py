@@ -48,25 +48,26 @@ def engine_args(path, architecture: str = "") -> dict:
         architecture: The registered class for a Decision 2.0 package;
             empty uses the generative backbone class.
     """
-    if not is_decision2(path):
-        settings = {"model": str(path)}
-        # mammoth-1's config says float32 at the top and bfloat16, the
-        # weights' dtype, in its text config; vLLM's "auto" reads the top
-        config = Path(path) / "config.json"
-        if config.is_file():
-            fields = json.loads(config.read_text())
-            text_dtype = fields.get("text_config", {}).get("dtype")
-            if text_dtype and fields.get("dtype", text_dtype) != text_dtype:
-                settings["dtype"] = text_dtype
-        return settings
-    from quail.backends.quail.executor.models.decision2 import (
-        BACKBONE_ARCHITECTURE,
-    )
+    if is_decision2(path):
+        from quail.backends.quail.executor.models.decision2 import (
+            BACKBONE_ARCHITECTURE,
+        )
 
-    return {"model": str(Path(path) / "backbone"), "tokenizer": str(path),
-            "dtype": "bfloat16",
-            "hf_overrides": {"architectures": [architecture
-                                               or BACKBONE_ARCHITECTURE]}}
+        return {"model": str(Path(path) / "backbone"),
+                "tokenizer": str(path), "dtype": "bfloat16",
+                "hf_overrides": {"architectures": [
+                    architecture or BACKBONE_ARCHITECTURE]}}
+    settings = {"model": str(path)}
+    config = Path(path) / "config.json"
+    if not config.is_file():
+        return settings
+    # mammoth-1's config says float32 at the top and bfloat16, the
+    # weights' dtype, in its text config; vLLM's "auto" reads the top
+    fields = json.loads(config.read_text())
+    text_dtype = fields.get("text_config", {}).get("dtype")
+    if text_dtype and fields.get("dtype", text_dtype) != text_dtype:
+        settings["dtype"] = text_dtype
+    return settings
 
 
 class _SingleRank:

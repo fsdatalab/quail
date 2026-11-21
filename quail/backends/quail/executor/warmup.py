@@ -229,7 +229,7 @@ def _warm_row_classes(torch, arena, pipeline, attention_mode):
     Each chunk holds m one-token rows that read a cached document and
     keep their token's KV, as greedy decode rounds do, and one fresh
     filler document that brings the chunk to n rows. A hybrid model
-    whose arena has fewer checkpoint slots than those documents skips
+    whose arena has too few checkpoint slots for the warm documents skips
     the passes, and a query compiles the kernels when it first runs them.
 
     Args:

@@ -502,21 +502,6 @@ class _PoolBuilder:
             max_used=int(lengths.max()))
 
 
-def _check_noncausal_group(spec, mask):
-    """Check that a unified group fits a non-causal mask.
-
-    Raises:
-        ValueError: The group borrows a prefix or keeps suffix KV.
-    """
-    key = spec["key"]
-    if spec["start"]:
-        raise ValueError(f"group {key!r}: the {mask} mask reads each "
-                         f"document whole, so it cannot borrow a prefix")
-    if spec["keeps"]:
-        raise ValueError(f"group {key!r}: the {mask} mask keeps no suffix "
-                         f"KV; a kept token would read later questions")
-
-
 def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                attention_mode, staging=None, canvas=(), answer_row=0,
                decode=None, mask="causal"):
@@ -925,11 +910,14 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
 
     unified = None
     temporary_keys = []
-    if mask != "causal" and len(unified_groups) != len(layout):
-        raise ValueError(f"the {mask} mask reads each document from its "
-                         f"pages; every group needs pages")
-    if attention_mode == "unified" and (unified_groups or decode is not None):
+    if attention_mode == "unified" and (
+            unified_groups or decode is not None
+            or (mask != "causal" and layout)):
         if len(unified_groups) != len(layout):
+            if mask != "causal":
+                raise ValueError(
+                    f"the {mask} mask reads each document from its "
+                    f"pages; every group needs pages")
             raise ValueError(
                 "a unified chunk cannot mix paged and unpaged "
                 "groups: the one paged call covers every row or "
@@ -963,7 +951,14 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     logical_start + count - view.start <= view.rows.numel()
                     for view in views)
                 if mask != "causal":
-                    _check_noncausal_group(spec, mask)
+                    if spec["start"]:
+                        raise ValueError(
+                            f"group {key!r}: the {mask} mask reads each "
+                            f"document whole, so it cannot borrow a prefix")
+                    if spec["keeps"]:
+                        raise ValueError(
+                            f"group {key!r}: the {mask} mask keeps no suffix "
+                            f"KV; a kept token would read later questions")
                     direct = False
                 suffix_total = int((ends - begins).sum())
                 if spec["keeps"] and not direct:
