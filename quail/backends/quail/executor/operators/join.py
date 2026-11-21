@@ -493,26 +493,6 @@ def _tuple_suffix(join, documents, member):
     return concat_tokens(*parts)
 
 
-def join_suffixes(group, documents, indices):
-    """Build partner suffixes and their global document IDs in the same order.
-
-    Args:
-        group: Join request descriptions in execution order.
-        documents: Selected partner documents indexed by local position.
-        indices: Global document IDs for those local positions, by alias.
-    """
-    suffixes, tuples = [], {}
-    for join in group:
-        partners = join["partners"]
-        members, tokens = [], []
-        for positions in itertools.product(*(range(len(indices[p])) for p in partners)):
-            members.append([indices[p][i] for p, i in zip(partners, positions)])
-            tokens.append(_tuple_suffix(join, documents, positions))
-        tuples[join["written_position"]] = members
-        suffixes.append(tokens)
-    return suffixes, tuples
-
-
 def runs_over_pairs(join: dict) -> bool:
     """Whether a stage streams each anchor's own pairs."""
     return bool(join.get("pairs_from"))
@@ -678,7 +658,16 @@ def join_inputs(nodes, documents, indices, prefixes, arena, retention, pair_tabl
     """Build join requests and KV settlement for local or worker execution."""
     node = nodes[0]
     group = [join_request(member) for member in nodes]
-    stage_suffixes, tuple_indices = join_suffixes(group, documents, indices)
+    stage_suffixes, tuple_indices = [], {}
+    for join in group:
+        partners = join["partners"]
+        members, tokens = [], []
+        for positions in itertools.product(
+            *(range(len(indices[p])) for p in partners)):
+            members.append([indices[p][i] for p, i in zip(partners, positions)])
+            tokens.append(_tuple_suffix(join, documents, positions))
+        tuple_indices[join["written_position"]] = members
+        stage_suffixes.append(tokens)
     maps = partner_maps(group, pair_tables)
     lists_for = partner_list_builder(
         group, [tuple_indices[stage.written_position] for stage in nodes], maps)
