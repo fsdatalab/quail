@@ -143,9 +143,9 @@ class GreedyDecoder:
         target, run = self.runs.after[node, best]
         if run is None:
             self.label[document] = self.leaf[target]
-        else:
-            self.node[document] = target
-            self.pending[document] = run
+            return
+        self.node[document] = target
+        self.pending[document] = run
 
 
 def trie_paths(label_ids, read=None) -> list:
