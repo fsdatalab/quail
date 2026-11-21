@@ -180,23 +180,6 @@ pub fn extract_inputs(spec: &ExtractSpec, resident: bool) -> ExtractInputs {
     }
 }
 
-/// A map's settings as the cost model reads them: an extraction that
-/// drafts no tokens.
-fn map_inputs(spec: &MapSpec, resident: bool) -> ExtractInputs {
-    ExtractInputs {
-        head_tokens: spec.prompt_token_parts[0].len() as i64,
-        tail_tokens: spec.prompt_token_parts[1].len() as i64,
-        window: 0,
-        resident,
-        max_answer_tokens: spec.max_answer_tokens,
-        draft_tokens: 0,
-        draft_policy: "fixed".to_string(),
-        round_cost_per_token: 0.0,
-        answer_tokens: spec.expected_answer_tokens,
-        recurrent: false,
-    }
-}
-
 /// The estimated cost of writing one answer per document of `alias`.
 ///
 /// # Errors
@@ -243,7 +226,18 @@ pub fn map_cost(
     answer_cost(
         context,
         &spec.aliases[0],
-        &map_inputs(spec, resident),
+        &ExtractInputs {
+            head_tokens: spec.prompt_token_parts[0].len() as i64,
+            tail_tokens: spec.prompt_token_parts[1].len() as i64,
+            window: 0,
+            resident,
+            max_answer_tokens: spec.max_answer_tokens,
+            draft_tokens: 0,
+            draft_policy: "fixed".to_string(),
+            round_cost_per_token: 0.0,
+            answer_tokens: spec.expected_answer_tokens,
+            recurrent: false,
+        },
         expected_rows,
         shared,
         chunk_budget(&context.model, &context.device),
