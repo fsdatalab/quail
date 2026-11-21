@@ -310,7 +310,7 @@ def _kernels() -> dict:
 
     @triton.jit
     def _attend_tile(q, k_ptr, v_ptr, bt_row, n0, kv_head, qpos, row_ok,
-                     used, window, profile_row, m_i, l_i, acc, scale_log2,
+                     used, window, bias_rows, m_i, l_i, acc, scale_log2,
                      stride_k0, stride_k1, stride_k2, stride_v0, stride_v1,
                      stride_v2, BN: tl.constexpr, D: tl.constexpr,
                      EXTENT: tl.constexpr, PAGE: tl.constexpr,
@@ -338,31 +338,37 @@ def _kernels() -> dict:
             valid = (dist >= 0) & key_ok[None, :] & row_ok[:, None]
             if HAS_WINDOW:
                 valid = valid & (dist < window)
-            near = valid & (dist < EXTENT)
-            s += tl.load(profile_row[:, None] + (EXTENT - 1 - dist),
-                         mask=near, other=0.0).to(tl.float32) * LOG2E
+            # bias_rows points at each row's bias for this tile's first key
+            bias = tl.load(bias_rows[:, None] + offs_key[None, :])
+            s += tl.where(dist < EXTENT, bias.to(tl.float32) * LOG2E, 0.0)
             s = tl.where(valid, s, -float("inf"))
         m_new = tl.maximum(m_i, tl.max(s, axis=1))
-        alpha = tl.math.exp2(m_i - m_new)
-        p = tl.math.exp2(s - m_new[:, None])
+        # a later split's row that has seen no key keeps m at -inf, and
+        # exp2(-inf - -inf) would be NaN
+        m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
+        alpha = tl.math.exp2(m_i - m_safe)
+        p = tl.math.exp2(s - m_safe[:, None])
         l_i = l_i * alpha + tl.sum(p, axis=1)
         acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
         return m_new, l_i, acc
 
     @triton.jit(do_not_specialize=["window", "splits"])
-    def rel_attention(q_ptr, k_ptr, v_ptr, profile_ptr, sink_ptr, out_ptr,
-                      part_acc_ptr, part_ml_ptr, tile_seq_ptr, tile_q0_ptr,
-                      cu_q_ptr, used_ptr, table_ptr, stride_q0, stride_q1,
+    def rel_attention(q_ptr, k_ptr, v_ptr, rel_ptr, proj_ptr, sink_ptr,
+                      out_ptr, scratch_ptr, part_acc_ptr, part_ml_ptr,
+                      tile_seq_ptr, tile_q0_ptr, cu_q_ptr, used_ptr,
+                      table_ptr, stride_q0, stride_q1, stride_r0, stride_r1,
                       stride_s0, stride_o0, stride_o1, stride_k0, stride_k1,
                       stride_k2, stride_v0, stride_v1, stride_v2, stride_bt,
                       scale_log2, window, splits, GROUP: tl.constexpr,
                       HEADS: tl.constexpr, BM: tl.constexpr,
-                      BN: tl.constexpr, D: tl.constexpr,
+                      BN: tl.constexpr, D: tl.constexpr, R: tl.constexpr,
                       EXTENT: tl.constexpr, PAGE: tl.constexpr,
+                      SPAN: tl.constexpr, WCH: tl.constexpr,
                       HAS_WINDOW: tl.constexpr, SPLIT: tl.constexpr):
-        # profile holds each row and head's bias by distance, longest
-        # first, (rows, heads, EXTENT): a row's bias over a key tile is one
-        # ascending run, so its loads coalesce
+        # each program first writes its rows' bias by key position over
+        # its near keys to its own (BM, SPAN) scratch, so every near key
+        # tile reads an aligned rectangle; reads that start at a different
+        # column in each row do not vectorize
         LOG2E: tl.constexpr = 1.4426950408889634
         TQ: tl.constexpr = BM // GROUP
         tile = tl.program_id(0) // splits
@@ -388,7 +394,6 @@ def _kernels() -> dict:
                     mask=row_ok[:, None], other=0.0)
         sink = tl.load(sink_ptr + q_row * stride_s0 + head, mask=row_ok,
                        other=0.0).to(tl.float32)
-        profile_row = profile_ptr + (q_row * HEADS + head) * EXTENT
         # the sink is one more logit, with a zero value, counted once
         if split == 0:
             m_i = sink * LOG2E
@@ -414,16 +419,40 @@ def _kernels() -> dict:
         far_end = tl.minimum(near, hi_key)
         near_start = tl.maximum(near, lo_key)
         bt_row = table_ptr + seq.to(tl.int64) * stride_bt
+        scratch = scratch_ptr + (tl.program_id(0) * tl.num_programs(1)
+                                 + kv_head).to(tl.int64) * (BM * SPAN)
+        bias_rows = scratch + offs_m * SPAN
+        if near_start < hi_key:
+            offs_r = tl.arange(0, R)
+            offs_c = tl.arange(0, WCH)
+            rel = tl.load(rel_ptr + q_row[:, None] * stride_r0
+                          + head[:, None] * stride_r1 + offs_r[None, :],
+                          mask=row_ok[:, None], other=0.0)
+            # the near keys' distances, from the last key to the first
+            d_lo = tl.maximum(first_q - hi_key + 1, 0) // WCH * WCH
+            reach = tl.minimum(last_q - near_start + 1, EXTENT)
+            for c0 in range(d_lo, reach, WCH):
+                dists = c0 + offs_c
+                part = tl.load(proj_ptr + offs_r[:, None] * EXTENT
+                               + dists[None, :],
+                               mask=(dists < EXTENT)[None, :], other=0.0)
+                # rounded to bf16 as the reference's bias is
+                values = tl.dot(rel, part).to(tl.bfloat16)
+                cols = qpos[:, None] - dists[None, :] - near_start
+                tl.store(bias_rows[:, None] + cols, values,
+                         mask=(cols >= 0) & (cols < SPAN))
+            tl.debug_barrier()
         for n0 in range(lo_key, far_end, BN):
             m_i, l_i, acc = _attend_tile(
                 q, k_ptr, v_ptr, bt_row, n0, kv_head, qpos, row_ok, used,
-                window, profile_row, m_i, l_i, acc, scale_log2, stride_k0,
+                window, bias_rows, m_i, l_i, acc, scale_log2, stride_k0,
                 stride_k1, stride_k2, stride_v0, stride_v1, stride_v2, BN, D,
                 EXTENT, PAGE, HAS_WINDOW, False)
         for n0 in range(near_start, hi_key, BN):
             m_i, l_i, acc = _attend_tile(
                 q, k_ptr, v_ptr, bt_row, n0, kv_head, qpos, row_ok, used,
-                window, profile_row, m_i, l_i, acc, scale_log2, stride_k0,
+                window, bias_rows + (n0 - near_start), m_i, l_i, acc,
+                scale_log2, stride_k0,
                 stride_k1, stride_k2, stride_v0, stride_v1, stride_v2, BN, D,
                 EXTENT, PAGE, HAS_WINDOW, True)
         if SPLIT:
@@ -957,7 +986,7 @@ def attention_tiles(cu_q_host, rows_per_tile):
 
 
 def rel_attention(torch, q3, kp, vp, rel, sink, proj, out, tiles, cu_q, used,
-                  table, *, window, max_keys, block_rows=128, block_keys=32,
+                  table, *, window, max_keys, block_rows=64, block_keys=64,
                   num_warps=8, num_stages=3):
     """Causal paged attention with the relative bias and sink logits.
 
@@ -988,11 +1017,13 @@ def rel_attention(torch, q3, kp, vp, rel, sink, proj, out, tiles, cu_q, used,
     rank, extent = proj.shape
     if rows == 0 or tiles[0].numel() == 0:
         return out
-    # each row and head's bias by distance, longest first, rounded to
-    # bf16 as the reference's bias is
-    profile = torch.mm(rel.reshape(rows * heads, rank), proj.flip(1))
     num_tiles = tiles[0].numel()
     splits = num_splits(num_tiles * kv_heads, max_keys, window)
+    # a program's near keys run from its first near tile to its last
+    # query, plus a tile past it; rows start on 16 bytes
+    span = -(-(extent + block_rows // group + 2 * block_keys) // 8) * 8
+    scratch = torch.empty(num_tiles * splits * kv_heads * block_rows * span,
+                          dtype=torch.bfloat16, device=q3.device)
     if splits > 1:
         part_acc = torch.empty((rows * heads * splits, dim),
                                dtype=torch.float32, device=q3.device)
@@ -1001,13 +1032,15 @@ def rel_attention(torch, q3, kp, vp, rel, sink, proj, out, tiles, cu_q, used,
     else:
         part_acc = part_ml = out
     _kernels()["rel_attention"][(num_tiles * splits, kv_heads)](
-        q3, kp, vp, profile, sink, out, part_acc, part_ml, tiles[0],
-        tiles[1], cu_q, used, table, q3.stride(0), q3.stride(1),
-        sink.stride(0), out.stride(0), out.stride(1), kp.stride(0),
-        kp.stride(1), kp.stride(2), vp.stride(0), vp.stride(1), vp.stride(2),
+        q3, kp, vp, rel, proj, sink, out, scratch, part_acc, part_ml,
+        tiles[0], tiles[1], cu_q, used, table, q3.stride(0), q3.stride(1),
+        rel.stride(0), rel.stride(1), sink.stride(0), out.stride(0),
+        out.stride(1), kp.stride(0), kp.stride(1), kp.stride(2), vp.stride(0),
+        vp.stride(1), vp.stride(2),
         table.stride(0), dim ** -0.5 * 1.4426950408889634, int(window),
         splits, GROUP=group, HEADS=heads, BM=block_rows, BN=block_keys, D=dim,
-        EXTENT=extent, PAGE=page, HAS_WINDOW=window > 0, SPLIT=splits > 1,
+        R=rank, EXTENT=extent, PAGE=page, SPAN=span, WCH=32,
+        HAS_WINDOW=window > 0, SPLIT=splits > 1,
         num_warps=num_warps, num_stages=num_stages)
     if splits > 1:
         _kernels()["merge_splits"][(rows, heads)](
@@ -1081,25 +1114,6 @@ def quantize_tokens(torch, x, c_map, ids, offsets, sf_offsets, *, nvfp4,
             row_scale, bf16, K=k, CH=_chunk(k, 256), TOPK=topk, NVFP4=nvfp4,
             HW=_hardware_e2m1(device), num_warps=4)
     return (q, sf, row_scale) if nvfp4 else (bf16, None, None)
-
-
-def quantize_rows(torch, x):
-    """Quantize each row of x to NVFP4 with its own outer scale.
-
-    Returns:
-        (packed (rows, K/2) uint8, swizzled scales fp8, row scales
-        (rows,) fp32), for a dense NVFP4 GEMM whose output rows the row
-        scales multiply.
-    """
-    rows = x.shape[0]
-    device = x.device
-    ids = torch.zeros((rows, 1), dtype=torch.int32, device=device)
-    c_map = torch.arange(rows, dtype=torch.int32, device=device)
-    # built on the device, since a graph capture allows no host copy
-    offsets = torch.arange(2, dtype=torch.int32, device=device) * rows
-    sf_offsets = torch.zeros(2, dtype=torch.int32, device=device)
-    return quantize_tokens(torch, x, c_map, ids, offsets, sf_offsets,
-                           nvfp4=True, sf_rows=rows)
 
 
 def swiglu_quantize(torch, gate_up, row_scale, gamma, expert, offsets,

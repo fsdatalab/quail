@@ -69,7 +69,7 @@ def test_relative_attention_matches_dense_attention(window):
         cu.append(cu[-1] + rows)
     cu_q = torch.tensor(cu, dtype=torch.int32, device="cuda")
     used = torch.tensor([u for _, u in shapes], dtype=torch.int32, device="cuda")
-    for block_rows in (16, 128):
+    for block_rows in (16, 64, 128):
         seqs, firsts = kernels.attention_tiles(cu, block_rows // 3)
         tiles = (torch.from_numpy(seqs).cuda(), torch.from_numpy(firsts).cuda())
         out = torch.empty_like(q)
@@ -190,33 +190,6 @@ def test_nvfp4_rows_round_trip_and_the_expert_gemm_matches_dequantized_math():
         error = ((out[part].float() - expected).norm()
                  / expected.norm().clamp(min=1e-6)).item()
         assert error < 1e-2, (e, error)
-
-
-def test_an_nvfp4_projection_row_ignores_the_other_rows_of_its_pass():
-    from vllm import _custom_ops as ops
-
-    from quail.backends.quail.executor.models import inkling2_kernels as kernels
-
-    torch.manual_seed(3)
-    hidden, width = 2304, 512
-    x = torch.randn(4, hidden, device="cuda", dtype=torch.bfloat16)
-    weight = torch.randn(width, hidden, device="cuda", dtype=torch.bfloat16)
-    scale = 6.0 * 448.0 / weight.abs().amax().float()
-    values, scales = ops.scaled_fp4_quant(weight, scale)
-
-    def project(rows):
-        q, sf, row_scale = kernels.quantize_rows(torch, rows)
-        out = ops.cutlass_scaled_fp4_mm(q, values, sf, scales, 1.0 / scale,
-                                        torch.bfloat16)
-        return out * row_scale[:, None]
-
-    # a padding row a thousand times larger than the real rows
-    padded = torch.cat([x, 1000 * x[:1]])
-    alone, beside = project(x), project(padded)[:4]
-    assert torch.equal(alone, beside)
-    expected = x.float() @ weight.float().t()
-    relative = ((alone.float() - expected).norm() / expected.norm()).item()
-    assert relative < 0.15, relative
 
 
 def test_the_message_gates_match_their_definition():

@@ -44,9 +44,6 @@ SKIPPED_PARTS = ("model.visual.",)
 # output, expert output
 STATE_CHANNELS = {"k": (0, 1024), "v": (1024, 2048), "attn": (2048, 4352),
                   "mlp": (4352, 6656)}
-# NVFP4's largest value times fp8 e4m3's: a global scale maps a tensor's
-# largest magnitude here
-FP4_RANGE = 6.0 * 448.0
 # the message gates of a loop layer, by checkpoint controller name
 GATES = (("q", "attn"), ("k", "k"), ("v", "v"), ("mlp", "mlp"))
 
@@ -114,38 +111,12 @@ def _dequantize_mxfp8(torch, weight, scale):
     return out
 
 
-def _fp4_weight(torch, sides):
-    """NVFP4 weights of stacked projections, each side padded to 128 rows.
-
-    The swizzled block scales come in tiles of 128 rows, so a side that
-    starts on a tile can be sliced out of the stack and multiplied alone.
-
-    Returns:
-        Namespace with the packed values, block scales, the GEMM alpha
-        that undoes the global scale, and each side's first row in the
-        stack.
-    """
-    from vllm import _custom_ops as ops
-
-    padded = [torch.cat([side, side.new_zeros(-side.shape[0] % 128,
-                                              side.shape[1])])
-              for side in sides]
-    weight = torch.cat(padded).contiguous()
-    scale = FP4_RANGE / weight.abs().amax().float().clamp(min=1e-12)
-    values, scales = ops.scaled_fp4_quant(weight, scale)
-    starts = np.cumsum([0] + [side.shape[0] for side in padded]).tolist()
-    return SimpleNamespace(values=values, scales=scales, alpha=1.0 / scale,
-                           starts=starts)
-
-
-def load_inkling2(path, device="cuda", *, quantize_fp4=False):
+def load_inkling2(path, device="cuda"):
     """Load an Inkling 2 Mini checkpoint's language model onto the GPU.
 
     Args:
         path: The local checkpoint directory.
         device: Where the weights go.
-        quantize_fp4: Quantize the bf16 attention projections to
-            NVFP4 as they load.
 
     Raises:
         ValueError: The checkpoint lacks a tensor the pass reads.
@@ -217,12 +188,6 @@ def load_inkling2(path, device="cuda", *, quantize_fp4=False):
         layer.side_rows = np.cumsum([0] + [sum(w) for w in widths]).tolist()
         layer.q_widths, layer.k_widths, layer.v_widths = widths
         layer.wo = take(own("attn.wo_ud.weight"))
-        layer.fp4 = None
-        if quantize_fp4:
-            sides = [torch.cat(side) for side in (q_side, k_side, v_side)]
-            layer.fp4 = _fp4_weight(torch, sides)
-            layer.wo_fp4 = _fp4_weight(torch, [layer.wo])
-            del layer.w_all, layer.wo
         layer.q_scale = take(own("attn.q_l2_clip.scale"))
         layer.rel_scale = take(own("attn.rel_l2_clip.scale"))
         layer.rel_proj = take(own("attn.rel_logits_proj.proj")).contiguous()
@@ -584,32 +549,9 @@ class Inkling2Pipeline(ModelPipeline):
         return tuple(self._gates(layer.gates["qkv"], hidden, messages,
                                  weight))
 
-    def _fp4_linear(self, x, weight, first=0, last=None):
-        """Return x @ rows [first, last) of an NVFP4 weight, in bf16.
-
-        Each activation row takes its own scale, so a row's result does
-        not depend on the other rows of the pass, padding included.
-        """
-        from vllm import _custom_ops as ops
-
-        torch = self.torch
-        values, scales, row_scale = kernels.quantize_rows(torch, x)
-        last = weight.starts[-1] if last is None else last
-        out = ops.cutlass_scaled_fp4_mm(
-            values, weight.values[first:last], scales,
-            weight.scales[first:last], weight.alpha, torch.bfloat16)
-        return out.mul_(row_scale[:, None])
-
     def _projections(self, layer, inputs):
         """(q side, k side, v side) projection outputs."""
         torch = self.torch
-        if layer.fp4 is not None:
-            starts = layer.fp4.starts
-            if len(inputs) == 1:
-                out = self._fp4_linear(inputs[0], layer.fp4)
-                return tuple(out[:, starts[i]:starts[i + 1]] for i in range(3))
-            return tuple(self._fp4_linear(inputs[i], layer.fp4, starts[i],
-                                          starts[i + 1]) for i in range(3))
         if len(inputs) == 1:
             out = torch.mm(inputs[0], layer.w_all.t())
             bounds = layer.side_rows
@@ -696,9 +638,7 @@ class Inkling2Pipeline(ModelPipeline):
         state = self.arena.conv_state[:, visit.index]
         gated = kernels.gate_attention(torch, run.attn.view(n, width),
                                        run.gate)
-        projected = (self._fp4_linear(gated, layer.wo_fp4)
-                     if layer.fp4 is not None
-                     else torch.mm(gated, layer.wo.t()))
+        projected = torch.mm(gated, layer.wo.t())
         attn_out = kernels.short_conv(torch, projected, run.taps,
                                       state[:, :, 2048:4352], layer.attn_conv)
         self._save_state(projected, run, state, "attn")
@@ -792,6 +732,7 @@ class Inkling2Pipeline(ModelPipeline):
             unified["used"], unified["table"],
             window=self.window if layer.is_local else 0,
             max_keys=unified["max_used"], block_rows=plan["block_rows"],
+            block_keys=64 if prefill else 32,
             num_warps=8 if prefill else 4, num_stages=3 if prefill else 2)
 
     def stage(self, buffers, chunk):
@@ -820,8 +761,8 @@ class Inkling2Pipeline(ModelPipeline):
         taps, slots, sources = conv_taps(meta["gdn"], chunk.tokens)
         unified = meta["unified"]
         group = self.spec.num_q_heads // self.spec.num_kv_heads
-        # 16-row tiles for answer steps, 128-row tiles for prefill
-        block_rows = 16 if unified["max_q"] <= 5 else 128
+        # 16-row tiles for answer steps, 64-row tiles for prefill
+        block_rows = 16 if unified["max_q"] <= 5 else 64
         seqs, firsts = kernels.attention_tiles(unified["cu_q_host"],
                                                block_rows // group)
 
