@@ -72,7 +72,9 @@ Run every check before you push:
 algorithm (PufferLib's SKILL_ISSUES.md) removes: tokens, functions used
 once, error guards, nesting, forwarding functions, and style. Save a
 baseline with `--json`, refactor, then run `--compare` on the baseline;
-it exits 1 when a count rises. `--list <metric>` prints the work, and
+it exits 1 when a count rises. `--trade N` lets nesting,
+line-length, and line counts rise when code tokens fall by N for each
+unit of their rise. `--list <metric>` prints the work, and
 `--under <path>` narrows the counts to one directory. The tests must
 still pass: the tool measures length, not behavior.
 

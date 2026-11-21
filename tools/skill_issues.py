@@ -86,6 +86,10 @@ METRICS = {
     "max_depth": ("info", "the deepest line in any function"),
 }
 LANGUAGES = ("python", "rust")
+# counts --trade lets rise while code_tokens falls: inlining a helper
+# nests its body deeper and lengthens its lines
+SOFT_METRICS = ("code_lines", "depth_excess", "lines_over_80",
+                "aligned_continuations")
 DIVIDER = re.compile(r"([-=#*~_])\1\1")
 TRANSPARENT_DECORATORS = {
     "property", "staticmethod", "classmethod", "cached_property", "cache",
@@ -1406,6 +1410,11 @@ def main(argv=None) -> int:
                         help="print the items behind a metric")
     parser.add_argument("--under", default="",
                         help="count only the files under this path prefix")
+    parser.add_argument("--trade", type=int, metavar="N",
+                        help="with --compare, accept a rise in the soft counts "
+                        "(code_lines, depth_excess, lines_over_80, "
+                        "aligned_continuations) when code_tokens fell by N "
+                        "or more for each unit of their summed rise")
     parser.add_argument("--no-references", action="store_true",
                         help="skip the Rust index; Rust reference metrics "
                         "read 0")
@@ -1424,6 +1433,16 @@ def main(argv=None) -> int:
     base = json.loads(Path(arguments.compare).read_text()) \
         if arguments.compare else None
     worse = print_table(data, base, arguments.under)
+    if worse and arguments.trade:
+        current, before = totals(data, arguments.under), totals(base, arguments.under)
+        for language in LANGUAGES:
+            removed = before["code_tokens"][language] - current["code_tokens"][language]
+            rise = sum(max(0, current[metric][language] - before[metric][language])
+                       for metric in SOFT_METRICS)
+            if removed > 0 and rise * arguments.trade <= removed:
+                worse = [entry for entry in worse
+                         if entry not in {f"{metric} ({language})"
+                                          for metric in SOFT_METRICS}]
     if worse:
         print("worse: " + ", ".join(worse), file=sys.stderr)
         return 1

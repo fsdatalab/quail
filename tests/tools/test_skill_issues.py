@@ -331,3 +331,43 @@ def test_rust_references_come_from_the_rust_analyzer_index(
         "crates/quail/src/lib.rs:10 tested 1 lines"]
     assert _items(data, "excluded_functions") == [
         "crates/quail/src/lib.rs:4 api public"]
+
+
+def test_trade_accepts_deeper_nesting_only_for_enough_removed_tokens(
+        tmp_path, monkeypatch, capsys):
+    helper_text = """\
+        def scaled(value):
+            if value > 0:
+                return value * 2
+            return 0
+
+
+        def run(values):
+            out = []
+            for value in values:
+                if value:
+                    out.append(scaled(value))
+            return out
+        """
+    inlined_text = """\
+        def run(values):
+            out = []
+            for value in values:
+                if value:
+                    if value > 0:
+                        out.append(value * 2)
+                    else:
+                        out.append(0)
+            return out
+        """
+    base = tmp_path / "base.json"
+    root = tmp_path / "tree"
+    _measure(root, monkeypatch, {"quail/a.py": helper_text})
+    skill_issues.main(["--no-references", "--json", str(base)])
+    _measure(root, monkeypatch, {"quail/a.py": inlined_text})
+    capsys.readouterr()
+    assert skill_issues.main(["--no-references", "--compare", str(base)]) == 1
+    assert skill_issues.main(["--no-references", "--compare", str(base),
+                              "--trade", "1"]) == 0
+    assert skill_issues.main(["--no-references", "--compare", str(base),
+                              "--trade", "1000"]) == 1
