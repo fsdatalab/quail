@@ -14,6 +14,11 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(),
                                 reason="needs a CUDA device")
 
 HEADS, KV_HEADS, DIM, RANK, EXTENT, PAGE = 24, 8, 128, 16, 1024, 128
+# FP4 tensor cores, FlashInfer's fused MoE, and the FA4 bias patch
+needs_sm100 = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability()[0] != 10,
+    reason="needs an SM100 GPU")
 
 
 def _dense_attention(q, k, v, rel, sink, proj, window):
@@ -107,6 +112,7 @@ def test_relative_attention_matches_dense_attention(window):
         _assert_dense(inputs, shapes, out, window, block_rows)
 
 
+@needs_sm100
 @pytest.mark.parametrize("window", [0, 1024])
 def test_fa4_prefill_and_answer_steps_match_dense_attention(window):
     import numpy as np
@@ -214,6 +220,7 @@ def _dequantize(packed, scales, row_scale):
     return values.reshape(packed.shape[0], -1) * row_scale[:, None]
 
 
+@needs_sm100
 def test_nvfp4_rows_round_trip_and_the_expert_gemm_matches_dequantized_math():
     from vllm import _custom_ops as ops
     from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
@@ -386,6 +393,7 @@ def _cosine(a, b):
         a.float().flatten(), b.float().flatten(), dim=0).item()
 
 
+@needs_sm100
 def test_the_fused_experts_agree_with_quails_expert_path(monkeypatch):
     from quail.backends.quail.executor.models import inkling2
 
