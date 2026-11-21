@@ -144,19 +144,13 @@ pub fn stages(graph: &PhysicalGraph, gpus: usize) -> Result<Vec<Stage>, String> 
         .into_iter()
         .map(|index| CutNode::of(&graph.nodes[index]))
         .collect();
-    if gpus == 1 {
-        return Ok(whole(&nodes));
+    if gpus != 1 {
+        return cut(&nodes);
     }
-    cut(&nodes)
-}
-
-/// Nodes, in topological order, as one stage that reads each scan whole;
-/// no stage when no node computes.
-fn whole(nodes: &[CutNode]) -> Vec<Stage> {
     let (scans, inside): (Vec<&CutNode>, Vec<&CutNode>) =
         nodes.iter().partition(|node| node.role == Role::Scan);
     if inside.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let mut inputs: Vec<StageInput> = Vec::new();
     for source in inside.iter().flat_map(|node| &node.inputs) {
@@ -170,12 +164,12 @@ fn whole(nodes: &[CutNode]) -> Vec<Stage> {
             inputs.push(input);
         }
     }
-    vec![Stage {
+    Ok(vec![Stage {
         key: String::new(),
         nodes: inside.iter().map(|node| node.id.clone()).collect(),
         inputs,
         outputs: Vec::new(),
-    }]
+    }])
 }
 
 /// Cut nodes, in topological order, into stages.
