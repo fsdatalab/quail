@@ -45,14 +45,11 @@ pub struct Planned<'a> {
 }
 
 impl Planned<'_> {
-    fn graph(&self) -> Result<PhysicalGraph> {
-        serde_json::from_value(self.envelope["graph"].clone()).map_err(failure)
-    }
-
     /// The region's compute nodes as a graph: the nodes the workers run
     /// and the scans they read.
     fn compute(&self) -> Result<PhysicalGraph> {
-        let graph = self.graph()?;
+        let graph: PhysicalGraph =
+            serde_json::from_value(self.envelope["graph"].clone()).map_err(failure)?;
         let nodes: Vec<PhysicalNode> = compute_nodes(&graph)
             .into_iter()
             .map(|index| graph.nodes[index].clone())
