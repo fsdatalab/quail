@@ -604,26 +604,6 @@ class CopyConstraint:
         return self._choose(values[:, 1 + k:], values[:, 1:1 + k].to(self.torch.int64),
                             values[:, 0], streams, alive, at, documents, first)
 
-    def _document_options(self, documents):
-        """Return each row's document options, padded with -1, and their keys.
-
-        A key is the option's key index within its document.
-        """
-        torch = self.torch
-        keys = (self.document_key_starts_device[documents, None]
-                + torch.arange(self.num_keys, device=self.device))
-        inside = keys < self.document_key_ends_device[documents, None]
-        keys = torch.where(inside, keys, 0)
-        counts = torch.where(inside, self.key_option_counts[keys], 0)
-        ends = counts.cumsum(dim=1)
-        columns = torch.arange(self.max_options, device=self.device).expand(
-            len(documents), -1).contiguous()
-        key = torch.searchsorted(ends, columns, right=True).clamp_max(
-            self.num_keys - 1)
-        options = (self.key_option_starts[keys.gather(1, key)] + columns
-                   - (ends - counts).gather(1, key))
-        return torch.where(columns < ends[:, -1:], options, -1), key
-
     def _choose(self, top_values, top_ids, stop, streams, alive, at, documents, first):
         torch = self.torch
         sorted_ids, order = top_ids.sort(dim=1)
@@ -638,7 +618,19 @@ class CopyConstraint:
         top = top_ids[:, 0]
         possible = alive
         if first:
-            options, key = self._document_options(documents)
+            keys = (self.document_key_starts_device[documents, None]
+                + torch.arange(self.num_keys, device=self.device))
+            inside = keys < self.document_key_ends_device[documents, None]
+            keys = torch.where(inside, keys, 0)
+            counts = torch.where(inside, self.key_option_counts[keys], 0)
+            ends = counts.cumsum(dim=1)
+            columns = torch.arange(self.max_options, device=self.device).expand(
+                len(documents), -1).contiguous()
+            key = torch.searchsorted(ends, columns, right=True).clamp_max(
+                self.num_keys - 1)
+            options = (self.key_option_starts[keys.gather(1, key)] + columns
+                - (ends - counts).gather(1, key))
+            options = torch.where(columns < ends[:, -1:], options, -1)
             option = options.clamp_min(0)
             values = scores(self.first_tokens[option])
             values = torch.where(options >= 0, values, -float("inf"))
