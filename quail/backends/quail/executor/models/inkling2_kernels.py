@@ -405,64 +405,127 @@ def _kernels() -> dict:
                          out.to(out_ptr.dtype.element_ty))
 
     @triton.jit
-    def _message(prev_block_ptr, prev_out_ptr, stride_prev, query_ptr, row,
-                 offs, mask, eps, H: tl.constexpr):
-        a = tl.load(prev_block_ptr + row * stride_prev + offs, mask=mask,
-                    other=0.0).to(tl.float32)
-        b = tl.load(prev_out_ptr + row * stride_prev + offs, mask=mask,
-                    other=0.0).to(tl.float32)
-        q = tl.load(query_ptr + offs, mask=mask, other=0.0)
-        a = a * tl.math.rsqrt(tl.sum(a * a, axis=0) / H + eps)
-        b = b * tl.math.rsqrt(tl.sum(b * b, axis=0) / H + eps)
-        sa = tl.sum(q * a, axis=0)
-        sb = tl.sum(q * b, axis=0)
+    def _blend(aa, bb, ab, qa, qb, eps, H: tl.constexpr):
+        # the message (alpha a + beta b) of the previous pass's last block a
+        # and output b: their RMS-normed softmax blend by query score;
+        # returns alpha, beta, and the message's squared sum
+        inv_a = tl.math.rsqrt(aa / H + eps)
+        inv_b = tl.math.rsqrt(bb / H + eps)
+        sa = qa * inv_a
+        sb = qb * inv_b
         top = tl.maximum(sa, sb)
         ea = tl.exp(sa - top)
         eb = tl.exp(sb - top)
-        return (ea * a + eb * b) / (ea + eb)
+        alpha = ea * inv_a / (ea + eb)
+        beta = eb * inv_b / (ea + eb)
+        mm = alpha * alpha * aa + 2.0 * alpha * beta * ab + beta * beta * bb
+        return alpha, beta, mm
 
     @triton.jit
     def gate_inputs(hidden_ptr, stride_hg, stride_h, prev_block_ptr,
                     prev_out_ptr, stride_prev, query_ptr, out_ptr, stride_og,
-                    stride_o, eps, H: tl.constexpr, HP: tl.constexpr):
-        # [norm(hidden) | norm(message)] in bf16 for gate program_id(1)
+                    stride_o, eps, H: tl.constexpr, CH: tl.constexpr):
+        # [norm(hidden) | norm(message)] in bf16 for gate program_id(1); the
+        # first pass sums products in registers, the second writes
         row = tl.program_id(0).to(tl.int64)
         gate = tl.program_id(1)
-        offs = tl.arange(0, HP)
-        mask = offs < H
-        h = tl.load(hidden_ptr + gate * stride_hg + row * stride_h + offs,
-                    mask=mask, other=0.0).to(tl.float32)
-        m = _message(prev_block_ptr, prev_out_ptr, stride_prev,
-                     query_ptr + gate * H, row, offs, mask, eps, H)
-        h = h * tl.math.rsqrt(tl.sum(h * h, axis=0) / H + eps)
-        m = m * tl.math.rsqrt(tl.sum(m * m, axis=0) / H + eps)
+        offs = tl.arange(0, CH)
+        hidden = hidden_ptr + gate * stride_hg + row * stride_h
+        block = prev_block_ptr + row * stride_prev
+        prev = prev_out_ptr + row * stride_prev
+        query = query_ptr + gate * H
+        hh = tl.zeros((CH,), dtype=tl.float32)
+        aa = tl.zeros((CH,), dtype=tl.float32)
+        bb = tl.zeros((CH,), dtype=tl.float32)
+        ab = tl.zeros((CH,), dtype=tl.float32)
+        qa = tl.zeros((CH,), dtype=tl.float32)
+        qb = tl.zeros((CH,), dtype=tl.float32)
+        for c in range(0, H, CH):
+            cols = c + offs
+            h = tl.load(hidden + cols).to(tl.float32)
+            a = tl.load(block + cols).to(tl.float32)
+            b = tl.load(prev + cols).to(tl.float32)
+            q = tl.load(query + cols)
+            hh += h * h
+            aa += a * a
+            bb += b * b
+            ab += a * b
+            qa += q * a
+            qb += q * b
+        alpha, beta, mm = _blend(tl.sum(aa, 0), tl.sum(bb, 0), tl.sum(ab, 0),
+                                 tl.sum(qa, 0), tl.sum(qb, 0), eps, H)
+        inv_h = tl.math.rsqrt(tl.sum(hh, 0) / H + eps)
+        inv_m = tl.math.rsqrt(mm / H + eps)
+        alpha *= inv_m
+        beta *= inv_m
         out = out_ptr + gate * stride_og + row * stride_o
-        tl.store(out + offs, h.to(tl.bfloat16), mask=mask)
-        tl.store(out + H + offs, m.to(tl.bfloat16), mask=mask)
+        for c in range(0, H, CH):
+            cols = c + offs
+            h = tl.load(hidden + cols).to(tl.float32)
+            a = tl.load(block + cols).to(tl.float32)
+            b = tl.load(prev + cols).to(tl.float32)
+            tl.store(out + cols, (h * inv_h).to(tl.bfloat16))
+            tl.store(out + H + cols, (alpha * a + beta * b).to(tl.bfloat16))
+
+    @triton.jit
+    def _gate_part(hidden, block, prev, query, gains, start, W: tl.constexpr,
+                   H: tl.constexpr):
+        # columns [start, start + W) of one gate's row: u = (1 - tanh(f)) h,
+        # v = tanh(g), and the previous pass's block a and output b
+        cols = start + tl.arange(0, W)
+        h = tl.load(hidden + cols).to(tl.float32)
+        a = tl.load(block + cols).to(tl.float32)
+        b = tl.load(prev + cols).to(tl.float32)
+        q = tl.load(query + cols)
+        u = (1.0 - libdevice.tanh(tl.load(gains + cols))) * h
+        v = libdevice.tanh(tl.load(gains + H + cols))
+        return u, v, a, b, q
 
     @triton.jit
     def gate_apply(hidden_ptr, stride_hg, stride_h, prev_block_ptr,
                    prev_out_ptr, stride_prev, query_ptr, gains_ptr,
                    stride_gg, stride_g, weight_ptr, out_ptr, stride_og,
-                   stride_o, eps, H: tl.constexpr, HP: tl.constexpr):
-        # norm((1 - tanh(f)) * hidden + tanh(g) * message) * weight
+                   stride_o, eps, H: tl.constexpr, HEAD: tl.constexpr,
+                   TAIL: tl.constexpr):
+        # norm((1 - tanh(f)) h + tanh(g) m) * weight in one pass, the row
+        # held as a power-of-two head and a power-of-two tail
         row = tl.program_id(0).to(tl.int64)
         gate = tl.program_id(1)
-        offs = tl.arange(0, HP)
-        mask = offs < H
-        h = tl.load(hidden_ptr + gate * stride_hg + row * stride_h + offs,
-                    mask=mask, other=0.0).to(tl.float32)
-        m = _message(prev_block_ptr, prev_out_ptr, stride_prev,
-                     query_ptr + gate * H, row, offs, mask, eps, H)
+        hidden = hidden_ptr + gate * stride_hg + row * stride_h
+        block = prev_block_ptr + row * stride_prev
+        prev = prev_out_ptr + row * stride_prev
+        query = query_ptr + gate * H
         gains = gains_ptr + gate * stride_gg + row * stride_g
-        forget = libdevice.tanh(tl.load(gains + offs, mask=mask, other=0.0))
-        gain = libdevice.tanh(tl.load(gains + H + offs, mask=mask, other=0.0))
-        out = (1.0 - forget) * h + gain * m
-        w = tl.load(weight_ptr + gate * H + offs, mask=mask,
-                    other=0.0).to(tl.float32)
-        out = out * tl.math.rsqrt(tl.sum(out * out, axis=0) / H + eps) * w
-        tl.store(out_ptr + gate * stride_og + row * stride_o + offs,
-                 out.to(tl.bfloat16), mask=mask)
+        u, v, a, b, q = _gate_part(hidden, block, prev, query, gains, 0, HEAD,
+                                   H)
+        aa = tl.sum(a * a, 0)
+        bb = tl.sum(b * b, 0)
+        ab = tl.sum(a * b, 0)
+        qa = tl.sum(q * a, 0)
+        qb = tl.sum(q * b, 0)
+        if TAIL > 0:
+            u2, v2, a2, b2, q2 = _gate_part(hidden, block, prev, query, gains,
+                                            HEAD, TAIL, H)
+            aa += tl.sum(a2 * a2, 0)
+            bb += tl.sum(b2 * b2, 0)
+            ab += tl.sum(a2 * b2, 0)
+            qa += tl.sum(q2 * a2, 0)
+            qb += tl.sum(q2 * b2, 0)
+        alpha, beta, mm = _blend(aa, bb, ab, qa, qb, eps, H)
+        y = u + v * (alpha * a + beta * b)
+        total = tl.sum(y * y, 0)
+        if TAIL > 0:
+            y2 = u2 + v2 * (alpha * a2 + beta * b2)
+            total += tl.sum(y2 * y2, 0)
+        scale = tl.math.rsqrt(total / H + eps)
+        out = out_ptr + gate * stride_og + row * stride_o
+        cols = tl.arange(0, HEAD)
+        w = tl.load(weight_ptr + gate * H + cols).to(tl.float32)
+        tl.store(out + cols, (y * scale * w).to(tl.bfloat16))
+        if TAIL > 0:
+            cols2 = HEAD + tl.arange(0, TAIL)
+            w2 = tl.load(weight_ptr + gate * H + cols2).to(tl.float32)
+            tl.store(out + cols2, (y2 * scale * w2).to(tl.bfloat16))
 
     @triton.jit
     def rms_norm(x_ptr, stride_x, weight_ptr, out_ptr, stride_o, eps,
@@ -1121,7 +1184,7 @@ def gate_inputs(torch, hidden, prev_block, prev_out, query, eps=1e-6):
         _kernels()["gate_inputs"][(rows, gates)](
             hidden, stride_hg, stride_h, prev_block, prev_out,
             prev_block.stride(0), query, out, out.stride(0), out.stride(1),
-            eps, H=width, HP=_hp(width), num_warps=16)
+            eps, H=width, CH=_chunk(width, 256), num_warps=1)
     return out
 
 
@@ -1150,7 +1213,8 @@ def gate_apply(torch, hidden, prev_block, prev_out, query, gains, weight,
             hidden, stride_hg, stride_h, prev_block, prev_out,
             prev_block.stride(0), query, gains, gains.stride(0),
             gains.stride(1), weight, out, out.stride(0), out.stride(1), eps,
-            H=width, HP=_hp(width), num_warps=16)
+            H=width, HEAD=_pow2(width + 1) // 2,
+            TAIL=width - _pow2(width + 1) // 2, num_warps=8)
     return out
 
 
