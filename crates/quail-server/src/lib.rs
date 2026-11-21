@@ -538,19 +538,16 @@ pub fn run(
                     .max_decoding_message_size(MAX_UPLOAD_MESSAGE_BYTES),
                 move |request| check_token(token.as_deref(), request),
             ))
-            .serve_with_shutdown(address, stopped()),
+            .serve_with_shutdown(address, async {
+                use tokio::signal::unix::{SignalKind, signal};
+                let mut terminate = signal(SignalKind::terminate()).expect("a SIGTERM handler");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }),
     )?;
     queue.close();
     // the session's workers stop, and their sockets go, as it drops
     Ok(())
-}
-
-/// Resolves when the server is told to stop: Ctrl-C, or SIGTERM.
-async fn stopped() {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut terminate = signal(SignalKind::terminate()).expect("a SIGTERM handler");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = terminate.recv() => {}
-    }
 }
