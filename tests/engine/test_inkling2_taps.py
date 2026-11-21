@@ -91,3 +91,27 @@ def test_staging_no_chunk_leaves_no_tap_slot_or_source_of_an_earlier_pass():
     assert buffers.taps.eq(-1).all()
     assert buffers.write_slots.eq(-1).all()
     assert buffers.write_sources.eq(-1).all()
+
+
+def test_a_long_sequence_off_blackwell_plans_triton_tiles_not_fa4():
+    torch = pytest.importorskip("torch")
+    from types import SimpleNamespace
+
+    from quail.backends.quail.executor.models.inkling2 import Inkling2Pipeline
+
+    pipeline = Inkling2Pipeline.__new__(Inkling2Pipeline)
+    pipeline.torch = torch
+    pipeline.spec = SimpleNamespace(num_q_heads=24, num_kv_heads=8)
+    arena = bare_arena(KVArena.__new__(KVArena), 64)
+    arena.accounting = PageArena(64, 16, num_slots=8)
+    arena.accounting.alloc("p", 64)
+    phases = plan_phases(arena, [group("p", 48, 0, 48)], stage)
+    # a CPU chunk stands in for a GPU the FA4 patch does not cover
+    chunk = SimpleNamespace(
+        tokens=50, input_ids=torch.zeros(50, dtype=torch.int64),
+        meta=dict(gdn=phases, unified=dict(cu_q_host=[0, 50])))
+    plan = pipeline._plan(chunk)
+    assert plan["prefill"] is None
+    assert plan["block_rows"] == 64
+    # 50 tokens in tiles of 21 tokens, three heads to a token
+    assert plan["tiles"][1].tolist() == [0, 21, 42]

@@ -50,9 +50,11 @@ FUSED_MIN_TOKENS = 4096
 # attention one token per program
 DECODE_MAX_QUERIES = 4
 # a chunk whose longer sequences hold at most this many queries runs them
-# in query tiles of SHORT_BLOCK_ROWS rows; a longer one, on FA4
+# in query tiles of SHORT_BLOCK_ROWS rows; a longer one, on FA4, or in
+# tiles of PREFILL_BLOCK_ROWS rows on a GPU FA4's patch does not cover
 SHORT_MAX_QUERIES = 5
 SHORT_BLOCK_ROWS = 16
+PREFILL_BLOCK_ROWS = 64
 # a decode-only chunk up to this many tokens replays as one CUDA graph,
 # attention included, reading a block table this many pages wide
 WHOLE_MAX_TOKENS = 512
@@ -126,6 +128,42 @@ def _fused_order(torch, w13):
     return grouped.reshape(experts, rows, cols).contiguous().view(w13.dtype)
 
 
+def marlin_experts(torch, w13, w13_scale, w2, w2_scale, w13_alpha,
+                   w2_alpha):
+    """NVFP4 experts repacked for vLLM's Marlin MoE, which takes bf16 rows.
+
+    Args:
+        torch: The torch module.
+        w13: (experts, 2N, K/2) packed FC1, (gate, up) row pairs.
+        w13_scale: (experts, 2N, K/16) e4m3 block scales of w13.
+        w2: (experts, K, N/2) packed FC2.
+        w2_scale: (experts, K, N/16) e4m3 block scales of w2.
+        w13_alpha: (experts,) global scale of w13.
+        w2_alpha: (experts,) global scale of w2.
+
+    Returns:
+        The repacked weights, scales, and Marlin workspace.
+    """
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+        prepare_nvfp4_moe_layer_for_marlin,
+    )
+
+    experts, rows, cols = w13.shape
+
+    def gates_then_ups(tensor):
+        return torch.cat([tensor[:, 0::2], tensor[:, 1::2]], dim=1).contiguous()
+
+    holder = SimpleNamespace(num_experts=experts, hidden_size=cols * 2,
+                             intermediate_size_per_partition=rows // 2,
+                             params_dtype=torch.bfloat16)
+    prepared = prepare_nvfp4_moe_layer_for_marlin(
+        holder, gates_then_ups(w13), gates_then_ups(w13_scale), w13_alpha,
+        w2.contiguous(), w2_scale.contiguous(), w2_alpha, is_act_and_mul=True)
+    names = ("w13", "w13_scale", "w13_global", "w2", "w2_scale", "w2_global")
+    return SimpleNamespace(**dict(zip(names, prepared)),
+                           workspace=holder.workspace)
+
+
 def _dequantize_mxfp8(torch, weight, scale):
     """bf16 values of e4m3 weights with a power-of-two scale per 32 columns."""
     experts, rows, columns = weight.shape
@@ -159,6 +197,8 @@ def load_inkling2(path, device="cuda"):
     config = text_config(path)
     hidden = config["hidden_size"]
     scale = hidden ** -0.5
+    # a GPU without FP4 tensor cores runs the NVFP4 experts on Marlin
+    fp4_cores = torch.cuda.get_device_capability(device)[0] >= 10
     files = {}
     for file in sorted(Path(path).glob("model*.safetensors")):
         with safe_open(str(file), framework="pt", device="cpu") as f:
@@ -235,7 +275,20 @@ def load_inkling2(path, device="cuda"):
         w13_scale = take(own("mlp.experts.w13_weight_scale"))
         w2_scale = take(own("mlp.experts.w2_weight_scale"))
         layer.nvfp4 = w13.dtype == torch.uint8
+        alphas = {}
         if layer.nvfp4:
+            for name in ("w13", "w2"):
+                amax = take(own(f"mlp.experts.{name}_weight_amax"), fp32)
+                denominator = take(
+                    own(f"mlp.experts.{name}_weight_outer_scale_denominator"),
+                    fp32)
+                alphas[name] = (amax / denominator).contiguous()
+        layer.marlin = None
+        if layer.nvfp4 and not fp4_cores:
+            layer.marlin = marlin_experts(torch, w13, w13_scale, w2, w2_scale,
+                                          alphas["w13"], alphas["w2"])
+            del w13, w2, w13_scale, w2_scale
+        elif layer.nvfp4:
             layer.w13, layer.w2 = _fused_order(torch, w13), w2.contiguous()
             layer.w13_scale = swizzle_blockscale(
                 _fused_order(torch, w13_scale)).contiguous()
@@ -249,13 +302,7 @@ def load_inkling2(path, device="cuda"):
             layer.w2_mma = convert_sf_to_mma_layout(
                 layer.w2_scale.view(experts * rows, -1), m=rows, k=cols * 2,
                 num_groups=experts)
-            for name in ("w13", "w2"):
-                amax = take(own(f"mlp.experts.{name}_weight_amax"), fp32)
-                denominator = take(
-                    own(f"mlp.experts.{name}_weight_outer_scale_denominator"),
-                    fp32)
-                setattr(layer, f"{name}_alpha",
-                        (amax / denominator).contiguous())
+            layer.w13_alpha, layer.w2_alpha = alphas["w13"], alphas["w2"]
         else:
             layer.w13 = _fused_order(
                 torch, _dequantize_mxfp8(torch, w13, w13_scale))
@@ -565,6 +612,8 @@ class Inkling2Pipeline(ModelPipeline):
             return torch.empty_like(x)
         ids, weights = self._router(layer, x)
         experts = self.config["n_routed_experts"]
+        if getattr(layer, "marlin", None) is not None:
+            return self._marlin_experts(layer, x, ids, weights)
         if layer.nvfp4 and tokens > FUSED_MIN_TOKENS:
             return self._fused_experts(layer, x, ids, weights)
         topk = ids.shape[1]
@@ -615,6 +664,37 @@ class Inkling2Pipeline(ModelPipeline):
             nvfp4=False, sf_rows=sf_rows, **caps)
         down = torch._grouped_mm(y, layer.w2.transpose(1, 2), offs=ends)
         return kernels.combine(torch, down, None, c_map, tokens, topk)
+
+    def _marlin_experts(self, layer, x, ids, weights):
+        """NVFP4 experts on Marlin, with bf16 rows, for GPUs without FP4 cores.
+
+        The activation applies each routing weight before FC2, as the
+        checkpoint does, so Marlin sums the rows with weight one.
+        """
+        from vllm.model_executor.layers.fused_moe.activation import (
+            MoEActivation,
+        )
+        from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
+            fused_marlin_moe,
+        )
+        from vllm.scalar_type import scalar_types
+
+        torch, marlin = self.torch, layer.marlin
+        flat = weights.reshape(-1).float().contiguous()
+        caps = dict(gate_cap=self.config["mlp_gate_softcap"],
+                    up_cap=self.config["mlp_up_softcap"])
+
+        def activation(kind, out, gate_up, **unused):
+            kernels.situ_rows(torch, out, gate_up, flat, **caps)
+
+        return fused_marlin_moe(
+            x, marlin.w13, marlin.w2, None, None, marlin.w13_scale,
+            marlin.w2_scale, torch.ones_like(weights, dtype=torch.float32),
+            ids, scalar_types.float4_e2m1f.id,
+            global_num_experts=self.config["n_routed_experts"],
+            activation=MoEActivation.SILU, activation_func=activation,
+            global_scale1=marlin.w13_global, global_scale2=marlin.w2_global,
+            workspace=marlin.workspace)
 
     def _fused_experts(self, layer, x, ids, weights):
         """NVFP4 experts through FlashInfer's fused CuTe-DSL MoE.
@@ -907,12 +987,14 @@ class Inkling2Pipeline(ModelPipeline):
                 unified["used"], unified["table"], window=window,
                 max_queries=plan["max_queries"])
         else:
+            short = plan["block_rows"] == SHORT_BLOCK_ROWS
             kernels.rel_attention(
                 torch, buffers.q3[:n], kp, vp, buffers.rel[:n],
                 buffers.sink[:n], layer.rel_proj, buffers.attn[:n],
                 plan["tiles"], *args, window=window,
-                max_keys=unified["max_used"], block_rows=SHORT_BLOCK_ROWS,
-                block_keys=32, num_warps=4, num_stages=2)
+                max_keys=unified["max_used"], block_rows=plan["block_rows"],
+                block_keys=32 if short else 64, num_warps=4 if short else 8,
+                num_stages=2 if short else 3)
         kernels.decode_attention(
             torch, buffers.q3[:n], kp, vp, buffers.rel[:n], buffers.sink[:n],
             layer.rel_proj_t, buffers.attn[:n], plan["tokens"], *args,
@@ -977,12 +1059,16 @@ class Inkling2Pipeline(ModelPipeline):
         cu = np.asarray(unified["cu_q_host"], dtype=np.int64)
         lengths = np.diff(cu)
         # answer steps' tokens run one per program; longer sequences, in
-        # 16-row query tiles when every one is short, else on FA4
+        # 16-row query tiles when every one is short, else on FA4, whose
+        # patch changes only its SM100 kernel, or in Triton's 64-row tiles
         decoded = lengths <= DECODE_MAX_QUERIES
         longest = int(lengths[~decoded].max()) if (~decoded).any() else 0
-        on_fa4 = longest > SHORT_MAX_QUERIES
+        short = longest <= SHORT_MAX_QUERIES
+        on_fa4 = (not short and device.type == "cuda"
+                  and torch.cuda.get_device_capability(device)[0] == 10)
+        block_rows = SHORT_BLOCK_ROWS if short else PREFILL_BLOCK_ROWS
         seqs, firsts = kernels.attention_tiles(
-            cu, SHORT_BLOCK_ROWS // group, keep=~decoded & (not on_fa4))
+            cu, block_rows // group, keep=~decoded & (not on_fa4))
         prefill_seqs, prefill_firsts = kernels.prefill_tiles(
             cu, group, ~decoded)
         token_seqs, token_q = kernels.attention_tiles(cu, 1, keep=decoded)
@@ -1002,7 +1088,7 @@ class Inkling2Pipeline(ModelPipeline):
                               gpu(prefill_firsts, torch.int32))
                              if on_fa4 else None),
                     used_q=gpu(np.where(decoded, 0, lengths), torch.int32),
-                    max_queries=longest)
+                    max_queries=longest, block_rows=block_rows)
         meta["inkling_plan"] = plan
         return plan
 

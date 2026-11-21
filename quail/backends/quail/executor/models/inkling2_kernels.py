@@ -27,6 +27,8 @@ the pass computes what the reference computes up to accumulation order.
   then the sink's share of each row (sink_gate).
 - gate_attention: the sigmoid output gate of every head.
 - route: each token's top experts and their normalized scores.
+- situ_rows: the softcapped SwiGLU of Marlin's FC1 rows, for GPUs
+  without FP4 tensor cores.
 - quantize_tokens, swiglu_quantize, combine: the expert path's
   activation quantization (four-over-six scales), its softcapped
   SwiGLU, and the weighted sum of each token's experts, for passes
@@ -1335,7 +1337,26 @@ def _kernels() -> dict:
                  (o.to(tl.float32) * keep[:, None]).to(tl.bfloat16),
                  mask=ok[:, None])
 
+    @triton.jit
+    def situ_rows(gate_up_ptr, weights_ptr, out_ptr, gate_cap, up_cap,
+                  N: tl.constexpr, BLOCK: tl.constexpr):
+        # one (token, expert) row of Marlin's FC1 output, gate columns then
+        # up columns: the softcapped SwiGLU times the routing weight
+        row = tl.program_id(0).to(tl.int64)
+        cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        mask = cols < N
+        gate = tl.load(gate_up_ptr + row * 2 * N + cols, mask=mask,
+                       other=0.0).to(tl.float32)
+        up = tl.load(gate_up_ptr + row * 2 * N + N + cols, mask=mask,
+                     other=0.0).to(tl.float32)
+        weight = tl.load(weights_ptr + row)
+        y = (gate_cap * _tanh_approx(gate / gate_cap) * _sigmoid_approx(gate)
+             * up_cap * _tanh_approx(up / up_cap))
+        tl.store(out_ptr + row * N + cols, (y * weight).to(tl.bfloat16),
+                 mask=mask)
+
     _KERNELS.update(
+        situ_rows=situ_rows,
         bias_tiles=bias_tiles, sink_gate=sink_gate,
         scatter_state=scatter_state,
         mix=mix, gate_out=gate_out,
@@ -1582,6 +1603,26 @@ def clip_heads(torch, x, scale, positions, *, heads, head_dim, clip,
         x, x.stride(0), scale, positions, out, out.stride(0), out.stride(1),
         clip, alpha, floor, H=heads, HP=_pow2(heads), D=head_dim,
         LOG_SCALE=log_scale is not None, num_warps=_warps(width))
+    return out
+
+
+def situ_rows(torch, out, gate_up, weights, *, gate_cap, up_cap):
+    """The softcapped SwiGLU of each (token, expert) row, times its weight.
+
+    Args:
+        torch: The torch module.
+        out: (rows, N) bf16 output.
+        gate_up: (rows, 2N) FC1 output, the gate columns then the up.
+        weights: (rows,) float32 routing weight of each row.
+        gate_cap: The gate's softcap.
+        up_cap: The up projection's softcap.
+    """
+    rows, width = out.shape
+    if rows:
+        block = 512
+        _kernels()["situ_rows"][(rows, triton_cdiv(width, block))](
+            gate_up, weights, out, float(gate_cap), float(up_cap),
+            N=width, BLOCK=block, num_warps=4)
     return out
 
 

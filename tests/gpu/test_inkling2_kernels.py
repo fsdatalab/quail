@@ -325,7 +325,11 @@ def test_the_message_gates_match_their_definition():
     assert (shared.float() - expected(raw[0])).abs().max().item() < 3e-2
 
 
-def test_the_fused_experts_agree_with_quails_expert_path(monkeypatch):
+EXPERTS, TOPK, HIDDEN, INTER = 128, 8, 2304, 1152
+
+
+def _expert_layer():
+    """Random NVFP4 experts in Quail's FP4 layout, and the checkpoint's."""
     from types import SimpleNamespace
 
     from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
@@ -334,49 +338,110 @@ def test_the_fused_experts_agree_with_quails_expert_path(monkeypatch):
     )
 
     from quail.backends.quail.executor.models import inkling2
-    from quail.backends.quail.executor.models.inkling2 import Inkling2Pipeline
-
-    torch.manual_seed(5)
-    experts, topk, hidden, inter, tokens = 128, 8, 2304, 1152, 4200
 
     def weight(rows, cols):
-        values = torch.randint(0, 256, (experts, rows, cols // 2),
+        values = torch.randint(0, 256, (EXPERTS, rows, cols // 2),
                                dtype=torch.uint8, device="cuda")
-        scales = (torch.rand(experts, rows, cols // 16, device="cuda") * 0.5
+        scales = (torch.rand(EXPERTS, rows, cols // 16, device="cuda") * 0.5
                   + 0.25).to(torch.float8_e4m3fn)
         return values, scales
 
     # FC1 in the checkpoint's order: (gate, up) row pairs
-    w13, w13_s = weight(2 * inter, hidden)
-    w2, w2_s = weight(hidden, inter)
-    w13 = inkling2._fused_order(torch, w13)
-    w13_s = swizzle_blockscale(inkling2._fused_order(torch, w13_s))
-    w2_s = swizzle_blockscale(w2_s)
+    raw = dict(zip(("w13", "w13_scale"), weight(2 * INTER, HIDDEN)))
+    raw.update(zip(("w2", "w2_scale"), weight(HIDDEN, INTER)))
+    raw["w13_alpha"] = torch.rand(EXPERTS, device="cuda") * 0.02 + 0.01
+    raw["w2_alpha"] = torch.rand(EXPERTS, device="cuda") * 0.02 + 0.01
+    w13 = inkling2._fused_order(torch, raw["w13"])
+    w13_s = swizzle_blockscale(inkling2._fused_order(torch, raw["w13_scale"]))
+    w2_s = swizzle_blockscale(raw["w2_scale"])
     layer = SimpleNamespace(
-        nvfp4=True, w13=w13, w2=w2, w13_scale=w13_s, w2_scale=w2_s,
-        w13_mma=convert_sf_to_mma_layout(w13_s.view(experts * 2 * inter, -1),
-                                         m=2 * inter, k=hidden,
-                                         num_groups=experts),
-        w2_mma=convert_sf_to_mma_layout(w2_s.view(experts * hidden, -1),
-                                        m=hidden, k=inter, num_groups=experts),
-        w13_alpha=torch.rand(experts, device="cuda") * 0.02 + 0.01,
-        w2_alpha=torch.rand(experts, device="cuda") * 0.02 + 0.01,
-        router=torch.randn(experts, hidden, device="cuda",
+        nvfp4=True, marlin=None, w13=w13, w2=raw["w2"], w13_scale=w13_s,
+        w2_scale=w2_s,
+        w13_mma=convert_sf_to_mma_layout(w13_s.view(EXPERTS * 2 * INTER, -1),
+                                         m=2 * INTER, k=HIDDEN,
+                                         num_groups=EXPERTS),
+        w2_mma=convert_sf_to_mma_layout(w2_s.view(EXPERTS * HIDDEN, -1),
+                                        m=HIDDEN, k=INTER, num_groups=EXPERTS),
+        w13_alpha=raw["w13_alpha"], w2_alpha=raw["w2_alpha"],
+        router=torch.randn(EXPERTS, HIDDEN, device="cuda",
                            dtype=torch.bfloat16) * 0.05,
-        router_bias=torch.zeros(experts, device="cuda"))
+        router_bias=torch.zeros(EXPERTS, device="cuda"))
+    return layer, raw
+
+
+def _expert_pipeline():
+    from quail.backends.quail.executor.models.inkling2 import Inkling2Pipeline
+
     pipeline = Inkling2Pipeline.__new__(Inkling2Pipeline)
-    pipeline.torch, pipeline.hidden = torch, hidden
+    pipeline.torch, pipeline.hidden = torch, HIDDEN
     pipeline._fp32_out = pipeline._fc2_scale = None
-    pipeline.config = dict(n_routed_experts=experts, num_experts_per_tok=topk,
-                           intermediate_size=inter, route_scale=8.0,
+    pipeline.config = dict(n_routed_experts=EXPERTS, num_experts_per_tok=TOPK,
+                           intermediate_size=INTER, route_scale=8.0,
                            mlp_gate_softcap=4.0, mlp_up_softcap=25.0)
-    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
-    fused = pipeline._experts(layer, x).float()
+    return pipeline
+
+
+def _cosine(a, b):
+    return torch.nn.functional.cosine_similarity(
+        a.float().flatten(), b.float().flatten(), dim=0).item()
+
+
+def test_the_fused_experts_agree_with_quails_expert_path(monkeypatch):
+    from quail.backends.quail.executor.models import inkling2
+
+    torch.manual_seed(5)
+    tokens = 4200
+    layer, _ = _expert_layer()
+    pipeline = _expert_pipeline()
+    x = torch.randn(tokens, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    fused = pipeline._experts(layer, x)
     monkeypatch.setattr(inkling2, "FUSED_MIN_TOKENS", tokens)
-    quail = pipeline._experts(layer, x).float()
-    cosine = torch.nn.functional.cosine_similarity(
-        fused.flatten(), quail.flatten(), dim=0).item()
-    assert cosine > 0.99, cosine
+    quail = pipeline._experts(layer, x)
+    assert _cosine(fused, quail) > 0.99
+
+
+E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def _dequantize_nvfp4(values, scales, alpha):
+    """(experts, rows, cols) float32 weights of packed e2m1 nibbles."""
+    table = torch.tensor(E2M1 + tuple(-v for v in E2M1), device="cuda")
+    low, high = values & 0xF, values >> 4
+    nibbles = torch.stack([low, high], dim=-1).flatten(-2).long()
+    weights = table[nibbles]
+    blocks = scales.float().repeat_interleave(16, dim=-1)
+    return weights * blocks * alpha[:, None, None]
+
+
+def test_the_marlin_experts_match_dequantized_bf16_math():
+    from types import SimpleNamespace
+
+    from quail.backends.quail.executor.models import inkling2
+
+    torch.manual_seed(6)
+    layer, raw = _expert_layer()
+    pipeline = _expert_pipeline()
+    marlin = SimpleNamespace(
+        nvfp4=True, router=layer.router, router_bias=layer.router_bias,
+        marlin=inkling2.marlin_experts(
+            torch, raw["w13"], raw["w13_scale"], raw["w2"], raw["w2_scale"],
+            raw["w13_alpha"], raw["w2_alpha"]))
+    w13 = _dequantize_nvfp4(raw["w13"], raw["w13_scale"], raw["w13_alpha"])
+    w2 = _dequantize_nvfp4(raw["w2"], raw["w2_scale"], raw["w2_alpha"])
+    for tokens in (7, 300):
+        x = torch.randn(tokens, HIDDEN, device="cuda", dtype=torch.bfloat16)
+        ids, weights = pipeline._router(layer, x)
+        expected = torch.zeros(tokens, HIDDEN, device="cuda")
+        for token in range(tokens):
+            for expert, weight in zip(ids[token].tolist(),
+                                      weights[token].tolist()):
+                gate_up = w13[expert] @ x[token].float()
+                gate, up = gate_up[0::2], gate_up[1::2]
+                y = (4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate)
+                     * 25.0 * torch.tanh(up / 25.0) * weight)
+                expected[token] += w2[expert] @ y
+        got = pipeline._experts(marlin, x)
+        assert _cosine(got, expected) > 0.999, tokens
 
 
 def test_routing_picks_the_top_experts_by_biased_score():
