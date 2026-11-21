@@ -129,7 +129,12 @@ class RequestModelExecution:
         if self.answer_submission in ("operator-at-a-time", "shuffled"):
             self._execute_answers(node, survivors, outputs, steps)
         else:
-            self._execute_extractions(node, survivors, outputs, steps)
+            for alias, specs, ids, texts, bodies, body_texts in self._answer_groups(
+                    node, node.extracts, survivors, "AI.EXTRACT"):
+                results = extract_fields(self.client, specs, bodies, texts,
+                    body_texts=body_texts)
+                for spec, result in zip(specs, results):
+                    self._extracted(alias, spec, ids, result, outputs, steps)
             self._execute_maps(node, survivors, outputs, steps)
 
         for alias in node.aliases:
@@ -485,15 +490,6 @@ class RequestModelExecution:
                     for document in ids],
                 ([preamble_text + text for text in document_texts]
                     if self.submit_text else None))
-
-    def _execute_extractions(self, node, survivors, outputs, steps):
-        """Submit extractions and collect their answers."""
-        for alias, specs, ids, texts, bodies, body_texts in self._answer_groups(
-                node, node.extracts, survivors, "AI.EXTRACT"):
-            results = extract_fields(self.client, specs, bodies, texts,
-                body_texts=body_texts)
-            for spec, result in zip(specs, results):
-                self._extracted(alias, spec, ids, result, outputs, steps)
 
     def _execute_maps(self, node, survivors, outputs, steps):
         """Submit every map's prompts and collect the answers."""
