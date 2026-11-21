@@ -93,16 +93,6 @@ def borrow_check(arena, keys, borrowing):
     return can_borrow
 
 
-def lowest_borrows(borrowing):
-    """Per document, the fewest tokens any of its borrowers shares."""
-    lowest = {}
-    for document, parent in enumerate(borrowing.tree_parent):
-        if parent is not None:
-            shared = borrowing.tree_shared[document]
-            lowest[parent] = min(lowest.get(parent, shared), shared)
-    return lowest
-
-
 class StageExecutor:
     """Run every stage over the documents with one admission: one GPU loop.
 
@@ -453,7 +443,12 @@ class StageExecutor:
                 self.borrowing.can_borrow)
         # The admission detaches residents from borrowing: they pack no prefix.
         self.borrowers = self.borrowing.borrowers()
-        self.lowest_borrow = lowest_borrows(self.borrowing)
+        lowest = {}
+        for document, parent in enumerate(self.borrowing.tree_parent):
+            if parent is not None:
+                shared = self.borrowing.tree_shared[document]
+                lowest[parent] = min(lowest.get(parent, shared), shared)
+        self.lowest_borrow = lowest
         self.held = [self.keys[a] for a, n in enumerate(self.borrowers) if n]
 
         self._held_parents = set()
@@ -596,10 +591,6 @@ class StageExecutor:
                 key, prefix, capacity_tokens=capacity, borrow=borrowed,
                 extension=self._extends, share_points=points):
             return False
-        return self._reserved(anchor, key, parent)
-
-    def _reserved(self, anchor, key, parent):
-        """Commit answer demand and hold the KV an admitted document reads and lends."""
         if self.answer_admission is not None:
             self.answer_admission.admit(anchor)
         if parent is not None:
