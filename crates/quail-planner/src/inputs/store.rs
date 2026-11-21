@@ -23,28 +23,6 @@ pub const COUNT_COLUMN: &str = "__quail_token_count";
 /// The column of each document's tokens' character ranges.
 pub const OFFSET_COLUMN: &str = "__quail_token_offsets";
 
-fn store_schema(with_offsets: bool) -> SchemaRef {
-    let metadata = HashMap::from([("quail.kind".to_string(), "token_store".to_string())]);
-    let mut fields = vec![
-        Field::new(
-            TOKEN_COLUMN,
-            DataType::LargeList(Arc::new(Field::new_list_field(DataType::Int32, true))),
-            false,
-        ),
-        Field::new(COUNT_COLUMN, DataType::Int64, false),
-    ];
-    if with_offsets {
-        let pair =
-            DataType::FixedSizeList(Arc::new(Field::new_list_field(DataType::Int64, true)), 2);
-        fields.push(Field::new(
-            OFFSET_COLUMN,
-            DataType::LargeList(Arc::new(Field::new_list_field(pair, true))),
-            true,
-        ));
-    }
-    Arc::new(Schema::new(fields).with_metadata(metadata))
-}
-
 /// Builds a token store batch by batch.
 pub struct TokenStoreWriter {
     schema: SchemaRef,
@@ -64,8 +42,26 @@ impl TokenStoreWriter {
     }
 
     fn with(with_offsets: bool) -> Self {
+        let metadata = HashMap::from([("quail.kind".to_string(), "token_store".to_string())]);
+        let mut fields = vec![
+            Field::new(
+                TOKEN_COLUMN,
+                DataType::LargeList(Arc::new(Field::new_list_field(DataType::Int32, true))),
+                false,
+            ),
+            Field::new(COUNT_COLUMN, DataType::Int64, false),
+        ];
+        if with_offsets {
+            let pair =
+                DataType::FixedSizeList(Arc::new(Field::new_list_field(DataType::Int64, true)), 2);
+            fields.push(Field::new(
+                OFFSET_COLUMN,
+                DataType::LargeList(Arc::new(Field::new_list_field(pair, true))),
+                true,
+            ));
+        }
         Self {
-            schema: store_schema(with_offsets),
+            schema: Arc::new(Schema::new(fields).with_metadata(metadata)),
             batches: Vec::new(),
         }
     }
