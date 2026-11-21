@@ -3,20 +3,6 @@
 import re
 
 
-def read_phrase(decoded: str) -> str | None:
-    """Return the words the model wrote after the phrase cue.
-
-    The answer is the whole text, up to where the model ended its turn.
-
-    Args:
-        decoded: The text the model wrote after the phrase cue.
-
-    Returns:
-        The answer, or None for an empty answer.
-    """
-    return decoded.strip() or None
-
-
 def locate_span(document: str, phrase: str) -> tuple[int, int] | None:
     """Return the character span of the phrase's first occurrence in the document.
 

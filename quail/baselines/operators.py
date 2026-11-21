@@ -13,7 +13,7 @@ from quail.execution.result import (
     filter_answer_table,
 )
 from quail.execution.rows import Rows
-from quail.execution.spans import held_prefix, read_phrase
+from quail.execution.spans import held_prefix
 
 # the order shuffled map submission sends prompts in
 SHUFFLE_SEED = 0
@@ -402,7 +402,7 @@ def read_extractions(outputs, texts, wall_s: float) -> dict:
     answers, spans = [], []
     unanswered = unaligned = cut = 0
     for output, document in zip(outputs, texts):
-        phrase = read_phrase(output.outputs[0].text or "")
+        phrase = (output.outputs[0].text or "").strip() or None
         held = None if phrase is None else held_prefix(document, phrase)
         if phrase is None:
             unanswered += 1
