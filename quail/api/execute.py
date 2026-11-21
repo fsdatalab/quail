@@ -152,9 +152,46 @@ def _execute_in_datafusion(query, physical_executor, on_backend_ready,
                 if called is not None:
                     called()
 
-        table, context, startup_s = _run_in_rust(
-            query, physical_executor, ready, results, region_tables,
-            region_s, region_results)
+        from quail.api.region_inputs import region_query
+
+        session = query.session
+        config, registry = session.config, session.registry
+        backend = registry.backend(config.backend)
+        startup_started = time.perf_counter()
+        workers = _start_workers(session, physical_executor)
+        startup_s = time.perf_counter() - startup_started
+        try:
+            context = SessionContext(session, order=query.order, workers=workers)
+            context.when_ready(ready)
+            table = context.sql(query.text, query.dialect)
+            regions = context.take_regions()
+        finally:
+            if physical_executor is not None:
+                physical_executor.close()
+        for planned, scans, inputs, relation, ran, boots, seconds, total_s in regions:
+            found = json.loads(planned)
+            region = region_query(
+                session, found["operators"], logical=found.get("logical", ""),
+                order=query.order, tables=inputs, keep_order=True,
+                region_id=found.get("region_id"))
+            region.adopt_plan(found, scans)
+            report = backend.report_region(
+                region.plan(), ran, [json.loads(boot) for boot in boots], seconds,
+                registry.device(config.device))
+            if physical_executor is not None:
+                report.update(physical_executor.report)
+            response = PhysicalResponse(report.pop("_outputs"), report)
+            result = region.finish(response, seconds, relation=relation)
+            result.report.update(
+                planning_s=round(region.planning_s, 4),
+                input_ready_s=round(region.planning_s, 4),
+                physical_prepare_s=0.0, model_wall_s=result.report["wall_s"],
+                finish_s=0.0, worker_total_s=round(total_s, 4))
+            results.append(result)
+            region_tables.append(result.collect())
+            # the boot is the region's time, not DataFusion's
+            region_s.append(total_s)
+            region_results[region.region_id] = result
         # starting the workers is model startup, not query time
         return _query_result(query, context, table, whole, started + startup_s,
             results, region_tables, region_s, region_results)
@@ -176,73 +213,6 @@ def _execute_in_datafusion(query, physical_executor, on_backend_ready,
     table = context.sql(query.text, query.dialect)
     return _query_result(query, context, table, whole, started, results,
         region_tables, region_s, region_results)
-
-
-def _run_in_rust(query, source, ready, results, region_tables, region_s,
-        region_results):
-    """Run a query whose model regions Rust runs on GPU workers.
-
-    Each region's QueryResult is built from what Rust kept of its run.
-
-    Args:
-        query: The Query.
-        source: None for the GPUs' workers, or a test's stand-in:
-            ``start_workers(gpus)`` returns workers under "workers",
-            ``report`` holds report fields to set, and ``close()`` stops
-            the workers.
-        ready: Callable() called once the workers have the model loaded
-            for a region.
-        results: Filled with each region's QueryResult, in run order.
-        region_tables: Filled with each region's rows.
-        region_s: Filled with each region's seconds.
-        region_results: Filled with each region's result by region id.
-
-    Returns:
-        The query's rows, the SessionContext that ran it, and the
-        seconds it took to start the workers.
-    """
-    from quail.api.context import SessionContext
-    from quail.api.region_inputs import region_query
-
-    session = query.session
-    config, registry = session.config, session.registry
-    backend = registry.backend(config.backend)
-    startup_started = time.perf_counter()
-    workers = _start_workers(session, source)
-    startup_s = time.perf_counter() - startup_started
-    try:
-        context = SessionContext(session, order=query.order, workers=workers)
-        context.when_ready(ready)
-        table = context.sql(query.text, query.dialect)
-        regions = context.take_regions()
-    finally:
-        if source is not None:
-            source.close()
-    for planned, scans, inputs, relation, ran, boots, seconds, total_s in regions:
-        found = json.loads(planned)
-        region = region_query(
-            session, found["operators"], logical=found.get("logical", ""),
-            order=query.order, tables=inputs, keep_order=True,
-            region_id=found.get("region_id"))
-        region.adopt_plan(found, scans)
-        report = backend.report_region(
-            region.plan(), ran, [json.loads(boot) for boot in boots], seconds,
-            registry.device(config.device))
-        if source is not None:
-            report.update(source.report)
-        response = PhysicalResponse(report.pop("_outputs"), report)
-        result = region.finish(response, seconds, relation=relation)
-        result.report.update(
-            planning_s=round(region.planning_s, 4),
-            input_ready_s=round(region.planning_s, 4),
-            physical_prepare_s=0.0, model_wall_s=result.report["wall_s"],
-            finish_s=0.0, worker_total_s=round(total_s, 4))
-        results.append(result)
-        region_tables.append(result.collect())
-        # the boot is the region's time, not DataFusion's
-        region_s.append(total_s)
-        region_results[region.region_id] = result
-    return table, context, startup_s
 
 
 def _start_workers(session, source):
