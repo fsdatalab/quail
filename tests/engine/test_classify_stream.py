@@ -371,7 +371,7 @@ def test_a_classification_of_joined_rows_runs_after_its_join_on_the_anchors_kv(
                                                       dtype="fake"))
     monkeypatch.setattr(
         label_stages_module, "AsyncLabelLogprobs",
-        lambda torch, F, head, targets, rows, normalize: FakeReadout(
+        lambda torch, F, head, targets, rows, normalize, softcap: FakeReadout(
             targets, rows))
     state = {
         "gpu": SimpleNamespace(torch=torch, arena=arena, pipeline=pipeline,
@@ -688,7 +688,7 @@ def _run_recorded_region(monkeypatch, region):
                         lambda model: SimpleNamespace(shape=(1, 1), dtype="fake"))
     monkeypatch.setattr(
         label_stages_module, "AsyncLabelLogprobs",
-        lambda torch, F, head, targets, rows, normalize: LabelReadout(
+        lambda torch, F, head, targets, rows, normalize, softcap: LabelReadout(
             targets, rows))
     execution.loaded_model.label_readout = LabelReadout(TARGETS, 1)
     state = {

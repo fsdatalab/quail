@@ -15,7 +15,11 @@ from pathlib import Path
 
 import numpy as np
 
-from quail.backends.quail.executor.model_loading import answer_weights
+from quail.backends.quail.executor.model_loading import (
+    answer_weights,
+    cap_logits,
+    logit_softcap,
+)
 from quail.common.budgets import READOUT_BLOCK_ROWS
 
 
@@ -34,6 +38,7 @@ class AnswerRows:
         self.F = F
         self.allowed = sorted(set(true_ids) | set(false_ids))
         self.weights = answer_weights(model, self.allowed)
+        self.softcap = logit_softcap(model)
         self.true_cols = torch.tensor(
             [i for i, t in enumerate(self.allowed) if t in set(true_ids)],
             device="cuda")
@@ -43,7 +48,7 @@ class AnswerRows:
 
     def logits(self, normed):
         """Per row, the best logit of each class over its spellings."""
-        scores = self.F.linear(normed, self.weights)
+        scores = cap_logits(self.F.linear(normed, self.weights), self.softcap)
         return (scores.index_select(1, self.true_cols).amax(dim=1),
                 scores.index_select(1, self.false_cols).amax(dim=1))
 
@@ -155,16 +160,19 @@ class AsyncLabelLogprobs(_HostReadout):
         targets: Token IDs to return, in column order.
         rows: Maximum rows per answer. Unused rows are filled with NaN.
         normalize: Whether to normalize against the full vocabulary.
+        softcap: The cap of the model's logits, or 0 for none.
     """
 
     # rows per head block: every block reads the whole head, so few big
     # blocks; 512 x 151,936 logits in bf16 and float32 are 445 MiB
     BLOCK_ROWS = READOUT_BLOCK_ROWS
 
-    def __init__(self, torch, F, head, targets, rows=1, normalize=True):
+    def __init__(self, torch, F, head, targets, rows=1, normalize=True,
+                 softcap=0.0):
         super().__init__(torch)
         self.F = F
         self.head = head
+        self.softcap = softcap
         self.targets = torch.tensor(list(targets), device=head.device,
                                     dtype=torch.long)
         self.rows = rows
@@ -187,13 +195,16 @@ class AsyncLabelLogprobs(_HostReadout):
         """
         torch = self.torch
         if not self.normalize:
-            return self.F.linear(normed.to(self.head.dtype),
-                                 self.head_rows).float()
+            return cap_logits(self.F.linear(normed.to(self.head.dtype),
+                                            self.head_rows).float(),
+                              self.softcap)
         out = torch.empty((normed.shape[0], len(self.targets)),
                           dtype=torch.float32, device=normed.device)
         for start in range(0, normed.shape[0], self.BLOCK_ROWS):
             block = normed[start:start + self.BLOCK_ROWS]
-            logits = self.F.linear(block.to(self.head.dtype), self.head).float()
+            logits = cap_logits(
+                self.F.linear(block.to(self.head.dtype), self.head).float(),
+                self.softcap)
             norm = torch.logsumexp(logits, dim=1, keepdim=True)
             out[start:start + block.shape[0]] = (
                 logits.index_select(1, self.targets) - norm)
@@ -246,14 +257,16 @@ class AsyncTopLogprobs(_HostReadout):
         ragged: Whether answers have several rows each: submit then
             takes rows_per_answer and result returns one (rows, width)
             array per answer, in an object array.
+        softcap: The cap of the model's logits, or 0 for none.
     """
 
     BLOCK_ROWS = AsyncLabelLogprobs.BLOCK_ROWS
 
-    def __init__(self, torch, F, head, k, extras, ragged=False):
+    def __init__(self, torch, F, head, k, extras, ragged=False, softcap=0.0):
         super().__init__(torch)
         self.F = F
         self.head = head
+        self.softcap = softcap
         self.k = k
         ids, self.groups = [], []
         for extra in extras:
@@ -282,7 +295,7 @@ class AsyncTopLogprobs(_HostReadout):
     def from_logits(self, logits):
         """Return compact top-token values from a full-vocabulary projection."""
         torch = self.torch
-        logits = logits.float()
+        logits = cap_logits(logits.float(), self.softcap)
         logits = logits - torch.logsumexp(logits, dim=1, keepdim=True)
         picked = logits.index_select(1, self.extras)
         extras = [torch.logsumexp(picked[:, group], dim=1)[:, None]
@@ -330,7 +343,8 @@ class AsyncScores(_HostReadout):
 
     def submit(self, normed):
         torch, rows = self.torch, self.rows
-        logits = rows.F.linear(normed.float(), self.weights)
+        logits = cap_logits(rows.F.linear(normed.float(), self.weights),
+                            rows.softcap)
         yes = logits.index_select(1, rows.true_cols).amax(dim=1)
         no = logits.index_select(1, rows.false_cols).amax(dim=1)
         return self._copy(torch.sigmoid((yes - no) / self.temperature))
@@ -367,7 +381,8 @@ class AsyncSlotMargins(_SlotReadout):
 
     def submit(self, normed, rows_per_answer=None):
         rows = self.rows
-        logits = rows.F.linear(normed.float(), self.weights)
+        logits = cap_logits(rows.F.linear(normed.float(), self.weights),
+                            rows.softcap)
         margins = (logits.index_select(1, rows.true_cols).amax(dim=1)
                    - logits.index_select(1, rows.false_cols).amax(dim=1))
         return (*self._copy(margins), rows_per_answer)

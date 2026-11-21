@@ -130,8 +130,8 @@ def _warm_boot() -> dict:
 
 
 # Architectures the request backends do not serve: vLLM 0.29 has no
-# LFM3 model.
-UNSERVED_ARCHS = frozenset({"lfm3"})
+# LFM3 or Inkling model.
+UNSERVED_ARCHS = frozenset({"lfm3", "inkling2_loop"})
 
 
 @dataclass

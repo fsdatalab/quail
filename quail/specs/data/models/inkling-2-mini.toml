@@ -1,0 +1,59 @@
+name = "inkling-2-mini"
+hf_name = "thinkingmachines/Inkling-2-Mini"
+revision = "ed40e7da625f594fc9c4990f5f66be24873c22d7"
+arch = "inkling2_loop"
+# text parameters: embedding, output head, 24 layers' attention, and 128
+# experts in each of the 24 layers
+params = 26_066_000_000
+# layers 6-17 run three times: 48 layer visits, each with its own KV and
+# convolution state, over 24 layers of weights
+layers = 48
+weight_layers = 24
+hidden = 2304
+num_q_heads = 24
+num_kv_heads = 8
+d_head = 128
+ffn_width = 0
+experts = 128
+experts_active = 8
+expert_intermediate = 1152
+# attention projections in bf16; experts in NVFP4, except the last four
+# layers' MXFP8 experts
+weight_precision = "bf16"
+w_bytes = 2.0
+mlp_weight_precision = "fp4"
+mlp_fp8_layers = 4
+attn_output_gate = true
+# relative-bias and sink projections on every visit, per-token key and
+# value taps on the full-attention visits, and the message gates of
+# passes 2 and 3
+extra_projection_params = 102_924_288
+kv_bytes = 2.0
+# loaded weights, measured on a B200: NVFP4 experts as stored, MXFP8
+# experts dequantized to bf16
+w_mem_bytes = 22_868_452_352
+vocab = 200_058
+tied_head = false
+sliding_window = 1024
+conv_width = 4
+# per visit: key and value (1,024 each), attention output and expert
+# output (2,304 each) convolution columns
+attention_conv_channels = 6656
+chunk_cap_tokens = 16_384
+layer_kinds = [
+    "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention",
+    "sliding_attention", "full_attention", "sliding_attention", "sliding_attention",
+    "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+    "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention",
+    "sliding_attention", "full_attention", "sliding_attention", "sliding_attention",
+    "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+    "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention",
+    "sliding_attention", "full_attention", "sliding_attention", "sliding_attention",
+    "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+    "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention",
+    "sliding_attention", "full_attention", "sliding_attention", "sliding_attention",
+    "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+]
+turn_prefix = "<|message_system|><|content_text|>You are an expert at text analysis<|end_message|><|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>"
+turn_suffix = "<|end_message|><|message_model|><|content_text|>"
+prompt_format = "inkling2-chat-text-analysis-v1"

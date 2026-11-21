@@ -49,21 +49,23 @@ pub fn gdn_core_flops_per_token(model: &ModelSpec) -> f64 {
 pub fn conv_flops_per_token(model: &ModelSpec) -> f64 {
     let gdn = model.gdn_layers().len() as i64 * model.conv_channels();
     let short = model.short_conv_layers().len() as i64 * model.hidden;
-    2.0 * model.conv_width as f64 * (gdn + short) as f64
+    let attention = model.attention_conv_layers().len() as i64 * model.attention_conv_channels;
+    2.0 * model.conv_width as f64 * (gdn + short + attention) as f64
 }
 
-fn mlp_params_with(model: &ModelSpec, experts: i64) -> i64 {
-    3 * model.hidden * (model.intermediate() + experts * model.expert_intermediate) * model.layers
+fn mlp_params_with(model: &ModelSpec, experts: i64, layers: i64) -> i64 {
+    3 * model.hidden * (model.intermediate() + experts * model.expert_intermediate) * layers
 }
 
 /// The MLP parameters one token multiplies.
 pub fn mlp_params(model: &ModelSpec) -> i64 {
-    mlp_params_with(model, model.experts_active)
+    mlp_params_with(model, model.experts_active, model.layers)
 }
 
-/// The MLP parameters a full chunk reads: every expert.
+/// The MLP parameters a full chunk reads: every expert of every
+/// weight layer.
 pub fn mlp_weight_params(model: &ModelSpec) -> i64 {
-    mlp_params_with(model, model.experts)
+    mlp_params_with(model, model.experts, model.weight_layer_count())
 }
 
 /// Parameters used by the modeled dense components.
@@ -71,6 +73,7 @@ pub fn dense_params(model: &ModelSpec) -> i64 {
     attention_projection_params(model)
         + gdn_projection_params(model)
         + short_conv_projection_params(model)
+        + model.extra_projection_params
         + mlp_params(model)
 }
 
@@ -110,22 +113,28 @@ pub fn dense_decoder_components(work: &Work, model: &ModelSpec, passes: f64) -> 
     let attn_proj = attention_projection_params(model)
         + gdn_projection_params(model)
         + short_conv_projection_params(model)
+        + model.extra_projection_params
         - separate_gdn;
-    let mlp = mlp_params(model);
+    // layers that run more than once read their weights once a pass
+    let weight_share = model.weight_layer_count() as f64 / model.layers as f64;
+    let fp8_share = model.mlp_fp8_layers as f64 / model.layers as f64;
+    let fp8_weight_share = model.mlp_fp8_layers as f64 / model.weight_layer_count() as f64;
+    let mlp = mlp_params(model) as f64;
+    let mlp_weights = mlp_weight_params(model) as f64;
     let (full_flops, sliding_flops) = attention_pair_flops(model);
     let mut components = vec![
         CostComponent {
             name: "attn_proj",
             flops: (2.0 * attn_proj as f64) * &work.tokens,
-            bytes_moved: Quantity::Scalar(attn_proj as f64 * model.w_bytes * passes),
+            bytes_moved: Quantity::Scalar(attn_proj as f64 * weight_share * model.w_bytes * passes),
             precision: model.weight_precision,
             gemm: true,
         },
         CostComponent {
             name: "mlp",
-            flops: (2.0 * mlp as f64) * &work.tokens,
+            flops: (2.0 * mlp * (1.0 - fp8_share)) * &work.tokens,
             bytes_moved: Quantity::Scalar(
-                mlp_weight_params(model) as f64 * mlp_weight_bytes(model) * passes,
+                mlp_weights * (1.0 - fp8_weight_share) * mlp_weight_bytes(model) * passes,
             ),
             precision: model.mlp_weight_precision.unwrap_or(model.weight_precision),
             gemm: true,
@@ -140,6 +149,17 @@ pub fn dense_decoder_components(work: &Work, model: &ModelSpec, passes: f64) -> 
             gemm: false,
         },
     ];
+    if model.mlp_fp8_layers != 0 {
+        components.push(CostComponent {
+            name: "mlp_fp8",
+            flops: (2.0 * mlp * fp8_share) * &work.tokens,
+            bytes_moved: Quantity::Scalar(
+                mlp_weights * fp8_weight_share * Precision::Fp8.bytes() * passes,
+            ),
+            precision: Precision::Fp8,
+            gemm: true,
+        });
+    }
     if model.experts != 0 {
         let router = model.layers * model.hidden * model.experts;
         components.push(CostComponent {
@@ -180,7 +200,10 @@ pub fn dense_decoder_components(work: &Work, model: &ModelSpec, passes: f64) -> 
             gemm: false,
         });
     }
-    if !model.gdn_layers().is_empty() || !model.short_conv_layers().is_empty() {
+    if !model.gdn_layers().is_empty()
+        || !model.short_conv_layers().is_empty()
+        || !model.attention_conv_layers().is_empty()
+    {
         components.push(CostComponent {
             name: "conv",
             flops: conv_flops_per_token(model) * &work.tokens,

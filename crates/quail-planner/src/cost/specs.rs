@@ -218,6 +218,23 @@ pub struct ModelSpec {
     pub mlp_weight_precision: Option<Precision>,
     #[serde(default)]
     pub conv_width: i64,
+    /// Convolution channels every attention layer keeps beside its KV,
+    /// for a model whose keys, values, and residual stream pass short
+    /// convolutions; 0 for none.
+    #[serde(default)]
+    pub attention_conv_channels: i64,
+    /// Layers that hold distinct weights, when layers run more than once;
+    /// 0 when every layer holds its own.
+    #[serde(default)]
+    pub weight_layers: i64,
+    /// Layers, each run once, whose experts run at fp8 instead of the MLP
+    /// precision.
+    #[serde(default)]
+    pub mlp_fp8_layers: i64,
+    /// Per-token bf16 projection parameters outside the modeled
+    /// components, such as relative-bias and gate projections.
+    #[serde(default)]
+    pub extra_projection_params: i64,
     #[serde(default)]
     pub checkpoint_layers: i64,
     #[serde(default)]
@@ -278,12 +295,17 @@ impl ModelSpec {
 
     /// The layers that keep state between a document's tokens.
     pub fn state_layers(&self) -> Vec<i64> {
+        if self.attention_conv_channels != 0 {
+            return self.attention_layers();
+        }
         self.layers_of(&["gated_delta_net", "short_conv"])
     }
 
     /// Channels of the convolution input a state layer keeps.
     pub fn conv_state_channels(&self) -> i64 {
-        if self.gdn_layers().is_empty() {
+        if self.attention_conv_channels != 0 {
+            self.attention_conv_channels
+        } else if self.gdn_layers().is_empty() {
             self.hidden
         } else {
             self.conv_channels()
@@ -312,6 +334,27 @@ impl ModelSpec {
                 * self.hidden
                 * (self.conv_width - 1)
                 * CONV_STATE_ELEMENT_BYTES
+            + self.attention_conv_layers().len() as i64
+                * self.attention_conv_channels
+                * (self.conv_width - 1)
+                * CONV_STATE_ELEMENT_BYTES
+    }
+
+    /// The attention layers that keep convolution state beside their KV.
+    pub fn attention_conv_layers(&self) -> Vec<i64> {
+        if self.attention_conv_channels == 0 {
+            return Vec::new();
+        }
+        self.attention_layers()
+    }
+
+    /// Layers that hold distinct weights.
+    pub fn weight_layer_count(&self) -> i64 {
+        if self.weight_layers != 0 {
+            self.weight_layers
+        } else {
+            self.layers
+        }
     }
 
     /// Whether the layer keeps every token with the full KV geometry.

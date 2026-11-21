@@ -232,6 +232,15 @@ class ModelSpec:
     # the MLP projections' precision, when it differs from weight_precision
     mlp_weight_precision: Precision | None = None
     conv_width: int = 0
+    # convolution channels every attention layer keeps beside its KV,
+    # for keys, values, and a residual stream that pass short convolutions
+    attention_conv_channels: int = 0
+    # layers holding distinct weights when layers run more than once;
+    # 0 when every layer holds its own
+    weight_layers: int = 0
+    mlp_fp8_layers: int = 0    # layers, each run once, with fp8 experts
+    # per-token bf16 projection parameters outside the modeled components
+    extra_projection_params: int = 0
     checkpoint_layers: int = 0    # layers in the checkpoint; when larger
     #                               than layers, the loader keeps the first
     #                               `layers` and frees the rest

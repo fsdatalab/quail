@@ -69,6 +69,8 @@ class MapDecoder:
         self.in_flight = in_flight
         self.torch = torch
         self.head = head
+        # the cap of the model's logits, set by map_decoder
+        self.softcap = 0.0
         self._staging = (InputStaging(torch, head.device)
                          if head.is_cuda else None)
         self._host_pool = []
@@ -164,7 +166,8 @@ class MapDecoder:
         key = specs[0].top_tokens, tuple(documents.vocabulary.tokenizer.stop_ids)
         if key not in self.copy_readouts:
             self.copy_readouts[key] = (AsyncTopLogprobs(
-                self.torch, self.torch.nn.functional, self.head, key[0], [key[1]]), [])
+                self.torch, self.torch.nn.functional, self.head, key[0], [key[1]],
+                softcap=self.softcap), [])
         _, questions = self.copy_readouts[key]
         questions.extend(range(first, first + len(specs)))
         constraint = CopyConstraint(self.torch, self.device, documents, specs[0])
@@ -865,7 +868,10 @@ class MapDecoder:
 
 def map_decoder(state, limits, num_documents: int, expected_tokens=None) -> MapDecoder:
     """Return a decoder for a pipeline's maps on the loaded model."""
-    from quail.backends.quail.executor.model_loading import full_output_head
+    from quail.backends.quail.executor.model_loading import (
+        full_output_head,
+        logit_softcap,
+    )
     from quail.common.budgets import copy_verification_workspace_bytes
 
     decoder = MapDecoder(
@@ -876,4 +882,5 @@ def map_decoder(state, limits, num_documents: int, expected_tokens=None) -> MapD
             state.loaded_model.model_spec, state.chunk_tokens),
         row_budget=state.chunk_tokens)
     decoder.tokenizer = state.loaded_model.tokenizer
+    decoder.softcap = logit_softcap(state.loaded_model.model)
     return decoder
