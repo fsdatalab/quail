@@ -421,4 +421,3 @@ def _binary_column(table: pa.Table):
                             and (binary(kind.value_type) or pages(kind.value_type))):
             return table.column(index)
     return None
-

@@ -184,7 +184,6 @@ class RegionExecution:
                 self, members, tuple(operators)))
         self.operators = operators
         if not any(operator.stages for operator in self.operators):
-            operators = self.operators
             own = operators[0].layout(self)
             operators[0].push(np.arange(len(
                 own.prefixes if own is not None else self.document_ids())))
@@ -197,13 +196,13 @@ class RegionExecution:
         first, operators = self.nodes[0], self.operators
         kinds = [node.type_name.rsplit("ai_", 1)[-1] for node in self.nodes]
         steps = [kind if (count := len(list(group))) == 1 else f"{kind} ×{count}"
-                 for kind, group in groupby(kinds)]
+            for kind, group in groupby(kinds)]
         alias = (self.nodes[0].document_aliases or ("",))[0]
         settings = ChainRun(
             label=f"{' → '.join(steps)} over {alias}",
             limit=self.context.state.get("filter_limit"),
             attention=(first.attention or None
-                       if isinstance(first, (AiFilter, AiJoin)) else None))
+                if isinstance(first, (AiFilter, AiJoin)) else None))
         if self.one_family:
             settings = type(operators[0]).alone(self, operators, table, settings)
         last = max(index for index, node in enumerate(self.nodes)
