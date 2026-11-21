@@ -180,25 +180,23 @@ class RegionExecution:
                     and nodes[0].document_aliases):
                 return SetChain(query, nodes, inputs, self.context).execute()
         self.nodes, self.inputs, self._ids = tuple(nodes), inputs, None
-        self.operators = self._chain(self.nodes)
-        if not any(operator.stages for operator in self.operators):
-            return self._run_answered()
-        return self._run_stages()
-
-    def _chain(self, nodes) -> list:
-        """Build the chain's operators, grouping nodes an operator combines."""
         types = self.model.operator_types
 
         def group_key(node):
             return (node.type_name,
-                    None if types[node.type_name].combine else node.node_id)
+                None if types[node.type_name].combine else node.node_id)
 
         operators = []
-        for _, group in groupby(nodes, group_key):
+        for _, group in groupby(self.nodes, group_key):
             members = list(group)
             operators.append(types[members[0].type_name].build(
                 self, members, tuple(operators)))
-        return operators
+        self.operators = operators
+        if not any(operator.stages for operator in self.operators):
+            return self._run_answered()
+        table = self._table()
+        return self.run_operators(self.operators, table, self._chain_run(table),
+            keep_kv=self._keep_kv())
 
     def _table(self) -> RegionDocuments:
         """The chain's documents: the first operator's own, or the table's."""
@@ -243,12 +241,6 @@ class RegionExecution:
         if self.one_family:
             settings = type(operators[0]).alone(self, operators, table, settings)
         return settings
-
-    def _run_stages(self) -> dict:
-        """Run the chain's stages in one GPU loop and close its operators."""
-        table = self._table()
-        return self.run_operators(self.operators, table, self._chain_run(table),
-                                  keep_kv=self._keep_kv())
 
     def run_operators(self, operators, table, settings=None, *,
                       keep_kv=False) -> dict:
