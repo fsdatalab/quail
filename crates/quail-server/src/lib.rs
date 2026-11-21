@@ -179,23 +179,6 @@ fn query_status(error: DataFusionError) -> Status {
     }
 }
 
-/// Refuse a call whose `authorization` header is not `Bearer <token>`;
-/// with no token every call passes.
-///
-/// # Errors
-///
-/// The header is missing or names another token.
-pub fn check_token<T>(token: Option<&str>, request: Request<T>) -> Result<Request<T>, Status> {
-    let Some(token) = token else {
-        return Ok(request);
-    };
-    let sent = (request.metadata().get("authorization")).and_then(|sent| sent.to_str().ok());
-    match sent.and_then(|sent| sent.strip_prefix("Bearer ")) == Some(token) {
-        true => Ok(request),
-        false => Err(Status::unauthenticated("this server needs its token")),
-    }
-}
-
 /// The server's actions, each with what it does.
 const ACTIONS: [(&str, &str); 7] = [
     (
@@ -536,7 +519,17 @@ pub fn run(
             .add_service(tonic::service::interceptor::InterceptedService::new(
                 arrow_flight::flight_service_server::FlightServiceServer::new(service)
                     .max_decoding_message_size(MAX_UPLOAD_MESSAGE_BYTES),
-                move |request| check_token(token.as_deref(), request),
+                move |request: Request<()>| {
+                    let Some(token) = token.as_deref() else {
+                        return Ok(request);
+                    };
+                    let sent = (request.metadata().get("authorization"))
+                        .and_then(|sent| sent.to_str().ok());
+                    match sent.and_then(|sent| sent.strip_prefix("Bearer ")) == Some(token) {
+                        true => Ok(request),
+                        false => Err(Status::unauthenticated("this server needs its token")),
+                    }
+                },
             ))
             .serve_with_shutdown(address, async {
                 use tokio::signal::unix::{SignalKind, signal};
