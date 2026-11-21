@@ -18,7 +18,7 @@ from typing import Literal, Union, get_args, get_origin, get_type_hints
 
 import _quail_native
 
-from .base import DeviceSpec, ModelSpec
+from .base import ModelSpec
 
 DATA = Path(__file__).parent / "data"
 
@@ -65,14 +65,3 @@ def read_models(directory: Path = DATA / "models") -> dict[str, ModelSpec]:
             a cycle.
     """
     return _read(ModelSpec, "models", directory)
-
-
-@cache
-def read_devices() -> dict[str, DeviceSpec]:
-    """Return every built-in device spec, by name.
-
-    Raises:
-        ValueError: A file's name differs from its spec's name, or a
-            key is not a DeviceSpec field.
-    """
-    return _read(DeviceSpec, "devices", DATA / "devices")
