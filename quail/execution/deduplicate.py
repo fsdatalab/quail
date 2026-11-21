@@ -6,14 +6,9 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 import pyarrow as pa
+from pyarrow import compute as pc
 
-from quail.common.pairs import (
-    COPIES,
-    FIRST_DOCUMENT,
-    columns_key,
-    pair_ids_table,
-    pair_keys,
-)
+from quail.common.pairs import COPIES, FIRST_DOCUMENT, columns_key
 from quail.execution.ids import document_ids
 from quail.execution.metrics import NodeResult
 from quail.execution.result import true_answer_rows
@@ -344,8 +339,12 @@ def _read_pairs(context, aliases, table, keys, every, pairs, node, port,
         mapped = keys[alias][documents] if alias in keys else documents
         sides.append(mapped)
     kept = np.unique(_pair_keys(*sides))
-    value = pair_ids_table(left, right, np.column_stack(
-        (kept >> 32, kept & 0xFFFFFFFF)))
+    rows = np.asarray(np.column_stack(
+        (kept >> 32, kept & 0xFFFFFFFF)), dtype=np.int64).reshape(-1, 2)
+    value = pa.table({
+        left: pa.array(rows[:, 0], type=pa.int32()),
+        right: pa.array(rows[:, 1], type=pa.int32()),
+    })
     if port.value_type is ValueType.ROWS:
         value = Rows({alias: value.column(alias) for alias in aliases})
     reduced[node.node_id][port.name] = value
@@ -392,8 +391,12 @@ def _expanded(table: pa.Table, aliases, every, keys, pairs) -> pa.Table:
 
 def _pair_keys(anchors, partners) -> np.ndarray:
     """One int64 per pair: the anchor's id, then the partner's."""
-    return pair_keys(pa.array(anchors, pa.int64()),
-                     pa.array(partners, pa.int64())).to_numpy()
+    anchors = pa.array(anchors, pa.int64())
+    partners = pa.array(partners, pa.int64())
+    keys = pc.add(pc.shift_left(anchors.cast(pa.int64()), 32),
+        partners.cast(pa.int64()))
+    return (keys.combine_chunks() if isinstance(keys, pa.ChunkedArray)
+        else keys).to_numpy()
 
 
 def _matches(wanted, answered) -> tuple[np.ndarray, np.ndarray]:

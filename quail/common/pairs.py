@@ -28,13 +28,6 @@ NULL_DOCUMENT = _quail_native.NULL_DOCUMENT
 COPIES = "__copies"
 
 
-def pair_keys(anchors, partners):
-    """Encode document ID pairs as int64 keys or an Arrow expression."""
-    keys = pc.add(pc.shift_left(anchors.cast(pa.int64()), 32),
-                  partners.cast(pa.int64()))
-    return keys.combine_chunks() if isinstance(keys, pa.ChunkedArray) else keys
-
-
 def columns_key(alias: str) -> str:
     """The request relation key of one alias's value table."""
     return f"{COLUMNS_PREFIX}{alias}"
@@ -105,15 +98,6 @@ def _integral_join_key(column):
                                  pc.less(column, float(2**64)))
         column = pc.if_else(pc.and_kleene(integral, in_range), column, None)
     return column.cast(pa.decimal128(20, 0))
-
-
-def pair_ids_table(left_alias: str, right_alias: str, pairs) -> pa.Table:
-    """Build an int32 pair table from an array of (left, right) id rows."""
-    rows = np.asarray(pairs, dtype=np.int64).reshape(-1, 2)
-    return pa.table({
-        left_alias: pa.array(rows[:, 0], type=pa.int32()),
-        right_alias: pa.array(rows[:, 1], type=pa.int32()),
-    })
 
 
 def pair_partner(anchor: str, partners) -> str:
