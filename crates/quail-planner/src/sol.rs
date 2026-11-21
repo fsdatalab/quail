@@ -105,10 +105,6 @@ fn not_priced<T>(message: impl Into<String>) -> Result<T, CompileError> {
     )))
 }
 
-fn round_to(value: f64, digits: usize) -> f64 {
-    format!("{value:.digits$}").parse().expect("a float")
-}
-
 fn label_name(found: &Operators, call: &ModelCall) -> String {
     found
         .classifies
@@ -419,7 +415,9 @@ fn stage(
         Value::from(if rows.is_empty() {
             0.0
         } else {
-            round_to(passed.len() as f64 / rows.len() as f64, 6)
+            format!("{:.6}", passed.len() as f64 / rows.len() as f64)
+                .parse::<f64>()
+                .expect("a float")
         }),
     );
     record.insert("fresh_tokens".into(), Value::from(work.tokens.total()));
@@ -427,10 +425,6 @@ fn stage(
 }
 
 impl<'a, 'c> Estimate<'a, 'c> {
-    fn lower(&self, prompt: &Prompt) -> Result<LoweredPrompt, CompileError> {
-        self.context.lowered(prompt)
-    }
-
     fn passes(&self, prompt: &Prompt, assignment: &[(&str, i64)]) -> Result<bool, CompileError> {
         let assignment: Vec<_> = assignment
             .iter()
@@ -833,7 +827,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
         stages: &mut Vec<Map<String, Value>>,
     ) -> Result<(Vec<i64>, Work), CompileError> {
         let prompt = &asked_call(&predicate.expression).prompt;
-        let tail = self.lower(prompt)?.tail_token_ids.len() as i64;
+        let tail = self.context.lowered(prompt)?.tail_token_ids.len() as i64;
         let asked: Vec<i64> = match predicate
             .disjunction
             .as_ref()
@@ -899,7 +893,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
         stages: &mut Vec<Map<String, Value>>,
     ) -> Result<(Vec<i64>, Work), CompileError> {
         let call = &column.call;
-        let tail = self.lower(&call.prompt)?.tail_token_ids.len() as i64;
+        let tail = self.context.lowered(&call.prompt)?.tail_token_ids.len() as i64;
         let work = self.question_work(alias, rows, tail, first);
         self.answer_rows += rows.len() as f64;
         let name = label_name(self.found, call);
@@ -977,7 +971,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
         stages: &mut Vec<Map<String, Value>>,
     ) -> Result<(Vec<i64>, Work), CompileError> {
         let call = &column.call;
-        let tail = self.lower(&call.prompt)?.tail_token_ids.len() as i64;
+        let tail = self.context.lowered(&call.prompt)?.tail_token_ids.len() as i64;
         let mut work = self.question_work(alias, rows, tail, first);
         let tokens = &self.aliases[alias].tokens;
         let documents = if first {
@@ -1025,7 +1019,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
         stages: &mut Vec<Map<String, Value>>,
     ) -> Result<(Vec<i64>, Work), CompileError> {
         let call = &column.call;
-        let tail = self.lower(&call.prompt)?.tail_token_ids.len() as i64;
+        let tail = self.context.lowered(&call.prompt)?.tail_token_ids.len() as i64;
         let mut work = self.question_work(alias, rows, tail, first);
         let mut answers = BTreeMap::new();
         for row in rows {
@@ -1121,7 +1115,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
             );
         }
         let call = &column.call;
-        let tail = self.lower(&call.prompt)?.tail_token_ids.len() as i64;
+        let tail = self.context.lowered(&call.prompt)?.tail_token_ids.len() as i64;
         let mut work = self.question_work(alias, rows, tail, first);
         let mut answer_rows = 0;
         for row in rows {
@@ -1275,7 +1269,7 @@ impl<'a, 'c> Estimate<'a, 'c> {
             anchor,
             &[partner.to_string()],
             &local,
-            &self.lower(&call.prompt)?,
+            &self.context.lowered(&call.prompt)?,
             &anchor_rows,
             &BTreeSet::new(),
             Some(&kept),
@@ -1745,7 +1739,7 @@ fn search_joins(
                     );
                     for prompt in &prompts {
                         if !estimate.anchor_fits(
-                            &estimate.lower(prompt)?,
+                            &estimate.context.lowered(prompt)?,
                             anchor,
                             &stage_aliases,
                             &survivors,
@@ -1772,7 +1766,7 @@ fn search_joins(
                         anchor,
                         &partners,
                         &survivors,
-                        &estimate.lower(join_prompt)?,
+                        &estimate.context.lowered(join_prompt)?,
                         if cached.contains(anchor) {
                             &survivors[anchor]
                         } else {
