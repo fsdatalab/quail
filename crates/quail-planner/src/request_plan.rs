@@ -143,10 +143,24 @@ pub fn request_plan(
             "extracts": extracts, "maps": maps,
         },
     }));
-    let (results, root) = result_nodes(found, request_id, &aliases, &joins);
-    for node in results {
-        nodes.push(node_value(node)?);
-    }
+    let full = joins.iter().find(|spec| spec["semantics"] == "full");
+    let rows = match full {
+        Some(spec) => port(
+            request_id,
+            format!(
+                "join_answers:{}",
+                spec["written_position"].as_i64().unwrap_or_default()
+            ),
+        ),
+        None => port(request_id, format!("rows:{}", aliases[0])),
+    };
+    let root = match limit_node(found, &rows) {
+        Some(limit) => {
+            nodes.push(node_value(limit)?);
+            port("limit", "rows")
+        }
+        None => rows,
+    };
 
     let (true_ids, false_ids) = answer_ids(&context.prompt_model(), context.tokenizer)?;
     let mut plan_settings = json!({
@@ -649,31 +663,6 @@ fn request_preamble(
         .map_or(shared.clone(), |text| (*text).clone());
     // vLLM adds the model's beginning-of-text token to a text prompt
     Ok((preamble, without_bos(&text, &context.model.bos_text)))
-}
-
-/// The Limit of the region's fetch, reading the request node's result
-/// rows, and the port that ends the plan.
-fn result_nodes(
-    found: &Operators,
-    request: &str,
-    aliases: &[String],
-    joins: &[Value],
-) -> (Vec<PhysicalNode>, PortRef) {
-    let full = joins.iter().find(|spec| spec["semantics"] == "full");
-    let rows = match full {
-        Some(spec) => port(
-            request,
-            format!(
-                "join_answers:{}",
-                spec["written_position"].as_i64().unwrap_or_default()
-            ),
-        ),
-        None => port(request, format!("rows:{}", aliases[0])),
-    };
-    match limit_node(found, &rows) {
-        Some(limit) => (vec![limit], port("limit", "rows")),
-        None => (Vec::new(), rows),
-    }
 }
 
 /// A string as Python's repr writes it.

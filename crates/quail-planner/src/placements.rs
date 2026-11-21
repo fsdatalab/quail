@@ -63,23 +63,6 @@ pub fn placements(found: &Operators) -> Vec<Alternative> {
     alternatives
 }
 
-/// The aliases whose column operators an AI join lets move above it:
-/// each table an AI join reads, except one a gate tests and keeps no
-/// KV of.
-fn moving_aliases(found: &Operators) -> BTreeSet<String> {
-    let mut fixed = BTreeSet::new();
-    let mut joined = BTreeSet::new();
-    for join in &found.joins {
-        for alias in call_aliases(asked_call(&join.predicate)) {
-            if join.semantics != "full" && Some(&alias) != join.anchor.as_ref() {
-                fixed.insert(alias.clone());
-            }
-            joined.insert(alias);
-        }
-    }
-    joined.difference(&fixed).cloned().collect()
-}
-
 /// Whether a classification of joined rows runs above every join: it
 /// follows the last AI join, and that join holds every table.
 fn above_every_join(found: &Operators, column: &SemanticColumn) -> bool {
@@ -101,7 +84,17 @@ fn lifted(found: &Operators) -> Option<Operators> {
     if found.scans.len() < 2 {
         return None;
     }
-    let moving = moving_aliases(found);
+    let mut fixed = BTreeSet::new();
+    let mut joined = BTreeSet::new();
+    for join in &found.joins {
+        for alias in call_aliases(asked_call(&join.predicate)) {
+            if join.semantics != "full" && Some(&alias) != join.anchor.as_ref() {
+                fixed.insert(alias.clone());
+            }
+            joined.insert(alias);
+        }
+    }
+    let moving: BTreeSet<String> = joined.difference(&fixed).cloned().collect();
     let any_join = !found.joins.is_empty();
     let place_column = |column: &SemanticColumn| -> Place {
         let read = call_aliases(&column.call);

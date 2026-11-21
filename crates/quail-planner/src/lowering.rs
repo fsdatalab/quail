@@ -102,14 +102,6 @@ pub struct PromptModel {
     pub prompt_layout: String,
 }
 
-fn tokenize_segments(segments: &[String], tokenizer: &Tokenizer) -> Result<Vec<i64>, CompileError> {
-    let mut ids = Vec::new();
-    for segment in segments {
-        ids.extend(tokenizer(segment)?);
-    }
-    Ok(ids)
-}
-
 /// Text with every `{N}` placeholder removed.
 fn without_placeholders(text: &str) -> String {
     let mut out = String::new();
@@ -129,29 +121,6 @@ fn without_placeholders(text: &str) -> String {
     out
 }
 
-/// The text after a filter document or a join's last partner, by segment.
-fn tail_segments(prompt: &Prompt) -> Vec<String> {
-    if prompt.tail_segments.is_empty() {
-        vec![without_placeholders(&prompt.tail)]
-    } else {
-        prompt.tail_segments.clone()
-    }
-}
-
-/// Candidate label letters: A to Z, a to z, then AA to ZZ.
-fn letter_candidates() -> Vec<String> {
-    let upper: Vec<String> = ('A'..='Z').map(String::from).collect();
-    let lower: Vec<String> = ('a'..='z').map(String::from).collect();
-    let mut found = upper.clone();
-    found.extend(lower);
-    for first in &upper {
-        for second in &upper {
-            found.push(format!("{first}{second}"));
-        }
-    }
-    found
-}
-
 /// Distinct one-token letters to stand for the labels, as `choice_letters`.
 ///
 /// # Errors
@@ -168,7 +137,16 @@ pub fn choice_letters(
         ));
     }
     let (mut letters, mut seen) = (Vec::new(), BTreeSet::new());
-    for letter in letter_candidates() {
+    let upper: Vec<String> = ('A'..='Z').map(String::from).collect();
+    let lower: Vec<String> = ('a'..='z').map(String::from).collect();
+    let mut found = upper.clone();
+    found.extend(lower);
+    for first in &upper {
+        for second in &upper {
+            found.push(format!("{first}{second}"));
+        }
+    }
+    for letter in found {
         let ids = tokenizer(&format!("{prefix}{letter}"))?;
         if ids.len() != 1 || !seen.insert(ids[0]) {
             continue;
@@ -393,10 +371,20 @@ pub fn lower_prompt(prompt: &Prompt, tokenizer: &Tokenizer) -> Result<LoweredPro
     for (alias, label, frame) in &prompt.label_texts {
         label_token_ids.push((alias.clone(), tokenizer(label)?, tokenizer(frame)?));
     }
+    let preamble_token_ids = tokenizer(&prompt.preamble)?;
+    let segments = if prompt.tail_segments.is_empty() {
+        vec![without_placeholders(&prompt.tail)]
+    } else {
+        prompt.tail_segments.clone()
+    };
+    let mut tail_token_ids = Vec::new();
+    for segment in &segments {
+        tail_token_ids.extend(tokenizer(segment)?);
+    }
     Ok(LoweredPrompt {
         prompt: prompt.clone(),
-        preamble_token_ids: tokenizer(&prompt.preamble)?,
-        tail_token_ids: tokenize_segments(&tail_segments(prompt), tokenizer)?,
+        preamble_token_ids,
+        tail_token_ids,
         frame_tokens: if prompt.frame_text.is_empty() {
             0
         } else {
@@ -449,19 +437,6 @@ const TEXT_ANALYSIS_SYSTEM_PROMPT: &str = "You are an expert at text analysis";
 const QWEN3_RERANKER_INSTRUCTION: &str =
     "Judge whether the document meets the requirements in the query.";
 
-fn render_qwen3_reranker_input(query: &str, document: &str) -> String {
-    let system = format!(
-        "{TEXT_ANALYSIS_SYSTEM_PROMPT}. Judge whether the Document meets the requirements \
-         based on the Query and the Instruct provided. Note that the answer can only be \"yes\" \
-         or \"no\"."
-    );
-    format!(
-        "<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n<Instruct>: \
-         {QWEN3_RERANKER_INSTRUCTION}\n<Query>: {query}\n<Document>: \
-         {document}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
-    )
-}
-
 /// Tokenize the fixed pieces of a score's rendered prompt around the
 /// documents, as `score_token_parts`.
 ///
@@ -476,7 +451,17 @@ pub fn score_token_parts(
     if model.role != "reranker" {
         return answer_token_parts(prompt, model, tokenizer);
     }
-    let rendered = render_qwen3_reranker_input(&score_query_template(prompt)?, "{document}");
+    let query = score_query_template(prompt)?;
+    let system = format!(
+        "{TEXT_ANALYSIS_SYSTEM_PROMPT}. Judge whether the Document meets the requirements \
+         based on the Query and the Instruct provided. Note that the answer can only be \"yes\" \
+         or \"no\"."
+    );
+    let rendered = format!(
+        "<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n<Instruct>: \
+         {QWEN3_RERANKER_INSTRUCTION}\n<Query>: {query}\n<Document>: \
+         {{document}}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    );
     let (before, after) = rendered.split_once("{document}").expect("a document field");
     let mut parts = vec![before.to_string(), after.to_string()];
     if prompt_aliases(prompt).len() == 2 {

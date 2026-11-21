@@ -1089,18 +1089,6 @@ fn build_extension(mut given: Map<String, Value>) -> PyResult<Held> {
         .map_err(|error| PyValueError::new_err(format!("ExtensionNode: {error}")))
 }
 
-fn field_order(object: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
-    let tagged = object.cast::<Tagged>()?.get();
-    Ok(match kind_of_object(object)? {
-        Some(kind) => kind
-            .fields
-            .iter()
-            .map(|(name, _)| name.to_string())
-            .collect(),
-        None => constructor_fields(&tagged.held).keys().cloned().collect(),
-    })
-}
-
 #[pymethods]
 impl Tagged {
     fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<Py<PyAny>> {
@@ -1159,7 +1147,18 @@ impl Tagged {
         fill(slf)?;
         let dict = slf.getattr("__dict__")?.cast_into::<PyDict>()?;
         let mut parts = Vec::new();
-        for name in field_order(slf.as_any())? {
+        let names: Vec<String> = match kind_of_object(slf.as_any())? {
+            Some(kind) => kind
+                .fields
+                .iter()
+                .map(|(name, _)| name.to_string())
+                .collect(),
+            None => constructor_fields(&slf.get().held)
+                .keys()
+                .cloned()
+                .collect(),
+        };
+        for name in names {
             if let Some(value) = dict.get_item(&name)? {
                 parts.push(format!("{name}={}", value.repr()?));
             }

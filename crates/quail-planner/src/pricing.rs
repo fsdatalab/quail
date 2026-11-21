@@ -53,38 +53,6 @@ fn set(priced: &mut Priced, node_id: &str, price: NodePrice, entry: Map<String, 
     }
 }
 
-fn spec_expected_rows(node: &PhysicalNode) -> f64 {
-    match node {
-        PhysicalNode::AiFilter(node) => node.attributes.expected_rows,
-        PhysicalNode::AiScore(node) => node
-            .attributes
-            .spec
-            .as_ref()
-            .map_or(0.0, |s| s.expected_rows),
-        PhysicalNode::AiClassify(node) => node
-            .attributes
-            .spec
-            .as_ref()
-            .map_or(0.0, |s| s.expected_rows),
-        PhysicalNode::AiExtract(node) => node
-            .attributes
-            .spec
-            .as_ref()
-            .map_or(0.0, |s| s.expected_rows),
-        PhysicalNode::AiMap(node) => node
-            .attributes
-            .spec
-            .as_ref()
-            .map_or(0.0, |s| s.expected_rows),
-        PhysicalNode::AiSaeFeatures(node) => node
-            .attributes
-            .spec
-            .as_ref()
-            .map_or(0.0, |s| s.expected_rows),
-        _ => 0.0,
-    }
-}
-
 fn spec_seconds(node: &PhysicalNode) -> Option<f64> {
     match node {
         PhysicalNode::AiScore(node) => node.attributes.spec.as_ref().map(|s| s.estimated_seconds),
@@ -111,27 +79,6 @@ fn spec_work(node: &PhysicalNode) -> Option<Work> {
         _ => return None,
     };
     (!values.is_empty()).then(|| Work::from_values(values))
-}
-
-fn spec_state_tail(node: &PhysicalNode) -> i64 {
-    match node {
-        PhysicalNode::AiScore(node) => node
-            .attributes
-            .spec
-            .as_ref()
-            .map_or(0, |s| s.state_tail_tokens),
-        PhysicalNode::AiClassify(node) => node
-            .attributes
-            .spec
-            .as_ref()
-            .map_or(0, |s| s.state_tail_tokens),
-        PhysicalNode::AiExtract(node) => node
-            .attributes
-            .spec
-            .as_ref()
-            .map_or(0, |s| s.state_tail_tokens),
-        _ => 0,
-    }
 }
 
 /// Whether a node borrows its documents' shared prefix KV.
@@ -179,15 +126,61 @@ pub fn head_tokens(node: &PhysicalNode) -> i64 {
 /// An operator's question tokens after the state tail, as
 /// `passes.question_tokens`.
 pub fn pass_question_tokens(node: &PhysicalNode, state_tail: i64) -> i64 {
-    match node {
-        PhysicalNode::AiFilter(node) => (node.attributes.question_tokens - state_tail).max(1),
-        _ => node.prompt_token_parts()[1].len() as i64 - spec_state_tail(node),
-    }
+    let state_tail = match node {
+        PhysicalNode::AiFilter(node) => {
+            return (node.attributes.question_tokens - state_tail).max(1);
+        }
+        PhysicalNode::AiScore(node) => node
+            .attributes
+            .spec
+            .as_ref()
+            .map_or(0, |s| s.state_tail_tokens),
+        PhysicalNode::AiClassify(node) => node
+            .attributes
+            .spec
+            .as_ref()
+            .map_or(0, |s| s.state_tail_tokens),
+        PhysicalNode::AiExtract(node) => node
+            .attributes
+            .spec
+            .as_ref()
+            .map_or(0, |s| s.state_tail_tokens),
+        _ => 0,
+    };
+    node.prompt_token_parts()[1].len() as i64 - state_tail
 }
 
 /// The documents an operator is expected to be asked about.
 pub fn expected_documents(node: &PhysicalNode) -> f64 {
-    spec_expected_rows(node)
+    match node {
+        PhysicalNode::AiFilter(node) => node.attributes.expected_rows,
+        PhysicalNode::AiScore(node) => node
+            .attributes
+            .spec
+            .as_ref()
+            .map_or(0.0, |s| s.expected_rows),
+        PhysicalNode::AiClassify(node) => node
+            .attributes
+            .spec
+            .as_ref()
+            .map_or(0.0, |s| s.expected_rows),
+        PhysicalNode::AiExtract(node) => node
+            .attributes
+            .spec
+            .as_ref()
+            .map_or(0.0, |s| s.expected_rows),
+        PhysicalNode::AiMap(node) => node
+            .attributes
+            .spec
+            .as_ref()
+            .map_or(0.0, |s| s.expected_rows),
+        PhysicalNode::AiSaeFeatures(node) => node
+            .attributes
+            .spec
+            .as_ref()
+            .map_or(0.0, |s| s.expected_rows),
+        _ => 0.0,
+    }
 }
 
 /// The positions of each pass group's operators, in execution order.
@@ -258,104 +251,6 @@ impl PlanPricer {
         let mut work = Work::default();
         let mut seconds = 0.0;
         let mut entries = Map::new();
-        for (node_id, price, entry) in self.priced(context, nodes)? {
-            entries.insert(node_id, Value::Object(entry));
-            match price.work {
-                Some(found) => work = &work + &found,
-                None => seconds += price.seconds,
-            }
-        }
-        Ok((self.seconds_of(context, &work) + seconds, entries))
-    }
-
-    fn priced(
-        &self,
-        context: &PlanningContext,
-        nodes: &[PhysicalNode],
-    ) -> Result<Priced, CompileError> {
-        let mut out = self.each_priced(context, nodes)?;
-        if context.model.attention_mask == "set" {
-            for (node_id, price, entry) in self.set_passes(context, nodes)? {
-                set(&mut out, &node_id, price, entry);
-            }
-            for node in nodes {
-                if let PhysicalNode::AiJoin(_) = node {
-                    let slot = out
-                        .iter_mut()
-                        .find(|(found, _, _)| found == node.id())
-                        .expect("a priced join");
-                    slot.2
-                        .insert("pass_questions".into(), Value::from(context.model.set_size));
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    /// A set-attention plan's passes: each group's first operator carries
-    /// the work of its passes, the others none.
-    fn set_passes(
-        &self,
-        context: &PlanningContext,
-        nodes: &[PhysicalNode],
-    ) -> Result<Priced, CompileError> {
-        let model = &context.model;
-        let (state_tail, header) = set_pass_tokens(context)?;
-        let mut out = Priced::new();
-        for members in pass_members(nodes) {
-            let first = &nodes[members[0]];
-            let alias = first.document_aliases()[0].clone();
-            let summary = AliasStats::summarize(context.lengths(&alias)?, model.sliding_window);
-            let questions: Vec<f64> = members
-                .iter()
-                .enumerate()
-                .map(|(index, member)| {
-                    (pass_question_tokens(&nodes[*member], state_tail)
-                        + if index > 0 { header } else { 0 }) as f64
-                })
-                .collect();
-            let rows = expected_documents(first) * self.distinct(context, &alias);
-            let state =
-                Quantity::Scalar(head_tokens(first) as f64 + summary.mean() + state_tail as f64);
-            let pass = &packed(&state, &questions, model.sliding_window)
-                + &Work {
-                    pairs: Quantity::Scalar(summary.variance()),
-                    ..Work::default()
-                };
-            let work = &pass * rows;
-            let ids: Vec<Value> = members
-                .iter()
-                .map(|member| Value::from(nodes[*member].id()))
-                .collect();
-            for (index, member) in members.iter().enumerate() {
-                let mut entry = Map::new();
-                entry.insert("pass_members".into(), Value::Array(ids.clone()));
-                let price = if index == 0 {
-                    entry.insert(
-                        "seconds".into(),
-                        Value::from(self.seconds_of(context, &work)),
-                    );
-                    NodePrice {
-                        work: Some(work.clone()),
-                        seconds: 0.0,
-                    }
-                } else {
-                    NodePrice {
-                        work: Some(Work::default()),
-                        seconds: 0.0,
-                    }
-                };
-                out.push((nodes[*member].id().to_string(), price, entry));
-            }
-        }
-        Ok(out)
-    }
-
-    fn each_priced(
-        &self,
-        context: &PlanningContext,
-        nodes: &[PhysicalNode],
-    ) -> Result<Priced, CompileError> {
         let pipelines = build_pipelines(nodes, &[]);
         let anchored: Vec<&str> = nodes
             .iter()
@@ -424,7 +319,7 @@ impl PlanPricer {
                     match spec_work(node) {
                         // its work joins the plan's, packed with the rest
                         Some(work) => {
-                            let copies = parallel_copies(context.gpus, spec_expected_rows(node));
+                            let copies = parallel_copies(context.gpus, expected_documents(node));
                             let work = &work * (share / copies);
                             let seconds = unrounded_seconds(
                                 &work,
@@ -452,6 +347,87 @@ impl PlanPricer {
                 _ => NodePrice::default(),
             };
             out.push((node.id().to_string(), price, entry));
+        }
+        if context.model.attention_mask == "set" {
+            for (node_id, price, entry) in self.set_passes(context, nodes)? {
+                set(&mut out, &node_id, price, entry);
+            }
+            for node in nodes {
+                if let PhysicalNode::AiJoin(_) = node {
+                    let slot = out
+                        .iter_mut()
+                        .find(|(found, _, _)| found == node.id())
+                        .expect("a priced join");
+                    slot.2
+                        .insert("pass_questions".into(), Value::from(context.model.set_size));
+                }
+            }
+        }
+        for (node_id, price, entry) in out {
+            entries.insert(node_id, Value::Object(entry));
+            match price.work {
+                Some(found) => work = &work + &found,
+                None => seconds += price.seconds,
+            }
+        }
+        Ok((self.seconds_of(context, &work) + seconds, entries))
+    }
+
+    /// A set-attention plan's passes: each group's first operator carries
+    /// the work of its passes, the others none.
+    fn set_passes(
+        &self,
+        context: &PlanningContext,
+        nodes: &[PhysicalNode],
+    ) -> Result<Priced, CompileError> {
+        let model = &context.model;
+        let (state_tail, header) = set_pass_tokens(context)?;
+        let mut out = Priced::new();
+        for members in pass_members(nodes) {
+            let first = &nodes[members[0]];
+            let alias = first.document_aliases()[0].clone();
+            let summary = AliasStats::summarize(context.lengths(&alias)?, model.sliding_window);
+            let questions: Vec<f64> = members
+                .iter()
+                .enumerate()
+                .map(|(index, member)| {
+                    (pass_question_tokens(&nodes[*member], state_tail)
+                        + if index > 0 { header } else { 0 }) as f64
+                })
+                .collect();
+            let rows = expected_documents(first) * self.distinct(context, &alias);
+            let state =
+                Quantity::Scalar(head_tokens(first) as f64 + summary.mean() + state_tail as f64);
+            let pass = &packed(&state, &questions, model.sliding_window)
+                + &Work {
+                    pairs: Quantity::Scalar(summary.variance()),
+                    ..Work::default()
+                };
+            let work = &pass * rows;
+            let ids: Vec<Value> = members
+                .iter()
+                .map(|member| Value::from(nodes[*member].id()))
+                .collect();
+            for (index, member) in members.iter().enumerate() {
+                let mut entry = Map::new();
+                entry.insert("pass_members".into(), Value::Array(ids.clone()));
+                let price = if index == 0 {
+                    entry.insert(
+                        "seconds".into(),
+                        Value::from(self.seconds_of(context, &work)),
+                    );
+                    NodePrice {
+                        work: Some(work.clone()),
+                        seconds: 0.0,
+                    }
+                } else {
+                    NodePrice {
+                        work: Some(Work::default()),
+                        seconds: 0.0,
+                    }
+                };
+                out.push((nodes[*member].id().to_string(), price, entry));
+            }
         }
         Ok(out)
     }

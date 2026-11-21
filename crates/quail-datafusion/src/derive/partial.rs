@@ -51,17 +51,6 @@ use quail_planner::physical::Expression;
 /// The column that holds each listed answer.
 pub(crate) const LISTED: &str = "answer";
 
-/// The schema of a batch of answers: the one column [`LISTED`].
-fn answer_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![Field::new(LISTED, DataType::Utf8, true)]))
-}
-
-/// The session whose functions and type rules plan a test of an answer.
-fn context() -> &'static SessionContext {
-    static CONTEXT: OnceLock<SessionContext> = OnceLock::new();
-    CONTEXT.get_or_init(SessionContext::new)
-}
-
 /// The least string greater than every string that starts with `text`:
 /// `text` with its last character that has a successor raised by one,
 /// and nothing after it. None when no character has one.
@@ -745,9 +734,16 @@ impl<F: Fn(&Expr) -> bool> Reader<'_, F> {
         }
     }
 
-    /// `expr` reading the answer as the column [`LISTED`]; None when it
-    /// reads any other column.
-    fn over_answer(&self, expr: &Expr) -> Option<Expr> {
+    /// Which values `expr` gives the complete answers still possible,
+    /// each one evaluated by DataFusion; None when the answers are too
+    /// many to list ([`Completions::listed`]), `expr` reads a column that
+    /// is not the answer, or DataFusion does not evaluate it.
+    fn evaluated(&self, expr: &Expr) -> Option<Possible> {
+        let mut answers: Vec<Option<String>> =
+            self.answers.listed()?.into_iter().map(Some).collect();
+        if self.answers.may_be_null {
+            answers.push(None);
+        }
         let mut other = false;
         let read = expr
             .clone()
@@ -763,24 +759,16 @@ impl<F: Fn(&Expr) -> bool> Reader<'_, F> {
             })
             .ok()?
             .data;
-        (!other).then_some(read)
-    }
-
-    /// Which values `expr` gives the complete answers still possible,
-    /// each one evaluated by DataFusion; None when the answers are too
-    /// many to list ([`Completions::listed`]), `expr` reads a column that
-    /// is not the answer, or DataFusion does not evaluate it.
-    fn evaluated(&self, expr: &Expr) -> Option<Possible> {
-        let mut answers: Vec<Option<String>> =
-            self.answers.listed()?.into_iter().map(Some).collect();
-        if self.answers.may_be_null {
-            answers.push(None);
+        if other {
+            return None;
         }
-        let read = self.over_answer(expr)?;
-        let schema = answer_schema();
+        let field = Field::new(LISTED, DataType::Utf8, true);
+        let schema = Arc::new(Schema::new(vec![field]));
         let column: ArrayRef = Arc::new(StringArray::from(answers));
         let batch = RecordBatch::try_new(Arc::clone(&schema), vec![column]).ok()?;
-        let physical = context()
+        static CONTEXT: OnceLock<SessionContext> = OnceLock::new();
+        let physical = CONTEXT
+            .get_or_init(SessionContext::new)
             .create_physical_expr(read, &DFSchema::try_from(schema).ok()?)
             .ok()?;
         let values = physical

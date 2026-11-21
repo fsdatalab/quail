@@ -7,11 +7,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::cost::budgets::pages;
 use crate::cost::quantity::python_sum;
 use crate::cost::work::Work;
+use crate::physical::port as port_of;
 use crate::physical::{
     AiClassifyAttributes, AiExtractAttributes, AiFilterAttributes, AiJoinAttributes,
     AiMapAttributes, AiSaeFeaturesAttributes, AiScoreAttributes, Asked, BarrierAttributes,
     ClassifySpec, ColumnRef, Expression, FilterAttributes, HashJoinAttributes, ModelCall, Node,
-    PhysicalNode, PortRef, Prompt, ScanAttributes, ScoreSpec, ValueExpression, input_ports, port,
+    PhysicalNode, PortRef, Prompt, ScanAttributes, ValueExpression, input_ports,
 };
 use serde_json::{Map, Value};
 
@@ -130,34 +131,6 @@ pub fn hash_join_nodes(
     nodes
 }
 
-/// The longest input of a score: its resident prefix and streamed suffix
-/// tokens, as `score_input_tokens`.
-fn score_input_tokens(
-    spec: &ScoreSpec,
-    context: &PlanningContext,
-) -> Result<(i64, i64), CompileError> {
-    let parts = &spec.prompt_token_parts;
-    let canvas = context.model.canvas_tokens;
-    let close = prompt_layout(&context.model.prompt_layout)?.document_close;
-    let close_tokens = if close.is_empty() {
-        0
-    } else {
-        (context.tokenizer)(close)?.len() as i64
-    };
-    let mut longest = Vec::new();
-    for alias in &spec.aliases {
-        longest.push(context.lengths(alias)?.iter().copied().max().unwrap_or(0) + close_tokens);
-    }
-    if spec.aliases.len() == 1 {
-        return Ok((
-            parts[0].len() as i64,
-            longest[0] + parts[1].len() as i64 + canvas,
-        ));
-    }
-    let prefix = parts[0].len() as i64 + longest[0] + parts[1].len() as i64;
-    Ok((prefix, longest[1] + parts[2].len() as i64 + canvas))
-}
-
 /// What the AI joins leave for the operators after them, as `JoinPorts`.
 #[derive(Debug, Default)]
 struct JoinPorts {
@@ -214,87 +187,7 @@ struct GraphBuilder<'a, 'c> {
 }
 
 impl<'a, 'c> GraphBuilder<'a, 'c> {
-    fn new(
-        found: &'a Operators,
-        context: &'a PlanningContext<'c>,
-        order: OperatorOrder,
-    ) -> Result<Self, CompileError> {
-        let labels = label_calls(found);
-        let classified = labels.iter().map(|(_, alias)| alias.clone()).collect();
-        let mut after_joins: BTreeMap<String, Kinds> = BTreeMap::new();
-        for (alias, kind) in columns_above_joins(found) {
-            after_joins
-                .entry(alias)
-                .or_default()
-                .insert(column_step_kind(&kind));
-        }
-        let classified_after = after_joins
-            .iter()
-            .filter(|(_, kinds)| kinds.contains("classify"))
-            .map(|(alias, _)| alias.clone())
-            .collect();
-        let ask_filters = order
-            .statistics
-            .asks
-            .iter()
-            .filter(|(_, positions)| !positions.is_empty())
-            .map(|(alias, _)| alias.clone())
-            .collect();
-        let label_names = found
-            .classifies
-            .iter()
-            .map(|column| (column.call.clone(), column.name.clone()))
-            .collect();
-        Ok(GraphBuilder {
-            context,
-            stop_keys: found.stop_keys.clone(),
-            order,
-            operators: found,
-            classified,
-            after_joins,
-            classified_after,
-            ask_filters,
-            sequence_groups: Vec::new(),
-            group_ids: Vec::new(),
-            seen_ids: BTreeMap::new(),
-            streamed: BTreeSet::new(),
-            pipelined: BTreeSet::new(),
-            nodes: Vec::new(),
-            computed_ports: Vec::new(),
-            computed_columns: BTreeMap::new(),
-            column_nodes: Vec::new(),
-            emitted_tests: Vec::new(),
-            scoring: None,
-            pairs_src: BTreeMap::new(),
-            label_names,
-        })
-    }
-
     fn build(mut self) -> Result<Planned, CompileError> {
-        self.prepare()?;
-        let ports = self.emit_scans();
-        let emitted = (|| -> Result<_, CompileError> {
-            let ports = self.emit_documents(ports)?;
-            let (mut ports, joins) = self.emit_joins(ports)?;
-            self.emit_join_answers(&joins)?;
-            self.emit_after_joins(&mut ports)?;
-            let score_pairs = self.emit_pair_scores(&ports, &joins)?;
-            Ok((ports, joins, score_pairs))
-        })();
-        let (ports, joins, score_pairs) = match emitted {
-            Ok(found) => found,
-            Err(error) => {
-                return match error.refusal() {
-                    Some(refusal) => Ok(Err(refusal.clone())),
-                    None => Err(error),
-                };
-            }
-        };
-        self.emit_result(&ports, &joins, score_pairs);
-        self.finish().map(Ok)
-    }
-
-    fn prepare(&mut self) -> Result<(), CompileError> {
         let sequence = &self.order.join_sequence;
         self.sequence_groups = group_sequence(sequence);
         for group in &self.sequence_groups {
@@ -338,10 +231,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                 index: 0,
             });
         }
-        Ok(())
-    }
-
-    fn emit_scans(&mut self) -> BTreeMap<String, PortRef> {
         let stats = &self.order.statistics.stats;
         let mut ports = BTreeMap::new();
         for scan in &self.operators.scans {
@@ -363,7 +252,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
             )));
             ports.insert(
                 scan.alias.clone(),
-                port(&scan_id, format!("rows:{}", scan.alias)),
+                port_of(&scan_id, format!("rows:{}", scan.alias)),
             );
         }
         for node in hash_join_nodes(self.operators, &self.context.pair_fractions, &ports) {
@@ -383,32 +272,156 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                 self.pipelined.insert(alias.clone());
             }
         }
-        ports
-    }
-
-    fn emit_documents(
-        &mut self,
-        ports: BTreeMap<String, PortRef>,
-    ) -> Result<BTreeMap<String, PortRef>, CompileError> {
-        let mut ports = ports;
-        let aliases: Vec<String> = self
-            .operators
-            .scans
-            .iter()
-            .map(|scan| scan.alias.clone())
-            .collect();
-        for alias in aliases {
-            // a column operator the planner lifted above the joins is emitted after them
-            let lifted = self.after_joins.get(&alias).cloned().unwrap_or_default();
-            let kinds: Kinds = [ASK, "classify", "extract", "features", "map"]
-                .into_iter()
-                .filter(|kind| !lifted.contains(kind))
+        let emitted = (|| -> Result<_, CompileError> {
+            let mut ports = ports;
+            let aliases: Vec<String> = self
+                .operators
+                .scans
+                .iter()
+                .map(|scan| scan.alias.clone())
                 .collect();
-            let rows = self.order.statistics.stats[&alias].num_documents as f64;
-            let after = self.emit_steps(&alias, rows, &kinds, ports[&alias].clone())?;
-            ports.insert(alias, after);
+            for alias in aliases {
+                // a column operator the planner lifted above the joins is emitted after them
+                let lifted = self.after_joins.get(&alias).cloned().unwrap_or_default();
+                let kinds: Kinds = [ASK, "classify", "extract", "features", "map"]
+                    .into_iter()
+                    .filter(|kind| !lifted.contains(kind))
+                    .collect();
+                let after = self.emit_steps(
+                    &alias,
+                    self.order.statistics.stats[&alias].num_documents as f64,
+                    &kinds,
+                    ports[&alias].clone(),
+                )?;
+                ports.insert(alias, after);
+            }
+            let (mut ports, joins) = self.emit_joins(ports)?;
+            self.emit_join_answers(&joins)?;
+            self.emit_after_joins(&mut ports)?;
+            let score_pairs = self.emit_pair_scores(&ports, &joins)?;
+            Ok((ports, joins, score_pairs))
+        })();
+        let (ports, joins, score_pairs) = match emitted {
+            Ok(found) => found,
+            Err(error) => {
+                return match error.refusal() {
+                    Some(refusal) => Ok(Err(refusal.clone())),
+                    None => Err(error),
+                };
+            }
+        };
+        let rows = match (score_pairs, joins.answers.first()) {
+            (Some(pairs), _) => pairs,
+            (None, Some(answers)) => answers.clone(),
+            (None, None) => ports[&self.operators.scans[0].alias].clone(),
+        };
+        self.nodes.extend(limit_node(self.operators, &rows));
+        let context = self.context;
+        let statistics = &self.order.statistics;
+        // a score join's work is in its AiScore's estimate
+        let stage_works: BTreeMap<usize, Work> = self
+            .order
+            .join_steps
+            .iter()
+            .filter(|step| !is_score(&self.operators.joins[step.written_position].predicate))
+            .map(|step| (step.written_position, step.copy_work(context.gpus)))
+            .collect();
+        let pricer = PlanPricer {
+            chunk: statistics.chunk,
+            cap_pages: statistics.cap_pages,
+            stats: statistics.stats.clone(),
+            stage_works,
+            expected_rows: self.order.expected_rows.clone(),
+        };
+        let model = &context.model;
+        let mut settings = Map::new();
+        settings.insert("chunk_tokens".into(), Value::from(statistics.chunk));
+        settings.insert(
+            "arena_pages".into(),
+            Value::Array(vec![
+                Value::from(statistics.arena_pages.0),
+                Value::from(statistics.arena_pages.1),
+            ]),
+        );
+        // the arena above leaves the CUDA graph reserve only for a plan
+        // that writes answers, so the worker captures graphs by this value
+        settings.insert(
+            "writes_answers".into(),
+            Value::from(context.writes_answers()),
+        );
+        settings.insert("admission_tokens".into(), Value::from(statistics.admission));
+        settings.insert(
+            "order_rule".into(),
+            Value::from(self.order.order_rule.clone()),
+        );
+        settings.insert(
+            "order_source".into(),
+            Value::from(self.order.order_source.clone()),
+        );
+        if let Some(scoring) = &self.scoring {
+            settings.insert("retained_kv_tokens".into(), Value::from(scoring.capacity));
+            settings.insert(
+                "prefix_reuse".into(),
+                Value::from("fixed prompt and first document within each score"),
+            );
+            settings.insert(
+                "survivor_assumption".into(),
+                Value::from("uniform independent selection"),
+            );
+            settings.insert(
+                "estimated_fresh_tokens".into(),
+                Value::from(scoring.work.tokens.total()),
+            );
+            settings.insert(
+                "estimated_attention_pairs".into(),
+                Value::from(scoring.work.pairs.total()),
+            );
+            settings.insert("batching".into(), Value::from("token_based_admission"));
+            settings.insert("data_parallel_copies".into(), Value::from(context.gpus));
+            settings.insert(
+                "score_normalization".into(),
+                Value::from(match model.role.as_str() {
+                    "reranker" => "yes_no_softmax",
+                    "decision" => "decision_head_softmax",
+                    _ => "true_false_softmax",
+                }),
+            );
         }
-        Ok(ports)
+        if !label_calls(self.operators).is_empty() {
+            settings.insert(
+                "classify_placement".into(),
+                Value::from(if self.classified_after.is_empty() {
+                    "before joins"
+                } else {
+                    "after joins"
+                }),
+            );
+            if model.answer_canvas.is_some() {
+                settings.insert("canvas_draws".into(), Value::from(context.canvas_draws));
+            }
+        }
+        let close = prompt_layout(&model.prompt_layout)?.document_close;
+        if !close.is_empty() {
+            settings.insert(
+                "document_close".into(),
+                Value::from((context.tokenizer)(close)?),
+            );
+        }
+        let last = self.nodes.last().expect("a node");
+        let root = port_of(last.id(), last.outputs()[0].0.clone());
+        let (seconds, estimates) = pricer.price(context, &self.nodes)?;
+        Ok(Ok(PhysicalPlan {
+            model: model.name.clone(),
+            device: context.device.name.clone(),
+            gpus: context.gpus,
+            backend: "quail".into(),
+            estimated_seconds: seconds,
+            nodes: self.nodes,
+            settings,
+            root,
+            estimates,
+            pricer,
+        }))
     }
 
     /// Emit the given kinds of a table's steps in run order.
@@ -497,15 +510,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         Ok(port)
     }
 
-    fn filter_order(&self, alias: &str) -> &[usize] {
-        self.order
-            .filter_orders
-            .iter()
-            .find(|(found, _)| found == alias)
-            .map(|(_, positions)| positions.as_slice())
-            .unwrap_or(&[])
-    }
-
     fn filters_of(&self, alias: &str) -> &[crate::physical::FilterPredicate] {
         self.operators
             .filters
@@ -525,7 +529,13 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         port: PortRef,
         followed: bool,
     ) -> Result<PortRef, CompileError> {
-        let order = self.filter_order(alias).to_vec();
+        let order = self
+            .order
+            .filter_orders
+            .iter()
+            .find(|(found, _)| found == alias)
+            .map(|(_, positions)| positions.clone())
+            .unwrap_or_default();
         let mut port = port;
         for (position, asked) in positions.iter().zip(asked) {
             let predicate = self.filters_of(alias)[*position].clone();
@@ -620,7 +630,29 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
             pair_fraction,
             prefix_groups,
         )?;
-        let (prefix, suffix) = score_input_tokens(&spec, context)?;
+        let parts = &spec.prompt_token_parts;
+        let canvas = context.model.canvas_tokens;
+        let close = prompt_layout(&context.model.prompt_layout)?.document_close;
+        let close_tokens = if close.is_empty() {
+            0
+        } else {
+            (context.tokenizer)(close)?.len() as i64
+        };
+        let mut longest = Vec::new();
+        for alias in &spec.aliases {
+            longest.push(context.lengths(alias)?.iter().copied().max().unwrap_or(0) + close_tokens);
+        }
+        let (prefix, suffix) = if spec.aliases.len() == 1 {
+            (
+                parts[0].len() as i64,
+                longest[0] + parts[1].len() as i64 + canvas,
+            )
+        } else {
+            (
+                parts[0].len() as i64 + longest[0] + parts[1].len() as i64,
+                longest[1] + parts[2].len() as i64 + canvas,
+            )
+        };
         let what = if spec.aliases.len() == 1 {
             format!("a document in {}", repr_str(&spec.aliases[0]))
         } else {
@@ -1387,137 +1419,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         }
         Ok(score_pairs)
     }
-
-    /// End the plan with the Limit of the region's fetch, which reads
-    /// the region's rows: the scored pairs, the one full join's answers,
-    /// or the surviving rows of the first table.
-    fn emit_result(
-        &mut self,
-        ports: &BTreeMap<String, PortRef>,
-        joins: &JoinPorts,
-        score_pairs: Option<PortRef>,
-    ) {
-        let rows = match (score_pairs, joins.answers.first()) {
-            (Some(pairs), _) => pairs,
-            (None, Some(answers)) => answers.clone(),
-            (None, None) => ports[&self.operators.scans[0].alias].clone(),
-        };
-        self.nodes.extend(limit_node(self.operators, &rows));
-    }
-
-    /// Build the plan and price it.
-    fn finish(self) -> Result<PhysicalPlan, CompileError> {
-        let context = self.context;
-        let statistics = &self.order.statistics;
-        // a score join's work is in its AiScore's estimate
-        let stage_works: BTreeMap<usize, Work> = self
-            .order
-            .join_steps
-            .iter()
-            .filter(|step| !is_score(&self.operators.joins[step.written_position].predicate))
-            .map(|step| (step.written_position, step.copy_work(context.gpus)))
-            .collect();
-        let pricer = PlanPricer {
-            chunk: statistics.chunk,
-            cap_pages: statistics.cap_pages,
-            stats: statistics.stats.clone(),
-            stage_works,
-            expected_rows: self.order.expected_rows.clone(),
-        };
-        let model = &context.model;
-        let mut settings = Map::new();
-        settings.insert("chunk_tokens".into(), Value::from(statistics.chunk));
-        settings.insert(
-            "arena_pages".into(),
-            Value::Array(vec![
-                Value::from(statistics.arena_pages.0),
-                Value::from(statistics.arena_pages.1),
-            ]),
-        );
-        // the arena above leaves the CUDA graph reserve only for a plan
-        // that writes answers, so the worker captures graphs by this value
-        settings.insert(
-            "writes_answers".into(),
-            Value::from(context.writes_answers()),
-        );
-        settings.insert("admission_tokens".into(), Value::from(statistics.admission));
-        settings.insert(
-            "order_rule".into(),
-            Value::from(self.order.order_rule.clone()),
-        );
-        settings.insert(
-            "order_source".into(),
-            Value::from(self.order.order_source.clone()),
-        );
-        if let Some(scoring) = &self.scoring {
-            settings.insert("retained_kv_tokens".into(), Value::from(scoring.capacity));
-            settings.insert(
-                "prefix_reuse".into(),
-                Value::from("fixed prompt and first document within each score"),
-            );
-            settings.insert(
-                "survivor_assumption".into(),
-                Value::from("uniform independent selection"),
-            );
-            settings.insert(
-                "estimated_fresh_tokens".into(),
-                Value::from(scoring.work.tokens.total()),
-            );
-            settings.insert(
-                "estimated_attention_pairs".into(),
-                Value::from(scoring.work.pairs.total()),
-            );
-            settings.insert("batching".into(), Value::from("token_based_admission"));
-            settings.insert("data_parallel_copies".into(), Value::from(context.gpus));
-            settings.insert(
-                "score_normalization".into(),
-                Value::from(match model.role.as_str() {
-                    "reranker" => "yes_no_softmax",
-                    "decision" => "decision_head_softmax",
-                    _ => "true_false_softmax",
-                }),
-            );
-        }
-        if !label_calls(self.operators).is_empty() {
-            settings.insert(
-                "classify_placement".into(),
-                Value::from(if self.classified_after.is_empty() {
-                    "before joins"
-                } else {
-                    "after joins"
-                }),
-            );
-            if model.answer_canvas.is_some() {
-                settings.insert("canvas_draws".into(), Value::from(context.canvas_draws));
-            }
-        }
-        let close = prompt_layout(&model.prompt_layout)?.document_close;
-        if !close.is_empty() {
-            settings.insert(
-                "document_close".into(),
-                Value::from((context.tokenizer)(close)?),
-            );
-        }
-        let last = self.nodes.last().expect("a node");
-        let root = port_of(last.id(), last.outputs()[0].0.clone());
-        let (seconds, estimates) = pricer.price(context, &self.nodes)?;
-        Ok(PhysicalPlan {
-            model: model.name.clone(),
-            device: context.device.name.clone(),
-            gpus: context.gpus,
-            backend: "quail".into(),
-            estimated_seconds: seconds,
-            nodes: self.nodes,
-            settings,
-            root,
-            estimates,
-            pricer,
-        })
-    }
-}
-
-fn port_of(node_id: &str, name: impl Into<String>) -> PortRef {
-    port(node_id, name)
 }
 
 fn classify_node(
@@ -1559,7 +1460,56 @@ pub fn build_physical_plan(
         Ok(order) => order,
         Err(refusal) => return Ok(Err(refusal)),
     };
-    GraphBuilder::new(found, context, order)?.build()
+    let labels = label_calls(found);
+    let classified = labels.iter().map(|(_, alias)| alias.clone()).collect();
+    let mut after_joins: BTreeMap<String, Kinds> = BTreeMap::new();
+    for (alias, kind) in columns_above_joins(found) {
+        after_joins
+            .entry(alias)
+            .or_default()
+            .insert(column_step_kind(&kind));
+    }
+    let classified_after = after_joins
+        .iter()
+        .filter(|(_, kinds)| kinds.contains("classify"))
+        .map(|(alias, _)| alias.clone())
+        .collect();
+    let ask_filters = order
+        .statistics
+        .asks
+        .iter()
+        .filter(|(_, positions)| !positions.is_empty())
+        .map(|(alias, _)| alias.clone())
+        .collect();
+    let label_names = found
+        .classifies
+        .iter()
+        .map(|column| (column.call.clone(), column.name.clone()))
+        .collect();
+    GraphBuilder {
+        context,
+        stop_keys: found.stop_keys.clone(),
+        order,
+        operators: found,
+        classified,
+        after_joins,
+        classified_after,
+        ask_filters,
+        sequence_groups: Vec::new(),
+        group_ids: Vec::new(),
+        seen_ids: BTreeMap::new(),
+        streamed: BTreeSet::new(),
+        pipelined: BTreeSet::new(),
+        nodes: Vec::new(),
+        computed_ports: Vec::new(),
+        computed_columns: BTreeMap::new(),
+        column_nodes: Vec::new(),
+        emitted_tests: Vec::new(),
+        scoring: None,
+        pairs_src: BTreeMap::new(),
+        label_names,
+    }
+    .build()
 }
 
 /// A refusal when a pair classification cannot run in its join's

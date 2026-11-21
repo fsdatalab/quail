@@ -88,13 +88,6 @@ pub fn attention_pair_flops(model: &ModelSpec) -> (i64, i64) {
     (full, sliding_flops)
 }
 
-/// Weight bytes per MLP parameter: its own precision's, or the model's.
-fn mlp_weight_bytes(model: &ModelSpec) -> f64 {
-    model
-        .mlp_weight_precision
-        .map_or(model.w_bytes, Precision::bytes)
-}
-
 /// The modeled decoder components, with a readout when the work has answer rows.
 ///
 /// # Panics
@@ -125,7 +118,11 @@ pub fn dense_decoder_components(work: &Work, model: &ModelSpec, passes: f64) -> 
             name: "mlp",
             flops: (2.0 * mlp as f64) * &work.tokens,
             bytes_moved: Quantity::Scalar(
-                mlp_weight_params(model) as f64 * mlp_weight_bytes(model) * passes,
+                mlp_weight_params(model) as f64
+                    * model
+                        .mlp_weight_precision
+                        .map_or(model.w_bytes, Precision::bytes)
+                    * passes,
             ),
             precision: model.mlp_weight_precision.unwrap_or(model.weight_precision),
             gemm: true,
@@ -205,42 +202,38 @@ pub fn dense_decoder_components(work: &Work, model: &ModelSpec, passes: f64) -> 
     let rows = work.readout_rows.scalar().expect("summed work");
     if rows != 0.0 {
         let head_rows = work.readout_head_rows.scalar().expect("summed work") / rows;
-        components.push(readout(model, rows, passes, head_rows));
+        let readout = if !model.readout.is_empty() {
+            // every code row of the fp32 readout times the prompt's last row
+            let codes = (crate::prompts::MAX_LETTERS as i64 * model.hidden) as f64;
+            CostComponent {
+                name: "readout",
+                flops: Quantity::Scalar(2.0 * codes * rows),
+                bytes_moved: Quantity::Scalar(4.0 * codes * passes),
+                precision: Precision::Fp32,
+                gemm: false,
+            }
+        } else if model.role == "decision" {
+            let (width, hidden) = (model.decision_head_dim, model.hidden);
+            CostComponent {
+                name: "readout",
+                flops: Quantity::Scalar(4.0 * width as f64 * hidden as f64 * rows),
+                bytes_moved: Quantity::Scalar(
+                    4.0 * (4 * width * hidden + 2 * width + 4 * hidden) as f64 * passes,
+                ),
+                precision: Precision::Fp32,
+                gemm: false,
+            }
+        } else {
+            let head = 2.0 * model.hidden as f64 * head_rows;
+            CostComponent {
+                name: "readout",
+                flops: Quantity::Scalar(head * rows),
+                bytes_moved: Quantity::Scalar(head * passes),
+                precision: Precision::Bf16,
+                gemm: true,
+            }
+        };
+        components.push(readout);
     }
     components
-}
-
-/// The answer readout: the decision head, or the output head's rows.
-fn readout(model: &ModelSpec, rows: f64, passes: f64, head_rows: f64) -> CostComponent {
-    if !model.readout.is_empty() {
-        // every code row of the fp32 readout times the prompt's last row
-        let codes = (crate::prompts::MAX_LETTERS as i64 * model.hidden) as f64;
-        return CostComponent {
-            name: "readout",
-            flops: Quantity::Scalar(2.0 * codes * rows),
-            bytes_moved: Quantity::Scalar(4.0 * codes * passes),
-            precision: Precision::Fp32,
-            gemm: false,
-        };
-    }
-    if model.role == "decision" {
-        let (width, hidden) = (model.decision_head_dim, model.hidden);
-        return CostComponent {
-            name: "readout",
-            flops: Quantity::Scalar(4.0 * width as f64 * hidden as f64 * rows),
-            bytes_moved: Quantity::Scalar(
-                4.0 * (4 * width * hidden + 2 * width + 4 * hidden) as f64 * passes,
-            ),
-            precision: Precision::Fp32,
-            gemm: false,
-        };
-    }
-    let head = 2.0 * model.hidden as f64 * head_rows;
-    CostComponent {
-        name: "readout",
-        flops: Quantity::Scalar(head * rows),
-        bytes_moved: Quantity::Scalar(head * passes),
-        precision: Precision::Bf16,
-        gemm: true,
-    }
 }

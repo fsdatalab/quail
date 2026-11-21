@@ -4,7 +4,7 @@ use crate::cost::budgets::{
     POOL_FRACTION, arena_bytes, chunk_budget, chunk_memory_bytes, minimum_weight_gpus,
     sliding_kv_fits, transient_sliding_pages,
 };
-use crate::cost::specs::{DeviceSpec, ModelSpec};
+use crate::cost::specs::ModelSpec;
 use crate::physical::{Asked, Prompt, ValueExpression};
 
 use crate::context::PlanningContext;
@@ -231,22 +231,6 @@ fn extraction_refusal(model: &ModelSpec, function: &str) -> Result<Option<Refusa
     Ok(Some(refusal(reason, &constraint)))
 }
 
-fn attention_device_refusal(model: &ModelSpec, device: &DeviceSpec) -> Option<Refusal> {
-    if device.name != "l40s" || !["diffusion_gemma", "qwen3_5"].contains(&model.arch.as_str()) {
-        return None;
-    }
-    Some(Refusal::new(
-        format!(
-            "{} does not run on {}: FlashAttention 4 does not run on this GPU",
-            model.name, device.name
-        ),
-        "flash_attention_4_unsupported",
-        4.0,
-        2.0,
-        "version",
-    ))
-}
-
 /// A refusal for what a bidirectional model cannot run yet.
 ///
 /// Each prompt reads one document: a join or a prompt over two tables
@@ -402,8 +386,17 @@ pub fn validate_query(
             return Ok(Some(refused));
         }
     }
-    if let Some(refused) = attention_device_refusal(model, device) {
-        return Ok(Some(refused));
+    if device.name == "l40s" && ["diffusion_gemma", "qwen3_5"].contains(&model.arch.as_str()) {
+        return Ok(Some(Refusal::new(
+            format!(
+                "{} does not run on {}: FlashAttention 4 does not run on this GPU",
+                model.name, device.name
+            ),
+            "flash_attention_4_unsupported",
+            4.0,
+            2.0,
+            "version",
+        )));
     }
     let weight_gpus = minimum_weight_gpus(model, device);
     if weight_gpus > 1 {

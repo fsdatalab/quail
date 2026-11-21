@@ -119,10 +119,6 @@ impl RoundChances {
         }
     }
 
-    fn first(&self, round_tokens: i64) -> f64 {
-        self.chance[&round_tokens][0]
-    }
-
     /// Sums of chance and of chance times j over rounds offset + j, j < count.
     fn sums(&self, round_tokens: i64, offset: i64, count: i64) -> (f64, f64) {
         let (sums, round_sums) = (
@@ -293,7 +289,7 @@ pub fn document_work(
                 let mut first = ask(&scalar(context), &scalar(step as f64), window);
                 first.state_read = scalar(1.0);
                 first.state_written = scalar(0.0);
-                work = &work + &(&first * chances.first(step));
+                work = &work + &(&first * chances.chance[&step][0]);
                 let mut replays = chances.asks(step, context, 2, 1, window);
                 let read = value(&replays.state_read);
                 replays.state_read = scalar(2.0 * read);

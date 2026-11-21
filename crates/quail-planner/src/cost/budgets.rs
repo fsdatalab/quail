@@ -4,7 +4,7 @@
 //! Python mixes integers and floats here; each function keeps the type
 //! Python's result has, and `//` on floats rounds as CPython's does.
 
-use crate::cost::specs::{DeviceSpec, ModelSpec, Precision};
+use crate::cost::specs::{DeviceSpec, ModelSpec};
 
 /// Fraction of device memory the executor claims.
 pub const POOL_FRACTION: f64 = 0.95;
@@ -423,15 +423,18 @@ pub fn sliding_kv_fits(model: &ModelSpec, device: &DeviceSpec, chunk_tokens: Opt
     model.sliding_window == 0 || arena_pages(model, device, chunk_tokens, None, true).is_ok()
 }
 
-/// Shrink a chunk until its activation reserve leaves its own KV.
-fn chunk_leaving_kv(model: &ModelSpec, device: &DeviceSpec, chunk: i64) -> i64 {
+/// The chunk budget allowed by the model and device.
+pub fn chunk_budget(model: &ModelSpec, device: &DeviceSpec) -> i64 {
+    let mut chunk = chunk_memory_bound(model, device).min(kernel_index_cap(model));
+    if model.chunk_cap_tokens != 0 {
+        chunk = chunk.min(model.chunk_cap_tokens);
+    }
     if model.sliding_window != 0 || chunk < 1 {
         return chunk;
     }
     let free =
         device.mem_bytes * POOL_FRACTION - model.W_resident() - graph_memory_bytes(model) as f64;
     let per = ACT_RESERVE_CHUNKS as f64 * model.act_per_token() + model.kappa_full();
-    let mut chunk = chunk;
     if per > 0.0 {
         chunk = chunk.min(1_i64.max(floor_divide(free, per) as i64));
     }
@@ -448,17 +451,13 @@ fn chunk_leaving_kv(model: &ModelSpec, device: &DeviceSpec, chunk: i64) -> i64 {
     chunk
 }
 
-/// The chunk budget allowed by the model and device.
-pub fn chunk_budget(model: &ModelSpec, device: &DeviceSpec) -> i64 {
-    let mut budget = chunk_memory_bound(model, device).min(kernel_index_cap(model));
-    if model.chunk_cap_tokens != 0 {
-        budget = budget.min(model.chunk_cap_tokens);
-    }
-    chunk_leaving_kv(model, device, budget)
-}
-
-/// (in dim, out dim, layers, precision) of each dense projection.
-fn projection_shapes(model: &ModelSpec) -> Vec<(i64, i64, i64, Precision)> {
+/// Chunk size (tokens) where the dense projections become compute-bound.
+///
+/// # Errors
+///
+/// The projections never cross the roofline ridge.
+pub fn compute_knee(model: &ModelSpec, device: &DeviceSpec) -> Result<f64, String> {
+    let (mut compute_seconds, mut weight_bytes, mut activation_bytes) = (0.0, 0.0, 0.0);
     let query_width = if model.attn_output_gate { 2 } else { 1 };
     let qkv_out = (query_width * model.num_q_heads + 2 * model.num_kv_heads) * model.d_head;
     let attention = model.attention_layers().len() as i64;
@@ -498,17 +497,7 @@ fn projection_shapes(model: &ModelSpec) -> Vec<(i64, i64, i64, Precision)> {
         shapes.push((model.hidden, 3 * model.hidden, short, precision));
         shapes.push((model.hidden, model.hidden, short, precision));
     }
-    shapes
-}
-
-/// Chunk size (tokens) where the dense projections become compute-bound.
-///
-/// # Errors
-///
-/// The projections never cross the roofline ridge.
-pub fn compute_knee(model: &ModelSpec, device: &DeviceSpec) -> Result<f64, String> {
-    let (mut compute_seconds, mut weight_bytes, mut activation_bytes) = (0.0, 0.0, 0.0);
-    for (din, dout, layers, precision) in projection_shapes(model) {
+    for (din, dout, layers, precision) in shapes {
         let share = layers as f64 / model.layers as f64;
         let params = share * din as f64 * dout as f64;
         compute_seconds += 2.0 * params / device.gemm_flops(precision);

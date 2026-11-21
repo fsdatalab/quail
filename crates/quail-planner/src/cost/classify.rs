@@ -59,13 +59,6 @@ fn filled(like: &Quantity, value: f64) -> Quantity {
     like.map(|_| value)
 }
 
-fn length(values: &Quantity) -> usize {
-    match values {
-        Quantity::Array(values) => values.len(),
-        Quantity::Scalar(_) => 1,
-    }
-}
-
 /// Every document's prefix-and-tail work: scan, or ask on resident KV.
 fn first_work(
     prefix: &Quantity,
@@ -74,7 +67,10 @@ fn first_work(
     resident: bool,
     window: i64,
 ) -> Work {
-    let documents = length(prefix) as f64;
+    let documents = match prefix {
+        Quantity::Array(values) => values.len(),
+        Quantity::Scalar(_) => 1,
+    } as f64;
     if resident {
         if tail == 0 {
             return Work::default();
@@ -108,14 +104,6 @@ fn canvas_work(work: Work, canvas_rows: i64) -> Work {
         return &work + &reread;
     }
     work
-}
-
-fn stream_work(context: &Quantity, suffixes: &[i64], window: i64, canvas_rows: i64) -> Work {
-    let fed: Vec<Quantity> = suffixes
-        .iter()
-        .map(|suffix| filled(context, *suffix as f64))
-        .collect();
-    canvas_work(stream(context, &fed, window).total(), canvas_rows)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -213,18 +201,19 @@ pub fn estimate_suffixes(
             (work, suffix_tokens, rows, rounds)
         }
         None => {
-            let work = &first_work(
+            let first = first_work(
                 &prefix,
                 &shared,
                 inputs.frame_tokens,
                 inputs.resident,
                 window,
-            ) + &stream_work(
-                &(&prefix + inputs.frame_tokens as f64),
-                suffixes,
-                window,
-                canvas_rows,
             );
+            let context = &prefix + inputs.frame_tokens as f64;
+            let fed: Vec<Quantity> = suffixes
+                .iter()
+                .map(|suffix| filled(&context, *suffix as f64))
+                .collect();
+            let work = &first + &canvas_work(stream(&context, &fed, window).total(), canvas_rows);
             let fed: i64 = suffixes.iter().sum();
             let rows = if canvas_rows != 0 { canvas_rows } else { fed };
             (work, fed as f64, rows as f64, 1)

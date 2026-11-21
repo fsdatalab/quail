@@ -20,6 +20,7 @@
 
 use datafusion::common::ScalarValue;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+use datafusion::common::utils::datafusion_strsim::levenshtein;
 use datafusion::logical_expr::{Expr, LogicalPlan, lit};
 
 use crate::ai::AiNode;
@@ -96,19 +97,27 @@ fn likeness(first: &Expr, second: &Expr) -> Option<(Likeness, (String, String))>
     }
     let mut least: Option<Likeness> = None;
     let mut differing: Option<(String, String)> = None;
-    for (left, right) in first_texts.iter().zip(&second_texts) {
-        if left == right {
+    let not_letters =
+        |text: &str| -> String { text.chars().filter(|c| !c.is_alphabetic()).collect() };
+    for (first, second) in first_texts.iter().zip(&second_texts) {
+        if first == second {
             continue;
         }
-        let pair = if normalized(left) == normalized(right) {
+        let (left, right) = (normalized(first), normalized(second));
+        let pair = if left == right {
             Likeness::Spelling
-        } else if is_typo(left, right) {
-            Likeness::Typo
         } else {
-            return None;
+            Likeness::Typo
         };
+        if pair == Likeness::Typo
+            && (left.chars().count().min(right.chars().count()) < 12
+                || not_letters(&left) != not_letters(&right)
+                || !(1..=2).contains(&levenshtein(&left, &right)))
+        {
+            return None;
+        }
         least = Some(least.map_or(pair, |found| found.min(pair)));
-        differing.get_or_insert_with(|| (left.clone(), right.clone()));
+        differing.get_or_insert_with(|| (first.clone(), second.clone()));
     }
     least.zip(differing)
 }
@@ -136,22 +145,6 @@ fn normalized(text: &str) -> String {
         .filter(|c| c.is_alphanumeric() || *c == '{' || *c == '}')
         .flat_map(char::to_lowercase)
         .collect()
-}
-
-/// Whether two texts at least 12 characters long are at most two letter
-/// edits apart, with the same digits and placeholders.
-fn is_typo(left: &str, right: &str) -> bool {
-    let (left, right) = (normalized(left), normalized(right));
-    let not_letters =
-        |text: &str| -> String { text.chars().filter(|c| !c.is_alphabetic()).collect() };
-    if left.chars().count().min(right.chars().count()) < 12
-        || not_letters(&left) != not_letters(&right)
-    {
-        return false;
-    }
-    (1..=2).contains(&datafusion::common::utils::datafusion_strsim::levenshtein(
-        &left, &right,
-    ))
 }
 
 #[cfg(test)]

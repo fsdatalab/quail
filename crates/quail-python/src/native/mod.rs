@@ -1178,7 +1178,10 @@ fn collect_answers<'py>(
 )> {
     use pyo3::IntoPyObjectExt;
     let request: crate::results::AnswerRequest = from_json(request)?;
-    let relations = read_relations(outputs)?;
+    let mut relations = std::collections::HashMap::new();
+    for (key, table) in outputs {
+        relations.insert(key, one_batch(&table)?);
+    }
     let found =
         crate::results::collect_answers(&request, &relations).map_err(PyValueError::new_err)?;
     let table = |batch: datafusion::arrow::array::RecordBatch| -> PyResult<Py<PyAny>> {
@@ -1214,17 +1217,6 @@ fn collect_answers<'py>(
         true_joins,
         serde_json::Value::from(found.stages).to_string(),
     ))
-}
-
-/// Each pyarrow Table of `outputs` as one record batch, by (node id, port).
-fn read_relations(
-    outputs: std::collections::HashMap<(String, String), Bound<'_, PyAny>>,
-) -> PyResult<std::collections::HashMap<(String, String), datafusion::arrow::array::RecordBatch>> {
-    let mut relations = std::collections::HashMap::new();
-    for (key, table) in outputs {
-        relations.insert(key, one_batch(&table)?);
-    }
-    Ok(relations)
 }
 
 /// A pyarrow Table as one record batch.

@@ -109,140 +109,6 @@ fn round_to(value: f64, digits: usize) -> f64 {
     format!("{value:.digits$}").parse().expect("a float")
 }
 
-/// Refuse any operator the estimate cannot price, as `_refuse_unpriced`.
-fn refuse_unpriced(found: &Operators) -> Result<(), CompileError> {
-    if found.fetch.is_some() {
-        return not_priced("the speed of light estimate does not price LIMIT");
-    }
-    for (alias, predicates) in &found.filters {
-        for predicate in predicates {
-            if !matches!(&predicate.expression, crate::physical::Asked::Call(call) if call.kind == "boolean")
-            {
-                let shown = match &predicate.expression {
-                    crate::physical::Asked::Call(call) => crate::expressions::explain_call(call),
-                    crate::physical::Asked::Compare(test) => {
-                        crate::expressions::column_name(&test.test, true)
-                    }
-                };
-                return not_priced(format!(
-                    "the speed of light estimate does not price the filter {shown} on {}; it \
-                     prices AI.IF and label filters",
-                    repr_str(alias)
-                ));
-            }
-        }
-    }
-    for (_, tests) in &found.column_filters {
-        for test in tests {
-            if test.call.kind == "features" {
-                return not_priced(
-                    "the speed of light estimate has no oracle for SAE feature tests",
-                );
-            }
-            if test.call.kind == "map" {
-                return not_priced(
-                    "the speed of light estimate does not price a test of a map answer",
-                );
-            }
-            let columns = condition_columns(&test.condition);
-            let text = condition_text(&test.condition);
-            if columns.len() > 1 {
-                return not_priced(format!(
-                    "the speed of light estimate does not price the test {text}, which reads \
-                     more than one column"
-                ));
-            }
-            if columns.iter().any(|column| column.ends_with(SPAN_SUFFIX)) {
-                return not_priced(format!(
-                    "the speed of light estimate does not price the test {text} of an \
-                     answer's span; the answer oracle gives the answer's text only"
-                ));
-            }
-        }
-    }
-    if !found.maps.is_empty() && !found.joins.is_empty() {
-        return not_priced(
-            "the speed of light estimate prices AI.MAP only in queries without joins",
-        );
-    }
-    for join in &found.joins {
-        let crate::physical::Asked::Call(call) = &join.predicate else {
-            return not_priced(
-                "the speed of light estimate does not price a join on ScoreTest; it \
-                 prices AI.IF joins",
-            );
-        };
-        if call.kind != "boolean" {
-            return not_priced(
-                "the speed of light estimate does not price a join on ModelCall; it prices \
-                 AI.IF joins",
-            );
-        }
-        if join.semantics != "full" {
-            return not_priced(format!(
-                "the speed of light estimate does not price {} joins; it prices full joins",
-                repr_str(&join.semantics)
-            ));
-        }
-        if call_aliases(call).iter().collect::<BTreeSet<_>>().len() != 2 {
-            return not_priced("the speed of light estimate prices binary join predicates");
-        }
-    }
-    for column in &found.projections {
-        let call = aliased_call(column, &[]).expect("a model call");
-        if !["label", "extract", "features", "map"].contains(&call.kind.as_str()) {
-            let name = match column {
-                crate::physical::ValueExpression::Alias(alias) => alias.name.clone(),
-                _ => String::new(),
-            };
-            return not_priced(format!(
-                "the speed of light estimate does not price the {} column {}; it prices \
-                 AI.CLASSIFY, AI.EXTRACT, AI.SAE_FEATURES, and AI.MAP columns",
-                repr_str(&call.kind),
-                repr_str(&name)
-            ));
-        }
-    }
-    let joined: Vec<BTreeSet<String>> = found
-        .joins
-        .iter()
-        .map(|join| {
-            call_aliases(asked_call(&join.predicate))
-                .into_iter()
-                .collect()
-        })
-        .collect();
-    for (call, _) in label_calls(found) {
-        let aliases = call_aliases(&call);
-        if aliases.len() == 1 {
-            continue;
-        }
-        let name = label_name(found, &call);
-        let set: BTreeSet<String> = aliases.iter().cloned().collect();
-        if aliases.len() != 2 || !joined.contains(&set) {
-            let listed: Vec<String> = aliases.iter().map(|alias| repr_str(alias)).collect();
-            return not_priced(format!(
-                "the classification {} reads [{}]; the speed of light estimate prices a \
-                 classification of one document or of one join's rows",
-                repr_str(&name),
-                listed.join(", ")
-            ));
-        }
-        let tested = found
-            .column_filters
-            .iter()
-            .any(|(_, tests)| tests.iter().any(|test| test.call == call));
-        if tested {
-            return not_priced(format!(
-                "the speed of light estimate does not price a label filter on {}, a \
-                 classification of joined rows",
-                repr_str(&name)
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn label_name(found: &Operators, call: &ModelCall) -> String {
     found
         .classifies
@@ -565,15 +431,12 @@ impl<'a, 'c> Estimate<'a, 'c> {
         self.context.lowered(prompt)
     }
 
-    fn assignment(pairs: &[(&str, i64)]) -> Vec<(String, i64)> {
-        pairs
+    fn passes(&self, prompt: &Prompt, assignment: &[(&str, i64)]) -> Result<bool, CompileError> {
+        let assignment: Vec<_> = assignment
             .iter()
             .map(|(alias, row)| (alias.to_string(), *row))
-            .collect()
-    }
-
-    fn passes(&self, prompt: &Prompt, assignment: &[(&str, i64)]) -> Result<bool, CompileError> {
-        let answer = (self.oracles.answer)(prompt, &Self::assignment(assignment))?;
+            .collect();
+        let answer = (self.oracles.answer)(prompt, &assignment)?;
         Ok(match answer {
             Value::Bool(found) => found,
             Value::Null => false,
@@ -1487,7 +1350,135 @@ pub fn speed_of_light_estimate(
     inputs: EstimateInputs,
     oracles: &Oracles,
 ) -> Result<Value, CompileError> {
-    refuse_unpriced(found)?;
+    if found.fetch.is_some() {
+        return not_priced("the speed of light estimate does not price LIMIT");
+    }
+    for (alias, predicates) in &found.filters {
+        for predicate in predicates {
+            if !matches!(&predicate.expression, crate::physical::Asked::Call(call) if call.kind == "boolean")
+            {
+                let shown = match &predicate.expression {
+                    crate::physical::Asked::Call(call) => crate::expressions::explain_call(call),
+                    crate::physical::Asked::Compare(test) => {
+                        crate::expressions::column_name(&test.test, true)
+                    }
+                };
+                return not_priced(format!(
+                    "the speed of light estimate does not price the filter {shown} on {}; it \
+                     prices AI.IF and label filters",
+                    repr_str(alias)
+                ));
+            }
+        }
+    }
+    for (_, tests) in &found.column_filters {
+        for test in tests {
+            if test.call.kind == "features" {
+                return not_priced(
+                    "the speed of light estimate has no oracle for SAE feature tests",
+                );
+            }
+            if test.call.kind == "map" {
+                return not_priced(
+                    "the speed of light estimate does not price a test of a map answer",
+                );
+            }
+            let columns = condition_columns(&test.condition);
+            let text = condition_text(&test.condition);
+            if columns.len() > 1 {
+                return not_priced(format!(
+                    "the speed of light estimate does not price the test {text}, which reads \
+                     more than one column"
+                ));
+            }
+            if columns.iter().any(|column| column.ends_with(SPAN_SUFFIX)) {
+                return not_priced(format!(
+                    "the speed of light estimate does not price the test {text} of an \
+                     answer's span; the answer oracle gives the answer's text only"
+                ));
+            }
+        }
+    }
+    if !found.maps.is_empty() && !found.joins.is_empty() {
+        return not_priced(
+            "the speed of light estimate prices AI.MAP only in queries without joins",
+        );
+    }
+    for join in &found.joins {
+        let crate::physical::Asked::Call(call) = &join.predicate else {
+            return not_priced(
+                "the speed of light estimate does not price a join on ScoreTest; it \
+                 prices AI.IF joins",
+            );
+        };
+        if call.kind != "boolean" {
+            return not_priced(
+                "the speed of light estimate does not price a join on ModelCall; it prices \
+                 AI.IF joins",
+            );
+        }
+        if join.semantics != "full" {
+            return not_priced(format!(
+                "the speed of light estimate does not price {} joins; it prices full joins",
+                repr_str(&join.semantics)
+            ));
+        }
+        if call_aliases(call).iter().collect::<BTreeSet<_>>().len() != 2 {
+            return not_priced("the speed of light estimate prices binary join predicates");
+        }
+    }
+    for column in &found.projections {
+        let call = aliased_call(column, &[]).expect("a model call");
+        if !["label", "extract", "features", "map"].contains(&call.kind.as_str()) {
+            let name = match column {
+                crate::physical::ValueExpression::Alias(alias) => alias.name.clone(),
+                _ => String::new(),
+            };
+            return not_priced(format!(
+                "the speed of light estimate does not price the {} column {}; it prices \
+                 AI.CLASSIFY, AI.EXTRACT, AI.SAE_FEATURES, and AI.MAP columns",
+                repr_str(&call.kind),
+                repr_str(&name)
+            ));
+        }
+    }
+    let joined: Vec<BTreeSet<String>> = found
+        .joins
+        .iter()
+        .map(|join| {
+            call_aliases(asked_call(&join.predicate))
+                .into_iter()
+                .collect()
+        })
+        .collect();
+    for (call, _) in label_calls(found) {
+        let aliases = call_aliases(&call);
+        if aliases.len() == 1 {
+            continue;
+        }
+        let name = label_name(found, &call);
+        let set: BTreeSet<String> = aliases.iter().cloned().collect();
+        if aliases.len() != 2 || !joined.contains(&set) {
+            let listed: Vec<String> = aliases.iter().map(|alias| repr_str(alias)).collect();
+            return not_priced(format!(
+                "the classification {} reads [{}]; the speed of light estimate prices a \
+                 classification of one document or of one join's rows",
+                repr_str(&name),
+                listed.join(", ")
+            ));
+        }
+        let tested = found
+            .column_filters
+            .iter()
+            .any(|(_, tests)| tests.iter().any(|test| test.call == call));
+        if tested {
+            return not_priced(format!(
+                "the speed of light estimate does not price a label filter on {}, a \
+                 classification of joined rows",
+                repr_str(&name)
+            ));
+        }
+    }
     if !label_calls(found).is_empty() && oracles.label.is_none() {
         return Err(CompileError::new(
             "ValueError: the query classifies documents; pass label=(prompt, assignment) -> str \

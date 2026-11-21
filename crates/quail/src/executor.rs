@@ -178,7 +178,19 @@ impl Executor {
     /// A worker does not start, or Quail refuses the configuration.
     pub fn open(config: &EngineConfig) -> Result<Self> {
         let mut workers = Workers::bind(config.gpus)?;
-        workers.spawn(&worker_command())?;
+        let command = if let Ok(command) = std::env::var("QUAIL_WORKER") {
+            command.split_whitespace().map(str::to_string).collect()
+        } else {
+            let python = match std::env::var_os("VIRTUAL_ENV") {
+                Some(root) => std::path::PathBuf::from(root)
+                    .join("bin/python")
+                    .to_string_lossy()
+                    .into_owned(),
+                None => "python3".to_string(),
+            };
+            vec![python, "-m".into(), "quail.worker".into()]
+        };
+        workers.spawn(&command)?;
         workers.connect()?;
         Self::on_workers(Arc::new(Mutex::new(workers)), config)
     }
@@ -481,22 +493,6 @@ impl Executor {
             _execution: execution,
         })
     }
-}
-
-/// The command that starts a GPU worker, before its socket and GPU
-/// index.
-fn worker_command() -> Vec<String> {
-    if let Ok(command) = std::env::var("QUAIL_WORKER") {
-        return command.split_whitespace().map(str::to_string).collect();
-    }
-    let python = match std::env::var_os("VIRTUAL_ENV") {
-        Some(root) => std::path::PathBuf::from(root)
-            .join("bin/python")
-            .to_string_lossy()
-            .into_owned(),
-        None => "python3".to_string(),
-    };
-    vec![python, "-m".into(), "quail.worker".into()]
 }
 
 /// A region a DataFusion worker hands to the calling thread to run.
@@ -1287,7 +1283,7 @@ fn source_lookup(
     };
     let mut positions: HashMap<String, u64> = HashMap::new();
     let mut next = 0u64;
-    for batch in scanned.column_rows(&key)? {
+    for batch in scanned.scan_columns(vec![key.clone()])? {
         let column = batch.columns().first().ok_or_else(|| {
             DataFusionError::Execution(format!("the table's scan returned no column {key}"))
         })?;
@@ -1573,11 +1569,6 @@ impl ScannedTable {
             state,
             constraints,
         }
-    }
-
-    /// One column of the table's rows.
-    fn column_rows(&self, name: &str) -> Result<Vec<RecordBatch>> {
-        self.scan_columns(vec![name.to_string()])
     }
 
     /// The named columns of every row, partition by partition, in order.
