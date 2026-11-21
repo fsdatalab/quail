@@ -205,9 +205,9 @@ class _Rows:
             if isinstance(part, tuple):
                 firsts.append(part[0])
                 counts.append(part[1])
-            else:
-                expand()
-                arrays.append(part)
+                continue
+            expand()
+            arrays.append(part)
         expand()
         return _concatenate(arrays)
 
