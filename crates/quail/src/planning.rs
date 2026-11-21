@@ -623,7 +623,9 @@ fn pair_fractions(
                 .find(|scan| scan.alias == alias)
                 .ok_or_else(|| CompileError::new(format!("no scan {alias}")))?;
             let rows = &tables[&scan.provider];
-            let batch = first_rows(rows)?;
+            let joined =
+                arrow::compute::concat_batches(&rows.schema, &rows.batches).map_err(arrow_error)?;
+            let batch = joined.slice(0, joined.num_rows().min(SAMPLE_ROWS));
             side.iter()
                 .map(|key| PhysicalValue::new(key)?.evaluate(&batch, false))
                 .collect()
@@ -634,12 +636,6 @@ fn pair_fractions(
         );
     }
     Ok(fractions)
-}
-
-fn first_rows(rows: &TableRows) -> Result<RecordBatch, CompileError> {
-    let joined =
-        arrow::compute::concat_batches(&rows.schema, &rows.batches).map_err(arrow_error)?;
-    Ok(joined.slice(0, joined.num_rows().min(SAMPLE_ROWS)))
 }
 
 /// The pairs whose keys are equal over the cross product of two samples:
