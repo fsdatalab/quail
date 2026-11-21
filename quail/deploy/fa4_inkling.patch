@@ -361,7 +361,7 @@ index 00000000..001460a5
 +    cute.arch.sync_warp()
 +    pipe.consumer_release(state)
 diff --git a/flash_attn/cute/interface.py b/flash_attn/cute/interface.py
-index b097c807..55d19445 100644
+index b097c807..7bd48f75 100644
 --- a/flash_attn/cute/interface.py
 +++ b/flash_attn/cute/interface.py
 @@ -21,6 +21,7 @@ from quack.compile_utils import make_fake_tensor as fake_tensor
@@ -372,13 +372,16 @@ index b097c807..55d19445 100644
      BwdConfig,
      BwdHeuristicInputs,
      FwdConfig,
-@@ -951,6 +952,9 @@ def _flash_attn_fwd(
+@@ -951,6 +952,12 @@ def _flash_attn_fwd(
              has_descale=has_descale,
          ),
      )
 +    if getattr(score_mod, "inkling_relative_bias", False) and isinstance(config, FwdConfig):
-+        # Inkling's bias slots need the room of an O buffer aliased with Q
-+        config = derive_fwd_config(config, inputs, overlap_sO_sQ=True)
++        # Inkling's bias slots need the room of an O buffer aliased with Q;
++        # one launch shape per window keeps every chunk on a warmed kernel
++        config = derive_fwd_config(
++            config, inputs, overlap_sO_sQ=True, q_stage=2,
++            is_static_persistent=False, use_dynamic_varlen=False)
      # The config is chosen; from here on the window only reaches the kernels, so use the clamped sides.
      window_size_left, window_size_right = kernel_window_left, kernel_window_right
      num_splits = config.num_splits
