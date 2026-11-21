@@ -432,7 +432,7 @@ def settle_documents(arena, keys, prefixes, keep_kv: bool, budget: int,
             return
         if survived and keep_kv and anchor not in dependencies:
             arena.retain(key, len(prefixes[anchor]))
-        else:
-            arena.free_key(key)
+            return
+        arena.free_key(key)
 
     return settled
