@@ -12,7 +12,8 @@ chunk, then asks a second question in a later chunk from the document's
 saved KV and convolution checkpoint. The later chunk replays CUDA graphs
 of the work between attention calls. The reference runs each whole
 sequence. The test checks that the next token and the TRUE-against-FALSE
-margin agree.
+margin agree, and that an answer step replayed as one graph, attention
+included, matches the same step replayed piecewise with eager attention.
 
 Skipped without a CUDA device; runs through
 `uv run modal run experiments/run_gpu_tests.py --keyword inkling2_forward
@@ -181,11 +182,36 @@ def quail(reference):
     # the documents' chunk exceeds the largest bucket and runs eagerly;
     # the resident documents' chunk replays
     assert graphs.replays == 1
-    return torch.stack([row for pair in logits for row in pair])
+    # one answer token per resident document: a whole-step graph, then the
+    # same step replayed piecewise in the same bucket, attention eager
+    def piecewise(chunk):
+        pipeline.whole_step = lambda chunk, num_tokens: False
+        try:
+            return graphs.forward(chunk)
+        finally:
+            del pipeline.whole_step
+
+    steps = []
+    for run in (graphs.forward, piecewise):
+        groups = []
+        for index, (document, suffixes) in enumerate(sequences):
+            key = ("review", index)
+            arena.activate(key, len(document), capacity_tokens=len(document) + 8)
+            groups.append(dict(key=key, prefix=None, f=len(document),
+                               suffixes=[suffixes[0][:1]]))
+        chunk = pack_chunk(torch, arena, groups, attention_mode="unified")
+        with torch.inference_mode():
+            steps.append(run(chunk).float())
+        for key in chunk.temporary_keys:
+            arena.free_key(key)
+    assert any(captured.whole is not None for captured in graphs.graphs)
+    return (torch.stack([row for pair in logits for row in pair]),
+            (steps[0] - steps[1]).abs().max().item())
 
 
 def test_next_tokens_and_answer_margins_agree_with_transformers(reference,
                                                                 quail):
+    quail = quail[0]
     true_id, false_id = _answer_ids()
     margins = [((r[true_id] - r[false_id]).item(),
                 (q[true_id] - q[false_id]).item())
@@ -206,6 +232,11 @@ def test_next_tokens_and_answer_margins_agree_with_transformers(reference,
     assert sum(unsure) / len(unsure) < MARGIN_TOLERANCE
     assert kl.median().item() < MEDIAN_KL_TOLERANCE
     assert kl.max().item() < KL_TOLERANCE
+
+
+def test_an_answer_step_replayed_whole_matches_its_piecewise_replay(quail):
+    # both pad to the same bucket, so only the attention calls differ
+    assert quail[1] < 1e-2
 
 
 if __name__ == "__main__":

@@ -53,6 +53,10 @@ DECODE_MAX_QUERIES = 4
 # in query tiles of SHORT_BLOCK_ROWS rows; a longer one, on FA4
 SHORT_MAX_QUERIES = 5
 SHORT_BLOCK_ROWS = 16
+# a decode-only chunk up to this many tokens replays as one CUDA graph,
+# attention included, reading a block table this many pages wide
+WHOLE_MAX_TOKENS = 512
+WHOLE_TABLE_PAGES = 1024
 STATE_CHANNELS = {"k": (0, 1024), "v": (1024, 2048), "attn": (2048, 4352),
                   "mlp": (4352, 6656)}
 # the message gates of a loop layer, by checkpoint controller name
@@ -811,6 +815,41 @@ class Inkling2Pipeline(ModelPipeline):
             write_slots=rows(dtype=torch.int64, fill=-1),
             write_sources=rows(3, dtype=torch.int32, fill=kernels.ZERO_TAP))
 
+    def bucket_boundary(self, num_tokens, device):
+        """A whole-step bucket's attention metadata, at fixed sizes.
+
+        Every bucket slices one allocation; one bucket replays at a time.
+        """
+        if num_tokens > WHOLE_MAX_TOKENS:
+            return {}
+        shared = getattr(self, "_whole_metadata", None)
+        if shared is None:
+            torch = self.torch
+
+            def ints(*shape):
+                return torch.zeros(shape, dtype=torch.int32, device=device)
+
+            # every sequence holds a token, so the tokens bound the sequences
+            size = WHOLE_MAX_TOKENS
+            shared = self._whole_metadata = dict(
+                attn_cu_q=ints(size + 1), attn_used=ints(size),
+                attn_table=ints(size, WHOLE_TABLE_PAGES),
+                attn_token_seqs=ints(size), attn_token_q=ints(size),
+                attn_token_rows=ints(size), attn_num_real=ints(1))
+        return {name: tensor if name == "attn_num_real"
+                else tensor[:num_tokens + (name == "attn_cu_q")]
+                for name, tensor in shared.items()}
+
+    def whole_step(self, chunk, num_tokens):
+        """Whether a decode-only chunk fits a whole-step graph of num_tokens."""
+        unified = chunk.meta.get("unified")
+        if (num_tokens > WHOLE_MAX_TOKENS or unified is None
+                or chunk.meta.get("gdn") is None
+                or unified["table"].shape[1] > WHOLE_TABLE_PAGES):
+            return False
+        lengths = np.diff(np.asarray(unified["cu_q_host"], dtype=np.int64))
+        return bool((lengths <= DECODE_MAX_QUERIES).all())
+
     def piece(self, index, buffers):
         """The previous visit's work after attention, then the next's up to it."""
         torch, model = self.torch, self.model
@@ -837,13 +876,27 @@ class Inkling2Pipeline(ModelPipeline):
         """Visit index's attention over the chunk's real rows."""
         torch = self.torch
         layer = self.schedule[index].layer
+        kp, vp = self.arena.paged_kv(index)
+        window = self.window if layer.is_local else 0
+        if chunk is None:
+            # a whole-step graph: the decode tokens stage left in buffers
+            num_tokens = buffers.q3.shape[0]
+            kernels.decode_attention(
+                torch, buffers.q3, kp, vp, buffers.rel, buffers.sink,
+                layer.rel_proj_t, buffers.attn,
+                (buffers.attn_token_seqs, buffers.attn_token_q,
+                 buffers.attn_token_rows),
+                buffers.attn_cu_q, buffers.attn_used, buffers.attn_table,
+                window=window, max_keys=0, num_real=buffers.attn_num_real,
+                splits=kernels.num_splits(
+                    num_tokens * self.spec.num_kv_heads,
+                    WHOLE_TABLE_PAGES * kp.shape[1], window))
+            return
         plan = chunk.meta["inkling_plan"]
         unified = chunk.meta["unified"]
         n = chunk.tokens
-        kp, vp = self.arena.paged_kv(index)
         if not isinstance(buffers, PiecewiseBuffers):
             buffers.attn = torch.empty_like(buffers.q3)
-        window = self.window if layer.is_local else 0
         args = (unified["cu_q"], unified["used"], unified["table"])
         # the query tiles first: they write every row
         if plan["prefill"] is not None:
@@ -882,6 +935,28 @@ class Inkling2Pipeline(ModelPipeline):
         buffers.taps[n:].fill_(kernels.ZERO_TAP)
         buffers.write_slots[writes:].fill_(-1)
         buffers.write_sources[writes:].fill_(kernels.ZERO_TAP)
+        if hasattr(buffers, "attn_num_real"):
+            self._stage_whole(buffers, chunk)
+
+    def _stage_whole(self, buffers, chunk):
+        """Copy a decode-only chunk's attention metadata into fixed buffers.
+
+        Any other chunk, or None, leaves no real token for the graph's
+        attention.
+        """
+        num_real = buffers.attn_num_real
+        if chunk is None or not self.whole_step(chunk, buffers.q3.shape[0]):
+            num_real.zero_()
+            return
+        unified, plan = chunk.meta["unified"], chunk.meta["inkling_plan"]
+        seqs, width = unified["table"].shape
+        count = plan["tokens"][0].numel()
+        buffers.attn_cu_q[:seqs + 1].copy_(unified["cu_q"])
+        buffers.attn_used[:seqs].copy_(unified["used"])
+        buffers.attn_table[:seqs, :width].copy_(unified["table"])
+        for name, values in zip(("seqs", "q", "rows"), plan["tokens"]):
+            getattr(buffers, f"attn_token_{name}")[:count].copy_(values)
+        num_real.fill_(count)
 
     # ---- the chunk --------------------------------------------------
 

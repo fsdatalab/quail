@@ -113,8 +113,22 @@ class ModelPipeline:
         raise NotImplementedError
 
     def mixer(self, index, buffers, chunk):
-        """Run layer index's token mixer eagerly over the chunk's real rows."""
+        """Run layer index's token mixer eagerly over the chunk's real rows.
+
+        A pipeline whose whole_step admits a chunk also runs its mixers
+        with a None chunk, inside one CUDA graph, from what stage put in
+        the buffers.
+        """
         raise NotImplementedError
+
+    def whole_step(self, chunk, num_tokens) -> bool:
+        """Whether the chunk can replay as one graph, mixers included.
+
+        Args:
+            chunk: The chunk to run.
+            num_tokens: The graph bucket's padded token count.
+        """
+        return False
 
     def stage(self, buffers, chunk):
         """Copy a chunk's own inputs, beyond ids and positions, into buffers.
