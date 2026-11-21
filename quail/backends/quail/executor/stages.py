@@ -167,17 +167,6 @@ class Stage:
         return callable(self.suffixes)
 
 
-def shared_preamble_tokens(question_ids) -> int:
-    """Return the length of the token prefix shared by multiple questions."""
-    if len(question_ids) < 2:
-        return 0
-    p = 0
-    while all(len(q) > p and q[p] == question_ids[0][p]
-              for q in question_ids):
-        p += 1
-    return p
-
-
 def filter_stages(question_ids, readout, frames=True) -> list:
     """Build one filter stage per question with a shared prompt frame.
 
@@ -190,7 +179,11 @@ def filter_stages(question_ids, readout, frames=True) -> list:
     Raises:
         ValueError: A question has no tokens past the shared preamble.
     """
-    p = shared_preamble_tokens(question_ids) if frames else 0
+    p = 0
+    if frames and len(question_ids) >= 2:
+        while all(len(q) > p and q[p] == question_ids[0][p]
+            for q in question_ids):
+            p += 1
     frame = list(question_ids[0][:p])
     stages = []
     for index, question in enumerate(question_ids):
