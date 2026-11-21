@@ -309,22 +309,6 @@ def pool_bytes(arena) -> dict:
 
 
 
-def _boot_record(gpu, cold, warm_s, warm_tier, t_boot):
-    """Assemble a boot timing dict from a loaded GPU and warm results."""
-    kind = "cold" if cold or warm_tier else "warm"
-    boot = {
-        "kind": kind,
-        "load_model_s": round(gpu.load_model_s if cold else 0.0, 2),
-        "arena_s": round(gpu.arena_s if cold else 0.0, 2),
-        "pipeline_s": round(gpu.pipeline_s if cold else 0.0, 2),
-        "warm_kernels_s": round(warm_s, 2),
-        "boot_s": round(time.perf_counter() - t_boot, 2),
-    }
-    if warm_tier:
-        boot["warm_tier"] = warm_tier
-    return boot
-
-
 def _boot_gpu(gpu, backend, gpu_context, chunk_tokens, true_ids, false_ids,
               arena_pages=None, *, writes_answers, model_path=None):
     """Prepare a GPU for a query, releasing it when preparation fails.
@@ -347,7 +331,16 @@ def _boot_gpu(gpu, backend, gpu_context, chunk_tokens, true_ids, false_ids,
         warm_s, warm_tier = gpu.warm(writes_answers)
         if cold:
             freeze_loaded_objects()
-        boot = _boot_record(gpu, cold, warm_s, warm_tier, t_boot)
+        boot = {
+            "kind": "cold" if cold or warm_tier else "warm",
+            "load_model_s": round(gpu.load_model_s if cold else 0.0, 2),
+            "arena_s": round(gpu.arena_s if cold else 0.0, 2),
+            "pipeline_s": round(gpu.pipeline_s if cold else 0.0, 2),
+            "warm_kernels_s": round(warm_s, 2),
+            "boot_s": round(time.perf_counter() - t_boot, 2),
+        }
+        if warm_tier:
+            boot["warm_tier"] = warm_tier
         say(f"model ready after {boot['boot_s']} s ({boot['kind']} start)")
         rollback.pop_all()
     return gpu, boot
