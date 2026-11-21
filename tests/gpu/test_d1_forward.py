@@ -102,12 +102,14 @@ def _tokenizer():
 def _prompts():
     """Per question, the lowered prompt and the text and ids of each review."""
     from quail.api.prompts import bind_prompt
+    from quail.common.expressions import ColumnRef
     from quail.physical.lowering import lower_prompt
 
     spec, ids = _spec(), _tokenizer()
+    body = ColumnRef(alias="d", provider="documents", column="body")
     out = []
     for question in QUESTIONS:
-        prompt = bind_prompt(question, ("body",), turn=spec.turn,
+        prompt = bind_prompt(question, (body,), turn=spec.turn,
                              layout=spec.prompt_layout)
         lowered = lower_prompt(prompt, ids)
         out.append((prompt, lowered, [
@@ -241,12 +243,14 @@ def _yes_no_questions(templates):
     """AI filter templates as the SetQuestions of one pass group."""
     from quail.api.prompts import bind_prompt
     from quail.backends.quail.executor.pass_groups import SetQuestion
+    from quail.common.expressions import ColumnRef
     from quail.physical.lowering import lower_prompt, set_question_parts
 
     spec, ids = _spec(), _tokenizer()
+    body = ColumnRef(alias="d", provider="documents", column="body")
     questions = []
     for template in templates:
-        prompt = bind_prompt(template, ("body",), turn=spec.turn,
+        prompt = bind_prompt(template, (body,), turn=spec.turn,
                              layout=spec.prompt_layout)
         lowered = lower_prompt(prompt, ids)
         parts = set_question_parts(prompt, ids)
@@ -307,7 +311,6 @@ def _join_passes():
     from quail.api.prompts import bind_join_prompt
     from quail.backends.quail.executor.operators import join as join_operator
     from quail.backends.quail.executor.stages import Stage, question_ends
-    from quail.backends.quail.lowering import set_join_parts
     from quail.common.expressions import ColumnRef
     from quail.physical.lowering import lower_prompt
 
@@ -318,7 +321,10 @@ def _join_passes():
         turn=spec.turn, layout=spec.prompt_layout)
     lowered = lower_prompt(prompt, ids)
     (_, review_label, frame), (_, aspect_label, _) = lowered.label_token_ids
-    parts = set_join_parts(lowered, spec, ids)
+    # the join parts the planner sets (crates/quail-planner/src/graph.rs);
+    # "QUESTION:\n" is the d1 layout's question label
+    parts = dict(separator_tokens=len(ids(prompt.tail_segments[0])),
+                 question_header_token_ids=tuple(ids("QUESTION:\n")))
     separator = tuple(lowered.tail_token_ids[:parts["separator_tokens"]])
     head = list(lowered.preamble_token_ids) + list(review_label)
     aspects = [ids(aspect) for aspect in JOIN_ASPECTS]

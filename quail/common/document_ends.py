@@ -18,7 +18,8 @@ def document_ends(last, tail, tokenizer) -> tuple:
     Args:
         last: The distinct last tokens.
         tail: The token ids after the document.
-        tokenizer: Encodes text (call) and decodes token ids (decode).
+        tokenizer: Encodes text (call) and decodes token ids to the bytes
+            of their texts (decode).
 
     Returns:
         Per last token, (the token, the tokens of it and the tail as one
@@ -27,9 +28,9 @@ def document_ends(last, tail, tokenizer) -> tuple:
     tail = [int(token) for token in tail]
     out = []
     for token in last:
-        text = tokenizer.decode([int(token), *tail])
+        text = tokenizer.decode([int(token), *tail]).decode("utf-8", "replace")
         joined = [int(t) for t in tokenizer(text)]
-        if tokenizer.decode(joined) != text:
+        if tokenizer.decode(joined).decode("utf-8", "replace") != text:
             joined = [int(token), *tail]
         out.append((int(token), tuple(joined)))
     return tuple(out)
