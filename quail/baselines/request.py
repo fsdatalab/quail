@@ -14,9 +14,8 @@ from quail.baselines.execution import RequestModelExecution
 from quail.baselines.images import ImagePrompts
 from quail.execution.metrics import scalar_node_metrics
 from quail.execution.runner import ExecutionContext, GenericRunner, compute_subgraph
-from quail.execution.runtimes import ModelNodeRuntime
 from quail.execution.types import PhysicalResponse, export_physical_outputs
-from quail.physical import RequestExecution, Scan
+from quail.physical import Scan
 from quail.specs import DEVICES, SupportResult
 
 
@@ -109,11 +108,6 @@ def _run_request_graph(context, backend, engine_state, boot, model_execution,
         export_physical_outputs(compute_graph, run),
         report,
     )
-
-
-def request_runtimes() -> dict:
-    """Return runtimes for the request backends' physical node."""
-    return {RequestExecution.runtime_key: ModelNodeRuntime()}
 
 
 SUPPORTED_DEVICES = frozenset(DEVICES)
