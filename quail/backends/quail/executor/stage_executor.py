@@ -873,18 +873,16 @@ class StageExecutor:
 
     def _event(self, settlement):
         # Progress counts settled documents: a dropped one is done too.
-        self.finished += int(settlement.anchor not in self.sched.dependencies)
-        if settlement.kind != "finished":
-            if self.arena.is_resident(self.keys[settlement.anchor]):
-                self.arena.free_key(self.keys[settlement.anchor])
-            return
         anchor = settlement.anchor
-        if self.on_settled is None or anchor in self.sched.dependencies:
-            if self.arena.is_resident(self.keys[anchor]):
-                self.arena.free_key(self.keys[anchor])
-        else:
+        self.finished += int(anchor not in self.sched.dependencies)
+        if settlement.kind == "finished" and (
+            self.on_settled is not None
+            and anchor not in self.sched.dependencies):
             self.on_settled(
                 anchor, settlement.survived, self.sched.answers[-1].get(anchor, []))
+            return
+        if self.arena.is_resident(self.keys[anchor]):
+            self.arena.free_key(self.keys[anchor])
 
     def _record(self, a, j, start, end, rows) -> list:
         """Report a group's answers once the next stage's inputs are ready."""
