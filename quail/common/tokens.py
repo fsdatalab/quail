@@ -394,8 +394,7 @@ def decode_token_documents(value):
 def token_table(documents) -> pa.Table:
     """Return token documents as a table another process can read.
 
-    ``documents_from_table`` reads the documents back over the table's
-    buffers.
+    The receiving process reads the documents back over the table's buffers.
     """
     if isinstance(documents, TokenStore):
         return documents.table
@@ -405,15 +404,6 @@ def token_table(documents) -> pa.Table:
             columns["offsets"] = documents.character_offsets
         return pa.table(columns)
     return _token_lists(documents)
-
-
-def documents_from_table(table: pa.Table):
-    """Return the token documents ``token_table`` wrote."""
-    if TokenStore._token_column in table.column_names:
-        return TokenStore(table)
-    return ArrowTokenDocuments(
-        table.column("tokens"),
-        table.column("offsets") if "offsets" in table.column_names else None)
 
 
 def _token_array(document):

@@ -11,7 +11,7 @@ from quail.backends.quail.executor.images import RegionImages
 from quail.backends.quail.executor.memory import memory_report
 from quail.backends.quail.retention import apply_retention
 from quail.common.pairs import columns_key
-from quail.common.tokens import documents_from_table
+from quail.common.tokens import ArrowTokenDocuments, TokenStore
 from quail.execution.finished import finished_table, first_rows
 from quail.execution.metrics import NodeResult
 from quail.execution.runner import (
@@ -129,10 +129,16 @@ def payload_tables(tables: dict) -> dict:
     payload = {name: {} for name in _PAYLOAD_TABLES}
     for name, table in tables.items():
         kind, alias = name.split(":", 1)
-        payload[kind][alias] = (
-            documents_from_table(table) if kind == "documents"
-            else table.column("text") if kind == "texts"
-            else table.column("row") if kind == "source_rows" else table)
+        if kind == "documents":
+            payload[kind][alias] = (TokenStore(table)
+                if TokenStore._token_column in table.column_names
+                else ArrowTokenDocuments(table.column("tokens"),
+                    table.column("offsets") if "offsets" in table.column_names
+                    else None))
+        else:
+            payload[kind][alias] = (
+                table.column("text") if kind == "texts"
+                else table.column("row") if kind == "source_rows" else table)
     return payload
 
 
