@@ -544,7 +544,11 @@ class RegionQuery:
         report = json.loads(_quail_native.execution_report(
             plan.backend, plan.estimated_seconds, plan.settings.get("order_rule"),
             json.dumps(out, default=str), coordinator_wall))
-        tables = _output_tables(response.outputs)
+        tables = {}
+        for ref, value in response.outputs.items():
+            table = as_table(value)
+            if isinstance(table, pa.Table):
+                tables[(ref.node_id, ref.port)] = table
         if relation is None:
             relation = self._built_rows(tables, finished)
         result = QueryResult.from_table(relation, report=report)
@@ -662,16 +666,6 @@ class RegionQuery:
                                    for alias, table in survivors}
         result.true_join_tables = dict(true_joins)
         result.report["stages"] = json.loads(stages)
-
-
-def _output_tables(outputs) -> dict:
-    """Return each output relation that is an Arrow table, by (node id, port)."""
-    tables = {}
-    for ref, value in outputs.items():
-        table = as_table(value)
-        if isinstance(table, pa.Table):
-            tables[(ref.node_id, ref.port)] = table
-    return tables
 
 
 def _observe(graph, outputs, metrics, observers) -> None:
