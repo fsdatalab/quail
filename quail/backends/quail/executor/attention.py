@@ -395,15 +395,6 @@ def flash_attention_version(capability: tuple[int, int]) -> int:
     raise ValueError(f"Quail does not support CUDA capability {capability}")
 
 
-def deep_gemm_supported(capability: tuple[int, int]) -> bool:
-    """Whether vLLM 0.29.0 enables DeepGEMM on this CUDA capability.
-
-    Matches CudaPlatform.support_deep_gemm: 9.0, 10.x, and 12.x.
-    """
-    major, _minor = capability
-    return capability == (9, 0) or major in (10, 12)
-
-
 def merge_partial(out, lse, index, out_c, lse_c) -> None:
     """Merge attention over two disjoint key sets into the selected rows.
 
@@ -455,7 +446,8 @@ class Engine:
 
         capability = torch.cuda.get_device_capability()
         self.fa_version = flash_attention_version(capability)
-        self.use_deep_gemm = deep_gemm_supported(capability)
+        major, _minor = capability
+        self.use_deep_gemm = capability == (9, 0) or major in (10, 12)
         self.torch = torch
         self.arena = arena
         self.rotary = rotary
