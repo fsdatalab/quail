@@ -69,7 +69,20 @@ pub fn derive_region(
     turn: &Turn,
     layout: &str,
 ) -> Result<(Operators, LogicalPlan), CompileError> {
-    let plan = as_bound(region.plan.clone())
+    // DataFusion folds option literals; the binder reads the original calls.
+    let plan = region
+        .plan
+        .clone()
+        .transform_up(|node| {
+            let Some(ai) = crate::extension::as_node::<AiNode>(&node) else {
+                return Ok(Transformed::no(node));
+            };
+            let ai = ai.map_expressions(|expr| Ok(unfolded(expr)))?;
+            Ok(Transformed::yes(crate::extension::extension_node(
+                ai.checked()?,
+            )))
+        })
+        .map(|done| done.data)
         .map_err(|error| CompileError::unsupported(error.to_string()))?;
     if let Some(found) = crate::derive::similar::similar_calls(&plan)
         .into_iter()
@@ -92,28 +105,8 @@ pub fn derive_region(
     Ok((operators, plan))
 }
 
-/// `plan` with each struct or list literal in an `AiNode`'s expressions
-/// written as the call it was folded from.
-///
-/// DataFusion's `SimplifyExpressions` runs over a region's operators and
-/// folds a `named_struct`, `struct`, or `make_array` of literals into one
-/// literal. The binder reads an AI call's options, categories, and
-/// fields from the calls the query wrote.
-fn as_bound(plan: LogicalPlan) -> datafusion::common::Result<LogicalPlan> {
-    plan.transform_up(|node| {
-        let Some(ai) = crate::extension::as_node::<AiNode>(&node) else {
-            return Ok(Transformed::no(node));
-        };
-        let ai = ai.map_expressions(|expr| Ok(unfolded(expr)))?;
-        Ok(Transformed::yes(crate::extension::extension_node(
-            ai.checked()?,
-        )))
-    })
-    .map(|done| done.data)
-}
-
 /// `expr` with each struct or list literal in it written as the call it
-/// was folded from, as [`as_bound`] reads an `AiNode`'s expressions.
+/// was folded from, as [`derive_region`] reads an `AiNode`'s expressions.
 pub(crate) fn unfolded(expr: Expr) -> Expr {
     expr.transform_up(|inner| Ok(unfold(inner)))
         .map(|done| done.data)
