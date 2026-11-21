@@ -50,19 +50,6 @@ def answer_admission_mode() -> str:
     return mode
 
 
-def attention_path(pipeline, requested, default_attention="unified") -> str:
-    """The path a filter stream or join runs: the plan's request where the model has it.
-
-    None asks for the default_attention. A model without tree attention, and a
-    canvas model (whose rows the tree path does not pack), run unified.
-    """
-    if requested is None:
-        requested = default_attention
-    if requested == "tree" and pipeline.tree_attention and not pipeline.canvas_ids:
-        return "tree"
-    return "unified"
-
-
 def forward_chunk(pipeline, arena, chunk):
     """Run the forward pass, then release the chunk's temporary pages.
 
@@ -306,8 +293,14 @@ class StageExecutor:
         # Stages packing label paths always need tree attention.
         if any(stage.paths is not None for stage in self.stages):
             attention_mode = "tree"
-        self.mode = attention_path(
-            self.pipeline, attention_mode, default_attention=default_attention)
+        if attention_mode is None:
+            attention_mode = default_attention
+        if (
+            attention_mode == "tree" and self.pipeline.tree_attention
+            and not self.pipeline.canvas_ids):
+            self.mode = "tree"
+        else:
+            self.mode = "unified"
         self.canvas = tuple(self.pipeline.canvas_ids)
         self.answer_row = self.pipeline.canvas_answer_row
         self.canvas_rows = [len(self.canvas) if stage.canvas is None
