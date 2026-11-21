@@ -20,30 +20,6 @@ def same_word(token) -> str:
     return text.lower() if text and "Ġ" not in text and "Ċ" not in text else ""
 
 
-def word_index(vocab: list) -> tuple[dict, list, np.ndarray]:
-    """Group a vocabulary's tokens by word, as same_word keys them.
-
-    Args:
-        vocab: Each token id's token text.
-
-    Returns:
-        The tokens of each word, keyed by the word; every key in order of
-        its first token, a word or, for a token without one, its token
-        id; and each token id's key index.
-    """
-    variants = {}
-    key_ids = {}
-    key_of = []
-    for index, token in enumerate(vocab):
-        key = same_word(token)
-        if key:
-            variants.setdefault(key, []).append(index)
-        else:
-            key = index
-        key_of.append(key_ids.setdefault(key, len(key_ids)))
-    return variants, list(key_ids), np.array(key_of, dtype=np.int64)
-
-
 class Vocabulary:
     """The word index of one model's vocabulary, which its extractions read.
 
@@ -60,7 +36,18 @@ class Vocabulary:
         # a document token may be written without its leading space
         # or in another case after the opening quote: every
         # vocabulary token with the same text up to those can start it
-        self.variants, self.keys, self.key_of = word_index(self.vocab)
+        self.variants = {}
+        key_ids = {}
+        key_of = []
+        for index, token in enumerate(self.vocab):
+            key = same_word(token)
+            if key:
+                self.variants.setdefault(key, []).append(index)
+            else:
+                key = index
+            key_of.append(key_ids.setdefault(key, len(key_ids)))
+        self.keys = list(key_ids)
+        self.key_of = np.array(key_of, dtype=np.int64)
         self._options = [None] * len(self.keys)
         self._fillers = [None] * len(self.vocab)
 
