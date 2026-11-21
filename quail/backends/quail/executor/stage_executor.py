@@ -343,7 +343,13 @@ class StageExecutor:
                     # built for another prefix; it is fed afresh
                     self.arena.free_key(key)
                     continue
-                resident[a] = self._held_pages(key, self.prefix_lengths[a])
+                # the admission prices a document at page_cost(prefix + extra)
+                # less what it holds; a trimmed window holds fewer sliding
+                # pages than that price assumes, so count what growing takes
+                capacity = self.prefix_lengths[a] + self.capacity_extra
+                resident[a] = (
+                    self.arena.page_cost(capacity)
+                    - self.arena.growth_cost(key, capacity))
         # Pin resident documents while fresh admissions evict retained KV.
         for a in resident:
             self.arena.pin(self.keys[a])
@@ -504,14 +510,6 @@ class StageExecutor:
         if self.writes[j] and start == 0:
             rows += len(self.frames[j]) + len(self.canvas)
         return rows
-
-    def _held_pages(self, key, prefix_tokens):
-        # the admission prices a document at page_cost(prefix + extra)
-        # less what it holds; a trimmed window holds fewer sliding
-        # pages than that price assumes, so count what growing takes
-        capacity = prefix_tokens + self.capacity_extra
-        return (self.arena.page_cost(capacity)
-                - self.arena.growth_cost(key, capacity))
 
     def _prepare(self, j, anchors):
         self.stages[j].prepare([self.keys[a] for a in anchors])
@@ -892,36 +890,6 @@ class StageExecutor:
         elif self.arena.is_resident(self.keys[settlement.anchor]):
             self.arena.free_key(self.keys[settlement.anchor])
 
-    def _report(self, entry):
-        if entry.values is None:
-            entry.values = self.readouts.results(entry.handles)
-            entry.positions = np.zeros(len(self.readouts), dtype=np.int64)
-        groups = entry.groups[entry.at:entry.at + entry.step]
-        values, position = entry.values, entry.positions
-        transitions = []
-        for a, j, start, end, _ in groups:
-            key = self.readouts.group_key[j]
-            if self.writes[j] and start == 0 and not self._merged(j, start, end):
-                position[key] += 1        # the frame entry's answer means nothing
-            count = end - start
-            rows = values[key][position[key]:position[key] + count]
-            position[key] += count
-            if j in self.answer_maps:
-                # the row stands until the decoder ends the answer
-                self.deferred[a] = (j, start, end, rows)
-                continue
-            transitions.extend(self._record(a, j, start, end, rows))
-        entry.at += len(groups)
-        transitions.extend(self._record_answers())
-        self._decide_waiting()
-        self.progress.update(
-            self.progress.done + sum(end - start for _, _, start, end, _ in groups)
-            if self.counting_answers else self.finished)
-        # with on_answers, answers may finish rows before any document moves
-        if (transitions or self.on_answers is not None) and self.on_chunk is not None:
-            self.on_chunk(transitions)
-        self._release_skipped()
-
     def _record(self, a, j, start, end, rows) -> list:
         """Report a group's answers once the next stage's inputs are ready."""
         if a not in self.sched.dependencies and j + 1 < len(self.stages):
@@ -979,7 +947,34 @@ class StageExecutor:
             if partial and self.split_answers and all(
                     self.stages[j].append for _, j, _, _, _ in entry.groups):
                 entry.step = (entry.step + 1) // 2
-        self._report(entry)
+        if entry.values is None:
+            entry.values = self.readouts.results(entry.handles)
+            entry.positions = np.zeros(len(self.readouts), dtype=np.int64)
+        groups = entry.groups[entry.at:entry.at + entry.step]
+        values, position = entry.values, entry.positions
+        transitions = []
+        for a, j, start, end, _ in groups:
+            key = self.readouts.group_key[j]
+            if self.writes[j] and start == 0 and not self._merged(j, start, end):
+                position[key] += 1        # the frame entry's answer means nothing
+            count = end - start
+            rows = values[key][position[key]:position[key] + count]
+            position[key] += count
+            if j in self.answer_maps:
+                # the row stands until the decoder ends the answer
+                self.deferred[a] = (j, start, end, rows)
+                continue
+            transitions.extend(self._record(a, j, start, end, rows))
+        entry.at += len(groups)
+        transitions.extend(self._record_answers())
+        self._decide_waiting()
+        self.progress.update(
+            self.progress.done + sum(end - start for _, _, start, end, _ in groups)
+            if self.counting_answers else self.finished)
+        # with on_answers, answers may finish rows before any document moves
+        if (transitions or self.on_answers is not None) and self.on_chunk is not None:
+            self.on_chunk(transitions)
+        self._release_skipped()
         if entry.at == len(entry.groups):
             self.outstanding.pop(0)
 
