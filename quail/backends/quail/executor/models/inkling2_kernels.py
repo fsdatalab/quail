@@ -64,60 +64,345 @@ def _kernels() -> dict:
         return value
 
     @triton.jit
+    def _state(blocks_ptr, stride_bb, partial_ptr, addend_ptr, row_b, row_p,
+               row_a, cols, J: tl.constexpr, NB: tl.constexpr,
+               NS: tl.constexpr, HAS_ADDEND: tl.constexpr):
+        # state J of one row: a completed block, the partial (+ addend), or
+        # zero past the last state
+        if J < NB:
+            x = tl.load(blocks_ptr + row_b + J * stride_bb + cols)
+            x = x.to(tl.float32)
+        elif J < NS:
+            x = tl.load(partial_ptr + row_p + cols).to(tl.float32)
+            if HAS_ADDEND:
+                x += tl.load(addend_ptr + row_a + cols).to(tl.float32)
+        else:
+            x = tl.zeros(cols.shape, dtype=tl.float32)
+        return x
+
+    @triton.jit
+    def _softmax5(l0, l1, l2, l3, l4, NS: tl.constexpr):
+        top = l0
+        if NS > 1:
+            top = tl.maximum(top, l1)
+        if NS > 2:
+            top = tl.maximum(top, l2)
+        if NS > 3:
+            top = tl.maximum(top, l3)
+        if NS > 4:
+            top = tl.maximum(top, l4)
+        e0 = tl.exp(l0 - top)
+        e1 = tl.exp(l1 - top) if NS > 1 else 0.0
+        e2 = tl.exp(l2 - top) if NS > 2 else 0.0
+        e3 = tl.exp(l3 - top) if NS > 3 else 0.0
+        e4 = tl.exp(l4 - top) if NS > 4 else 0.0
+        total = e0 + e1 + e2 + e3 + e4
+        return e0 / total, e1 / total, e2 / total, e3 / total, e4 / total
+
+    @triton.jit
     def mix(blocks_ptr, stride_bb, stride_br, partial_ptr, stride_p,
             addend_ptr, stride_a, query_ptr, weight_ptr, out_ptr, stride_oq,
-            stride_or, eps, H: tl.constexpr, HP: tl.constexpr,
+            stride_or, eps, H: tl.constexpr, CH: tl.constexpr,
             NB: tl.constexpr, NS: tl.constexpr, NQ: tl.constexpr,
             HAS_ADDEND: tl.constexpr, NORM: tl.constexpr):
-        # states: NB completed blocks, then the partial (+ addend) if any
+        # One row of up to five states and three queries. The first pass
+        # accumulates the states' pairwise products and each query's
+        # products with each state elementwise, reduced once at the end;
+        # the RMS norms, the softmax weights, and each output's norm
+        # follow from those sums, so the second pass writes finished rows.
         row = tl.program_id(0).to(tl.int64)
-        offs = tl.arange(0, HP)
-        mask = offs < H
-        logits = tl.zeros((4, 8), dtype=tl.float32) - float("inf")
-        rows4 = tl.arange(0, 4)
-        cols8 = tl.arange(0, 8)
-        queries = tl.load(query_ptr + rows4[:, None] * H + offs[None, :],
-                          mask=(rows4[:, None] < NQ) & mask[None, :],
-                          other=0.0)
-        for j in tl.static_range(NS):
-            if j < NB:
-                x = tl.load(blocks_ptr + j * stride_bb + row * stride_br
-                            + offs, mask=mask, other=0.0).to(tl.float32)
-            else:
-                x = tl.load(partial_ptr + row * stride_p + offs, mask=mask,
-                            other=0.0).to(tl.float32)
-                if HAS_ADDEND:
-                    x += tl.load(addend_ptr + row * stride_a + offs,
-                                 mask=mask, other=0.0).to(tl.float32)
-            inv = tl.math.rsqrt(tl.sum(x * x, axis=0) / H + eps)
-            score = tl.sum(queries * (x * inv)[None, :], axis=1)
-            logits = tl.where(cols8[None, :] == j, score[:, None], logits)
-        top = tl.max(logits, axis=1)
-        p = tl.exp(logits - top[:, None])
-        p = p / tl.sum(p, axis=1)[:, None]
-        acc = tl.zeros((4, HP), dtype=tl.float32)
-        for j in tl.static_range(NS):
-            if j < NB:
-                x = tl.load(blocks_ptr + j * stride_bb + row * stride_br
-                            + offs, mask=mask, other=0.0).to(tl.float32)
-            else:
-                x = tl.load(partial_ptr + row * stride_p + offs, mask=mask,
-                            other=0.0).to(tl.float32)
-                if HAS_ADDEND:
-                    x += tl.load(addend_ptr + row * stride_a + offs,
-                                 mask=mask, other=0.0).to(tl.float32)
-            inv = tl.math.rsqrt(tl.sum(x * x, axis=0) / H + eps)
-            weight_j = tl.sum(tl.where(cols8[None, :] == j, p, 0.0), axis=1)
-            acc += weight_j[:, None] * (x * inv)[None, :]
-        for q in tl.static_range(NQ):
-            out = tl.sum(tl.where(rows4[:, None] == q, acc, 0.0), axis=0)
+        row_b = row * stride_br
+        row_p = row * stride_p
+        row_a = row * stride_a
+        offs = tl.arange(0, CH)
+        g00 = tl.zeros((CH,), dtype=tl.float32)
+        g01 = tl.zeros((CH,), dtype=tl.float32)
+        g02 = tl.zeros((CH,), dtype=tl.float32)
+        g03 = tl.zeros((CH,), dtype=tl.float32)
+        g04 = tl.zeros((CH,), dtype=tl.float32)
+        g11 = tl.zeros((CH,), dtype=tl.float32)
+        g12 = tl.zeros((CH,), dtype=tl.float32)
+        g13 = tl.zeros((CH,), dtype=tl.float32)
+        g14 = tl.zeros((CH,), dtype=tl.float32)
+        g22 = tl.zeros((CH,), dtype=tl.float32)
+        g23 = tl.zeros((CH,), dtype=tl.float32)
+        g24 = tl.zeros((CH,), dtype=tl.float32)
+        g33 = tl.zeros((CH,), dtype=tl.float32)
+        g34 = tl.zeros((CH,), dtype=tl.float32)
+        g44 = tl.zeros((CH,), dtype=tl.float32)
+        d00 = tl.zeros((CH,), dtype=tl.float32)
+        d01 = tl.zeros((CH,), dtype=tl.float32)
+        d02 = tl.zeros((CH,), dtype=tl.float32)
+        d03 = tl.zeros((CH,), dtype=tl.float32)
+        d04 = tl.zeros((CH,), dtype=tl.float32)
+        d10 = tl.zeros((CH,), dtype=tl.float32)
+        d11 = tl.zeros((CH,), dtype=tl.float32)
+        d12 = tl.zeros((CH,), dtype=tl.float32)
+        d13 = tl.zeros((CH,), dtype=tl.float32)
+        d14 = tl.zeros((CH,), dtype=tl.float32)
+        d20 = tl.zeros((CH,), dtype=tl.float32)
+        d21 = tl.zeros((CH,), dtype=tl.float32)
+        d22 = tl.zeros((CH,), dtype=tl.float32)
+        d23 = tl.zeros((CH,), dtype=tl.float32)
+        d24 = tl.zeros((CH,), dtype=tl.float32)
+        for c in range(0, H, CH):
+            cols = c + offs
+            x0 = _state(blocks_ptr, stride_bb, partial_ptr, addend_ptr, row_b,
+                        row_p, row_a, cols, 0, NB, NS, HAS_ADDEND)
+            x1 = _state(blocks_ptr, stride_bb, partial_ptr, addend_ptr, row_b,
+                        row_p, row_a, cols, 1, NB, NS, HAS_ADDEND)
+            x2 = _state(blocks_ptr, stride_bb, partial_ptr, addend_ptr, row_b,
+                        row_p, row_a, cols, 2, NB, NS, HAS_ADDEND)
+            x3 = _state(blocks_ptr, stride_bb, partial_ptr, addend_ptr, row_b,
+                        row_p, row_a, cols, 3, NB, NS, HAS_ADDEND)
+            x4 = _state(blocks_ptr, stride_bb, partial_ptr, addend_ptr, row_b,
+                        row_p, row_a, cols, 4, NB, NS, HAS_ADDEND)
+            if NQ > 0:
+                q0 = tl.load(query_ptr + 0 * H + cols)
+                if NS > 0:
+                    d00 += q0 * x0
+                if NS > 1:
+                    d01 += q0 * x1
+                if NS > 2:
+                    d02 += q0 * x2
+                if NS > 3:
+                    d03 += q0 * x3
+                if NS > 4:
+                    d04 += q0 * x4
+            if NQ > 1:
+                q1 = tl.load(query_ptr + 1 * H + cols)
+                if NS > 0:
+                    d10 += q1 * x0
+                if NS > 1:
+                    d11 += q1 * x1
+                if NS > 2:
+                    d12 += q1 * x2
+                if NS > 3:
+                    d13 += q1 * x3
+                if NS > 4:
+                    d14 += q1 * x4
+            if NQ > 2:
+                q2 = tl.load(query_ptr + 2 * H + cols)
+                if NS > 0:
+                    d20 += q2 * x0
+                if NS > 1:
+                    d21 += q2 * x1
+                if NS > 2:
+                    d22 += q2 * x2
+                if NS > 3:
+                    d23 += q2 * x3
+                if NS > 4:
+                    d24 += q2 * x4
+            if NS > 0:
+                g00 += x0 * x0
+            if NS > 1:
+                g01 += x0 * x1
+            if NS > 2:
+                g02 += x0 * x2
+            if NS > 3:
+                g03 += x0 * x3
+            if NS > 4:
+                g04 += x0 * x4
+            if NS > 1:
+                g11 += x1 * x1
+            if NS > 2:
+                g12 += x1 * x2
+            if NS > 3:
+                g13 += x1 * x3
+            if NS > 4:
+                g14 += x1 * x4
+            if NS > 2:
+                g22 += x2 * x2
+            if NS > 3:
+                g23 += x2 * x3
+            if NS > 4:
+                g24 += x2 * x4
+            if NS > 3:
+                g33 += x3 * x3
+            if NS > 4:
+                g34 += x3 * x4
+            if NS > 4:
+                g44 += x4 * x4
+        # the reductions, once
+        s00 = tl.sum(g00, axis=0)
+        s01 = tl.sum(g01, axis=0)
+        s02 = tl.sum(g02, axis=0)
+        s03 = tl.sum(g03, axis=0)
+        s04 = tl.sum(g04, axis=0)
+        s11 = tl.sum(g11, axis=0)
+        s12 = tl.sum(g12, axis=0)
+        s13 = tl.sum(g13, axis=0)
+        s14 = tl.sum(g14, axis=0)
+        s22 = tl.sum(g22, axis=0)
+        s23 = tl.sum(g23, axis=0)
+        s24 = tl.sum(g24, axis=0)
+        s33 = tl.sum(g33, axis=0)
+        s34 = tl.sum(g34, axis=0)
+        s44 = tl.sum(g44, axis=0)
+        i0 = tl.math.rsqrt(s00 / H + eps)
+        i1 = tl.math.rsqrt(s11 / H + eps)
+        i2 = tl.math.rsqrt(s22 / H + eps)
+        i3 = tl.math.rsqrt(s33 / H + eps)
+        i4 = tl.math.rsqrt(s44 / H + eps)
+        if NQ > 0:
+            p00, p01, p02, p03, p04 = _softmax5(
+                tl.sum(d00, axis=0) * i0, tl.sum(d01, axis=0) * i1,
+                tl.sum(d02, axis=0) * i2, tl.sum(d03, axis=0) * i3,
+                tl.sum(d04, axis=0) * i4, NS)
+            w00 = p00 * i0
+            w01 = p01 * i1
+            w02 = p02 * i2
+            w03 = p03 * i3
+            w04 = p04 * i4
             if NORM:
-                w = tl.load(weight_ptr + q * H + offs, mask=mask,
-                            other=0.0).to(tl.float32)
-                out = out * tl.math.rsqrt(tl.sum(out * out, axis=0) / H + eps)
-                out = out * w
-            tl.store(out_ptr + q * stride_oq + row * stride_or + offs,
-                     out.to(out_ptr.dtype.element_ty), mask=mask)
+                norm_sq = (w00 * w00 * s00
+                           + w00 * w01 * s01
+                           + w00 * w02 * s02
+                           + w00 * w03 * s03
+                           + w00 * w04 * s04
+                           + w01 * w00 * s01
+                           + w01 * w01 * s11
+                           + w01 * w02 * s12
+                           + w01 * w03 * s13
+                           + w01 * w04 * s14
+                           + w02 * w00 * s02
+                           + w02 * w01 * s12
+                           + w02 * w02 * s22
+                           + w02 * w03 * s23
+                           + w02 * w04 * s24
+                           + w03 * w00 * s03
+                           + w03 * w01 * s13
+                           + w03 * w02 * s23
+                           + w03 * w03 * s33
+                           + w03 * w04 * s34
+                           + w04 * w00 * s04
+                           + w04 * w01 * s14
+                           + w04 * w02 * s24
+                           + w04 * w03 * s34
+                           + w04 * w04 * s44)
+                scale = tl.math.rsqrt(norm_sq / H + eps)
+                w00 = w00 * scale
+                w01 = w01 * scale
+                w02 = w02 * scale
+                w03 = w03 * scale
+                w04 = w04 * scale
+        if NQ > 1:
+            p10, p11, p12, p13, p14 = _softmax5(
+                tl.sum(d10, axis=0) * i0, tl.sum(d11, axis=0) * i1,
+                tl.sum(d12, axis=0) * i2, tl.sum(d13, axis=0) * i3,
+                tl.sum(d14, axis=0) * i4, NS)
+            w10 = p10 * i0
+            w11 = p11 * i1
+            w12 = p12 * i2
+            w13 = p13 * i3
+            w14 = p14 * i4
+            if NORM:
+                norm_sq = (w10 * w10 * s00
+                           + w10 * w11 * s01
+                           + w10 * w12 * s02
+                           + w10 * w13 * s03
+                           + w10 * w14 * s04
+                           + w11 * w10 * s01
+                           + w11 * w11 * s11
+                           + w11 * w12 * s12
+                           + w11 * w13 * s13
+                           + w11 * w14 * s14
+                           + w12 * w10 * s02
+                           + w12 * w11 * s12
+                           + w12 * w12 * s22
+                           + w12 * w13 * s23
+                           + w12 * w14 * s24
+                           + w13 * w10 * s03
+                           + w13 * w11 * s13
+                           + w13 * w12 * s23
+                           + w13 * w13 * s33
+                           + w13 * w14 * s34
+                           + w14 * w10 * s04
+                           + w14 * w11 * s14
+                           + w14 * w12 * s24
+                           + w14 * w13 * s34
+                           + w14 * w14 * s44)
+                scale = tl.math.rsqrt(norm_sq / H + eps)
+                w10 = w10 * scale
+                w11 = w11 * scale
+                w12 = w12 * scale
+                w13 = w13 * scale
+                w14 = w14 * scale
+        if NQ > 2:
+            p20, p21, p22, p23, p24 = _softmax5(
+                tl.sum(d20, axis=0) * i0, tl.sum(d21, axis=0) * i1,
+                tl.sum(d22, axis=0) * i2, tl.sum(d23, axis=0) * i3,
+                tl.sum(d24, axis=0) * i4, NS)
+            w20 = p20 * i0
+            w21 = p21 * i1
+            w22 = p22 * i2
+            w23 = p23 * i3
+            w24 = p24 * i4
+            if NORM:
+                norm_sq = (w20 * w20 * s00
+                           + w20 * w21 * s01
+                           + w20 * w22 * s02
+                           + w20 * w23 * s03
+                           + w20 * w24 * s04
+                           + w21 * w20 * s01
+                           + w21 * w21 * s11
+                           + w21 * w22 * s12
+                           + w21 * w23 * s13
+                           + w21 * w24 * s14
+                           + w22 * w20 * s02
+                           + w22 * w21 * s12
+                           + w22 * w22 * s22
+                           + w22 * w23 * s23
+                           + w22 * w24 * s24
+                           + w23 * w20 * s03
+                           + w23 * w21 * s13
+                           + w23 * w22 * s23
+                           + w23 * w23 * s33
+                           + w23 * w24 * s34
+                           + w24 * w20 * s04
+                           + w24 * w21 * s14
+                           + w24 * w22 * s24
+                           + w24 * w23 * s34
+                           + w24 * w24 * s44)
+                scale = tl.math.rsqrt(norm_sq / H + eps)
+                w20 = w20 * scale
+                w21 = w21 * scale
+                w22 = w22 * scale
+                w23 = w23 * scale
+                w24 = w24 * scale
+        for c in range(0, H, CH):
+            cols = c + offs
+            x0 = _state(blocks_ptr, stride_bb, partial_ptr, addend_ptr, row_b,
+                        row_p, row_a, cols, 0, NB, NS, HAS_ADDEND)
+            x1 = _state(blocks_ptr, stride_bb, partial_ptr, addend_ptr, row_b,
+                        row_p, row_a, cols, 1, NB, NS, HAS_ADDEND)
+            x2 = _state(blocks_ptr, stride_bb, partial_ptr, addend_ptr, row_b,
+                        row_p, row_a, cols, 2, NB, NS, HAS_ADDEND)
+            x3 = _state(blocks_ptr, stride_bb, partial_ptr, addend_ptr, row_b,
+                        row_p, row_a, cols, 3, NB, NS, HAS_ADDEND)
+            x4 = _state(blocks_ptr, stride_bb, partial_ptr, addend_ptr, row_b,
+                        row_p, row_a, cols, 4, NB, NS, HAS_ADDEND)
+            if NQ > 0:
+                out = (w00 * x0 + w01 * x1 + w02 * x2 + w03 * x3
+                       + w04 * x4)
+                if NORM:
+                    out *= tl.load(weight_ptr + 0 * H + cols).to(tl.float32)
+                tl.store(out_ptr + 0 * stride_oq + row * stride_or + cols,
+                         out.to(out_ptr.dtype.element_ty))
+            if NQ > 1:
+                out = (w10 * x0 + w11 * x1 + w12 * x2 + w13 * x3
+                       + w14 * x4)
+                if NORM:
+                    out *= tl.load(weight_ptr + 1 * H + cols).to(tl.float32)
+                tl.store(out_ptr + 1 * stride_oq + row * stride_or + cols,
+                         out.to(out_ptr.dtype.element_ty))
+            if NQ > 2:
+                out = (w20 * x0 + w21 * x1 + w22 * x2 + w23 * x3
+                       + w24 * x4)
+                if NORM:
+                    out *= tl.load(weight_ptr + 2 * H + cols).to(tl.float32)
+                tl.store(out_ptr + 2 * stride_oq + row * stride_or + cols,
+                         out.to(out_ptr.dtype.element_ty))
 
     @triton.jit
     def _message(prev_block_ptr, prev_out_ptr, stride_prev, query_ptr, row,
@@ -803,9 +1088,9 @@ def mix(torch, blocks, num_blocks, partial, query, *, addend=None,
         blocks, blocks.stride(1), blocks.stride(0), partial, partial.stride(0),
         addend_t, addend_t.stride(0), query,
         weight if weight is not None else query, out, out.stride(0),
-        out.stride(1), eps, H=hidden, HP=_hp(hidden), NB=num_blocks,
+        out.stride(1), eps, H=hidden, CH=_chunk(hidden, 256), NB=num_blocks,
         NS=num_blocks + int(has_partial), NQ=nq,
-        HAS_ADDEND=addend is not None, NORM=weight is not None, num_warps=16)
+        HAS_ADDEND=addend is not None, NORM=weight is not None, num_warps=1)
     return out
 
 
