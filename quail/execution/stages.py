@@ -243,28 +243,16 @@ def _port_value(node, port, table: pa.Table, context: ExecutionContext):
         return Rows({node.alias: ids.filter(pc.is_in(ids, value_set=sent))})
     if port.value_type is not ValueType.ROWS:
         return table
-    names = _id_columns(table)
-    table = distinct_rows(table, names)
+    names = [field.name for field in table.schema
+        if field.metadata and b"quail.alias" in field.metadata]
+    # A partner's survivors reach a later stage from every GPU that pruned
+    # them, so the same ids can arrive more than once.
+    if table.num_rows != 0 and names:
+        positions = table.select(names).append_column(
+            "position", pa.array(np.arange(table.num_rows)))
+        first = positions.group_by(names, use_threads=False).aggregate(
+            [("position", "min")]).column("position_min").to_numpy()
+        if len(first) != table.num_rows:
+            table = table.take(np.sort(first))
     return Rows({name: table.column(name) for name in names},
-                table.drop_columns(names))
-
-
-def _id_columns(table: pa.Table) -> list[str]:
-    """Return the names of a table's document id columns."""
-    return [field.name for field in table.schema
-            if field.metadata and b"quail.alias" in field.metadata]
-
-
-def distinct_rows(table: pa.Table, names: list[str]) -> pa.Table:
-    """Keep the first row of each combination of the named id columns.
-
-    A partner's survivors reach a later stage from every GPU that pruned
-    them, so the same ids can arrive more than once.
-    """
-    if table.num_rows == 0 or not names:
-        return table
-    positions = table.select(names).append_column(
-        "position", pa.array(np.arange(table.num_rows)))
-    first = positions.group_by(names, use_threads=False).aggregate(
-        [("position", "min")]).column("position_min").to_numpy()
-    return table if len(first) == table.num_rows else table.take(np.sort(first))
+        table.drop_columns(names))
