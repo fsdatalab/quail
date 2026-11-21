@@ -67,6 +67,7 @@ def _device():
 
 def _prompt_ids():
     from quail.api.prompts import bind_prompt
+    from quail.common.expressions import ColumnRef
     from quail.common.tokens import Tokenizer
     from quail.physical.lowering import lower_prompt
     from quail.specs import MODELS
@@ -75,7 +76,8 @@ def _prompt_ids():
     spec = MODELS[MODEL]
     ids = Tokenizer(resolve_model_path(spec.hf_name, spec.revision))
 
-    prompt = lower_prompt(bind_prompt(QUESTION, ("body",), turn=spec.turn), ids)
+    body = ColumnRef(alias="r", provider="reviews", column="body")
+    prompt = lower_prompt(bind_prompt(QUESTION, (body,), turn=spec.turn), ids)
     return [[*prompt.preamble_token_ids, *ids(review), *prompt.tail_token_ids]
             for review in REVIEWS]
 

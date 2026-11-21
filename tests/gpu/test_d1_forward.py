@@ -102,12 +102,14 @@ def _tokenizer():
 def _prompts():
     """Per question, the lowered prompt and the text and ids of each review."""
     from quail.api.prompts import bind_prompt
+    from quail.common.expressions import ColumnRef
     from quail.physical.lowering import lower_prompt
 
     spec, ids = _spec(), _tokenizer()
+    body = ColumnRef(alias="r", provider="reviews", column="body")
     out = []
     for question in QUESTIONS:
-        prompt = bind_prompt(question, ("body",), turn=spec.turn,
+        prompt = bind_prompt(question, (body,), turn=spec.turn,
                              layout=spec.prompt_layout)
         lowered = lower_prompt(prompt, ids)
         out.append((prompt, lowered, [
@@ -241,12 +243,14 @@ def _yes_no_questions(templates):
     """AI filter templates as the SetQuestions of one pass group."""
     from quail.api.prompts import bind_prompt
     from quail.backends.quail.executor.pass_groups import SetQuestion
+    from quail.common.expressions import ColumnRef
     from quail.physical.lowering import lower_prompt, set_question_parts
 
     spec, ids = _spec(), _tokenizer()
+    body = ColumnRef(alias="r", provider="reviews", column="body")
     questions = []
     for template in templates:
-        prompt = bind_prompt(template, ("body",), turn=spec.turn,
+        prompt = bind_prompt(template, (body,), turn=spec.turn,
                              layout=spec.prompt_layout)
         lowered = lower_prompt(prompt, ids)
         parts = set_question_parts(prompt, ids)
