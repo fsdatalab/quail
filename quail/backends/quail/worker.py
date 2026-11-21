@@ -136,7 +136,11 @@ class LoadedGpu:
         tokenizer = None
         if spec.role not in ("reranker", "decision"):
             say(f"loading the tokenizer of {spec.name} for AI.MAP and AI.EXTRACT")
-            tokenizer = model_tokenizer(spec, model_path)
+            from quail.common.tokens import Tokenizer
+
+            path = resolve_model_path(model_path or spec.hf_name,
+                None if model_path else spec.revision, include_weights=False)
+            tokenizer = Tokenizer(path, spec.turn_suffix)
         self.execution = backend.start(context)
         self.execution.bind_loaded_model(
             model=self.model, arena=self.arena, pipeline=self.pipeline,
@@ -253,23 +257,6 @@ def checkpoint_arena_args(spec, device, chunk_tokens, kv_pages,
         "conv_state_shape": (layers, spec.conv_width - 1,
                              spec.conv_state_channels),
     }
-
-
-def model_tokenizer(spec, model_path: str = ""):
-    """Load a model's tokenizer, with the ids that end its answers.
-
-    Args:
-        spec: The model spec.
-        model_path: A local checkpoint that replaces the spec's Hugging
-            Face repository at its pinned revision.
-    """
-    from quail.common.tokens import Tokenizer
-    from quail.specs.files import resolve_model_path
-
-    path = resolve_model_path(model_path or spec.hf_name,
-                              None if model_path else spec.revision,
-                              include_weights=False)
-    return Tokenizer(path, spec.turn_suffix)
 
 
 def decision_offsets(spec, path) -> tuple[int, ...]:
