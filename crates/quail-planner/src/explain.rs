@@ -166,7 +166,10 @@ pub fn explain_text(request: &ExplainRequest) -> Result<String, String> {
         if let Some(admission) = settings
             .get("admission_tokens")
             .filter(|value| !value.is_null())
-            && reuses_kv(request.model_spec.as_ref())
+            && request
+                .model_spec
+                .as_ref()
+                .is_none_or(|spec| spec["attention_mask"].as_str() != Some("set"))
         {
             budgets.push(format!("admission budget={} tokens", commas(admission)));
         }
@@ -440,7 +443,8 @@ fn field_lines_as(fields: &[(String, Shown)], depth: usize, tuples: bool) -> Vec
                     }
                 }
             }
-            other => lines.push(format!("{pad}{key}={}", other.text(tuples))),
+            Shown::Text(text) => lines.push(format!("{pad}{key}={text}")),
+            other => lines.push(format!("{pad}{key}={}", other.repr(tuples))),
         }
     }
     lines
@@ -747,14 +751,6 @@ impl Shown {
                     }
                 }
             }
-        }
-    }
-
-    /// Python's `str`.
-    fn text(&self, tuples: bool) -> String {
-        match self {
-            Shown::Text(text) => text.clone(),
-            other => other.repr(tuples),
         }
     }
 }
@@ -1872,12 +1868,6 @@ fn rule_lines(rules: &[(String, String)]) -> Vec<String> {
         format!("  refine each graph in order: {}", names("physical")),
         "  selection: lowest estimated cost after graph refinement".to_string(),
     ]
-}
-
-/// Whether a model keeps documents' KV for later questions: every model
-/// but one whose attention is set attention.
-fn reuses_kv(spec: Option<&Value>) -> bool {
-    spec.is_none_or(|spec| spec["attention_mask"].as_str() != Some("set"))
 }
 
 /// The architecture, weight precision, and kernel path lines of a model,
