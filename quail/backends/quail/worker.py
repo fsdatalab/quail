@@ -440,14 +440,9 @@ def _close_workers():
 atexit.register(_close_workers)
 
 
-def _ensure_workers(gpus, configuration):
-    """Return live workers for the configuration, replacing any others.
-
-    Args:
-        gpus: How many GPUs, one worker process each.
-        configuration: The model, device, backend, and GPU count the
-            workers load.
-    """
+def quail_workers(model: str, device: str, backend: str, gpus: int):
+    """Return the GPUs' workers for a configuration, starting them if needed."""
+    configuration = (model, device, backend, gpus)
     global _WORKERS
     if (_WORKERS is None or _WORKERS[0] != configuration
             or not _WORKERS[1].alive()):
@@ -461,9 +456,4 @@ def _ensure_workers(gpus, configuration):
             raise
         _WORKERS = (configuration, workers)
     return _WORKERS[1]
-
-
-def quail_workers(model: str, device: str, backend: str, gpus: int):
-    """Return the GPUs' workers for a configuration, starting them if needed."""
-    return _ensure_workers(gpus, (model, device, backend, gpus))
 
