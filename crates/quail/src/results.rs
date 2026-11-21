@@ -307,7 +307,19 @@ pub fn collect_answers(
             table.clone(),
         ));
         if semantics == "full" {
-            true_joins.insert(position, true_answer_rows(table)?);
+            let answers = table
+                .columns()
+                .last()
+                .and_then(|column| column.as_boolean_opt())
+                .ok_or("answer table has no answer column")?
+                .clone();
+            let selected = filter_record_batch(table, &answers).map_err(arrow_error)?;
+            let kept: Vec<usize> = (0..table.num_columns() - 1).collect();
+            let selected = selected.project(&kept).map_err(arrow_error)?;
+            let mut metadata = table.schema().metadata().clone();
+            metadata.insert("quail.kind".into(), "join_answers".into());
+            let schema = Arc::new(selected.schema().as_ref().clone().with_metadata(metadata));
+            true_joins.insert(position, selected.with_schema(schema).map_err(arrow_error)?);
         }
     }
 
@@ -317,20 +329,11 @@ pub fn collect_answers(
         true_joins,
         stages,
     };
-    to_source_rows(&mut answers, &request.source_rows)?;
-    Ok(answers)
-}
-
-/// Number each document by its row in the registered table, for each
-/// alias `source_rows` holds.
-fn to_source_rows(
-    answers: &mut Answers,
-    source_rows: &BTreeMap<String, Vec<i32>>,
-) -> Result<(), Error> {
-    if source_rows.is_empty() {
-        return Ok(());
+    if request.source_rows.is_empty() {
+        return Ok(answers);
     }
-    let mappings: BTreeMap<&String, Int32Array> = source_rows
+    let mappings: BTreeMap<&String, Int32Array> = request
+        .source_rows
         .iter()
         .map(|(alias, rows)| (alias, Int32Array::from(rows.clone())))
         .collect();
@@ -355,7 +358,7 @@ fn to_source_rows(
             *survivors = taken.as_primitive::<Int32Type>().clone();
         }
     }
-    Ok(())
+    Ok(answers)
 }
 
 /// The report of one region's run, from its plan and the backend's
@@ -443,24 +446,6 @@ fn true_count(table: &RecordBatch) -> usize {
         .last()
         .and_then(|column| column.as_boolean_opt())
         .map_or(0, BooleanArray::true_count)
-}
-
-/// The rows of a join answer table whose answer is true, without the
-/// answer column.
-fn true_answer_rows(table: &RecordBatch) -> Result<RecordBatch, Error> {
-    let answers = table
-        .columns()
-        .last()
-        .and_then(|column| column.as_boolean_opt())
-        .ok_or("answer table has no answer column")?
-        .clone();
-    let selected = filter_record_batch(table, &answers).map_err(arrow_error)?;
-    let kept: Vec<usize> = (0..table.num_columns() - 1).collect();
-    let selected = selected.project(&kept).map_err(arrow_error)?;
-    let mut metadata = table.schema().metadata().clone();
-    metadata.insert("quail.kind".into(), "join_answers".into());
-    let schema = Arc::new(selected.schema().as_ref().clone().with_metadata(metadata));
-    selected.with_schema(schema).map_err(arrow_error)
 }
 
 /// Document positions as one int32 array.
