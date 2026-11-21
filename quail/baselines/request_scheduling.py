@@ -184,8 +184,8 @@ def run_filter_sequence(
                 document, stage = inflight.pop(output.request_id)
                 if sequence.record(document, stage, output):
                     submit(document, stage + 1)
-                else:
-                    expected_rows -= 1
+                    continue
+                expected_rows -= 1
     finally:
         if inflight:
             # the engine is reused by the next query; a request left
