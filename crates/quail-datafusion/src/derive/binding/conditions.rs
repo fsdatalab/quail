@@ -248,7 +248,7 @@ impl Binder {
     fn extract_column(&self, node: &Expr) -> Result<Option<Expr>, CompileError> {
         let mut path = Vec::new();
         let mut inner = node;
-        while is_get_field(inner) {
+        while is_call(inner, "get_field") {
             let args = arguments(inner);
             let mut fields: Vec<String> = args[1..]
                 .iter()
@@ -324,10 +324,6 @@ impl Binder {
         ));
         self.computed(&test)
     }
-}
-
-fn is_get_field(expr: &Expr) -> bool {
-    is_call(expr, "get_field")
 }
 
 /// Refuse a test of the label `name` that accepts a label its
