@@ -32,14 +32,6 @@ class FilterRuntime:
             node, rows, lambda name, ids: _read(name, ids, node, others, sources)))
 
 
-def _filter_answer_table(node: Filter, rows: Rows, answers) -> pa.Table:
-    """Build one answer row per document using the filter answer schema."""
-    alias = node.aliases[0]
-    return filter_answer_table(
-        alias, rows.ids[alias],
-        np.full(rows.num_rows, node.written_position, dtype=np.int32), answers)
-
-
 def tested_table(node, rows: Rows, read) -> pa.Table:
     """Return every column a document Filter tests, one row per row of rows.
 
@@ -82,7 +74,11 @@ def filter_scores(node, rows: Rows, tested: pa.Table | None = None) -> NodeResul
     filtered = rows.filter(answers)
     if len(node.aliases) == 1:
         answer_name = f"filter_answers:{node.aliases[0]}"
-        answer_relation = _filter_answer_table(node, rows, answers)
+        alias = node.aliases[0]
+        answer_relation = filter_answer_table(
+            alias, rows.ids[alias],
+            np.full(rows.num_rows, node.written_position, dtype=np.int32),
+            answers)
     else:
         left, right = node.aliases
         answer_name = f"join_answers:{node.written_position}"
