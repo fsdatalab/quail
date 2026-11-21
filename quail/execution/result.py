@@ -218,15 +218,12 @@ def build_result_declaration(
         schema = table.schema
         while pending:
             for index, table in enumerate(pending):
-                if set(schema.names) & set(table.schema.names):
-                    declaration, schema = _inner_join(
-                        declaration,
-                        schema,
-                        _table_source(table),
-                        table.schema,
-                    )
-                    pending.pop(index)
-                    break
+                if set(schema.names).isdisjoint(table.schema.names):
+                    continue
+                declaration, schema = _inner_join(
+                    declaration, schema, _table_source(table), table.schema)
+                pending.pop(index)
+                break
             else:
                 raise ValueError("AI join relations form a disconnected graph")
     else:

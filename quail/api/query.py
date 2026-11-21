@@ -548,7 +548,19 @@ class RegionQuery:
         report["node_metrics"] = {
             node_id: dict(metrics) for node_id, metrics in measured.items()}
         observers = self.session.registry.new_observers()
-        _observe(plan.graph, response.outputs, result.node_metrics, observers)
+        if observers:
+            values = {(ref.node_id, ref.port): value
+                for ref, value in response.outputs.items()}
+            for node in plan.graph.topological_nodes():
+                found = {output.name: values[(node.node_id, output.name)]
+                    for output in node.outputs
+                    if (node.node_id, output.name) in values}
+                if not found or len(found) != len(node.outputs):
+                    continue
+                observed = NodeResult(found,
+                    result.node_metrics.get(node.node_id, NodeMetrics()))
+                for observer in observers:
+                    observer.after_node(node, observed)
         observer_reports = {
             observer.name: dict(observer.report())
             for observer in observers
@@ -630,18 +642,3 @@ class RegionQuery:
             "num_documents": {alias: len(tokens)
                 for alias, tokens in self._document_tokens.items()},
             "source_rows": source_rows}
-
-def _observe(graph, outputs, metrics, observers) -> None:
-    """Show each observer every node whose outputs the run returned."""
-    if not observers:
-        return
-    values = {(ref.node_id, ref.port): value for ref, value in outputs.items()}
-    for node in graph.topological_nodes():
-        found = {output.name: values[(node.node_id, output.name)]
-            for output in node.outputs
-            if (node.node_id, output.name) in values}
-        if not found or len(found) != len(node.outputs):
-            continue
-        result = NodeResult(found, metrics.get(node.node_id, NodeMetrics()))
-        for observer in observers:
-            observer.after_node(node, result)

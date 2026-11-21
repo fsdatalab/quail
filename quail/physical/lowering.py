@@ -160,13 +160,6 @@ def _call(name: str, arguments: list, tokenizer):
     return json.loads(found), vocabulary
 
 
-def model_fields(model) -> dict:
-    """The model fields prompt lowering reads."""
-    return {"role": model.role,
-        "answer_spellings": [list(words) for words in model.answer_spellings],
-        "turn": list(model.turn), "prompt_layout": model.prompt_layout}
-
-
 def lower_prompt(prompt: Prompt, tokenizer) -> LoweredPrompt:
     """Lower a prompt's text to the token ids the tokenizer gives it.
 
@@ -180,8 +173,10 @@ def lower_prompt(prompt: Prompt, tokenizer) -> LoweredPrompt:
 
 def answer_ids(model, tokenizer) -> tuple[list, list]:
     """Return the token ids a model answers true and false with."""
-    (true_ids, false_ids), vocabulary = _call(
-        "answer_ids", [model_fields(model)], tokenizer)
+    (true_ids, false_ids), vocabulary = _call("answer_ids", [{
+        "role": model.role,
+        "answer_spellings": [list(words) for words in model.answer_spellings],
+        "turn": list(model.turn), "prompt_layout": model.prompt_layout}], tokenizer)
     return ([vocabulary.word(token) for token in true_ids],
         [vocabulary.word(token) for token in false_ids])
 

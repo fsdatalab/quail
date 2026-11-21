@@ -70,9 +70,9 @@ class Session:
             from quail.remote.client import RemoteConnection
 
             self._remote = RemoteConnection(endpoint)
-        else:
-            self.datafusion = _quail_native.DataFusionContext()
-            _ = self.tokenizer
+            return
+        self.datafusion = _quail_native.DataFusionContext()
+        _ = self.tokenizer
 
     @property
     def endpoint(self) -> str | None:
@@ -123,8 +123,8 @@ class Session:
         try:
             if self._remote is not None:
                 self._remote.register(name, provider)
-            else:
-                register_provider(self.datafusion, name, provider)
+                return
+            register_provider(self.datafusion, name, provider)
         except Exception:
             del self.catalog.providers[name]
             raise

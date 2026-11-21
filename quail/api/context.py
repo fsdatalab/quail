@@ -151,10 +151,10 @@ class SessionContext:
             engine = Engine(session, physical_executor, order=order,
                 run_query=run_query)
             self._native = NativeSession(engine, session.planner, session.datafusion)
-        else:
-            description = engine_description(Engine(session, order=order))
-            self._native = NativeSession.on_workers(
-                workers, json.dumps(description), session.planner, session.datafusion)
+            return
+        description = engine_description(Engine(session, order=order))
+        self._native = NativeSession.on_workers(
+            workers, json.dumps(description), session.planner, session.datafusion)
 
     def register(self, name: str, table, id_col: str = "") -> None:
         """Register a table with the session, as ``Session.register`` does."""

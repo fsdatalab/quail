@@ -108,11 +108,11 @@ def decode_runs(label_ids) -> DecodeRuns:
         for token in trie[node]:
             target = follow(node + (token,))
             reads[target] = reads[node] + (target in trie)
-            if target in trie:
-                runs.append(list(target[len(node):]))
-                after[node, token] = (target, len(runs) - 1)
-            else:
+            if target not in trie:
                 after[node, token] = (target, None)
+                continue
+            runs.append(list(target[len(node):]))
+            after[node, token] = (target, len(runs) - 1)
     rounds = max(reads[node] for node in reads if node not in trie)
     return DecodeRuns(runs, first, after, rounds)
 

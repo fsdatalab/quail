@@ -16,11 +16,11 @@ from .base import (
     SaeSpec,
     SupportResult,
 )
-from .loading import read_devices, read_models
+from .loading import DATA, _read, read_models
 from .qwen3 import qwen3_spec
 
 MODELS = read_models()
-DEVICES = read_devices()
+DEVICES = _read(DeviceSpec, "devices", DATA / "devices")
 # hourly rental price of one device, keyed by device name
 MODAL_GPU_USD_PER_HOUR = {
     name: device.usd_per_hour for name, device in DEVICES.items()}

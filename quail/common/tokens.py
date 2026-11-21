@@ -80,7 +80,16 @@ class TokenConcat(Sequence):
             start, stop, step = index.indices(self._length)
             if step != 1:
                 return list(self)[index]
-            return TokenConcat(*self._sliced_parts(start, stop))
+            parts = []
+            offset = 0
+            for part in self._parts:
+                end = offset + len(part)
+                if end > start and offset < stop:
+                    parts.append(part[max(0, start - offset):stop - offset])
+                offset = end
+                if offset >= stop:
+                    break
+            return TokenConcat(*parts)
         if index < 0:
             index += self._length
         if not 0 <= index < self._length:
@@ -90,19 +99,6 @@ class TokenConcat(Sequence):
                 return part[index]
             index -= len(part)
         raise IndexError(index)
-
-    def _sliced_parts(self, start, stop):
-        """The parts covering [start, stop), each sliced to it."""
-        parts = []
-        offset = 0
-        for part in self._parts:
-            end = offset + len(part)
-            if end > start and offset < stop:
-                parts.append(part[max(0, start - offset):stop - offset])
-            offset = end
-            if offset >= stop:
-                break
-        return parts
 
     @property
     def token_parts(self):
