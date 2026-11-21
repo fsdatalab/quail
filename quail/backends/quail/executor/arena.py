@@ -333,15 +333,6 @@ class KVArena:
         self._refresh_rows(key)
         return self.free_pages - before
 
-    def _lift_floor(self, key) -> None:
-        """The last borrower is admitted: rows kept for it may go.
-
-        A key that already trimmed for its own pass trims again; one
-        still to run trims after that pass.
-        """
-        if self._window_floor.pop(key, None) is not None and key in self._trimmed:
-            self.trim_window(key)
-
     # ---- allocation ----------------------------------------------------
 
     def alloc(self, key, tokens: int, capacity_tokens: int | None = None,
@@ -671,8 +662,8 @@ class KVArena:
         if key in self._deferred:
             self._deferred.discard(key)
             self.free_key(key)
-        else:
-            self._lift_floor(key)
+        elif self._window_floor.pop(key, None) is not None and key in self._trimmed:
+            self.trim_window(key)
 
     def read_state(self, keys) -> None:
         """Keep each key's pages and slots until its admitted readers run."""
