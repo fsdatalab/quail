@@ -619,7 +619,16 @@ class HeadroomAdmission:
         self.committed[list(members)] = True
         slots = self._answer_slots(members)
         if self.choose_headroom:
-            self._hold_admitted(members, slots)
+            _, risk = self._admission_risk(members)
+            decision = self._decision
+            self.held_slots = np.r_[self.held_slots, slots]
+            self.held_risk = np.concatenate((self.held_risk, risk))
+            self.held_base = np.r_[self.held_base,
+                self.capacity[slots] // self.decoder.page_tokens]
+            if decision is not None and decision[1] == members:
+                self._hold(decision[3], decision[2])
+            else:
+                self._hold(np.r_[self.held_pages, np.zeros(len(slots), np.int64)], None)
         self._decision = None
         granted = ((self.reach[slots] - self.capacity[slots])
             // self.decoder.page_tokens).clip(0)
@@ -636,23 +645,6 @@ class HeadroomAdmission:
             self.headroom_pages = self.fixed_pages + int(self.held_pages.sum())
         else:
             self.headroom_pages += int(granted.sum()) + branch_pages
-
-    def _hold_admitted(self, members, slots):
-        """Add admitted answers to the held ones with allows()'s headroom.
-
-        Answers admitted without allows() accepting them, because no
-        answer could free pages, start with no headroom.
-        """
-        _, risk = self._admission_risk(members)
-        decision = self._decision
-        self.held_slots = np.r_[self.held_slots, slots]
-        self.held_risk = np.concatenate((self.held_risk, risk))
-        self.held_base = np.r_[self.held_base,
-            self.capacity[slots] // self.decoder.page_tokens]
-        if decision is not None and decision[1] == members:
-            self._hold(decision[3], decision[2])
-        else:
-            self._hold(np.r_[self.held_pages, np.zeros(len(slots), np.int64)], None)
 
     def waits(self):
         """Return whether a refused document can wait for pages to free."""
