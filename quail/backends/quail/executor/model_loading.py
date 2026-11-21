@@ -302,7 +302,7 @@ def keep_layers(torch, model, num_layers: int):
 def load_model(model_name: str, revision: str | None = None, *,
                answer_token_ids, max_batched_tokens=None,
                moe_backend=None, text_only=False, images=False,
-               num_layers=None, quantize_fp8=False, quantize_fp4=False):
+               num_layers=None, quantize_fp8=False):
     """Load model weights and retain the answer rows and the full output head.
 
     max_batched_tokens is the largest chunk the model will see. vLLM's
@@ -315,8 +315,6 @@ def load_model(model_name: str, revision: str | None = None, *,
     spec that reads an intermediate layer's residual stream.
     quantize_fp8 quantizes a bf16 LFM3 checkpoint's linear weights to fp8
     as they load; vLLM's checkpoints carry their own precision.
-    quantize_fp4 quantizes an Inkling checkpoint's bf16 attention
-    projections to NVFP4 as they load.
     """
     import os
     import tempfile
@@ -337,7 +335,7 @@ def load_model(model_name: str, revision: str | None = None, *,
         model = load_lfm3(model_path, quantize_fp8=quantize_fp8)
     elif is_inkling2(model_path):
         # vLLM 0.29 has no Inkling model
-        model = load_inkling2(model_path, quantize_fp4=quantize_fp4)
+        model = load_inkling2(model_path)
     else:
         model = _load_vllm_model(model_path, max_batched_tokens, moe_backend,
                                  text_only, images)

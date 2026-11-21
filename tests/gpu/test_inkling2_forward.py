@@ -30,9 +30,6 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(),
                                 reason="needs a CUDA device")
 
 MODEL = "inkling-2-mini"
-# the checkpoint's bf16 attention projections, and the same projections
-# quantized to NVFP4 as they load
-SPECS = ["inkling-2-mini", "inkling-2-mini-nvfp4-attention"]
 # transformers at the Inkling 2 Mini commit, installed by
 # experiments/run_gpu_tests.py's image
 REFERENCE_PACKAGES = "/opt/inkling-reference"
@@ -125,8 +122,8 @@ def reference(tmp_path_factory):
     return torch.load(path)
 
 
-@pytest.fixture(scope="module", params=SPECS)
-def quail(reference, request):
+@pytest.fixture(scope="module")
+def quail(reference):
     """Quail's last-row logits of the same sequences, in the same order.
 
     Built after the reference so the two model copies never share the GPU.
@@ -141,12 +138,11 @@ def quail(reference, request):
         logit_softcap,
     )
     from quail.backends.quail.executor.models import build_pipeline
-    from quail.specs import B200, MODELS
+    from quail.specs import B200
 
-    spec = MODELS[request.param]
+    spec = _spec()
     model = load_model(spec.hf_name, spec.revision,
-                       answer_token_ids=list(_answer_ids()),
-                       quantize_fp4=spec.weight_precision == "fp4")
+                       answer_token_ids=list(_answer_ids()))
     arena = KVArena(num_layers=spec.layers, num_pages=1024,
                     page_tokens=B200.page_tokens,
                     num_kv_heads=spec.num_kv_heads, d_head=spec.d_head,

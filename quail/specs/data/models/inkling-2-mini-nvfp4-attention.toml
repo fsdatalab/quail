@@ -1,9 +1,0 @@
-base = "inkling-2-mini"
-name = "inkling-2-mini-nvfp4-attention"
-# the bf16 attention projections quantized to NVFP4 as they load, with one
-# global activation scale per projection input; the experts as stored
-weight_precision = "fp4"
-w_bytes = 0.5625
-# the bf16 spec's measured weights less the attention projections' bf16
-# bytes plus their NVFP4 bytes, from the tensor shapes; an estimate
-w_mem_bytes = 21_920_000_000

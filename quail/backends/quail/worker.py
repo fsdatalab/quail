@@ -83,9 +83,7 @@ class LoadedGpu:
                                 num_layers=(spec.layers if spec.checkpoint_layers
                                             else None),
                                 quantize_fp8=(spec.arch == "lfm3"
-                                              and spec.weight_precision == "fp8"),
-                                quantize_fp4=(spec.arch == "inkling2_loop"
-                                              and spec.weight_precision == "fp4"))
+                                              and spec.weight_precision == "fp8"))
         self.load_model_s = time.perf_counter() - t0
         self.weights_bytes = int(torch.cuda.memory_allocated())
         say(f"loaded {self.weights_bytes / 2**30:.2f} GiB of weights in "
