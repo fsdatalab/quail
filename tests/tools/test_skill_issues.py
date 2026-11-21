@@ -371,3 +371,27 @@ def test_trade_accepts_deeper_nesting_only_for_enough_removed_tokens(
                               "--trade", "1"]) == 0
     assert skill_issues.main(["--no-references", "--compare", str(base),
                               "--trade", "1000"]) == 1
+
+
+def test_a_method_a_subclass_overrides_is_not_single_use(tmp_path, monkeypatch):
+    source_text = {"quail/a.py": """\
+        class Base:
+            def run(self):
+                return self.hook()
+
+            def hook(self):
+                return 1
+
+
+        class Child(Base):
+            def hook(self):
+                return 2
+        """, "bench/run.py": """\
+        from quail.a import Child
+
+        Child().run()
+        """}
+    data = _measure(tmp_path, monkeypatch, source_text)
+    assert "quail/a.py:5 hook overridden" in _items(data, "excluded_functions")
+    assert not any(" hook " in item
+                   for item in _items(data, "single_use_functions"))

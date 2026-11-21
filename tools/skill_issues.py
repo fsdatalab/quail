@@ -829,6 +829,17 @@ class PythonIndex:
                     if not function.name.startswith("_") \
                             and not function.excluded:
                         function.excluded = "public"
+        children = self.subclasses()
+        for key, info in self.classes.items():
+            # a subclass's override takes the call self.name() makes
+            pending, below = list(children.get(key, ())), set()
+            while pending:
+                child = pending.pop()
+                below.update(self.classes[child]["methods"])
+                pending.extend(children.get(child, ()))
+            for name, method in info["methods"].items():
+                if name in below and not self.functions[method].excluded:
+                    self.functions[method].excluded = "overridden"
         for key, info in self.classes.items():
             outside = [ast.unparse(base) for base, found in
                        zip(info["node"].bases, self.bases(key))
