@@ -248,16 +248,15 @@ class PiecewiseGraphs:
         self.stream = None
 
     def prepare(self):
-        """Build every bucket's buffers and capture the largest bucket.
+        """Build bucket buffers and capture the largest plus decode buckets.
 
-        Each smaller bucket is captured on the first pass that needs it,
-        so a new KV allocation costs one bucket's capture, not every
-        bucket's. A bucket captured later grows the shared pool by its
-        own blocks, so later captures stop before the pool outgrows its
-        reserve, and the remaining buckets run eagerly.
+        Pre-captures the largest bucket and every bucket in _PRECAPTURE_BUCKETS
+        that fits inside the memory reserve, skipping buckets that exceed room
+        so smaller decode buckets still get captured. Uncaptured buckets are
+        captured lazily on first use while reserve room remains.
 
         Returns:
-            Whether this call built new graphs for the current KV allocation.
+            Whether new graphs were built for the current KV allocation.
 
         Raises:
             RuntimeError: The largest bucket alone exceeds the reserve.
@@ -293,7 +292,7 @@ class PiecewiseGraphs:
             target = by_tokens.get(size)
             if target is not None and target.graphs is None:
                 if not self.capture_within_reserve(target):
-                    break
+                    continue
         return True
 
     def capture_within_reserve(self, captured, *, copy_tail=False):

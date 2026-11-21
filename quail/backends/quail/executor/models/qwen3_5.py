@@ -40,7 +40,7 @@ class Qwen35Pipeline(ModelPipeline):
     # its documents from checkpoints, which the unified path plans
     needs_pages = True
     tree_attention = False
-    warm_row_classes = True
+    warm_row_classes = False
     warm_joins = False
     gemm_warmup = False
     # the vision encoder, and the images the running region's documents

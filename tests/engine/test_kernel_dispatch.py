@@ -12,7 +12,8 @@ from quail.backends.quail.executor.attention import (
 
 
 def check_attention_dispatch_preserves_each_device_path(
-        monkeypatch, capability, head_dim, max_q, backend, version):
+        monkeypatch, capability, head_dim, page_tokens, max_q, backend,
+        version):
     calls = []
 
     def fake_attention(*args, **kwargs):
@@ -37,7 +38,7 @@ def check_attention_dispatch_preserves_each_device_path(
     engine.fa_version = flash_attention_version(capability)
     metadata = object()
     query = SimpleNamespace(shape=(4, 16, head_dim))
-    keys = SimpleNamespace(shape=(64, 128, 4, head_dim))
+    keys = SimpleNamespace(shape=(64, page_tokens, 4, head_dim))
     result = engine._paged(
         query, keys, keys, "cu", max_q, "used", 32,
         SimpleNamespace(shape=(4, 1)), causal=True, softmax_scale=1.0,
@@ -55,16 +56,19 @@ def check_attention_dispatch_preserves_each_device_path(
 
 
 def test_attention_dispatch_preserves_each_device_path(monkeypatch):
-    for capability, head_dim, max_q, backend, version in [
-        ((9, 0), 128, 8, "fa", 3),
-        ((10, 0), 512, 8, "flashinfer", None),
-        ((10, 0), 256, 32, "fa", 4),
-        ((10, 0), 256, 16, "triton", None),
-        ((10, 0), 256, 1, "triton", None),
+    for capability, head_dim, page_tokens, max_q, backend, version in [
+        ((9, 0), 128, 16, 8, "fa", 3),
+        ((10, 0), 512, 128, 8, "flashinfer", None),
+        ((10, 0), 256, 128, 32, "fa", 4),
+        ((10, 0), 256, 128, 16, "triton", None),
+        ((10, 0), 256, 128, 1, "triton", None),
+        ((10, 0), 256, 16, 1, "fa", 4),
     ]:
         named(
-            f"capability={capability} head_dim={head_dim} max_q={max_q} "
+            f"capability={capability} head_dim={head_dim} "
+            f"page_tokens={page_tokens} max_q={max_q} "
             f"backend={backend} version={version}",
             check_attention_dispatch_preserves_each_device_path,
             monkeypatch=monkeypatch, capability=capability, head_dim=head_dim,
-            max_q=max_q, backend=backend, version=version)
+            page_tokens=page_tokens, max_q=max_q, backend=backend,
+            version=version)

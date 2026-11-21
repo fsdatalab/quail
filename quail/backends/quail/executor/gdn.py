@@ -59,6 +59,7 @@ class GdnPhase:
     copy_reads: object = None
     copy_writes: object = None
     contiguous_from_zero: bool = False
+    contiguous_span: tuple | None = None
     read_slots_i32: object = None
     write_slots_i32: object = None
     unique_writes: bool = False
@@ -315,15 +316,22 @@ def _plan_phases(arena, groups, stage, undo):
             add("suffix", np.arange(begin, end, dtype=np.int64), source)
             suffix_slots.add(source)
 
-    def _is_contiguous_from_zero(segments):
-        cursor = 0
+    def _contiguous_span(segments):
+        if not segments or not len(segments[0]):
+            return None
+        first = int(segments[0][0])
+        cursor = first
         for part in segments:
-            if not len(part) or int(part[0]) != cursor:
-                return False
-            if len(part) > 1 and int(part[-1]) != cursor + len(part) - 1:
-                return False
-            cursor += len(part)
-        return cursor > 0
+            length = len(part)
+            if not length or int(part[0]) != cursor:
+                return None
+            if length > 1 and (int(part[-1]) != cursor + length - 1
+                               or not np.array_equal(
+                                   part, np.arange(cursor, cursor + length,
+                                                   dtype=np.int64))):
+                return None
+            cursor += length
+        return (first, cursor) if cursor > first else None
 
     def build(name, rows, lengths, reads, writes, output=True):
         cu = np.concatenate([[0], np.cumsum(lengths)])
@@ -341,6 +349,7 @@ def _plan_phases(arena, groups, stage, undo):
             if all(owner.get(int(slot), index) == index
                    for index, slot in enumerate(reads_arr)):
                 moved = reads_arr != writes_arr
+        span = _contiguous_span(rows)
         phase = GdnPhase(
             rows=stage(f"gdn_{name}_rows", np.concatenate(rows), torch.int64),
             cu_seqlens=stage(f"gdn_{name}_cu", cu, torch.int32),
@@ -350,7 +359,8 @@ def _plan_phases(arena, groups, stage, undo):
             write_slots=(None if writes_arr is None else
                          stage(f"gdn_{name}_write", writes_arr, torch.int64)),
             output=output,
-            contiguous_from_zero=_is_contiguous_from_zero(rows),
+            contiguous_from_zero=span is not None and span[0] == 0,
+            contiguous_span=span,
             read_slots_i32=(None if reads_arr is None else stage(
                 f"gdn_{name}_read32", reads_arr.astype(np.int32), torch.int32)),
             write_slots_i32=(None if writes_arr is None else stage(
@@ -438,7 +448,9 @@ def gdn_prefill_backend():
     if capability == (9, 0) or (capability[0] == 10 and cuda_major >= 13):
         return "flashinfer"
     if requested == "flashinfer":
-        raise ValueError("FlashInfer GDN prefill needs a Hopper or Blackwell GPU")
+        raise ValueError(
+            "FlashInfer GDN prefill needs a Hopper GPU or a Blackwell GPU "
+            "with CUDA 13 or newer")
     return "triton"
 
 
@@ -463,7 +475,7 @@ def _flashinfer_delta_rule(q, k, v, g, beta, state, cu_seqlens,
         q=q.contiguous(), k=k.contiguous(),
         v=v.contiguous(), g=decay,
         beta=beta.float().contiguous(), initial_state=initial,
-        output_final_state=output_final_state, cu_seqlens=cu_seqlens,
+        output_final_state=output_final_state, cu_seqlens=cu_seqlens.long(),
         **kwargs)
     return result if output_final_state else (result, None)
 
@@ -663,22 +675,218 @@ def _decode_conv_kernel(x, weight, bias, arena, phase, layer_slot):
     return out
 
 
+_GDN_KERNELS = {}
+
+
+def _gdn_kernels() -> dict:
+    """Compile the Gated DeltaNet Triton kernels on first use."""
+    if _GDN_KERNELS:
+        return _GDN_KERNELS
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def gather_gdn_inputs(
+        qkv_ptr, a_ptr, b_ptr, rows_ptr, qkv_out_ptr, a_out_ptr, b_out_ptr,
+        stride_qkv, stride_a, stride_b, stride_qo, stride_ao, stride_bo,
+        CONV_DIM: tl.constexpr, HV: tl.constexpr, QKV_BLOCKS: tl.constexpr,
+        BLOCK: tl.constexpr, HV_BLOCK: tl.constexpr,
+    ):
+        dst_row = tl.program_id(0).to(tl.int64)
+        col_block = tl.program_id(1)
+        src_row = tl.load(rows_ptr + dst_row).to(tl.int64)
+        if col_block < QKV_BLOCKS:
+            offs = col_block * BLOCK + tl.arange(0, BLOCK)
+            mask = offs < CONV_DIM
+            vals = tl.load(qkv_ptr + src_row * stride_qkv + offs,
+                           mask=mask, other=0.0)
+            tl.store(qkv_out_ptr + dst_row * stride_qo + offs, vals, mask=mask)
+        else:
+            hv_offs = tl.arange(0, HV_BLOCK)
+            hv_mask = hv_offs < HV
+            tl.store(a_out_ptr + dst_row * stride_ao + hv_offs,
+                     tl.load(a_ptr + src_row * stride_a + hv_offs,
+                             mask=hv_mask, other=0.0), mask=hv_mask)
+            tl.store(b_out_ptr + dst_row * stride_bo + hv_offs,
+                     tl.load(b_ptr + src_row * stride_b + hv_offs,
+                             mask=hv_mask, other=0.0), mask=hv_mask)
+
+    @triton.jit
+    def scatter_gdn_rows(
+        src_ptr, rows_ptr, dst_ptr, stride_src, stride_dst,
+        WIDTH: tl.constexpr, BLOCK: tl.constexpr,
+    ):
+        src_row = tl.program_id(0).to(tl.int64)
+        offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < WIDTH
+        dst_row = tl.load(rows_ptr + src_row).to(tl.int64)
+        tl.store(dst_ptr + dst_row * stride_dst + offs,
+                 tl.load(src_ptr + src_row * stride_src + offs,
+                         mask=mask, other=0.0), mask=mask)
+
+    @triton.jit
+    def copy_slots(pool_ptr, src_ptr, dst_ptr, stride_slot,
+                   WIDTH: tl.constexpr, BLOCK: tl.constexpr):
+        pair = tl.program_id(0)
+        offs = tl.program_id(1).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < WIDTH
+        src = tl.load(src_ptr + pair).to(tl.int64)
+        dst = tl.load(dst_ptr + pair).to(tl.int64)
+        tl.store(pool_ptr + dst * stride_slot + offs,
+                 tl.load(pool_ptr + src * stride_slot + offs, mask=mask),
+                 mask=mask)
+
+    # PDL invariant: loads before gdc_wait read only weights and staged indices.
+    @triton.jit
+    def gdn_decode_step(
+        x_ptr, a_ptr, b_ptr, a_log_ptr, dt_bias_ptr, state_ptr, state_rows_ptr,
+        out_ptr, out_rows_ptr, stride_x, stride_a, stride_b, stride_state,
+        stride_out, scale, H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr,
+        V: tl.constexpr, BV: tl.constexpr, HAS_OUT_ROWS: tl.constexpr,
+        PDL: tl.constexpr,
+    ):
+        v_block = tl.program_id(0)
+        seq_head = tl.program_id(1)
+        seq = (seq_head // HV).to(tl.int64)
+        hv = seq_head % HV
+        h = hv // (HV // H)
+        state_row = tl.load(state_rows_ptr + seq).to(tl.int64)
+        dt_bias = tl.load(dt_bias_ptr + hv).to(tl.float32)
+        a_log = tl.load(a_log_ptr + hv).to(tl.float32)
+        out_row = tl.load(out_rows_ptr + seq).to(tl.int64) if HAS_OUT_ROWS else seq
+        offs_k = tl.arange(0, K)
+        offs_v = v_block * BV + tl.arange(0, BV)
+        p_state = (state_ptr + state_row * stride_state + hv * V * K
+                   + offs_v[:, None] * K + offs_k[None, :])
+        if PDL:
+            tl.extra.cuda.gdc_wait()
+        row = x_ptr + seq * stride_x
+        q = tl.load(row + h * K + offs_k).to(tl.float32)
+        k = tl.load(row + H * K + h * K + offs_k).to(tl.float32)
+        v = tl.load(row + 2 * H * K + hv * V + offs_v).to(tl.float32)
+        q = (q / tl.sqrt(tl.sum(q * q) + 1e-6)).to(tl.bfloat16).to(tl.float32) * scale
+        k = (k / tl.sqrt(tl.sum(k * k) + 1e-6)).to(tl.bfloat16).to(tl.float32)
+        x = tl.load(a_ptr + seq * stride_a + hv).to(tl.float32) + dt_bias
+        softplus = tl.where(x > 0, x + tl.log(1.0 + tl.exp(-x)),
+                            tl.log(1.0 + tl.exp(x)))
+        g = -tl.exp(a_log) * tl.where(x <= 20.0, softplus, x)
+        beta = tl.sigmoid(tl.load(b_ptr + seq * stride_b + hv).to(tl.float32))
+        state = tl.load(p_state) * tl.exp(g)
+        v = (v - tl.sum(state * k[None, :], 1)) * beta
+        state += v[:, None] * k[None, :]
+        o = tl.sum(state * q[None, :], 1)
+        if PDL:
+            tl.extra.cuda.gdc_launch_dependents()
+        tl.store(p_state, state)
+        tl.store(out_ptr + out_row * stride_out + hv * V + offs_v,
+                 o.to(out_ptr.dtype.element_ty))
+
+    _GDN_KERNELS.update(
+        gather_gdn_inputs=gather_gdn_inputs,
+        scatter_gdn_rows=scatter_gdn_rows,
+        copy_slots=copy_slots,
+        gdn_decode_step=gdn_decode_step,
+    )
+    return _GDN_KERNELS
+
+
+def gather_gdn_inputs(qkv, a, b, rows):
+    """Gather qkv, a, and b at selected row indices in one vectorized launch."""
+    import torch
+
+    from quail.backends.quail.executor.attention import launch_triton
+
+    count, conv_dim, hv = rows.shape[0], qkv.shape[1], a.shape[1]
+    qkv_out = torch.empty((count, conv_dim), dtype=qkv.dtype, device=qkv.device)
+    a_out = torch.empty((count, hv), dtype=a.dtype, device=a.device)
+    b_out = torch.empty((count, hv), dtype=b.dtype, device=b.device)
+    if count == 0:
+        return qkv_out, a_out, b_out
+    block = 1024
+    qkv_blocks = (conv_dim + block - 1) // block
+    hv_block = max(16, 1 << (hv - 1).bit_length())
+    launch_triton(
+        _gdn_kernels()["gather_gdn_inputs"], (count, qkv_blocks + 1),
+        (qkv, a, b, rows, qkv_out, a_out, b_out, qkv.stride(0), a.stride(0),
+         b.stride(0), qkv_out.stride(0), a_out.stride(0), b_out.stride(0)),
+        key=(conv_dim, hv, qkv_blocks, block, hv_block),
+        kwargs=dict(CONV_DIM=conv_dim, HV=hv, QKV_BLOCKS=qkv_blocks,
+                    BLOCK=block, HV_BLOCK=hv_block, num_warps=4))
+    return qkv_out, a_out, b_out
+
+
+def scatter_gdn_rows(core, rows, out):
+    """Scatter 3D core recurrence outputs into out at selected row indices."""
+    from quail.backends.quail.executor.attention import launch_triton
+
+    count = rows.shape[0]
+    if count == 0:
+        return out
+    core_2d, out_2d = core.reshape(count, -1), out.view(out.shape[0], -1)
+    width, block = core_2d.shape[1], 1024
+    launch_triton(
+        _gdn_kernels()["scatter_gdn_rows"],
+        (count, (width + block - 1) // block),
+        (core_2d, rows, out_2d, core_2d.stride(0), out_2d.stride(0)),
+        key=(width, block), kwargs=dict(WIDTH=width, BLOCK=block, num_warps=4))
+    return out
+
+
+def copy_slots(pool, src, dst):
+    """Copy pool[src[i]] into pool[dst[i]]; no dst may also be a src."""
+    from quail.backends.quail.executor.attention import launch_triton
+
+    count = src.shape[0]
+    if count == 0:
+        return pool
+    assert pool[0].is_contiguous()
+    width, block = pool[0].numel(), 4096
+    launch_triton(
+        _gdn_kernels()["copy_slots"], (count, (width + block - 1) // block),
+        (pool, src, dst, pool.stride(0)),
+        key=(width, block), kwargs=dict(WIDTH=width, BLOCK=block, num_warps=8))
+    return pool
+
+
+def gdn_decode_step(conv_out, a, b, a_log, dt_bias, state_pool, state_rows, out,
+                    *, num_key_heads, scale, out_rows=None, block_v=8,
+                    num_warps=1):
+    """Advance one-token Gated DeltaNet sequences and write their outputs."""
+    from quail.backends.quail.executor.attention import launch_triton, pdl_enabled
+
+    count = state_rows.shape[0]
+    if count == 0:
+        return out
+    _, value_heads, value_dim, key_dim = state_pool.shape
+    assert state_pool.stride()[1:] == (value_dim * key_dim, key_dim, 1)
+    out_2d = out.view(out.shape[0], -1)
+    has_out_rows = out_rows is not None
+    pdl = pdl_enabled(conv_out.device)
+    launch_triton(
+        _gdn_kernels()["gdn_decode_step"],
+        (value_dim // block_v, count * value_heads),
+        (conv_out, a, b, a_log, dt_bias, state_pool, state_rows, out_2d,
+         state_rows if not has_out_rows else out_rows,
+         conv_out.stride(0), a.stride(0), b.stride(0), state_pool.stride(0),
+         out_2d.stride(0), scale),
+        key=(num_key_heads, value_heads, key_dim, value_dim, block_v,
+             has_out_rows, num_warps, pdl),
+        kwargs=dict(H=num_key_heads, HV=value_heads, K=key_dim, V=value_dim,
+                    BV=block_v, HAS_OUT_ROWS=has_out_rows, PDL=pdl,
+                    num_warps=num_warps, launch_pdl=pdl))
+    return out
+
+
 def _move_states(arena, phase, layer_slot):
     """Copy each moved sequence's read-slot state into its write slot."""
     if phase.copy_reads is None:
         return
     if phase.moves_in_place and arena.gdn_state.is_cuda:
-        from quail.backends.quail.executor.models.qwen3_5_kernels import (
-            copy_slots,
-        )
-
         copy_slots(arena.gdn_state[:, layer_slot], phase.copy_reads,
                    phase.copy_writes)
         copy_slots(arena.conv_state[:, layer_slot], phase.copy_reads,
                    phase.copy_writes)
         return
-    # one write slot is another sequence's read slot: gather every state
-    # before writing any
     arena.gdn_state[phase.copy_writes, layer_slot] = (
         arena.gdn_state[phase.copy_reads, layer_slot])
     arena.conv_state[phase.copy_writes, layer_slot] = (
@@ -735,12 +943,6 @@ def gdn_core(geometry, tensors, phases, arena, layer_slot, *, output=None):
     import torch
     from vllm.third_party.flash_linear_attention.ops import fused_post_conv_prep
 
-    from quail.backends.quail.executor.models.qwen3_5_kernels import (
-        gather_gdn_inputs,
-        gdn_decode_step,
-        scatter_gdn_rows,
-    )
-
     spec = geometry
     qkv = tensors["qkv"]
     rows = qkv.shape[0]
@@ -765,9 +967,14 @@ def gdn_core(geometry, tensors, phases, arena, layer_slot, *, output=None):
                 and spec.gdn_key_dim == 128
                 and torch.cuda.get_device_capability(qkv.device)[0] == 10)
     for phase in active_phases:
+        span = getattr(phase, "contiguous_span", None)
         if single_identity:
             mixed_in = qkv
             a_in, b_in = tensors["a"], tensors["b"]
+        elif span is not None:
+            mixed_in = qkv[span[0]:span[1]]
+            a_in = tensors["a"][span[0]:span[1]]
+            b_in = tensors["b"][span[0]:span[1]]
         elif qkv.is_cuda:
             mixed_in, a_in, b_in = gather_gdn_inputs(
                 qkv, tensors["a"], tensors["b"], phase.rows)
@@ -791,17 +998,22 @@ def gdn_core(geometry, tensors, phases, arena, layer_slot, *, output=None):
                 out = torch.empty(
                     (rows, spec.gdn_value_heads, spec.gdn_value_dim),
                     dtype=qkv.dtype, device=qkv.device)
-            target = out
-            if not (single_identity or phase.output):
+            if single_identity:
+                target, out_rows = out, None
+            elif not phase.output:
                 target = torch.empty(
                     (len(phase.lengths), spec.gdn_value_heads,
                      spec.gdn_value_dim), dtype=qkv.dtype, device=qkv.device)
+                out_rows = None
+            elif span is not None:
+                target, out_rows = out[span[0]:span[1]], None
+            else:
+                target, out_rows = out, phase.rows
             gdn_decode_step(
                 mixed, a_in, b_in, tensors["A_log"], tensors["dt_bias"],
                 arena.gdn_state_rows[:, layer_slot], phase.state_rows, target,
                 num_key_heads=spec.gdn_key_heads, scale=scale,
-                out_rows=phase.rows if target is out and not single_identity
-                else None)
+                out_rows=out_rows)
             if single_identity:
                 return out
             continue
@@ -825,12 +1037,15 @@ def gdn_core(geometry, tensors, phases, arena, layer_slot, *, output=None):
             output_g_exp=g_exp)
         pool_ok = is_sm100 and (phase.write_slots is None or in_place)
         if pool_ok:
+            direct_out = (out if single_identity
+                          else out[span[0]:span[1]]
+                          if phase.output and span is not None else None)
             core = _sm100_pool_delta_rule(
                 spec, q, k, v, g, b, arena, phase, layer_slot,
-                output=out if single_identity else None)
+                output=direct_out)
             if single_identity:
                 return core
-            if phase.output:
+            if phase.output and direct_out is None:
                 if out.is_cuda:
                     scatter_gdn_rows(core, phase.rows, out)
                 else:
