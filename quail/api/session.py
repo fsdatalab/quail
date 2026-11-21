@@ -123,8 +123,8 @@ class Session:
         try:
             if self._remote is not None:
                 self._remote.register(name, provider)
-            else:
-                register_provider(self.datafusion, name, provider)
+                return
+            register_provider(self.datafusion, name, provider)
         except Exception:
             del self.catalog.providers[name]
             raise
