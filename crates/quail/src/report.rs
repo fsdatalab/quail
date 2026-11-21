@@ -171,72 +171,6 @@ fn merged_table(tables: &[&Table], rows_port: bool) -> Result<Table> {
     Ok((schema, vec![kept]))
 }
 
-/// The workers' memory reports as one: capacity and bytes add, the
-/// peak is the largest, and the trace sums each worker's latest sample.
-fn merged_memory(workers: &[Value]) -> Map<String, Value> {
-    let rows = |worker: &Value, name: &str| -> Vec<Value> {
-        worker[name].as_array().cloned().unwrap_or_default()
-    };
-    let mut records: Vec<(f64, usize, Value)> = Vec::new();
-    let mut events: Vec<(f64, usize, Value)> = Vec::new();
-    for (worker, report) in workers.iter().enumerate() {
-        for row in rows(report, "memory_trace") {
-            records.push((row[0].as_f64().unwrap_or(0.0), worker, row));
-        }
-        for event in rows(report, "memory_events") {
-            let mut detail = event[2].as_object().cloned().unwrap_or_default();
-            detail.insert("worker".into(), json!(worker));
-            let stamp = event[0].as_f64().unwrap_or(0.0);
-            events.push((stamp, worker, json!([event[0], event[1], detail])));
-        }
-    }
-    let by_time = |one: &(f64, usize, Value), two: &(f64, usize, Value)| {
-        one.0.total_cmp(&two.0).then(one.1.cmp(&two.1))
-    };
-    records.sort_by(by_time);
-    events.sort_by(by_time);
-    let mut latest: BTreeMap<usize, Value> = BTreeMap::new();
-    let mut trace = Vec::new();
-    for (_, worker, row) in records {
-        latest.insert(worker, row.clone());
-        let summed = |index: usize| {
-            (latest.values()).fold(json!(0), |sum, sample| added(&sum, &sample[index]))
-        };
-        let mut sample = vec![row[0].clone()];
-        sample.extend((1..7).map(summed));
-        sample.extend([row[7].clone(), row[8].clone(), summed(9)]);
-        trace.push(Value::Array(sample));
-    }
-    let started = (workers.iter())
-        .filter_map(|worker| worker.get("memory_trace_started")?.as_f64())
-        .fold(None, |least: Option<f64>, found| {
-            Some(least.map_or(found, |least| least.min(found)))
-        });
-    let peak = (workers.iter())
-        .filter_map(|worker| worker.get("peak_gib")?.as_f64())
-        .fold(0.0, f64::max);
-    let mut merged = Map::new();
-    merged.insert("memory_workers".into(), json!(workers));
-    merged.insert("memory_trace".into(), Value::Array(trace));
-    merged.insert("memory_trace_started".into(), json!(started.unwrap_or(0.0)));
-    let events = events.into_iter().map(|(_, _, event)| event).collect();
-    merged.insert("memory_events".into(), Value::Array(events));
-    merged.insert("peak_gib".into(), json!(peak));
-    for field in ["memory_capacity", "memory_bytes"] {
-        let mut totals = Map::new();
-        for worker in workers {
-            for (key, value) in worker[field].as_object().into_iter().flatten() {
-                let total = totals
-                    .get(key)
-                    .map_or(value.clone(), |sum| added(sum, value));
-                totals.insert(key.clone(), total);
-            }
-        }
-        merged.insert(field.into(), Value::Object(totals));
-    }
-    merged
-}
-
 /// A counter from every worker as one: numbers add, and counters by
 /// alias add alias by alias.
 fn summed(values: &[&Value]) -> Value {
@@ -421,6 +355,64 @@ pub fn region_report(
         .iter()
         .map(|(found, _)| found["memory"].clone())
         .collect();
-    report.extend(merged_memory(&memory));
+    let rows = |worker: &Value, name: &str| -> Vec<Value> {
+        worker[name].as_array().cloned().unwrap_or_default()
+    };
+    let mut records: Vec<(f64, usize, Value)> = Vec::new();
+    let mut events: Vec<(f64, usize, Value)> = Vec::new();
+    for (worker, report) in memory.iter().enumerate() {
+        for row in rows(report, "memory_trace") {
+            records.push((row[0].as_f64().unwrap_or(0.0), worker, row));
+        }
+        for event in rows(report, "memory_events") {
+            let mut detail = event[2].as_object().cloned().unwrap_or_default();
+            detail.insert("worker".into(), json!(worker));
+            let stamp = event[0].as_f64().unwrap_or(0.0);
+            events.push((stamp, worker, json!([event[0], event[1], detail])));
+        }
+    }
+    let by_time = |one: &(f64, usize, Value), two: &(f64, usize, Value)| {
+        one.0.total_cmp(&two.0).then(one.1.cmp(&two.1))
+    };
+    records.sort_by(by_time);
+    events.sort_by(by_time);
+    let mut latest: BTreeMap<usize, Value> = BTreeMap::new();
+    let mut trace = Vec::new();
+    for (_, worker, row) in records {
+        latest.insert(worker, row.clone());
+        let summed = |index: usize| {
+            (latest.values()).fold(json!(0), |sum, sample| added(&sum, &sample[index]))
+        };
+        let mut sample = vec![row[0].clone()];
+        sample.extend((1..7).map(summed));
+        sample.extend([row[7].clone(), row[8].clone(), summed(9)]);
+        trace.push(Value::Array(sample));
+    }
+    let started = (memory.iter())
+        .filter_map(|worker| worker.get("memory_trace_started")?.as_f64())
+        .fold(None, |least: Option<f64>, found| {
+            Some(least.map_or(found, |least| least.min(found)))
+        });
+    let peak = (memory.iter())
+        .filter_map(|worker| worker.get("peak_gib")?.as_f64())
+        .fold(0.0, f64::max);
+    report.insert("memory_workers".into(), json!(memory));
+    report.insert("memory_trace".into(), Value::Array(trace));
+    report.insert("memory_trace_started".into(), json!(started.unwrap_or(0.0)));
+    let events = events.into_iter().map(|(_, _, event)| event).collect();
+    report.insert("memory_events".into(), Value::Array(events));
+    report.insert("peak_gib".into(), json!(peak));
+    for field in ["memory_capacity", "memory_bytes"] {
+        let mut totals = Map::new();
+        for worker in &memory {
+            for (key, value) in worker[field].as_object().into_iter().flatten() {
+                let total = totals
+                    .get(key)
+                    .map_or(value.clone(), |sum| added(sum, value));
+                totals.insert(key.clone(), total);
+            }
+        }
+        report.insert(field.into(), Value::Object(totals));
+    }
     Ok((Value::Object(report), outputs))
 }
