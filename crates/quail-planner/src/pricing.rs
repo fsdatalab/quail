@@ -258,104 +258,6 @@ impl PlanPricer {
         let mut work = Work::default();
         let mut seconds = 0.0;
         let mut entries = Map::new();
-        for (node_id, price, entry) in self.priced(context, nodes)? {
-            entries.insert(node_id, Value::Object(entry));
-            match price.work {
-                Some(found) => work = &work + &found,
-                None => seconds += price.seconds,
-            }
-        }
-        Ok((self.seconds_of(context, &work) + seconds, entries))
-    }
-
-    fn priced(
-        &self,
-        context: &PlanningContext,
-        nodes: &[PhysicalNode],
-    ) -> Result<Priced, CompileError> {
-        let mut out = self.each_priced(context, nodes)?;
-        if context.model.attention_mask == "set" {
-            for (node_id, price, entry) in self.set_passes(context, nodes)? {
-                set(&mut out, &node_id, price, entry);
-            }
-            for node in nodes {
-                if let PhysicalNode::AiJoin(_) = node {
-                    let slot = out
-                        .iter_mut()
-                        .find(|(found, _, _)| found == node.id())
-                        .expect("a priced join");
-                    slot.2
-                        .insert("pass_questions".into(), Value::from(context.model.set_size));
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    /// A set-attention plan's passes: each group's first operator carries
-    /// the work of its passes, the others none.
-    fn set_passes(
-        &self,
-        context: &PlanningContext,
-        nodes: &[PhysicalNode],
-    ) -> Result<Priced, CompileError> {
-        let model = &context.model;
-        let (state_tail, header) = set_pass_tokens(context)?;
-        let mut out = Priced::new();
-        for members in pass_members(nodes) {
-            let first = &nodes[members[0]];
-            let alias = first.document_aliases()[0].clone();
-            let summary = AliasStats::summarize(context.lengths(&alias)?, model.sliding_window);
-            let questions: Vec<f64> = members
-                .iter()
-                .enumerate()
-                .map(|(index, member)| {
-                    (pass_question_tokens(&nodes[*member], state_tail)
-                        + if index > 0 { header } else { 0 }) as f64
-                })
-                .collect();
-            let rows = expected_documents(first) * self.distinct(context, &alias);
-            let state =
-                Quantity::Scalar(head_tokens(first) as f64 + summary.mean() + state_tail as f64);
-            let pass = &packed(&state, &questions, model.sliding_window)
-                + &Work {
-                    pairs: Quantity::Scalar(summary.variance()),
-                    ..Work::default()
-                };
-            let work = &pass * rows;
-            let ids: Vec<Value> = members
-                .iter()
-                .map(|member| Value::from(nodes[*member].id()))
-                .collect();
-            for (index, member) in members.iter().enumerate() {
-                let mut entry = Map::new();
-                entry.insert("pass_members".into(), Value::Array(ids.clone()));
-                let price = if index == 0 {
-                    entry.insert(
-                        "seconds".into(),
-                        Value::from(self.seconds_of(context, &work)),
-                    );
-                    NodePrice {
-                        work: Some(work.clone()),
-                        seconds: 0.0,
-                    }
-                } else {
-                    NodePrice {
-                        work: Some(Work::default()),
-                        seconds: 0.0,
-                    }
-                };
-                out.push((nodes[*member].id().to_string(), price, entry));
-            }
-        }
-        Ok(out)
-    }
-
-    fn each_priced(
-        &self,
-        context: &PlanningContext,
-        nodes: &[PhysicalNode],
-    ) -> Result<Priced, CompileError> {
         let pipelines = build_pipelines(nodes, &[]);
         let anchored: Vec<&str> = nodes
             .iter()
@@ -452,6 +354,87 @@ impl PlanPricer {
                 _ => NodePrice::default(),
             };
             out.push((node.id().to_string(), price, entry));
+        }
+        if context.model.attention_mask == "set" {
+            for (node_id, price, entry) in self.set_passes(context, nodes)? {
+                set(&mut out, &node_id, price, entry);
+            }
+            for node in nodes {
+                if let PhysicalNode::AiJoin(_) = node {
+                    let slot = out
+                        .iter_mut()
+                        .find(|(found, _, _)| found == node.id())
+                        .expect("a priced join");
+                    slot.2
+                        .insert("pass_questions".into(), Value::from(context.model.set_size));
+                }
+            }
+        }
+        for (node_id, price, entry) in out {
+            entries.insert(node_id, Value::Object(entry));
+            match price.work {
+                Some(found) => work = &work + &found,
+                None => seconds += price.seconds,
+            }
+        }
+        Ok((self.seconds_of(context, &work) + seconds, entries))
+    }
+
+    /// A set-attention plan's passes: each group's first operator carries
+    /// the work of its passes, the others none.
+    fn set_passes(
+        &self,
+        context: &PlanningContext,
+        nodes: &[PhysicalNode],
+    ) -> Result<Priced, CompileError> {
+        let model = &context.model;
+        let (state_tail, header) = set_pass_tokens(context)?;
+        let mut out = Priced::new();
+        for members in pass_members(nodes) {
+            let first = &nodes[members[0]];
+            let alias = first.document_aliases()[0].clone();
+            let summary = AliasStats::summarize(context.lengths(&alias)?, model.sliding_window);
+            let questions: Vec<f64> = members
+                .iter()
+                .enumerate()
+                .map(|(index, member)| {
+                    (pass_question_tokens(&nodes[*member], state_tail)
+                        + if index > 0 { header } else { 0 }) as f64
+                })
+                .collect();
+            let rows = expected_documents(first) * self.distinct(context, &alias);
+            let state =
+                Quantity::Scalar(head_tokens(first) as f64 + summary.mean() + state_tail as f64);
+            let pass = &packed(&state, &questions, model.sliding_window)
+                + &Work {
+                    pairs: Quantity::Scalar(summary.variance()),
+                    ..Work::default()
+                };
+            let work = &pass * rows;
+            let ids: Vec<Value> = members
+                .iter()
+                .map(|member| Value::from(nodes[*member].id()))
+                .collect();
+            for (index, member) in members.iter().enumerate() {
+                let mut entry = Map::new();
+                entry.insert("pass_members".into(), Value::Array(ids.clone()));
+                let price = if index == 0 {
+                    entry.insert(
+                        "seconds".into(),
+                        Value::from(self.seconds_of(context, &work)),
+                    );
+                    NodePrice {
+                        work: Some(work.clone()),
+                        seconds: 0.0,
+                    }
+                } else {
+                    NodePrice {
+                        work: Some(Work::default()),
+                        seconds: 0.0,
+                    }
+                };
+                out.push((nodes[*member].id().to_string(), price, entry));
+            }
         }
         Ok(out)
     }
