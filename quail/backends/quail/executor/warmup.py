@@ -368,14 +368,6 @@ def touch_kernels(torch, arena, pipeline, async_ans, budget):
         join_chunk=True)
 
 
-def _marker_path(model_name, budget):
-    import os
-    root = os.path.expanduser(os.environ.get(
-        "QUAIL_CACHE_DIR", "~/.cache/quail/kernels"))
-    safe = model_name.replace("/", "--")
-    return os.path.join(root, f"quail-warm-{safe}-{int(budget)}.json")
-
-
 def _marker_identity(torch, model_name, budget):
     try:
         import vllm
@@ -412,7 +404,10 @@ def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
     import os
 
     with quiet():
-        path = _marker_path(model_name, budget)
+        root = os.path.expanduser(os.environ.get(
+            "QUAIL_CACHE_DIR", "~/.cache/quail/kernels"))
+        safe = model_name.replace("/", "--")
+        path = os.path.join(root, f"quail-warm-{safe}-{int(budget)}.json")
         identity = _marker_identity(torch, model_name, budget)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         t0 = time.perf_counter()
