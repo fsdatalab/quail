@@ -263,7 +263,12 @@ impl<'w, 'a> Assembly<'w, 'a> {
         let guard = self.bound_guard(node)?;
         let (kind, columns) = self.bound_columns(node)?;
         for (call, name) in columns {
-            let list = self.list(kind);
+            let list = match kind {
+                "label" => &mut self.found.classifies,
+                "extract" => &mut self.found.extracts,
+                "map" => &mut self.found.maps,
+                _ => &mut self.found.sae_features,
+            };
             list.push(SemanticColumn {
                 call,
                 name,
@@ -278,15 +283,6 @@ impl<'w, 'a> Assembly<'w, 'a> {
             push(&mut self.placed, &alias, (kind, position));
         }
         Some(())
-    }
-
-    fn list(&mut self, kind: &str) -> &mut Vec<SemanticColumn> {
-        match kind {
-            "label" => &mut self.found.classifies,
-            "extract" => &mut self.found.extracts,
-            "map" => &mut self.found.maps,
-            _ => &mut self.found.sae_features,
-        }
     }
 
     pub(super) fn column(&self, kind: &str, position: usize) -> &SemanticColumn {
