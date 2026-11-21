@@ -53,9 +53,59 @@ impl HfTokenizer {
             token_bytes: Vec::new(),
             eos_token_id: None,
         };
-        tokenizer.token_bytes = tokenizer.read_token_bytes();
+        // ids past this many consecutive misses are past the vocabulary
+        const MISSES: u32 = 4096;
+        let added = tokenizer.inner.get_added_vocabulary();
+        let model = tokenizer.inner.get_model();
+        let mut texts: Vec<Option<(bool, String)>> = Vec::new();
+        let (mut id, mut misses) = (0u32, 0u32);
+        while misses < MISSES {
+            let found = match added.id_to_token_bytes(id) {
+                Some((bytes, _)) => Some((true, String::from_utf8_lossy(bytes).into_owned())),
+                None => model.id_to_token(id).map(|text| (false, text)),
+            };
+            misses = if found.is_some() { 0 } else { misses + 1 };
+            texts.push(found);
+            id += 1;
+        }
+        let size = texts
+            .iter()
+            .rposition(Option::is_some)
+            .map_or(0, |last| last + 1);
+        texts.truncate(size);
+        let byte_level = texts
+            .iter()
+            .flatten()
+            .any(|(is_added, text)| !is_added && text.starts_with('\u{120}'));
+        let bytes = byte_level_bytes();
+        tokenizer.token_bytes = texts
+            .into_iter()
+            .map(|found| {
+                found.map(|(is_added, text)| {
+                    if is_added {
+                        text.into_bytes()
+                    } else if byte_level {
+                        text.chars()
+                            .flat_map(|c| match bytes.get(&c) {
+                                Some(&byte) => vec![byte],
+                                None => c.to_string().into_bytes(),
+                            })
+                            .collect()
+                    } else {
+                        sentencepiece_bytes(&text)
+                    }
+                })
+            })
+            .collect();
         tokenizer.eos_token_id = directory
-            .and_then(eos_token)
+            .and_then(|directory| {
+                let text = std::fs::read_to_string(directory.join("tokenizer_config.json")).ok()?;
+                let config: serde_json::Value = serde_json::from_str(&text).ok()?;
+                match config.get("eos_token")? {
+                    serde_json::Value::String(token) => Some(token.clone()),
+                    other => other.get("content")?.as_str().map(str::to_string),
+                }
+            })
             .and_then(|token| tokenizer.added_token_id(&token));
         Ok(tokenizer)
     }
@@ -281,67 +331,6 @@ impl HfTokenizer {
             .iter()
             .map(|ids| self.inner.decode(ids, true).map_err(external))
             .collect()
-    }
-
-    /// An added token is its text; a model token has the pre-tokenizer's
-    /// spelling undone: byte-level BPE's characters for bytes, or
-    /// SentencePiece's `▁` for a space and `<0xHH>` for a byte.
-    fn read_token_bytes(&self) -> Vec<Option<Vec<u8>>> {
-        // ids past this many consecutive misses are past the vocabulary
-        const MISSES: u32 = 4096;
-        let added = self.inner.get_added_vocabulary();
-        let model = self.inner.get_model();
-        let mut texts: Vec<Option<(bool, String)>> = Vec::new();
-        let (mut id, mut misses) = (0u32, 0u32);
-        while misses < MISSES {
-            let found = match added.id_to_token_bytes(id) {
-                Some((bytes, _)) => Some((true, String::from_utf8_lossy(bytes).into_owned())),
-                None => model.id_to_token(id).map(|text| (false, text)),
-            };
-            misses = if found.is_some() { 0 } else { misses + 1 };
-            texts.push(found);
-            id += 1;
-        }
-        let size = texts
-            .iter()
-            .rposition(Option::is_some)
-            .map_or(0, |last| last + 1);
-        texts.truncate(size);
-        let byte_level = texts
-            .iter()
-            .flatten()
-            .any(|(is_added, text)| !is_added && text.starts_with('\u{120}'));
-        let bytes = byte_level_bytes();
-        texts
-            .into_iter()
-            .map(|found| {
-                found.map(|(is_added, text)| {
-                    if is_added {
-                        text.into_bytes()
-                    } else if byte_level {
-                        text.chars()
-                            .flat_map(|c| match bytes.get(&c) {
-                                Some(&byte) => vec![byte],
-                                None => c.to_string().into_bytes(),
-                            })
-                            .collect()
-                    } else {
-                        sentencepiece_bytes(&text)
-                    }
-                })
-            })
-            .collect()
-    }
-}
-
-/// The end-of-text token's text the `tokenizer_config.json` in a model's
-/// directory names.
-fn eos_token(directory: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(directory.join("tokenizer_config.json")).ok()?;
-    let config: serde_json::Value = serde_json::from_str(&text).ok()?;
-    match config.get("eos_token")? {
-        serde_json::Value::String(token) => Some(token.clone()),
-        other => other.get("content")?.as_str().map(str::to_string),
     }
 }
 
