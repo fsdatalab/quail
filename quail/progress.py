@@ -127,21 +127,17 @@ _SINK = None
 _ANSWER_SINK = None
 
 
-def set_progress_sink(sink, *, owner=None) -> None:
+def set_progress_sink(sink) -> None:
     """Send every throttled progress count to ``sink`` as well as the log.
 
     The sink is called as ``sink(label, done, total, unit)`` from the
     thread that runs the loop, so it must return quickly and must not
     block. Pass None to remove it. The sink is one per process: the
     query loop reads it from module state because its threads and
-    worker processes cannot carry a per-query value. With ``owner``,
-    the change applies only while ``owner`` is the installed sink, so
-    a query that outlived its own execution cannot remove the sink of
-    the query that came after it.
+    worker processes cannot carry a per-query value.
     """
     global _SINK
-    if owner is None or _SINK is owner:
-        _SINK = sink
+    _SINK = sink
 
 
 def set_answer_sink(sink) -> None:
