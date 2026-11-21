@@ -642,8 +642,8 @@ class HeadroomAdmission:
         self.fixed_pages += branch_pages
         if self.choose_headroom:
             self.headroom_pages = self.fixed_pages + int(self.held_pages.sum())
-        else:
-            self.headroom_pages += int(granted.sum()) + branch_pages
+            return
+        self.headroom_pages += int(granted.sum()) + branch_pages
 
     def waits(self):
         """Return whether a refused document can wait for pages to free."""
