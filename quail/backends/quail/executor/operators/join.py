@@ -479,11 +479,6 @@ def set_joins(state, join) -> dict:
     return join.close(sum(own_tokens), all_spans, {}, 0)
 
 
-def _join_round_kv(anchor_keys, arena) -> dict:
-    hits = sum(arena.is_resident(key) for key in anchor_keys)
-    return {"hits": hits, "misses": len(anchor_keys) - hits}
-
-
 def _tuple_suffix(join, documents, member):
 
     parts = []
@@ -674,7 +669,10 @@ def join_inputs(nodes, documents, indices, prefixes, arena, retention, pair_tabl
     anchor_ids = indices[node.anchor] if upstream is None else None
     anchor_keys = DocumentKeys(node.anchor, anchor_ids if upstream is None
                                else upstream["document_ids"])
-    round_kv = _join_round_kv(anchor_keys, arena) if upstream is None else None
+    round_kv = None
+    if upstream is None:
+        hits = sum(arena.is_resident(key) for key in anchor_keys)
+        round_kv = {"hits": hits, "misses": len(anchor_keys) - hits}
     last = group[-1]
     last_tuples = tuple_indices[last["written_position"]]
 
