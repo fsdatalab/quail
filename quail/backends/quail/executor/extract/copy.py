@@ -56,14 +56,6 @@ def verification_blocks(counts, stream_width, num_streams, num_options, num_keys
         start = end
 
 
-def _padded(values, dtype=np.int64):
-    width = max(1, max(map(len, values), default=0))
-    out = np.full((len(values), width), -1, dtype=dtype)
-    for i, row in enumerate(values):
-        out[i, : len(row)] = row
-    return out
-
-
 # A stream stores position * STREAM_STRIDE + option.
 STREAM_STRIDE = 1 << 24
 
@@ -353,7 +345,10 @@ class CopyConstraint:
                 )
                 counts[: len(self.num_fillers)] = self.num_fillers
                 self.num_fillers = counts
-            values = _padded(fillers)
+            width = max(1, max(map(len, fillers), default=0))
+            values = np.full((len(fillers), width), -1, dtype=np.int64)
+            for i, row in enumerate(fillers):
+                values[i, :len(row)] = row
             self.filler_rows[missing] = rows
             self.fillers_host[rows, : values.shape[1]] = values
             selected = self.tensor(rows)
