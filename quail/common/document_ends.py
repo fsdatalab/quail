@@ -5,34 +5,11 @@ last token with the text that follows it: d1-2B reads "great." and a
 blank line as "great" and one token for the period and the blank line.
 Quail tokenizes documents and prompt
 pieces apart, so the planner finds each table's distinct last tokens
-and joins each with the text after it once (document_ends); a pass
+and joins each with the text after it once (JoinDocumentEnds); a pass
 then ends the document with that join (joined_state).
 """
 
 from quail.common.tokens import concat_tokens
-
-
-def document_ends(last, tail, tokenizer) -> tuple:
-    """Each last token's tokens when the tokenizer reads it with the tail.
-
-    Args:
-        last: The distinct last tokens.
-        tail: The token ids after the document.
-        tokenizer: Encodes text (call) and decodes token ids (decode).
-
-    Returns:
-        Per last token, (the token, the tokens of it and the tail as one
-        text); a text that does not decode back the same keeps its tokens.
-    """
-    tail = [int(token) for token in tail]
-    out = []
-    for token in last:
-        text = tokenizer.decode([int(token), *tail])
-        joined = [int(t) for t in tokenizer(text)]
-        if tokenizer.decode(joined) != text:
-            joined = [int(token), *tail]
-        out.append((int(token), tuple(joined)))
-    return tuple(out)
 
 
 def ends_for(entries, alias, tail) -> dict | None:
