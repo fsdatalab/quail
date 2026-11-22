@@ -67,6 +67,7 @@ def _device():
 
 def _prompt_ids():
     from quail.api.prompts import bind_prompt
+    from quail.common.expressions import ColumnRef
     from quail.common.tokens import Tokenizer
     from quail.physical.lowering import lower_prompt
     from quail.specs import MODELS
@@ -75,7 +76,8 @@ def _prompt_ids():
     spec = MODELS[MODEL]
     ids = Tokenizer(resolve_model_path(spec.hf_name, spec.revision))
 
-    prompt = lower_prompt(bind_prompt(QUESTION, ("body",), turn=spec.turn), ids)
+    body = ColumnRef(alias="d", provider="documents", column="body")
+    prompt = lower_prompt(bind_prompt(QUESTION, (body,), turn=spec.turn), ids)
     return [[*prompt.preamble_token_ids, *ids(review), *prompt.tail_token_ids]
             for review in REVIEWS]
 
@@ -163,11 +165,17 @@ def quail(prompts, stock_layers):
     from quail.backends.quail.executor.chunk import pack_chunk
     from quail.backends.quail.executor.model_loading import load_model
     from quail.backends.quail.executor.models import build_pipeline
+    from quail.common.tokens import Tokenizer, model_answers
     from quail.specs import MODELS
+    from quail.specs.files import resolve_model_path
 
     device = _device()
     spec = MODELS[MODEL]
+    # the worker loads the TRUE and FALSE rows the plan carries
+    true_ids, false_ids, _ = model_answers(
+        spec, Tokenizer(resolve_model_path(spec.hf_name, spec.revision)))
     model = load_model(spec.hf_name, max_batched_tokens=8192,
+                       answer_token_ids=sorted(true_ids) + sorted(false_ids),
                        moe_backend=spec.moe_backend)
     arena = KVArena(num_layers=spec.layers, num_pages=2048,
                     page_tokens=device.page_tokens, num_kv_heads=spec.num_kv_heads,
