@@ -1389,11 +1389,18 @@ impl TreeRows<'_> {
                         format!("{} = {}", column_name(left, true), column_name(right, true))
                     })
                     .collect();
+                if let Some(filter) = &join.filter {
+                    details.push(format!("filter: {}", condition_text(filter)));
+                }
                 details.push(format!(
                     "pairs kept: {} of the cross product",
                     format_g(join.pair_fraction, 4)
                 ));
-                format!("HashJoin: {}", on.join(" and "))
+                if on.is_empty() {
+                    format!("HashJoin: {} x {}", join.left, join.right)
+                } else {
+                    format!("HashJoin: {}", on.join(" and "))
+                }
             }
             PhysicalNode::Barrier(barrier) => {
                 format!("Barrier: next_anchor={}", barrier.attributes.next_anchor)

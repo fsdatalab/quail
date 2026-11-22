@@ -172,9 +172,9 @@ impl<'w, 'a> Assembly<'w, 'a> {
             return None;
         }
         let input = self.input(id, 0)?;
-        let on = match &self.walk.get(input).kind {
-            Kind::Join(_) => spec.on.clone(),
-            _ => Vec::new(),
+        let (on, filter) = match &self.walk.get(input).kind {
+            Kind::Join(_) => (spec.on.clone(), spec.filter.clone()),
+            _ => (Vec::new(), None),
         };
         let mut outer = input;
         while let Kind::Join(_) = &self.walk.get(outer).kind {
@@ -190,6 +190,7 @@ impl<'w, 'a> Assembly<'w, 'a> {
             selectivity: spec.selectivity,
             anchor: spec.anchor.clone(),
             on,
+            filter,
             outer_aliases,
         });
         Some(())
@@ -344,6 +345,12 @@ pub(super) fn set_scan_columns(found: &mut Operators) {
             .flat_map(equality_refs),
     );
     valued.extend(
+        read.joins
+            .iter()
+            .filter_map(|join| join.filter.as_ref())
+            .flat_map(column_references),
+    );
+    valued.extend(
         read.scans
             .iter()
             .flat_map(|scan| &scan.predicates)
@@ -360,6 +367,7 @@ pub(super) fn set_scan_columns(found: &mut Operators) {
     for join in read.joins.iter().rev() {
         needed.extend(asked_refs(&join.predicate));
         needed.extend(join.on.iter().flat_map(equality_refs));
+        needed.extend(join.filter.iter().flat_map(column_references));
     }
     let columns: Vec<&SemanticColumn> = read.columns().collect();
     needed.extend(
