@@ -717,6 +717,7 @@ class StageExecutor:
         from quail.backends.quail.executor.chunk import Suffixes, pack_chunk
 
         specs = []
+        prefix_specs = []
         entries = []
         appended = {}
         firsts = []
@@ -813,6 +814,14 @@ class StageExecutor:
                     write_suffix_tokens=kept,
                     paths=self.stages[j].paths, **own))
             else:
+                if (self.mask != "causal" and prefix is not None
+                        and not carry.get("transient_state")):
+                    prefix_specs.append(dict(
+                        key=key, prefix=prefix, start=shared, read_key=read_key,
+                        f=f + len(frame) + path,
+                        suffixes=Suffixes(np.empty(0, dtype=np.int64), []),
+                        **carry))
+                    prefix, shared, read_key, carry = None, 0, None, {}
                 specs.append(dict(
                     key=key, prefix=prefix, start=shared, read_key=read_key,
                     f=f + len(frame) + path,
@@ -823,6 +832,8 @@ class StageExecutor:
             if j in self.answer_maps and start == 0:
                 firsts.append((sum(n for _, n in entries) + rows - 1, a, j))
             entries.append((j, rows))
+        if prefix_specs:
+            specs = prefix_specs + specs
         resumed = []
         for a, start, end in replays:
             j = int(self.answer_stage[a])

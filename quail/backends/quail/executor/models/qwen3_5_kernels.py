@@ -199,11 +199,38 @@ def _kernels() -> dict:
         else:
             tl.store(dst_ptr + row * stride_dst + offs, gated, mask=mask)
 
+    @triton.jit
+    def silu_mul(
+        gate_up_ptr, dst_ptr, stride_gu, stride_dst,
+        WIDTH: tl.constexpr, BLOCK: tl.constexpr, PDL: tl.constexpr,
+    ):
+        row = tl.program_id(0).to(tl.int64)
+        offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < WIDTH
+        if PDL:
+            tl.extra.cuda.gdc_wait()
+        gate = tl.load(
+            gate_up_ptr + row * stride_gu + offs, mask=mask, other=0.0
+        ).to(tl.float32)
+        up = tl.load(
+            gate_up_ptr + row * stride_gu + WIDTH + offs, mask=mask, other=0.0
+        ).to(tl.float32)
+        # matches vLLM's silu_and_mul bit for bit: IEEE expf and division,
+        # and silu(gate) rounds to the output dtype before the product
+        silu = tl.extra.cuda.libdevice.div_rn(
+            gate, 1.0 + tl.extra.cuda.libdevice.exp(-gate)).to(
+            dst_ptr.dtype.element_ty)
+        activated = (silu.to(tl.float32) * up).to(dst_ptr.dtype.element_ty)
+        if PDL:
+            tl.extra.cuda.gdc_launch_dependents()
+        tl.store(dst_ptr + row * stride_dst + offs, activated, mask=mask)
+
     _KERNELS.update(
         gemma_add_norm_fp8=gemma_add_norm_fp8,
         gdn_gated_norm=gdn_gated_norm,
         qkv_gemma_norm_rope_gate=qkv_gemma_norm_rope_gate,
         sigmoid_gate=sigmoid_gate,
+        silu_mul=silu_mul,
     )
     return _KERNELS
 
@@ -395,8 +422,10 @@ def gdn_gated_norm(core, z, weight, eps, *, inv_scale=None, activation="silu"):
     if rows == 0:
         return out
     z_2d, core_2d = z.view(rows, total_width), core.reshape(rows, total_width)
-    heads_per_block = 8 if heads >= 8 else (1 << (heads - 1).bit_length())
+    heads_per_block = (16 if heads >= 16 else 8 if heads >= 8
+                       else (1 << (heads - 1).bit_length()))
     block = 1 << (width - 1).bit_length()
+    warps = 8 if heads_per_block >= 16 else 4
     silu_gate, pdl = activation != "sigmoid", pdl_enabled(core.device, rows)
     launch_triton(
         _kernels()["gdn_gated_norm"],
@@ -406,7 +435,7 @@ def gdn_gated_norm(core, z, weight, eps, *, inv_scale=None, activation="silu"):
         key=(heads, width, heads_per_block, block, silu_gate, write_fp8, pdl),
         kwargs=dict(HEADS=heads, D=width, HEADS_PER_BLOCK=heads_per_block,
                     BLOCK=block, SILU_GATE=silu_gate, WRITE_FP8=write_fp8,
-                    PDL=pdl, num_warps=4, launch_pdl=pdl))
+                    PDL=pdl, num_warps=warps, launch_pdl=pdl))
     return out
 
 
@@ -481,4 +510,23 @@ def sigmoid_gate(out, gate, *, inv_scale=None):
         key=(width, block, write_fp8, pdl),
         kwargs=dict(WIDTH=width, BLOCK=block, WRITE_FP8=write_fp8, PDL=pdl,
                     num_warps=4, launch_pdl=pdl))
+    return dst
+
+
+def silu_mul(gate_up):
+    """Apply SwiGLU over (rows, 2 * width)."""
+    import torch
+
+    rows, double_width = gate_up.shape
+    width = double_width // 2
+    dst = torch.empty((rows, width), dtype=gate_up.dtype, device=gate_up.device)
+    if rows == 0:
+        return dst
+    block, pdl = 1024, pdl_enabled(gate_up.device, rows)
+    launch_triton(
+        _kernels()["silu_mul"], (rows, (width + block - 1) // block),
+        (gate_up, dst, gate_up.stride(0), dst.stride(0)),
+        key=(width, block, pdl),
+        kwargs=dict(WIDTH=width, BLOCK=block, PDL=pdl, num_warps=4,
+                    launch_pdl=pdl))
     return dst

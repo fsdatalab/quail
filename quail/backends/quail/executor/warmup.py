@@ -21,7 +21,7 @@ from quail.progress import Progress, logger, quiet
 # Bump when either pass covers a different set of shapes. A bumped
 # version invalidates every marker, so the next boot re-runs the
 # compile pass.
-WARMUP_VERSION = 16
+WARMUP_VERSION = 18
 
 # Triton compiles one copy of a kernel for each class of its integer
 # arguments: equal to 1, a multiple of 16, or neither. Quail's row
@@ -174,6 +174,14 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
             torch, arena, pipeline,
             filter_stages([question], async_ans), warm_documents, budget,
             attention_mode=mode)
+        for count in (2, 8):
+            if arena.num_state_slots >= count and len(warm_documents) >= count:
+                _warm_run(
+                    torch, arena, pipeline,
+                    [Stage(suffixes=[question], readout=async_ans,
+                           decide=lambda _, row: True),
+                     Stage(suffixes=[question], readout=async_ans)],
+                    warm_documents[:count], budget, attention_mode=mode)
         # small chunks, one document each: the trailing-chunk shapes
         # of gated multi-stage runs (see ModelPipeline.warm_tokens)
         for t in pipeline.warm_tokens:

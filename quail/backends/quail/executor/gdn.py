@@ -625,40 +625,50 @@ def _kernel_in_batches(spec, q, k, v, g, beta, load, store, phase, scale, *,
     return pieces[0] if len(pieces) == 1 else torch.cat(pieces)
 
 
-def _sm100_pool_delta_rule(spec, q, k, v, g, beta, arena, phase, layer_slot,
-                           *, output=None):
-    """Run SM100 FlashInfer GDN prefill directly against the arena state pool."""
+def _pool_delta_rule(spec, q, k, v, g, beta, arena, phase, layer_slot, *,
+                     output=None):
+    """Run FlashInfer GDN prefill against the arena state pool."""
     import torch
 
     count = len(phase.lengths)
-    per_launch = max(1, GRID_LIMIT // spec.gdn_value_heads)
-    pool = arena.gdn_state[:, layer_slot]
-    has_reads = phase.read_slots_i32 is not None
-    has_writes = phase.write_slots_i32 is not None
-    indices = phase.write_slots_i32 if has_writes else phase.read_slots_i32
-    initial = pool if has_reads else None
-    out_state = pool if has_writes else None
-    if count <= per_launch:
-        core, _ = _flashinfer_delta_rule(
-            q, k, v, g, beta, initial, phase.cu_seqlens, has_writes,
-            g_is_exp=True, output=output, output_state=out_state,
-            state_indices=indices)
-        return core
-    starts = [0]
-    for length in phase.lengths:
-        starts.append(starts[-1] + length)
+    has_reads = phase.read_slots is not None
+    has_writes = phase.write_slots is not None
+    is_sm100 = q.is_cuda and torch.cuda.get_device_capability(q.device)[0] == 10
+    direct = (is_sm100 and not has_reads
+              and (not has_writes or phase.unique_writes))
+    per_launch = max(
+        1,
+        GRID_LIMIT // spec.gdn_value_heads if direct
+        else min(GRID_LIMIT // spec.gdn_value_heads, SEQUENCES_PER_LAUNCH))
+    pool = arena.gdn_state[:, layer_slot] if (has_reads or has_writes) else None
     target = (output if output is not None else torch.empty(
         (q.shape[0], spec.gdn_value_heads, spec.gdn_value_dim),
         dtype=q.dtype, device=q.device))
+    low = 0
     for first in range(0, count, per_launch):
         last = min(count, first + per_launch)
-        low, high = starts[first], starts[last]
-        _flashinfer_delta_rule(
-            q[low:high], k[low:high], v[low:high], g[low:high],
-            beta[low:high], initial, phase.cu_seqlens[first:last + 1] - low,
-            has_writes, g_is_exp=True, output=target[low:high],
-            output_state=out_state,
-            state_indices=(None if indices is None else indices[first:last]))
+        high = (q.shape[0] if last == count
+                else low + sum(phase.lengths[first:last]))
+        bounds = phase.cu_seqlens[first:last + 1] - low
+        if direct:
+            indices = (phase.write_slots_i32[first:last]
+                       if has_writes else None)
+            _flashinfer_delta_rule(
+                q[low:high], k[low:high], v[low:high], g[low:high],
+                beta[low:high], None, bounds, has_writes, g_is_exp=True,
+                output=target[low:high],
+                output_state=pool if has_writes else None,
+                state_indices=indices)
+        else:
+            initial = pool[phase.read_slots[first:last]] if has_reads else None
+            _, final = _flashinfer_delta_rule(
+                q[low:high], k[low:high], v[low:high], g[low:high],
+                beta[low:high], initial, bounds, has_writes, g_is_exp=True,
+                output=target[low:high])
+            if has_writes:
+                copy_slots(final, torch.arange(last - first, device=q.device),
+                           phase.write_slots[first:last], dst_pool=pool)
+        low = high
     return target
 
 
@@ -729,15 +739,16 @@ def _gdn_kernels() -> dict:
                          mask=mask, other=0.0), mask=mask)
 
     @triton.jit
-    def copy_slots(pool_ptr, src_ptr, dst_ptr, stride_slot,
-                   WIDTH: tl.constexpr, BLOCK: tl.constexpr):
-        pair = tl.program_id(0)
-        offs = tl.program_id(1).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    def copy_slots(src_ptr, dst_ptr, src_index_ptr, dst_index_ptr, stride_src,
+                   stride_dst, WIDTH: tl.constexpr, BLOCK: tl.constexpr):
+        # a wave of blocks covers one slot, so it touches few pages
+        offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        pair = tl.program_id(1)
         mask = offs < WIDTH
-        src = tl.load(src_ptr + pair).to(tl.int64)
-        dst = tl.load(dst_ptr + pair).to(tl.int64)
-        tl.store(pool_ptr + dst * stride_slot + offs,
-                 tl.load(pool_ptr + src * stride_slot + offs, mask=mask),
+        src = tl.load(src_index_ptr + pair).to(tl.int64)
+        dst = tl.load(dst_index_ptr + pair).to(tl.int64)
+        tl.store(dst_ptr + dst * stride_dst + offs,
+                 tl.load(src_ptr + src * stride_src + offs, mask=mask),
                  mask=mask)
 
     # PDL invariant: loads before gdc_wait read only weights and staged indices.
@@ -836,20 +847,21 @@ def scatter_gdn_rows(core, rows, out):
     return out
 
 
-def copy_slots(pool, src, dst):
-    """Copy pool[src[i]] into pool[dst[i]]; no dst may also be a src."""
+def copy_slots(pool, src, dst, *, dst_pool=None):
+    """Copy pool[src[i]] into dst_pool[dst[i]]; within one pool no dst is a src."""
     from quail.backends.quail.executor.attention import launch_triton
 
+    target = pool if dst_pool is None else dst_pool
     count = src.shape[0]
     if count == 0:
-        return pool
-    assert pool[0].is_contiguous()
+        return target
+    assert pool[0].is_contiguous() and target[0].is_contiguous()
     width, block = pool[0].numel(), 4096
     launch_triton(
-        _gdn_kernels()["copy_slots"], (count, (width + block - 1) // block),
-        (pool, src, dst, pool.stride(0)),
+        _gdn_kernels()["copy_slots"], ((width + block - 1) // block, count),
+        (pool, target, src, dst, pool.stride(0), target.stride(0)),
         key=(width, block), kwargs=dict(WIDTH=width, BLOCK=block, num_warps=8))
-    return pool
+    return target
 
 
 def gdn_decode_step(conv_out, a, b, a_log, dt_bias, state_pool, state_rows, out,
@@ -967,11 +979,8 @@ def gdn_core(geometry, tensors, phases, arena, layer_slot, *, output=None):
            if not single_identity else None)
     scale = spec.gdn_key_dim ** -0.5
     use_flashinfer = qkv.is_cuda and gdn_prefill_backend() == "flashinfer"
-    is_sm100 = (use_flashinfer
-                and spec.gdn_key_dim == 128
-                and torch.cuda.get_device_capability(qkv.device)[0] == 10)
     for phase in active_phases:
-        span = getattr(phase, "contiguous_span", None)
+        span = phase.contiguous_span
         if single_identity:
             mixed_in = qkv
             a_in, b_in = tensors["a"], tensors["b"]
@@ -1039,12 +1048,11 @@ def gdn_core(geometry, tensors, phases, arena, layer_slot, *, output=None):
             num_k_heads=spec.gdn_key_heads, head_k_dim=spec.gdn_key_dim,
             head_v_dim=spec.gdn_value_dim, apply_l2norm=True,
             output_g_exp=g_exp)
-        pool_ok = is_sm100 and (phase.write_slots is None or in_place)
-        if pool_ok:
+        if use_flashinfer and spec.gdn_key_dim == 128:
             direct_out = (out if single_identity
                           else out[span[0]:span[1]]
                           if phase.output and span is not None else None)
-            core = _sm100_pool_delta_rule(
+            core = _pool_delta_rule(
                 spec, q, k, v, g, b, arena, phase, layer_slot,
                 output=direct_out)
             if single_identity:

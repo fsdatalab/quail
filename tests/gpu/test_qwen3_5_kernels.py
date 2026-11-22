@@ -166,14 +166,25 @@ def test_sigmoid_gate_matches_bf16_and_static_fp8_reference():
     assert actual_bf16.data_ptr() == inplace.data_ptr()
     torch.testing.assert_close(actual_bf16, expected_bf16, rtol=1e-2, atol=1e-2)
 
+    import vllm._custom_ops  # noqa: F401
 
-def test_decode_conv_and_sm100_pool_gdn_match_reference():
+    from quail.backends.quail.executor.models.qwen3_5_kernels import silu_mul
+
+    for dtype in (torch.bfloat16, torch.float16):
+        gate_up = torch.randn(63, 2 * 512, device="cuda", dtype=dtype) * 3
+        expected_silu = torch.empty(63, 512, device="cuda", dtype=dtype)
+        torch.ops._C.silu_and_mul(expected_silu, gate_up)
+        torch.testing.assert_close(silu_mul(gate_up), expected_silu,
+                                   rtol=0, atol=0)
+
+
+def test_decode_conv_and_pool_gdn_match_reference():
     from experiments.hybrid import causal_conv_reference, gated_delta_reference
     from quail.backends.quail.executor.gdn import (
         GdnPhase,
         _decode_conv_kernel,
         _move_states,
-        _sm100_pool_delta_rule,
+        _pool_delta_rule,
     )
 
     torch.manual_seed(4)
@@ -212,7 +223,7 @@ def test_decode_conv_and_sm100_pool_gdn_match_reference():
     torch.testing.assert_close(
         arena.conv_state[writes, 1], expected_tails, rtol=1e-2, atol=1e-2)
 
-    if torch.cuda.get_device_capability()[0] != 10:
+    if torch.cuda.get_device_capability()[0] < 9:
         return
     spec = SimpleNamespace(gdn_value_heads=48, gdn_key_heads=16,
                            gdn_key_dim=128, gdn_value_dim=128)
@@ -240,7 +251,7 @@ def test_decode_conv_and_sm100_pool_gdn_match_reference():
     prefill_phase = GdnPhase(
         rows=torch.arange(total, device="cuda"), cu_seqlens=cu, lengths=lengths,
         write_slots=w_slots.long(), write_slots_i32=w_slots, unique_writes=True)
-    actual_out = _sm100_pool_delta_rule(
+    actual_out = _pool_delta_rule(
         spec, q, k, v, log_g.exp().contiguous(), beta, gdn_arena,
         prefill_phase, 1)
     torch.testing.assert_close(actual_out, ref_out, rtol=2e-2, atol=2e-2)
@@ -255,10 +266,25 @@ def test_decode_conv_and_sm100_pool_gdn_match_reference():
     suffix_phase = GdnPhase(
         rows=torch.arange(total, device="cuda"), cu_seqlens=cu, lengths=lengths,
         read_slots=r_slots.long(), read_slots_i32=r_slots)
-    suffix_out = _sm100_pool_delta_rule(
+    suffix_out = _pool_delta_rule(
         spec, q, k, v, log_g.exp().contiguous(), beta, gdn_arena,
         suffix_phase, 1)
     torch.testing.assert_close(suffix_out, suffix_ref, rtol=2e-2, atol=2e-2)
+
+    # Read+write extension phase updating slots in place.
+    ext_ref_state = gdn_arena.gdn_state[w_slots.long(), 1].clone()
+    ext_ref = gated_delta_reference(
+        q, k, v, log_g, beta, ext_ref_state, lengths, scale)
+    ext_phase = GdnPhase(
+        rows=torch.arange(total, device="cuda"), cu_seqlens=cu, lengths=lengths,
+        read_slots=w_slots.long(), read_slots_i32=w_slots,
+        write_slots=w_slots.long(), write_slots_i32=w_slots, unique_writes=True)
+    ext_out = _pool_delta_rule(
+        spec, q, k, v, log_g.exp().contiguous(), beta, gdn_arena, ext_phase, 1)
+    torch.testing.assert_close(ext_out, ext_ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(
+        gdn_arena.gdn_state[w_slots.long(), 1], ext_ref_state,
+        rtol=2e-2, atol=2e-2)
 
 
 def test_sm100_nvfp4_silu_and_linear_match_both_row_regimes():
@@ -474,7 +500,7 @@ def test_short_query_paged_attention_and_shared_reads_match_dense():
             cu_q=torch.tensor(cu, device="cuda", dtype=torch.int32),
             max_q=max(lengths), table=table_of(page_lists),
             used=torch.tensor(used, device="cuda", dtype=torch.int32),
-            max_used=max(used), prefill_seqs=prefill_seqs)
+            max_used=max(used), prefill_seqs=prefill_seqs, causal=True)
         if prefill_seqs:
             decode = lengths[prefill_seqs:]
             row0 = cu[prefill_seqs]

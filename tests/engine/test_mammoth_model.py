@@ -357,6 +357,27 @@ def test_a_mammoth_document_longer_than_a_chunk_is_refused():
             [Stage(suffixes=[[99] * 20], readout=readout, single=True)],
             [[1] * 90], budget=100, attention_mode="unified")
 
+    # a multi-stage run packs fresh document blocks before question
+    # suffixes so both Gated DeltaNet phases span contiguous rows
+    from quail.backends.quail.executor.arena import KVArena
+
+    hybrid = KVArena(
+        num_layers=1, num_pages=64, page_tokens=16, num_kv_heads=1, d_head=1,
+        dtype=pytest.importorskip("torch").float32, device="cpu",
+        num_state_slots=8, gdn_state_shape=(1, 1, 2, 2),
+        conv_state_shape=(1, 3, 6))
+    two_stage = StageExecutor(
+        host_torch(), hybrid, pipeline,
+        [Stage(suffixes=[[90, 91]], readout=readout, single=True),
+         Stage(suffixes=[[92, 93, 94]], readout=readout, single=True)],
+        [[10, 11, 12, 13], [20, 21, 22]], budget=64, attention_mode="unified")
+    groups = two_stage.sched.next_chunk(64)
+    packed, entries, _ = two_stage._build(groups)
+    phases = [p for p in packed.meta["gdn"] if p is not None]
+    assert [p.contiguous_span for p in phases] == [(0, 7), (7, 11)]
+    assert entries == [(0, 1), (0, 1)]
+    assert packed.final_indices.tolist() == [8, 10]
+
 
 def test_stock_vllm_refuses_mammoth_which_it_would_run_causal():
     support = stock_vllm_backend().supports(MAMMOTH, H100_SXM, 1)
