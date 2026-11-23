@@ -461,8 +461,16 @@ impl AiNode {
         &self.answer
     }
 
-    pub fn semantics(&self) -> Semantics {
-        self.semantics
+    pub fn is_join(&self) -> bool {
+        self.semantics != Semantics::Rows
+    }
+
+    pub fn is_anti(&self) -> bool {
+        self.semantics == Semantics::Anti
+    }
+
+    pub fn is_column(&self) -> bool {
+        !self.is_predicate() && !self.is_join()
     }
 
     pub fn call(&self) -> Expr {

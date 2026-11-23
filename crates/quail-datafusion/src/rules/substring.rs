@@ -5,10 +5,10 @@ use datafusion::logical_expr::expr_rewriter::unnormalize_col;
 use datafusion::logical_expr::utils::split_conjunction;
 use datafusion::logical_expr::{Expr, LogicalPlan};
 
-use crate::ai::{AiNode, Semantics};
+use crate::ai::AiNode;
 
 pub(crate) fn precheck(node: &AiNode, input: &LogicalPlan) -> Option<Expr> {
-    if node.function() != "ai_extract" || node.semantics() != Semantics::Rows {
+    if node.function() != "ai_extract" || node.is_join() {
         return None;
     }
     let Expr::ScalarFunction(call) = node.call() else {
