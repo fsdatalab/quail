@@ -1,0 +1,57 @@
+# Every fourth layer is attention (layers 3, 7, ..., 23); the other 18
+# are Gated DeltaNet. params counts the safetensors header shapes the
+# way the 4B spec does (the same count reproduces the 4B value).
+
+name = "qwen3.5-2b-bf16"
+params = 1_373_159_424  # attention, Gated DeltaNet, and MLP
+                        # projections plus the convolution weights;
+                        # norms and the embedding excluded
+layers = 24
+hidden = 2048
+num_q_heads = 8
+num_kv_heads = 2
+d_head = 256
+ffn_width = 12288  # gate_up output: 2 x 6144 intermediate
+w_bytes = 2.0  # bf16 weights
+hf_name = "Qwen/Qwen3.5-2B"
+revision = "15852e8c16360a2fea060d615a32b45270f8a8fc"
+kv_bytes = 2.0
+w_mem_bytes = 3_823_868_579  # the text and embedding tensors in bf16 plus
+                             # the 1.6 percent vLLM adds to the 4B; an
+                             # estimate, not a measurement
+vocab = 248_320
+tied_head = true
+weight_precision = "bf16"
+arch = "qwen3_5"
+layer_kinds = [
+    "gated_delta_net", "gated_delta_net", "gated_delta_net", "full_attention",
+    "gated_delta_net", "gated_delta_net", "gated_delta_net", "full_attention",
+    "gated_delta_net", "gated_delta_net", "gated_delta_net", "full_attention",
+    "gated_delta_net", "gated_delta_net", "gated_delta_net", "full_attention",
+    "gated_delta_net", "gated_delta_net", "gated_delta_net", "full_attention",
+    "gated_delta_net", "gated_delta_net", "gated_delta_net", "full_attention",
+]
+max_num_seqs = 3_000  # vLLM 0.26 on an H100 at 0.91 memory holds 3,052
+                      # state blocks; 4,096 sequences raised ValueError
+vision_tower = true
+# the vision tower's bf16 weights (0.67 GB, from its config),
+# 1 GiB for an encoder call of 32,768 patches, and a full chunk's
+# image embeddings; an estimate, not a measurement
+vision_mem_bytes = 2_350_000_000
+# preprocessor_config.json: patch_size, merge_size, size.shortest_edge,
+# size.longest_edge
+image_patch_pixels = 16
+image_merge = 2
+image_min_pixels = 65_536
+image_max_pixels = 16_777_216
+attn_output_gate = true
+gdn_key_heads = 16
+gdn_value_heads = 16
+gdn_key_dim = 128
+gdn_value_dim = 128
+conv_width = 4
+# the chat template's turn with thinking off; a raw prompt makes the
+# model open a <think> block, and no answer names a label
+turn_prefix = "<|im_start|>system\nYou are an expert at text analysis<|im_end|>\n<|im_start|>user\n"
+turn_suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+prompt_format = "qwen3-chat-text-analysis-v1"
