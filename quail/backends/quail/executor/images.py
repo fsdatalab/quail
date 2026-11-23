@@ -30,6 +30,7 @@ TEMPORAL_PATCH = 2
 IMAGE_SIGNATURES = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff")
 DECODE_THREADS = 8
 ENCODER_PATCHES = 32_768
+UNDECODED_SHADE = 128
 
 
 @dataclass(frozen=True)
@@ -106,6 +107,12 @@ def pixel_patches(torch, rgb, patch_pixels: int, merge: int):
 def decode_image(image: Image, token_pixels: int) -> np.ndarray:
     """An image's pixels at the size the model reads, as (height, width, 3) uint8.
 
+    The planner counts an image's tokens from its header alone, so an
+    image whose data does not decode, such as a truncated JPEG, has its
+    tokens already. It reads as a gray image of that size: the encoder
+    normalizes gray to zero, and the other rows of the query keep their
+    answers.
+
     Args:
         image: The image.
         token_pixels: The pixels along each side of one image token.
@@ -113,11 +120,14 @@ def decode_image(image: Image, token_pixels: int) -> np.ndarray:
     from PIL import Image as PILImage
 
     width, height = image.columns * token_pixels, image.rows * token_pixels
-    with PILImage.open(io.BytesIO(image.encoded)) as opened:
-        rgb = opened.convert("RGB")
-        if rgb.size != (width, height):
-            rgb = rgb.resize((width, height), PILImage.Resampling.BICUBIC)
-        return np.asarray(rgb)
+    try:
+        with PILImage.open(io.BytesIO(image.encoded)) as opened:
+            rgb = opened.convert("RGB")
+    except OSError:
+        return np.full((height, width, 3), UNDECODED_SHADE, dtype=np.uint8)
+    if rgb.size != (width, height):
+        rgb = rgb.resize((width, height), PILImage.Resampling.BICUBIC)
+    return np.asarray(rgb)
 
 
 class RegionImages:
