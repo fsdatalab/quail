@@ -678,6 +678,209 @@ impl Tagged {
             physical,
         })
     }
+
+    /// The node `object` holds; an error for any other object.
+    fn held_node(object: &Bound<'_, PyAny>) -> PyResult<Arc<physical::PhysicalNode>> {
+        match &object.cast::<Tagged>()?.get().held {
+            Held::Node(node) => Ok(Arc::clone(node)),
+            Held::Value(_) => Err(PyTypeError::new_err(
+                "a physical graph holds physical nodes",
+            )),
+        }
+    }
+
+    /// The value `object` holds, read as `T`; an error for any other object.
+    fn held_value<T: DeserializeOwned>(object: &Bound<'_, PyAny>) -> PyResult<T> {
+        serde_json::from_value(object.cast::<Tagged>()?.get().held.json())
+            .map_err(|error| PyTypeError::new_err(error.to_string()))
+    }
+
+    /// The names of the instance's fields, in its constructor's order.
+    fn field_order(slf: &Bound<'_, Self>) -> PyResult<Vec<String>> {
+        Ok(match kind_of_object(slf.as_any())? {
+            Some(kind) => kind
+                .fields
+                .iter()
+                .map(|(name, _)| name.to_string())
+                .collect(),
+            None => constructor_fields(&slf.get().held)
+                .keys()
+                .cloned()
+                .collect(),
+        })
+    }
+
+    /// Fill the instance's `__dict__` from its value, once.
+    fn fill(slf: &Bound<'_, Self>) -> PyResult<()> {
+        let tagged = slf.get();
+        if tagged.filled.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let py = slf.py();
+        let dict = slf.getattr("__dict__")?.cast_into::<PyDict>()?;
+        match &tagged.held {
+            Held::Node(node) => Self::fill_node(py, &dict, node)?,
+            Held::Value(value) => Self::fill_value(py, &dict, value)?,
+        }
+        tagged.filled.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Write a node's fields, and those derived from them, into `dict`.
+    fn fill_node(
+        py: Python<'_>,
+        dict: &Bound<'_, PyDict>,
+        node: &physical::PhysicalNode,
+    ) -> PyResult<()> {
+        let Value::Object(mut map) = serde_json::to_value(node).expect("a node writes") else {
+            unreachable!("a node writes an object")
+        };
+        dict.set_item("node_id", node.id())?;
+        dict.set_item(
+            "inputs",
+            to_python(py, map.get("inputs").unwrap_or(&Value::Null))?,
+        )?;
+        if let Some(Value::Object(attributes)) = map.remove("attributes") {
+            for (name, value) in &attributes {
+                dict.set_item(name, to_python(py, value)?)?;
+            }
+        }
+        let ports = node
+            .output_ports()
+            .iter()
+            .map(|port| to_python(py, &serde_json::to_value(port).expect("a port writes")))
+            .collect::<PyResult<Vec<_>>>()?;
+        dict.set_item("outputs", PyTuple::new(py, ports)?)?;
+        dict.set_item(
+            "location",
+            location(py)?.call1((match node.location() {
+                physical::Location::Coordinator => "coordinator",
+                physical::Location::GpuExecutor => "gpu_executor",
+            },))?,
+        )?;
+        dict.set_item("backend", node.backend())?;
+        dict.set_item("document_aliases", tuple_of(py, &node.document_aliases())?)?;
+        dict.set_item("document_head", PyTuple::new(py, node.document_head())?)?;
+        match node {
+            physical::PhysicalNode::Filter(filter) => {
+                dict.set_item("rows_port", node.rows_port())?;
+                let columns = filter
+                    .attributes
+                    .predicate
+                    .as_ref()
+                    .map(quail_planner::expressions::condition_columns)
+                    .unwrap_or_default();
+                dict.set_item("tested_columns", tuple_of(py, &columns)?)?;
+            }
+            physical::PhysicalNode::AiScore(_)
+            | physical::PhysicalNode::AiClassify(_)
+            | physical::PhysicalNode::AiExtract(_)
+            | physical::PhysicalNode::AiMap(_)
+            | physical::PhysicalNode::AiSaeFeatures(_) => {
+                dict.set_item("rows_port", node.rows_port())?;
+                let shares = dict
+                    .get_item("spec")?
+                    .filter(|spec| !spec.is_none())
+                    .map(|spec| spec.getattr("share_prefixes"))
+                    .transpose()?;
+                dict.set_item(
+                    "share_prefixes",
+                    shares.map_or(Ok(false), |found| found.extract())?,
+                )?;
+            }
+            physical::PhysicalNode::Extension(extension) => {
+                dict.set_item("type_name", &extension.type_name)?;
+                dict.set_item("runtime_key", &extension.type_name)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Write a value's fields, and those derived from them, into `dict`.
+    fn fill_value(py: Python<'_>, dict: &Bound<'_, PyDict>, value: &Value) -> PyResult<()> {
+        let Value::Object(map) = value else {
+            return Ok(());
+        };
+        let tag = map.get("type").and_then(Value::as_str).unwrap_or_default();
+        for (name, item) in map {
+            if name == "type" {
+                continue;
+            }
+            let converted = if name == "value_type" {
+                value_type(py)?.call1((to_python(py, item)?,))?
+            } else {
+                to_python(py, item)?
+            };
+            dict.set_item(name, converted)?;
+        }
+        let text = |name: &str| map.get(name).and_then(Value::as_str).unwrap_or_default();
+        let aliases: Vec<String> = map
+            .get("aliases")
+            .and_then(Value::as_array)
+            .map(|aliases| {
+                aliases
+                    .iter()
+                    .filter_map(|alias| alias.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let class = kind_of_value(tag)
+            .map(|kind| kind.class)
+            .unwrap_or_default();
+        if class.ends_with("Spec") && !class.starts_with("Request") {
+            let mut columns = aliases.clone();
+            columns.push(text("name").to_string());
+            if class == "ExtractSpec" {
+                let span = format!("{}_span", text("name"));
+                dict.set_item("alias", aliases.first())?;
+                dict.set_item("span_name", &span)?;
+                columns.push(span);
+            }
+            if class == "ClassifySpec" {
+                dict.set_item("anchor", aliases.first())?;
+                dict.set_item("partner", (aliases.len() == 2).then(|| aliases[1].clone()))?;
+            }
+            dict.set_item("output_columns", tuple_of(py, &columns)?)?;
+        }
+        match class {
+            "RequestExtractSpec" => {
+                dict.set_item("span_output", format!("{}_span", text("output")))?;
+            }
+            "ExtractStruct" => {
+                let members: Vec<String> = map
+                    .get("fields")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .map(|field| format!("{}.{}", text("name"), field.as_str().unwrap_or_default()))
+                    .collect();
+                dict.set_item("members", tuple_of(py, &members)?)?;
+            }
+            "FilterPredicate" => {
+                let predicate: physical::FilterPredicate = serde_json::from_value(value.clone())
+                    .map_err(|error| PyValueError::new_err(error.to_string()))?;
+                let call = quail_planner::expressions::asked_call(&predicate.expression);
+                let prompt = serde_json::to_value(call.prompt.as_ref()).expect("a prompt writes");
+                dict.set_item("prompt", to_python(py, &prompt)?)?;
+            }
+            "ColumnRef" | "GetField" | "Alias" | "Expression" => {
+                // the columns the executor gathers to evaluate the value
+                let expression: physical::ValueExpression =
+                    serde_json::from_value(value.clone())
+                        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+                let references: Vec<physical::ValueExpression> =
+                    quail_planner::expressions::column_references(&expression)
+                        .into_iter()
+                        .map(physical::ValueExpression::ColumnRef)
+                        .collect();
+                let references = serde_json::to_value(references).expect("columns write");
+                dict.set_item("references", to_python(py, &references)?)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 /// The classes whose values DataFusion evaluates.
@@ -821,176 +1024,8 @@ fn constructor_fields(held: &Held) -> Map<String, Value> {
     map
 }
 
-fn fill(object: &Bound<'_, Tagged>) -> PyResult<()> {
-    let tagged = object.get();
-    if tagged.filled.load(Ordering::Acquire) {
-        return Ok(());
-    }
-    let py = object.py();
-    let dict = object.getattr("__dict__")?.cast_into::<PyDict>()?;
-    match &tagged.held {
-        Held::Node(node) => fill_node(py, &dict, node)?,
-        Held::Value(value) => fill_value(py, &dict, value)?,
-    }
-    tagged.filled.store(true, Ordering::Release);
-    Ok(())
-}
-
 fn tuple_of<'py, T: AsRef<str>>(py: Python<'py>, items: &[T]) -> PyResult<Bound<'py, PyTuple>> {
     PyTuple::new(py, items.iter().map(AsRef::as_ref))
-}
-
-fn fill_node(
-    py: Python<'_>,
-    dict: &Bound<'_, PyDict>,
-    node: &physical::PhysicalNode,
-) -> PyResult<()> {
-    let Value::Object(mut map) = serde_json::to_value(node).expect("a node writes") else {
-        unreachable!("a node writes an object")
-    };
-    dict.set_item("node_id", node.id())?;
-    dict.set_item(
-        "inputs",
-        to_python(py, map.get("inputs").unwrap_or(&Value::Null))?,
-    )?;
-    if let Some(Value::Object(attributes)) = map.remove("attributes") {
-        for (name, value) in &attributes {
-            dict.set_item(name, to_python(py, value)?)?;
-        }
-    }
-    let ports = node
-        .output_ports()
-        .iter()
-        .map(|port| to_python(py, &serde_json::to_value(port).expect("a port writes")))
-        .collect::<PyResult<Vec<_>>>()?;
-    dict.set_item("outputs", PyTuple::new(py, ports)?)?;
-    dict.set_item(
-        "location",
-        location(py)?.call1((match node.location() {
-            physical::Location::Coordinator => "coordinator",
-            physical::Location::GpuExecutor => "gpu_executor",
-        },))?,
-    )?;
-    dict.set_item("backend", node.backend())?;
-    dict.set_item("document_aliases", tuple_of(py, &node.document_aliases())?)?;
-    dict.set_item("document_head", PyTuple::new(py, node.document_head())?)?;
-    match node {
-        physical::PhysicalNode::Filter(filter) => {
-            dict.set_item("rows_port", node.rows_port())?;
-            let columns = filter
-                .attributes
-                .predicate
-                .as_ref()
-                .map(quail_planner::expressions::condition_columns)
-                .unwrap_or_default();
-            dict.set_item("tested_columns", tuple_of(py, &columns)?)?;
-        }
-        physical::PhysicalNode::AiScore(_)
-        | physical::PhysicalNode::AiClassify(_)
-        | physical::PhysicalNode::AiExtract(_)
-        | physical::PhysicalNode::AiMap(_)
-        | physical::PhysicalNode::AiSaeFeatures(_) => {
-            dict.set_item("rows_port", node.rows_port())?;
-            let shares = dict
-                .get_item("spec")?
-                .filter(|spec| !spec.is_none())
-                .map(|spec| spec.getattr("share_prefixes"))
-                .transpose()?;
-            dict.set_item(
-                "share_prefixes",
-                shares.map_or(Ok(false), |found| found.extract())?,
-            )?;
-        }
-        physical::PhysicalNode::Extension(extension) => {
-            dict.set_item("type_name", &extension.type_name)?;
-            dict.set_item("runtime_key", &extension.type_name)?;
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn fill_value(py: Python<'_>, dict: &Bound<'_, PyDict>, value: &Value) -> PyResult<()> {
-    let Value::Object(map) = value else {
-        return Ok(());
-    };
-    let tag = map.get("type").and_then(Value::as_str).unwrap_or_default();
-    for (name, item) in map {
-        if name == "type" {
-            continue;
-        }
-        let converted = if name == "value_type" {
-            value_type(py)?.call1((to_python(py, item)?,))?
-        } else {
-            to_python(py, item)?
-        };
-        dict.set_item(name, converted)?;
-    }
-    let text = |name: &str| map.get(name).and_then(Value::as_str).unwrap_or_default();
-    let aliases: Vec<String> = map
-        .get("aliases")
-        .and_then(Value::as_array)
-        .map(|aliases| {
-            aliases
-                .iter()
-                .filter_map(|alias| alias.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-    let class = kind_of_value(tag)
-        .map(|kind| kind.class)
-        .unwrap_or_default();
-    if class.ends_with("Spec") && !class.starts_with("Request") {
-        let mut columns = aliases.clone();
-        columns.push(text("name").to_string());
-        if class == "ExtractSpec" {
-            let span = format!("{}_span", text("name"));
-            dict.set_item("alias", aliases.first())?;
-            dict.set_item("span_name", &span)?;
-            columns.push(span);
-        }
-        if class == "ClassifySpec" {
-            dict.set_item("anchor", aliases.first())?;
-            dict.set_item("partner", (aliases.len() == 2).then(|| aliases[1].clone()))?;
-        }
-        dict.set_item("output_columns", tuple_of(py, &columns)?)?;
-    }
-    match class {
-        "RequestExtractSpec" => {
-            dict.set_item("span_output", format!("{}_span", text("output")))?;
-        }
-        "ExtractStruct" => {
-            let members: Vec<String> = map
-                .get("fields")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .map(|field| format!("{}.{}", text("name"), field.as_str().unwrap_or_default()))
-                .collect();
-            dict.set_item("members", tuple_of(py, &members)?)?;
-        }
-        "FilterPredicate" => {
-            let predicate: physical::FilterPredicate = serde_json::from_value(value.clone())
-                .map_err(|error| PyValueError::new_err(error.to_string()))?;
-            let call = quail_planner::expressions::asked_call(&predicate.expression);
-            let prompt = serde_json::to_value(call.prompt.as_ref()).expect("a prompt writes");
-            dict.set_item("prompt", to_python(py, &prompt)?)?;
-        }
-        "ColumnRef" | "GetField" | "Alias" | "Expression" => {
-            // the columns the executor gathers to evaluate the value
-            let expression: physical::ValueExpression = serde_json::from_value(value.clone())
-                .map_err(|error| PyValueError::new_err(error.to_string()))?;
-            let references: Vec<physical::ValueExpression> =
-                quail_planner::expressions::column_references(&expression)
-                    .into_iter()
-                    .map(physical::ValueExpression::ColumnRef)
-                    .collect();
-            let references = serde_json::to_value(references).expect("columns write");
-            dict.set_item("references", to_python(py, &references)?)?;
-        }
-        _ => {}
-    }
-    Ok(())
 }
 
 /// Read the constructor's arguments as fields, by position then by name.
@@ -1089,24 +1124,12 @@ fn build_extension(mut given: Map<String, Value>) -> PyResult<Held> {
         .map_err(|error| PyValueError::new_err(format!("ExtensionNode: {error}")))
 }
 
-fn field_order(object: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
-    let tagged = object.cast::<Tagged>()?.get();
-    Ok(match kind_of_object(object)? {
-        Some(kind) => kind
-            .fields
-            .iter()
-            .map(|(name, _)| name.to_string())
-            .collect(),
-        None => constructor_fields(&tagged.held).keys().cloned().collect(),
-    })
-}
-
 #[pymethods]
 impl Tagged {
     fn __getattr__(slf: &Bound<'_, Self>, name: &str) -> PyResult<Py<PyAny>> {
         let filled = slf.get().filled.load(Ordering::Acquire);
         if !filled && !name.starts_with("__") {
-            fill(slf)?;
+            Self::fill(slf)?;
             if let Some(found) = slf
                 .getattr("__dict__")?
                 .cast_into::<PyDict>()?
@@ -1156,10 +1179,10 @@ impl Tagged {
     }
 
     fn __repr__(slf: &Bound<'_, Self>) -> PyResult<String> {
-        fill(slf)?;
+        Self::fill(slf)?;
         let dict = slf.getattr("__dict__")?.cast_into::<PyDict>()?;
         let mut parts = Vec::new();
-        for name in field_order(slf.as_any())? {
+        for name in Self::field_order(slf)? {
             if let Some(value) = dict.get_item(&name)? {
                 parts.push(format!("{name}={}", value.repr()?));
             }
@@ -1340,7 +1363,7 @@ leaf_classes! {
     /// keeps those that matched. `matched` is a bool or a NumPy bool
     /// array.
     fn keeps<'py>(slf: &Bound<'py, Self>, matched: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
-        let node = held_node(slf.as_any())?;
+        let node = Tagged::held_node(slf.as_any())?;
         let physical::PhysicalNode::AiJoin(join) = node.as_ref() else {
             unreachable!("an AiJoin holds a join")
         };
@@ -1356,7 +1379,7 @@ leaf_classes! {
     AiClassify = "AiClassify": AiInference [NodeBase, AiInference] {
     /// Return whether this classification reads the join's surviving pairs.
     fn classifies_join(slf: &Bound<'_, Self>, join: &Bound<'_, PyAny>) -> PyResult<bool> {
-        Ok(held_node(slf.as_any())?.classifies_join(held_node(join)?.as_ref()))
+        Ok(Tagged::held_node(slf.as_any())?.classifies_join(Tagged::held_node(join)?.as_ref()))
     }
     },
     AiExtract = "AiExtract": AiInference [NodeBase, AiInference] {},
@@ -1367,8 +1390,8 @@ leaf_classes! {
     ExtractSpec = "ExtractSpec": InferenceSpec [InferenceSpec] {
     /// Return whether two extractions can use the same decoder.
     fn same_decoding(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<bool> {
-        let one: physical::ExtractSpec = held_value(slf.as_any())?;
-        let two: physical::ExtractSpec = held_value(other)?;
+        let one: physical::ExtractSpec = Tagged::held_value(slf.as_any())?;
+        let two: physical::ExtractSpec = Tagged::held_value(other)?;
         Ok(physical::same_decoding(&one, &two))
     }
     },
@@ -1503,7 +1526,7 @@ leaf_classes! {
         max_chars: Option<usize>,
     ) -> PyResult<&'static str> {
         use quail_datafusion::derive::partial::{Completions, Decision, decide};
-        let physical::ValueExpression::Value(expression) = held_value(slf.as_any())? else {
+        let physical::ValueExpression::Value(expression) = Tagged::held_value(slf.as_any())? else {
             return Err(compile_error(slf.py(), "an Expression holds an expression".into()));
         };
         let answers = Completions {
@@ -1556,7 +1579,7 @@ leaf_classes! {
     ModelCall = "ModelCall": Tagged [] {
     /// Return the table aliases the prompt reads, in placeholder order.
     fn aliases<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyTuple>> {
-        let call: physical::ValueExpression = held_value(slf.as_any())?;
+        let call: physical::ValueExpression = Tagged::held_value(slf.as_any())?;
         let physical::ValueExpression::ModelCall(call) = call else {
             unreachable!("a ModelCall holds a model call")
         };
@@ -1642,20 +1665,6 @@ fn node_object(py: Python<'_>, node: Arc<physical::PhysicalNode>) -> PyResult<Bo
     create(py, kind.class, Held::Node(node))
 }
 
-fn held_node(object: &Bound<'_, PyAny>) -> PyResult<Arc<physical::PhysicalNode>> {
-    match &object.cast::<Tagged>()?.get().held {
-        Held::Node(node) => Ok(Arc::clone(node)),
-        Held::Value(_) => Err(PyTypeError::new_err(
-            "a physical graph holds physical nodes",
-        )),
-    }
-}
-
-fn held_value<T: DeserializeOwned>(object: &Bound<'_, PyAny>) -> PyResult<T> {
-    serde_json::from_value(object.cast::<Tagged>()?.get().held.json())
-        .map_err(|error| PyTypeError::new_err(error.to_string()))
-}
-
 // ----------------------------------------------------------------- the graph
 
 /// An immutable graph of physical nodes and the port that returns the
@@ -1714,14 +1723,14 @@ impl PhysicalGraph {
             .collect::<PyResult<Vec<Bound<'_, PyAny>>>>()?;
         let typed = objects
             .iter()
-            .map(|node| held_node(node).map(|node| node.as_ref().clone()))
+            .map(|node| Tagged::held_node(node).map(|node| node.as_ref().clone()))
             .collect::<PyResult<Vec<_>>>()?;
         Ok(Self {
             nodes: PyTuple::new(py, objects)?.unbind(),
             root: root.clone().unbind(),
             graph: physical::PhysicalGraph {
                 nodes: typed,
-                root: held_value(root)?,
+                root: Tagged::held_value(root)?,
             },
         })
     }
@@ -1928,7 +1937,7 @@ pub fn input_ports<'py>(
 ) -> PyResult<Bound<'py, PyTuple>> {
     let sources = sources
         .try_iter()?
-        .map(|source| held_value::<physical::PortRef>(&source?))
+        .map(|source| Tagged::held_value::<physical::PortRef>(&source?))
         .collect::<PyResult<Vec<_>>>()?;
     let ports = physical::input_ports(&sources)
         .iter()
