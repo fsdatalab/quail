@@ -1,10 +1,11 @@
-//! Speed-of-light time.
+//! Speed-of-light time: the sum of each model component's time at the
+//! device's limits.
 
-use crate::cost::dense_decoder_cost::dense_decoder_components;
-use crate::cost::quantity::python_sum;
-use crate::cost::roofline::{ComponentLatency, component_latencies};
-use crate::cost::specs::{DeviceSpec, ModelSpec};
-use crate::cost::work::Work;
+use crate::cost::dense_decoder_cost::{
+    ComponentLatency, component_latencies, dense_decoder_components,
+};
+use crate::cost::work::{Work, python_sum};
+use crate::specs::{DeviceSpec, ModelSpec};
 
 fn latencies(
     work: &Work,

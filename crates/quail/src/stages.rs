@@ -1,7 +1,7 @@
 //! Run a region's stages on several GPUs, one DataFusion partition per
 //! GPU.
 //!
-//! [`quail_planner::stages`] cuts the region's graph into stages when
+//! [`quail_planner::plan::stages`] cuts the region's graph into stages when
 //! the region is planned; this module runs the stages the plan holds.
 //! Partition p of every stage runs on the worker of GPU p, a process
 //! that holds every document and the GPU's KV
@@ -37,7 +37,7 @@ use datafusion::physical_plan::{ExecutionPlan, Partitioning, collect, common};
 use datafusion::prelude::SessionContext;
 use futures::future::{BoxFuture, FutureExt, Shared, try_join_all};
 use quail_planner::physical::{PhysicalGraph, PhysicalNode};
-use quail_planner::stages::Stage;
+use quail_planner::plan::stages::Stage;
 
 /// The column a keyed table's rows are hashed by, which no partition
 /// reads.

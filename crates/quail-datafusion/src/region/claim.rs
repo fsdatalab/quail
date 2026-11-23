@@ -9,19 +9,17 @@ use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, Result, ScalarValue, plan_err};
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::expr_rewriter::replace_col;
-use datafusion::logical_expr::{Expr, LogicalPlan, Projection};
+use datafusion::logical_expr::{Expr, LogicalPlan, Projection, UserDefinedLogicalNodeCore};
 use datafusion::optimizer::Optimizer;
 use quail_planner::error::CompileError;
 
-use super::ModelRegion;
 use super::inputs::{numbered, split_inputs};
 use super::lift::lift_relational;
-use super::shared::SharedInput;
-use crate::ai::AiNode;
-use crate::extension::{as_node, extension_node};
+use super::{ModelRegion, calls_ai};
+use crate::ai::{AiNode, Semantics};
 use crate::functions::is_ai_call;
-
-pub(crate) use super::lowering::lower_regions;
+use crate::plan::{as_node, extension_node};
+use crate::shared::SharedInput;
 
 /// Replace each part of an optimized plan that holds `AiNode`s with one
 /// `ModelRegion`, leave the relational operators above it to DataFusion,
@@ -110,10 +108,9 @@ fn number_regions(plan: LogicalPlan) -> Result<LogicalPlan> {
                 let numbered = if let Some(known) = shared.get(&input.key) {
                     known.clone()
                 } else {
-                    let mut input = input.clone();
-                    input.input = visit(input.input, next, shared)?;
+                    let rows = visit(input.inputs()[0].clone(), next, shared)?;
                     let key = input.key;
-                    let numbered = extension_node(input);
+                    let numbered = extension_node(input.with_exprs_and_inputs(vec![], vec![rows])?);
                     shared.insert(key, numbered.clone());
                     numbered
                 };
@@ -174,8 +171,8 @@ fn drop_unread_probabilities(plan: LogicalPlan) -> Result<LogicalPlan> {
         region.plan.apply(|found| {
             if let Some(ai) = as_node::<AiNode>(found)
                 && ai.function() == "ai_classify"
-                && !returned.contains(&ai.answer)
-                && let Some(call) = without_probabilities(&ai.call)
+                && !returned.iter().any(|name| name == ai.answer())
+                && let Some(call) = without_probabilities(&ai.call())
                 && !unread.iter().any(|(known, _)| *known == call.0)
             {
                 unread.push(call);
@@ -198,7 +195,7 @@ fn drop_unread_probabilities(plan: LogicalPlan) -> Result<LogicalPlan> {
 /// `probabilities` option false, when the option is true.
 fn without_probabilities(call: &Expr) -> Option<(Expr, Expr)> {
     use datafusion::logical_expr::expr::ScalarFunction;
-    let Expr::ScalarFunction(unfolded) = crate::derive::unfolded(call.clone()) else {
+    let Expr::ScalarFunction(unfolded) = crate::functions::options::unfolded(call.clone()) else {
         return None;
     };
     let Some(Expr::ScalarFunction(config)) = unfolded.args.get(2) else {
@@ -332,11 +329,11 @@ fn claim_needed(plan: LogicalPlan, needed: Option<Vec<Column>>) -> Result<Logica
         .into_iter()
         .cloned()
         .map(|input| {
-            let read = super::lowering::read_from(&plan, &input, needed.as_deref());
+            let read = read_from(&plan, &input, needed.as_deref());
             claim_needed(input, read)
         })
         .collect::<Result<Vec<_>>>()?;
-    crate::extension::with_inputs(&plan, inputs)
+    crate::plan::with_inputs(&plan, inputs)
 }
 
 /// Quail's binder's error for `plan` as a region, if it has one.
@@ -344,99 +341,7 @@ fn derive_error(plan: &LogicalPlan) -> Option<CompileError> {
     // the chat turn and layout change the prompts, not what Quail reads
     let turn: quail_planner::prompts::Turn = (String::new(), String::new());
     let region = ModelRegion::new(plan.clone());
-    crate::derive::derive_region(&region, &turn, "ai-if").err()
-}
-
-/// The CTE name and body of a FROM subquery: `x` over the CTE `clauses`,
-/// or the subquery itself.
-pub(crate) fn subquery_body(
-    alias: &datafusion::logical_expr::SubqueryAlias,
-) -> (String, &LogicalPlan) {
-    match alias.input.as_ref() {
-        LogicalPlan::SubqueryAlias(cte) => (cte.alias.table().to_string(), cte.input.as_ref()),
-        body => (alias.alias.table().to_string(), body),
-    }
-}
-
-/// The aliases of the JOIN inputs a region reads through, and the CTE
-/// each reads: each subquery that selects and filters one table, with
-/// AI.IF filters but no other model call, and is read once. Any other
-/// FROM or JOIN subquery runs before the region, as its own input.
-///
-/// For example, `FROM contracts a JOIN kept b ON AI.IF(...b.text...)`,
-/// with `kept` as `SELECT c.id, c.text FROM contracts c WHERE AI.IF(...)`,
-/// reads `kept` through: the region scans `contracts` as `c` under `b`.
-pub(crate) fn merged_aliases(plan: &LogicalPlan) -> Vec<String> {
-    let mut readers: std::collections::BTreeMap<String, usize> = Default::default();
-    let _ = plan.apply(|node| {
-        // each read of a CTE is one copy of its body under the CTE's name
-        if let LogicalPlan::SubqueryAlias(alias) = node
-            && !matches!(
-                alias.input.as_ref(),
-                LogicalPlan::TableScan(_) | LogicalPlan::SubqueryAlias(_)
-            )
-        {
-            *readers.entry(alias.alias.table().to_string()).or_default() += 1;
-        }
-        Ok(TreeNodeRecursion::Continue)
-    });
-    let mut merged = Vec::new();
-    let _ = plan.apply(|node| {
-        let LogicalPlan::Join(join) = node else {
-            return Ok(TreeNodeRecursion::Continue);
-        };
-        for side in [join.left.as_ref(), join.right.as_ref()] {
-            let LogicalPlan::SubqueryAlias(alias) = side else {
-                continue;
-            };
-            let (name, body) = subquery_body(alias);
-            // DataFusion's optimizer removes a SELECT list that passes its
-            // input's columns on, and lowers an AI.IF filter to an `AiNode`
-            let (mut base, mut calls_model) = match body {
-                LogicalPlan::Projection(projection) => (
-                    projection.input.as_ref(),
-                    projection
-                        .expr
-                        .iter()
-                        .any(|expr| expr.exists(|inner| Ok(is_ai_call(inner))).unwrap_or(false)),
-                ),
-                other => (other, false),
-            };
-            loop {
-                base = match base {
-                    LogicalPlan::Filter(filter) => filter.input.as_ref(),
-                    LogicalPlan::Extension(_) => match as_node::<AiNode>(base) {
-                        Some(node) => {
-                            calls_model |= !node.is_predicate()
-                                || node.semantics != crate::ai::Semantics::Rows;
-                            node.input.as_ref()
-                        }
-                        None => break,
-                    },
-                    _ => break,
-                };
-            }
-            let is_table = match base {
-                LogicalPlan::SubqueryAlias(found) => {
-                    let mut scanned = found.input.as_ref();
-                    while let LogicalPlan::Filter(filter) = scanned {
-                        scanned = filter.input.as_ref();
-                    }
-                    matches!(scanned, LogicalPlan::TableScan(_))
-                }
-                _ => false,
-            };
-            if is_table && readers.get(&name).copied().unwrap_or(0) <= 1 && !calls_model {
-                merged.push(alias.alias.table().to_string());
-                // `kept b` reads the CTE `kept` through `b`
-                if name != alias.alias.table() {
-                    merged.push(name);
-                }
-            }
-        }
-        Ok(TreeNodeRecursion::Continue)
-    });
-    merged
+    crate::region::derive::derive_region(&region, &turn, "ai-if").err()
 }
 
 /// A region's plan with a SELECT list at its root: the plan itself when
@@ -455,48 +360,6 @@ pub(super) fn select_list(plan: LogicalPlan, needed: Option<Vec<Column>>) -> Res
         exprs,
         Arc::new(plan),
     )?))
-}
-
-/// Whether any operator in the subtree is an `AiNode`, or calls an AI
-/// function in its expressions or in an EXISTS or IN subquery.
-pub(super) fn calls_ai(plan: &LogicalPlan) -> Result<bool> {
-    let mut found = false;
-    plan.apply_with_subqueries(|node| {
-        found = as_node::<AiNode>(node).is_some()
-            || node
-                .expressions()
-                .iter()
-                .any(|expr| expr.exists(|inner| Ok(is_ai_call(inner))).unwrap_or(false));
-        Ok(if found {
-            TreeNodeRecursion::Stop
-        } else {
-            TreeNodeRecursion::Continue
-        })
-    })?;
-    Ok(found)
-}
-
-/// Whether any operator in the subtree, or an EXISTS or IN subquery in
-/// it, calls an AI function that is not yet lowered into an `AiNode`.
-pub(crate) fn calls_ai_function(plan: &LogicalPlan) -> Result<bool> {
-    plan.exists(|node| {
-        // an `AiNode`'s expressions hold its lowered call
-        if as_node::<AiNode>(node).is_some() {
-            return Ok(false);
-        }
-        for expr in node.expressions() {
-            let found = expr.exists(|inner| match inner {
-                Expr::Exists(exists) => calls_ai_function(&exists.subquery.subquery),
-                Expr::InSubquery(found) => calls_ai_function(&found.subquery.subquery),
-                Expr::ScalarSubquery(found) => calls_ai_function(&found.subquery),
-                other => Ok(is_ai_call(other)),
-            })?;
-            if found {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    })
 }
 
 /// Whether Quail can plan every operator in the subtree.
@@ -549,12 +412,7 @@ thread_local! {
 /// None when the run reads its input as it stands: an AI join's two
 /// sides, one table ([`is_table`]), or rows already cut off.
 fn isolate_chain(plan: &LogicalPlan) -> Result<Option<(LogicalPlan, Vec<Expr>)>> {
-    let mut nodes = Vec::new();
-    let mut bottom = plan;
-    while let Some(node) = as_node::<AiNode>(bottom) {
-        nodes.push(node);
-        bottom = node.input.as_ref();
-    }
+    let (nodes, bottom) = AiNode::run(plan);
     let Some(lowest) = nodes.last() else {
         return Ok(None);
     };
@@ -716,58 +574,30 @@ fn simpler_run(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
             Arc::new(input.clone()),
         )?))
     };
-    if as_node::<AiNode>(node.input.as_ref()).is_some() {
+    let (nodes, bottom) = AiNode::run(plan);
+    if let [_, _, ..] = nodes.as_slice() {
         // a hint test only saves work, and one that reads another call's
         // answer is the usual reason a run of several calls is refused
-        let mut nodes = Vec::new();
-        let mut bottom = plan;
-        while let Some(found) = as_node::<AiNode>(bottom) {
-            nodes.push(found);
-            bottom = found.input.as_ref();
-        }
-        if nodes.iter().any(|found| !found.tests.is_empty()) {
+        let untested: Vec<Option<AiNode>> =
+            nodes.iter().map(|found| found.without_tests()).collect();
+        if untested.iter().any(Option::is_some) {
             let mut run = bottom.clone();
-            for found in nodes.iter().rev() {
-                let mut found = (*found).clone();
-                found.tests = Vec::new();
+            for (found, untested) in nodes.iter().zip(untested).rev() {
+                let found = untested.unwrap_or_else(|| (*found).clone());
                 run = extension_node(found.with_input(run)?);
             }
             return Ok(Some(run));
         }
-        let below = pass_on(node.input.as_ref())?;
+        let below = pass_on(node.inputs()[0])?;
         return Ok(Some(extension_node(node.with_input(below)?)));
     }
-    if node.semantics != crate::ai::Semantics::Rows {
+    if node.semantics() != Semantics::Rows {
         return Ok(None);
     }
-    let plain = node.filter.is_none()
-        && node.guard.is_none()
-        && node.hint.is_none()
-        && node.fetch.is_none()
-        && node.projection.is_none()
-        && node.tests.is_empty();
-    if plain {
+    if node.is_bare() {
         return computed_arguments(node);
     }
-    let mut stripped = node.clone();
-    stripped.filter = None;
-    stripped.guard = None;
-    stripped.hint = None;
-    stripped.fetch = None;
-    stripped.projection = None;
-    stripped.tests = Vec::new();
-    let mut above = extension_node(stripped.checked()?);
-    if let Some(filter) = &node.filter {
-        above = LogicalPlan::Filter(datafusion::logical_expr::Filter::try_new(
-            filter.clone(),
-            Arc::new(above),
-        )?);
-    }
-    if let Some(crate::ai::Fetch::Global(rows)) = &node.fetch {
-        above = datafusion::logical_expr::LogicalPlanBuilder::from(above)
-            .limit(0, Some(*rows))?
-            .build()?;
-    }
+    let above = node.options_above()?;
     let columns = plan.schema().columns().into_iter().map(Expr::Column);
     Ok(Some(LogicalPlan::Projection(Projection::try_new(
         columns.collect(),
@@ -780,28 +610,28 @@ fn simpler_run(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
 /// is one already.
 fn computed_arguments(node: &AiNode) -> Result<Option<LogicalPlan>> {
     let mut exprs: Vec<Expr> = node
-        .input
-        .schema()
+        .input_schema()
         .columns()
         .into_iter()
         .map(Expr::Column)
         .collect();
-    exprs.push(node.call.clone().alias(&node.answer));
-    if let Expr::ScalarFunction(call) = &node.call
+    let asked = node.call();
+    exprs.push(asked.clone().alias(node.answer()));
+    if let Expr::ScalarFunction(call) = &asked
         && call.name() == "ai_extract"
     {
         // an extraction's node also returns its spans
         let spans = Expr::ScalarFunction(datafusion::logical_expr::expr::ScalarFunction::new_udf(
-            crate::rules::lower::quail_function("ai_extract_span"),
+            crate::functions::quail_function("ai_extract_span"),
             call.args.clone(),
         ));
         exprs.push(spans.alias(format!(
             "{}{}",
-            node.answer,
+            node.answer(),
             quail_planner::constants::SPAN_SUFFIX
         )));
     }
-    let written = Projection::try_new(exprs, Arc::clone(&node.input))?;
+    let written = Projection::try_new(exprs, Arc::new(node.inputs()[0].clone()))?;
     let computed = crate::rules::lower::precompute_prompt_arguments(written.clone())?;
     if computed == written {
         return Ok(None);
@@ -828,13 +658,60 @@ fn is_ai_join(node: &AiNode, input: &LogicalPlan) -> bool {
     let LogicalPlan::Join(join) = input else {
         return false;
     };
-    if node.semantics != crate::ai::Semantics::Rows {
+    if node.semantics() != Semantics::Rows {
         return true;
     }
     if join.join_type != datafusion::logical_expr::JoinType::Inner {
         return false;
     }
-    let read = node.call.column_refs();
+    let call = node.call();
+    let read = call.column_refs();
     let reads = |side: &LogicalPlan| read.iter().any(|column| side.schema().has_column(column));
     reads(&join.left) && reads(&join.right)
+}
+
+/// The columns of `input` that `plan` reads, when the operator above
+/// `plan` reads `needed` of its columns.
+fn read_from(
+    plan: &LogicalPlan,
+    input: &LogicalPlan,
+    needed: Option<&[Column]>,
+) -> Option<Vec<Column>> {
+    let mut read: Vec<Column> = Vec::new();
+    let mut add = |column: Column| {
+        if !read.contains(&column) {
+            read.push(column);
+        }
+    };
+    for expr in plan.expressions() {
+        for column in expr.column_refs() {
+            add(column.clone());
+        }
+    }
+    match plan {
+        // these pass their input's columns on
+        LogicalPlan::Filter(_)
+        | LogicalPlan::Sort(_)
+        | LogicalPlan::Limit(_)
+        | LogicalPlan::Distinct(_)
+        | LogicalPlan::Window(_)
+        | LogicalPlan::Join(_) => needed?.iter().cloned().for_each(&mut add),
+        // a union's inputs line up by position, not by name
+        LogicalPlan::Union(_) => return None,
+        LogicalPlan::SubqueryAlias(_) => {
+            // the alias renames the qualifier; the input's columns keep their names
+            let names: Vec<String> = needed?.iter().map(|column| column.name.clone()).collect();
+            for (qualifier, field) in input.schema().iter() {
+                if names.contains(field.name()) {
+                    add(Column::new(qualifier.cloned(), field.name()));
+                }
+            }
+        }
+        _ => {}
+    }
+    Some(
+        read.into_iter()
+            .filter(|column| input.schema().has_column(column))
+            .collect(),
+    )
 }

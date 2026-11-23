@@ -2,8 +2,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::cost::quantity::{Quantity, python_sum};
 use crate::cost::statistics::{AliasStats, int_true_divide};
+use crate::cost::work::{Quantity, python_sum};
 use crate::cost::work::{Work, triangle};
 
 /// One join with the token counts the cost model prices it by.

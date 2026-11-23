@@ -10,7 +10,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyString, PyTuple};
 use quail_planner::physical::PhysicalGraph;
-use quail_planner::stages::Stage;
+use quail_planner::plan::stages::Stage;
 
 use super::{from_json, python_error};
 use crate::pyarrow::{stream_from_pyarrow, to_pyarrow};
@@ -142,7 +142,7 @@ impl Workers {
     ) -> PyResult<Vec<(String, Vec<Bound<'py, PyAny>>)>> {
         let graph: PhysicalGraph = from_json(graph)?;
         let cut: Vec<Stage> = from_json(stages)?;
-        quail_planner::physical::validate_graph(&graph.nodes, &graph.root)
+        quail_planner::topology::validate_graph(&graph.nodes, &graph.root)
             .map_err(PyValueError::new_err)?;
         let region: serde_json::Value = from_json(region)?;
         let tables = tables

@@ -5,6 +5,7 @@
 
 mod budgets;
 mod cost;
+mod graph;
 mod physical;
 mod workers;
 
@@ -320,8 +321,7 @@ impl NativeSession {
         &self,
         py: Python<'py>,
     ) -> PyResult<Vec<Bound<'py, pyo3::types::PyTuple>>> {
-        let mut regions = Vec::new();
-        for region in self.session.take_regions() {
+        self.session.take_regions(|region| {
             let inputs = pyo3::types::PyDict::new(py);
             for (name, batches) in region.inputs {
                 if let Some(first) = batches.first() {
@@ -341,7 +341,7 @@ impl NativeSession {
                 .collect::<PyResult<Vec<_>>>()?;
             let boots: Vec<String> = region.boots.iter().map(ToString::to_string).collect();
             let rows = to_pyarrow(py, region.rows.schema(), vec![region.rows])?;
-            regions.push(pyo3::types::PyTuple::new(
+            pyo3::types::PyTuple::new(
                 py,
                 [
                     pyo3::types::PyString::new(py, &region.planned).into_any(),
@@ -353,9 +353,8 @@ impl NativeSession {
                     region.seconds.into_pyobject(py)?.into_any(),
                     region.total_seconds.into_pyobject(py)?.into_any(),
                 ],
-            )?);
-        }
-        Ok(regions)
+            )
+        })
     }
 
     /// Run a query, read in `dialect` ("Snowflake" by default), and
@@ -595,7 +594,7 @@ fn bind_prompt(
 }
 
 /// The placements of a region's column operators that physical planning
-/// prices, as `quail_planner::placements::placements` returns them.
+/// prices, as `quail_planner::plan::placements::placements` returns them.
 ///
 /// Returns [(operators JSON, rewrite names), ...].
 #[pyfunction]
@@ -603,7 +602,7 @@ fn column_placements(operators: &str) -> PyResult<Vec<(String, Vec<String>)>> {
     let invalid = |error: serde_json::Error| PyValueError::new_err(error.to_string());
     let found: quail_planner::operators::Operators =
         serde_json::from_str(operators).map_err(invalid)?;
-    quail_planner::placements::placements(&found)
+    quail_planner::plan::placements::placements(&found)
         .into_iter()
         .map(|alternative| {
             Ok((
@@ -647,7 +646,7 @@ fn from_json<T: serde::de::DeserializeOwned>(text: &str) -> PyResult<T> {
     serde_json::from_str(text).map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
-/// Run one function of the planner's prompt lowering (`quail_planner::lowering`).
+/// Run one function of the planner's prompt lowering (`quail_planner::prompts::lowering`).
 ///
 /// `name` is the function; `arguments` its JSON-encoded arguments other
 /// than the tokenizer. Returns (the result as JSON, None), or (None, the
@@ -659,7 +658,7 @@ fn prompt_lowering<'py>(
     arguments: &str,
     tokenizer: Bound<'py, PyAny>,
 ) -> PyResult<(Option<String>, Option<String>)> {
-    use quail_planner::lowering as lower;
+    use quail_planner::prompts::lowering as lower;
     let tokens = python_tokenizer(py, &tokenizer);
     let arguments: serde_json::Value = from_json(arguments)?;
     let get = |index: usize| arguments[index].to_string();
@@ -707,8 +706,8 @@ fn model_answers<'py>(
     model: &str,
     tokenizer: Bound<'py, PyAny>,
 ) -> PyResult<(Vec<i64>, Vec<i64>, Vec<usize>)> {
-    let spec: quail_planner::cost::specs::ModelSpec = from_json(model)?;
-    let model = quail_planner::lowering::PromptModel {
+    let spec: quail_planner::specs::ModelSpec = from_json(model)?;
+    let model = quail_planner::prompts::lowering::PromptModel {
         role: spec.role.clone(),
         answer_spellings: spec.answer_spellings.clone(),
         turn: (spec.turn_prefix.clone(), spec.turn_suffix.clone()),
@@ -717,8 +716,9 @@ fn model_answers<'py>(
     let tokens = python_tokenizer(py, &tokenizer);
     let failed = |error: quail_planner::CompileError| PyRuntimeError::new_err(error.to_string());
     let (true_ids, false_ids) =
-        quail_planner::lowering::answer_ids(&model, &tokens).map_err(failed)?;
-    let offsets = quail_planner::lowering::answer_row_offsets(&model, &tokens).map_err(failed)?;
+        quail_planner::prompts::lowering::answer_ids(&model, &tokens).map_err(failed)?;
+    let offsets =
+        quail_planner::prompts::lowering::answer_row_offsets(&model, &tokens).map_err(failed)?;
     Ok((true_ids, false_ids, offsets))
 }
 
@@ -727,11 +727,11 @@ fn model_answers<'py>(
 #[pyfunction]
 fn read_specs(kind: &str, directory: &str) -> PyResult<String> {
     let directory = std::path::Path::new(directory);
-    let failed = |error: quail_planner::cost::specs::SpecError| PyValueError::new_err(error.0);
+    let failed = |error: quail_planner::specs::SpecError| PyValueError::new_err(error.0);
     let found = if kind == "models" {
-        serde_json::to_value(quail_planner::cost::specs::read_models(directory).map_err(failed)?)
+        serde_json::to_value(quail_planner::specs::read_models(directory).map_err(failed)?)
     } else {
-        serde_json::to_value(quail_planner::cost::specs::read_devices(directory).map_err(failed)?)
+        serde_json::to_value(quail_planner::specs::read_devices(directory).map_err(failed)?)
     };
     found
         .map(|value| value.to_string())
@@ -804,9 +804,9 @@ fn plan_operator<'py>(
                 .map_err(|error| quail_planner::CompileError::new(error.value(py).to_string()))
         }
     });
-    let decoder_ref: Option<&quail_planner::lowering::Decoder> = decoder
+    let decoder_ref: Option<&quail_planner::prompts::lowering::Decoder> = decoder
         .as_ref()
-        .map(|found| found as &quail_planner::lowering::Decoder);
+        .map(|found| found as &quail_planner::prompts::lowering::Decoder);
     let fields: ContextFields = from_json(context)?;
     let context = quail_planner::context::PlanningContext {
         model: json_value(fields.model)?,
@@ -844,7 +844,7 @@ fn plan_operator<'py>(
                 ));
             };
             let found: quail_planner::operators::Operators = json_value(get("operators"))?;
-            let inputs: quail_planner::sol::EstimateInputs = json_value(get("inputs"))?;
+            let inputs: quail_planner::pricing::sol::EstimateInputs = json_value(get("inputs"))?;
             let failed =
                 |error: PyErr| quail_planner::CompileError::new(error.value(py).to_string());
             let text = |method: &str, arguments: (String, String)| {
@@ -858,17 +858,19 @@ fn plan_operator<'py>(
                     .map_err(|error| quail_planner::CompileError::new(error.to_string()))
             };
             let encode = |value: &dyn erased_json::Json| value.json();
-            let answer = |prompt: &quail_planner::physical::Prompt,
-                          assignment: &quail_planner::sol::Assignment| {
-                parse(text(
-                    "answer",
-                    (encode(prompt), encode(&assignment.to_vec())),
-                )?)
-            };
-            let label = |prompt: &quail_planner::physical::Prompt,
-                         assignment: &quail_planner::sol::Assignment| {
-                text("label", (encode(prompt), encode(&assignment.to_vec())))
-            };
+            let answer =
+                |prompt: &quail_planner::physical::Prompt,
+                 assignment: &quail_planner::pricing::sol::Assignment| {
+                    parse(text(
+                        "answer",
+                        (encode(prompt), encode(&assignment.to_vec())),
+                    )?)
+                };
+            let label =
+                |prompt: &quail_planner::physical::Prompt,
+                 assignment: &quail_planner::pricing::sol::Assignment| {
+                    text("label", (encode(prompt), encode(&assignment.to_vec())))
+                };
             let accepts = |condition: &quail_planner::physical::ValueExpression,
                            values: &[serde_json::Value]| {
                 accepted_answers(condition, values)
@@ -882,13 +884,13 @@ fn plan_operator<'py>(
                     .map_err(|error| quail_planner::CompileError::new(error.to_string()))
             };
             let has_label = callbacks.getattr("has_label")?.extract::<bool>()?;
-            let oracles = quail_planner::sol::Oracles {
+            let oracles = quail_planner::pricing::sol::Oracles {
                 answer: &answer,
                 label: if has_label { Some(&label) } else { None },
                 accepts: &accepts,
                 subset_shared: &subset_shared,
             };
-            lowering_result(quail_planner::sol::speed_of_light_estimate(
+            lowering_result(quail_planner::pricing::sol::speed_of_light_estimate(
                 &found, &context, inputs, &oracles,
             ))
         }
@@ -897,7 +899,7 @@ fn plan_operator<'py>(
                 json_value(get("alternatives"))?;
             let rules: Vec<String> = json_value(get("rules"))?;
             lowering_result(
-                quail_planner::optimize::search_plan(&alternatives, &context, &rules).map(
+                quail_planner::plan::optimize::search_plan(&alternatives, &context, &rules).map(
                     |found| match found {
                         Ok(selected) => serde_json::json!({
                             "envelope": selected.plan.envelope(),
@@ -1149,11 +1151,11 @@ impl Tokenizer {
 }
 
 /// The `explain()` text of a request, as JSON: see
-/// `quail_planner::explain::ExplainRequest`.
+/// `quail_planner::plan::explain::ExplainRequest`.
 #[pyfunction]
 fn explain_plan(request: &str) -> PyResult<String> {
-    let request: quail_planner::explain::ExplainRequest = from_json(request)?;
-    quail_planner::explain::explain_text(&request).map_err(PyRuntimeError::new_err)
+    let request: quail_planner::plan::explain::ExplainRequest = from_json(request)?;
+    quail_planner::plan::explain::explain_text(&request).map_err(PyRuntimeError::new_err)
 }
 
 /// Collect a run's answers from its output relations, as
@@ -1264,7 +1266,7 @@ impl NativeFinishedRows {
         let request: crate::results::AnswerRequest = from_json(request)?;
         let found: quail_planner::operators::Operators = from_json(&request.operators)?;
         let mut sources = std::collections::HashMap::new();
-        for (name, expression) in quail_planner::results::source_columns(&found) {
+        for (name, expression) in quail_planner::plan::results::source_columns(&found) {
             let expression = serde_json::to_string(&expression)
                 .map_err(|error| PyValueError::new_err(error.to_string()))?;
             let values = one_batch(&evaluate.call1((&name, expression))?)?;
@@ -1366,11 +1368,11 @@ fn serve(py: Python<'_>, arguments: Vec<String>) -> PyResult<()> {
         .map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
-/// A region's facts as JSON, as `quail_planner::facts::region_facts`
+/// A region's facts as JSON, as `quail_planner::plan::facts::region_facts`
 /// reads them from its operators, given as JSON.
 #[pyfunction]
 fn region_facts(operators: &str) -> PyResult<String> {
-    quail_planner::facts::region_facts(&read_operators(operators)?)
+    quail_planner::plan::facts::region_facts(&read_operators(operators)?)
         .map(|facts| facts.to_string())
         .map_err(|error| PyValueError::new_err(error.to_string()))
 }
@@ -1439,7 +1441,7 @@ fn parse_expression<'py>(
 #[pyfunction]
 fn region_stages(graph: &str, gpus: usize) -> PyResult<String> {
     let graph: quail_planner::physical::PhysicalGraph = from_json(graph)?;
-    let cut = quail_planner::stages::stages(&graph, gpus).map_err(PyValueError::new_err)?;
+    let cut = quail_planner::plan::stages::stages(&graph, gpus).map_err(PyValueError::new_err)?;
     serde_json::to_string(&cut).map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
@@ -1448,11 +1450,12 @@ fn region_stages(graph: &str, gpus: usize) -> PyResult<String> {
 #[pymodule]
 pub fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     physical::register(module)?;
+    graph::register(module)?;
     // the rule lists Python's registry starts from
     module.add("LOGICAL_RULES", quail_datafusion::default_rule_names())?;
     module.add(
         "PHYSICAL_RULES",
-        quail_planner::physical_rules::PHYSICAL_RULES.to_vec(),
+        quail_planner::plan::physical_rules::PHYSICAL_RULES.to_vec(),
     )?;
     module.add_class::<NativeSession>()?;
     module.add_class::<RowStream>()?;
@@ -1476,7 +1479,7 @@ pub fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     // the names and numbers Python shares with the planner
     {
         use quail_planner::constants as shared;
-        use quail_planner::cost::specs;
+        use quail_planner::specs;
         module.add("SPAN_SUFFIX", shared::SPAN_SUFFIX)?;
         module.add("PROBABILITIES_SUFFIX", shared::PROBABILITIES_SUFFIX)?;
         module.add("NULL_DOCUMENT", shared::NULL_DOCUMENT)?;

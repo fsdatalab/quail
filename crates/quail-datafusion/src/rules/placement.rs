@@ -37,11 +37,13 @@ use std::sync::Arc;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, Result};
 use datafusion::logical_expr::utils::split_conjunction;
-use datafusion::logical_expr::{Expr, Filter, JoinType, LogicalPlan, Projection, Sort, SortExpr};
+use datafusion::logical_expr::{
+    Expr, Filter, JoinType, LogicalPlan, Projection, Sort, SortExpr, UserDefinedLogicalNodeCore,
+};
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
 use crate::ai::{AiNode, Semantics};
-use crate::extension::{as_node, extension_node};
+use crate::plan::{as_node, extension_node};
 
 /// Move each `AiNode` to the tables and joins it reads and order each
 /// table's operators, as the module explains.
@@ -102,7 +104,7 @@ fn plan_answers(plan: &LogicalPlan) -> Vec<(String, BTreeSet<String>)> {
     let mut found = Vec::new();
     let _ = plan.apply(|node| {
         if let Some(column) = as_node::<AiNode>(node) {
-            let read = expr_tables(&column.call, &[]);
+            let read = expr_tables(&column.call(), &[]);
             for field in &column.returned_fields() {
                 found.push((field.name().clone(), read.clone()));
             }
@@ -167,7 +169,7 @@ fn role(node: &AiNode) -> Role {
     if !node.is_predicate() {
         return Role::Column;
     }
-    if node.semantics == Semantics::Rows && expr_tables(&node.call, &[]).len() < 2 {
+    if node.semantics() == Semantics::Rows && expr_tables(&node.call(), &[]).len() < 2 {
         return Role::TableFilter;
     }
     Role::Join
@@ -182,14 +184,14 @@ fn mover(node: &LogicalPlan) -> Option<Mover> {
     if let Some(ai) = as_node::<AiNode>(node) {
         // moving a node with a fetch below an operator moves the operator
         // above the fetch
-        if ai.fetch.is_some() {
+        if ai.has_fetch() {
             return None;
         }
         // every table the node reads, by its call, guard, or filter
-        let answers = plan_answers(&ai.input);
-        let mut tables = expr_tables(&ai.call, &[]);
-        for expr in ai.guard.iter().chain(&ai.filter) {
-            tables.extend(expr_tables(expr, &answers));
+        let answers = plan_answers(ai.inputs()[0]);
+        let mut tables = expr_tables(&ai.call(), &[]);
+        for expr in ai.guard().into_iter().chain(ai.filter()) {
+            tables.extend(expr_tables(&expr, &answers));
         }
         // an AI filter whose answer the query reads adds it as a column
         let added = ai
@@ -275,9 +277,8 @@ fn lift_above_limit(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     };
     // a node over another shares its documents' KV with it, which rows
     // cut off between them would not keep
-    let shares = as_node::<AiNode>(node.input.as_ref()).is_some();
-    let limited_rows = node.filter.is_some() || node.fetch.is_some() || node.guard.is_some();
-    if node.semantics != Semantics::Rows || limited_rows || shares {
+    let shares = as_node::<AiNode>(node.inputs()[0]).is_some();
+    if !node.asks_every_row() || shares {
         return Ok(Transformed::no(plan));
     }
     // each sort key as the node's input computes it
@@ -294,7 +295,7 @@ fn lift_above_limit(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
             _ => return Ok(Transformed::no(plan)),
         }
     }
-    let rows = node.input.as_ref().clone();
+    let rows = node.inputs()[0].clone();
     let kept = match &plan {
         LogicalPlan::Limit(_) => with_input(&plan, sorted(keys_below, rows, None))?,
         _ => sorted(keys_below, rows, sort.fetch),
@@ -311,7 +312,7 @@ fn lift_above_limit(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
 
 /// `node`, whose one input was `input`, over `below` instead.
 fn with_input(node: &LogicalPlan, below: LogicalPlan) -> Result<LogicalPlan> {
-    crate::extension::with_inputs(node, vec![below])
+    crate::plan::with_inputs(node, vec![below])
 }
 
 /// The tables each input of a join holds.
@@ -364,13 +365,13 @@ fn push_down(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
             let (keeps_left, keeps_right) = preserved_sides(join.join_type);
             if keeps_left && moving.tables.is_subset(&left) {
                 let below = with_input(&node, join.left.as_ref().clone())?;
-                Some(crate::extension::with_inputs(
+                Some(crate::plan::with_inputs(
                     &input,
                     vec![below, join.right.as_ref().clone()],
                 )?)
             } else if keeps_right && moving.tables.is_subset(&right) {
                 let below = with_input(&node, join.right.as_ref().clone())?;
-                Some(crate::extension::with_inputs(
+                Some(crate::plan::with_inputs(
                     &input,
                     vec![join.left.as_ref().clone(), below],
                 )?)
@@ -379,14 +380,14 @@ fn push_down(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
             }
         }
         LogicalPlan::Extension(_) if let Some(join) = ai_join(&input) => {
-            let sides = join_sides(&join.input);
+            let sides = join_sides(join.inputs()[0]);
             let fits = sides.is_some_and(|(left, right)| {
                 moving.tables.is_subset(&left) || moving.tables.is_subset(&right)
             });
             // a classification of joined rows reads the pairs the join keeps
-            let same_pair = moving.pairs && expr_tables(&join.call, &[]) == moving.tables;
+            let same_pair = moving.pairs && expr_tables(&join.call(), &[]) == moving.tables;
             if fits && !same_pair {
-                let below = with_input(&node, join.input.as_ref().clone())?;
+                let below = with_input(&node, join.inputs()[0].clone())?;
                 Some(with_input(&input, below)?)
             } else {
                 None
@@ -468,7 +469,7 @@ fn order_stack(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
             } else {
                 Item::Column(ai.clone())
             });
-            below = ai.input.as_ref().clone();
+            below = ai.inputs()[0].clone();
         } else if let LogicalPlan::Filter(filter) = &below {
             for term in split_conjunction(&filter.predicate).into_iter().rev() {
                 items.push(Item::Test(term.clone()));
@@ -521,7 +522,7 @@ fn order_stack(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
             continue;
         }
         for column in reads {
-            if !placed.iter().any(|found| found.answer == column.answer) {
+            if !placed.iter().any(|found| found.answer() == column.answer()) {
                 placed.push(column);
                 sequence.push(Item::Column(column.clone()));
             }
@@ -532,7 +533,7 @@ fn order_stack(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     let mut ordered: Vec<&AiNode> = columns.iter().collect();
     ordered.sort_by_key(|column| kind(column));
     for column in ordered {
-        if placed.iter().any(|found| found.answer == column.answer) {
+        if placed.iter().any(|found| found.answer() == column.answer()) {
             continue;
         }
         placed.push(column);
@@ -554,7 +555,7 @@ fn order_stack(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     let stack: BTreeSet<String> = filters
         .iter()
         .chain(&columns)
-        .flat_map(|found| found.fields.iter().map(|field| field.name().clone()))
+        .flat_map(AiNode::added_names)
         .collect();
     let needs = |item: &Item| -> BTreeSet<String> {
         let read: BTreeSet<String> = match item {
@@ -580,7 +581,7 @@ fn order_stack(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
         };
         plan = match sequence.remove(next) {
             Item::Filter(found) | Item::Column(found) => {
-                available.extend(found.fields.iter().map(|field| field.name().clone()));
+                available.extend(found.added_names());
                 extension_node(found.with_input(plan)?)
             }
             Item::Test(test) => LogicalPlan::Filter(Filter::try_new(test, Arc::new(plan))?),

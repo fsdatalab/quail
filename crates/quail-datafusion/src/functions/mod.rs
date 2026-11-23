@@ -7,6 +7,7 @@
 
 pub(crate) mod field_access;
 pub(crate) mod image;
+pub(crate) mod options;
 pub(crate) mod parse_document;
 pub(crate) mod pdf_pages;
 mod quiet;
@@ -197,6 +198,18 @@ pub fn quail_functions() -> Vec<Arc<ScalarUDF>> {
     .into_iter()
     .map(|(name, kind)| Arc::new(ScalarUDF::new_from_impl(QuailFunction::new(name, kind))))
     .collect()
+}
+
+/// The Quail function named `name`, such as `ai_extract_span`.
+///
+/// # Panics
+///
+/// `name` is not one of Quail's functions.
+pub(crate) fn quail_function(name: &str) -> Arc<ScalarUDF> {
+    quail_functions()
+        .into_iter()
+        .find(|function| function.name() == name)
+        .expect("a Quail function")
 }
 
 /// Whether an expression calls one of Quail's functions: an AI

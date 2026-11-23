@@ -1,9 +1,9 @@
 //! Pass groups of a set-attention chain.
 
-use crate::cost::quantity::Quantity;
 use crate::cost::sol::unrounded_seconds;
-use crate::cost::specs::{DeviceSpec, ModelSpec};
+use crate::cost::work::Quantity;
 use crate::cost::work::packed;
+use crate::specs::{DeviceSpec, ModelSpec};
 
 /// Split an ordered chain of questions into consecutive pass groups,
 /// the cheapest split by dynamic programming.

@@ -16,8 +16,8 @@ use quail_planner::error::CompileError;
 use quail_planner::expressions::column_references;
 use quail_planner::operators::Operators;
 use quail_planner::physical::{PhysicalGraph, PhysicalNode};
-use quail_planner::results::source_columns;
-use quail_planner::stages::{Stage, compute_nodes};
+use quail_planner::plan::results::source_columns;
+use quail_planner::plan::stages::{Stage, compute_nodes};
 use serde_json::{Value, json};
 
 use crate::finished::FinishedRows;
@@ -60,7 +60,7 @@ impl Planned<'_> {
         let last = (nodes.last()).ok_or_else(|| failure("the plan has no compute operation"))?;
         let port = (last.output_ports().into_iter().next())
             .ok_or_else(|| failure("the plan's last node has no output"))?;
-        let root = quail_planner::physical::port(last.id(), &port.name);
+        let root = quail_planner::topology::port(last.id(), &port.name);
         Ok(PhysicalGraph { nodes, root })
     }
 

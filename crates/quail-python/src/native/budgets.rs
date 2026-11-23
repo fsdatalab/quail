@@ -5,9 +5,10 @@ use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
+use quail_planner::budgets;
 use quail_planner::cost::decode::DecodeCost;
-use quail_planner::cost::specs::{DeviceSpec, ModelSpec};
-use quail_planner::cost::{answers, budgets, draft_policy, retention};
+use quail_planner::cost::{answers, draft_policy, retention};
+use quail_planner::specs::{DeviceSpec, ModelSpec};
 
 /// One model's memory and time budgets, on one device when given.
 #[pyclass(name = "Budgets", module = "_quail_native", frozen)]

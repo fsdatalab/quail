@@ -17,23 +17,17 @@
 //! | `labels` | `quail/labels.py`, the trie the costs read |
 
 pub mod answers;
-pub mod budgets;
 pub mod classify;
 pub mod decode;
 pub mod dense_decoder_cost;
 pub mod draft_policy;
 pub mod extract;
-pub mod filters;
 pub mod joins;
-pub mod labels;
 pub mod packing;
-pub mod quantity;
 pub mod retention;
-pub mod roofline;
 pub mod sae_features;
 pub mod score;
 pub mod sol;
-pub mod specs;
 pub mod statistics;
 pub mod work;
 
@@ -41,7 +35,7 @@ pub mod work;
 mod tests {
     use std::path::Path;
 
-    use crate::cost::specs::{ModelSpec, Precision, read_devices, read_models};
+    use crate::specs::{ModelSpec, Precision, read_devices, read_models};
 
     fn data(kind: &str) -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))

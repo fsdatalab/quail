@@ -15,7 +15,7 @@ use datafusion::arrow::compute::cast;
 use datafusion::arrow::compute::{concat_batches, filter_record_batch};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::{Constraints, DataFusionError, Result};
+use datafusion::common::{Constraint, Constraints, DataFusionError, Result};
 use datafusion::datasource::TableType;
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::{Expr, LogicalPlan, TableProviderFilterPushDown};
@@ -302,7 +302,7 @@ impl Executor {
 
     /// What the planner's explain reads of a planned region, as
     /// [`outcome_json`] writes the region: a
-    /// `quail_planner::explain::ExplainRequest` as JSON.
+    /// `quail_planner::plan::explain::ExplainRequest` as JSON.
     pub(crate) fn explain_request(
         &self,
         planned: &serde_json::Value,
@@ -452,10 +452,25 @@ impl Executor {
         self.progress.lock().expect("the progress lock").clone()
     }
 
-    /// What each region of the last query ran on the workers, in the
-    /// order the regions ran; the executor keeps none of it.
-    pub fn take_regions(&self) -> Vec<RegionRan> {
-        std::mem::take(&mut *self.regions.lock().expect("the regions lock"))
+    /// Hand what each region of the last query ran on the workers to
+    /// `each`, in the order the regions ran, and return what `each`
+    /// makes of them; the executor keeps none of it.
+    ///
+    /// # Errors
+    ///
+    /// `each` fails; the regions after the one it failed on are dropped.
+    pub fn take_regions<T, E>(
+        &self,
+        each: impl FnMut(RegionRan) -> std::result::Result<T, E>,
+    ) -> std::result::Result<Vec<T>, E> {
+        let regions = std::mem::take(&mut *self.regions.lock().expect("the regions lock"));
+        regions.into_iter().map(each).collect()
+    }
+
+    /// Drop what each region of the last query ran, such as after the
+    /// query failed.
+    pub fn discard_regions(&self) {
+        self.regions.lock().expect("the regions lock").clear();
     }
 
     pub(crate) fn enter(&self, sender: UnboundedSender<RegionCall>) -> Result<CallerGuard<'_>> {
@@ -858,7 +873,7 @@ impl Executor {
                     if planned.get("envelope").is_some() {
                         let request = self.explain_request(&planned, false)?;
                         let request = serde_json::from_value(request).map_err(read)?;
-                        let explained = quail_planner::explain::explain_text(&request)
+                        let explained = quail_planner::plan::explain::explain_text(&request)
                             .map_err(DataFusionError::Execution)?;
                         observer(RegionEvent::Planned {
                             explained: &explained,
@@ -961,11 +976,11 @@ fn run_on_workers(
     let scanned: Vec<crate::request::Scanned> = scans
         .iter()
         .map(|scan| {
-            let tokens = (
-                Arc::clone(scan.tokens.schema()),
-                scan.tokens.record_batches().to_vec(),
-            );
-            (scan.alias.clone(), tokens, scan.columns.clone())
+            (
+                scan.alias.clone(),
+                scan.tokens.to_table(),
+                scan.columns.clone(),
+            )
         })
         .collect();
     // the workers and the answers name a scan by its alias
@@ -1235,7 +1250,6 @@ fn source_lookup(
     batches: &[RecordBatch],
 ) -> Result<Option<datafusion::arrow::array::UInt64Array>> {
     use datafusion::arrow::datatypes::DataType;
-    use datafusion::common::Constraint;
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
     use datafusion::datasource::source_as_provider;
     use datafusion::logical_expr::LogicalPlan;
@@ -1258,20 +1272,13 @@ fn source_lookup(
     let Some(scanned) = table.inner().downcast_ref::<ScannedTable>() else {
         return Ok(None);
     };
-    let key = scanned
-        .constraints
-        .iter()
-        .find_map(|constraint| match constraint {
-            Constraint::PrimaryKey(keys) if keys.len() == 1 => Some(keys[0]),
-            _ => None,
-        });
-    let Some(key) = key.map(|index| scanned.schema.field(index).name().clone()) else {
+    let Some(key) = scanned.id_column() else {
         return Ok(None);
     };
     let Some(first) = batches.first() else {
         return Ok(None);
     };
-    let Ok(column) = first.schema().index_of(&key) else {
+    let Ok(column) = first.schema().index_of(key) else {
         return Ok(None);
     };
     let texts = |values: &ArrayRef| -> Result<Vec<Option<String>>> {
@@ -1287,7 +1294,7 @@ fn source_lookup(
     };
     let mut positions: HashMap<String, u64> = HashMap::new();
     let mut next = 0u64;
-    for batch in scanned.column_rows(&key)? {
+    for batch in scanned.column_rows(key)? {
         let column = batch.columns().first().ok_or_else(|| {
             DataFusionError::Execution(format!("the table's scan returned no column {key}"))
         })?;
@@ -1402,43 +1409,24 @@ fn planning_tables(
         let Some(scanned) = table.inner().downcast_ref::<ScannedTable>() else {
             continue;
         };
-        let mut names = required.get(&name).cloned().unwrap_or_default();
+        let names = required.get(&name).map_or(&[][..], Vec::as_slice);
         // The hint reads passed-through columns by source position. Include
         // them and primary keys even if no physical alternative reads them.
-        for column in &columns.0 {
-            if let quail_datafusion::RegionColumn::Source(source, index) = column
-                && *source == name
-            {
-                names.push(scanned.schema.field(*index).name().clone());
-            }
-        }
-        for constraint in scanned.constraints.iter() {
-            if let datafusion::common::Constraint::PrimaryKey(indices) = constraint {
-                names.extend(
-                    indices
-                        .iter()
-                        .map(|index| scanned.schema.field(*index).name().clone()),
-                );
-            }
-        }
-        let mut indices = names
-            .iter()
-            .map(|name| scanned.schema.index_of(name))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        indices.sort_unstable();
-        indices.dedup();
-        let schema = Arc::new(scanned.schema.project(&indices)?);
-        let names = schema
-            .fields()
-            .iter()
-            .map(|field| field.name().clone())
+        let positions: Vec<usize> = (columns.0.iter())
+            .filter_map(|column| match column {
+                quail_datafusion::RegionColumn::Source(source, index) if *source == name => {
+                    Some(*index)
+                }
+                _ => None,
+            })
             .collect();
+        let (schema, batches) = scanned.rows_with_keys(names, &positions)?;
         tables.insert(
             name,
             TableRows {
                 identity: Some(table.identity().to_string()),
                 schema,
-                batches: scanned.scan_columns(names)?,
+                batches,
             },
         );
     }
@@ -1475,11 +1463,9 @@ fn whole_table_identity(input: &datafusion::logical_expr::LogicalPlan) -> Option
                     let scanned = table.inner().downcast_ref::<ScannedTable>()?;
                     // in_source_order restores only inputs retaining the source
                     // primary key. Otherwise partition order is not stable.
-                    let ordered = scanned.constraints.iter().any(|constraint| {
-                        matches!(constraint, datafusion::common::Constraint::PrimaryKey(keys)
-                            if keys.len() == 1 && input.schema().as_arrow()
-                                .index_of(scanned.schema.field(keys[0]).name()).is_ok())
-                    });
+                    let ordered = scanned
+                        .id_column()
+                        .is_some_and(|key| input.schema().as_arrow().index_of(key).is_ok());
                     ordered.then(|| table.identity().to_string())
                 });
             }
@@ -1573,6 +1559,49 @@ impl ScannedTable {
             state,
             constraints,
         }
+    }
+
+    /// The name of the id column: the column of a primary key of one
+    /// column.
+    fn id_column(&self) -> Option<&str> {
+        self.constraints
+            .iter()
+            .find_map(|constraint| match constraint {
+                Constraint::PrimaryKey(keys) if keys.len() == 1 => {
+                    Some(self.schema.field(keys[0]).name().as_str())
+                }
+                _ => None,
+            })
+    }
+
+    /// Every row of the named columns, the columns at `positions`, and
+    /// the primary key columns, in the table's column order: their
+    /// schema and the rows.
+    ///
+    /// # Errors
+    ///
+    /// The table has no column of a name, or the scan fails.
+    fn rows_with_keys(
+        &self,
+        names: &[String],
+        positions: &[usize],
+    ) -> Result<crate::shared::Table> {
+        let keys = (self.constraints.iter()).flat_map(|constraint| match constraint {
+            Constraint::PrimaryKey(keys) => keys.as_slice(),
+            _ => &[],
+        });
+        let mut indices = names
+            .iter()
+            .map(|name| self.schema.index_of(name))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        indices.extend(positions.iter().chain(keys));
+        indices.sort_unstable();
+        indices.dedup();
+        let schema = Arc::new(self.schema.project(&indices)?);
+        let names = (schema.fields().iter())
+            .map(|field| field.name().clone())
+            .collect();
+        Ok((schema, self.scan_columns(names)?))
     }
 
     /// One column of the table's rows.

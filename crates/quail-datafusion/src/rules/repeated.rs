@@ -29,11 +29,13 @@ use std::sync::Arc;
 
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column, Result};
-use datafusion::logical_expr::{Expr, Filter, LogicalPlan, Projection, SubqueryAlias};
+use datafusion::logical_expr::{
+    Expr, Filter, LogicalPlan, Projection, SubqueryAlias, UserDefinedLogicalNodeCore,
+};
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
 use crate::ai::{AiNode, Semantics};
-use crate::extension::{as_node, extension_node};
+use crate::plan::{as_node, extension_node};
 
 /// Make each repeated AI call read the answer of the same call below it,
 /// as the module explains.
@@ -58,19 +60,15 @@ fn merge(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     let Some(upper) = as_node::<AiNode>(&plan) else {
         return Ok(Transformed::no(plan));
     };
-    if upper.semantics != Semantics::Rows || upper.has_options() {
+    if upper.semantics() != Semantics::Rows || upper.has_options() {
         return Ok(Transformed::no(plan));
     }
     let Some(lower) = same_call_below(upper) else {
         return Ok(Transformed::no(plan));
     };
-    let answers = &upper.fields;
-    let input = upper.input.as_ref().clone();
-    let names: Vec<String> = lower
-        .fields
-        .iter()
-        .map(|field| field.name().clone())
-        .collect();
+    let answers = upper.added_names();
+    let input = upper.inputs()[0].clone();
+    let names = lower.added_names();
     // the lower node's answers as the upper node's input names them,
     // added to each derived table's SELECT list between them
     let Some((exposed, read)) = expose(&input, lower, &names)? else {
@@ -86,7 +84,7 @@ fn merge(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
         answers
             .iter()
             .zip(read)
-            .map(|(field, column)| Expr::Column(column).alias(field.name())),
+            .map(|(name, column)| Expr::Column(column).alias(name)),
     );
     Ok(Transformed::yes(LogicalPlan::Projection(
         Projection::try_new(exprs, Arc::new(exposed))?,
@@ -243,8 +241,8 @@ pub(crate) fn through_alias(expr: &Expr, alias: &SubqueryAlias) -> Option<Expr> 
 /// makes `upper`'s call, each column read by the name the node's input
 /// gives it, has no options, and adds columns of the same types.
 fn same_call_below(upper: &AiNode) -> Option<&AiNode> {
-    let mut plan = upper.input.as_ref();
-    let mut call = upper.call.clone();
+    let mut plan = upper.inputs()[0];
+    let mut call = upper.call();
     loop {
         plan = match plan {
             LogicalPlan::Filter(filter) => filter.input.as_ref(),
@@ -258,19 +256,13 @@ fn same_call_below(upper: &AiNode) -> Option<&AiNode> {
             }
             LogicalPlan::Extension(_) => {
                 let node = as_node::<AiNode>(plan)?;
-                if node.semantics != Semantics::Rows {
+                if node.semantics() != Semantics::Rows {
                     return None;
                 }
-                let same_types = node.fields.len() == upper.fields.len()
-                    && node
-                        .fields
-                        .iter()
-                        .zip(&upper.fields)
-                        .all(|(found, field)| found.data_type() == field.data_type());
-                if node.call == call && same_types && !node.has_options() {
+                if node.repeats(&call, upper) {
                     return Some(node);
                 }
-                node.input.as_ref()
+                node.inputs()[0]
             }
             _ => return None,
         };

@@ -56,8 +56,16 @@ impl CompileError {
         &self.message
     }
 
-    pub fn refusal(&self) -> Option<&Refusal> {
-        self.refusal.as_deref()
+    /// The refusal the error carries, or the error itself when it carries none.
+    ///
+    /// # Errors
+    ///
+    /// The error carries no refusal.
+    pub fn into_refusal(self) -> Result<Refusal, CompileError> {
+        match self.refusal {
+            Some(refusal) => Ok(*refusal),
+            None => Err(self),
+        }
     }
 
     pub fn kind(&self) -> ErrorKind {
@@ -122,8 +130,8 @@ mod tests {
         refusal.reasons.clear();
         let error = CompileError::refused(refusal.clone());
         assert_eq!(error.message(), "memory");
-        assert_eq!(error.refusal(), Some(&refusal));
         assert_eq!(error.kind(), ErrorKind::Invalid);
+        assert_eq!(error.into_refusal(), Ok(refusal));
     }
 
     #[test]

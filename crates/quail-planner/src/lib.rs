@@ -13,37 +13,20 @@
 //! - [`explain`], [`sol`], [`request_plan`]: plan text, speed-of-light
 //!   estimates, and the plans of the request baselines.
 
+pub mod budgets;
 pub mod cost;
 pub mod inputs;
 pub mod physical;
 
-pub mod classify;
-pub mod columns;
 pub mod constants;
 pub mod context;
-pub mod costs;
 pub mod error;
-pub mod explain;
 pub mod expressions;
-pub mod facts;
-pub mod graph;
-pub mod lowering;
 pub mod operators;
-pub mod optimize;
-pub mod physical_rules;
-pub mod placements;
-pub mod plan_statistics;
+pub mod plan;
 pub mod pricing;
 pub mod prompts;
-pub mod request_order;
-pub mod request_plan;
-pub mod results;
-pub mod retention;
-pub mod scores;
-pub mod search;
-pub mod sol;
-pub mod stages;
-pub mod statistics;
-pub mod validation;
+pub mod specs;
+pub mod topology;
 
 pub use error::{CompileError, ErrorKind, Refusal, compile_error};

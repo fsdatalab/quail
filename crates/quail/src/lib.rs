@@ -277,10 +277,23 @@ impl Session {
         self.runner.progress()
     }
 
-    /// What each model region of the last query ran on the workers, in
-    /// the order the regions ran; the session keeps none of it.
-    pub fn take_regions(&self) -> Vec<RegionRan> {
-        self.runner.take_regions()
+    /// Hand what each model region of the last query ran on the workers
+    /// to `each`, as [`Executor::take_regions`] does.
+    ///
+    /// # Errors
+    ///
+    /// `each` fails.
+    pub fn take_regions<T, E>(
+        &self,
+        each: impl FnMut(RegionRan) -> std::result::Result<T, E>,
+    ) -> std::result::Result<Vec<T>, E> {
+        self.runner.take_regions(each)
+    }
+
+    /// Drop what each model region of the last query ran, such as after
+    /// the query failed.
+    pub fn discard_regions(&self) {
+        self.runner.discard_regions();
     }
 
     /// The DataFusion context, for registering tables or functions.
@@ -537,7 +550,8 @@ impl Session {
                 let planned: serde_json::Value = serde_json::from_str(&planned).map_err(read)?;
                 let request = self.runner.explain_request(&planned, verbose)?;
                 let request = serde_json::from_value(request).map_err(read)?;
-                quail_planner::explain::explain_text(&request).map_err(DataFusionError::Execution)
+                quail_planner::plan::explain::explain_text(&request)
+                    .map_err(DataFusionError::Execution)
             })
             .collect()
     }
@@ -559,13 +573,11 @@ impl Session {
     ) -> Result<(SchemaRef, Vec<RecordBatch>, Vec<String>)> {
         let read = |error: serde_json::Error| DataFusionError::External(Box::new(error));
         let (schema, batches) = self.sql_in_dialect(query, dialect)?;
-        let explained = (self.take_regions().iter())
-            .map(|region| {
-                let request = self.runner.analyzed_request(region, verbose)?;
-                let request = serde_json::from_value(request).map_err(read)?;
-                quail_planner::explain::explain_text(&request).map_err(DataFusionError::Execution)
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let explained = self.take_regions(|region| {
+            let request = self.runner.analyzed_request(&region, verbose)?;
+            let request = serde_json::from_value(request).map_err(read)?;
+            quail_planner::plan::explain::explain_text(&request).map_err(DataFusionError::Execution)
+        })?;
         Ok((schema, batches, explained))
     }
 

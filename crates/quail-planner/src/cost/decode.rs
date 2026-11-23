@@ -5,10 +5,10 @@
 //! `replay_seconds`, `gain`) stay in Python with the executor.
 
 use crate::cost::dense_decoder_cost::dense_decoder_components;
-use crate::cost::quantity::python_sum;
 use crate::cost::retention::{Coefficients, coefficients};
-use crate::cost::specs::{DeviceSpec, ModelSpec};
 use crate::cost::work::Work;
+use crate::cost::work::python_sum;
+use crate::specs::{DeviceSpec, ModelSpec};
 
 /// Prices decode passes and prefix recomputation in seconds.
 #[derive(Debug, Clone, PartialEq)]
@@ -44,7 +44,7 @@ impl DecodeCost {
     /// A count in `work` is an array.
     pub fn lower_bound_seconds(&self, work: &Work, passes: f64) -> f64 {
         let value =
-            |quantity: &crate::cost::quantity::Quantity| quantity.scalar().expect("summed work");
+            |quantity: &crate::cost::work::Quantity| quantity.scalar().expect("summed work");
         let policy = &self.recompute_cost;
         let memory = passes * self.weight_seconds
             + self.kv_seconds * value(&work.kv_read)

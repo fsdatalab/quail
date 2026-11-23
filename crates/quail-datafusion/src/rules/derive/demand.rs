@@ -42,16 +42,14 @@ use datafusion::logical_expr::expr_rewriter::NamePreserver;
 use datafusion::logical_expr::utils::{conjunction, split_binary, split_conjunction};
 use datafusion::logical_expr::{
     BinaryExpr, Distinct, EmptyRelation, Expr, FetchType, Filter, JoinType, LogicalPlan, Operator,
-    SkipType, lit,
+    SkipType, UserDefinedLogicalNodeCore, lit,
 };
 
-use super::fetch::{at_least, distinct_key, input_key, is_count_star, stops_per_key};
-use crate::ai::{AiNode, Fetch, Semantics};
-use crate::derive::unfolded;
-use crate::extension::{as_node, extension_node, with_inputs};
+use super::fetch::{at_least, is_count_star};
+use crate::ai::{AiNode, Semantics};
+use crate::functions::options::unfolded;
+use crate::plan::{as_node, extension_node, with_inputs};
 use crate::rules::distinct::{is_distinct, is_unique};
-use crate::rules::guards::reads_call_table;
-use crate::rules::or_guards::or_terms;
 use crate::rules::projection::{question_fields, replace_call, with_fields};
 use crate::rules::repeated::{through_alias, through_projection};
 use crate::rules::substring::precheck;
@@ -659,28 +657,16 @@ impl Pass {
     fn node(&mut self, plan: LogicalPlan, demand: Demand) -> Result<(LogicalPlan, Taken)> {
         let mut node = as_node::<AiNode>(&plan).expect("an AiNode").clone();
         let mut taken = Taken::default();
-        let input_schema = Arc::clone(node.input.schema());
+        let input_schema = Arc::clone(node.input_schema());
         let reads_input_only = |expr: &Expr| {
             expr.column_refs()
                 .iter()
                 .all(|column| input_schema.has_column(column))
         };
         // a test of the node's answer becomes its filter
-        if self.options.filters && node.fetch.is_none() && node.semantics == Semantics::Rows {
-            let returned: BTreeSet<String> = (node.returned_fields().iter())
-                .map(|field| field.name().clone())
-                .collect();
+        if self.options.filters {
             for test in &demand.tests {
-                let reads_returned = (test.expr.column_refs().iter())
-                    .any(|column| column.relation.is_none() && returned.contains(&column.name));
-                // a call written twice tests the one answer twice
-                let held =
-                    (node.filter.iter().flat_map(split_conjunction)).any(|term| *term == test.expr);
-                if reads_returned && (held || node.accepts_test(&test.expr)) {
-                    if !held {
-                        node.filter =
-                            conjunction(node.filter.take().into_iter().chain([test.expr.clone()]));
-                    }
+                if node.take_test(&test.expr) {
                     taken.tests.insert(test.id);
                 }
             }
@@ -695,34 +681,24 @@ impl Pass {
         let fetch = match &demand.count {
             _ if !decided || !node.accepts_fetch() => None,
             Count::All => None,
-            Count::Rows(rows) => match &node.fetch {
-                Some(Fetch::PerKey { .. }) => None,
-                Some(Fetch::Global(found)) if *found <= *rows => None,
-                _ => Some(Fetch::Global(*rows)),
-            },
-            Count::Distinct(keys) => (node.semantics == Semantics::Rows && node.fetch.is_none())
-                .then(|| distinct_key(&node, keys))
-                .flatten()
-                .map(|key| Fetch::PerKey { key, n: 1 }),
-            Count::PerKey(keys, n) => stops_per_key(&node)
-                .then(|| input_key(&node, keys))
-                .flatten()
-                .map(|key| Fetch::PerKey { key, n: *n }),
+            Count::Rows(rows) => node.rows_fetch(*rows),
+            Count::Distinct(keys) => node.distinct_fetch(keys),
+            Count::PerKey(keys, n) => node.per_key_fetch(keys, *n),
         };
-        let mut input = node.input.as_ref().clone();
-        let fetched = fetch.is_some() || node.fetch.is_some() && demand.count != Count::All;
+        let mut input = node.inputs()[0].clone();
+        let fetched = fetch.is_some() || node.has_fetch() && demand.count != Count::All;
         if let Some(fetch) = fetch {
             if let Some(predicate) = conjunction(below_tests.iter().map(|test| test.expr.clone())) {
                 input = LogicalPlan::Filter(Filter::try_new(predicate, Arc::new(input))?);
             }
             taken.tests.extend(below_tests.iter().map(|test| test.id));
-            node.fetch = Some(fetch);
+            node = node.with_fetch(fetch);
             taken.count = true;
         }
         // an extraction whose answer must contain a literal reads only the
         // documents that contain it
         if self.options.filters
-            && node.fetch.is_none()
+            && !node.has_fetch()
             && let Some(test) = precheck(&node, &input)
         {
             input = LogicalPlan::Filter(Filter::try_new(test, Arc::new(input))?);
@@ -772,24 +748,21 @@ impl Pass {
                 .filter(|(column, _)| input_schema.has_column(column))
                 .map(|(column, read)| (column.clone(), weaken(read, &reads_input_only)))
                 .collect();
-            for expr in [Some(&node.call), node.guard.as_ref(), node.hint.as_ref()]
-                .into_iter()
-                .flatten()
-            {
+            for expr in node.asked_expressions() {
                 for column in expr.column_refs() {
                     add_read(&mut found, column, lit(true));
                 }
             }
-            if let Some(filter) = &node.filter {
+            if let Some(filter) = node.filter() {
                 for column in filter.column_refs() {
                     if input_schema.has_column(column) {
-                        let within = read_condition(filter, column).unwrap_or(lit(true));
+                        let within = read_condition(&filter, column).unwrap_or(lit(true));
                         let within = weaken(&within, &reads_input_only);
                         add_read(&mut found, column, within);
                     }
                 }
             }
-            for test in &node.tests {
+            for test in node.tests() {
                 for column in test.test.column_refs() {
                     add_read(&mut found, column, lit(true));
                 }
@@ -798,21 +771,18 @@ impl Pass {
         });
         // a node that returns each input row as it is passes the count on
         let count = match &demand.count {
-            _ if taken.count || node.fetch.is_some() => Count::All,
+            _ if taken.count || node.has_fetch() => Count::All,
             Count::Rows(_)
-                if node.semantics == Semantics::Rows && node.filter.is_none() && decided =>
+                if node.semantics() == Semantics::Rows && node.filter().is_none() && decided =>
             {
                 demand.count.clone()
             }
             _ => Count::All,
         };
         // the node's own expressions read their columns whole
-        let own: BTreeSet<Column> = ([Some(&node.call), node.guard.as_ref(), node.hint.as_ref()])
-            .into_iter()
-            .flatten()
-            .chain(node.filter.iter())
-            .chain(node.tests.iter().map(|test| &test.test))
-            .flat_map(|expr| expr.column_refs().into_iter().cloned())
+        let own: BTreeSet<Column> = (node.asked_expressions().into_iter())
+            .chain(node.filter_expressions())
+            .flat_map(|expr| expr.column_refs().into_iter().cloned().collect::<Vec<_>>())
             .collect();
         let fields = (without_tests(&held.fields, &held.tests).into_iter())
             .filter(|(column, _)| input_schema.has_column(column) && !own.contains(column))
@@ -837,64 +807,38 @@ impl Pass {
     }
 }
 
-/// Return only the added columns the plan above reads, the answer always.
-/// An `AI.IF` that keeps only the rows whose answer is `b`, or only those
-/// whose answer is `NOT b`, returns no column: a read of the answer above
-/// reads the value every row it returns has, which this returns.
+/// Return only the added columns the plan above reads, as
+/// [`AiNode::project`] explains.
 fn project(node: &mut AiNode, above: &Demand) -> Option<(String, bool)> {
-    if node.semantics != Semantics::Rows || above.reads.is_none() {
-        return None;
-    }
-    let read = |name: &str| above.read_where(&Column::from_name(name)).is_some();
-    if !node.is_predicate() {
-        let returned =
-            (node.projection.clone()).unwrap_or_else(|| (0..node.fields.len()).collect());
-        let kept: Vec<usize> = (returned.iter().copied())
-            .filter(|index| *index == 0 || read(node.fields[*index].name()))
-            .collect();
-        if kept.len() < returned.len() {
-            node.projection = Some(kept);
-        }
-        return None;
-    }
-    let returns_answer = (node.returned_fields().iter()).any(|field| *field.name() == node.answer);
-    // a score only its own test reads returns nothing
-    if node.function() == "ai_score" && returns_answer && !read(&node.answer) {
-        node.projection = Some(Vec::new());
-    }
-    if node.function() != "ai_filter" || !returns_answer {
-        return None;
-    }
-    let filter = node.filter.as_ref()?;
-    if !read(&node.answer) {
-        node.projection = Some(Vec::new());
-        return None;
-    }
-    let negated = node.answer_term(filter)?;
-    if !above.carried {
-        return None;
-    }
-    node.projection = Some(Vec::new());
-    Some((node.answer.clone(), !negated))
+    above.reads.as_ref()?;
+    node.project(
+        |name| above.read_where(&Column::from_name(name)).is_some(),
+        above.carried,
+    )
 }
 
 /// Ask an extraction only the fields the plan above and its own filter
 /// and tests read, of its answer and its spans; each field is a question
 /// of its own, so leaving one out changes no other's answer.
 fn ask_read_fields(node: &mut AiNode, above: &Demand) -> Result<()> {
-    if node.function() != "ai_extract" || node.semantics != Semantics::Rows || above.reads.is_none()
+    if node.function() != "ai_extract"
+        || node.semantics() != Semantics::Rows
+        || above.reads.is_none()
     {
         return Ok(());
     }
-    let call = unfolded(node.call.clone());
+    let call = unfolded(node.call());
     let Some(questions) = question_fields(&call) else {
         return Ok(());
     };
-    let names: Vec<Column> = [node.answer.clone(), format!("{}{SPAN_SUFFIX}", node.answer)]
-        .into_iter()
-        .filter(|name| node.fields.iter().any(|field| field.name() == name))
-        .map(Column::from_name)
-        .collect();
+    let names: Vec<Column> = [
+        node.answer().to_string(),
+        format!("{}{SPAN_SUFFIX}", node.answer()),
+    ]
+    .into_iter()
+    .filter(|name| node.is_field(name))
+    .map(Column::from_name)
+    .collect();
     let mut read = BTreeSet::new();
     for name in &names {
         if above.read_where(name).is_some() {
@@ -903,13 +847,9 @@ fn ask_read_fields(node: &mut AiNode, above: &Demand) -> Result<()> {
             };
             read.extend(found);
         }
-        for expr in node
-            .filter
-            .iter()
-            .chain(node.tests.iter().map(|test| &test.test))
-        {
+        for expr in node.filter_expressions() {
             if expr.column_refs().contains(name) {
-                let Some(found) = read_fields(expr, name) else {
+                let Some(found) = read_fields(&expr, name) else {
                     return Ok(());
                 };
                 read.extend(found);
@@ -925,7 +865,7 @@ fn ask_read_fields(node: &mut AiNode, above: &Demand) -> Result<()> {
     }
     // the call changes in this node alone: a node below with the same call
     // asks the fields its own readers read
-    let input = Arc::clone(&node.input);
+    let input = node.inputs()[0].clone();
     let alone = LogicalPlan::EmptyRelation(EmptyRelation {
         produce_one_row: false,
         schema: Arc::clone(input.schema()),
@@ -933,7 +873,7 @@ fn ask_read_fields(node: &mut AiNode, above: &Demand) -> Result<()> {
     let alone = extension_node(node.with_input(alone)?.checked()?);
     let asked = replace_call(alone, &call, &with_fields(&call, &kept))?;
     let found = as_node::<AiNode>(&asked).expect("an AiNode");
-    *node = found.with_input(Arc::unwrap_or_clone(input))?;
+    *node = found.with_input(input)?;
     Ok(())
 }
 
@@ -1028,46 +968,23 @@ fn guard(node: &mut AiNode, demand: &Demand) {
     if node.function() == "ai_filter" {
         return or_guard(node, demand);
     }
-    let plain = node.semantics == Semantics::Rows
-        && !node.is_predicate()
-        && node.filter.is_none()
-        && node.hint.is_none()
-        && node.fetch.is_none();
-    if !plain {
+    if !node.is_plain_column() {
         return;
     }
-    let added: Vec<Column> = (node.fields.iter())
-        .map(|field| Column::from_name(field.name()))
-        .collect();
-    let Some(read) = added
-        .iter()
-        .filter_map(|column| demand.read_where(column))
+    let Some(read) = (node.added_names().into_iter())
+        .filter_map(|name| demand.read_where(&Column::from_name(name)))
         .reduce(|one, two| or(&one, &two))
     else {
         return;
     };
     // a part the node cannot evaluate may be anything
-    let known = |atom: &Expr| reads_rows_values(atom, node);
+    let known = |atom: &Expr| node.evaluates_on_rows(atom);
     let read = bounds(&read, &known).may_be_true;
     let kept: Vec<Expr> = (split_conjunction(&read).into_iter())
         .filter(|term| !matches!(term, Expr::Literal(..)))
         .cloned()
         .collect();
-    let guarded_already = |term: &Expr| {
-        node.guard
-            .as_ref()
-            .is_some_and(|guard| split_conjunction(guard).contains(&term))
-    };
-    let new: Vec<Expr> = kept
-        .into_iter()
-        .filter(|term| !guarded_already(term))
-        .collect();
-    if let Some(found) = conjunction(new) {
-        node.guard = Some(match node.guard.take() {
-            Some(guard) => guard.and(found),
-            None => found,
-        });
-    }
+    node.add_guard(kept);
 }
 
 /// What a condition may and must be, where some of its parts are
@@ -1182,140 +1099,39 @@ fn bounds(expr: &Expr, known: &dyn Fn(&Expr) -> bool) -> Bounds {
     }
 }
 
-/// Whether the executor can evaluate `term` on the rows a node reads:
-/// it calls no AI function and reads columns of the one table the
-/// node's call reads, and the answers of AI operators below the node,
-/// which the rows carry.
-fn reads_rows_values(term: &Expr, node: &AiNode) -> bool {
-    if reads_call_table(term, node) {
-        return true;
-    }
-    let tables: BTreeSet<String> = (node.call.column_refs().into_iter())
-        .filter_map(|column| {
-            column
-                .relation
-                .as_ref()
-                .map(|table| table.table().to_string())
-        })
-        .collect();
-    let mut earlier = rows_answers(&node.input);
-    // classifications of the same rows run as one operator, so one cannot
-    // read another's label before it runs
-    if node.function() == "ai_classify" {
-        earlier.retain(|name| !classified(&node.input, name));
-    }
-    let input = node.input.schema();
-    tables.len() == 1
-        && !term
-            .exists(|inner| Ok(crate::is_ai_call(inner)))
-            .unwrap_or(true)
-        && term.column_refs().iter().all(|column| {
-            input.has_column(column)
-                && match &column.relation {
-                    Some(table) => tables.contains(table.table()),
-                    None => earlier.contains(&column.name),
-                }
-        })
-}
-
-/// Whether a classification below adds the column `name`.
-fn classified(plan: &LogicalPlan, name: &str) -> bool {
-    plan.exists(|below| {
-        Ok(as_node::<AiNode>(below).is_some_and(|asked| {
-            asked.function() == "ai_classify"
-                && asked.fields.iter().any(|field| field.name() == name)
-        }))
-    })
-    .unwrap_or(true)
-}
-
-/// The columns the AI operators of rows below add, which each row they
-/// return carries. A map's text and SAE features are not carried on the
-/// rows, so a guard cannot read them.
-fn rows_answers(plan: &LogicalPlan) -> BTreeSet<String> {
-    let mut found = BTreeSet::new();
-    let _ = plan.apply(|below| {
-        if let Some(asked) = as_node::<AiNode>(below)
-            && asked.semantics == Semantics::Rows
-            && !matches!(asked.function(), "ai_map" | "ai_sae_features")
-        {
-            found.extend(asked.fields.iter().map(|field| field.name().clone()));
-        }
-        Ok(TreeNodeRecursion::Continue)
-    });
-    found
-}
-
-/// Guard an `AI.IF` of an OR with the OR's other terms: it is asked only
+/// Guard an `AI.IF` of an OR with the OR's other terms, as
+/// [`crate::rules::guards`] explains: it is asked only
 /// where none of them is TRUE, as far as the executor can tell before
 /// asking. The OR's last `AI.IF` filters on the OR, so its own filter reads
 /// its answer; each earlier one returns its answer, which the last one's
 /// filter reads. A term the guard keeps reads only the one table the call
 /// reads, or is an earlier `AI.IF`'s answer not TRUE.
 fn or_guard(node: &mut AiNode, demand: &Demand) {
-    if node.semantics != Semantics::Rows
-        || node.guard.is_some()
-        || node.hint.is_some()
-        || node.fetch.is_some()
-    {
+    if !node.takes_or_guard() {
         return;
     }
-    let answer = Column::from_name(node.answer.clone());
-    let read = match &node.filter {
+    let answer = Column::from_name(node.answer());
+    let read = match node.filter() {
         // nothing above reads the last one's answer, so it returns none
-        Some(filter) if unread(node, demand) && or_terms(node).is_some() => {
-            read_condition(filter, &answer)
+        Some(filter) if unread(node, demand) && node.or_terms().is_some() => {
+            read_condition(&filter, &answer)
         }
         Some(_) => None,
         None => demand.read_where(&answer),
     };
-    let Some(read) = read else {
-        return;
-    };
-    let earlier = earlier_answers(&node.input);
-    let is_earlier = |expr: &Expr| {
-        let read = match expr {
-            Expr::Not(inner) => inner.as_ref(),
-            other => other,
-        };
-        read.try_as_col()
-            .is_some_and(|column| column.relation.is_none() && earlier.contains(&column.name))
-    };
-    let kept = (split_conjunction(&read).into_iter()).filter(|term| match term {
-        Expr::IsNotTrue(inner) if is_earlier(inner) => true,
-        Expr::Literal(..) => false,
-        other => reads_call_table(other, node),
-    });
-    node.guard = conjunction(kept.cloned());
+    if let Some(read) = read {
+        node.guard_or(&read);
+    }
 }
 
 /// Whether no operator above reads the node's answer: it does not
 /// return it, or the demand reads it nowhere.
 fn unread(node: &AiNode, demand: &Demand) -> bool {
-    let returned = (node.returned_fields().iter()).any(|field| *field.name() == node.answer);
+    let returned = (node.returned_fields().iter()).any(|field| field.name() == node.answer());
     !returned
         || demand
-            .read_where(&Column::from_name(node.answer.clone()))
+            .read_where(&Column::from_name(node.answer()))
             .is_none()
-}
-
-/// The answers of the `AI.IF` nodes below that return their answer and
-/// drop no row, as each earlier `AI.IF` of an OR does, guarded or not.
-fn earlier_answers(plan: &LogicalPlan) -> Vec<String> {
-    let mut found = Vec::new();
-    let _ = plan.apply(|below| {
-        if let Some(asked) = as_node::<AiNode>(below)
-            && asked.semantics == Semantics::Rows
-            && asked.function() == "ai_filter"
-            && asked.filter.is_none()
-            && asked.hint.is_none()
-            && asked.fetch.is_none()
-        {
-            found.push(asked.answer.clone());
-        }
-        Ok(TreeNodeRecursion::Continue)
-    });
-    found
 }
 
 /// The keys of a semi join's filtered side, when the join compares plain

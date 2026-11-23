@@ -9,12 +9,15 @@ use datafusion::datasource::{MemTable, provider_as_source, source_as_provider};
 use datafusion::logical_expr::utils::{conjunction, split_conjunction};
 use datafusion::logical_expr::{
     Expr, LogicalPlan, LogicalPlanBuilder, Projection, TableScan, TableScanBuilder,
+    UserDefinedLogicalNodeCore,
 };
 
-use super::claim::{calls_ai, merged_aliases};
+use super::calls_ai;
 use super::identified::IdentifiedTable;
-use super::shared::{ROW_COLUMN, row_field};
-use crate::functions::is_quail_call;
+use crate::ai::{AiNode, Semantics};
+use crate::functions::{is_ai_call, is_quail_call};
+use crate::plan::as_node;
+use crate::shared::{ROW_COLUMN, row_field};
 
 /// Compute each plain expression of a region that reads one table as a
 /// column of that table's input, so DataFusion evaluates it.
@@ -233,7 +236,7 @@ fn single_scan(plan: &LogicalPlan) -> Option<TableScan> {
     let mut scans = Vec::new();
     plan.apply(|node| {
         // Shared rows have their own identity, not the source table's key.
-        if crate::extension::as_node::<super::shared::SharedInput>(node).is_some() {
+        if crate::plan::as_node::<crate::shared::SharedInput>(node).is_some() {
             return Ok(TreeNodeRecursion::Jump);
         }
         if let LogicalPlan::TableScan(scan) = node {
@@ -291,7 +294,7 @@ pub(super) fn numbered(plan: &LogicalPlan) -> Vec<String> {
 }
 
 /// The schema of a placeholder for a region input: the input's columns,
-/// then [`ROW_COLUMN`] when `numbered`, as [`super::shared::SharedInput`] returns them.
+/// then [`ROW_COLUMN`] when `numbered`, as [`crate::shared::SharedInput`] returns them.
 fn placeholder_schema(
     schema: &datafusion::arrow::datatypes::Schema,
     numbered: bool,
@@ -550,4 +553,94 @@ fn table_input(
         inputs.push((name, body));
     }
     Ok(Transformed::new(read, true, TreeNodeRecursion::Jump))
+}
+
+/// The CTE name and body of a FROM subquery: `x` over the CTE `clauses`,
+/// or the subquery itself.
+fn subquery_body(alias: &datafusion::logical_expr::SubqueryAlias) -> (String, &LogicalPlan) {
+    match alias.input.as_ref() {
+        LogicalPlan::SubqueryAlias(cte) => (cte.alias.table().to_string(), cte.input.as_ref()),
+        body => (alias.alias.table().to_string(), body),
+    }
+}
+
+/// The aliases of the JOIN inputs a region reads through, and the CTE
+/// each reads: each subquery that selects and filters one table, with
+/// AI.IF filters but no other model call, and is read once. Any other
+/// FROM or JOIN subquery runs before the region, as its own input.
+///
+/// For example, `FROM contracts a JOIN kept b ON AI.IF(...b.text...)`,
+/// with `kept` as `SELECT c.id, c.text FROM contracts c WHERE AI.IF(...)`,
+/// reads `kept` through: the region scans `contracts` as `c` under `b`.
+fn merged_aliases(plan: &LogicalPlan) -> Vec<String> {
+    let mut readers: std::collections::BTreeMap<String, usize> = Default::default();
+    let _ = plan.apply(|node| {
+        // each read of a CTE is one copy of its body under the CTE's name
+        if let LogicalPlan::SubqueryAlias(alias) = node
+            && !matches!(
+                alias.input.as_ref(),
+                LogicalPlan::TableScan(_) | LogicalPlan::SubqueryAlias(_)
+            )
+        {
+            *readers.entry(alias.alias.table().to_string()).or_default() += 1;
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    let mut merged = Vec::new();
+    let _ = plan.apply(|node| {
+        let LogicalPlan::Join(join) = node else {
+            return Ok(TreeNodeRecursion::Continue);
+        };
+        for side in [join.left.as_ref(), join.right.as_ref()] {
+            let LogicalPlan::SubqueryAlias(alias) = side else {
+                continue;
+            };
+            let (name, body) = subquery_body(alias);
+            // DataFusion's optimizer removes a SELECT list that passes its
+            // input's columns on, and lowers an AI.IF filter to an `AiNode`
+            let (mut base, mut calls_model) = match body {
+                LogicalPlan::Projection(projection) => (
+                    projection.input.as_ref(),
+                    projection
+                        .expr
+                        .iter()
+                        .any(|expr| expr.exists(|inner| Ok(is_ai_call(inner))).unwrap_or(false)),
+                ),
+                other => (other, false),
+            };
+            loop {
+                base = match base {
+                    LogicalPlan::Filter(filter) => filter.input.as_ref(),
+                    LogicalPlan::Extension(_) => match as_node::<AiNode>(base) {
+                        Some(node) => {
+                            calls_model |=
+                                !node.is_predicate() || node.semantics() != Semantics::Rows;
+                            node.inputs()[0]
+                        }
+                        None => break,
+                    },
+                    _ => break,
+                };
+            }
+            let is_table = match base {
+                LogicalPlan::SubqueryAlias(found) => {
+                    let mut scanned = found.input.as_ref();
+                    while let LogicalPlan::Filter(filter) = scanned {
+                        scanned = filter.input.as_ref();
+                    }
+                    matches!(scanned, LogicalPlan::TableScan(_))
+                }
+                _ => false,
+            };
+            if is_table && readers.get(&name).copied().unwrap_or(0) <= 1 && !calls_model {
+                merged.push(alias.alias.table().to_string());
+                // `kept b` reads the CTE `kept` through `b`
+                if name != alias.alias.table() {
+                    merged.push(name);
+                }
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    merged
 }
