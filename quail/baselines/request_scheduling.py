@@ -196,7 +196,6 @@ def run_filter_sequence(
     )
 
 
-
 def extract_document_cap(
     body_ids,
     tail_ids,

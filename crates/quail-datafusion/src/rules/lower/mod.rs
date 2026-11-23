@@ -18,7 +18,7 @@ use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 use datafusion::optimizer::simplify_expressions::ExprSimplifier;
 use datafusion::optimizer::{AnalyzerRule, OptimizerConfig, OptimizerRule};
 
-use crate::ai::{AiNode, Semantics, Written, WrittenTest};
+use crate::ai::{AiNode, Semantics, Written, WrittenPredicate};
 use crate::functions::column_call_kind;
 use crate::functions::{function_name, is_ai_call, quail_function};
 use crate::plan::{as_node, extension_node};
@@ -201,7 +201,7 @@ fn asked_node(
 ) -> Result<LogicalPlan> {
     let (term, hint) = unhint(term);
     let read = Expr::Column(Column::from_name(answer.clone()));
-    let (call, filter) = match term {
+    let (call, inline_predicate) = match term {
         Expr::BinaryExpr(mut binary) if function_name(&binary.left) == Some("ai_score") => {
             let call = std::mem::replace(binary.left.as_mut(), read);
             (call, Expr::BinaryExpr(binary))
@@ -213,7 +213,9 @@ fn asked_node(
         call => (call, read),
     };
     let node = AiNode::answering(input, call, answer, Written { index, ..written })?;
-    Ok(extension_node(node.hinted(hint).tested(filter, semantics)?))
+    Ok(extension_node(
+        node.hinted(hint).tested(inline_predicate, semantics)?,
+    ))
 }
 
 fn stack_asked(
@@ -542,8 +544,8 @@ fn lower_filter(filter: &Filter, columns: &mut Columns) -> Result<Transformed<Lo
     let mut written = Vec::new();
     for (position, term) in tested {
         let test = read_columns(term.clone(), &added)?;
-        written.push(WrittenTest {
-            test: simplified(test.clone(), &input),
+        written.push(WrittenPredicate {
+            predicate: simplified(test.clone(), &input),
             written: term,
             position,
             clause,
@@ -551,7 +553,7 @@ fn lower_filter(filter: &Filter, columns: &mut Columns) -> Result<Transformed<Lo
         tests.push(test);
     }
     let names: Vec<String> = added.iter().map(|(_, name)| name.clone()).collect();
-    input = with_tests(input, &names, &written)?;
+    input = with_written_predicates(input, &names, &written)?;
     match boolean_filter(
         conjunction(tests).unwrap_or(datafusion::logical_expr::lit(true)),
         &Arc::new(input),
@@ -576,7 +578,11 @@ fn simplified(test: Expr, input: &LogicalPlan) -> Expr {
         .unwrap_or(test)
 }
 
-fn with_tests(plan: LogicalPlan, names: &[String], tests: &[WrittenTest]) -> Result<LogicalPlan> {
+fn with_written_predicates(
+    plan: LogicalPlan,
+    names: &[String],
+    predicates: &[WrittenPredicate],
+) -> Result<LogicalPlan> {
     Ok(plan
         .transform_down(|node| {
             if matches!(node, LogicalPlan::SubqueryAlias(_)) {
@@ -589,7 +595,7 @@ fn with_tests(plan: LogicalPlan, names: &[String], tests: &[WrittenTest]) -> Res
                 return Ok(Transformed::no(node));
             }
             Ok(Transformed::yes(extension_node(
-                column.clone().with_tests(tests),
+                column.clone().with_written_predicates(predicates),
             )))
         })?
         .data)

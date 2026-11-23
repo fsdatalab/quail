@@ -414,7 +414,6 @@ class _Routes:
                       for _ in range(low, high)]
 
 
-
 def region_of(model, context) -> RegionExecution:
     """Return the context's RegionExecution for the model, created on first use."""
     region = context.state.get("region")

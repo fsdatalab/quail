@@ -1,6 +1,6 @@
 logical:
   Projection: c.id, e.id
-    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Does the Wikipedia passage in DOCUMENT {1} support the claim in DOCUMENT {0}?"), c.claim, e.text), named_struct(Utf8("selectivity"), Float64(0.002167247386759582))), filter: __quail_answer_1, returns: []
+    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Does the Wikipedia passage in DOCUMENT {1} support the claim in DOCUMENT {0}?"), c.claim, e.text), named_struct(Utf8("selectivity"), Float64(0.002167247386759582))), inline_predicate: __quail_answer_1, returns: []
       Cross Join:
         SubqueryAlias: c
           TableScan: claims projection=[id, claim]

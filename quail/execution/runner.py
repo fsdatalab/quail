@@ -9,8 +9,12 @@ from typing import Any, Callable, Mapping, Protocol
 
 from quail.execution.deduplicate import MODEL_NODES, deduplicate
 from quail.execution.finished import renumbered, report_outputs
-from quail.execution.guard import guarded, present_join_inputs, reads_null_documents
 from quail.execution.metrics import NodeMetrics, NodeResult, RunResult
+from quail.execution.precondition import (
+    preconditioned,
+    present_join_inputs,
+    reads_null_documents,
+)
 from quail.execution.rows import Rows
 from quail.physical import (
     AiFilter,
@@ -72,7 +76,7 @@ def _check_ports(node, result) -> None:
 def _answers(values: Mapping[tuple[str, str], Any]) -> dict[str, Rows]:
     """Return the rows that hold each value column of the outputs so far.
 
-    A guard reads an earlier node's answer from those rows, by document
+    A precondition reads an earlier node's answer from those rows, by document
     id, instead of from a copy every node between them carries.
     """
     found = {}
@@ -148,22 +152,27 @@ class GenericRunner:
                 for member in pipeline:
                     inputs[member.node_id] = present_join_inputs(
                         member, inputs[member.node_id], context)
-                guard = guarded(node, inputs[node.node_id], context,
-                                runtime_answers=True, answers=_answers(values))
-                if guard is not None:
-                    inputs[node.node_id] = guard.inputs(inputs[node.node_id])
+                precondition = preconditioned(
+                    node,
+                    inputs[node.node_id],
+                    context,
+                    runtime_answers=True,
+                    answers=_answers(values),
+                )
+                if precondition is not None:
+                    inputs[node.node_id] = precondition.inputs(inputs[node.node_id])
                 deduplicated = deduplicate(graph, pipeline, inputs, context)
                 started = time.perf_counter()
-                with _renumbered(guard, deduplicated):
+                with _renumbered(precondition, deduplicated):
                     results = context.run_pipeline(
                         pipeline,
                         inputs if deduplicated is None else deduplicated.inputs,
                         context)
                 if deduplicated is not None:
                     results = deduplicated.expanded(results)
-                if guard is not None:
-                    results = {**results,
-                               node.node_id: guard.expanded(results[node.node_id])}
+                if precondition is not None:
+                    expanded = precondition.expanded(results[node.node_id])
+                    results = {**results, node.node_id: expanded}
                 for index, member in enumerate(pipeline):
                     record(member, results[member.node_id],
                            started if index == 0 else None)
@@ -191,13 +200,14 @@ class GenericRunner:
                     for input_port in node.inputs
                 }
                 inputs = present_join_inputs(node, inputs, context)
-                guard = guarded(node, inputs, context, answers=_answers(values))
-                if guard is not None:
-                    inputs = guard.inputs(inputs)
+                precondition = preconditioned(
+                    node, inputs, context, answers=_answers(values))
+                if precondition is not None:
+                    inputs = precondition.inputs(inputs)
                 deduplicated = deduplicate(
                     graph, (node,), {node.node_id: inputs}, context)
                 started = time.perf_counter()
-                with _renumbered(guard, deduplicated):
+                with _renumbered(precondition, deduplicated):
                     result = context.runtimes[node.runtime_key].execute(
                         node,
                         inputs if deduplicated is None
@@ -206,8 +216,8 @@ class GenericRunner:
                 if deduplicated is not None:
                     result = deduplicated.expanded(
                         {node.node_id: result})[node.node_id]
-                if guard is not None:
-                    result = guard.expanded(result)
+                if precondition is not None:
+                    result = precondition.expanded(result)
                 record(node, result, started)
                 continue
             record(node, result)
@@ -238,15 +248,15 @@ def _without_early_stops(ordered, pipelines) -> dict:
             member.node_id for member in pipelines.get(node.node_id, ())}}
 
 
-def _renumbered(guard, deduplicated):
+def _renumbered(precondition, deduplicated):
     """Report a node's rows over the region's rows while it runs.
 
-    A guard keeps the region's ids, so the rows a node finishes go on at
+    A precondition keeps the region's ids, so the rows a node finishes go on at
     once, unless its result adds rows the node never reported. A
     deduplicated node's rows go to every copy of their key documents.
     Any other report waits for the node's expanded result.
     """
-    if guard is not None and not guard.reports_as_run():
+    if precondition is not None and not precondition.reports_as_run():
         return renumbered()
     if deduplicated is not None:
         return renumbered(deduplicated.reported)

@@ -230,10 +230,10 @@ tagged_struct! {
     FilterPredicate(FilterPredicateFields, FilterPredicateTagged) = "quail.common.expressions.FilterPredicate" | "quail.logical.expressions.FilterPredicate" {
         expression: Asked,
         selectivity: Option<f64>,
-        guard: Option<ValueExpression>,
+        precondition: Option<ValueExpression>,
         alternative: Option<ValueExpression>,
         answer: Option<String>,
-        guard_selectivity: Option<f64>,
+        precondition_selectivity: Option<f64>,
         negated: bool = default,
         disjunction: Option<String>,
         short_circuit: bool = default,
@@ -631,7 +631,7 @@ physical_nodes! {
         #[serde(default = "one")]
         num_key_survivors: i64,
         #[serde(default)]
-        guard: Option<ValueExpression>,
+        precondition: Option<ValueExpression>,
         #[serde(default)]
         alternative: Option<ValueExpression>,
         #[serde(default)]
@@ -667,7 +667,7 @@ physical_nodes! {
         pass_group: i64,
         document_ends: Value,
         #[serde(default)]
-        guard: Option<ValueExpression>,
+        precondition: Option<ValueExpression>,
     }
     AiExtract(AiExtractAttributes) = "quail.ai_extract" {
         backend_name: String,
@@ -678,7 +678,7 @@ physical_nodes! {
         document_ends: Value,
         attention: String,
         #[serde(default)]
-        guard: Option<ValueExpression>,
+        precondition: Option<ValueExpression>,
         #[serde(default)]
         stop_tests: Vec<ValueExpression>,
         #[serde(default)]
@@ -693,7 +693,7 @@ physical_nodes! {
         document_ends: Value,
         attention: String,
         #[serde(default)]
-        guard: Option<ValueExpression>,
+        precondition: Option<ValueExpression>,
         #[serde(default)]
         stop_tests: Vec<ValueExpression>,
         #[serde(default)]
@@ -707,7 +707,7 @@ physical_nodes! {
         pass_group: i64,
         document_ends: Value,
         #[serde(default)]
-        guard: Option<ValueExpression>,
+        precondition: Option<ValueExpression>,
     }
     Barrier(BarrierAttributes) = "quail.barrier" {
         next_anchor: String,
@@ -828,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn a_plan_saved_before_guards_and_key_survivors_reads_with_their_defaults() {
+    fn a_plan_saved_before_preconditions_and_key_survivors_reads_with_their_defaults() {
         let filter = PhysicalNode::AiFilter(Node {
             id: "ai_filter:r".into(),
             inputs: Vec::new(),
@@ -851,7 +851,7 @@ mod tests {
                 question_header_token_ids: Vec::new(),
                 document_ends: serde_json::Value::Array(Vec::new()),
                 num_key_survivors: 1,
-                guard: None,
+                precondition: None,
                 alternative: None,
                 answer: None,
                 negated: false,
@@ -871,14 +871,14 @@ mod tests {
                 pass_group: -1,
                 document_ends: serde_json::Value::Array(Vec::new()),
                 attention: String::new(),
-                guard: None,
+                precondition: None,
                 stop_tests: Vec::new(),
                 stop_when_true: false,
             },
         });
         let added = [
             "num_key_survivors",
-            "guard",
+            "precondition",
             "alternative",
             "answer",
             "negated",
@@ -908,10 +908,14 @@ mod tests {
             "selectivity":null}"#;
         let predicate: FilterPredicate = serde_json::from_str(predicate).unwrap();
         assert_eq!(
-            (predicate.guard, predicate.alternative, predicate.answer),
+            (
+                predicate.precondition,
+                predicate.alternative,
+                predicate.answer
+            ),
             (None, None, None)
         );
-        assert_eq!(predicate.guard_selectivity, None);
+        assert_eq!(predicate.precondition_selectivity, None);
         let text = r#"{"type":"quail.common.expressions.Expression","encoded":"",
             "columns":[],"text":"TRUE"}"#;
         let ValueExpression::Value(expression) = serde_json::from_str(text).unwrap() else {

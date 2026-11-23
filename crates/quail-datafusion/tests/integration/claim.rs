@@ -317,7 +317,7 @@ async fn a_projected_ai_if_returns_a_boolean_without_filtering_rows() -> Result<
                 .any(|(name, _, kind, _, _)| name == answer && kind == "boolean")
         );
         assert!(predicates[0].alternative.is_none());
-        assert!(predicates[0].guard.is_none());
+        assert!(predicates[0].precondition.is_none());
     }
     Ok(())
 }
@@ -489,7 +489,7 @@ async fn a_test_of_a_label_is_absorbed_into_its_classifications_filter() -> Resu
     };
     assert!(column.starts_with("AiNode: tone = ai_classify"), "{plan:?}");
     assert!(
-        column.ends_with(", filter: tone = Utf8(\"good\")"),
+        column.ends_with(", inline_predicate: tone = Utf8(\"good\")"),
         "{plan:?}"
     );
     assert!(

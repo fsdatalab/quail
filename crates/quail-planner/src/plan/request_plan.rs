@@ -215,16 +215,16 @@ fn refusal(
             "backends",
         ));
     }
-    if found.columns().any(|column| column.guard.is_some()) {
+    if found.columns().any(|column| column.precondition.is_some()) {
         return Ok(refuse(
-            format!("a guarded AI column asks only some rows, which {backend} does not"),
-            "guard_needs_quail_backend".into(),
+            format!("a preconditioned AI column asks only some rows, which {backend} does not"),
+            "precondition_needs_quail_backend".into(),
             "backends",
         ));
     }
     let ored = found.filters.iter().flat_map(|(_, predicates)| predicates);
     if ored.clone().any(|predicate| {
-        predicate.guard.is_some()
+        predicate.precondition.is_some()
             || predicate.alternative.is_some()
             || predicate.answer.is_some()
             || predicate.disjunction.is_some()

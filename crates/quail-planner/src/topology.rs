@@ -490,13 +490,13 @@ impl PhysicalNode {
         }
     }
 
-    pub fn guard(&self) -> Option<&ValueExpression> {
+    pub fn precondition(&self) -> Option<&ValueExpression> {
         match self {
-            PhysicalNode::AiFilter(node) => node.attributes.guard.as_ref(),
-            PhysicalNode::AiClassify(node) => node.attributes.guard.as_ref(),
-            PhysicalNode::AiExtract(node) => node.attributes.guard.as_ref(),
-            PhysicalNode::AiMap(node) => node.attributes.guard.as_ref(),
-            PhysicalNode::AiSaeFeatures(node) => node.attributes.guard.as_ref(),
+            PhysicalNode::AiFilter(node) => node.attributes.precondition.as_ref(),
+            PhysicalNode::AiClassify(node) => node.attributes.precondition.as_ref(),
+            PhysicalNode::AiExtract(node) => node.attributes.precondition.as_ref(),
+            PhysicalNode::AiMap(node) => node.attributes.precondition.as_ref(),
+            PhysicalNode::AiSaeFeatures(node) => node.attributes.precondition.as_ref(),
             _ => None,
         }
     }
@@ -504,7 +504,7 @@ impl PhysicalNode {
     pub fn runs_alone(&self) -> bool {
         let ored = matches!(self, PhysicalNode::AiFilter(node)
             if node.attributes.disjunction.is_some());
-        self.guard().is_some() || self.alternative().is_some() || ored
+        self.precondition().is_some() || self.alternative().is_some() || ored
     }
 
     pub fn answer(&self) -> Option<&String> {

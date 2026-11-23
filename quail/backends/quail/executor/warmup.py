@@ -8,7 +8,6 @@ from quail.backends.quail.executor.stage_executor import StageExecutor
 from quail.backends.quail.executor.stages import Stage, filter_stages
 from quail.progress import Progress, logger, quiet
 
-
 WARMUP_VERSION = 18
 
 ROW_CLASSES = ((1, 1), (32, 1), (32, 16), (32, 17),

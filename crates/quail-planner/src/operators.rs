@@ -90,14 +90,14 @@ pub struct SemanticColumn {
     pub name: String,
     pub above_joins: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub guard: Option<ValueExpression>,
+    pub precondition: Option<ValueExpression>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub guard_selectivity: Option<f64>,
+    pub precondition_selectivity: Option<f64>,
 }
 
 impl SemanticColumn {
     pub fn asked_fraction(&self) -> f64 {
-        guarded_fraction(self.guard.as_ref(), self.guard_selectivity)
+        precondition_fraction(self.precondition.as_ref(), self.precondition_selectivity)
     }
 
     pub fn alias(&self) -> String {
@@ -192,16 +192,19 @@ pub fn effective_selectivity(selectivity: Option<f64>) -> f64 {
     selectivity.unwrap_or(DEFAULT_SELECTIVITY)
 }
 
-pub fn guarded_fraction(
-    guard: Option<&crate::physical::ValueExpression>,
+pub fn precondition_fraction(
+    precondition: Option<&crate::physical::ValueExpression>,
     selectivity: Option<f64>,
 ) -> f64 {
-    match guard {
+    match precondition {
         Some(_) => effective_selectivity(selectivity),
         None => 1.0,
     }
 }
 
 pub fn predicate_asked_fraction(predicate: &crate::physical::FilterPredicate) -> f64 {
-    guarded_fraction(predicate.guard.as_ref(), predicate.guard_selectivity)
+    precondition_fraction(
+        predicate.precondition.as_ref(),
+        predicate.precondition_selectivity,
+    )
 }

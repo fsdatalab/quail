@@ -4,7 +4,7 @@ use super::relation::{JoinSpec, Relation, check_calls, check_joins};
 use super::walk::{Kind, Walk};
 use super::{ByAlias, lookup, note, push};
 use crate::ai::{AiNode, Semantics};
-use crate::rules::guards::guard_selectivity;
+use crate::rules::preconditions::precondition_selectivity;
 use quail_planner::error::CompileError;
 use quail_planner::expressions::{
     aliased_call, asked_call, asked_refs, call_aliases, call_refs, column_name, column_references,
@@ -152,7 +152,7 @@ impl<'w, 'a> Assembly<'w, 'a> {
     pub(super) fn place(&mut self) -> Option<()> {
         for id in self.walk.ids() {
             if let Kind::Ai(node) = &self.walk.get(id).kind
-                && node.guard().is_some()
+                && node.precondition().is_some()
                 && (node.function() == "ai_score" || node.semantics() != Semantics::Rows)
             {
                 return None;
@@ -201,7 +201,7 @@ impl<'w, 'a> Assembly<'w, 'a> {
         }
         let before_joins = !self.walk.get(below).ai_join;
         let stop_key = run.iter().find_map(|id| match &self.walk.get(*id).kind {
-            Kind::Ai(node) if self.stops_per_key(&alias) => node.key_fetch(),
+            Kind::Ai(node) if self.stops_per_key(&alias) => node.key_row_limit(),
             _ => None,
         });
         if stop_key.is_some()
@@ -264,11 +264,11 @@ impl<'w, 'a> Assembly<'w, 'a> {
         Some((kind, found.calls.clone()))
     }
 
-    fn bound_guard(&mut self, node: &AiNode) -> Option<Option<ValueExpression>> {
-        match node.guard() {
+    fn bound_precondition(&mut self, node: &AiNode) -> Option<Option<ValueExpression>> {
+        match node.precondition() {
             None => Some(None),
-            Some(guard) => {
-                let read = self.walk.through(&guard);
+            Some(precondition) => {
+                let read = self.walk.through(&precondition);
                 self.binder.bind_condition(&read).ok().map(Some)
             }
         }
@@ -298,17 +298,17 @@ impl<'w, 'a> Assembly<'w, 'a> {
             }
             let above_joins = self.walk.get(below).ai_join;
             for (_, found) in run {
-                let guard = self.bound_guard(found)?;
+                let precondition = self.bound_precondition(found)?;
                 let (_, columns) = self.bound_columns(found)?;
                 for (call, name) in columns {
                     self.found.classifies.push(SemanticColumn {
                         call,
                         name,
                         above_joins,
-                        guard: guard.clone(),
-                        guard_selectivity: found
-                            .guard()
-                            .map(|found| guard_selectivity(&found, &[])),
+                        precondition: precondition.clone(),
+                        precondition_selectivity: found
+                            .precondition()
+                            .map(|found| precondition_selectivity(&found, &[])),
                     });
                 }
             }
@@ -316,7 +316,7 @@ impl<'w, 'a> Assembly<'w, 'a> {
         }
         let [alias] = <[String; 1]>::try_from(read).ok()?;
         let above_joins = self.walk.get(self.walk.get(id).inputs[0]).ai_join;
-        let guard = self.bound_guard(node)?;
+        let precondition = self.bound_precondition(node)?;
         let (kind, columns) = self.bound_columns(node)?;
         for (call, name) in columns {
             let list = self.list(kind);
@@ -324,8 +324,10 @@ impl<'w, 'a> Assembly<'w, 'a> {
                 call,
                 name,
                 above_joins,
-                guard: guard.clone(),
-                guard_selectivity: node.guard().map(|found| guard_selectivity(&found, &[])),
+                precondition: precondition.clone(),
+                precondition_selectivity: node
+                    .precondition()
+                    .map(|found| precondition_selectivity(&found, &[])),
             });
             let position = list.len() - 1;
             push(&mut self.placed, &alias, (kind, position));
@@ -360,13 +362,13 @@ pub(super) fn set_scan_columns(found: &mut Operators) {
         .columns()
         .flat_map(|column| column.added_columns())
         .collect();
-    let guards: Vec<ColumnRef> = read
+    let preconditions: Vec<ColumnRef> = read
         .columns()
-        .filter_map(|column| column.guard.as_ref())
+        .filter_map(|column| column.precondition.as_ref())
         .chain(read.filters.iter().flat_map(|(_, predicates)| {
             predicates
                 .iter()
-                .flat_map(|predicate| predicate.guard.iter().chain(&predicate.alternative))
+                .flat_map(|predicate| predicate.precondition.iter().chain(&predicate.alternative))
         }))
         .flat_map(column_references)
         .collect();
@@ -405,7 +407,7 @@ pub(super) fn set_scan_columns(found: &mut Operators) {
             .chain(&read.maps)
             .flat_map(|column| call_refs(&column.call)),
     );
-    valued.extend(guards.iter().cloned());
+    valued.extend(preconditions.iter().cloned());
     let mut needed: Vec<ColumnRef> = selected;
     for join in read.joins.iter().rev() {
         needed.extend(asked_refs(&join.predicate));
@@ -447,11 +449,11 @@ pub(super) fn set_scan_columns(found: &mut Operators) {
             .map(|reference| reference.column.clone())
             .collect::<Vec<_>>();
         let keys = read.stop_keys.get(&alias).cloned().unwrap_or_default();
-        let guarded = guards
+        let preconditioned = preconditions
             .iter()
             .filter(|reference| reference.alias == alias)
             .map(|reference| reference.column.clone());
-        for name in references.into_iter().chain(keys).chain(guarded) {
+        for name in references.into_iter().chain(keys).chain(preconditioned) {
             let computed =
                 added.contains(&name) || answers.contains(&(alias.as_str(), name.as_str()));
             let loaded = !sources.contains(&name)

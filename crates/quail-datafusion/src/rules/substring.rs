@@ -15,8 +15,8 @@ pub(crate) fn precheck(node: &AiNode, input: &LogicalPlan) -> Option<Expr> {
         return None;
     };
     let document = call.args.first()?;
-    let filter = node.filter()?;
-    let literal = split_conjunction(&filter)
+    let inline_predicate = node.inline_predicate()?;
+    let literal = split_conjunction(&inline_predicate)
         .into_iter()
         .filter_map(|term| required_literal(term, node))
         .max_by_key(|literal| literal.chars().count())?;

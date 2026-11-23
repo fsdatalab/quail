@@ -48,7 +48,7 @@ def test_a_filter_asks_about_each_distinct_page_image_once():
 --- SELECT p.id FROM pages p WHERE AI.IF(PROMPT('Is this page a lease? {0}', p.image))
     ---
 plan
-  __quail_answer_1 = ai_filter('Is this page a lease? {0}', p.image), filter:
+  __quail_answer_1 = ai_filter('Is this page a lease? {0}', p.image), inline_predicate:
       __quail_answer_1, returns: []
 asked 2 of 3
   'Is this page a lease? {0}': p1/p3 TRUE, p2 FALSE
@@ -211,7 +211,7 @@ def test_a_question_reads_each_page_of_an_unnest():
     ---
 plan
   __quail_answer_1 = ai_filter('Is this page a lease? {0}', get_field(p.u, 'image')),
-      filter: __quail_answer_1, returns: []
+      inline_predicate: __quail_answer_1, returns: []
 asked 3 of 3
   'Is this page a lease? {0}': <1 images 107f1fde> TRUE, <1 images d1934d8c> TRUE, <1
       images fc0237ea> TRUE
@@ -231,7 +231,7 @@ def test_a_jpeg_and_a_png_of_any_size_are_image_documents():
         tables={"photos": photos}), """\
 --- SELECT p.id FROM photos p WHERE AI.IF(PROMPT('Is this a lease? {0}', p.image)) ---
 plan
-  __quail_answer_1 = ai_filter('Is this a lease? {0}', p.image), filter:
+  __quail_answer_1 = ai_filter('Is this a lease? {0}', p.image), inline_predicate:
       __quail_answer_1, returns: []
 asked 2 of 2
   'Is this a lease? {0}': p1 TRUE, p2 FALSE
@@ -262,8 +262,8 @@ def test_a_question_reads_a_shrunk_photo():
 --- SELECT p.id FROM photos p WHERE AI.IF(PROMPT('Is this a lease? {0}',
     AI.IMAGE(p.image, 512))) ---
 plan
-  __quail_answer_1 = ai_filter('Is this a lease? {0}', p.__quail_expr_0), filter:
-      __quail_answer_1, returns: []
+  __quail_answer_1 = ai_filter('Is this a lease? {0}', p.__quail_expr_0),
+      inline_predicate: __quail_answer_1, returns: []
 asked 1 of 1
   'Is this a lease? {0}': <1 images bb6fdb89> TRUE
 rows 1

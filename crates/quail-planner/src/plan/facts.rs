@@ -65,17 +65,17 @@ pub fn region_facts(found: &Operators) -> Result<Value, crate::error::CompileErr
         }
     }
     let answers = found.filter_answers();
-    let filter_guards = found.filters.iter().flat_map(|(_, predicates)| {
+    let filter_preconditions = found.filters.iter().flat_map(|(_, predicates)| {
         predicates
             .iter()
-            .flat_map(|predicate| predicate.guard.iter().chain(&predicate.alternative))
+            .flat_map(|predicate| predicate.precondition.iter().chain(&predicate.alternative))
     });
-    for guard in found
+    for precondition in found
         .columns()
-        .filter_map(|column| column.guard.as_ref())
-        .chain(filter_guards)
+        .filter_map(|column| column.precondition.as_ref())
+        .chain(filter_preconditions)
     {
-        for reference in column_references(guard) {
+        for reference in column_references(precondition) {
             let held = (schemas.get(reference.alias.as_str()))
                 .is_none_or(|columns| columns.contains(&reference.column));
             if held && !answers.contains(&(reference.alias.as_str(), reference.column.as_str())) {

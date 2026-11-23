@@ -1,8 +1,8 @@
-"""A guarded AI call asks the model only where its guard is TRUE.
+"""A preconditioned AI call asks the model only where its precondition is TRUE.
 
-An AI operator's guard says which rows the model is asked about; every
+An AI operator's precondition says which rows the model is asked about; every
 other row's answer is NULL. derive makes the condition under which a
-CASE reads an answer the guard, and guards an AI filter in an OR with
+CASE reads an answer the precondition, and preconditions an AI filter in an OR with
 the OR's other terms; in an OR of several AI filters, each is asked only
 where the terms before it are not TRUE. Each test's transcript shows the
 plan, the questions the model answered, and the
@@ -74,8 +74,8 @@ def test_a_case_over_a_classification_labels_only_the_rows_it_reads():
 --- SELECT r.id, CASE WHEN r.long THEN AI_CLASSIFY(PROMPT('tone: {0}', r.body), ['a',
     'b']) END AS t FROM reviews r ---
 plan
-  __quail_call_1 = ai_classify('tone: {0}', r.body, make_array('a', 'b')), guard: r.long
-      IS TRUE
+  __quail_call_1 = ai_classify('tone: {0}', r.body, make_array('a', 'b')), precondition:
+      r.long IS TRUE
 asked 3 of 6
   'tone: {0}': r0 'a', r3 'b', r5 'b'
 rows 6
@@ -90,7 +90,8 @@ rows 6
     AS tone FROM reviews r) SELECT t.id, CASE WHEN t.long THEN t.tone END AS tone FROM t
     ---
 plan
-  tone = ai_classify('tone: {0}', r.body, make_array('a', 'b')), guard: r.long IS TRUE
+  tone = ai_classify('tone: {0}', r.body, make_array('a', 'b')), precondition: r.long IS
+      TRUE
 asked 3 of 6
   'tone: {0}': r0 'a', r3 'b', r5 'b'
 rows 6
@@ -110,8 +111,8 @@ def test_a_case_over_a_map_writes_only_the_answers_it_reads():
 --- SELECT r.id, CASE WHEN r.id <> 'r0' AND r.long THEN AI_MAP(r.body, 'Summarize.') END
     AS s FROM reviews r ---
 plan
-  __quail_call_1 = ai_map(r.body, 'Summarize.'), guard: r.id != 'r0' IS TRUE AND r.long
-      IS TRUE
+  __quail_call_1 = ai_map(r.body, 'Summarize.'), precondition: r.id != 'r0' IS TRUE AND
+      r.long IS TRUE
 asked 2 of 6
   'Summarize.': r3 'summary r3', r5 'summary r5'
 rows 6
@@ -130,8 +131,8 @@ def test_a_case_over_an_extraction_is_null_where_its_test_is_not_true():
 --- SELECT r.id, CASE WHEN r.long THEN AI.EXTRACT(r.body, {'w': 'Which word?'}) END AS e
     FROM reviews r ---
 plan
-  __quail_call_1 = ai_extract(r.body, named_struct('w', 'Which word?')), guard: r.long
-      IS TRUE, returns: [__quail_call_1]
+  __quail_call_1 = ai_extract(r.body, named_struct('w', 'Which word?')), precondition:
+      r.long IS TRUE, returns: [__quail_call_1]
 asked 3 of 6
   'Which word?': r0 'b0', r3 'b3', r5 'b5'
 rows 6
@@ -152,7 +153,7 @@ def test_an_extraction_guarded_by_an_ai_filter_runs_beside_an_unguarded_extracti
     AI_FILTER(PROMPT('kind: {0}', r.body)) THEN AI.EXTRACT(r.body, {'v': 'Which verb?'})
     END AS g FROM reviews r ---
 plan
-  __quail_call_2 = ai_extract(r.body, named_struct('v', 'Which verb?')), guard:
+  __quail_call_2 = ai_extract(r.body, named_struct('v', 'Which verb?')), precondition:
       __quail_call_1 IS TRUE, returns: [__quail_call_2]
   e = ai_extract(r.body, named_struct('w', 'Which word?')), returns: [e]
   __quail_call_1 = ai_filter('kind: {0}', r.body)
@@ -177,8 +178,8 @@ def test_a_case_with_an_else_guards_its_call_by_the_condition():
 --- SELECT r.id, CASE WHEN r.long THEN AI_CLASSIFY(PROMPT('tone: {0}', r.body), ['a',
     'b']) ELSE 'none' END AS t FROM reviews r ---
 plan
-  __quail_call_1 = ai_classify('tone: {0}', r.body, make_array('a', 'b')), guard: r.long
-      IS TRUE
+  __quail_call_1 = ai_classify('tone: {0}', r.body, make_array('a', 'b')), precondition:
+      r.long IS TRUE
 asked 3 of 6
   'tone: {0}': r0 'a', r3 'b', r5 'b'
 rows 6
@@ -219,8 +220,8 @@ def test_an_or_of_a_column_and_an_ai_filter_asks_only_where_the_column_is_not_tr
 --- SELECT r.id FROM reviews r WHERE r.long OR AI_FILTER(PROMPT('kind: {0}', r.body))
     ---
 plan
-  __quail_answer_1 = ai_filter('kind: {0}', r.body), guard: r.long IS NOT TRUE, filter:
-      r.long OR __quail_answer_1, returns: []
+  __quail_answer_1 = ai_filter('kind: {0}', r.body), precondition: r.long IS NOT TRUE,
+      inline_predicate: r.long OR __quail_answer_1, returns: []
 asked 3 of 6
   'kind: {0}': r1 FALSE, r2 TRUE, r4 TRUE
 rows 5
@@ -233,8 +234,9 @@ rows 5
 --- SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('kind: {0}', r.body)) OR (r.long
     AND r.id <> 'r0') ---
 plan
-  __quail_answer_1 = ai_filter('kind: {0}', r.body), guard: r.long AND r.id != 'r0' IS
-      NOT TRUE, filter: __quail_answer_1 OR r.long AND r.id != 'r0', returns: []
+  __quail_answer_1 = ai_filter('kind: {0}', r.body), precondition: r.long AND r.id !=
+      'r0' IS NOT TRUE, inline_predicate: __quail_answer_1 OR r.long AND r.id != 'r0',
+      returns: []
 asked 4 of 6
   'kind: {0}': r0 TRUE, r1 FALSE, r2 TRUE, r4 TRUE
 rows 5
@@ -291,8 +293,8 @@ def test_an_or_of_two_ai_filters_asks_the_second_only_where_the_first_is_not_tru
 --- SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('kind: {0}', r.body)) OR
     AI_FILTER(PROMPT('long: {0}', r.body)) ---
 plan
-  __quail_answer_2 = ai_filter('long: {0}', r.body), guard: __quail_answer_1 IS NOT
-      TRUE, filter: __quail_answer_1 OR __quail_answer_2, returns: []
+  __quail_answer_2 = ai_filter('long: {0}', r.body), precondition: __quail_answer_1 IS
+      NOT TRUE, inline_predicate: __quail_answer_1 OR __quail_answer_2, returns: []
   __quail_answer_1 = ai_filter('kind: {0}', r.body)
 asked 10 of 12
   'kind: {0}': r0 TRUE, r1 FALSE, r2 FALSE, r3 TRUE, r4 FALSE, r5 FALSE
@@ -307,8 +309,8 @@ rows 4
     AI_FILTER(PROMPT('long: {0}', r.body), {'selectivity': 0.9}) ---
 plan
   __quail_answer_2 = ai_filter('long: {0}', r.body, named_struct('selectivity',
-      Float64(0.9))), guard: __quail_answer_1 IS NOT TRUE, filter: __quail_answer_1 OR
-      __quail_answer_2, returns: []
+      Float64(0.9))), precondition: __quail_answer_1 IS NOT TRUE, inline_predicate:
+      __quail_answer_1 OR __quail_answer_2, returns: []
   __quail_answer_1 = ai_filter('kind: {0}', r.body)
 asked 9 of 12
   'long: {0}': r0 FALSE, r1 FALSE, r2 TRUE, r3 TRUE, r4 TRUE, r5 FALSE
@@ -328,8 +330,8 @@ def test_an_or_of_a_column_and_two_ai_filters_asks_each_where_no_earlier_term_is
 --- SELECT r.id FROM reviews r WHERE r.long OR AI_FILTER(PROMPT('kind: {0}', r.body)) OR
     AI_FILTER(PROMPT('long: {0}', r.body)) ---
 plan
-  __quail_answer_2 = ai_filter('long: {0}', r.body), guard: r.long IS NOT TRUE AND
-      __quail_answer_1 IS NOT TRUE, filter: r.long OR __quail_answer_1 OR
+  __quail_answer_2 = ai_filter('long: {0}', r.body), precondition: r.long IS NOT TRUE
+      AND __quail_answer_1 IS NOT TRUE, inline_predicate: r.long OR __quail_answer_1 OR
       __quail_answer_2, returns: []
   __quail_answer_1 = ai_filter('kind: {0}', r.body)
 asked 5 of 12
@@ -364,7 +366,7 @@ def test_stock_vllm_refuses_a_guarded_classification_and_a_guarded_ai_filter():
     session.register("reviews",
                      quail.DocumentProvider.from_table(REVIEWS, id_col="id"))
     plans = {
-        "guard_needs_quail_backend": session.sql(
+        "precondition_needs_quail_backend": session.sql(
             f"SELECT r.id, CASE WHEN r.long THEN {TONE} END AS t "
             "FROM reviews r").plan(),
         "or_filter_needs_quail_backend": session.sql(
@@ -402,22 +404,22 @@ def test_a_guarded_ai_call_is_priced_on_the_rows_its_guard_passes(session):
         (node,) = [node for node in plan.nodes if isinstance(node, AiClassify)]
         return node.spec.expected_rows, plan.estimated_seconds
 
-    guarded = classified_rows(
+    preconditioned = classified_rows(
         f"SELECT r.id, CASE WHEN r.long THEN {TONE} END AS t FROM reviews r")
     everything = classified_rows(f"SELECT r.id, {TONE} AS t FROM reviews r")
     # r.long passes the default 20% of rows
-    assert guarded[0] == pytest.approx(0.2 * everything[0])
-    assert guarded[1] < everything[1]
+    assert preconditioned[0] == pytest.approx(0.2 * everything[0])
+    assert preconditioned[1] < everything[1]
 
     sql = f"SELECT r.id FROM reviews r WHERE r.long OR {KIND}"
-    (guarded,) = [node for node in session.sql(sql).plan().nodes
+    (preconditioned,) = [node for node in session.sql(sql).plan().nodes
                   if isinstance(node, AiFilter)]
-    unguarded = _session(logical_rules_without("derive.guard"))
+    unguarded = _session(logical_rules_without("derive.precondition"))
     (everything,) = [node for node in unguarded.sql(sql).plan().nodes
                      if isinstance(node, AiFilter)]
     unguarded.close()
     # r.long IS NOT TRUE passes 1 - 20% of rows
-    assert guarded.expected_rows == pytest.approx(0.8 * everything.expected_rows)
+    assert preconditioned.expected_rows == pytest.approx(0.8 * everything.expected_rows)
 
 
 
@@ -428,8 +430,8 @@ def test_a_classification_guarded_by_an_extraction_runs_after_the_extraction():
 --- SELECT r.id FROM reviews r WHERE AI.EXTRACT(r.body, {'w': 'Which word?'})['w'] =
     'b1' OR AI_CLASSIFY(PROMPT('tone: {0}', r.body), ['a', 'b']) = 'a' ---
 plan
-  __quail_column_2 = ai_classify('tone: {0}', r.body, make_array('a', 'b')), guard: NOT
-      get_field(__quail_column_1, 'w') = 'b1' IS TRUE
+  __quail_column_2 = ai_classify('tone: {0}', r.body, make_array('a', 'b')),
+      precondition: NOT get_field(__quail_column_1, 'w') = 'b1' IS TRUE
   __quail_column_1 = ai_extract(r.body, named_struct('w', 'Which word?')), returns:
       [__quail_column_1]
 asked 11 of 12

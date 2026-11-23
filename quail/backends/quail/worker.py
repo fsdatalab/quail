@@ -300,7 +300,6 @@ def pool_bytes(arena) -> dict:
     }
 
 
-
 def _boot_record(gpu, cold, warm_s, warm_tier, t_boot):
     """Assemble a boot timing dict from a loaded GPU and warm results."""
     kind = "cold" if cold or warm_tier else "warm"

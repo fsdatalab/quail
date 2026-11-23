@@ -11,8 +11,12 @@ from quail.specs import DEVICES, MODELS
 
 LOGICAL_RULES = tuple(_quail_native.LOGICAL_RULES)
 PHYSICAL_RULES = tuple(_quail_native.PHYSICAL_RULES)
-DERIVE_OPTIONS = ("derive.filters", "derive.fetch", "derive.projection",
-                  "derive.guard")
+DERIVE_OPTIONS = (
+    "derive.inline_predicates",
+    "derive.row_limit",
+    "derive.field_pruning",
+    "derive.precondition",
+)
 
 
 def logical_rules_without(name: str) -> tuple[str, ...]:

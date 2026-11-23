@@ -556,10 +556,10 @@ impl TreeRows<'_> {
             }
             return (title, details, predicates);
         };
-        if let Some(guard) = known.guard() {
+        if let Some(precondition) = known.precondition() {
             details.push(format!(
                 "asks only where {}; every other row's answer is NULL",
-                condition_text(guard)
+                condition_text(precondition)
             ));
         }
         let (stops, when_true) = known.answer_stops();

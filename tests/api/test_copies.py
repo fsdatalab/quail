@@ -39,8 +39,8 @@ def test_a_filter_asks_once_per_text_and_a_join_once_per_pair_of_texts():
     assert_transcript(filtered + "\n" + joined, """\
 --- SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('Is {0} short?', r.body)) ---
 plan
-  __quail_answer_1 = ai_filter('Is {0} short?', r.body), filter: __quail_answer_1,
-      returns: []
+  __quail_answer_1 = ai_filter('Is {0} short?', r.body), inline_predicate:
+      __quail_answer_1, returns: []
 asked 3 of 6
   'Is {0} short?': r0/r2/r4 TRUE, r1/r5 TRUE, r3 FALSE
 rows 5
@@ -53,8 +53,8 @@ rows 5
 --- SELECT a.id, b.id FROM reviews a JOIN reviews b ON a.hotel = b.hotel AND
     AI_FILTER(PROMPT('Do {0} and {1} agree?', a.body, b.body)) ---
 plan
-  __quail_answer_1 = ai_filter('Do {0} and {1} agree?', a.body, b.body), filter:
-      __quail_answer_1, returns: []
+  __quail_answer_1 = ai_filter('Do {0} and {1} agree?', a.body, b.body),
+      inline_predicate: __quail_answer_1, returns: []
 asked 9 of 14
   'Do {0} and {1} agree?': r0/r2/r4+r0/r2/r4 TRUE, r0/r2/r4+r1/r5 TRUE, r0/r2/r4+r3
       FALSE, r1/r5+r0/r2/r4 TRUE, r1/r5+r1/r5 TRUE, r1/r5+r3 FALSE, r3+r0/r2/r4 FALSE,

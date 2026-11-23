@@ -44,7 +44,7 @@ fn drop_unread(plan: LogicalPlan, read: Option<&BTreeSet<String>>) -> Result<Log
     }
     let mut exprs = plan.expressions();
     if let Some(node) = as_node::<AiNode>(&plan) {
-        exprs.extend(node.filter_expressions());
+        exprs.extend(node.predicate_expressions());
     }
     let own = read_names(&exprs);
     let below: Option<BTreeSet<String>> = match &plan {

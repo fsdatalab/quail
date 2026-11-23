@@ -1,7 +1,7 @@
 use super::binding::{AnswerColumn, Binder, negated_inward, unsupported};
 use super::walk::{Kind, Walk};
 use super::{ByAlias, push};
-use crate::ai::{AiNode, Semantics, WrittenTest};
+use crate::ai::{AiNode, Semantics, WrittenPredicate};
 use crate::functions::is_quail_call;
 use crate::functions::options::{string_literal, unwrap_hint};
 use datafusion::common::tree_node::{Transformed, TreeNode};
@@ -134,8 +134,8 @@ impl Relation {
                 continue;
             };
             let disjunction = (!parts.others.is_empty()).then(|| node.answer().to_string());
-            let short_circuit = node.guard().is_some_and(|guard| {
-                guard.column_refs().iter().any(|column| {
+            let short_circuit = node.precondition().is_some_and(|precondition| {
+                precondition.column_refs().iter().any(|column| {
                     parts
                         .others
                         .iter()
@@ -193,43 +193,43 @@ impl Relation {
         for (id, node) in rest {
             relation.bind_asked(walk, binder, id, node)?;
         }
-        let mut tests: Vec<WrittenTest> = Vec::new();
+        let mut predicates: Vec<WrittenPredicate> = Vec::new();
         let mut terms: Vec<Expr> = Vec::new();
         for id in walk.ids() {
             let Kind::Ai(node) = &walk.get(id).kind else {
                 continue;
             };
-            for test in node.tests() {
-                if !tests
+            for pred in node.written_predicates() {
+                if !predicates
                     .iter()
-                    .any(|found| (found.clause, found.position) == (test.clause, test.position))
+                    .any(|found| (found.clause, found.position) == (pred.clause, pred.position))
                 {
-                    tests.push(test);
+                    predicates.push(pred);
                 }
             }
             if !node.is_predicate()
                 && node.semantics() == Semantics::Rows
-                && let Some(filter) = node.filter()
+                && let Some(inline_predicate) = node.inline_predicate()
             {
-                terms.extend(split_conjunction(&filter).into_iter().cloned());
+                terms.extend(split_conjunction(&inline_predicate).into_iter().cloned());
             }
         }
         terms.retain(|term| {
-            !tests
+            !predicates
                 .iter()
-                .any(|test| split_conjunction(&test.test).contains(&term))
+                .any(|pred| split_conjunction(&pred.predicate).contains(&term))
         });
         for term in terms {
             relation.bind_term(binder, &walk.through(&term), None)?;
         }
-        tests.sort_by_key(|test| (test.clause, test.position));
-        for test in tests {
-            let (written, hint) = unwrap_hint(&test.written)?;
+        predicates.sort_by_key(|pred| (pred.clause, pred.position));
+        for pred in predicates {
+            let (written, hint) = unwrap_hint(&pred.written)?;
             let hint = match hint {
                 Some(hint) => Some(hint),
                 None => binder.label_selectivity(&written)?,
             };
-            relation.bind_term(binder, &walk.through(&test.test), hint)?;
+            relation.bind_term(binder, &walk.through(&pred.predicate), hint)?;
         }
         Ok(relation)
     }
@@ -268,8 +268,10 @@ impl Relation {
             self.joins.insert(id, spec);
             return Ok(());
         }
-        let filter = node.filter().filter(|_| node.function() == "ai_filter");
-        let term = match (filter, self.or_terms.get(node.answer())) {
+        let inline_predicate = node
+            .inline_predicate()
+            .filter(|_| node.function() == "ai_filter");
+        let term = match (inline_predicate, self.or_terms.get(node.answer())) {
             (_, Some(term)) => term.clone(),
             (Some(filter), None) => match node.answer_term(&filter) {
                 Some(negated) => OrTerm {
@@ -295,9 +297,9 @@ impl Relation {
             Some(plain) => Some(binder.bind_condition(&walk.through(plain))?),
             None => None,
         };
-        let guard = node.guard().and_then(|guard| {
+        let precondition = node.precondition().and_then(|precondition| {
             conjunction(
-                split_conjunction(&guard)
+                split_conjunction(&precondition)
                     .into_iter()
                     .filter(|term| {
                         !term
@@ -308,15 +310,16 @@ impl Relation {
                     .cloned(),
             )
         });
-        let guard = match &guard {
-            Some(guard) => Some(binder.bind_condition(&walk.through(guard))?),
+        let precondition = match &precondition {
+            Some(precondition) => Some(binder.bind_condition(&walk.through(precondition))?),
             None => None,
         };
-        let answer = (node.function() == "ai_filter" && node.filter().is_none() && !in_or)
-            .then(|| node.answer().to_string());
+        let answer =
+            (node.function() == "ai_filter" && node.inline_predicate().is_none() && !in_or)
+                .then(|| node.answer().to_string());
         let (predicate, options) = if node.function() == "ai_score" {
             let term = walk
-                .through(&node.filter().expect("a test"))
+                .through(&node.inline_predicate().expect("a predicate"))
                 .transform_up(|found| {
                     Ok(match &found {
                         Expr::Column(column)
@@ -343,9 +346,9 @@ impl Relation {
                     "anchor is a join option; a one-provider AI_FILTER takes only selectivity",
                 );
             }
-            let guard_selectivity = node
-                .guard()
-                .map(|found| crate::rules::guards::guard_selectivity(&found, &self.answers));
+            let precondition_selectivity = node.precondition().map(|found| {
+                crate::rules::preconditions::precondition_selectivity(&found, &self.answers)
+            });
             if let Some(answer) = &answer {
                 self.answers.push((answer.clone(), options.selectivity));
             }
@@ -355,10 +358,10 @@ impl Relation {
             let filter = FilterPredicate {
                 expression: predicate,
                 selectivity,
-                guard,
+                precondition,
                 alternative,
                 answer,
-                guard_selectivity,
+                precondition_selectivity,
                 negated,
                 disjunction,
                 short_circuit,
@@ -366,10 +369,10 @@ impl Relation {
             push(&mut self.filters, &read[0], filter);
             return Ok(());
         }
-        if in_or || guard.is_some() || answer.is_some() || negated {
+        if in_or || precondition.is_some() || answer.is_some() || negated {
             return unsupported(&format!(
                 "DataFusion must evaluate {} over joined model results.",
-                walk.through(&node.filter().unwrap_or_else(|| node.call()))
+                walk.through(&node.inline_predicate().unwrap_or_else(|| node.call()))
             ));
         }
         let spec = JoinSpec {
@@ -513,7 +516,10 @@ fn bind_answers(
         let returned_score = node.function() == "ai_score" && !node.returned_fields().is_empty();
         if node.is_predicate() && !returned_score {
             let tables: Vec<String> = walk.call_tables(&node.call()).into_iter().collect();
-            if node.function() != "ai_filter" || node.filter().is_some() || tables.len() != 1 {
+            if node.function() != "ai_filter"
+                || node.inline_predicate().is_some()
+                || tables.len() != 1
+            {
                 continue;
             }
             found.alias = tables.into_iter().next();

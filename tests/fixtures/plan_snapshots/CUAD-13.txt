@@ -1,6 +1,6 @@
 logical:
   Projection: c.id, k.id
-    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("DOCUMENT {1} names a clause type and the question its labelers answered. Judge strictly from the contract in DOCUMENT {0} whether the answer to that question for this contract is yes."), c.text, k.question), named_struct(Utf8("selectivity"), Float64(0.19281905918876965))), filter: __quail_answer_1, returns: []
+    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("DOCUMENT {1} names a clause type and the question its labelers answered. Judge strictly from the contract in DOCUMENT {0} whether the answer to that question for this contract is yes."), c.text, k.question), named_struct(Utf8("selectivity"), Float64(0.19281905918876965))), inline_predicate: __quail_answer_1, returns: []
       Cross Join:
         SubqueryAlias: c
           TableScan: contracts projection=[id, text]

@@ -1,6 +1,6 @@
-"""Ask a guarded model node about its guard's rows alone.
+"""Ask a preconditioned model node about its precondition's rows alone.
 
-A guarded column node answers NULL for every other row. An AI filter in
+A preconditioned column node answers NULL for every other row. An AI filter in
 an OR passes each row where the OR's plain terms, its alternative, are
 TRUE, whether or not it asked the model about that row. When the OR has
 several AI filters, the rows carry whether a term has passed them in
@@ -10,7 +10,7 @@ the rows no earlier one passed.
 An AI filter that returns its answer keeps every row it reads and adds
 the answer column: TRUE or FALSE where it asked, NULL elsewhere.
 
-A row whose document is NULL is guarded the same way, whatever the
+A row whose document is NULL is preconditioned the same way, whatever the
 plan: the model is not asked about it, a column node answers NULL for
 it, and an AI filter does not pass it. An AI join reads no such row:
 a pair with a NULL document does not match. A column node over pairs
@@ -44,15 +44,15 @@ DOCUMENT_NODES = (AiFilter, AiClassify, AiExtract, AiMap, AiSaeFeatures, AiScore
 
 
 @dataclass
-class Guarded:
-    """A guarded node's rows, before and after its guard.
+class Preconditioned:
+    """A preconditioned node's rows, before and after its precondition.
 
     Attributes:
-        node: The guarded column node or AI filter.
+        node: The preconditioned column node or AI filter.
         port: The name of its rows input.
         rows: The rows it read.
         asked: Whether the model is asked about each row it read: its
-            guard is TRUE, and for a short-circuit filter no earlier
+            precondition is TRUE, and for a short-circuit filter no earlier
             term of its OR passed the row.
         passes: For an AI filter, whether a term of its OR has passed
             each row it read; all false for any other node.
@@ -65,7 +65,7 @@ class Guarded:
     passes: pa.Array
 
     def inputs(self, inputs: dict) -> dict:
-        """Return the node's inputs with only the rows its guard accepts."""
+        """Return the node's inputs with only the rows its precondition accepts."""
         asked = self.rows.filter(self.asked)
         if not isinstance(inputs[self.port], Rows):
             return {**inputs, self.port: asked.ids[asked.aliases[0]]}
@@ -93,7 +93,7 @@ class Guarded:
         """Give every row the node read its answer, or NULL where not asked.
 
         Args:
-            result: The node's result over the rows its guard accepts.
+            result: The node's result over the rows its precondition accepts.
         """
         if isinstance(self.node, AiFilter):
             if self.node.answer is not None:
@@ -300,9 +300,15 @@ def present_join_inputs(node, inputs: dict, context) -> dict:
     return found
 
 
-def guarded(node, inputs: dict, context, *, runtime_answers: bool = False,
-            answers: Mapping[str, Rows] | None = None) -> Guarded | NullPairs | None:
-    """Evaluate a column node's guard over the rows it reads.
+def preconditioned(
+    node,
+    inputs: dict,
+    context,
+    *,
+    runtime_answers: bool = False,
+    answers: Mapping[str, Rows] | None = None,
+) -> Preconditioned | NullPairs | None:
+    """Evaluate a column node's precondition over the rows it reads.
 
     Args:
         node: The node to run.
@@ -317,26 +323,32 @@ def guarded(node, inputs: dict, context, *, runtime_answers: bool = False,
 
     Returns:
         The rows and which of them the model is asked about, or None for
-        a node without a guard.
+        a node without a precondition.
     """
     if (pairs := _null_pairs(node, inputs, context)) is not None:
         return pairs
-    guard = getattr(node, "guard", None)
+    precondition = getattr(node, "precondition", None)
     alternative = getattr(node, "alternative", None)
     answer = None if runtime_answers else getattr(node, "answer", None)
     disjunction = getattr(node, "disjunction", None)
     absent = _document_alias(node) is not None and reads_null_documents(node, context)
-    if (guard is None and alternative is None and answer is None
+    if (precondition is None and alternative is None and answer is None
             and disjunction is None and not absent):
         return None
     (port,) = [port.name for port in node.inputs]
     alias = node.alias if isinstance(node, AiFilter) else node.spec.aliases[0]
     rows = rows_of(inputs[port], alias)
-    read = _read(node, rows, alias, context, [
-        condition for condition in (guard, alternative) if condition is not None],
-        answers or {})
+    read = _read(
+        node,
+        rows,
+        alias,
+        context,
+        [condition for condition in (precondition, alternative)
+         if condition is not None],
+        answers or {},
+    )
     everyone = pa.array([True] * rows.num_rows, pa.bool_())
-    asked = everyone if guard is None else accepts(guard, read)
+    asked = everyone if precondition is None else accepts(precondition, read)
     passes = (pc.invert(everyone) if alternative is None
               else pc.fill_null(accepts(alternative, read), False))
     if disjunction in rows.column_names:
@@ -348,7 +360,7 @@ def guarded(node, inputs: dict, context, *, runtime_answers: bool = False,
         null_documents = context.sources[columns_key(alias)].column(NULL_DOCUMENT)
         present = pc.invert(pc.take(null_documents, rows.ids[alias]))
         asked = pc.and_(pc.fill_null(asked, False), present)
-    return Guarded(node, port, rows, asked, passes)
+    return Preconditioned(node, port, rows, asked, passes)
 
 
 def _read(node, rows: Rows, alias: str, context, conditions,
@@ -371,7 +383,8 @@ def _read(node, rows: Rows, alias: str, context, conditions,
         return read if read.column_names else pa.table({"_": pa.nulls(rows.num_rows)})
     columns = context.sources.get(columns_key(alias))
     if columns is None:
-        raise KeyError(f"{node.node_id!r} reads its guard from {alias!r}'s columns")
+        raise KeyError(
+            f"{node.node_id!r} reads its precondition from {alias!r}'s columns")
     taken = columns.take(rows.ids[alias])
     for name in read.column_names:
         taken = taken.append_column(name, read.column(name))

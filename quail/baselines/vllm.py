@@ -151,7 +151,6 @@ def diffusion_canvas(spec):
         diffusion_gemma.DiffusionGemmaRequestStates = original
 
 
-
 def _capacity(llm) -> dict:
     config = llm.llm_engine.vllm_config
     cache = config.cache_config

@@ -138,7 +138,7 @@ fn drop_unread_probabilities(plan: LogicalPlan) -> Result<LogicalPlan> {
         }
         let mut region = region.clone();
         for (old, new) in &unread {
-            region.plan = crate::rules::projection::replace_call(region.plan, old, new)?;
+            region.plan = crate::rules::field_pruning::replace_call(region.plan, old, new)?;
         }
         Ok(Transformed::yes(extension_node(region)))
     })
@@ -477,8 +477,10 @@ fn simpler_run(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
     };
     let (nodes, bottom) = AiNode::run(plan);
     if let [_, _, ..] = nodes.as_slice() {
-        let untested: Vec<Option<AiNode>> =
-            nodes.iter().map(|found| found.without_tests()).collect();
+        let untested: Vec<Option<AiNode>> = nodes
+            .iter()
+            .map(|found| found.without_predicates())
+            .collect();
         if untested.iter().any(Option::is_some) {
             let mut run = bottom.clone();
             for (found, untested) in nodes.iter().zip(untested).rev() {

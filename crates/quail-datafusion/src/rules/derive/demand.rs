@@ -11,22 +11,22 @@ use datafusion::logical_expr::{
     SkipType, UserDefinedLogicalNodeCore, lit,
 };
 
-use super::fetch::{at_least, is_count_star};
+use super::row_limit::{at_least, is_count_star};
 use crate::ai::{AiNode, Semantics};
 use crate::functions::options::unfolded;
 use crate::plan::{as_node, extension_node, with_inputs};
 use crate::rules::distinct::{is_distinct, is_unique};
-use crate::rules::projection::{question_fields, replace_call, with_fields};
+use crate::rules::field_pruning::{question_fields, replace_call, with_fields};
 use crate::rules::repeated::{through_alias, through_projection};
 use crate::rules::substring::precheck;
 use quail_planner::constants::SPAN_SUFFIX;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Options {
-    pub(super) filters: bool,
-    pub(super) fetch: bool,
-    pub(super) guard: bool,
-    pub(super) projection: bool,
+    pub(super) inline_predicates: bool,
+    pub(super) row_limit: bool,
+    pub(super) precondition: bool,
+    pub(super) field_pruning: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -38,14 +38,14 @@ enum Count {
 }
 
 #[derive(Debug, Clone)]
-struct Test {
+struct Predicate {
     id: usize,
     expr: Expr,
 }
 
 #[derive(Debug, Clone)]
 struct Demand {
-    tests: Vec<Test>,
+    predicates: Vec<Predicate>,
     reads: Option<BTreeMap<Column, Expr>>,
     count: Count,
     carried: bool,
@@ -55,7 +55,7 @@ struct Demand {
 impl Demand {
     fn everything() -> Self {
         Demand {
-            tests: Vec::new(),
+            predicates: Vec::new(),
             reads: None,
             count: Count::All,
             carried: false,
@@ -67,13 +67,20 @@ impl Demand {
         let Some(reads) = &self.reads else {
             return Some(lit(true));
         };
-        let passing =
-            conjunction(self.tests.iter().map(|test| test.expr.clone())).unwrap_or(lit(true));
+        let passing = conjunction(
+            self.predicates
+                .iter()
+                .map(|predicate| predicate.expr.clone()),
+        )
+        .unwrap_or(lit(true));
         (reads
             .get(column)
             .map(|read| and(read, &passing))
             .into_iter())
-        .chain((self.tests.iter()).filter_map(|test| read_condition(&test.expr, column)))
+        .chain(
+            (self.predicates.iter())
+                .filter_map(|predicate| read_condition(&predicate.expr, column)),
+        )
         .reduce(|one, two| or(&one, &two))
     }
 
@@ -83,19 +90,19 @@ impl Demand {
         if reads.contains_key(column) {
             found.extend(self.fields.get(column)?.iter().cloned());
         }
-        for test in &self.tests {
-            if test.expr.column_refs().contains(column) {
-                found.extend(read_fields(&test.expr, column)?);
+        for predicate in &self.predicates {
+            if predicate.expr.column_refs().contains(column) {
+                found.extend(read_fields(&predicate.expr, column)?);
             }
         }
         Some(found)
     }
 
-    fn reads_with_tests(&self) -> Option<BTreeMap<Column, Expr>> {
+    fn reads_with_predicates(&self) -> Option<BTreeMap<Column, Expr>> {
         let mut reads = self.reads.clone()?;
-        for test in &self.tests {
-            for column in test.expr.column_refs() {
-                if let Some(within) = read_condition(&test.expr, column) {
+        for predicate in &self.predicates {
+            for column in predicate.expr.column_refs() {
+                if let Some(within) = read_condition(&predicate.expr, column) {
                     add_read(&mut reads, column, within);
                 }
             }
@@ -106,21 +113,21 @@ impl Demand {
 
 #[derive(Debug, Default)]
 struct Taken {
-    tests: BTreeSet<usize>,
+    predicates: BTreeSet<usize>,
     count: bool,
     kept: Vec<(String, bool)>,
 }
 
 struct Pass {
     options: Options,
-    next_test: usize,
+    next_predicate: usize,
 }
 
 pub(super) fn demand_pass(plan: LogicalPlan, options: Options) -> Result<Transformed<LogicalPlan>> {
     let before = plan.clone();
     let mut pass = Pass {
         options,
-        next_test: 0,
+        next_predicate: 0,
     };
     let (after, _) = pass.down(plan, Demand::everything())?;
     let changed = after != before;
@@ -128,10 +135,10 @@ pub(super) fn demand_pass(plan: LogicalPlan, options: Options) -> Result<Transfo
 }
 
 impl Pass {
-    fn test(&mut self, expr: Expr) -> Test {
-        self.next_test += 1;
-        Test {
-            id: self.next_test,
+    fn predicate(&mut self, expr: Expr) -> Predicate {
+        self.next_predicate += 1;
+        Predicate {
+            id: self.next_predicate,
             expr,
         }
     }
@@ -176,8 +183,13 @@ impl Pass {
             unreachable!()
         };
         let below = |expr: &Expr| through_projection(expr, projection);
-        let tests = (demand.tests.iter())
-            .filter_map(|test| below(&test.expr).map(|expr| Test { id: test.id, expr }))
+        let predicates = (demand.predicates.iter())
+            .filter_map(|predicate| {
+                below(&predicate.expr).map(|expr| Predicate {
+                    id: predicate.id,
+                    expr,
+                })
+            })
             .collect();
         let mut reads = BTreeMap::new();
         for (index, expr) in projection.expr.iter().enumerate() {
@@ -228,7 +240,7 @@ impl Pass {
         let (input, taken) = self.down(
             input,
             Demand {
-                tests,
+                predicates,
                 reads: Some(reads),
                 count,
                 carried: demand.carried,
@@ -250,8 +262,13 @@ impl Pass {
             let index = alias.schema.index_of_column(column).ok()?;
             Some(Column::from(alias.input.schema().qualified_field(index)))
         };
-        let tests = (demand.tests.iter())
-            .filter_map(|test| below(&test.expr).map(|expr| Test { id: test.id, expr }))
+        let predicates = (demand.predicates.iter())
+            .filter_map(|predicate| {
+                below(&predicate.expr).map(|expr| Predicate {
+                    id: predicate.id,
+                    expr,
+                })
+            })
             .collect();
         let reads = demand.reads.as_ref().map(|reads| {
             (reads.iter())
@@ -275,7 +292,7 @@ impl Pass {
         let (input, taken) = self.down(
             input,
             Demand {
-                tests,
+                predicates,
                 reads,
                 count,
                 carried: demand.carried,
@@ -292,17 +309,17 @@ impl Pass {
         let LogicalPlan::Filter(filter) = plan else {
             unreachable!()
         };
-        let own: Vec<Test> = (split_conjunction(&filter.predicate).into_iter())
-            .map(|term| self.test(term.clone()))
+        let own: Vec<Predicate> = (split_conjunction(&filter.predicate).into_iter())
+            .map(|term| self.predicate(term.clone()))
             .collect();
         let reads = demand.reads.clone();
-        let mut tests = demand.tests.clone();
-        tests.extend(own.iter().cloned());
+        let mut predicates = demand.predicates.clone();
+        predicates.extend(own.iter().cloned());
         let input = Arc::unwrap_or_clone(filter.input);
         let (input, mut taken) = self.down(
             input,
             Demand {
-                tests,
+                predicates,
                 reads,
                 count: demand.count,
                 carried: demand.carried,
@@ -310,12 +327,12 @@ impl Pass {
             },
         )?;
         let kept: Vec<Expr> = (own.iter())
-            .filter(|test| !taken.tests.contains(&test.id))
-            .map(|test| test.expr.clone())
+            .filter(|predicate| !taken.predicates.contains(&predicate.id))
+            .map(|predicate| predicate.expr.clone())
             .collect();
         taken
-            .tests
-            .retain(|id| !own.iter().any(|test| test.id == *id));
+            .predicates
+            .retain(|id| !own.iter().any(|predicate| predicate.id == *id));
         let plan = match conjunction(kept) {
             Some(predicate) => LogicalPlan::Filter(Filter::try_new(predicate, Arc::new(input))?),
             None => input,
@@ -338,7 +355,7 @@ impl Pass {
             (Some((skip, fetch)), _) => Count::Rows(skip + fetch),
             (None, _) => Count::All,
         };
-        let count = if self.options.fetch {
+        let count = if self.options.row_limit {
             count
         } else {
             Count::All
@@ -347,11 +364,11 @@ impl Pass {
         let (input, taken) = self.down(
             input,
             Demand {
-                tests: Vec::new(),
-                reads: demand.reads_with_tests(),
+                predicates: Vec::new(),
+                reads: demand.reads_with_predicates(),
                 count,
                 carried: demand.carried,
-                fields: without_tests(&demand.fields, &demand.tests),
+                fields: without_predicates(&demand.fields, &demand.predicates),
             },
         )?;
         if taken.count && literal.is_some_and(|(skip, _)| skip == 0) {
@@ -397,7 +414,7 @@ impl Pass {
         let (input, mut taken) = self.down(
             input,
             Demand {
-                tests: demand.tests,
+                predicates: demand.predicates,
                 reads,
                 count: Count::All,
                 carried: demand.carried,
@@ -414,10 +431,10 @@ impl Pass {
     fn distinct(&mut self, plan: LogicalPlan, demand: Demand) -> Result<(LogicalPlan, Taken)> {
         let input = plan.inputs()[0].clone();
         let keys = input.schema().columns();
-        if self.options.fetch && is_unique(&input, &keys.iter().cloned().collect()) {
+        if self.options.row_limit && is_unique(&input, &keys.iter().cloned().collect()) {
             return self.down(input, demand);
         }
-        let count = if self.options.fetch {
+        let count = if self.options.row_limit {
             Count::Distinct(keys)
         } else {
             Count::All
@@ -425,7 +442,7 @@ impl Pass {
         let (input, mut taken) = self.down(
             input,
             Demand {
-                tests: demand.tests,
+                predicates: demand.predicates,
                 reads: None,
                 count,
                 carried: false,
@@ -453,19 +470,20 @@ impl Pass {
             ([counted], Some(keys)) if is_count_star(counted) && !keys.is_empty() => {
                 let column =
                     Column::from(aggregate.schema.qualified_field(aggregate.group_expr.len()));
-                let tests_read: Vec<&Test> = (demand.tests.iter())
-                    .filter(|test| test.expr.column_refs().contains(&column))
+                let predicates_read: Vec<&Predicate> = (demand.predicates.iter())
+                    .filter(|predicate| predicate.expr.column_refs().contains(&column))
                     .collect();
                 let unread = demand
                     .reads
                     .as_ref()
                     .is_some_and(|reads| !reads.contains_key(&column))
-                    && (tests_read.iter()).all(|test| at_least(&test.expr, &column).is_some());
-                let threshold = (tests_read.iter())
-                    .filter_map(|test| at_least(&test.expr, &column))
+                    && (predicates_read.iter())
+                        .all(|predicate| at_least(&predicate.expr, &column).is_some());
+                let threshold = (predicates_read.iter())
+                    .filter_map(|predicate| at_least(&predicate.expr, &column))
                     .max();
                 match (unread, threshold) {
-                    (true, Some(n)) if self.options.fetch => Count::PerKey(keys.clone(), n),
+                    (true, Some(n)) if self.options.row_limit => Count::PerKey(keys.clone(), n),
                     _ => Count::All,
                 }
             }
@@ -475,7 +493,7 @@ impl Pass {
         let (input, _) = self.down(
             input,
             Demand {
-                tests: Vec::new(),
+                predicates: Vec::new(),
                 reads: None,
                 count,
                 carried: false,
@@ -515,18 +533,18 @@ impl Pass {
                     .iter()
                     .all(|column| schema.has_column(column))
             };
-            let tests = if keeps {
+            let predicates = if keeps {
                 demand
-                    .tests
+                    .predicates
                     .iter()
-                    .filter(|test| within(&test.expr))
+                    .filter(|predicate| within(&predicate.expr))
                     .cloned()
                     .collect()
             } else {
                 Vec::new()
             };
-            let reads_with_tests = demand.reads_with_tests();
-            let reads = reads_with_tests.as_ref().map(|reads| {
+            let reads_with_predicates = demand.reads_with_predicates();
+            let reads = reads_with_predicates.as_ref().map(|reads| {
                 let mut found: BTreeMap<Column, Expr> = (reads.iter())
                     .filter(|(column, _)| schema.has_column(column))
                     .map(|(column, read)| (column.clone(), weaken(read, &within)))
@@ -545,17 +563,17 @@ impl Pass {
                 .chain(join.filter.iter())
                 .flat_map(|expr| expr.column_refs())
                 .collect::<BTreeSet<_>>();
-            let fields = (without_tests(&demand.fields, &demand.tests).into_iter())
+            let fields = (without_predicates(&demand.fields, &demand.predicates).into_iter())
                 .filter(|(column, _)| schema.has_column(column) && !on.contains(column))
                 .collect();
             let count = match semi_join_keys(join, filtered) {
-                Some(keys) if self.options.fetch => Count::PerKey(keys, 1),
+                Some(keys) if self.options.row_limit => Count::PerKey(keys, 1),
                 _ => Count::All,
             };
             sides.push((
                 input.clone(),
                 Demand {
-                    tests,
+                    predicates,
                     reads,
                     count,
                     carried,
@@ -567,7 +585,7 @@ impl Pass {
         let mut inputs = Vec::new();
         for (input, demand) in sides {
             let (input, below) = self.down(input, demand)?;
-            taken.tests.extend(below.tests);
+            taken.predicates.extend(below.predicates);
             taken.kept.extend(below.kept);
             inputs.push(input);
         }
@@ -583,44 +601,53 @@ impl Pass {
                 .iter()
                 .all(|column| input_schema.has_column(column))
         };
-        if self.options.filters {
-            for test in &demand.tests {
-                if node.take_test(&test.expr) {
-                    taken.tests.insert(test.id);
+        if self.options.inline_predicates {
+            for predicate in &demand.predicates {
+                if node.take_predicate(&predicate.expr) {
+                    taken.predicates.insert(predicate.id);
                 }
             }
         }
-        let below_tests: Vec<&Test> = (demand.tests.iter())
-            .filter(|test| !taken.tests.contains(&test.id) && reads_input_only(&test.expr))
+        let below_predicates: Vec<&Predicate> = (demand.predicates.iter())
+            .filter(|predicate| {
+                !taken.predicates.contains(&predicate.id) && reads_input_only(&predicate.expr)
+            })
             .collect();
-        let decided = (demand.tests.iter())
-            .all(|test| taken.tests.contains(&test.id) || reads_input_only(&test.expr));
-        let fetch = match &demand.count {
-            _ if !decided || !node.accepts_fetch() => None,
+        let decided = (demand.predicates.iter()).all(|predicate| {
+            taken.predicates.contains(&predicate.id) || reads_input_only(&predicate.expr)
+        });
+        let row_limit = match &demand.count {
+            _ if !decided || !node.accepts_row_limit() => None,
             Count::All => None,
-            Count::Rows(rows) => node.rows_fetch(*rows),
-            Count::Distinct(keys) => node.distinct_fetch(keys),
-            Count::PerKey(keys, n) => node.per_key_fetch(keys, *n),
+            Count::Rows(rows) => node.row_limit_for(*rows),
+            Count::Distinct(keys) => node.distinct_row_limit(keys),
+            Count::PerKey(keys, n) => node.per_key_row_limit(keys, *n),
         };
         let mut input = node.inputs()[0].clone();
-        let fetched = fetch.is_some() || node.has_fetch() && demand.count != Count::All;
-        if let Some(fetch) = fetch {
-            if let Some(predicate) = conjunction(below_tests.iter().map(|test| test.expr.clone())) {
+        let limited = row_limit.is_some() || node.has_row_limit() && demand.count != Count::All;
+        if let Some(row_limit) = row_limit {
+            if let Some(predicate) = conjunction(
+                below_predicates
+                    .iter()
+                    .map(|predicate| predicate.expr.clone()),
+            ) {
                 input = LogicalPlan::Filter(Filter::try_new(predicate, Arc::new(input))?);
             }
-            taken.tests.extend(below_tests.iter().map(|test| test.id));
-            node = node.with_fetch(fetch);
+            taken
+                .predicates
+                .extend(below_predicates.iter().map(|predicate| predicate.id));
+            node = node.with_row_limit(row_limit);
             taken.count = true;
         }
-        if self.options.filters
-            && !node.has_fetch()
+        if self.options.inline_predicates
+            && !node.has_row_limit()
             && let Some(test) = precheck(&node, &input)
         {
             input = LogicalPlan::Filter(Filter::try_new(test, Arc::new(input))?);
         }
         let above = Demand {
-            tests: (demand.tests.iter())
-                .filter(|test| !taken.tests.contains(&test.id))
+            predicates: (demand.predicates.iter())
+                .filter(|predicate| !taken.predicates.contains(&predicate.id))
                 .cloned()
                 .collect(),
             reads: demand.reads.clone(),
@@ -628,25 +655,29 @@ impl Pass {
             carried: demand.carried,
             fields: demand.fields.clone(),
         };
-        if self.options.guard && !fetched {
-            guard(&mut node, &above);
+        if self.options.precondition && !limited {
+            precondition(&mut node, &above);
         }
         let mut kept = None;
-        if self.options.projection {
-            kept = project(&mut node, &above);
+        if self.options.field_pruning {
+            kept = prune_fields(&mut node, &above);
             ask_read_fields(&mut node, &above)?;
         }
-        let tests = (demand.tests.iter())
-            .filter(|test| !taken.tests.contains(&test.id) && reads_input_only(&test.expr))
+        let predicates = (demand.predicates.iter())
+            .filter(|predicate| {
+                !taken.predicates.contains(&predicate.id) && reads_input_only(&predicate.expr)
+            })
             .cloned()
             .collect();
-        let passed: BTreeSet<usize> = (demand.tests.iter())
-            .filter(|test| !taken.tests.contains(&test.id) && reads_input_only(&test.expr))
-            .map(|test| test.id)
+        let passed: BTreeSet<usize> = (demand.predicates.iter())
+            .filter(|predicate| {
+                !taken.predicates.contains(&predicate.id) && reads_input_only(&predicate.expr)
+            })
+            .map(|predicate| predicate.id)
             .collect();
         let held = Demand {
-            tests: (demand.tests.iter())
-                .filter(|test| !passed.contains(&test.id))
+            predicates: (demand.predicates.iter())
+                .filter(|predicate| !passed.contains(&predicate.id))
                 .cloned()
                 .collect(),
             reads: demand.reads.clone(),
@@ -654,7 +685,7 @@ impl Pass {
             carried: demand.carried,
             fields: demand.fields.clone(),
         };
-        let reads = held.reads_with_tests().map(|reads| {
+        let reads = held.reads_with_predicates().map(|reads| {
             let mut found: BTreeMap<Column, Expr> = (reads.iter())
                 .filter(|(column, _)| input_schema.has_column(column))
                 .map(|(column, read)| (column.clone(), weaken(read, &reads_input_only)))
@@ -664,49 +695,51 @@ impl Pass {
                     add_read(&mut found, column, lit(true));
                 }
             }
-            if let Some(filter) = node.filter() {
-                for column in filter.column_refs() {
+            if let Some(inline_predicate) = node.inline_predicate() {
+                for column in inline_predicate.column_refs() {
                     if input_schema.has_column(column) {
-                        let within = read_condition(&filter, column).unwrap_or(lit(true));
+                        let within = read_condition(&inline_predicate, column).unwrap_or(lit(true));
                         let within = weaken(&within, &reads_input_only);
                         add_read(&mut found, column, within);
                     }
                 }
             }
-            for test in node.tests() {
-                for column in test.test.column_refs() {
+            for pred in node.written_predicates() {
+                for column in pred.predicate.column_refs() {
                     add_read(&mut found, column, lit(true));
                 }
             }
             found
         });
         let count = match &demand.count {
-            _ if taken.count || node.has_fetch() => Count::All,
+            _ if taken.count || node.has_row_limit() => Count::All,
             Count::Rows(_)
-                if node.semantics() == Semantics::Rows && node.filter().is_none() && decided =>
+                if node.semantics() == Semantics::Rows
+                    && node.inline_predicate().is_none()
+                    && decided =>
             {
                 demand.count.clone()
             }
             _ => Count::All,
         };
         let own: BTreeSet<Column> = (node.asked_expressions().into_iter())
-            .chain(node.filter_expressions())
+            .chain(node.predicate_expressions())
             .flat_map(|expr| expr.column_refs().into_iter().cloned().collect::<Vec<_>>())
             .collect();
-        let fields = (without_tests(&held.fields, &held.tests).into_iter())
+        let fields = (without_predicates(&held.fields, &held.predicates).into_iter())
             .filter(|(column, _)| input_schema.has_column(column) && !own.contains(column))
             .collect();
         let (input, below) = self.down(
             input,
             Demand {
-                tests,
+                predicates,
                 reads,
                 count,
                 carried: demand.carried,
                 fields,
             },
         )?;
-        taken.tests.extend(below.tests);
+        taken.predicates.extend(below.predicates);
         taken.count |= below.count;
         let node = node.with_input(input)?;
         let rebuilt = read_kept(extension_node(node.checked()?), &below.kept)?;
@@ -716,9 +749,9 @@ impl Pass {
     }
 }
 
-fn project(node: &mut AiNode, above: &Demand) -> Option<(String, bool)> {
+fn prune_fields(node: &mut AiNode, above: &Demand) -> Option<(String, bool)> {
     above.reads.as_ref()?;
-    node.project(
+    node.prune_fields(
         |name| above.read_where(&Column::from_name(name)).is_some(),
         above.carried,
     )
@@ -751,7 +784,7 @@ fn ask_read_fields(node: &mut AiNode, above: &Demand) -> Result<()> {
             };
             read.extend(found);
         }
-        for expr in node.filter_expressions() {
+        for expr in node.predicate_expressions() {
             if expr.column_refs().contains(name) {
                 let Some(found) = read_fields(&expr, name) else {
                     return Ok(());
@@ -779,13 +812,13 @@ fn ask_read_fields(node: &mut AiNode, above: &Demand) -> Result<()> {
     Ok(())
 }
 
-fn without_tests(
+fn without_predicates(
     fields: &BTreeMap<Column, BTreeSet<String>>,
-    tests: &[Test],
+    predicates: &[Predicate],
 ) -> BTreeMap<Column, BTreeSet<String>> {
-    let tested: BTreeSet<&Column> = tests
+    let tested: BTreeSet<&Column> = predicates
         .iter()
-        .flat_map(|test| test.expr.column_refs())
+        .flat_map(|predicate| predicate.expr.column_refs())
         .collect();
     (fields.iter())
         .filter(|(column, _)| !tested.contains(column))
@@ -856,9 +889,9 @@ fn read_kept(plan: LogicalPlan, kept: &[(String, bool)]) -> Result<LogicalPlan> 
     plan.with_new_exprs(exprs, inputs)
 }
 
-fn guard(node: &mut AiNode, demand: &Demand) {
+fn precondition(node: &mut AiNode, demand: &Demand) {
     if node.function() == "ai_filter" {
-        return or_guard(node, demand);
+        return or_precondition(node, demand);
     }
     if !node.is_plain_column() {
         return;
@@ -875,7 +908,7 @@ fn guard(node: &mut AiNode, demand: &Demand) {
         .filter(|term| !matches!(term, Expr::Literal(..)))
         .cloned()
         .collect();
-    node.add_guard(kept);
+    node.add_precondition(kept);
 }
 
 struct Bounds {
@@ -985,20 +1018,20 @@ fn bounds(expr: &Expr, known: &dyn Fn(&Expr) -> bool) -> Bounds {
     }
 }
 
-fn or_guard(node: &mut AiNode, demand: &Demand) {
-    if !node.takes_or_guard() {
+fn or_precondition(node: &mut AiNode, demand: &Demand) {
+    if !node.takes_or_precondition() {
         return;
     }
     let answer = Column::from_name(node.answer());
-    let read = match node.filter() {
-        Some(filter) if unread(node, demand) && node.or_terms().is_some() => {
-            read_condition(&filter, &answer)
+    let read = match node.inline_predicate() {
+        Some(inline_predicate) if unread(node, demand) && node.or_terms().is_some() => {
+            read_condition(&inline_predicate, &answer)
         }
         Some(_) => None,
         None => demand.read_where(&answer),
     };
     if let Some(read) = read {
-        node.guard_or(&read);
+        node.precondition_or(&read);
     }
 }
 

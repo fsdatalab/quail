@@ -1232,7 +1232,6 @@ class Engine:
             q3, k3, v3, chunk.meta, output=target), output=output)
 
 
-
     def _fa(self, q, k, v, cu_q, cu_k, max_q, max_k, causal,
             block_table=None, seqused_k=None, softmax_scale=None,
             window=None, version=None, output=None):

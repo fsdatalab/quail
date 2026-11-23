@@ -42,7 +42,7 @@ pub(super) fn read_fetch(top: &Top<'_>) -> Option<Option<i64>> {
     let mut elsewhere = false;
     let _ = top.relation.apply(|plan| {
         if let Some(node) = as_node::<AiNode>(plan)
-            && let Some(rows) = node.global_fetch()
+            && let Some(rows) = node.global_row_limit()
         {
             match last {
                 Some(found) if std::ptr::eq(found, node) => fetch = Some(rows as i64),

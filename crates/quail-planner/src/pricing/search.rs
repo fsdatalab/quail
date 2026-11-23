@@ -203,7 +203,7 @@ pub fn table_steps(
             later,
             reuse_key: None,
             document_head: head(&call.prompt)?,
-            reads: (column.guard.iter())
+            reads: (column.precondition.iter())
                 .flat_map(crate::expressions::column_references)
                 .map(|reference| reference.column)
                 .collect(),

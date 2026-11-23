@@ -1,13 +1,13 @@
 """Transcripts of what Quail asks the model, for a person to read.
 
 A transcript test runs a query on an oracle model and writes, as text,
-what Quail did: each AI operator of the plan with its guard, filter, and
-fetch; each question the model answered, by prompt and row, in the order
-the operators asked; and the rows the query returned. The test passes
-when the text matches the expected transcript, a string literal written
-in the test itself as the second argument of ``assert_transcript``. A
-change in what Quail asks shows up as a diff of the test, which a
-reviewer reads in place of counts.
+what Quail did: each AI operator of the plan with its precondition,
+inline_predicate, and row_limit; each question the model answered, by
+prompt and row, in the order the operators asked; and the rows the query
+returned. The test passes when the text matches the expected transcript,
+a string literal written in the test itself as the second argument of
+``assert_transcript``. A change in what Quail asks shows up as a diff of
+the test, which a reviewer reads in place of counts.
 
 Each query also runs with every pushdown off. The transcript fails if the
 two return different rows, and says how many of that run's questions

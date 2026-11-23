@@ -410,7 +410,6 @@ def _plan_phases(arena, groups, stage, undo):
     return tuple(phases)
 
 
-
 def gdn_prefill_backend():
     """Return "flashinfer" or "triton" for the chunked recurrence.
 
@@ -879,7 +878,6 @@ def _move_states(arena, phase, layer_slot):
         arena.gdn_state[phase.copy_reads, layer_slot])
     arena.conv_state[phase.copy_writes, layer_slot] = (
         arena.conv_state[phase.copy_reads, layer_slot])
-
 
 
 def short_conv_core(inputs, weight, phases, arena, layer_slot):

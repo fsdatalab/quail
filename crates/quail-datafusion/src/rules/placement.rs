@@ -130,12 +130,12 @@ fn ai_join(plan: &LogicalPlan) -> Option<&AiNode> {
 
 fn mover(node: &LogicalPlan) -> Option<Mover> {
     if let Some(ai) = as_node::<AiNode>(node) {
-        if ai.has_fetch() {
+        if ai.has_row_limit() {
             return None;
         }
         let answers = plan_answers(ai.inputs()[0]);
         let mut tables = expr_tables(&ai.call(), &[]);
-        for expr in ai.guard().into_iter().chain(ai.filter()) {
+        for expr in ai.precondition().into_iter().chain(ai.inline_predicate()) {
             tables.extend(expr_tables(&expr, &answers));
         }
         let added = ai

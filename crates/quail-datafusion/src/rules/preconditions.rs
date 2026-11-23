@@ -1,16 +1,19 @@
 use datafusion::logical_expr::Expr;
 
-pub(crate) fn guard_selectivity(guard: &Expr, answers: &[(String, Option<f64>)]) -> f64 {
+pub(crate) fn precondition_selectivity(
+    precondition: &Expr,
+    answers: &[(String, Option<f64>)],
+) -> f64 {
     use datafusion::logical_expr::{BinaryExpr, Operator};
     use quail_planner::operators::effective_selectivity;
-    match guard {
-        Expr::IsNotTrue(inner) | Expr::Not(inner) => 1.0 - guard_selectivity(inner, answers),
+    match precondition {
+        Expr::IsNotTrue(inner) | Expr::Not(inner) => 1.0 - precondition_selectivity(inner, answers),
         Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::And => {
-            guard_selectivity(left, answers) * guard_selectivity(right, answers)
+            precondition_selectivity(left, answers) * precondition_selectivity(right, answers)
         }
         Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::Or => {
-            1.0 - (1.0 - guard_selectivity(left, answers))
-                * (1.0 - guard_selectivity(right, answers))
+            1.0 - (1.0 - precondition_selectivity(left, answers))
+                * (1.0 - precondition_selectivity(right, answers))
         }
         Expr::Column(column) if column.relation.is_none() => effective_selectivity(
             answers

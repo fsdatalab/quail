@@ -4,25 +4,30 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
 mod demand;
-mod fetch;
+mod row_limit;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeriveOption {
-    Filters,
-    Fetch,
-    Projection,
-    Guard,
+    InlinePredicates,
+    RowLimit,
+    FieldPruning,
+    Precondition,
 }
 
 impl DeriveOption {
-    const ALL: [Self; 4] = [Self::Filters, Self::Fetch, Self::Projection, Self::Guard];
+    const ALL: [Self; 4] = [
+        Self::InlinePredicates,
+        Self::RowLimit,
+        Self::FieldPruning,
+        Self::Precondition,
+    ];
 
     pub const fn rule_name(self) -> &'static str {
         match self {
-            Self::Filters => "derive.filters",
-            Self::Fetch => "derive.fetch",
-            Self::Projection => "derive.projection",
-            Self::Guard => "derive.guard",
+            Self::InlinePredicates => "derive.inline_predicates",
+            Self::RowLimit => "derive.row_limit",
+            Self::FieldPruning => "derive.field_pruning",
+            Self::Precondition => "derive.precondition",
         }
     }
 }
@@ -63,10 +68,10 @@ impl OptimizerRule for Derive {
     ) -> Result<Transformed<LogicalPlan>> {
         let wants = |option: DeriveOption| self.only.is_none_or(|only| only == option);
         let options = demand::Options {
-            filters: wants(DeriveOption::Filters),
-            fetch: wants(DeriveOption::Fetch),
-            guard: wants(DeriveOption::Guard),
-            projection: wants(DeriveOption::Projection),
+            inline_predicates: wants(DeriveOption::InlinePredicates),
+            row_limit: wants(DeriveOption::RowLimit),
+            precondition: wants(DeriveOption::Precondition),
+            field_pruning: wants(DeriveOption::FieldPruning),
         };
         demand::demand_pass(plan, options)
     }

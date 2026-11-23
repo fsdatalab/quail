@@ -1,10 +1,9 @@
 pub(crate) mod derive;
 pub(crate) mod distinct;
-pub(crate) mod guards;
-
+pub(crate) mod field_pruning;
 pub(crate) mod lower;
 pub(crate) mod placement;
-pub(crate) mod projection;
+pub(crate) mod preconditions;
 pub(crate) mod repeated;
 pub(crate) mod substring;
 

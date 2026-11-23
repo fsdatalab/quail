@@ -46,7 +46,6 @@ def pages_for(tokens: int, page_tokens: int) -> int:
     return -(-tokens // page_tokens)
 
 
-
 _DONE = -2
 
 

@@ -25,7 +25,6 @@ from quail.explain import explain
 from quail.physical import Limit, Scan, decode_plan_value
 from quail.physical.plan import Refusal, RefusalError, plan_from_json
 
-
 if TYPE_CHECKING:
     from quail.api.session import Session
 

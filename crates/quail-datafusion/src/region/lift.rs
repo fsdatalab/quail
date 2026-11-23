@@ -319,7 +319,7 @@ fn take_row_tests(
                 lifted,
             )?;
             let mut node = node.with_input(input)?;
-            lifted.extend(node.lift_filter(|filter| split(filter, false)));
+            lifted.extend(node.lift_filter(|inline_predicate| split(inline_predicate, false)));
             Ok(extension_node(node.checked()?))
         }
         other => {

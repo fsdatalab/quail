@@ -549,7 +549,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                     state_tail_tokens: 0,
                     question_header_token_ids: Vec::new(),
                     document_ends: Value::Array(Vec::new()),
-                    guard: predicate.guard.clone(),
+                    precondition: predicate.precondition.clone(),
                     alternative: predicate.alternative.clone(),
                     answer: predicate.answer.clone(),
                     negated: predicate.negated,
@@ -1014,7 +1014,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                 inputs,
                 spec,
                 model,
-                column.guard.clone(),
+                column.precondition.clone(),
             ));
         }
         let spec = column_spec(context, column, expected_rows, resident)?;
@@ -1032,7 +1032,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                         pass_group: -1,
                         document_ends: Value::Array(Vec::new()),
                         attention: String::new(),
-                        guard: column.guard.clone(),
+                        precondition: column.precondition.clone(),
                         stop_tests: Vec::new(),
                         stop_when_true: false,
                     },
@@ -1051,7 +1051,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                         pass_group: -1,
                         document_ends: Value::Array(Vec::new()),
                         attention: String::new(),
-                        guard: column.guard.clone(),
+                        precondition: column.precondition.clone(),
                         stop_tests: Vec::new(),
                         stop_when_true: false,
                     },
@@ -1069,7 +1069,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                         keep_kv: false,
                         pass_group: -1,
                         document_ends: Value::Array(Vec::new()),
-                        guard: column.guard.clone(),
+                        precondition: column.precondition.clone(),
                     },
                 ))
             }
@@ -1468,7 +1468,7 @@ fn classify_node(
     inputs: &[PortRef],
     spec: ClassifySpec,
     model: String,
-    guard: Option<ValueExpression>,
+    precondition: Option<ValueExpression>,
 ) -> PhysicalNode {
     PhysicalNode::AiClassify(tagged_node(
         id,
@@ -1480,7 +1480,7 @@ fn classify_node(
             keep_kv: false,
             pass_group: -1,
             document_ends: Value::Array(Vec::new()),
-            guard,
+            precondition,
         },
     ))
 }

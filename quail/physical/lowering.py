@@ -22,7 +22,6 @@ from quail.physical import decode_plan_value
 _WORDS = 1 << 40
 
 
-
 class Vocabulary:
     """A tokenizer's ids as Rust reads them, with words interned."""
 

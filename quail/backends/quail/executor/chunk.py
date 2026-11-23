@@ -380,7 +380,6 @@ def joined_ids(sequences) -> np.ndarray:
     return np.concatenate(arrays) if arrays else np.empty(0, dtype=np.int64)
 
 
-
 class _PoolView:
     """Rows and pages owned by one KV key in one arena pool.
 
