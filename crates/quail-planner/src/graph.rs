@@ -32,9 +32,7 @@ use crate::search::{
     ASK, OperatorOrder, StepKey, TableStep, choose_operator_order, column_step_kind, label_calls,
     resident_after,
 };
-use crate::statistics::{
-    RowFlow, arena_capacity, effective_selectivity, pair_counts, predicate_asked_fraction,
-};
+use crate::statistics::{RowFlow, effective_selectivity, pair_counts, predicate_asked_fraction};
 use crate::validation::{
     columns_above_joins, has_score, is_score, score_projections, validate_query,
 };
@@ -337,7 +335,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
             self.scoring = Some(ScoreLowering {
                 projected: score_projections(self.operators),
                 chunk,
-                capacity: arena_capacity(self.context, chunk)?,
+                capacity: self.context.arena_capacity(chunk)?,
                 names: Vec::new(),
                 work: Work::default(),
                 index: 0,

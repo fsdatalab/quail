@@ -13,8 +13,6 @@ use crate::cost::statistics::AliasStats;
 use crate::cost::work::{Work, ask, scan};
 use crate::physical::Prompt;
 
-use crate::classify::classify_work;
-use crate::columns::{ColumnSpec, column_spec};
 use crate::context::PlanningContext;
 pub use crate::costs::StepCost;
 use crate::costs::{prepare_filter_costs, question_tokens};
@@ -38,38 +36,6 @@ pub const ASK: &str = "ask";
 pub enum StepKey {
     Position(usize),
     Name(String),
-}
-
-/// A column operator's work over `rows` documents, or None when the
-/// model cannot run it.
-///
-/// # Errors
-///
-/// The tokenizer fails, or the model cannot run the operator.
-pub fn column_work(
-    context: &PlanningContext,
-    column: &SemanticColumn,
-    resident: bool,
-    rows: f64,
-) -> Result<Option<Work>, CompileError> {
-    // a guarded operator asks the model about its guard's rows alone
-    let rows = rows * column.asked_fraction();
-    if column.call.kind == "label" {
-        return classify_work(
-            context,
-            &column.call,
-            &column.name,
-            &column.alias(),
-            resident,
-            rows,
-        );
-    }
-    let values = match column_spec(context, column, rows, resident)? {
-        ColumnSpec::Extract(spec) => spec.estimated_work,
-        ColumnSpec::Map(spec) => spec.estimated_work,
-        ColumnSpec::SaeFeatures(spec) => spec.estimated_work,
-    };
-    Ok(Some(Work::from_values(&values)))
 }
 
 /// One step of a table's sequence and its costs, as `TableStep`.

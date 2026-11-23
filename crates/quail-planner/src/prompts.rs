@@ -4,7 +4,7 @@
 //! arguments into a `Prompt`: the text before the document, the text
 //! after it, and the pieces the planner tokenizes on their own.
 
-use crate::constants::LABEL_PREFIX;
+use crate::constants::{LABEL_PREFIX, MAX_LETTERS};
 use std::collections::BTreeMap;
 
 use crate::physical::{Prompt, ValueExpression};
@@ -112,9 +112,6 @@ impl PromptLayout {
             .replacen("{}", name, 1)
     }
 }
-
-/// Jev's limit on one choice's options, which OpenJev keeps.
-pub const MAX_LETTERS: usize = 255;
 
 /// The codes a coded prompt may use, in order: A to Z, then AA to ZZ.
 pub fn code_candidates() -> Vec<String> {

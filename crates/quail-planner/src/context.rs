@@ -2,7 +2,9 @@
 
 use std::collections::BTreeMap;
 
+use crate::cost::budgets::arena_pages;
 use crate::cost::specs::{DeviceSpec, ModelSpec};
+use crate::cost::statistics::AliasStats;
 
 use crate::error::CompileError;
 use crate::lowering::{Decoder, LoweredPrompt, PromptModel, Tokenizer, lower_prompt};
@@ -48,6 +50,31 @@ pub struct PlanningContext<'a> {
 }
 
 impl PlanningContext<'_> {
+    /// The tokens of document KV the query's arena holds at once.
+    ///
+    /// # Errors
+    ///
+    /// The arena does not fit the device.
+    pub fn arena_capacity(&self, chunk: i64) -> Result<i64, CompileError> {
+        let window = self.model.sliding_window;
+        let mut longest: Option<f64> = None;
+        for lengths in self.document_tokens.values() {
+            let mean = AliasStats::summarize(lengths, window).mean();
+            if longest.is_none_or(|found| mean > found) {
+                longest = Some(mean);
+            }
+        }
+        let (full, _) = arena_pages(
+            &self.model,
+            &self.device,
+            Some(chunk),
+            longest,
+            self.writes_answers(),
+        )
+        .map_err(CompileError::new)?;
+        Ok(full * self.device.page_tokens)
+    }
+
     /// Whether the plan being planned writes answers token by token,
     /// as [`Operators::writes_answers`]; true while the operators are
     /// unknown, which keeps the CUDA graph reserve.

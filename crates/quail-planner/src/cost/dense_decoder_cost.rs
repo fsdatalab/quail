@@ -214,7 +214,7 @@ pub fn dense_decoder_components(work: &Work, model: &ModelSpec, passes: f64) -> 
 fn readout(model: &ModelSpec, rows: f64, passes: f64, head_rows: f64) -> CostComponent {
     if !model.readout.is_empty() {
         // every code row of the fp32 readout times the prompt's last row
-        let codes = (crate::prompts::MAX_LETTERS as i64 * model.hidden) as f64;
+        let codes = (crate::constants::MAX_LETTERS as i64 * model.hidden) as f64;
         return CostComponent {
             name: "readout",
             flops: Quantity::Scalar(2.0 * codes * rows),

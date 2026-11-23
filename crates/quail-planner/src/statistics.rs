@@ -3,12 +3,7 @@
 use crate::constants::DEFAULT_SELECTIVITY;
 use std::collections::BTreeMap;
 
-use crate::cost::budgets::arena_pages;
 use crate::cost::joins::PricedJoin;
-use crate::cost::statistics::AliasStats;
-
-use crate::context::PlanningContext;
-use crate::error::CompileError;
 
 /// The selectivity the planner uses: the given one or the default.
 pub fn effective_selectivity(selectivity: Option<f64>) -> f64 {
@@ -204,31 +199,6 @@ pub fn pair_counts(
         left * right * fraction,
         surviving_documents(left, right, Some(fraction)),
     )
-}
-
-/// The tokens of document KV the query's arena holds at once.
-///
-/// # Errors
-///
-/// The arena does not fit the device.
-pub fn arena_capacity(context: &PlanningContext, chunk: i64) -> Result<i64, CompileError> {
-    let window = context.model.sliding_window;
-    let mut longest: Option<f64> = None;
-    for lengths in context.document_tokens.values() {
-        let mean = AliasStats::summarize(lengths, window).mean();
-        if longest.is_none_or(|found| mean > found) {
-            longest = Some(mean);
-        }
-    }
-    let (full, _) = arena_pages(
-        &context.model,
-        &context.device,
-        Some(chunk),
-        longest,
-        context.writes_answers(),
-    )
-    .map_err(CompileError::new)?;
-    Ok(full * context.device.page_tokens)
 }
 
 #[cfg(test)]

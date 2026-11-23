@@ -10,6 +10,8 @@ use crate::cost::score::ScoreCost;
 use crate::cost::work::Work;
 use crate::physical::{Equality, FilterPredicate, Prompt};
 
+use crate::classify::classify_work;
+use crate::columns::{ColumnSpec, column_spec};
 use crate::context::PlanningContext;
 use crate::error::{CompileError, compile_error};
 use crate::expressions::asked_call;
@@ -44,7 +46,7 @@ impl StepCost {
             StepCost::PerDocument(work) => return Ok(Some(&**work * rows)),
             StepCost::Score(cost) => cost.estimate(rows, None).0,
             StepCost::Column { column, resident } => {
-                match crate::search::column_work(context, column, *resident, rows)? {
+                match column_work(context, column, *resident, rows)? {
                     Some(work) => work,
                     None => return Ok(None),
                 }
@@ -52,6 +54,38 @@ impl StepCost {
         };
         Ok(Some(&work * (1.0 / parallel_copies(context.gpus, rows))))
     }
+}
+
+/// A column operator's work over `rows` documents, or None when the
+/// model cannot run it.
+///
+/// # Errors
+///
+/// The tokenizer fails, or the model cannot run the operator.
+fn column_work(
+    context: &PlanningContext,
+    column: &SemanticColumn,
+    resident: bool,
+    rows: f64,
+) -> Result<Option<Work>, CompileError> {
+    // a guarded operator asks the model about its guard's rows alone
+    let rows = rows * column.asked_fraction();
+    if column.call.kind == "label" {
+        return classify_work(
+            context,
+            &column.call,
+            &column.name,
+            &column.alias(),
+            resident,
+            rows,
+        );
+    }
+    let values = match column_spec(context, column, rows, resident)? {
+        ColumnSpec::Extract(spec) => spec.estimated_work,
+        ColumnSpec::Map(spec) => spec.estimated_work,
+        ColumnSpec::SaeFeatures(spec) => spec.estimated_work,
+    };
+    Ok(Some(Work::from_values(&values)))
 }
 
 /// One predicate's costs, and the score result a later predicate may reuse.

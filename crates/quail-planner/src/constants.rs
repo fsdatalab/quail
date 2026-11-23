@@ -118,3 +118,6 @@ pub const WORK_FIELDS: [&str; 9] = [
     "state_read",
     "sae_encoded",
 ];
+
+/// Jev's limit on one choice's options, which OpenJev keeps.
+pub const MAX_LETTERS: usize = 255;

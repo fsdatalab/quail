@@ -7,6 +7,7 @@
 mod expressions;
 mod graph;
 mod nodes;
+mod ports;
 mod specs;
 mod tagged;
 mod topology;
@@ -15,10 +16,9 @@ pub use expressions::{
     Alias, Asked, ColumnRef, Equality, Expression, ExtractStruct, FilterPredicate, GetField,
     ModelCall, Projected, Prompt, ScoreTest, TaggedModelCall, ValueExpression,
 };
-pub use graph::{
-    AnswerOutput, InputPort, OutputPort, PhysicalGraph, PlanEnvelope, PortRef, ValueType,
-};
+pub use graph::{PhysicalGraph, PlanEnvelope};
 pub use nodes::*;
+pub use ports::{AnswerOutput, InputPort, OutputPort, PortRef, ValueType};
 pub use specs::{
     ClassifySpec, ExtractSpec, MapSpec, RequestClassifySpec, RequestExtractSpec, RequestFilterSpec,
     RequestJoinSpec, RequestMapSpec, SaeFeaturesSpec, ScoreSpec, TokenIds,

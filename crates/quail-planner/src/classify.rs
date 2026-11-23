@@ -22,7 +22,6 @@ use crate::lowering::{
     option_spellings,
 };
 use crate::prompts::prompt_layout;
-use crate::statistics::arena_capacity;
 
 pub const DECISION_SCORING: &str = "decision_choice";
 pub const SET_CHOICE_SCORING: &str = "set_choice";
@@ -99,7 +98,7 @@ pub fn classify_statistics(
     let lengths = context.lengths(alias)?;
     let summary = AliasStats::summarize(lengths, model.sliding_window);
     let chunk = chunk_budget(model, &context.device);
-    let capacity = arena_capacity(context, chunk)?;
+    let capacity = context.arena_capacity(chunk)?;
     Ok(ClassifyTable {
         alias: alias.to_string(),
         mean: summary.mean(),

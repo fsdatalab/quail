@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::physical::expressions::ValueExpression;
-use crate::physical::graph::{InputPort, OutputPort};
+use crate::physical::ports::{InputPort, OutputPort};
 use crate::physical::specs::{
     ClassifySpec, ExtractSpec, MapSpec, RequestClassifySpec, RequestExtractSpec, RequestFilterSpec,
     RequestJoinSpec, RequestMapSpec, SaeFeaturesSpec, ScoreSpec, TokenIds,

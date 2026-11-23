@@ -13,7 +13,7 @@ use crate::error::CompileError;
 use crate::expressions::{argument_alias, column_name};
 use crate::lowering::{lower_prompt, score_query_template, score_token_parts};
 use crate::prompts::{bind_prompt, prompt_layout};
-use crate::statistics::{arena_capacity, pair_counts};
+use crate::statistics::pair_counts;
 
 /// A prompt's table aliases in placeholder order.
 pub fn prompt_aliases(prompt: &Prompt) -> Vec<String> {
@@ -57,7 +57,7 @@ pub fn score_statistics(
         model: model.clone(),
         device: context.device.clone(),
         chunk_tokens: chunk,
-        capacity: arena_capacity(context, chunk)?,
+        capacity: context.arena_capacity(chunk)?,
         gpus: context.gpus,
         draws: if model.canvas_tokens != 0 && aliases.len() == 1 {
             context.canvas_draws

@@ -3,8 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::physical::expressions::ValueExpression;
-use crate::physical::graph::{AnswerOutput, InputPort, OutputPort, PortRef, ValueType};
 use crate::physical::nodes::*;
+use crate::physical::ports::{AnswerOutput, InputPort, OutputPort, PortRef, ValueType};
 use crate::physical::specs::ExtractSpec;
 
 /// The outputs of a request backend's node: each table's survivors, then

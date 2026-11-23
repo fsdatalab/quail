@@ -21,7 +21,7 @@ pub type Tokenizer<'a> = dyn Fn(&str) -> Result<Vec<i64>, CompileError> + 'a;
 pub type Decoder<'a> = dyn Fn(&[i64]) -> Result<String, CompileError> + 'a;
 
 /// AI.CLASSIFY's most labels; Jev's limit on one choice's options.
-pub use crate::prompts::MAX_LETTERS;
+use crate::constants::MAX_LETTERS;
 
 /// A set-attention question's state tail length and later-question header:
 /// the tokens of the tail's first segment, which the state keeps, and the
