@@ -31,6 +31,7 @@ use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
 mod demand;
 mod fetch;
+mod node;
 
 /// One kind of option [`Derive`] sets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
