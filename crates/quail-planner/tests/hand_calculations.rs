@@ -1,6 +1,3 @@
-//! The cost model's work counts and latencies against hand calculations
-//! and brute-force attention masks.
-
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -38,7 +35,6 @@ fn q(value: f64) -> Quantity {
     Quantity::Scalar(value)
 }
 
-/// Allowed keys for every new query position, counted one by one.
 fn mask_pairs(prefix: i64, suffix: i64, window: i64) -> f64 {
     (prefix..prefix + suffix)
         .map(|query| {
@@ -181,9 +177,6 @@ fn diffusion_gemma_attention_reads_full_and_sliding_kv() {
 fn one_review_through_a_filter_and_a_join_matches_the_hand_calculation() {
     let models = models();
     let model = &models["qwen3.5-4b-bf16"];
-    // 100-token review, 6-token preamble, 56-token filter question, then a
-    // join: a 43-token frame and two aspects of 2 and 3 tokens, each with a
-    // 13-token tail
     let checkpoint = Work {
         state_written: q(1.0),
         ..Work::default()
@@ -215,8 +208,6 @@ fn one_review_through_a_filter_and_a_join_matches_the_hand_calculation() {
             .find(|component| component.component.name == name)
             .expect("component")
     };
-    // one pass reads every weight once, so the weight components are
-    // limited by memory at this size
     let projection = component("attn_proj");
     assert!(value(&projection.memory_seconds) > value(&projection.compute_seconds));
     assert_eq!(

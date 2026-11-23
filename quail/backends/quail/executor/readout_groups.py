@@ -15,7 +15,6 @@ class ReadoutGroups:
 
     def __init__(self, torch, stages):
         self.torch = torch
-        # Combine stages sharing a readout in one submission per chunk.
         self.shared_readout = all(stage.readout is stages[0].readout
                                   for stage in stages)
         groups = []

@@ -1,5 +1,3 @@
-//! AI.SCORE's statistics, cost, and spec.
-
 use std::collections::BTreeMap;
 
 use crate::cost::score::ScoreCost;
@@ -15,7 +13,6 @@ use crate::pricing::statistics::pair_counts;
 use crate::prompts::lowering::{lower_prompt, score_query_template, score_token_parts};
 use crate::prompts::{bind_prompt, prompt_layout};
 
-/// A prompt's table aliases in placeholder order.
 pub fn prompt_aliases(prompt: &Prompt) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
     for argument in &prompt.args {
@@ -27,11 +24,6 @@ pub fn prompt_aliases(prompt: &Prompt) -> Vec<String> {
     found
 }
 
-/// A score's prompt tokens around the documents, and its cost inputs.
-///
-/// # Errors
-///
-/// The tokenizer fails, or the arena does not fit the device.
 pub fn score_statistics(
     prompt: &Prompt,
     context: &PlanningContext,
@@ -68,12 +60,6 @@ pub fn score_statistics(
     Ok((parts, cost))
 }
 
-/// A set-attention score's state tail length and later-question header,
-/// as `set_score_parts`; (0, []) for every other score.
-///
-/// # Errors
-///
-/// The tokenizer fails.
 pub fn set_score_parts(
     prompt: &Prompt,
     context: &PlanningContext,
@@ -91,11 +77,6 @@ pub fn set_score_parts(
     crate::prompts::lowering::set_question_parts(&lowered, &model.prompt_layout, context.tokenizer)
 }
 
-/// A score's spec and its work, as `score_spec`.
-///
-/// # Errors
-///
-/// The tokenizer fails, or the arena does not fit the device.
 #[allow(clippy::too_many_arguments)]
 pub fn score_spec(
     prompt: &Prompt,
@@ -132,7 +113,6 @@ pub fn score_spec(
     Ok((spec, work))
 }
 
-/// A score join's work at the given survivor counts, as `ScoreJoinCost.work`.
 pub fn score_join_work(
     cost: &ScoreCost,
     aliases: &[String],

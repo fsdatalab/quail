@@ -1,56 +1,25 @@
-//! Cut a region's graph into stages, one DataFusion partition per GPU.
-//!
-//! A stage is a run of nodes whose rows are spread over the GPUs by the
-//! ids of one table, its key: partition p of the stage runs on GPU p
-//! over the rows whose key id hashes to p. A stage's inputs are the
-//! ports it reads from scans or other stages: a port carrying the key's
-//! rows is hashed by the key, so each document is asked once and on the
-//! GPU that holds its KV; every other port is broadcast whole to every
-//! partition, after the stage that writes it has finished.
-//!
-//! A table's filters run in the stage of the join anchored on it; a
-//! partner's filters are a stage of their own, so they run once, not
-//! once per partition. A Barrier starts a stage, keyed by the next
-//! anchor, that reads the join answers so far whole.
-//!
-//! On one GPU nothing is spread: the region is one stage of every node,
-//! which reads each scan whole, so its nodes run in the order and the
-//! chains of the plan.
-//!
-//! The planner cuts the stages once, into the plan's `stages` setting;
-//! explain prints them and the run reads them.
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::physical::{Location, PhysicalGraph, PhysicalNode, PortRef};
 use crate::topology::topological_nodes;
 use serde::{Deserialize, Serialize};
 
-/// One port a stage reads from outside it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StageInput {
     pub node_id: String,
     pub port: String,
-    /// The stage that writes the port, or None for a scan's rows.
     pub stage: Option<usize>,
-    /// Whether each partition reads the rows whose key id hashes to it;
-    /// otherwise every partition reads the whole port.
     pub hashed: bool,
 }
 
-/// A run of nodes spread over the GPUs by the ids of one table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stage {
-    /// The alias whose ids pick each row's partition.
     pub key: String,
-    /// The stage's node ids, in run order.
     pub nodes: Vec<String>,
     pub inputs: Vec<StageInput>,
-    /// The ports later stages read, as (node id, port).
     pub outputs: Vec<(String, String)>,
 }
 
-/// What the cut reads of one node.
 #[derive(Debug, Clone)]
 pub struct CutNode {
     pub id: String,
@@ -58,23 +27,16 @@ pub struct CutNode {
     pub inputs: Vec<PortRef>,
 }
 
-/// How a node takes part in the cut.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Role {
-    /// A scan: its rows are an input, not part of a stage.
     Scan,
-    /// A join that asks no model: it runs in the stage that reads it.
     HashJoin,
-    /// A Barrier: it starts a stage keyed by the next anchor.
     Barrier(String),
-    /// A node over one table's documents, or a join's anchor.
     Keyed(String),
-    /// A node over rows of several tables: it runs with its input.
     Follows(String),
 }
 
 impl CutNode {
-    /// What the cut reads of a physical node.
     pub fn of(node: &PhysicalNode) -> Self {
         let role = match node {
             PhysicalNode::Scan(_) => Role::Scan,
@@ -82,8 +44,6 @@ impl CutNode {
             PhysicalNode::Barrier(barrier) => Role::Barrier(barrier.attributes.next_anchor.clone()),
             PhysicalNode::AiJoin(join) => Role::Keyed(join.attributes.anchor.clone()),
             _ => {
-                // a node of several tables' rows runs with the join whose
-                // pairs it reads, on the anchors' KV
                 let mut aliases = node.spec_aliases();
                 if aliases.len() < 2 {
                     aliases = node.document_aliases();
@@ -109,8 +69,6 @@ impl CutNode {
     }
 }
 
-/// A graph's compute nodes: the nodes on the GPU executor or a backend
-/// and the nodes they read, as indices in topological order.
 pub fn compute_nodes(graph: &PhysicalGraph) -> Vec<usize> {
     let by_id: BTreeMap<&str, &PhysicalNode> =
         graph.nodes.iter().map(|node| (node.id(), node)).collect();
@@ -133,12 +91,6 @@ pub fn compute_nodes(graph: &PhysicalGraph) -> Vec<usize> {
         .collect()
 }
 
-/// Cut a graph's compute nodes, the nodes on the GPU executor or a
-/// backend and the nodes they read, into stages for `gpus` GPUs.
-///
-/// # Errors
-///
-/// The graph is invalid, or a node reads a port no scan or stage writes.
 pub fn stages(graph: &PhysicalGraph, gpus: usize) -> Result<Vec<Stage>, String> {
     crate::topology::validate_graph(&graph.nodes, &graph.root)?;
     let nodes: Vec<CutNode> = compute_nodes(graph)
@@ -151,8 +103,6 @@ pub fn stages(graph: &PhysicalGraph, gpus: usize) -> Result<Vec<Stage>, String> 
     cut(&nodes)
 }
 
-/// Nodes, in topological order, as one stage that reads each scan whole;
-/// no stage when no node computes.
 fn whole(nodes: &[CutNode]) -> Vec<Stage> {
     let (scans, inside): (Vec<&CutNode>, Vec<&CutNode>) =
         nodes.iter().partition(|node| node.role == Role::Scan);
@@ -179,14 +129,8 @@ fn whole(nodes: &[CutNode]) -> Vec<Stage> {
     }]
 }
 
-/// Cut nodes, in topological order, into stages.
-///
-/// # Errors
-///
-/// A node reads a port no scan or stage writes.
 pub fn cut(nodes: &[CutNode]) -> Result<Vec<Stage>, String> {
     let mut stages: Vec<Stage> = Vec::new();
-    // stage -> the stages it reads
     let mut reads: Vec<BTreeSet<usize>> = Vec::new();
     let mut stage_of: BTreeMap<&str, usize> = BTreeMap::new();
     let rows = |key: &str| format!("rows:{key}");
@@ -212,8 +156,6 @@ pub fn cut(nodes: &[CutNode]) -> Result<Vec<Stage>, String> {
                 None => (alias.clone(), None),
             },
         };
-        // a node joins its producer's stage unless that stage would then
-        // read a stage that reads it
         let joined = joined.filter(|stage| {
             producers
                 .iter()
@@ -233,7 +175,6 @@ pub fn cut(nodes: &[CutNode]) -> Result<Vec<Stage>, String> {
         stages[stage].nodes.push(node.id.clone());
         stage_of.insert(&node.id, stage);
     }
-    // a join that asks no model runs in the stage of its first reader
     for node in nodes.iter().filter(|node| node.role == Role::HashJoin) {
         let reader = nodes
             .iter()
@@ -293,7 +234,6 @@ pub fn cut(nodes: &[CutNode]) -> Result<Vec<Stage>, String> {
     Ok(stages)
 }
 
-/// Whether stage `from` reads stage `to`, directly or through others.
 fn reaches(reads: &[BTreeSet<usize>], from: usize, to: usize) -> bool {
     let mut pending = vec![from];
     let mut seen = BTreeSet::new();
@@ -376,7 +316,6 @@ mod tests {
         )
     }
 
-    /// A stage as its key, its nodes, and its inputs as (node, hashed).
     type Shape<'a> = (&'a str, Vec<&'a str>, Vec<(&'a str, bool)>);
 
     fn shape(stages: &[Stage]) -> Vec<Shape<'_>> {
@@ -398,8 +337,6 @@ mod tests {
 
     #[test]
     fn a_partner_filter_is_a_stage_of_its_own_and_the_anchor_filter_runs_with_its_join() {
-        // IMDB-4: two filters on reviews, one on aspects, then a join
-        // anchored on reviews
         let nodes = vec![
             scan("r"),
             scan("a"),
@@ -431,7 +368,6 @@ mod tests {
 
     #[test]
     fn a_join_without_filters_hashes_its_anchors_and_broadcasts_its_partners() {
-        // IMDB-2: reviews joined with aspects
         let nodes = vec![
             scan("r"),
             scan("a"),
@@ -453,7 +389,6 @@ mod tests {
 
     #[test]
     fn a_barrier_starts_a_stage_keyed_by_the_next_anchor() {
-        // FEV-9: e1 joins c1 and c2, then c2 joins e2 after a barrier
         let nodes = vec![
             scan("c1"),
             scan("e1"),
@@ -525,8 +460,6 @@ mod tests {
 
     #[test]
     fn a_node_does_not_join_a_stage_that_reads_its_other_input() {
-        // y's filter reads x's rows; x's join reads y's: the join cannot
-        // run in x's filter stage
         let nodes = vec![
             scan("x"),
             filter("x", "scan:x"),

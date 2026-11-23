@@ -1,6 +1,3 @@
-//! The physical plan tree of `explain()`: each node, its fields and
-//! estimates, and the stages.
-
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::physical::{PhysicalNode, PortRef};
@@ -21,7 +18,6 @@ use super::values::{
 };
 use super::{ExtensionNode, PhysicalRequest, RunRequest};
 
-/// The table's columns in display order: (cell key, header).
 const COLUMNS: [(&str, &str); 7] = [
     ("est_rows", "est. rows"),
     ("rows", "rows"),
@@ -32,12 +28,8 @@ const COLUMNS: [(&str, &str); 7] = [
     ("tokens", "fresh tokens"),
 ];
 
-// ---------------------------------------------------------------- physical
-
-/// One node of an explained graph: one of Quail's, or an extension's.
 struct Node {
     id: String,
-    /// Each input as (port name, source port).
     inputs: Vec<(String, PortRef)>,
     known: Option<PhysicalNode>,
     extension: Option<ExtensionNode>,
@@ -60,8 +52,6 @@ impl Node {
         }
     }
 
-    /// The node's explain fields, as its Python class's `explain_fields`,
-    /// and whether its arrays are tuples.
     fn fields(&self) -> (Vec<(String, Shown)>, bool) {
         match (&self.known, &self.extension) {
             (Some(node), _) => known_fields(node),
@@ -70,7 +60,6 @@ impl Node {
         }
     }
 
-    /// The node's explain fields as `key=value` lines.
     fn field_lines(&self, extra: Vec<(String, Shown)>, depth: usize) -> Vec<String> {
         let (fields, tuples) = self.fields();
         let mut all = extra;
@@ -79,9 +68,6 @@ impl Node {
     }
 }
 
-/// A node explain shows by its fields alone: an extension's node, with
-/// its attributes, or a request backend's, with each operator it
-/// submits; None for any other node.
 fn shown_alone(node: &PhysicalNode) -> Option<ExtensionNode> {
     let inputs = node
         .inputs()
@@ -112,7 +98,6 @@ fn shown_alone(node: &PhysicalNode) -> Option<ExtensionNode> {
     })
 }
 
-/// Text without runs of whitespace, cut to 60 characters.
 fn short_text(text: &str) -> String {
     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if text.chars().count() <= 60 {
@@ -122,8 +107,6 @@ fn short_text(text: &str) -> String {
     }
 }
 
-/// A request backend's node fields: its backend and tables, then each
-/// filter's questions, join, classification, extraction, and map.
 fn request_fields(request: &crate::physical::RequestExecutionAttributes) -> Vec<(String, Shown)> {
     let text = |value: Value| Shown::Text(py_str(&value));
     let mut fields = vec![
@@ -184,7 +167,6 @@ struct WrittenNode {
     attributes: Shown,
 }
 
-/// A node's attributes in declaration order.
 pub(super) fn attributes(node: &PhysicalNode) -> Vec<(String, Shown)> {
     let written = serde_json::to_string(node)
         .ok()
@@ -195,8 +177,6 @@ pub(super) fn attributes(node: &PhysicalNode) -> Vec<(String, Shown)> {
     }
 }
 
-/// A node's explain fields, as its Python class's `explain_fields`, and
-/// whether its arrays are tuples: the default lists every attribute.
 fn known_fields(node: &PhysicalNode) -> (Vec<(String, Shown)>, bool) {
     let attributes = attributes(node);
     let get = |name: &str| {
@@ -274,7 +254,6 @@ fn known_fields(node: &PhysicalNode) -> (Vec<(String, Shown)>, bool) {
     }
 }
 
-/// The explain fields every model call node shares, then its own.
 fn inference_fields(
     node: &PhysicalNode,
     spec: &Shown,
@@ -342,7 +321,6 @@ fn inference_fields(
     fields
 }
 
-/// A physical graph to explain: its nodes in written order and its root.
 pub(super) struct Graph {
     nodes: Vec<Node>,
     root: PortRef,
@@ -350,7 +328,6 @@ pub(super) struct Graph {
 }
 
 impl Graph {
-    /// The documents the graph's scans read.
     pub(super) fn num_documents(&self) -> i64 {
         self.nodes
             .iter()
@@ -394,7 +371,6 @@ impl Graph {
         &self.nodes[self.by_id[id]]
     }
 
-    /// Node positions, each after the nodes it reads.
     fn topological(&self) -> Vec<usize> {
         fn visit(graph: &Graph, index: usize, visited: &mut Vec<bool>, ordered: &mut Vec<usize>) {
             if visited[index] {
@@ -414,10 +390,8 @@ impl Graph {
         ordered
     }
 
-    /// The planner's estimated rows on each output port.
     fn estimated_rows(&self) -> HashMap<(String, String), Option<f64>> {
         let mut rows: HashMap<(String, String), Option<f64>> = HashMap::new();
-        // by table, the rows its AI filters have passed so far
         let mut flows: HashMap<String, RowFlow> = HashMap::new();
         for index in self.topological() {
             let node = &self.nodes[index];
@@ -473,9 +447,6 @@ impl Graph {
     }
 }
 
-/// `value` with each list of words under a token field read as zeros:
-/// a tokenizer that splits words gives words for token ids, and explain
-/// reads only how many there are.
 fn numeric_tokens(value: Value, in_tokens: bool) -> Value {
     match value {
         Value::Object(fields) => Value::Object(
@@ -502,7 +473,6 @@ fn numeric_tokens(value: Value, in_tokens: bool) -> Value {
     }
 }
 
-/// A run's stage measurements, by the predicate they ran.
 #[derive(Default)]
 struct Stages {
     filters: HashMap<(String, i64), Value>,
@@ -536,8 +506,6 @@ impl Stages {
 
 type Cells = BTreeMap<&'static str, String>;
 
-/// The rows of a physical tree: each node's line, details, and
-/// predicate rows, with their cells.
 struct TreeRows<'a> {
     graph: &'a Graph,
     verbose: bool,
@@ -578,7 +546,6 @@ impl TreeRows<'_> {
         cells
     }
 
-    /// The node's title, detail lines, and predicate rows.
     fn describe(&mut self, node: &Node) -> (String, Vec<String>, Vec<(String, Cells)>) {
         let mut details: Vec<String> = Vec::new();
         let mut predicates: Vec<(String, Cells)> = Vec::new();
@@ -989,7 +956,6 @@ impl TreeRows<'_> {
     }
 }
 
-/// Lay out (text, cells) rows as a tree column and aligned columns.
 fn table(rows: &[(String, Cells)]) -> Vec<String> {
     let columns: Vec<(&str, &str)> = COLUMNS
         .iter()
@@ -1033,7 +999,6 @@ fn table(rows: &[(String, Cells)]) -> Vec<String> {
     lines
 }
 
-/// A physical tree with estimated and measured columns.
 pub(super) fn physical_tree(
     graph: &Graph,
     found: Option<&Operators>,
@@ -1090,8 +1055,6 @@ pub(super) fn physical_tree(
         rows: Vec::new(),
         used_default: false,
     };
-    // each node no other node reads heads one tree: the root first, then
-    // the latest first
     let root = graph.by_id[&graph.root.node_id];
     let sinks = topological
         .iter()
@@ -1176,9 +1139,6 @@ pub(super) fn physical_tree(
     lines.join("\n")
 }
 
-/// One line per stage of a plan on several GPUs: its nodes, its inputs
-/// split across the GPUs by its key's ids, its inputs collected once and
-/// sent whole to every GPU, and the stages it waits for.
 pub(super) fn stage_lines(stages: &[Stage]) -> Vec<String> {
     stages
         .iter()

@@ -1,11 +1,3 @@
-//! What a region's run returns besides its rows: each model operator's
-//! answers, the documents still in play, the measured selectivity of
-//! each predicate, and the run's report.
-//!
-//! [`collect_answers`] reads the executor's output relations by port;
-//! [`execution_report`] reads the backend's measurements. The rows
-//! themselves are [`crate::finished::FinishedRows`].
-
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -18,65 +10,43 @@ use quail_planner::operators::Operators;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-/// The answer columns a port exposes for reporting.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AnswerPort {
-    /// "classifies", "scores", "extracts", "features", or "maps".
     pub kind: String,
     pub name: String,
     pub columns: Vec<String>,
 }
 
-/// One output port of the executed graph.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OutputPort {
-    /// The node's registered type name, such as `quail.ai_join`.
     pub node_type: String,
     pub node: String,
     pub port: String,
-    /// The port's value type, such as "rows" or "filter_answers".
     pub value_type: String,
     pub answer: Option<AnswerPort>,
 }
 
-/// What [`collect_answers`] reads besides the output relations.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AnswerRequest {
-    /// The region's operators, as JSON.
     pub operators: String,
-    /// Every output port, in the graph's topological order.
     pub ports: Vec<OutputPort>,
-    /// alias -> the number of documents its scan read.
     pub num_documents: BTreeMap<String, i64>,
-    /// alias -> each document's row in the registered table, for a scan
-    /// that reads some of a table's rows.
     #[serde(default)]
     pub source_rows: BTreeMap<String, Vec<i32>>,
 }
 
-/// Which operator an answer table belongs to.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AnswerKey {
-    /// An answer column, by its output name.
     Name(String),
-    /// A filter predicate: its alias and written position.
     Filter(String, i64),
-    /// A join predicate, by written position.
     Join(i64),
 }
 
-/// The answers, survivors, and stages of one run.
 #[derive(Debug)]
 pub struct Answers {
-    /// (kind, key, table): kind is "filters", "joins", or an answer
-    /// port's kind.
     pub tables: Vec<(String, AnswerKey, RecordBatch)>,
-    /// alias -> the documents still in play after the last operator.
     pub survivors: BTreeMap<String, Int32Array>,
-    /// written position -> the rows a full join kept.
     pub true_joins: BTreeMap<i64, RecordBatch>,
-    /// One record per filter and join predicate, with its measured
-    /// selectivity.
     pub stages: Vec<Value>,
 }
 
@@ -86,23 +56,12 @@ pub(crate) fn arrow_error(error: arrow::error::ArrowError) -> Error {
     error.to_string()
 }
 
-/// Read each model operator's answers, the surviving documents, and each
-/// predicate's measured selectivity from a run's output relations.
-///
-/// Answer tables and survivors name each document by its row in the
-/// registered table when `source_rows` holds its alias.
-///
-/// # Errors
-///
-/// A filter or join predicate has no answer relation, or one lacks the
-/// metadata or columns that name its predicate.
 pub fn collect_answers(
     request: &AnswerRequest,
     outputs: &HashMap<(String, String), RecordBatch>,
 ) -> Result<Answers, Error> {
     let found: Operators =
         serde_json::from_str(&request.operators).map_err(|error| error.to_string())?;
-    // alias -> its AI.IF predicates' selectivities, then its column tests'
     let mut filters: Vec<(String, Vec<Option<f64>>)> = Vec::new();
     for (alias, predicates) in &found.filters {
         filters.push((
@@ -204,7 +163,6 @@ pub fn collect_answers(
     for (alias, relations) in &filter_relations {
         let table = concat(relations)?;
         let positions = int_column(&table, 1)?;
-        // predicates in the order their first answers appear
         let mut order: Vec<i64> = Vec::new();
         for position in positions.iter().flatten() {
             if !order.contains(&position) {
@@ -244,7 +202,6 @@ pub fn collect_answers(
         }
     }
 
-    // joins in the order the planned joins and barriers run them, then the rest
     let mut order: Vec<i64> = request
         .ports
         .iter()
@@ -315,8 +272,6 @@ pub fn collect_answers(
     Ok(answers)
 }
 
-/// Number each document by its row in the registered table, for each
-/// alias `source_rows` holds.
 fn to_source_rows(
     answers: &mut Answers,
     source_rows: &BTreeMap<String, Vec<i32>>,
@@ -352,8 +307,6 @@ fn to_source_rows(
     Ok(())
 }
 
-/// The report of one region's run, from its plan and the backend's
-/// measurements.
 pub fn execution_report(
     backend: &str,
     estimated_seconds: f64,
@@ -438,13 +391,11 @@ fn concat(tables: &[RecordBatch]) -> Result<RecordBatch, Error> {
     arrow::compute::concat_batches(&tables[0].schema(), tables).map_err(arrow_error)
 }
 
-/// A column of integers, as int64.
 fn int_column(table: &RecordBatch, index: usize) -> Result<arrow::array::Int64Array, Error> {
     let column = cast(table.column(index), &DataType::Int64).map_err(arrow_error)?;
     Ok(column.as_primitive::<arrow::datatypes::Int64Type>().clone())
 }
 
-/// The number of true answers in an answer table: its last column.
 fn true_count(table: &RecordBatch) -> usize {
     table
         .columns()
@@ -453,8 +404,6 @@ fn true_count(table: &RecordBatch) -> usize {
         .map_or(0, BooleanArray::true_count)
 }
 
-/// The rows of a join answer table whose answer is true, without the
-/// answer column.
 fn true_answer_rows(table: &RecordBatch) -> Result<RecordBatch, Error> {
     let answers = table
         .columns()
@@ -471,7 +420,6 @@ fn true_answer_rows(table: &RecordBatch) -> Result<RecordBatch, Error> {
     selected.with_schema(schema).map_err(arrow_error)
 }
 
-/// Document positions as one int32 array.
 pub(crate) fn document_ids(column: &ArrayRef) -> Result<Int32Array, Error> {
     if column.null_count() > 0 {
         return Err("a document id is null".into());

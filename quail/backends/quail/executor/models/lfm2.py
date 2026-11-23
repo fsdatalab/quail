@@ -125,7 +125,6 @@ class Lfm2Pipeline(ModelPipeline):
             if hasattr(layer, "short_conv"):
                 x = self._short_conv(layer.short_conv, x, phases, slot)
                 slot += 1
-                # arena layers are indexed by model layer
                 meta["layer"] += 1
             else:
                 x = self._attention(layer.self_attn, x, chunk.positions, chunk)

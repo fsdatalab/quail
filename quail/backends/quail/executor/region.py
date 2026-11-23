@@ -131,7 +131,6 @@ class RegionExecution:
         self.operators = []
         self.executor = None
         self._ids = None
-        # operators whose rows an answer finished since the last chunk
         self._answered = []
 
     @property
@@ -174,8 +173,6 @@ class RegionExecution:
         query = self.query
         if query is not None:
             query.gpu_timing = bool(self.context.state.get("gpu_timing", False))
-            # a set-attention model runs every pipeline as passes over
-            # whole sequences; this is the one place that choice is made
             if (query.loaded_model.pipeline.whole_sequences
                     and nodes[0].document_aliases):
                 return SetChain(query, nodes, inputs, self.context).execute()
@@ -284,7 +281,6 @@ class RegionExecution:
         if pipeline.whole_sequences:
             if keep_kv:
                 raise ValueError("a set-attention model keeps no document KV")
-            # each request is one unpaged sequence: no pages, no borrowing
             paged, tree = False, None
         paged = paged or pipeline.needs_pages
         if keep_kv and not paged:

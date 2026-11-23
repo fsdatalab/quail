@@ -1,26 +1,3 @@
-//! Run a region's stages on several GPUs, one DataFusion partition per
-//! GPU.
-//!
-//! [`quail_planner::plan::stages`] cuts the region's graph into stages when
-//! the region is planned; this module runs the stages the plan holds.
-//! Partition p of every stage runs on the worker of GPU p, a process
-//! that holds every document and the GPU's KV
-//! ([`crate::workers`]); this module sends it the stage's input rows
-//! and reads back the rows the stage writes. DataFusion moves the rows
-//! between stages: a hashed input goes through a `RepartitionExec` on the key's ids, so a
-//! document reaches the same GPU in every stage that reads it by its
-//! key; a broadcast input goes through a `CoalescePartitionsExec`,
-//! collected once and handed whole to every partition.
-//!
-//! While a stage runs, its worker sends each table it finishes as soon
-//! as it has it, and may ask the region a question, such as whether the
-//! tests above the region still keep a row; the region answers before
-//! the stage goes on.
-//!
-//! A stage's partition starts once all of its inputs have ended, and a
-//! worker runs one stage at a time; the stages form a DAG, so every
-//! call a worker receives can finish.
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -39,37 +16,25 @@ use futures::future::{BoxFuture, FutureExt, Shared, try_join_all};
 use quail_planner::physical::{PhysicalGraph, PhysicalNode};
 use quail_planner::plan::stages::Stage;
 
-/// The column a keyed table's rows are hashed by, which no partition
-/// reads.
 const KEY: &str = "quail.key";
 
 use crate::shared::Table;
 use crate::workers::{Connection, Region, failure};
 
-/// What one partition of a stage wrote: each output port's rows, in the
-/// order of the stage's outputs.
 type Written = Arc<Vec<Table>>;
 
-/// A future many readers await; its error is the failure's text.
 type Once<T> = Shared<BoxFuture<'static, std::result::Result<T, String>>>;
 
-/// One stage input, ready for its partitions.
 #[derive(Clone)]
 enum Ready {
-    /// Partition p reads output partition p.
     Hashed(Arc<dyn ExecutionPlan>),
-    /// Every partition reads every row.
     Whole(Arc<Table>),
 }
 
-/// A region's stages running on its GPUs' workers.
 struct Staged {
     stages: Vec<Stage>,
     workers: Vec<Arc<Mutex<Connection>>>,
-    /// Scan node id -> its alias and number of documents.
     scans: HashMap<String, (String, usize)>,
-    /// Alias -> each document's key, for a table hashed by a key other
-    /// than its ids.
     keys: HashMap<String, Int32Array>,
     region: Arc<Region>,
     task: Arc<TaskContext>,
@@ -82,7 +47,6 @@ impl Staged {
         self.workers.len()
     }
 
-    /// The run of one stage's partition, started on first use.
     fn run(self: &Arc<Self>, stage: usize, partition: usize) -> Once<Written> {
         let mut runs = self.runs.lock().expect("the runs lock");
         let staged = Arc::clone(self);
@@ -131,7 +95,6 @@ impl Staged {
         Ok(Arc::new(outputs))
     }
 
-    /// One stage input, collected once its writers have all ended.
     fn input(self: &Arc<Self>, stage: usize, index: usize) -> Once<Ready> {
         let mut inputs = self.inputs.lock().expect("the inputs lock");
         let staged = Arc::clone(self);
@@ -175,8 +138,6 @@ impl Staged {
                     .ok_or_else(|| failure(format!("stage {from} does not write {wanted:?}")))?;
                 let runs = (0..self.partitions()).map(|partition| self.run(from, partition));
                 let written = try_join_all(runs).await.map_err(failure)?;
-                // a GPU that wrote no rows may type a column apart from
-                // the others: its empty batches are left out
                 let rows = |batches: &Vec<RecordBatch>| -> Vec<RecordBatch> {
                     batches
                         .iter()
@@ -229,7 +190,6 @@ impl Staged {
     }
 }
 
-/// Rows with each row's key beside its id, to hash by.
 fn keyed(
     schema: &SchemaRef,
     partitions: Vec<Vec<RecordBatch>>,
@@ -264,7 +224,6 @@ fn keyed(
     Ok((keyed_schema, partitions))
 }
 
-/// Rows without the key column [`keyed`] added.
 fn unkeyed(schema: &SchemaRef, batches: Vec<RecordBatch>) -> Result<Table> {
     let Ok(index) = schema.index_of(KEY) else {
         return Ok((Arc::clone(schema), batches));
@@ -278,14 +237,6 @@ fn unkeyed(schema: &SchemaRef, batches: Vec<RecordBatch>) -> Result<Table> {
     Ok((schema, batches))
 }
 
-/// Each document's key, by alias, for a table hashed by more than its
-/// ids.
-///
-/// `groupings` gives, by alias, lists of each document's group: a stop
-/// key's group goes to one GPU, so its per-key stop sees the whole
-/// group, and copies of one text go with the copy that is asked. A
-/// document's key is the smallest id it is grouped with, through every
-/// list alike.
 fn grouped_keys(
     groupings: HashMap<String, Vec<Vec<i64>>>,
     num_documents: &HashMap<String, usize>,
@@ -318,18 +269,6 @@ fn grouped_keys(
         .collect()
 }
 
-/// Run a region's stages, as the plan cut them, on `workers`, one per
-/// GPU, each of which has begun the region.
-///
-/// `graph` holds the region's compute nodes; `groupings` gives, by
-/// alias, the groups [`grouped_keys`] reads for a table whose rows go to
-/// a GPU by a key other than their id. Each table a stage finishes goes
-/// to `region.report`, one at a time, and each question a worker asks
-/// to `region.ask`.
-///
-/// # Errors
-///
-/// A grouping names no scan, or a stage fails.
 pub fn run_stages(
     graph: &PhysicalGraph,
     cut: Vec<Stage>,
@@ -371,7 +310,6 @@ pub fn run_stages(
         keys,
         region: Arc::new(Region {
             report: {
-                // the region's rows take one table at a time
                 let (report, one) = (region.report, Mutex::new(()));
                 Box::new(move |table| {
                     let _held = one.lock().expect("the report lock");
@@ -384,8 +322,6 @@ pub fn run_stages(
         runs: Mutex::new(HashMap::new()),
         inputs: Mutex::new(HashMap::new()),
     });
-    // the caller may be inside another runtime, where a runtime cannot
-    // block: the stages run on a thread of their own
     let thread = {
         let staged = Arc::clone(&staged);
         std::thread::Builder::new()

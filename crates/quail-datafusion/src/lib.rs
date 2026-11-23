@@ -1,35 +1,3 @@
-//! Quail as a DataFusion extension.
-//!
-//! A query's AI function calls become `AiNode`s, which DataFusion's
-//! optimizer rules move and prune around as they do any other node (see
-//! [`rules`]). Then the `AiNode`s, and the operators around them that
-//! Quail plans, become one `ModelRegion` node. DataFusion plans and runs
-//! everything else; a [`RegionRunner`] plans and runs each model region.
-//!
-//! The modules are layers: each uses only the ones above it in the table.
-//!
-//! | Module | Contents |
-//! | --- | --- |
-//! | [`functions`] | the AI functions as UDFs, their literal arguments, and SQL dialect support |
-//! | `plan` | Quail's extension nodes in a plan, and operators over new inputs |
-//! | `shared` | `SharedInput`, rows computed once and numbered |
-//! | [`ai`] | `AiNode`, one AI call as a plan node |
-//! | [`rules`] | `LowerAiCalls` and the optimizer rules around `AiNode`s |
-//! | [`region`] | `ModelRegion`, its operators ([`derive`]), `claim_model_regions`, and `ModelRegionExec` |
-//! | `extension` | `QuailExtension`: all of the above added to a session |
-//!
-//! ```ignore
-//! let context = quail_datafusion::session_context(runner)?;
-//! context.register_table("reviews", reviews)?;
-//! let rows = context
-//!     .sql("SELECT r.id FROM reviews r \
-//!         WHERE AI.IF(PROMPT('Does the review discuss the ending?\n\n{0}', r.body))")
-//!     .await?
-//!     .collect()
-//!     .await?;
-//! ```
-
-// links DataFusion and Quail from the shared library
 #[cfg(test)]
 use quail_dylib as _;
 
@@ -55,12 +23,8 @@ pub use functions::regexps::SnowflakeRegexpLike;
 pub use functions::{AI_FUNCTION_NAMES, is_ai_call, quail_functions};
 pub use quail_planner::constants::SPAN_SUFFIX;
 
-/// The stack size of a thread that plans a query: DataFusion's planner
-/// recurses through the plan, and a query with about 80 AI calls overflows
-/// Rust's default 2 MiB.
 pub const PLANNING_STACK_BYTES: usize = 64 << 20;
 
-/// Quail's own error as a DataFusion error a host can downcast.
 pub fn external(error: quail_planner::error::CompileError) -> datafusion::error::DataFusionError {
     datafusion::error::DataFusionError::External(Box::new(error))
 }
@@ -81,28 +45,10 @@ pub use rules::repeated::MergeRepeatedAiCalls;
 pub use rules::{default_rule_names, logical_rule};
 pub use shared::{ROW_COLUMN, SharedInput, SharedInputExec};
 
-/// Build a DataFusion session state with Quail registered.
-///
-/// SQL is read in the Snowflake dialect, as Quail's `Session.sql`
-/// reads it; `SET datafusion.sql_parser.dialect` changes it.
-///
-/// # Errors
-///
-/// A `DATAFUSION_*` environment option has an invalid value.
 pub fn session_state(runner: Arc<dyn RegionRunner>) -> Result<SessionState> {
     session_state_with_rules(runner, default_rule_names())
 }
 
-/// Build a DataFusion session state with Quail registered, whose
-/// optimizer runs `rules`, names [`logical_rule`] knows, in order.
-///
-/// DataFusion's `DATAFUSION_*` environment variables set its options,
-/// such as `DATAFUSION_EXECUTION_TARGET_PARTITIONS`.
-///
-/// # Errors
-///
-/// A rule name is unknown, or an environment variable holds a value its
-/// option does not take.
 pub fn session_state_with_rules(
     runner: Arc<dyn RegionRunner>,
     rules: Vec<String>,
@@ -112,13 +58,6 @@ pub fn session_state_with_rules(
         .register(base_state()?)
 }
 
-/// Build a DataFusion session state without Quail, configured as
-/// [`session_state`] configures it: SQL in the Snowflake dialect, and
-/// DataFusion's `DATAFUSION_*` environment variables.
-///
-/// # Errors
-///
-/// An environment variable holds a value its option does not take.
 pub fn base_state() -> Result<SessionState> {
     let config = SessionConfig::from_env()?.set_str("datafusion.sql_parser.dialect", "Snowflake");
     Ok(SessionStateBuilder::new()
@@ -127,21 +66,10 @@ pub fn base_state() -> Result<SessionState> {
         .build())
 }
 
-/// Build a DataFusion session context with Quail registered.
-///
-/// # Errors
-///
-/// A `DATAFUSION_*` environment option has an invalid value.
 pub fn session_context(runner: Arc<dyn RegionRunner>) -> Result<SessionContext> {
     Ok(SessionContext::new_with_state(session_state(runner)?))
 }
 
-/// Build a DataFusion session context with Quail registered, whose
-/// optimizer runs `rules`, as [`session_state_with_rules`] explains.
-///
-/// # Errors
-///
-/// A rule name is unknown.
 pub fn session_context_with_rules(
     runner: Arc<dyn RegionRunner>,
     rules: Vec<String>,
@@ -151,10 +79,6 @@ pub fn session_context_with_rules(
     )?))
 }
 
-/// Quail's name for each column `plan` returns: `alias.column` for a
-/// table's column, as in `r.id`; `r.details.body` for a struct field
-/// the SELECT list reads without an `AS` name; and otherwise the name
-/// DataFusion gives it, such as an `AS` name, as written.
 pub fn quail_column_names(plan: &LogicalPlan) -> Vec<String> {
     let selected = select_list(plan);
     plan.schema()
@@ -173,8 +97,6 @@ pub fn quail_column_names(plan: &LogicalPlan) -> Vec<String> {
         .collect()
 }
 
-/// The SELECT list whose columns `plan` returns as they are, through the
-/// operators that keep their input's columns, and the plan it reads.
 fn select_list(plan: &LogicalPlan) -> Option<(&[Expr], &LogicalPlan)> {
     match plan {
         LogicalPlan::Projection(projection) => Some((&projection.expr, &projection.input)),
@@ -188,10 +110,6 @@ fn select_list(plan: &LogicalPlan) -> Option<(&[Expr], &LogicalPlan)> {
     }
 }
 
-/// `column.field.inner` for a SELECT list item that reads a struct
-/// field of a column, `get_field(column, 'field', 'inner')`, without an
-/// `AS` name, or that reads such a field `input` computes, as a `GROUP
-/// BY` key; None for any other item.
 fn field_path(expr: &Expr, input: &LogicalPlan) -> Option<String> {
     match expr {
         Expr::ScalarFunction(call) if call.name() == "get_field" => {
@@ -217,8 +135,6 @@ fn field_path(expr: &Expr, input: &LogicalPlan) -> Option<String> {
     }
 }
 
-/// The expression of `plan`, or of a plan below it that keeps its
-/// columns, that computes the column `name`, and the plan it reads.
 fn computed_by<'a>(plan: &'a LogicalPlan, name: &str) -> Option<(&'a Expr, &'a LogicalPlan)> {
     let named = |expr: &&Expr| expr.schema_name().to_string() == name;
     match plan {
@@ -241,7 +157,6 @@ fn computed_by<'a>(plan: &'a LogicalPlan, name: &str) -> Option<(&'a Expr, &'a L
     }
 }
 
-/// An Arrow schema of `plan`'s columns with Quail's names.
 pub fn quail_schema(plan: &LogicalPlan) -> SchemaRef {
     let fields: Vec<Field> = plan
         .schema()

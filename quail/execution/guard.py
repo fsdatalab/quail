@@ -106,7 +106,6 @@ class Guarded:
         alias = self.node.spec.aliases[0]
         positions = pc.index_in(self.rows.ids[alias],
                                 value_set=answered.ids[alias])
-        # a row asked and given no answer row was dropped by the node
         kept = pc.or_(pc.invert(self.asked), pc.is_valid(positions))
         rows = self.rows
         for name in answered.column_names:
@@ -124,7 +123,6 @@ class Guarded:
         port = f"rows:{alias}"
         found = result.outputs[port]
         if isinstance(found, Rows) and self.node.answer in found.column_names:
-            # the runtime wrote the answer of each row it asked
             positions = pc.index_in(self.rows.ids[alias], value_set=found.ids[alias])
             rows = self.rows
             for name in found.column_names:
@@ -325,7 +323,6 @@ def guarded(node, inputs: dict, context, *, runtime_answers: bool = False,
         return pairs
     guard = getattr(node, "guard", None)
     alternative = getattr(node, "alternative", None)
-    # a runtime that writes a filter's answer column needs no guard for it
     answer = None if runtime_answers else getattr(node, "answer", None)
     disjunction = getattr(node, "disjunction", None)
     absent = _document_alias(node) is not None and reads_null_documents(node, context)
@@ -368,8 +365,6 @@ def _read(node, rows: Rows, alias: str, context, conditions,
         answered = answers.get(name)
         if answered is None or alias not in answered.aliases:
             continue
-        # the answering node asked about every row this node reads, or
-        # answered NULL where it did not
         positions = pc.index_in(rows.ids[alias], value_set=answered.ids[alias])
         read = read.append_column(name, pc.take(answered.column(name), positions))
     if names <= set(read.column_names):

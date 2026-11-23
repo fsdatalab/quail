@@ -1,5 +1,3 @@
-//! Restore outer AI joins from matching pairs and positional row identities.
-
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -11,12 +9,6 @@ use crate::functions::is_ai_call;
 use crate::plan::extension_node;
 use crate::shared::{ROW_COLUMN, SharedInput};
 
-/// Lower an outer AI ON predicate through an inner matching relation.
-///
-/// `lower` recursively lowers the inputs and the inner matching relation. The
-/// latter may use the general expression fallback; only restoring unmatched
-/// rows needs this special rewrite. Inner joins and joins without AI in ON are
-/// left unchanged. Call this only after the existing lowering path declines.
 pub(super) fn lower_outer_join(
     plan: &LogicalPlan,
     number: usize,
@@ -91,8 +83,6 @@ pub(super) fn lower_outer_join(
         ])?
         .build()?;
     let matches = lower(pairs)?;
-    // The source aliases also occur in the restoring joins. Keep them behind
-    // the pair projection so optimizer inlining cannot expose them twice.
     let matches = extension_node(SharedInput::try_new(matches, false)?);
     let matches = LogicalPlanBuilder::from(matches)
         .alias(pairs_alias.clone())?
@@ -100,13 +90,7 @@ pub(super) fn lower_outer_join(
     let matched_left = Column::new(Some(pairs_alias.clone()), left_id);
     let matched_right = Column::new(Some(pairs_alias), right_id);
 
-    // Each occurrence has a non-null positional id, even when its content id
-    // is duplicated or NULL. The first join restores left-only rows; their
-    // NULL pair-right id cannot match a right row in the second join. RIGHT
-    // needs no left-only rows, whereas FULL preserves both unmatched sides.
     let restored = match join.join_type {
-        // a semi, anti, or mark join returns one side's rows, each kept,
-        // dropped, or marked by whether it has a matching pair
         JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark => {
             LogicalPlanBuilder::from(left.rows.clone())
                 .join(
@@ -151,8 +135,6 @@ pub(super) fn lower_outer_join(
         .map(|column| {
             let read = match left.column(&column).or_else(|| right.column(&column)) {
                 Some(read) => read,
-                // a mark join's mark is the restoring join's own, under the
-                // restoring join's qualifier; every other column is renamed
                 None => match restored
                     .schema()
                     .columns()
@@ -184,8 +166,6 @@ struct Side {
 impl Side {
     fn new(input: LogicalPlan, name: String, names: &mut Names) -> Result<Self> {
         let columns = input.schema().columns();
-        // A side can itself be a join with duplicate names, or already contain
-        // __quail_row. Rename every column before adding a positional identity.
         let renamed: Vec<_> = columns
             .iter()
             .map(|_| names.fresh("__quail_outer_column"))
@@ -205,8 +185,6 @@ impl Side {
         exprs.push(Expr::Column(Column::from_name(ROW_COLUMN)).alias(&id));
         let alias = TableReference::bare(name);
         let renamed_rows = LogicalPlanBuilder::from(numbered).project(exprs)?.build()?;
-        // A staged region input gets its own __quail_row. Keep the old name
-        // hidden behind an optimizer boundary after renaming the identity.
         let shared = extension_node(SharedInput::try_new(renamed_rows, false)?);
         let rows = LogicalPlanBuilder::from(shared)
             .alias(alias.clone())?
@@ -232,8 +210,6 @@ impl Side {
     }
 }
 
-/// Internal aliases and columns must not shadow user names, including names
-/// behind a projection that optimizer rules might expose later.
 #[derive(Default)]
 struct Names {
     used: HashSet<String>,

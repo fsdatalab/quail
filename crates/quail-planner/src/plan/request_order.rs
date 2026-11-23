@@ -1,7 +1,3 @@
-//! The operator order a request backend runs: each table's AI.IF filters
-//! and the join sequence, priced on one model copy without KV reuse
-//! across operators.
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::budgets::chunk_budget;
@@ -22,39 +18,23 @@ use crate::pricing::costs::{join_specs, prepare_filter_costs};
 use crate::pricing::plan_statistics::CorpusStats;
 use crate::pricing::search::{StepKey, TableStep, default_order_rule, order_steps, search_joins};
 
-/// One table's documents and tokens, before and after its scan's tests.
 #[derive(Debug, Clone, Serialize)]
 pub struct TableSize {
     pub num_documents: i64,
     pub total_tokens: i64,
-    /// The documents and tokens the regular predicates are expected to keep.
     pub kept_documents: i64,
     pub kept_tokens: i64,
 }
 
-/// The order a request backend runs a plan's operators in.
 #[derive(Debug, Clone, Serialize)]
 pub struct RequestOrder {
-    /// "by_cost" or "as_written".
     pub rule: String,
-    /// alias -> the written positions of its AI.IF filters, in run order.
     pub filter_orders: BTreeMap<String, Vec<usize>>,
-    /// (written position, anchor) of each join, in run order.
     pub join_sequence: Vec<(usize, String)>,
-    /// The hash joins that pair each join's tables on its equality conditions.
     pub hash_joins: Vec<PhysicalNode>,
     pub tables: BTreeMap<String, TableSize>,
 }
 
-/// Order a plan's filters and joins for a request backend.
-///
-/// The filters of a table are ordered at one document, as each runs
-/// once per document; the joins are searched as on the Quail backend
-/// but with no table's KV resident and on one model copy.
-///
-/// # Errors
-///
-/// A prompt cannot be lowered, or a scanned table has no document tokens.
 pub fn request_order(
     found: &Operators,
     context: &PlanningContext,

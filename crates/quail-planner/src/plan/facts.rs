@@ -1,6 +1,3 @@
-//! What the executor's caller reads from a region's operators, so that
-//! no plan crosses into Python.
-
 use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
@@ -10,24 +7,6 @@ use crate::expressions::{argument_alias, call_aliases, column_name, column_refer
 use crate::operators::{Operators, ScanColumn};
 use crate::pricing::plan_statistics::plan_prompts;
 
-/// A region's facts as JSON:
-///
-/// - `asks_model`: whether any operator asks the model;
-/// - `scans`: each scan's alias, provider, document column and its
-///   name without the alias, value columns, and the column names of
-///   its table's schema;
-/// - `value_columns`: alias -> the columns the executor reads by
-///   document id: join equalities and filters, regular predicates,
-///   tests of labels and answers on the table's own columns, DISTINCT
-///   stop keys, and the guards of column operators and AI filters and
-///   the alternatives of AI filters;
-/// - `stop_keys`: alias -> its DISTINCT stop key;
-/// - `join_conditions`: for each join with equalities, its written
-///   position, its two aliases, and each equality's sides in that
-///   alias order;
-/// - `prompts`: each table's AI.IF prompts in written order, each
-///   join's prompt by written position, and each classification's
-///   prompt and aliases by its output name.
 pub fn region_facts(found: &Operators) -> Result<Value, crate::error::CompileError> {
     let mut value_columns: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut add = |alias: &str, column: &str| {
@@ -96,8 +75,6 @@ pub fn region_facts(found: &Operators) -> Result<Value, crate::error::CompileErr
         .filter_map(|column| column.guard.as_ref())
         .chain(filter_guards)
     {
-        // a guard may read an earlier AI operator's answer, which no
-        // table holds: the rows carry it
         for reference in column_references(guard) {
             let held = (schemas.get(reference.alias.as_str()))
                 .is_none_or(|columns| columns.contains(&reference.column));

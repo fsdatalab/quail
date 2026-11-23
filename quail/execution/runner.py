@@ -56,8 +56,6 @@ class ExecutionContext:
     observers: tuple[ExecutionObserver, ...] = ()
     functions: Mapping[str, Callable[..., Any]] = field(default_factory=dict)
     run_pipeline: Callable[..., Mapping[str, "NodeResult"]] | None = None
-    # alias -> the row columns its documents are grouped by beside their
-    # tokens; empty leaves every model operator asking per row
     deduplicate: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
 def _check_ports(node, result) -> None:
@@ -108,7 +106,6 @@ class GenericRunner:
 
         def record(node, result, started=None):
             if started is not None and result.metrics.wall_s == 0.0:
-                # runtimes that do not time themselves are timed here
                 result = replace(result, metrics=replace(
                     result.metrics, wall_s=time.perf_counter() - started))
             _check_ports(node, result)
@@ -121,9 +118,6 @@ class GenericRunner:
 
         completed = tuple(dict.fromkeys(ref.node_id for ref in (initial_outputs or ())))
         pipelines = graph.pipelines(completed) if context.run_pipeline else {}
-        # a guarded node runs in a pipeline of its own, and a NULL
-        # document guards every node that asks about its table; a test of
-        # their rows then runs after them, by its own runtime
         for pipeline in list(pipelines.values()):
             if len(pipeline) > 1 and any(
                     reads_null_documents(member, context) for member in pipeline):
@@ -154,7 +148,6 @@ class GenericRunner:
                 for member in pipeline:
                     inputs[member.node_id] = present_join_inputs(
                         member, inputs[member.node_id], context)
-                # a guarded node runs in a pipeline of its own
                 guard = guarded(node, inputs[node.node_id], context,
                                 runtime_answers=True, answers=_answers(values))
                 if guard is not None:
@@ -171,7 +164,6 @@ class GenericRunner:
                 if guard is not None:
                     results = {**results,
                                node.node_id: guard.expanded(results[node.node_id])}
-                # a pipeline's wall is charged once, to its first member
                 for index, member in enumerate(pipeline):
                     record(member, results[member.node_id],
                            started if index == 0 else None)

@@ -73,7 +73,6 @@ class HashJoinRuntime:
                         if port.source.port == f"rows:{alias}")
             ids = document_ids(inputs[port.name])
             columns = context.sources.get(columns_key(alias))
-            # a key column may carry the alias's name: the ids stay apart
             sides[alias] = (ids, [relation_values(columns, key).take(ids)
                                   for key in keys])
             if node.filter is not None:
@@ -84,7 +83,6 @@ class HashJoinRuntime:
         positions = join_pairs(node.left, sides[node.left][1],
                                node.right, sides[node.right][1],
                                join_filter=node.filter, values=values)
-        # pair_table pairs row positions; map them back to the ids read
         pairs = pa.table({
             alias: pc.take(sides[alias][0], positions.column(alias))
             for alias in (node.left, node.right)})

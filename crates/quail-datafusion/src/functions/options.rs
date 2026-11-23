@@ -1,8 +1,3 @@
-//! The literal arguments of Quail's functions: text, numbers, option
-//! objects such as `{'selectivity': 0.4, 'anchor': 'r'}`, the test and
-//! options of a `HINT`, and each such argument as the query wrote it
-//! once DataFusion has folded it into a literal.
-
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::ScalarValue;
 use datafusion::common::tree_node::{Transformed, TreeNode};
@@ -13,14 +8,12 @@ use quail_planner::expressions::repr_str;
 
 use super::function_name;
 
-/// An AI predicate's options: selectivity and anchor.
 #[derive(Default, Clone)]
 pub(crate) struct Options {
     pub(crate) selectivity: Option<f64>,
     pub(crate) anchor: Option<String>,
 }
 
-/// The text of a string literal, or None.
 pub(crate) fn string_literal(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Literal(value, _) => value.try_as_str().flatten().map(str::to_string),
@@ -28,7 +21,6 @@ pub(crate) fn string_literal(expr: &Expr) -> Option<String> {
     }
 }
 
-/// A numeric SQL literal cast to `to`, or None.
 fn numeric_literal(expr: &Expr, to: &DataType) -> Option<ScalarValue> {
     match expr {
         Expr::Literal(value, _) if value.data_type().is_numeric() => value.cast_to(to).ok(),
@@ -37,7 +29,6 @@ fn numeric_literal(expr: &Expr, to: &DataType) -> Option<ScalarValue> {
     }
 }
 
-/// A numeric SQL literal as a float, or None.
 pub(crate) fn number_of(expr: &Expr) -> Option<f64> {
     match numeric_literal(expr, &DataType::Float64)? {
         ScalarValue::Float64(value) => value,
@@ -45,7 +36,6 @@ pub(crate) fn number_of(expr: &Expr) -> Option<f64> {
     }
 }
 
-/// The (key, value) pairs of an option object, `named_struct(k, v, ...)`.
 pub(crate) fn object_fields(expr: &Expr) -> Option<Vec<(String, &Expr)>> {
     let Expr::ScalarFunction(ScalarFunction { args, .. }) = expr else {
         return None;
@@ -64,13 +54,6 @@ fn sorted_keys(keys: &[&str]) -> String {
     format!("[{}]", keys.join(", "))
 }
 
-/// The options an option object sets, each key one of `allowed`;
-/// no options without an object.
-///
-/// # Errors
-///
-/// `node` is no option object, names a key `allowed` lacks, or gives a
-/// key a value of the wrong type.
 pub(crate) fn parse_options(
     node: Option<&Expr>,
     allowed: &[&str],
@@ -105,13 +88,6 @@ pub(crate) fn parse_options(
     Ok(options)
 }
 
-/// The test a `HINT` wraps and the selectivity it gives; `term` and
-/// None without one.
-///
-/// # Errors
-///
-/// The `HINT` lacks its test or its options, or its options are not
-/// `{'selectivity': s}`.
 pub(crate) fn unwrap_hint(term: &Expr) -> Result<(Expr, Option<f64>), CompileError> {
     let Expr::ScalarFunction(ScalarFunction { args, .. }) = term else {
         return Ok((term.clone(), None));
@@ -126,20 +102,12 @@ pub(crate) fn unwrap_hint(term: &Expr) -> Result<(Expr, Option<f64>), CompileErr
     Ok((args[0].clone(), options.selectivity))
 }
 
-/// `expr` with each struct or list literal in it written as the call it
-/// was folded from, as the query wrote it.
-///
-/// DataFusion's `SimplifyExpressions` folds a `named_struct`, `struct`,
-/// or `make_array` of literals into one literal; an AI call's options,
-/// categories, and fields are read from the calls the query wrote.
 pub(crate) fn unfolded(expr: Expr) -> Expr {
     expr.transform_up(|inner| Ok(unfold(inner)))
         .map(|done| done.data)
         .expect("unfolding a literal does not fail")
 }
 
-/// `expr` as the `named_struct`, `struct`, or `make_array` call of
-/// literals it was folded from, when it is a struct or list literal.
 fn unfold(expr: Expr) -> Transformed<Expr> {
     use datafusion::arrow::array::Array;
     use datafusion::logical_expr::expr::ScalarFunction as Call;

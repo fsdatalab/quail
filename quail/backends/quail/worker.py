@@ -44,8 +44,6 @@ from quail.progress import (
 )
 from quail.specs.files import resolve_model_path
 
-# The workers and the configuration they load. They outlive sessions,
-# so later queries reuse their loaded models.
 _WORKERS = None
 
 
@@ -89,9 +87,6 @@ class LoadedGpu:
         say(f"loaded {self.weights_bytes / 2**30:.2f} GiB of weights in "
             f"{self.load_model_s:.1f} s")
 
-        # cuBLAS allocates its handle outside PyTorch's caching allocator.
-        # At the warm-up peak the allocator holds every free byte, so
-        # create the handle now while memory is available.
         torch.cuda.current_blas_handle()
         probe = torch.ones(8, 64, device="cuda", dtype=torch.bfloat16)
         F.linear(probe, probe)
@@ -120,7 +115,6 @@ class LoadedGpu:
             path = resolve_model_path(model_path or spec.hf_name,
                                       None if model_path else spec.revision)
             if spec.readout == "slot_lm":
-                # every option read at the prompt's last row
                 self.decision_head = LetterReadout.load(
                     torch, F, path, turn_suffix=spec.turn_suffix)
                 self.decision_offsets = (0, 0, 0)
@@ -180,7 +174,6 @@ class LoadedGpu:
         rows = AnswerRows(self.torch, self.F, self.model, true_ids, false_ids)
         async_scores = None
         if self.decision_head is not None:
-            # a filter lists yes (A) then no (B); yes/no readouts take no first
             yes_no = (self.decision_head.reordered((1, 0))
                       if self.spec.readout == "slot_lm" else self.decision_head)
             self.async_ans = AsyncDecisions(
@@ -299,7 +292,6 @@ def pool_bytes(arena) -> dict:
         return 0 if tensor is None else int(
             tensor.numel() * tensor.element_size())
 
-    # a KVArena's recurrent state has one more row than its slots
     rows = getattr(arena, "gdn_state_rows", None)
     return {
         "kv": sum(size(t) for t in list(arena.k) + list(arena.v)),
@@ -336,7 +328,6 @@ def _boot_gpu(gpu, backend, gpu_context, chunk_tokens, true_ids, false_ids,
     cold = gpu is None
     state = {}
     with ExitStack() as rollback:
-        # a failed boot must leave the GPU free for the next attempt
         rollback.callback(release_models, state)
         if cold:
             gpu = LoadedGpu(backend, gpu_context, true_ids + false_ids,
@@ -423,7 +414,6 @@ def _boot_worker(state, setup) -> dict:
             device=registry.device(setup["device"]), query_settings={}),
         setup["chunk_tokens"], setup["true_ids"], setup["false_ids"],
         setup.get("arena_pages"), writes_answers=setup["writes_answers"],
-        # a setup without the model's files has the worker find them
         model_path=(setup["model_path"]
                     or resolve_model_path(spec.hf_name, spec.revision)))
     return boot
@@ -434,7 +424,6 @@ def _serve_region(state, region, tables, end) -> None:
     payload = {**region["query"], **payload_tables(tables)}
     graph = graph_from_envelope(payload["physical_plan"])
     progress, answers = region["listening"]
-    # the listeners are in the region's process: each event is sent there
     if progress:
         set_progress_sink(lambda *event: end.ask(json.dumps({"progress": event})))
     if answers:

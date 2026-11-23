@@ -1,28 +1,6 @@
-//! Quail's physical plan types, which the GPU executor runs.
-//!
-//! A plan crosses from the planner to the GPU executor as a JSON
-//! envelope. These types read and write that envelope, so the Rust
-//! planner can produce plans the Python executor runs.
-//!
-//! The types are the built-in nodes, each written `{"type": <type name>,
-//! "id", "inputs", "attributes"}`; the ports that join them; the specs an
-//! AI node carries, its prompt as token ids and its plan estimates; and
-//! the expressions nodes carry, from `quail.common.expressions`. A value
-//! or condition the executor computes is an [`Expression`], which
-//! DataFusion evaluates. Each struct is written with a `"type"` key naming
-//! its Python class, and also accepts the tag the class had before it
-//! moved from `quail.logical.expressions`.
-
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-/// Define a struct that reads and writes `{"type": <tag>, ...fields}`.
-///
-/// serde's own struct tag cannot be combined with
-/// `deny_unknown_fields`, which then refuses the tag key. The struct
-/// instead goes through a one-variant tagged enum: reading refuses
-/// another tag, a missing field, and an unknown field. Further literals after the tag are older tags that are
-/// also accepted.
 #[macro_export]
 macro_rules! tagged_struct {
     (
@@ -70,7 +48,6 @@ macro_rules! tagged_struct {
     };
 }
 
-/// A value computed from one row's columns.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ValueExpression {
@@ -98,7 +75,6 @@ pub enum ValueExpression {
     ModelCall(ModelCall),
 }
 
-/// One column of one table in the query.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ColumnRef {
@@ -108,8 +84,6 @@ pub struct ColumnRef {
 }
 
 impl ColumnRef {
-    /// The column's name, with its table alias when `qualified` and it
-    /// has one.
     pub fn name(&self, qualified: bool) -> String {
         if qualified && !self.alias.is_empty() {
             format!("{}.{}", self.alias, self.column)
@@ -119,7 +93,6 @@ impl ColumnRef {
     }
 }
 
-/// One field of a struct value.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GetField {
@@ -127,29 +100,17 @@ pub struct GetField {
     pub field: String,
 }
 
-/// A value or condition DataFusion computes from one row's columns.
-///
-/// `encoded` is DataFusion's logical expression as datafusion-proto
-/// bytes in base64. It reads the column named `#i` where the rows hold
-/// `columns[i]`, so a planner can rename the columns it reads without
-/// DataFusion. `types` holds the Arrow type of each column as Arrow
-/// writes it, such as `Int64` or `Utf8`. `text` is how `explain()`
-/// writes the expression, with `{i}` for the name of `columns[i]` and
-/// `{{` and `}}` for braces.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Expression {
     pub encoded: String,
     pub columns: Vec<ColumnRef>,
-    /// Empty in an expression saved before types were written.
     #[serde(default)]
     pub types: Vec<String>,
     pub text: String,
 }
 
 impl Expression {
-    /// The expression's text, each column named with its table alias
-    /// when `qualified`.
     pub fn text_with(&self, qualified: bool) -> String {
         let mut out = String::new();
         let mut chars = self.text.chars().peekable();
@@ -187,7 +148,6 @@ impl Expression {
     }
 }
 
-/// A value under the name a query gives it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Alias {
@@ -196,10 +156,8 @@ pub struct Alias {
 }
 
 tagged_struct! {
-    /// The text of one model call, laid out for a model's prompt format.
     Prompt(PromptFields, PromptTagged) = "quail.common.expressions.Prompt" | "quail.logical.expressions.Prompt" {
         template: String,
-        /// Column references in placeholder order.
         args: Vec<ValueExpression>,
         preamble: String,
         tail: String,
@@ -208,7 +166,6 @@ tagged_struct! {
         kind: String,
         layout: String,
         tail_segments: Vec<String>,
-        /// Per placeholder: alias, its label text, its frame text.
         label_texts: Vec<(String, String, String)>,
         label_prefix: String,
         categories: Vec<String>,
@@ -220,7 +177,6 @@ tagged_struct! {
     }
 }
 
-/// One prompt asked of every row; the model answers with a value.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelCall {
@@ -234,8 +190,6 @@ pub struct ModelCall {
     pub max_answer_tokens: i64,
 }
 
-/// An `AI.SCORE` call compared with a constant. `test` is an
-/// `Expression` that reads the score as its one column.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScoreTest {
@@ -243,7 +197,6 @@ pub struct ScoreTest {
     pub test: ValueExpression,
 }
 
-/// A value expression or a column name, as a projection lists them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Projected {
@@ -251,7 +204,6 @@ pub enum Projected {
     Expression(ValueExpression),
 }
 
-/// A model call, written with its class tag where a field holds one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum TaggedModelCall {
@@ -262,8 +214,6 @@ pub enum TaggedModelCall {
     Call(ModelCall),
 }
 
-/// What a semantic filter or join asks: a yes-or-no model call, or a
-/// comparison of an `AI.SCORE` call with a constant.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Asked {
@@ -277,43 +227,20 @@ pub enum Asked {
 }
 
 tagged_struct! {
-    /// One `AI.IF` predicate of a semantic filter.
     FilterPredicate(FilterPredicateFields, FilterPredicateTagged) = "quail.common.expressions.FilterPredicate" | "quail.logical.expressions.FilterPredicate" {
         expression: Asked,
-        /// The fraction of documents that pass, if the query gives one.
         selectivity: Option<f64>,
-        /// The condition that says which documents the model is asked
-        /// about; None asks about every document.
         guard: Option<ValueExpression>,
-        /// The terms of an OR the predicate is one term of that ask no
-        /// model: a document where it is TRUE passes whatever the model
-        /// answers, and the model is not asked about it. None for a
-        /// predicate that is not in an OR, or whose OR has no such term.
         alternative: Option<ValueExpression>,
-        /// The column the predicate adds with its answer, when it keeps
-        /// every row it reads instead of dropping the rows it rejects:
-        /// TRUE or FALSE for a document it asks about, NULL for one its
-        /// guard leaves out. None for a predicate that drops rows.
         answer: Option<String>,
-        /// The estimated fraction of documents where the guard is TRUE;
-        /// None without a guard, or for the default selectivity.
         guard_selectivity: Option<f64>,
-        /// Whether the predicate is `NOT AI.IF(...)`: a document passes
-        /// when the model answers no, and `selectivity` is the fraction
-        /// of documents that do.
         negated: bool = default,
-        /// The name of the OR the predicate is one term of, when the OR
-        /// has other `AI.IF` terms: a document passes the OR when any
-        /// term passes it, in whatever order the terms run.
         disjunction: Option<String>,
-        /// Whether the predicate asks the model only about the documents
-        /// no earlier term of its OR passed.
         short_circuit: bool = default,
     }
 }
 
 tagged_struct! {
-    /// An equality between a value of one table and a value of another.
     Equality(EqualityFields, EqualityTagged) = "quail.common.expressions.Equality" | "quail.logical.expressions.Equality" {
         left: ValueExpression,
         right: ValueExpression,
@@ -321,14 +248,12 @@ tagged_struct! {
 }
 
 tagged_struct! {
-    /// The struct column of an `AI.EXTRACT` call and its fields.
     ExtractStruct(ExtractStructFields, ExtractStructTagged) = "quail.common.expressions.ExtractStruct" | "quail.logical.expressions.ExtractStruct" {
         name: String,
         fields: Vec<String>,
     }
 }
 
-/// What a port carries between two nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ValueType {
@@ -342,7 +267,6 @@ pub enum ValueType {
 }
 
 tagged_struct! {
-    /// One output port of another node.
     PortRef(PortRefFields, PortRefTagged) = "quail.physical.base.PortRef" {
         node_id: String,
         port: String,
@@ -350,7 +274,6 @@ tagged_struct! {
 }
 
 tagged_struct! {
-    /// One input of a node: its name, what it carries, and where from.
     InputPort(InputPortFields, InputPortTagged) = "quail.physical.base.InputPort" {
         name: String,
         value_type: ValueType,
@@ -360,8 +283,6 @@ tagged_struct! {
 }
 
 tagged_struct! {
-    /// A model call's answer columns, as a node's output reports them
-    /// before later row operations.
     AnswerOutput(AnswerOutputFields, AnswerOutputTagged) = "quail.physical.base.AnswerOutput" {
         kind: String,
         name: String,
@@ -370,8 +291,6 @@ tagged_struct! {
 }
 
 tagged_struct! {
-    /// One output of a node: its name, what it carries, its columns, and
-    /// the model answer it holds, if any.
     OutputPort(OutputPortFields, OutputPortTagged) = "quail.physical.base.OutputPort" {
         name: String,
         value_type: ValueType,
@@ -380,11 +299,9 @@ tagged_struct! {
     }
 }
 
-/// Token ids, as the tokenizer returns them.
 pub type TokenIds = Vec<i64>;
 
 tagged_struct! {
-    /// An `AI.SCORE` call.
     ScoreSpec(ScoreSpecFields, ScoreSpecTagged) = "quail.physical.nodes.inference.ScoreSpec" {
         name: String,
         aliases: Vec<String>,
@@ -392,7 +309,6 @@ tagged_struct! {
         arguments: Vec<(String, String)>,
         expected_rows: f64,
         estimated_seconds: f64,
-        /// The work the seconds price, as `Work::values` lists it.
         estimated_work: Vec<f64> = default,
         prompt_token_parts: Vec<TokenIds>,
         share_prefixes: bool,
@@ -404,7 +320,6 @@ tagged_struct! {
 }
 
 tagged_struct! {
-    /// An `AI.CLASSIFY` call.
     ClassifySpec(ClassifySpecFields, ClassifySpecTagged) = "quail.physical.nodes.classify.ClassifySpec" {
         name: String,
         aliases: Vec<String>,
@@ -412,7 +327,6 @@ tagged_struct! {
         arguments: Vec<(String, String)>,
         expected_rows: f64,
         estimated_seconds: f64,
-        /// The work the seconds price, as `Work::values` lists it.
         estimated_work: Vec<f64> = default,
         prompt_token_parts: Vec<TokenIds>,
         share_prefixes: bool,
@@ -422,7 +336,6 @@ tagged_struct! {
         label_token_ids: Vec<TokenIds>,
         scoring: String,
         probabilities: bool,
-        /// A joined classification's anchor and partner layouts.
         join_layout: Option<(Vec<Value>, Vec<Value>)>,
         frame_tokens: i64,
         state_tail_tokens: i64,
@@ -432,7 +345,6 @@ tagged_struct! {
 }
 
 tagged_struct! {
-    /// One `AI.EXTRACT` question.
     ExtractSpec(ExtractSpecFields, ExtractSpecTagged) = "quail.physical.nodes.extract.ExtractSpec" {
         name: String,
         aliases: Vec<String>,
@@ -440,7 +352,6 @@ tagged_struct! {
         arguments: Vec<(String, String)>,
         expected_rows: f64,
         estimated_seconds: f64,
-        /// The work the seconds price, as `Work::values` lists it.
         estimated_work: Vec<f64> = default,
         prompt_token_parts: Vec<TokenIds>,
         share_prefixes: bool,
@@ -460,7 +371,6 @@ tagged_struct! {
 }
 
 tagged_struct! {
-    /// An `AI.MAP` call.
     MapSpec(MapSpecFields, MapSpecTagged) = "quail.physical.nodes.map.MapSpec" {
         name: String,
         aliases: Vec<String>,
@@ -468,7 +378,6 @@ tagged_struct! {
         arguments: Vec<(String, String)>,
         expected_rows: f64,
         estimated_seconds: f64,
-        /// The work the seconds price, as `Work::values` lists it.
         estimated_work: Vec<f64> = default,
         prompt_token_parts: Vec<TokenIds>,
         share_prefixes: bool,
@@ -478,7 +387,6 @@ tagged_struct! {
 }
 
 tagged_struct! {
-    /// An `AI.SAE_FEATURES` call.
     SaeFeaturesSpec(SaeFeaturesSpecFields, SaeFeaturesSpecTagged) = "quail.physical.nodes.sae_features.SaeFeaturesSpec" {
         name: String,
         aliases: Vec<String>,
@@ -486,7 +394,6 @@ tagged_struct! {
         arguments: Vec<(String, String)>,
         expected_rows: f64,
         estimated_seconds: f64,
-        /// The work the seconds price, as `Work::values` lists it.
         estimated_work: Vec<f64> = default,
         prompt_token_parts: Vec<TokenIds>,
         share_prefixes: bool,
@@ -495,7 +402,6 @@ tagged_struct! {
 }
 
 tagged_struct! {
-    /// One filter sequence a request backend submits as model requests.
     RequestFilterSpec(RequestFilterSpecFields, RequestFilterSpecTagged) = "quail.baselines.nodes.RequestFilterSpec" {
         alias: String,
         written_positions: Vec<i64>,
@@ -505,15 +411,6 @@ tagged_struct! {
 }
 
 tagged_struct! {
-    /// One decoded classification answer per document or joined row.
-    ///
-    /// The tail follows the document: the question, the label list, and
-    /// the answer cue. `tests` are (written position, accepted labels)
-    /// pairs applied in order after classification. A classification of
-    /// joined rows names its partner, the anchor note and partner label
-    /// token ids, and the join whose rows it labels. `option_offsets`
-    /// are a decision model's scored options: distances before the
-    /// prompt's last row of each option block's end, then 0.
     RequestClassifySpec(RequestClassifySpecFields, RequestClassifySpecTagged) = "quail.baselines.nodes.RequestClassifySpec" {
         alias: String,
         output: String,
@@ -529,7 +426,6 @@ tagged_struct! {
 }
 
 tagged_struct! {
-    /// One join predicate submitted over its complete cross product.
     RequestJoinSpec(RequestJoinSpecFields, RequestJoinSpecTagged) = "quail.baselines.nodes.RequestJoinSpec" {
         written_position: i64,
         aliases: Vec<String>,
@@ -547,11 +443,6 @@ tagged_struct! {
 }
 
 tagged_struct! {
-    /// An answer copied from the document, located in its text.
-    ///
-    /// The preamble precedes the document: the model's turn and the
-    /// document label. The tail holds the question, the instruction, and
-    /// the phrase cue.
     RequestExtractSpec(RequestExtractSpecFields, RequestExtractSpecTagged) = "quail.baselines.nodes.RequestExtractSpec" {
         alias: String,
         output: String,
@@ -565,7 +456,6 @@ tagged_struct! {
 }
 
 tagged_struct! {
-    /// An answer the model writes for an instruction, up to its turn end.
     RequestMapSpec(RequestMapSpecFields, RequestMapSpecTagged) = "quail.baselines.nodes.RequestMapSpec" {
         alias: String,
         output: String,
@@ -577,7 +467,6 @@ tagged_struct! {
     }
 }
 
-/// A node's id, inputs, and type-specific attributes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Node<A> {
@@ -602,16 +491,12 @@ macro_rules! physical_nodes {
             }
         )*
 
-        /// A node of a plan's graph, tagged with its type name: one of
-        /// Quail's, or an extension's.
         #[derive(Debug, Clone, PartialEq)]
         pub enum PhysicalNode {
             $($variant(Node<$attributes>),)*
-            /// A node of a type an extension registers.
             Extension(ExtensionNode),
         }
 
-        /// Quail's own node types, read and written with their tag.
         #[derive(Serialize)]
         #[serde(tag = "type")]
         enum KnownRef<'a> {
@@ -624,7 +509,6 @@ macro_rules! physical_nodes {
             $(#[serde(rename = $type_name)] $variant(Node<$attributes>),)*
         }
 
-        /// The type names of Quail's own nodes.
         pub const NODE_TYPES: &[&str] = &[$($type_name,)*];
 
         impl Serialize for PhysicalNode {
@@ -656,7 +540,6 @@ macro_rules! physical_nodes {
         }
 
         impl PhysicalNode {
-            /// The node's id.
             pub fn id(&self) -> &str {
                 match self {
                     $(PhysicalNode::$variant(node) => &node.id,)*
@@ -664,7 +547,6 @@ macro_rules! physical_nodes {
                 }
             }
 
-            /// The node's input ports.
             pub fn inputs(&self) -> &[InputPort] {
                 match self {
                     $(PhysicalNode::$variant(node) => &node.inputs,)*
@@ -672,7 +554,6 @@ macro_rules! physical_nodes {
                 }
             }
 
-            /// The node's input ports, to rewire.
             pub fn inputs_mut(&mut self) -> &mut Vec<InputPort> {
                 match self {
                     $(PhysicalNode::$variant(node) => &mut node.inputs,)*
@@ -680,7 +561,6 @@ macro_rules! physical_nodes {
                 }
             }
 
-            /// The node's registered type name.
             pub fn type_name(&self) -> &str {
                 match self {
                     $(PhysicalNode::$variant(_) => $type_name,)*
@@ -691,7 +571,6 @@ macro_rules! physical_nodes {
     };
 }
 
-/// Where a node runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Location {
@@ -707,10 +586,6 @@ fn one() -> i64 {
     1
 }
 
-/// A node of a type Quail does not define: an extension's.
-///
-/// It carries what Quail cannot derive from its attributes: its outputs,
-/// the backend of a model node, and where it runs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExtensionNode {
@@ -727,7 +602,6 @@ pub struct ExtensionNode {
 }
 
 physical_nodes! {
-    /// Reads one table's documents, after its regular predicates.
     Scan(ScanAttributes) = "quail.scan" {
         alias: String,
         input_id: String,
@@ -736,7 +610,6 @@ physical_nodes! {
         predicates: Vec<ValueExpression>,
         expected_rows: Option<f64>,
     }
-    /// An `AI.IF` over one table.
     AiFilter(AiFilterAttributes) = "quail.ai_filter" {
         alias: String,
         arena_writes: bool,
@@ -755,7 +628,6 @@ physical_nodes! {
         state_tail_tokens: i64,
         question_header_token_ids: TokenIds,
         document_ends: Value,
-        // plans saved before these fields read with the behavior they had
         #[serde(default = "one")]
         num_key_survivors: i64,
         #[serde(default)]
@@ -764,23 +636,15 @@ physical_nodes! {
         alternative: Option<ValueExpression>,
         #[serde(default)]
         answer: Option<String>,
-        /// Whether a document passes when the model answers no.
         #[serde(default)]
         negated: bool,
-        /// The column that holds whether a term of the filter's OR has
-        /// passed each row, which the filter writes.
         #[serde(default)]
         disjunction: Option<String>,
-        /// Whether the filter asks the model only about the rows where
-        /// that column is not TRUE.
         #[serde(default)]
         short_circuit: bool,
-        /// Whether the filter is the last term of its OR to run: it
-        /// returns the rows a term passed, without the column.
         #[serde(default)]
         closes_disjunction: bool,
     }
-    /// An `AI.SCORE` call.
     AiScore(AiScoreAttributes) = "quail.ai_score" {
         backend_name: String,
         model: String,
@@ -789,14 +653,12 @@ physical_nodes! {
         pass_group: i64,
         document_ends: Value,
     }
-    /// A condition that asks no model, on one or more tables' documents.
     Filter(FilterAttributes) = "quail.filter" {
         predicate: Option<ValueExpression>,
         aliases: Vec<String>,
         selectivity: Option<f64>,
         written_position: i64,
     }
-    /// An `AI.CLASSIFY` call.
     AiClassify(AiClassifyAttributes) = "quail.ai_classify" {
         backend_name: String,
         model: String,
@@ -807,12 +669,6 @@ physical_nodes! {
         #[serde(default)]
         guard: Option<ValueExpression>,
     }
-    /// One `AI.EXTRACT` question.
-    ///
-    /// The executor stops an answer once a stop test is decided not TRUE
-    /// on the tokens decoded so far, or, with `stop_when_true`, once
-    /// every stop test is decided TRUE. Stop tests are the region's exact
-    /// tests that read the answer alone.
     AiExtract(AiExtractAttributes) = "quail.ai_extract" {
         backend_name: String,
         model: String,
@@ -828,12 +684,6 @@ physical_nodes! {
         #[serde(default)]
         stop_when_true: bool,
     }
-    /// An `AI.MAP` call.
-    ///
-    /// The executor stops an answer once a stop test is decided not TRUE
-    /// on the tokens decoded so far, or, with `stop_when_true`, once
-    /// every stop test is decided TRUE. Stop tests are the region's exact
-    /// tests that read the answer alone.
     AiMap(AiMapAttributes) = "quail.ai_map" {
         backend_name: String,
         model: String,
@@ -849,7 +699,6 @@ physical_nodes! {
         #[serde(default)]
         stop_when_true: bool,
     }
-    /// An `AI.SAE_FEATURES` call.
     AiSaeFeatures(AiSaeFeaturesAttributes) = "quail.ai_sae_features" {
         backend_name: String,
         model: String,
@@ -860,14 +709,10 @@ physical_nodes! {
         #[serde(default)]
         guard: Option<ValueExpression>,
     }
-    /// Prunes each table's survivors with the join answers so far.
     Barrier(BarrierAttributes) = "quail.barrier" {
         next_anchor: String,
         aliases: Vec<String>,
     }
-    /// The pairs of two tables an AI join asks about: those whose `on`
-    /// keys are equal, or every pair without keys, where `filter` is
-    /// TRUE. It asks no model.
     HashJoin(HashJoinAttributes) = "quail.hash_join" {
         left: String,
         right: String,
@@ -877,7 +722,6 @@ physical_nodes! {
         written_position: i64,
         pair_fraction: f64,
     }
-    /// An `AI.IF` over the pairs of an anchor table and its partners.
     AiJoin(AiJoinAttributes) = "quail.ai_join" {
         anchor: String,
         anchor_resident: String,
@@ -903,12 +747,9 @@ physical_nodes! {
         question_header_token_ids: TokenIds,
         document_ends: Value,
     }
-    /// The first rows a region returns: its fetch.
     Limit(LimitAttributes) = "quail.limit" {
         count: i64,
     }
-    /// A request backend's whole model work: each document or pair
-    /// submitted to an engine such as vLLM.
     RequestExecution(RequestExecutionAttributes) = "quail.request_execution" {
         backend_name: String,
         aliases: Vec<String>,
@@ -922,7 +763,6 @@ physical_nodes! {
     }
 }
 
-/// A physical graph: its nodes, and the port that returns the result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PhysicalGraph {
@@ -930,7 +770,6 @@ pub struct PhysicalGraph {
     pub root: PortRef,
 }
 
-/// The physical plan as it crosses a process boundary.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanEnvelope {
@@ -938,17 +777,14 @@ pub struct PlanEnvelope {
     pub model: String,
     pub device: String,
     pub gpus: i64,
-    /// Settings the planner chose for the run, keyed by name.
     pub settings: Map<String, Value>,
     pub graph: PhysicalGraph,
 }
 
-/// Read a plan envelope from JSON.
 pub fn read_plan(text: &str) -> serde_json::Result<PlanEnvelope> {
     serde_json::from_str(text)
 }
 
-/// Write a plan envelope as JSON.
 pub fn write_plan(plan: &PlanEnvelope) -> serde_json::Result<String> {
     serde_json::to_string(plan)
 }

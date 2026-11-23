@@ -1,5 +1,3 @@
-//! `ModelRegionExec` and the planners that build it and `SharedInputExec`.
-
 use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
@@ -43,24 +41,14 @@ use crate::region::ModelRegion;
 use crate::region::region_hint::RegionHint;
 use crate::shared::{SharedInput, SharedInputExec, SharedRowsByKey};
 
-/// The rows of one region input: its table name and its batches.
 pub type InputRows = (String, Vec<RecordBatch>);
 
-/// A region's rows, in the region's schema, as the runner produces them.
 pub type RegionBatches = Box<dyn Iterator<Item = Result<RecordBatch>> + Send>;
 
-/// One region input's batches, read as DataFusion computes them; a read
-/// blocks until the next batch arrives.
 pub type InputBatches = Box<dyn Iterator<Item = Result<RecordBatch>> + Send>;
 
-/// One region input: its table name and its batches as they arrive.
 pub type InputStream = (String, InputBatches);
 
-/// Read each input stream to its end.
-///
-/// # Errors
-///
-/// An input fails.
 pub fn collect_inputs(inputs: Vec<InputStream>) -> Result<Vec<InputRows>> {
     inputs
         .into_iter()
@@ -68,19 +56,7 @@ pub fn collect_inputs(inputs: Vec<InputStream>) -> Result<Vec<InputRows>> {
         .collect()
 }
 
-/// Plans and runs one model region, returning its rows as they come.
-///
-/// Quail's executor implements this trait, in the same process or
-/// behind Quail Server. `ModelRegionExec` calls it on a thread that may
-/// block, and hands DataFusion each batch as the iterator yields it, so
-/// the operators above the region read rows while the region runs.
 pub trait RegionRunner: fmt::Debug + Send + Sync {
-    /// Plan and run the region over its inputs' rows, which arrive as
-    /// DataFusion computes them. Each input holds at least one batch, or
-    /// has ended, when the call starts. `fetch` is the most rows
-    /// DataFusion reads, when a LIMIT above the region says so; a
-    /// runner may stop the model once it has that many. The region may
-    /// drop each row where a test of `hint` is not TRUE.
     fn run(
         &self,
         region: &ModelRegion,
@@ -90,19 +66,13 @@ pub trait RegionRunner: fmt::Debug + Send + Sync {
     ) -> Result<RegionBatches>;
 }
 
-/// The physical operator for one model region.
 #[derive(Debug)]
 pub struct ModelRegionExec {
     region: ModelRegion,
     runner: Arc<dyn RegionRunner>,
-    /// The physical plans of the region's inputs, in order.
     inputs: Vec<Arc<dyn ExecutionPlan>>,
-    /// The most rows DataFusion reads, from its limit pushdown.
     fetch: Option<usize>,
-    /// The dynamic filters the operators above handed the region.
     hint: RegionHint,
-    /// The columns a dynamic filter may read, once
-    /// [`super::filter_guard::GuardRegionFilters`] has named them.
     filter_columns: Option<BTreeSet<String>>,
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
@@ -110,8 +80,6 @@ pub struct ModelRegionExec {
 }
 
 impl ModelRegionExec {
-    /// Create the operator for a region, run by the given runner over the
-    /// rows of `inputs`, the physical plans of the region's inputs.
     pub fn new(
         region: ModelRegion,
         runner: Arc<dyn RegionRunner>,
@@ -124,7 +92,6 @@ impl ModelRegionExec {
             EmissionType::Incremental,
             Boundedness::Bounded,
         )
-        // the region runs on tasks of its own and buffers their rows
         .with_evaluation_type(EvaluationType::Eager);
         Self {
             region,
@@ -139,8 +106,6 @@ impl ModelRegionExec {
         }
     }
 
-    /// The operator with the same region, hint, and fetch over other
-    /// inputs.
     fn with_inputs(&self, inputs: Vec<Arc<dyn ExecutionPlan>>) -> Self {
         let mut exec = Self::new(self.region.clone(), Arc::clone(&self.runner), inputs);
         exec.fetch = self.fetch;
@@ -149,8 +114,6 @@ impl ModelRegionExec {
         exec
     }
 
-    /// The operator over `inputs`, taking dynamic filters that read
-    /// `columns` only.
     pub(crate) fn with_filter_columns(
         &self,
         columns: BTreeSet<String>,
@@ -161,7 +124,6 @@ impl ModelRegionExec {
         exec
     }
 
-    /// The region this operator runs.
     pub fn region(&self) -> &ModelRegion {
         &self.region
     }
@@ -207,7 +169,6 @@ impl ExecutionPlan for ModelRegionExec {
     }
 
     fn input_distribution_requirements(&self) -> InputDistributionRequirements {
-        // `execute` reads each input as one stream
         InputDistributionRequirements::new(vec![Distribution::SinglePartition; self.inputs.len()])
     }
 
@@ -229,8 +190,6 @@ impl ExecutionPlan for ModelRegionExec {
         &self,
         f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
     ) -> Result<TreeNodeRecursion> {
-        // the operator that made a dynamic filter fills it only when an
-        // operator below holds it
         for test in &self.hint.tests {
             if f(test)? == TreeNodeRecursion::Stop {
                 return Ok(TreeNodeRecursion::Stop);
@@ -245,8 +204,6 @@ impl ExecutionPlan for ModelRegionExec {
         child_pushdown_result: ChildPushdownResult,
         _config: &ConfigOptions,
     ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
-        // the operators above still apply every filter: the region only
-        // may drop the rows a filter rejects
         let filters = vec![PushedDown::No; child_pushdown_result.parent_filters.len()];
         let dynamic: Vec<Arc<dyn PhysicalExpr>> = child_pushdown_result
             .parent_filters
@@ -256,7 +213,6 @@ impl ExecutionPlan for ModelRegionExec {
                 test.exists(|expr| Ok(expr.downcast_ref::<DynamicFilterPhysicalExpr>().is_some()))
                     .unwrap_or(false)
             })
-            // only a filter whose columns arrived mapped correctly
             .filter(|test| {
                 self.filter_columns.as_ref().is_some_and(|safe| {
                     collect_columns(test)
@@ -306,12 +262,7 @@ impl ExecutionPlan for ModelRegionExec {
         let fetch = self.fetch;
         let hint = self.hint.clone();
         let schema = Arc::clone(&self.schema);
-        // the region starts when DataFusion first reads it: a hash join
-        // reads its probe side once its build side, and so its filter, is
-        // complete
         let start = move || {
-            // the builder's stream reports a failed or panicked task as an
-            // error, and dropping the stream stops the tasks
             let mut builder = RecordBatchReceiverStreamBuilder::new(schema, BUFFERED_BATCHES);
             let mut streams: Vec<InputStream> = Vec::new();
             let mut first = Vec::new();
@@ -332,7 +283,6 @@ impl ExecutionPlan for ModelRegionExec {
                         }
                     };
                     while let Some(batch) = found.next().await {
-                        // the runner stopped reading this input
                         if batches.send(batch).await.is_err() {
                             break;
                         }
@@ -348,18 +298,12 @@ impl ExecutionPlan for ModelRegionExec {
             }
             let sender = builder.tx();
             builder.spawn(async move {
-                // a region starts once each input has a batch or has ended:
-                // an input that is another region's rows then runs first, on
-                // the same thread
                 for waiting in first {
                     let _ = waiting.await;
                 }
-                // the runner blocks while the region runs; Quail's hands the
-                // region to the thread that called DataFusion
                 SpawnedTask::spawn_blocking(move || {
                     let batches = runner.run(&region, streams, fetch, &hint)?;
                     for batch in batches {
-                        // the receiver is gone once DataFusion stops reading
                         if sender
                             .blocking_send(batch.and_then(with_struct_nulls))
                             .is_err()
@@ -380,7 +324,6 @@ impl ExecutionPlan for ModelRegionExec {
             Arc::clone(&self.schema),
             batches,
         ));
-        // cuts the rows off at the fetch and counts them for EXPLAIN ANALYZE
         Ok(Box::pin(LimitStream::new(
             batches,
             0,
@@ -390,13 +333,8 @@ impl ExecutionPlan for ModelRegionExec {
     }
 }
 
-/// How many batches each channel into and out of a region holds before
-/// its sender waits.
 const BUFFERED_BATCHES: usize = 2;
 
-/// Carry a nullable struct's validity into its children before SQL reads them.
-/// DataFusion's get_field reads child arrays directly, so a null span must not
-/// expose the zero-filled storage beneath its null struct.
 fn with_struct_nulls(batch: RecordBatch) -> Result<RecordBatch> {
     use datafusion::arrow::array::{Array, ArrayRef, StructArray, make_array};
     use datafusion::arrow::buffer::NullBuffer;
@@ -432,13 +370,8 @@ fn with_struct_nulls(batch: RecordBatch) -> Result<RecordBatch> {
     .map_err(Into::into)
 }
 
-/// One region input's batches, read on a thread that may block.
-///
-/// The thread that runs a region may be inside the tokio runtime, where
-/// tokio's blocking receive panics, so this waits with `futures`' executor.
 struct BlockingReceiver {
     received: futures::channel::mpsc::Receiver<Result<RecordBatch>>,
-    /// Whether the input ended; a cancelled query closes the channel too.
     ended: Arc<AtomicBool>,
 }
 
@@ -455,9 +388,6 @@ impl Iterator for BlockingReceiver {
     }
 }
 
-/// The `ExtensionPlanner` that turns a `ModelRegion` into a
-/// `ModelRegionExec`, and a `SharedInput` into a `SharedInputExec` that
-/// shares its rows with the other readers of its key.
 #[derive(Debug)]
 pub struct ModelRegionPlanner {
     runner: Arc<dyn RegionRunner>,
@@ -465,7 +395,6 @@ pub struct ModelRegionPlanner {
 }
 
 impl ModelRegionPlanner {
-    /// Create the planner; every region it plans runs on `runner`.
     pub fn new(runner: Arc<dyn RegionRunner>) -> Self {
         Self {
             runner,
@@ -507,16 +436,12 @@ impl ExtensionPlanner for ModelRegionPlanner {
     }
 }
 
-/// DataFusion's default query planner, which claims the plan's model
-/// regions ([`crate::claim_model_regions`]) and plans each with
-/// `ModelRegionPlanner`.
 #[derive(Debug)]
 pub struct QuailQueryPlanner {
     runner: Arc<dyn RegionRunner>,
 }
 
 impl QuailQueryPlanner {
-    /// Create the query planner; every region runs on `runner`.
     pub fn new(runner: Arc<dyn RegionRunner>) -> Self {
         Self { runner }
     }

@@ -8,8 +8,6 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
 use quail_datafusion::{ModelRegion, RegionRunner, session_context};
 
-/// A runner for planning tests, which never run a region. Execution is
-/// covered end to end in `tests/api/test_session_context.py`.
 #[derive(Debug)]
 struct NotRun;
 
@@ -45,7 +43,6 @@ fn text_table(columns: &[&str], rows: &[&[&str]]) -> Result<MemTable> {
 
 fn context() -> Result<SessionContext> {
     let context = session_context(Arc::new(NotRun))?;
-    // a region returns each review's id, its primary key
     let reviews = text_table(
         &["id", "body"],
         &[&["r1", "A moving ending."], &["r2", "Too long."]],
@@ -65,13 +62,10 @@ async fn optimized(context: &SessionContext, query: &str) -> Result<LogicalPlan>
     claimed(context, context.sql(query).await?.into_optimized_plan()?)
 }
 
-/// An optimized plan with its model regions claimed, as the query
-/// planner sees it.
 fn claimed(context: &SessionContext, plan: LogicalPlan) -> Result<LogicalPlan> {
     quail_datafusion::claim_model_regions(plan, &context.state())
 }
 
-/// Each model region of a plan, each checked to derive its operators.
 fn regions(plan: &LogicalPlan) -> Vec<ModelRegion> {
     let mut found = Vec::new();
     plan.apply(|node| {
@@ -156,7 +150,6 @@ fn malformed_environment_options_return_errors() {
         assert!(error.to_string().contains("not-a-number"), "{error}");
         return;
     }
-    // Isolate the environment from parallel tests without mutating this process.
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -243,7 +236,6 @@ async fn datafusion_groups_the_answers_a_region_returns() -> Result<()> {
         !inner.iter().any(|line| line.starts_with("Aggregate")),
         "{inner:?}"
     );
-    // the classification's column keeps the name SELECT gives it
     assert!(
         inner
             .iter()
@@ -378,7 +370,6 @@ async fn an_ai_join_stays_in_one_region_under_its_distinct() -> Result<()> {
     let inner = found[0].plan.display_indent().to_string();
     assert!(!inner.contains("Distinct"), "{inner}");
     assert!(inner.contains("Join"), "{inner}");
-    // DataFusion's DISTINCT, a GROUP BY, reads the region's rows
     let shape = lines(&plan);
     assert!(
         shape.iter().any(|line| line.starts_with("Aggregate:")),
@@ -411,7 +402,6 @@ async fn an_exists_gate_becomes_a_semi_join_inside_the_region() -> Result<()> {
     assert_eq!(found.len(), 1, "{}", plan.display_indent());
     let shape = lines(&found[0].plan);
     assert!(shape[1].starts_with("AiNode: semi"), "{shape:?}");
-    // the gate's table is an input DataFusion scans for the region
     assert_eq!(
         shape.last().map(String::as_str),
         Some("TableScan: aspects@a")
@@ -435,12 +425,10 @@ async fn a_where_clause_asks_the_model_above_its_plain_terms() -> Result<()> {
     let [region] =
         <[ModelRegion; 1]>::try_from(regions(&optimized(&context, query).await?)).unwrap();
     let plan = lines(&region.plan);
-    // one node per AI call, the first written lowest
     assert!(plan[1].starts_with("AiNode: "), "{plan:?}");
     assert!(plan[1].contains("Long?"), "{plan:?}");
     assert!(plan[2].starts_with("AiNode: "), "{plan:?}");
     assert!(plan[2].contains("Kind?"), "{plan:?}");
-    // the plain test runs in DataFusion, in the region's input
     assert!(!plan.iter().any(|line| line.contains("r9")), "{plan:?}");
     assert!(
         region
@@ -463,7 +451,6 @@ async fn an_ai_join_asks_the_model_above_datafusions_join() -> Result<()> {
         plan[1].starts_with("AiNode: __quail_answer_1 = ai_filter"),
         "{plan:?}"
     );
-    // the ON has no other term, so DataFusion's join pairs every row
     assert_eq!(plan[2], "Cross Join:", "{plan:?}");
     Ok(())
 }
@@ -493,7 +480,6 @@ async fn a_test_of_a_label_is_absorbed_into_its_classifications_filter() -> Resu
     let [region] =
         <[ModelRegion; 1]>::try_from(regions(&optimized(&context, query).await?)).unwrap();
     let plan = lines(&region.plan);
-    // one classification serves the test and the SELECT list
     let columns: Vec<&String> = plan
         .iter()
         .filter(|line| line.starts_with("AiNode"))
@@ -520,7 +506,6 @@ async fn a_plain_filter_runs_in_datafusion_as_the_regions_input() -> Result<()> 
         AND AI.IF(PROMPT('Is {0} kind?', r.body))";
     let [region] =
         <[ModelRegion; 1]>::try_from(regions(&optimized(&context, query).await?)).unwrap();
-    // the model reads only the rows the plain test keeps
     assert!(
         !lines(&region.plan).iter().any(|line| line.contains("r9")),
         "{:?}",
@@ -549,7 +534,6 @@ async fn a_plain_expression_in_select_runs_in_datafusion_above_the_region() -> R
         "{:?}",
         lines(&region.plan)
     );
-    // DataFusion computes it from the rows the region keeps
     assert!(
         lines(&plan).iter().any(|line| line.contains("upper(")),
         "{:?}",
@@ -571,7 +555,6 @@ async fn a_table_without_a_key_is_numbered_and_its_columns_come_from_the_region(
         "Projection: r.id, a.aspect",
         "{text}"
     );
-    // DataFusion numbers the aspects' rows once and adds no join
     assert_eq!(text.matches("SharedInput: ").count(), 1, "{text}");
     assert!(!text.contains("Join: "), "{text}");
     Ok(())
@@ -585,8 +568,6 @@ async fn an_ai_filter_joins_the_region_of_an_extraction_a_join_key_reads() -> Re
         WHERE AI.IF(PROMPT('Is {0} long?', r.body))";
     let plan = optimized(&context, query).await?;
     let text = plan.display_indent().to_string();
-    // the join key is a field of the extraction's answer, which a SELECT
-    // list above the region reads; the filter runs in the same region
     let [region] = <[ModelRegion; 1]>::try_from(regions(&plan)).unwrap();
     let found = lines(&region.plan);
     let operators: Vec<&str> = found
@@ -607,8 +588,6 @@ async fn an_ai_filter_joins_the_region_of_an_extraction_a_join_key_reads() -> Re
 #[tokio::test]
 async fn a_join_above_reordered_ai_nodes_reads_their_columns_by_their_new_order() -> Result<()> {
     let context = context()?;
-    // the map's test and the classification both move below the join,
-    // where the classification goes first
     let query = "SELECT r.id, a.aspect, \
         AI.CLASSIFY(PROMPT('q: {0}', r.body), ['x', 'y']) AS c0 \
         FROM reviews r LEFT JOIN aspects a ON r.id = a.aspect \
@@ -621,8 +600,6 @@ async fn a_join_above_reordered_ai_nodes_reads_their_columns_by_their_new_order(
 #[tokio::test]
 async fn a_test_of_two_answers_below_a_join_stays_below_it() -> Result<()> {
     let context = context()?;
-    // no region runs a test of two calls' answers, and the SELECT list
-    // below the join hides them from the rows the AI join returns
     let query = "SELECT r.id, a.aspect FROM reviews r JOIN aspects a \
         ON AI.IF(PROMPT('q {0} {1}', r.body, a.aspect)) AND r.id = a.aspect \
         WHERE (length(AI.MAP(r.body, 'q3', 16)) > 4 \

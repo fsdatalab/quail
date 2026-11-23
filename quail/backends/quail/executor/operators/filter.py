@@ -24,7 +24,6 @@ from quail.execution.rows import Rows
 from quail.execution.runtimes.filter import filter_scores, tested_table
 from quail.progress import answer_sink
 
-# the key of a NaN stop key value
 NAN_KEY = ("NaN",)
 
 
@@ -40,7 +39,6 @@ class FilterOperator(SingleNodeOperator):
         found = cls(node, region.document_ids(), query.async_answers,
                     len(pipeline.canvas_ids), frames=pipeline.mask == "causal")
         if getattr(node, "answer", None) is not None:
-            # a filter that keeps every row carries the columns before it
             found.priors, found.prior_tables = prior_inputs(
                 node, chain, region.node_inputs(node))
         return found
@@ -74,7 +72,6 @@ class FilterOperator(SingleNodeOperator):
             async_answers, frames)
         self._keep_answer()
         self.answers = {}
-        # (document, passed, answer) settled since the last take
         self.finished = []
         self.priors, self.prior_tables = [], []
 
@@ -162,7 +159,6 @@ class FilterOperator(SingleNodeOperator):
             pack_s=stats.get("pack_s", 0.0))
         if getattr(self.node, "answer", None) is None:
             return found
-        # every document asked, with its answer, after the columns before it
         alias = self.node.alias
         local = np.fromiter(self.answers, dtype=np.int64, count=len(self.answers))
         positions = np.asarray(self.ids, dtype=np.int64)[local]
@@ -206,18 +202,17 @@ class ConditionGate(SingleNodeOperator):
 
     def __init__(self, node, producers, source, columns, document_ids=None):
         self.node = node
-        # Callable() -> the region's document ids, by position
         self.document_ids = document_ids
-        self.finished = []  # documents that passed since the last take
-        self.producers = producers  # column -> the operator computing it
-        self.source = source  # the operator whose rows the Filter reads
-        self.columns = columns  # the table's source columns, by document
+        self.finished = []
+        self.producers = producers
+        self.source = source
+        self.columns = columns
         self.positions = {
             id(operator): {document: index
                            for index, document in enumerate(operator.ids)}
             for operator in producers.values()}
         self.accepted = {}
-        self.decided = {}  # key -> kept, from decide, until gate asks
+        self.decided = {}
 
     @property
     def answer_dependencies(self):
@@ -238,7 +233,6 @@ class ConditionGate(SingleNodeOperator):
             raise KeyError(f"{self.node.node_id!r} reads {name!r}, which no "
                            f"operator computes and the scan does not hold")
         if len(documents) == 1:
-            # one document at a time: a slice copies nothing
             return self.columns.column(name).slice(documents[0], 1)
         return pc.take(self.columns.column(name), pa.array(documents, pa.int64()))
 
@@ -263,9 +257,6 @@ class ConditionGate(SingleNodeOperator):
         kept = self.decided.pop(key, None)
         if kept is not None:
             return None if kept else Stage.DROP
-        # a document decide did not see, such as one asked outside a
-        # chunk report, is tested alone; a repeated value, such as a
-        # label, is evaluated once
         values = {column: self.read(column, [key[1]])
                   for column in self.node.tested_columns}
         token = tuple(_hashable(found[0].as_py()) for found in values.values())
@@ -415,7 +406,6 @@ class StopKeyGroups:
         values = [equality_keys(self.columns.column(name).take(positions),
                                 nan_equal=True).to_pylist()
                   for name in self.node.stop_key]
-        # every NaN is one key, though no two NaN floats are equal
         keys = (tuple(NAN_KEY if value != value else value for value in row)
                 for row in zip(*values))
         return [self.numbers.setdefault(key, len(self.numbers)) for key in keys]

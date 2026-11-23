@@ -171,7 +171,6 @@ class _Rows:
     """
 
     def __init__(self):
-        # each an array, or a run as (first, count)
         self.parts = []
 
     def __bool__(self):
@@ -302,15 +301,12 @@ class Suffixes:
         index = np.asarray(indices, dtype=np.int64)
         lengths = self.lengths[index]
         total = int(lengths.sum())
-        # each suffix's rows read from its start in ids
         starts = np.cumsum(lengths) - lengths
         rows = (np.repeat(self.offsets[index] - starts, lengths)
                 + np.arange(total, dtype=np.int64))
         return Suffixes(self.ids[rows], lengths)
 
 
-# the passes a staged input buffer goes unused before the host refills
-# it; more than the passes the host builds ahead (map_decoder.IN_FLIGHT)
 STAGING_DEPTH = 4
 
 
@@ -328,8 +324,8 @@ class InputStaging:
     def __init__(self, torch, device="cuda"):
         self.torch = torch
         self.device = device
-        self.buffers = {}     # name -> the buffer in use: host, device, event
-        self.rings = {}       # name -> (next slot, list of buffers or None)
+        self.buffers = {}
+        self.rings = {}
 
     def host(self, name, count, dtype):
         torch = self.torch
@@ -337,7 +333,6 @@ class InputStaging:
         previous = ring[slot]
         if previous is not None:
             host, device, event = previous
-            # The CPU must not overwrite a buffer while its transfer is pending.
             event.synchronize()
         if previous is None or host.numel() < count or host.dtype != dtype:
             host = torch.empty(count, dtype=dtype, pin_memory=True)
@@ -349,7 +344,6 @@ class InputStaging:
 
     def upload(self, name, count):
         host, device, event = self.buffers[name]
-        # Reusing the device buffer is ordered after its previous readers.
         device[:count].copy_(host[:count], non_blocking=True)
         event.record()
         return device[:count]
@@ -386,7 +380,6 @@ def joined_ids(sequences) -> np.ndarray:
     return np.concatenate(arrays) if arrays else np.empty(0, dtype=np.int64)
 
 
-# ------------------------------------------------------- chunk packing
 
 class _PoolView:
     """Rows and pages owned by one KV key in one arena pool.
@@ -414,7 +407,6 @@ class _PoolBuilder:
         self.dst = []
         self.tail_src = []
         self.tail_dst = []
-        # (page table, lengths) blocks of decode sequences, after the rows
         self.blocks = []
 
     def add_sequence(self, pages, kv_tokens):
@@ -479,8 +471,6 @@ class _PoolBuilder:
                 len(lengths), width)
         decode = {}
         if self.page_rows and self.blocks:
-            # Triton specializes pointers on 16-byte alignment, which a
-            # slice at the first decode row would vary pass to pass
             first = len(self.page_rows)
             decode = dict(
                 decode_used=stage(f"unified_decode_lengths{tag}",
@@ -575,33 +565,25 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         raise ValueError(
             f"answer_row {answer_row} is outside the {len(canvas)}-row canvas")
     t = time.perf_counter() if timing is not None else 0.0
-    # unified scatters every fresh row through its own src/dst map, so
-    # the reads and kv_writes bookkeeping below is tree only
     tree_path = attention_mode == "tree"
     canvas_ids = np.asarray(canvas, dtype=np.int64)
-    canvas_starts = []    # per group, the first row of each canvas
-    canvas_sizes = []     # per group, the rows of each canvas
-    canvas_seq = []       # its sequence in the unified paged call
+    canvas_starts = []
+    canvas_sizes = []
+    canvas_seq = []
     id_parts, num_tokens = [], 0
     position, finals = _Rows(), _Rows()
     cu_a = _Rows()
     cu_a.run(0, 1)
     rows_per_answer = []
     multi_row = False
-    # rows that read resident KV in call B: a borrowing document's
-    # rows reading its parent, and a kept document's tail reading its
-    # own prefix (wider than the planner's readers, which are children)
     reader_rows = _Rows()
     kv_writes, layout = [], []
     row_spans = []
-    # per group: (first row, end row), or under set attention (first
-    # row, end of the state, each question's rows after it)
     passes = []
     fresh_keys = []
     read_keys, read_used, cu_q = [], [], [0]
     max_q = 0
     unified_groups = []
-    # call C: path rows reading their off-path ancestor rows
     node_q, node_k, node_cu_q, node_cu_k = [], [], [0], [0]
     for g in groups:
         fresh = g.get("prefix") is not None
@@ -614,11 +596,6 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         if not isinstance(sufs, Suffixes):
             sufs = Suffixes.of(sufs)
         n = len(sufs)
-        # a borrowing fresh group under tree attention reads the pages
-        # before start in call B. With one suffix and a read_key the
-        # group is one causal segment that reads the parent, stacked
-        # with its siblings; otherwise the prefix is its own segment
-        # reading the key's borrowed pages
         borrowing = fresh and start and tree_path
         stacked = borrowing and n == 1 and g.get("read_key") is not None
         whole = (fresh and paged and tree_path and not start and n == 1
@@ -651,12 +628,9 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 fresh_keys.append(key)
         prefix_end = num_tokens
         s_row0 = num_tokens
-        # with a canvas, read_all_rows reads every canvas row instead
-        # of the suffix's own rows
         read_all = bool(g.get("read_all_rows"))
         own = g.get("canvas")
         paths = g.get("paths")
-        # one suffix read plainly, the common group: its rows are one run
         plain = (n == 1 and own is None and not len(canvas_ids)
                  and paths is None and g.get("read_mask") is None
                  and g.get("read_rows") is None)
@@ -684,7 +658,6 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         else:
             group_canvas = (canvas_ids if own is None
                             else np.asarray(own, dtype=np.int64))
-            # a two-dimensional canvas holds one canvas per suffix
             per_suffix = group_canvas.ndim == 2
             if per_suffix and len(group_canvas) != n:
                 raise ValueError(
@@ -694,17 +667,13 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 raise ValueError(
                     f"group {key!r}: answer_row {answer_row} is outside its "
                     f"{width}-row canvas")
-            # every suffix's rows at once: positions restart at f for each
-            # suffix, and a canvas continues its suffix's positions
             widths = sufs.lengths + width
             total = int(widths.sum())
             ends = np.cumsum(widths)
             begins = ends - widths
             within = np.arange(total, dtype=np.int64) - np.repeat(begins, widths)
             if n and width:
-                # row answer_row of each canvas carries the answer
                 past = within - np.repeat(sufs.lengths, widths)
-                # suffix s reads canvas row s of a two-dimensional canvas
                 first_row = (np.repeat(np.arange(n) * width, widths) if per_suffix
                              else 0)
                 source = np.where(
@@ -724,7 +693,6 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                     finals.append(first + answer_row)
                     rows_per_answer.append(np.ones(n, dtype=np.int64))
             elif n and g.get("read_mask") is not None:
-                # the marked rows of the one suffix carry the answers
                 id_parts.append(sufs.ids)
                 marked = np.asarray(g["read_mask"], dtype=bool)
                 if n != 1 or len(marked) != total:
@@ -733,14 +701,12 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 reads = s_row0 + np.flatnonzero(marked)
                 state_reads = g.get("state_reads")
                 if state_reads is not None:
-                    # a pointer read's document rows, read before its slots
                     reads = np.concatenate(
                         [row0 + np.asarray(state_reads, dtype=np.int64), reads])
                 finals.append(reads)
                 rows_per_answer.append(np.array([len(reads)], dtype=np.int64))
                 multi_row = True
             elif n and g.get("read_rows") is not None:
-                # the last read_rows rows of each suffix carry the answers
                 id_parts.append(sufs.ids)
                 counts = np.asarray(g["read_rows"], dtype=np.int64)
                 if len(counts) != n or (counts > sufs.lengths).any():
@@ -774,8 +740,6 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                            + (np.arange(total, dtype=np.int64)
                               - np.repeat(path_row0 - s_row0, lengths)))
                 cu_a.append(path_ends)
-                # a path's rows read the rows above its first node, which
-                # earlier paths hold, in call C
                 for index, (_, _, gathers) in enumerate(paths):
                     if not gathers:
                         continue
@@ -794,9 +758,6 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 num_tokens += total
                 wst = g.get("write_suffix_tokens", 0)
                 if wst and paged and tree_path:
-                    # the shared question preamble joins the kept KV right
-                    # after the document rows: after the fresh prefix, or
-                    # after a kept document's f rows
                     dest = start + prefix_len if fresh else f
                     kv_writes.append((key, s_row0, s_row0 + wst, dest))
         num_s = num_tokens - s_row0
@@ -806,8 +767,6 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         passes.append((row0, num_tokens) if questions is None else
                       (row0, prefix_end, questions))
         if stacked:
-            # every row of the group reads the parent's pages up to
-            # start; siblings packed back to back share that read
             count = num_tokens - row0
             reader_rows.run(row0, count)
             read_key = g["read_key"]
@@ -849,7 +808,6 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
         count = len(decode)
         decode_offsets = decode.sequence_offsets
         if tree_path:
-            # A draft reads its resident prefix in B and its causal rows in A.
             reader_rows.append(np.arange(num_tokens, num_tokens + count,
                                          dtype=np.int64))
             cu_q.extend((cu_q[-1] + decode_offsets[1:]).tolist())
@@ -881,8 +839,6 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
             table = stage("read_table", flat, torch.int32).view(*flat.shape)
         t = _tick(timing, "pack_blocktable", t)
         rows = reader_rows.joined()
-        # row -> its index in call B's output, -1 for rows that read
-        # nothing resident; the fused merge kernel's map
         source = np.full(num_tokens, -1, dtype=np.int32)
         source[rows] = np.arange(len(rows), dtype=np.int32)
         reads = dict(
@@ -901,7 +857,6 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 cu_k=_staged(torch, node_cu_k, torch.int32, pinned),
                 max_q=int(np.diff(node_cu_q).max()),
                 max_k=int(np.diff(node_cu_k).max()),
-                # each node row's index among call B's rows
                 b_index=_staged(torch, source[q_rows], torch.int64, pinned))
     elif node_q:
         raise ValueError("path rows read their document in call B; "
@@ -923,9 +878,6 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 "groups: the one paged call covers every row or "
                 "none (the fast path packs whole chunks unpaged)")
         sliding = arena.has_sliding
-        # one builder per pool: the every-token pool, and the
-        # sliding pool that holds each key's rows from its window
-        # origin on
         pools = [_PoolBuilder()] + ([_PoolBuilder()] if sliding else [])
         cu_q = [0]
         page_tokens = arena.page_tokens
@@ -1057,9 +1009,6 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                 arena.free_key(key)
             raise
 
-    # the tree path's KV writes as one list of (source, destination)
-    # row pairs: the attention pass scatters them with a single kernel
-    # launch per layer (kv_row_scatter)
     kv_src = kv_dst = None
     if kv_writes or tree_decode:
         src, dst_parts = _Rows(), []
@@ -1094,7 +1043,6 @@ def pack_chunk(torch, arena, groups, timing=None, pinned=True, *,
                        - np.repeat(cum - widths, widths), torch.int64),
             cu_q=stage("canvas_cu_q", np.concatenate([[0], cum]),
                        torch.int32),
-            # the readouts slice canvases by their row offsets on the host
             cu_q_host=np.concatenate([[0], cum]),
             max_q=int(widths.max()))
         if unified is not None:

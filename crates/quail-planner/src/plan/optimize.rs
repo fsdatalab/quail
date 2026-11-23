@@ -1,6 +1,3 @@
-//! Lower and refine every alternative's operators, then select the
-//! cheapest.
-
 use serde_json::{Map, Value};
 
 use crate::context::PlanningContext;
@@ -9,22 +6,11 @@ use crate::operators::Operators;
 use crate::plan::graph::{PhysicalPlan, Planned, plan_region};
 use crate::plan::physical_rules::apply_plan_rules;
 
-/// The selected plan and the index of the alternative it lowers.
 pub struct Selected {
     pub plan: PhysicalPlan,
     pub alternative: usize,
 }
 
-/// Plan each alternative, apply the physical rules, and select the
-/// cheapest, as `search_plan`. Ties go to the earlier alternative. On
-/// several GPUs, the selected plan's `stages` setting holds its stages.
-///
-/// Each alternative is a plan's operators and the rewrites that produced
-/// the plan.
-///
-/// # Errors
-///
-/// A callback fails, or a plan is malformed.
 pub fn search_plan(
     alternatives: &[(Operators, Vec<String>)],
     context: &PlanningContext,

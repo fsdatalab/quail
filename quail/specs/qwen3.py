@@ -12,7 +12,6 @@ from .prompts import (
     QWEN3_TURN_SUFFIX,
 )
 
-# The FP8 layout the executor's DeepGEMM path reads.
 FP8_BLOCK = [128, 128]
 
 
@@ -65,13 +64,12 @@ def qwen3_spec(name: str, hf_name: str, revision: str = "", *,
     num_kv_heads = config["num_key_value_heads"]
     d_head = config.get("head_dim") or hidden // num_q_heads
     intermediate = config["intermediate_size"]
-    per_layer = (hidden * (num_q_heads + 2 * num_kv_heads) * d_head    # qkv_proj
-                 + num_q_heads * d_head * hidden                # o_proj
-                 + 3 * hidden * intermediate            # gate_up, down
-                 + 2 * hidden + 2 * d_head)             # four norms
+    per_layer = (hidden * (num_q_heads + 2 * num_kv_heads) * d_head
+                 + num_q_heads * d_head * hidden
+                 + 3 * hidden * intermediate
+                 + 2 * hidden + 2 * d_head)
     params = float(layers * per_layer + hidden)
     tied_head = bool(config.get("tie_word_embeddings", False))
-    # vLLM keeps the embedding table and output head in bf16
     embedding_bytes = config["vocab_size"] * hidden * 2
     spec = ModelSpec(
         name=name,

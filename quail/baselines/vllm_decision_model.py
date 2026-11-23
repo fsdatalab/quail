@@ -56,6 +56,5 @@ class Qwen3DecisionModel(Decision2ForCausalLM, VllmModelForPooling):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        # the head sits at the package root, beside backbone/
         self.pooler = DecisionPooler(DecisionHead.load(
             torch, F, Path(vllm_config.model_config.model).parent))

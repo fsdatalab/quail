@@ -1,28 +1,3 @@
-//! A filter of [`crate::Derive`]'s demand pass: an extraction whose
-//! answer must contain a literal reads only the documents that contain
-//! it.
-//!
-//! `AI.EXTRACT` copies each answer from its document: an answer is NULL
-//! or a substring of the document `d`. A `LIKE` pattern `x` of an answer
-//! names literal text `s` that every string it matches contains, so a
-//! document without `s` cannot give a passing answer:
-//!
-//! ```text
-//! σ_{a LIKE x}(AI_{extract(d) → a}(R))
-//!     ⇒ σ_{a LIKE x}(AI_{extract(d) → a}(σ_{d ILIKE '%s%'}(R)))
-//! ```
-//!
-//! For example, `WHERE lease.end_date LIKE '%2027%'` extracts end dates
-//! only from the contracts that contain `2027`. The test of the answer
-//! stays: containing `s` does not make the answer match `x`.
-//!
-//! `s` is the longest run of the pattern between its wildcards, then the
-//! longest word of that run: whitespace and case are where a decoded
-//! answer may differ from its document, so the precheck ignores case
-//! (`ILIKE`) and reads no whitespace. The rule rewrites an extraction
-//! node of rows with no fetch whose filter has a term `get_field(a, f)
-//! LIKE x` or `ILIKE x`, not negated, with a literal pattern.
-
 use datafusion::common::ScalarValue;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::expr::Like;
@@ -32,10 +7,6 @@ use datafusion::logical_expr::{Expr, LogicalPlan};
 
 use crate::ai::{AiNode, Semantics};
 
-/// Test each extraction's document for the literal its answer's `LIKE`
-/// needs, as the module explains.
-/// The test of `input`'s documents that an extraction node's filter
-/// implies, as the module explains, when `input` does not test it already.
 pub(crate) fn precheck(node: &AiNode, input: &LogicalPlan) -> Option<Expr> {
     if node.function() != "ai_extract" || node.semantics() != Semantics::Rows {
         return None;
@@ -62,8 +33,6 @@ pub(crate) fn precheck(node: &AiNode, input: &LogicalPlan) -> Option<Expr> {
     (!tests_below(input, &test)).then_some(test)
 }
 
-/// The literal text every answer `term` accepts contains, when `term` is
-/// a `LIKE` of a field of the node's answer.
 fn required_literal(term: &Expr, node: &AiNode) -> Option<String> {
     let Expr::Like(Like {
         negated: false,
@@ -95,7 +64,6 @@ fn required_literal(term: &Expr, node: &AiNode) -> Option<String> {
         .map(ToString::to_string)
 }
 
-/// The runs of literal text between a `LIKE` pattern's wildcards.
 fn literal_runs(pattern: &str, escape: char) -> Vec<String> {
     let mut runs = vec![String::new()];
     let mut chars = pattern.chars();
@@ -114,7 +82,6 @@ fn literal_runs(pattern: &str, escape: char) -> Vec<String> {
     runs
 }
 
-/// `text` as literal text in a `LIKE` pattern escaped with `\`.
 fn escaped(text: &str) -> String {
     let mut found = String::new();
     for character in text.chars() {
@@ -126,9 +93,6 @@ fn escaped(text: &str) -> String {
     found
 }
 
-/// Whether a filter at or below `plan` already makes `test`, read by
-/// column names: DataFusion's `push_down_filter` renames a test's table
-/// as it moves it below a subquery alias.
 fn tests_below(plan: &LogicalPlan, test: &Expr) -> bool {
     let named = |expr: &Expr| unnormalize_col(expr.clone());
     let wanted = named(test);

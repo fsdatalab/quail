@@ -1,40 +1,3 @@
-//! Conditions decided on partial answers.
-//!
-//! While the model writes an answer, the tokens decoded so far, `w`,
-//! limit the complete answers still possible, `C(w)`. A condition `q` of
-//! the answer is decided TRUE at `w` when `q(z)` is TRUE for every `z` in
-//! `C(w)`, and decided not TRUE when `q(z)` is FALSE or NULL for every
-//! `z` in `C(w)`; otherwise it is undecided. Undecided is a state of the
-//! executor, not a NULL.
-//!
-//! [`Completions`] describes `C(w)`: the text so far, whether the answer
-//! may still be NULL, and how it may go on. An `AI.MAP` answer goes on
-//! with any text within its answer limit. An `AI.EXTRACT` answer copies
-//! a span of its document, so it goes on with the text after one of the
-//! places where the document holds the text so far.
-//!
-//! [`decide`] evaluates a condition over `C(w)` instead of over one
-//! value. Each part of the expression has a [`Partial`]: what is known
-//! of its value for every answer in `C(w)`. A literal is one known
-//! value, the answer is a text that starts with the text so far, and a
-//! function gives the `Partial` of its value from the `Partial`s of its
-//! arguments through [`PartialEval`]:
-//!
-//! - `LOWER` and `UPPER` of a text are a text in that letter case;
-//! - `LEFT(a, k)` and `SUBSTR(a, 1, k)` are a text of at most `k`
-//!   characters;
-//! - `LENGTH`, `CHARACTER_LENGTH`, and `CHAR_LENGTH` are a count
-//!   between two bounds;
-//! - `STARTS_WITH`, the comparisons, `LIKE`, `ILIKE`, `IN`, `IS NULL`,
-//!   AND, OR, and NOT give which of TRUE, FALSE, and NULL are possible.
-//!
-//! A function without a [`PartialEval`] may give any value, and parts
-//! are combined one at a time, ignoring that two parts read the same
-//! answer. So a condition this leaves undecided is then evaluated by
-//! DataFusion on each complete answer, when `C(w)` is a short list: a
-//! finished answer, or an extraction with few places left to copy from.
-//! That decides any expression of the answer alone.
-
 use quail_planner::constants::MAX_LISTED;
 use std::sync::{Arc, OnceLock};
 
@@ -48,23 +11,17 @@ use datafusion::prelude::SessionContext;
 use quail_planner::error::CompileError;
 use quail_planner::physical::Expression;
 
-/// The column that holds each listed answer.
 pub(crate) const LISTED: &str = "answer";
 
-/// The schema of a batch of answers: the one column [`LISTED`].
 fn answer_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![Field::new(LISTED, DataType::Utf8, true)]))
 }
 
-/// The session whose functions and type rules plan a test of an answer.
 fn context() -> &'static SessionContext {
     static CONTEXT: OnceLock<SessionContext> = OnceLock::new();
     CONTEXT.get_or_init(SessionContext::new)
 }
 
-/// The least string greater than every string that starts with `text`:
-/// `text` with its last character that has a successor raised by one,
-/// and nothing after it. None when no character has one.
 fn after(text: &str) -> Option<String> {
     let mut characters: Vec<char> = text.chars().collect();
     while let Some(last) = characters.pop() {
@@ -77,36 +34,23 @@ fn after(text: &str) -> Option<String> {
     None
 }
 
-/// What a condition is at a partial answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
-    /// TRUE for every complete answer still possible.
     True,
-    /// FALSE or NULL for every complete answer still possible.
     NotTrue,
-    /// TRUE for some complete answer and not for another.
     Undecided,
 }
 
-/// The complete answers still possible after a partial answer, `C(w)`.
 #[derive(Debug, Clone)]
 pub struct Completions {
-    /// The answer's text so far.
     pub prefix: String,
-    /// Whether the answer is complete: then `C(w)` is the text alone.
     pub complete: bool,
-    /// Whether the answer may still be NULL, as an extraction that may
-    /// still answer that it found nothing.
     pub may_be_null: bool,
-    /// The texts the answer may go on with, each cut anywhere; None for
-    /// any text.
     pub tails: Option<Vec<String>>,
-    /// The most characters the answer may add; None for no limit.
     pub max_chars: Option<usize>,
 }
 
 impl Completions {
-    /// The answers of a model that may write any text after `prefix`.
     pub fn text(prefix: &str) -> Self {
         Self {
             prefix: prefix.to_string(),
@@ -121,7 +65,6 @@ impl Completions {
         text.chars().count()
     }
 
-    /// Whether some answer adds exactly `rest` and possibly more.
     fn can_add(&self, rest: &str) -> bool {
         if rest.is_empty() {
             return true;
@@ -135,7 +78,6 @@ impl Completions {
         }
     }
 
-    /// Whether some answer adds at least one character.
     fn can_grow(&self) -> bool {
         if self.complete || self.max_chars == Some(0) {
             return false;
@@ -146,12 +88,6 @@ impl Completions {
         }
     }
 
-    /// Every complete answer still possible, when they are few: the text
-    /// so far, and the text with each cut of each tail. None when the
-    /// answer may go on with any text, or there are more than
-    /// [`MAX_LISTED`]. An extraction strips the whitespace around its
-    /// span, so the list can hold answers the model cannot give, which
-    /// only delays a decision.
     fn listed(&self) -> Option<Vec<String>> {
         if !self.can_grow() {
             return Some(vec![self.prefix.clone()]);
@@ -172,8 +108,6 @@ impl Completions {
         Some(found.into_iter().collect())
     }
 
-    /// The fewest and the most characters an answer has; None for no
-    /// most.
     fn lengths(&self) -> (usize, Option<usize>) {
         let low = Self::chars(&self.prefix);
         if self.complete {
@@ -193,8 +127,6 @@ impl Completions {
         (low, added.map(|added| low + added))
     }
 
-    /// Which values some answer gives a test of its text: TRUE and FALSE
-    /// from the text, and NULL when the answer may be NULL.
     fn text_test(&self, can_true: bool, can_false: bool) -> Possible {
         Possible {
             t: can_true,
@@ -211,26 +143,18 @@ impl Completions {
         let can_true = literal
             .strip_prefix(prefix.as_str())
             .is_some_and(|rest| self.can_add(rest));
-        // the text so far is an answer that does not start with it
         self.text_test(can_true, true)
     }
 
-    /// Whether an answer holds `literal` somewhere: decided TRUE once the
-    /// text so far holds it, whatever follows.
     fn contains(&self, literal: &str) -> Possible {
         if self.prefix.contains(literal) {
             return self.text_test(true, false);
         }
-        // the text so far is an answer that does not hold it
         self.text_test(self.can_grow(), true)
     }
 
-    /// Whether an answer compares with `literal` as `op` says. Every
-    /// answer sorts from the text so far up to, and not at, the text
-    /// with its last character raised by one.
     fn ordered(&self, op: Operator, literal: &str) -> Possible {
         let least = self.prefix.as_str();
-        // whether some answer is above, or at or above, the literal
         let reaches = |strictly: bool| {
             if !self.can_grow() {
                 return if strictly {
@@ -250,9 +174,6 @@ impl Completions {
         self.text_test(can_true, can_false)
     }
 
-    /// The texts in one letter case, `upper` or lower; None when a text
-    /// is not ASCII, where a letter's case can depend on the letters
-    /// after it.
     fn in_case(&self, upper: bool) -> Option<Self> {
         let ascii =
             self.prefix.is_ascii() && self.tails.iter().flatten().all(|tail| tail.is_ascii());
@@ -269,8 +190,6 @@ impl Completions {
                 .tails
                 .as_ref()
                 .map(|tails| tails.iter().map(fold).collect()),
-            // a letter the answer has yet to add may become two in the
-            // other case, as the German sharp s does
             max_chars: self
                 .max_chars
                 .filter(|_| self.tails.is_some() || !self.can_grow()),
@@ -278,13 +197,11 @@ impl Completions {
         })
     }
 
-    /// The first `count` characters of each answer.
     fn cut(&self, count: i64) -> Self {
         let count = usize::try_from(count).unwrap_or(0);
         let held = Self::chars(&self.prefix);
         let first = |text: &str, count: usize| text.chars().take(count).collect::<String>();
         if count <= held {
-            // every answer starts with the text so far
             return Self {
                 prefix: first(&self.prefix, count),
                 complete: true,
@@ -313,7 +230,6 @@ impl Completions {
     }
 }
 
-/// Which of TRUE, FALSE, and NULL some complete answer gives a condition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Possible {
     t: bool,
@@ -357,23 +273,16 @@ impl Possible {
     }
 }
 
-/// What is known of an expression's value over the complete answers
-/// still possible.
 #[derive(Debug, Clone)]
 pub enum Partial {
-    /// The same value for every answer.
     Known(ScalarValue),
-    /// A text that goes on from a text so far.
     Text(Completions),
-    /// An integer from `low` to `high`, or with no most when None.
     Count {
         low: i64,
         high: Option<i64>,
         may_be_null: bool,
     },
-    /// A test: which of TRUE, FALSE, and NULL some answer gives.
     Truth(Possible),
-    /// Any value.
     Any,
 }
 
@@ -385,7 +294,6 @@ impl Partial {
         }
     }
 
-    /// The value when it is a whole number; a decimal bound is not one.
     fn integer(&self) -> Option<i64> {
         match self {
             Partial::Known(value) if value.data_type().is_integer() => {
@@ -398,8 +306,6 @@ impl Partial {
         }
     }
 
-    /// The value as the type a CAST gives it: a text stays a text only
-    /// as another string type, and a count only as an integer.
     fn cast(self, data_type: &DataType) -> Partial {
         let string = matches!(
             data_type,
@@ -423,7 +329,6 @@ impl Partial {
         }
     }
 
-    /// Which values `IS NULL` gives; None when nothing is known.
     fn is_null(&self) -> Option<Possible> {
         let may_be_null = match self {
             Partial::Known(value) => return Some(Possible::constant(Some(value.is_null()))),
@@ -446,15 +351,10 @@ impl Partial {
     }
 }
 
-/// How a function maps what is known of its arguments to what is known
-/// of its value. A function that implements it is evaluated on a
-/// partial answer; any other gives [`Partial::Any`].
 pub trait PartialEval: Sync {
-    /// The value's `Partial` from the arguments', in order.
     fn partial_eval(&self, args: &[Partial]) -> Partial;
 }
 
-/// `LOWER` or `UPPER`.
 struct LetterCase {
     upper: bool,
 }
@@ -470,8 +370,6 @@ impl PartialEval for LetterCase {
     }
 }
 
-/// The first `count` characters of a text; a negative count cuts from
-/// the end, which is not known.
 fn first_characters(found: &Completions, count: &Partial) -> Partial {
     match count.integer() {
         Some(count) if count >= 0 => Partial::Text(found.cut(count)),
@@ -479,7 +377,6 @@ fn first_characters(found: &Completions, count: &Partial) -> Partial {
     }
 }
 
-/// `LEFT(text, count)`.
 struct Left;
 
 impl PartialEval for Left {
@@ -491,8 +388,6 @@ impl PartialEval for Left {
     }
 }
 
-/// `SUBSTR(text, 1, count)`; a later start drops characters the text so
-/// far may not hold yet.
 struct Substr;
 
 impl PartialEval for Substr {
@@ -506,7 +401,6 @@ impl PartialEval for Substr {
     }
 }
 
-/// `LENGTH`, `CHARACTER_LENGTH`, and `CHAR_LENGTH`.
 struct Length;
 
 impl PartialEval for Length {
@@ -525,7 +419,6 @@ impl PartialEval for Length {
     }
 }
 
-/// `STARTS_WITH(text, literal)`.
 struct StartsWith;
 
 impl PartialEval for StartsWith {
@@ -540,7 +433,6 @@ impl PartialEval for StartsWith {
     }
 }
 
-/// The [`PartialEval`] of a DataFusion function, by its name.
 fn partial_function(name: &str) -> Option<&'static dyn PartialEval> {
     Some(match name {
         "lower" => &LetterCase { upper: false },
@@ -553,7 +445,6 @@ fn partial_function(name: &str) -> Option<&'static dyn PartialEval> {
     })
 }
 
-/// Which values `low..=high op bound` gives.
 fn count_test(low: i64, high: Option<i64>, op: Operator, bound: i64) -> Option<(bool, bool)> {
     let holds = |length: i64| match op {
         Operator::Eq => length == bound,
@@ -589,7 +480,6 @@ fn count_test(low: i64, high: Option<i64>, op: Operator, bound: i64) -> Option<(
     })
 }
 
-/// Which values `left op right` gives.
 fn compare(left: &Partial, op: Operator, right: &Partial) -> Possible {
     match (left, right) {
         (Partial::Text(found), literal) => match (literal.text(), op) {
@@ -625,13 +515,10 @@ fn compare(left: &Partial, op: Operator, right: &Partial) -> Possible {
     }
 }
 
-/// Which values `subject LIKE pattern` gives: a pattern with no
-/// wildcard, one that ends with its one `%`, or one between two `%`.
 fn like(subject: &Partial, pattern: &Partial, case_insensitive: bool) -> Possible {
     let (Partial::Text(found), Some(pattern)) = (subject, pattern.text()) else {
         return ANY;
     };
-    // a backslash escapes the character after it
     if pattern.contains('\\') {
         return ANY;
     }
@@ -653,8 +540,6 @@ fn like(subject: &Partial, pattern: &Partial, case_insensitive: bool) -> Possibl
         (None, Some(at)) if at == pattern.len() - 1 && pattern.ends_with('%') => {
             found.starts_with(&pattern[..at])
         }
-        // any other pattern passes only an answer that starts with the
-        // text before its first wildcard
         (None, Some(at)) => Possible {
             f: true,
             ..found.starts_with(&pattern[..at])
@@ -662,15 +547,12 @@ fn like(subject: &Partial, pattern: &Partial, case_insensitive: bool) -> Possibl
     }
 }
 
-/// Evaluates an expression over the answers in `C(w)`, as the module
-/// explains.
 struct Reader<'a, F: Fn(&Expr) -> bool> {
     is_answer: F,
     answers: &'a Completions,
 }
 
 impl<F: Fn(&Expr) -> bool> Reader<'_, F> {
-    /// What is known of `expr`'s value.
     fn value(&self, expr: &Expr) -> Partial {
         let truth = |expr: &Expr| self.value(expr).truth();
         match expr {
@@ -745,8 +627,6 @@ impl<F: Fn(&Expr) -> bool> Reader<'_, F> {
         }
     }
 
-    /// `expr` reading the answer as the column [`LISTED`]; None when it
-    /// reads any other column.
     fn over_answer(&self, expr: &Expr) -> Option<Expr> {
         let mut other = false;
         let read = expr
@@ -766,10 +646,6 @@ impl<F: Fn(&Expr) -> bool> Reader<'_, F> {
         (!other).then_some(read)
     }
 
-    /// Which values `expr` gives the complete answers still possible,
-    /// each one evaluated by DataFusion; None when the answers are too
-    /// many to list ([`Completions::listed`]), `expr` reads a column that
-    /// is not the answer, or DataFusion does not evaluate it.
     fn evaluated(&self, expr: &Expr) -> Option<Possible> {
         let mut answers: Vec<Option<String>> =
             self.answers.listed()?.into_iter().map(Some).collect();
@@ -805,17 +681,12 @@ impl<F: Fn(&Expr) -> bool> Reader<'_, F> {
     }
 }
 
-/// `expr` at the answers in `answers`, with `is_answer` telling which
-/// column holds the answer.
 pub fn decide_expr(
     expr: &Expr,
     is_answer: impl Fn(&Expr) -> bool,
     answers: &Completions,
 ) -> Decision {
     let reader = Reader { is_answer, answers };
-    // a short list of answers is exact: DataFusion evaluates each one.
-    // Otherwise the parts are combined ignoring that two read one
-    // answer, and a part without a `PartialEval` is any value
     let found = reader
         .evaluated(expr)
         .unwrap_or_else(|| reader.value(expr).truth());
@@ -828,12 +699,6 @@ pub fn decide_expr(
     }
 }
 
-/// `condition`, an [`Expression`], at the answers in `answers`, where
-/// the column named `answer` holds the answer.
-///
-/// # Errors
-///
-/// The expression does not decode.
 pub fn decide(
     condition: &Expression,
     answer: &str,
@@ -884,7 +749,6 @@ mod tests {
         let equals = lower(col("a")).eq(lit("acme"));
         assert_eq!(at(&equals, &text("B")), Decision::NotTrue);
         assert_eq!(at(&equals, &text("AC")), Decision::Undecided);
-        // a letter outside ASCII may change case with what follows it
         assert_eq!(at(&starts, &text("Σ")), Decision::Undecided);
     }
 
@@ -917,7 +781,6 @@ mod tests {
         let test = col("a").eq(lit("yes"));
         assert_eq!(at(&test, &text("no")), Decision::NotTrue);
         assert_eq!(at(&test, &text("ye")), Decision::Undecided);
-        // the answer may still go on past the literal
         assert_eq!(at(&test, &text("yes")), Decision::Undecided);
         let complete = Completions {
             complete: true,
@@ -938,7 +801,6 @@ mod tests {
         assert_eq!(at(&col("a").is_not_null(), &found), Decision::Undecided);
         assert_eq!(at(&col("a").is_not_null(), &text("x")), Decision::True);
         assert_eq!(at(&col("a").is_null(), &text("x")), Decision::NotTrue);
-        // a prefix test of a NULL answer is NULL, so not TRUE
         let test = col("a").like(lit("Mar%"));
         let null_or_mar = Completions {
             may_be_null: true,
@@ -981,7 +843,6 @@ mod tests {
     #[test]
     fn datafusion_decides_any_test_of_a_short_list_of_answers() {
         use datafusion::prelude::upper;
-        // a finished answer is one answer
         let done = Completions {
             complete: true,
             ..text("yes, kind")
@@ -989,7 +850,6 @@ mod tests {
         let loud = upper(col("a")).eq(lit("YES, KIND"));
         assert_eq!(at(&loud, &done), Decision::True);
         assert_eq!(at(&loud, &text("yes")), Decision::Undecided);
-        // a span that can only go on as "2027." never holds "2026"
         let copied = Completions {
             tails: Some(vec!["27.".into()]),
             ..text("20")
@@ -998,27 +858,22 @@ mod tests {
         assert_eq!(at(&holds("2026"), &copied), Decision::NotTrue);
         assert_eq!(at(&holds("2027"), &copied), Decision::Undecided);
         assert_eq!(at(&holds("20"), &copied), Decision::True);
-        // an answer that may be NULL is not certainly TRUE
         let nullable = Completions {
             may_be_null: true,
             ..copied.clone()
         };
         assert_eq!(at(&holds("20"), &nullable), Decision::Undecided);
-        // two parts that read the one answer are decided together
         let either = col("a").like(lit("%7%")).or(col("a").not_like(lit("%7%")));
         assert_eq!(at(&either, &copied), Decision::True);
     }
 
     #[test]
     fn a_range_of_strings_decides_a_comparison_of_open_ended_text() {
-        // every answer that starts with "N" sorts after "Mz" and before "O"
         let before = col("a").lt(lit("Mz"));
         assert_eq!(at(&before, &text("N")), Decision::NotTrue);
         assert_eq!(at(&col("a").gt(lit("Mz")), &text("N")), Decision::True);
         assert_eq!(at(&before, &text("M")), Decision::Undecided);
-        // a NOT is read as the comparison it negates
         assert_eq!(at(&!before.clone(), &text("N")), Decision::True);
-        // an answer that may be NULL is not certainly TRUE
         let nullable = Completions {
             may_be_null: true,
             ..text("N")
@@ -1036,11 +891,9 @@ mod tests {
             .and(col("a").is_not_null());
         assert_eq!(at(&test, &text("Jan")), Decision::NotTrue);
         assert_eq!(at(&test, &text("Apr 1")), Decision::True);
-        // a part that reads another column may be anything
         let mixed = col("a").like(lit("Mar%")).and(col("b"));
         assert_eq!(at(&mixed, &text("Mar")), Decision::Undecided);
         assert_eq!(at(&mixed, &text("Jan")), Decision::NotTrue);
-        // a pattern with a wildcard inside is read by its literal start
         let other = col("a").like(lit("M_r%"));
         assert_eq!(at(&other, &text("Jan")), Decision::NotTrue);
         assert_eq!(at(&other, &text("Mar")), Decision::Undecided);
@@ -1052,25 +905,18 @@ mod tests {
         use datafusion::functions::string::expr_fn::upper;
         use datafusion::functions::unicode::expr_fn::{left, substr};
         use datafusion::logical_expr::cast;
-        // a backslash escapes the wildcard after it
         let escaped = col("a").like(lit("a\\%"));
         assert_eq!(at(&escaped, &text("a%")), Decision::Undecided);
-        // a cast answer is no longer the text
         let number = cast(col("a"), DataType::Int32).eq(lit(5));
         assert_eq!(at(&number, &text("0")), Decision::Undecided);
-        // no characters are the empty text, whatever the answer
         let none = left(col("a"), lit(0)).eq(lit(""));
         assert_eq!(at(&none, &text("x")), Decision::True);
-        // a negative count cuts from the end, and a later start skips
-        // characters the answer may not hold yet
         let end = left(col("a"), lit(-1)).eq(lit("x"));
         assert_eq!(at(&end, &text("x")), Decision::Undecided);
         let rest = substr(col("a"), lit(2)).eq(lit(""));
         assert_eq!(at(&rest, &text("I")), Decision::Undecided);
-        // a decimal bound is no count of characters
         let half = character_length(col("a")).lt(lit(2.5));
         assert_eq!(at(&half, &text("ab")), Decision::Undecided);
-        // one letter yet to come may be two in the other case
         let sharp = upper(col("a")).eq(lit("SS"));
         let one = Completions {
             max_chars: Some(1),

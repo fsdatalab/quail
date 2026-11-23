@@ -1,42 +1,3 @@
-//! The columns and fields an `AiNode` returns, which [`crate::Derive`]'s
-//! demand pass decides: an `AiNode` returns only the added columns the
-//! plan above reads, and an extraction asks only the fields it reads.
-//!
-//! An `AiNode`'s projection `P` names the added columns it returns. A
-//! projection `Q` above the node that reads only some of them needs only
-//! those:
-//!
-//! ```text
-//! π_Q(AI(R; P)) ⇒ π_Q(AI(R; P = Q[P]))
-//! ```
-//!
-//! `Q[P]` is the columns of `P` that `Q` reads. For example, a SELECT
-//! list over a FROM subquery that returns an extraction reads the
-//! extraction's answer but not its spans: the node then returns the
-//! answer alone. The node always returns its answer: a column node's
-//! answer is the reason the model is asked. The node's filter and tests
-//! still read every added column, as `P` applies after them.
-//!
-//! An `AI.EXTRACT` asks one question per field of its answer `a`, each
-//! in a prompt of its own, so leaving out a field changes no other
-//! field's answer. When every use of `a` and its spans in the plan reads
-//! named fields, `a.f` or `a_span.f`, the call asks only those fields:
-//!
-//! ```text
-//! π_{a.f}(AI_{extract(d, {f, g}) → a}(R)) ⇒ π_{a.f}(AI_{extract(d, {f}) → a}(R))
-//! ```
-//!
-//! A use is any expression of any operator above, the node's own filter
-//! and tests included, followed through projections that pass the column
-//! on or rename it. A use that reads `a` whole, such as `SELECT a`, a
-//! comparison of `a`, or the query's own result columns, keeps every
-//! field; so does an operator whose columns the rule does not follow by
-//! name, such as a `UNION` or an `UNNEST`.
-//!
-//! DataFusion's `OptimizeProjections` prunes the columns a node reads
-//! from its input (`AiNode::necessary_children_exprs`), but not the
-//! columns the node adds or the fields of a struct column.
-
 use std::sync::Arc;
 
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
@@ -48,8 +9,6 @@ use crate::ai::AiNode;
 use crate::functions::options::unfolded;
 use crate::plan::{as_node, extension_node};
 
-/// The field names of an unfolded extraction call's questions argument,
-/// in order; None when it is not a `named_struct` of named fields.
 pub(crate) fn question_fields(call: &Expr) -> Option<Vec<String>> {
     let Expr::ScalarFunction(found) = call else {
         return None;
@@ -70,7 +29,6 @@ pub(crate) fn question_fields(call: &Expr) -> Option<Vec<String>> {
         .collect()
 }
 
-/// An unfolded extraction call asking only the questions at `kept`.
 pub(crate) fn with_fields(call: &Expr, kept: &[usize]) -> Expr {
     let Expr::ScalarFunction(found) = call else {
         unreachable!("an extraction call")
@@ -87,9 +45,6 @@ pub(crate) fn with_fields(call: &Expr, kept: &[usize]) -> Expr {
     Expr::ScalarFunction(ScalarFunction::new_udf(Arc::clone(&found.func), args))
 }
 
-/// `plan` with each AI call `old`, an unfolded call, as `new` in every
-/// `AiNode`, an extraction's spans call of the same arguments included,
-/// and each node that makes `new` adding the columns of its types.
 pub(crate) fn replace_call(plan: LogicalPlan, old: &Expr, new: &Expr) -> Result<LogicalPlan> {
     let (Expr::ScalarFunction(old), Expr::ScalarFunction(new)) = (old, new) else {
         return internal_err!("an AI call is a function call");

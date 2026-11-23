@@ -53,13 +53,10 @@ class Deduplicated:
         """
         current = dict(self.every)
         expanded = {}
-        # node id, port name -> the expanded output of an earlier member
         earlier_outputs = {}
         for node in self.nodes:
             result = results[node.node_id]
             pairs = self._pairs_read(node, earlier_outputs)
-            # every port stands for the documents the node read, before
-            # its survivors become what the next node reads
             read = dict(current)
             outputs = {}
             ports = sorted(node.outputs,
@@ -79,7 +76,6 @@ class Deduplicated:
                 elif port.value_type is ValueType.FILTER_ANSWERS:
                     outputs[port.name] = _expanded(value, aliases, read, keys, None)
                 elif isinstance(node, AiJoin):
-                    # an AI join's anchor rows come from its expanded answers
                     joined = next(table for table in outputs.values()
                                   if isinstance(table, pa.Table))
                     (anchor,) = aliases
@@ -163,7 +159,6 @@ class Deduplicated:
             if alias in self.keys:
                 keys[alias] = self.keys[alias]
                 continue
-            # cover every id the answers or the pairs can name
             known = [self.every.get(alias, np.zeros(0, dtype=np.int64))]
             if pairs is not None and alias in pairs.column_names:
                 known.append(pairs.column(alias).to_numpy())
@@ -199,8 +194,6 @@ class Deduplicated:
             return value.aliases
         if port.value_type is ValueType.ROWS:
             return (port.name.split(":", 1)[1],)
-        # a model operator's answers cover its anchor and partner; a
-        # condition's cover the tables it tests
         if isinstance(node, AiJoin):
             return (node.anchor, *node.partners)
         if isinstance(node, AiFilter):
@@ -237,8 +230,6 @@ def deduplicate(graph, nodes, inputs, context) -> Deduplicated | None:
     reduced = {node.node_id: dict(inputs.get(node.node_id, {})) for node in nodes}
     outside = [(node, port) for node in nodes for port in node.inputs
                if port.source.node_id not in inside]
-    # the rows ports say which documents the group read; a pair input
-    # read beside them is filtered to those documents when expanded
     for node, port in sorted(outside, key=lambda item: _is_pairs(
             item[1], inputs[item[0].node_id][item[1].name])):
         value = inputs[node.node_id][port.name]
@@ -246,8 +237,6 @@ def deduplicate(graph, nodes, inputs, context) -> Deduplicated | None:
             aliases = (value.aliases if isinstance(value, Rows)
                        else tuple(value.column_names))
             table = value.table() if isinstance(value, Rows) else value
-            # a pair input may carry only its two id columns: other
-            # values could differ between copies
             if len(aliases) != 2 or table.num_columns != 2:
                 return None
             _read_pairs(context, aliases, table, keys, every, pairs, node,

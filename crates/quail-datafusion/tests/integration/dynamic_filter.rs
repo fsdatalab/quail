@@ -1,20 +1,3 @@
-//! Dynamic join filters around a model region's rows.
-//!
-//! A hash join sends the keys of its build side to its probe side as a
-//! dynamic filter, which an operator there, such as a sort, applies to
-//! the rows it reads. DataFusion 55.2 moves the filter into a child
-//! by column name (`FilterRemapper::try_remap` in
-//! `datafusion-physical-plan` `filter_pushdown.rs`, which a hash join
-//! calls from `gather_filters_for_pushdown`). When the child has two
-//! columns of one name, the filter reads the first, whichever column
-//! the join reads. A model region over two tables returns two id
-//! columns of one name, such as `r.id` and `p.id`, so it takes no
-//! dynamic filter that reads either (`ModelRegionExec`).
-//!
-//! The first test reproduces the bug with DataFusion's operators alone.
-//! It fails once DataFusion maps the columns by position; the region
-//! can then take those filters.
-
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
@@ -72,7 +55,6 @@ fn inner_join(
 
 #[tokio::test]
 async fn datafusion_filters_the_first_of_two_columns_of_one_name() -> Result<()> {
-    // each row pairs a review id with a product id, under one name
     let pairs = text_batch(&["id", "id"], &[&["r0", "r2"], &["p0", "p1"]])?;
     let pairs = MemorySourceConfig::try_new_exec(&[vec![pairs.clone()]], pairs.schema(), None)?;
     let ordering = LexOrdering::new(vec![PhysicalSortExpr::new_default(Arc::new(Column::new(
@@ -86,8 +68,6 @@ async fn datafusion_filters_the_first_of_two_columns_of_one_name() -> Result<()>
     let products = text_batch(&["k"], &[&["p0", "p1"]])?;
     let products =
         MemorySourceConfig::try_new_exec(&[vec![products.clone()]], products.schema(), None)?;
-    // the review join's output is k, id, id; the product join reads the
-    // second id, the product's
     let by_review = inner_join(reviews, sorted, (Column::new("k", 0), Column::new("id", 0)))?;
     let by_product = inner_join(
         products,
@@ -98,7 +78,6 @@ async fn datafusion_filters_the_first_of_two_columns_of_one_name() -> Result<()>
         FilterPushdown::new_post_optimization().optimize(by_product, &ConfigOptions::default())?;
     let batches = collect(Arc::clone(&plan), SessionContext::new().task_ctx()).await?;
     let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-    // both pairs match; the product filter tests the review ids instead
     assert_eq!(
         rows,
         0,
@@ -112,8 +91,6 @@ fn int_array(values: &[i64]) -> Arc<dyn Array> {
     Arc::new(Int64Array::from(values.to_vec()))
 }
 
-/// Stands in for Quail's executor: the model keeps the pairs of reviews
-/// r0 and r2 with every product, or reviews r0 and r2 alone.
 #[derive(Debug)]
 struct KeepsTwoReviews;
 
@@ -194,7 +171,6 @@ async fn context(settings: &[&str]) -> Result<SessionContext> {
     Ok(context)
 }
 
-/// The plan of `query` and its rows, each as text.
 async fn run(context: &SessionContext, query: &str) -> Result<(Arc<dyn ExecutionPlan>, String)> {
     let plan = context.sql(query).await?.create_physical_plan().await?;
     let batches = collect(Arc::clone(&plan), context.task_ctx()).await?;
@@ -241,10 +217,7 @@ async fn a_join_with_a_plain_table_filters_the_regions_rows_by_the_tables_keys()
     )
     .await?;
     let text = displayable(plan.as_ref()).indent(true).to_string();
-    // the sort below the join applies the tags' product ids to the
-    // region's rows
     assert!(text.contains("FilterExec: DynamicFilter"), "{text}");
-    // the region has two columns named id, so it does not take the test
     assert!(!text.contains("hint=["), "{text}");
     eprintln!("{text}");
     let expected = [

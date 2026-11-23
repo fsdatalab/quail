@@ -43,7 +43,6 @@ def release_models(state: dict) -> None:
         state[key].close()
         del state[key]
     _release_vllm_parallel_state()
-    # the released engines' objects may be frozen
     gc.unfreeze()
     gc.collect()
     if initialized:

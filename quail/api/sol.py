@@ -46,21 +46,13 @@ from quail.physical import decode_plan_value
 from quail.physical.lowering import Vocabulary
 from quail.specs import DeviceSpec, ModelSpec
 
-# answer(prompt, assignment) -> bool, where assignment maps each alias
-# in the prompt to a row index of that alias's corpus table; for an
-# AI.EXTRACT prompt, the reference answer text, or None for no answer;
-# for an AI.MAP prompt, the answer the map writes
 AnswerOracle = Callable[[object, Mapping[str, int]], object]
-# label(prompt, assignment) -> str, the reference label of an
-# AI.CLASSIFY prompt for one row assignment
 LabelOracle = Callable[[object, Mapping[str, int]], str]
 
-# the operators of one alias, as the stage records name them
 FILTER = "AI.IF"
 CLASSIFY = "AI.CLASSIFY"
 EXTRACT = "AI.EXTRACT"
 
-# the exceptions a refused estimate raises, by the name Rust gives
 _ERRORS = {"NotImplementedError": NotImplementedError, "ValueError": ValueError}
 
 
@@ -418,7 +410,6 @@ def speed_of_light_estimate(
     try:
         inputs = _estimate_inputs(query, stores, chunk, credit_shared_prefixes)
     except (NotImplementedError, ValueError):
-        # an operator the estimate cannot price; Rust names it
         inputs = {"aliases": [], "stop_groups": {}, "allowed_pairs": {},
                   "order": query.order, "credit_shared": credit_shared_prefixes,
                   "chunk_tokens": chunk}

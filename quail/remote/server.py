@@ -12,7 +12,6 @@ def main() -> None:
     except ValueError as error:
         sys.exit(str(error))
     except KeyboardInterrupt:
-        # Python also saw the Ctrl-C that stopped the server
         pass
 
 

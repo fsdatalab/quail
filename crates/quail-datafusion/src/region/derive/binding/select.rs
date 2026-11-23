@@ -1,6 +1,3 @@
-//! Bind SELECT items to output columns and extraction structs.
-//! Check output names and reject a model result returned twice.
-
 use super::{Binder, contains, unsupported};
 use crate::functions::{ai_function_name, function_name};
 use datafusion::logical_expr::Expr;
@@ -9,17 +6,10 @@ use quail_planner::error::CompileError;
 use quail_planner::expressions::{aliased_call, call_aliases, column_name, repr_list, repr_str};
 use quail_planner::physical::{Alias, ExtractStruct, ValueExpression};
 
-/// The name a SELECT list item returns its column by.
 pub(crate) fn output_name(expr: &Expr) -> String {
     expr.qualified_name().1
 }
 
-/// An expression without the AS names on it, and the name the query
-/// wrote for it.
-///
-/// DataFusion names `COUNT(*)` itself, as `count(Int64(1)) AS count(*)`,
-/// and a call written by a dotted name, as `ai_map(...) AS AI.MAP(...)`;
-/// those names are not ones the query wrote.
 fn unalias(expr: &Expr) -> (&Expr, Option<&str>) {
     let mut names = Vec::new();
     let mut node = expr;
@@ -50,13 +40,10 @@ fn unalias(expr: &Expr) -> (&Expr, Option<&str>) {
     )
 }
 
-/// A bound SELECT list.
 pub(crate) struct Selected {
     pub(crate) columns: Vec<ValueExpression>,
     pub(crate) structs: Vec<ExtractStruct>,
-    /// The structs whose spans the SELECT list returns.
     pub(crate) spans: Vec<String>,
-    /// The output column names, in SELECT order.
     pub(crate) output: Vec<String>,
 }
 
@@ -114,11 +101,6 @@ impl Binder {
         Ok(())
     }
 
-    /// Bind a SELECT list.
-    ///
-    /// # Errors
-    ///
-    /// An item does not bind, or two output columns share a name.
     pub(crate) fn bind_select(&mut self, projection: &[Expr]) -> Result<Selected, CompileError> {
         let mut selected = Selected {
             columns: Vec::new(),
@@ -126,8 +108,6 @@ impl Binder {
             spans: Vec::new(),
             output: Vec::new(),
         };
-        // (struct name, answer) of each extraction returned, then of
-        // each span
         let mut extracts: Vec<(String, String)> = Vec::new();
         let mut spans: Vec<(String, String)> = Vec::new();
         for item in projection {
@@ -178,9 +158,6 @@ impl Binder {
         Ok(selected)
     }
 
-    /// Bind one SELECT item, returned as `name`: an answer column as its
-    /// model call, an extraction as its fields' calls, and any other
-    /// value as itself.
     fn bind_select_item(
         &mut self,
         node: &Expr,
@@ -241,7 +218,6 @@ impl Binder {
         }
         let read = self.answer_refs(node)?;
         let value = self.bind_value(&read)?;
-        // an AI filter's answer leaves the region under its own name
         let renamed = aliased || read != *node && column_name(&value, true) != name;
         Ok(vec![if renamed { named(value) } else { value }])
     }

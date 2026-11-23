@@ -1,6 +1,3 @@
-//! What filter ordering and join search price: each AI.IF predicate's
-//! cost and each join's token counts.
-
 use std::collections::BTreeMap;
 
 use crate::budgets::parallel_copies;
@@ -20,14 +17,10 @@ use crate::pricing::columns::{ColumnSpec, column_spec};
 use crate::pricing::scores::{prompt_aliases, score_statistics};
 use crate::prompts::lowering::LoweredPrompt;
 
-/// A step's work as a function of the documents it reads.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StepCost {
-    /// Work per document.
     PerDocument(Box<Work>),
-    /// A score's own estimate at each count.
     Score(Box<ScoreCost>),
-    /// A column operator's planner prices it.
     Column {
         column: Box<SemanticColumn>,
         resident: bool,
@@ -35,12 +28,6 @@ pub enum StepCost {
 }
 
 impl StepCost {
-    /// One model copy's work over `rows` documents, or None when the
-    /// model cannot run the step.
-    ///
-    /// # Errors
-    ///
-    /// The tokenizer fails, or the model cannot run a column operator.
     pub fn work(&self, context: &PlanningContext, rows: f64) -> Result<Option<Work>, CompileError> {
         let work = match self {
             StepCost::PerDocument(work) => return Ok(Some(&**work * rows)),
@@ -56,19 +43,12 @@ impl StepCost {
     }
 }
 
-/// A column operator's work over `rows` documents, or None when the
-/// model cannot run it.
-///
-/// # Errors
-///
-/// The tokenizer fails, or the model cannot run the operator.
 fn column_work(
     context: &PlanningContext,
     column: &SemanticColumn,
     resident: bool,
     rows: f64,
 ) -> Result<Option<Work>, CompileError> {
-    // a guarded operator asks the model about its guard's rows alone
     let rows = rows * column.asked_fraction();
     if column.call.kind == "label" {
         return classify_work(
@@ -88,23 +68,14 @@ fn column_work(
     Ok(Some(Work::from_values(&values)))
 }
 
-/// One predicate's costs, and the score result a later predicate may reuse.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PredicateCost {
     pub selectivity: f64,
-    /// Its work when the predicate reads its documents first.
     pub first: StepCost,
-    /// Its work when an earlier predicate already read them.
     pub later: StepCost,
-    /// The score prompt whose result the predicate reuses, or None.
     pub reuse_key: Option<Prompt>,
 }
 
-/// Token count of a prompt's per-evaluation tail, as `question_tokens`.
-///
-/// # Errors
-///
-/// The prompt is a score's, which has no question tail.
 pub fn question_tokens(lowered: &LoweredPrompt, canvas: i64) -> Result<i64, CompileError> {
     if lowered.prompt.kind == "score" {
         return compile_error("a score prompt has no question tail");
@@ -112,11 +83,6 @@ pub fn question_tokens(lowered: &LoweredPrompt, canvas: i64) -> Result<i64, Comp
     Ok(lowered.tail_token_ids.len() as i64 + canvas)
 }
 
-/// Each predicate's costs for ordering one table's filters.
-///
-/// # Errors
-///
-/// The tokenizer fails, or the arena does not fit the device.
 pub fn prepare_filter_costs(
     predicates: &[FilterPredicate],
     mean_tokens: f64,
@@ -134,7 +100,6 @@ pub fn prepare_filter_costs(
             (curve.clone(), curve, Some((*call.prompt).clone()))
         } else {
             let question = question_tokens(&context.lowered(&call.prompt)?, model.canvas_tokens)?;
-            // a guarded filter asks the model about its guard's rows alone
             let asked = crate::operators::predicate_asked_fraction(predicate);
             let cost = |fresh: bool| {
                 StepCost::PerDocument(Box::new(
@@ -162,15 +127,6 @@ fn priced_key(condition: &Equality) -> (String, String, String, String) {
     )
 }
 
-/// The joins as the cost model prices them, in written order.
-///
-/// `pair_fractions` maps a written position to the fraction of the
-/// cross product its equality conditions and filter keep; `canvas` is the rows a
-/// diffusion model appends to every pair.
-///
-/// # Errors
-///
-/// The tokenizer fails, or the arena does not fit the device.
 pub fn join_specs(
     joins: &[SemanticJoin],
     pair_fractions: &BTreeMap<usize, f64>,

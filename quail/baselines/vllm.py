@@ -18,8 +18,6 @@ from quail.specs.base import DeviceSpec, ModelSpec
 from quail.specs.files import resolve_model_path
 
 GPU_MEMORY_UTILIZATION = 0.91
-# -1 tells vLLM to keep the model's context length when the
-# leftover KV holds it, and otherwise the longest length that fits.
 MAX_MODEL_LEN = -1
 
 
@@ -50,17 +48,9 @@ def gpu_memory_utilization(device: DeviceSpec | None,
     return min(GPU_MEMORY_UTILIZATION, reserved)
 
 
-# vLLM caps a diffusion model at 8 sequences per step whenever the
-# setting is 128 or more, sized for its 256-row canvas; one row needs
-# no cap, so stay just under the trigger.
 DIFFUSION_SEQUENCES = 127
-# DiffusionGemma ignores logprob_token_ids in vLLM 0.26. Request the full
-# vocabulary so TRUE/FALSE scores are returned regardless of their ranks.
 DIFFUSION_LOGPROBS = -1
-# generated tokens a longer canvas gets; the answer word is read
-# from the text
 DIFFUSION_TEXT_TOKENS = 16
-# draft tokens of the n-gram baseline, as in vLLM's documented example
 NGRAM_SPECULATIVE_TOKENS = 5
 
 
@@ -108,15 +98,8 @@ def engine_environment(spec):
     from vllm import envs
 
     settings = {}
-    # vLLM 0.26 reads process selection from the environment in LLM's
-    # constructor, and caches what it read; its public LLM API has no
-    # per-instance override
     if spec.vision_tower or spec.canvas_tokens == 1:
         settings["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-    # an engine that takes images feeds embeddings, not token ids: a
-    # compiled graph saved for text alone loads and then fails, so it
-    # keeps its own cache. vLLM 0.29's V2 model runner fails in a Gated
-    # DeltaNet kernel while it captures such an engine's graphs
     if spec.vision_tower and os.environ.get("QUAIL_VLLM_IMAGES"):
         root = os.environ.get("VLLM_CACHE_ROOT",
                               os.path.expanduser("~/.cache/vllm"))
@@ -161,8 +144,6 @@ def diffusion_canvas(spec):
                 raise ValueError("vLLM canvas geometry differs from the model spec")
             self.canvas[slots] = tokens[0]
 
-    # vLLM 0.26 has no public canvas-input setting. Instances retain this
-    # subclass after construction; later engines see the original class.
     diffusion_gemma.DiffusionGemmaRequestStates = FixedCanvasStates
     try:
         yield tokens
@@ -202,7 +183,6 @@ def diffusion_kwargs(spec) -> dict:
     kwargs = {"diffusion_config": diffusion}
     if spec.canvas_tokens == 1:
         diffusion["max_denoising_steps"] = 1
-        # vLLM refuses a request for more logprobs than this
         kwargs["max_logprobs"] = DIFFUSION_LOGPROBS
     return kwargs
 
@@ -245,7 +225,6 @@ class VLLMClient:
     def __init__(self, llm, capacity: dict):
         self.llm = llm
         self.capacity = capacity
-        # the running region's ImagePrompts, when its documents are images
         self.images = None
 
     def _prompt(self, prompt):
@@ -330,14 +309,10 @@ class VLLMEngine:
 
     kind = "vllm"
     label = "vLLM"
-    # prompts are rendered as text and tokenized by vLLM
     reads_document_text = True
     runtime_package = "vllm==0.29.0"
-    # a request can decode an answer as text
     scores_labels = True
-    # a request returns the logprobs a canvas model's answer is read from
     reads_logprobs = True
-    # a decision model runs on the pooling runner
     roles = frozenset({"generative", "decision"})
 
     def llm_kwargs(self, spec, device: DeviceSpec | None = None) -> dict:
@@ -396,8 +371,6 @@ class VLLMEngine:
             device: Device used to calculate the memory reserve.
             resources: Owns the engine; closing it stops the engine.
         """
-        # a session tokenizes on background threads before the engine
-        # starts, and a forked worker would inherit their locks
         os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
         if spec.role == "decision":
             from quail.baselines.vllm_decision import boot_decision
@@ -494,7 +467,6 @@ def speculative_config(value: str) -> dict:
     if method != "ngram" or not tokens.isdigit() or int(tokens) < 1:
         raise ValueError(
             f"QUAIL_VLLM_SPECULATIVE={value!r} is not ngram:<tokens>")
-    # the lookup length is vLLM's documented example
     return {"method": "ngram", "num_speculative_tokens": int(tokens),
             "prompt_lookup_max": 4}
 

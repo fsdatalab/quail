@@ -54,7 +54,6 @@ class JoinOperator(ModelOperator):
     """
 
     combine = True
-    # the operator decides each settled anchor's KV
     settles_kv = True
 
     @classmethod
@@ -98,7 +97,7 @@ class JoinOperator(ModelOperator):
         self.settled = np.zeros(len(ids), dtype=bool)
         self.final_rows = [None] * len(ids)
         self.readers = []
-        self.finished = []      # finished rows since the last take
+        self.finished = []
         lists_for = inputs.get("anchor_partners")
         self.stages = [
             Stage(suffixes=suffixes, readout=state.async_answers, frame=frame,
@@ -207,7 +206,6 @@ class JoinOperator(ModelOperator):
             matched = [anchor_ids[int(local)] for local in sorted(rows)
                        if any(rows[local])]
             survivors = matched
-            # Anchors with no candidates never launch a request.
             if member.semantics == "anti":
                 candidates = np.asarray(
                     anchor_ids if j == 0 else id_positions(results[
@@ -246,8 +244,6 @@ class JoinOperator(ModelOperator):
                     }))
         self._results = results
         if self.context is not None:
-            # the first predicate's hits count the anchors that reached
-            # the group on resident KV
             first = nodes[0]
             self.context.model_result(first, results[first.node_id], self.context)
         return results
@@ -448,7 +444,6 @@ def set_joins(state, join) -> dict:
                     (np.asarray(margins, dtype=float) > 0).tolist())
         every.append(rows)
         own_tokens.append(passes.tokens)
-        # one run per join: its stage 0 is the group's stage j
         all_spans += [({j: by_stage.get(0, 0)}, chunk, start, end)
                       for by_stage, chunk, start, end in passes.spans]
         reached = [anchor for anchor in sorted(rows) if any(rows[anchor])]
@@ -575,7 +570,6 @@ def partner_list_builder(group, tuples_by_stage, maps):
             return None
         rows, members, cache = entry
         if cache is None:
-            # Per-batch apply results can arrive after the lookup is constructed.
             return allowed_members(rows, members, anchor)
         position = np.searchsorted(rows.keys, anchor)
         if position == len(rows.keys) or rows.keys[position] != anchor:
@@ -632,20 +626,19 @@ def prepare_join_inputs(nodes, inputs, context: ExecutionContext,
     state = context.state
     node = nodes[0]
     by_alias = {}
-    port_pairs = {}        # written position -> pair table from a port
+    port_pairs = {}
     for member, input_port in ((member, port) for member in nodes
                                for port in member.inputs):
         values = inputs[member.node_id]
         port = input_port.source.port
         if input_port.name not in values:
-            continue           # fed by the upstream itself
+            continue
         value = values[input_port.name]
         if port.startswith("pairs:"):
             port_pairs[int(port.split(":", 1)[1])] = value
             continue
         if not port.startswith("rows:"):
             continue
-        # the suffix and partner builders index these as Python ints
         by_alias[port.split(":", 1)[1]] = id_positions(value).tolist()
     if not state["joins_started"]:
         state["joins_started"] = True

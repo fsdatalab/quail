@@ -1,39 +1,22 @@
-//! Model work of a join at given row counts and KV residency.
-
 use std::collections::BTreeMap;
 
 use crate::cost::statistics::{AliasStats, int_true_divide};
 use crate::cost::work::{Quantity, python_sum};
 use crate::cost::work::{Work, triangle};
 
-/// One join with the token counts the cost model prices it by.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PricedJoin {
-    /// The join's position among the query's joins.
     pub written_position: usize,
-    /// The join's tables in placeholder order.
     pub aliases: Vec<String>,
-    /// The table whose document KV the join reuses, or None when the
-    /// search chooses it.
     pub anchor: Option<String>,
-    /// Whether the search may choose the anchor.
     pub anchor_free: bool,
-    /// "full" for a join returning pairs, else the gate's kind.
     pub semantics: String,
-    /// The fraction of pairs expected to pass, or None.
     pub selectivity: Option<f64>,
-    /// Equality conditions: (left alias, left column, right alias, right column).
     pub on: Vec<(String, String, String, String)>,
-    /// The fraction of the cross product the equality conditions keep.
     pub pair_fraction: f64,
-    /// A score join's own pricing; None for a join the model answers.
     pub score: Option<crate::cost::score::ScoreCost>,
-    /// alias -> tokens of the frame after that alias's document when it
-    /// anchors.
     pub frame_tokens: BTreeMap<String, i64>,
-    /// alias -> tokens of its label block.
     pub label_tokens: BTreeMap<String, i64>,
-    /// Tokens of the question tail after every pair.
     pub tail_tokens: i64,
 }
 
@@ -49,9 +32,6 @@ fn scalar(value: f64) -> Quantity {
     Quantity::Scalar(value)
 }
 
-/// The tokens of the longest input one join orientation makes.
-///
-/// `partners` holds each partner's label tokens and longest document.
 pub fn longest_join_input(
     pre: i64,
     anchor_max: i64,
@@ -68,7 +48,6 @@ pub fn longest_join_input(
             .sum::<i64>()
 }
 
-/// Work of streaming every partner suffix past one resident anchor.
 pub fn partner_stream_work(anchor_prefix: f64, suffixes: &[f64], window: i64) -> Work {
     let tokens = python_sum(suffixes.iter().copied());
     let sliding_pairs = if window == 0 {
@@ -105,11 +84,6 @@ fn check_window(stats: &AliasStats, window: i64) -> Result<(), String> {
     Ok(())
 }
 
-/// Expected work of one join stage at the current live counts.
-///
-/// # Errors
-///
-/// The anchor's length summary uses another attention window.
 #[allow(clippy::too_many_arguments)]
 pub fn stage_work(
     spec: &PricedJoin,
@@ -209,11 +183,6 @@ pub fn stage_work(
     Ok(&(&start + &stream) * fraction)
 }
 
-/// Expected work of one join under set attention.
-///
-/// # Errors
-///
-/// The anchor's length summary uses another attention window.
 #[allow(clippy::too_many_arguments)]
 pub fn packed_join_work(
     spec: &PricedJoin,

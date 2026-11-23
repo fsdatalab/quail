@@ -1,5 +1,3 @@
-//! Work and time of an `AI.SCORE` call.
-
 use crate::budgets::parallel_copies;
 use crate::cost::sol::speed_of_light;
 use crate::cost::statistics::AliasStats;
@@ -7,17 +5,14 @@ use crate::cost::work::{Quantity, python_sum};
 use crate::cost::work::{Work, packed, triangle};
 use crate::specs::{DeviceSpec, ModelSpec};
 
-/// The tokens a score adds to each input besides its documents.
 pub fn score_fixed_tokens(token_lengths: &[i64], canvas_tokens: i64, draws: i64) -> i64 {
     token_lengths.iter().sum::<i64>() + canvas_tokens + (draws - 1) * (1 + canvas_tokens)
 }
 
-/// Python's `max(0.0, value)`.
 fn at_least_zero(value: f64) -> f64 {
     if value > 0.0 { value } else { 0.0 }
 }
 
-/// Python's `min(a, b)`: `b` only when it is smaller.
 pub fn python_min(a: f64, b: f64) -> f64 {
     if b < a { b } else { a }
 }
@@ -26,7 +21,6 @@ fn tri(tokens: f64) -> f64 {
     triangle(&Quantity::Scalar(tokens), 0).total()
 }
 
-/// The work of scoring `count` inputs, with a reused prefix.
 #[allow(clippy::too_many_arguments)]
 pub fn score_work(
     count: f64,
@@ -76,7 +70,6 @@ pub fn score_work(
         } * shared_reuses)
 }
 
-/// Prepared inputs for one score's cost at any survivor count.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScoreCost {
     pub token_lengths: Vec<i64>,
@@ -91,7 +84,6 @@ pub struct ScoreCost {
 }
 
 impl ScoreCost {
-    /// Model work and seconds for the expected inputs.
     pub fn estimate(&self, expected_rows: f64, prefix_groups: Option<f64>) -> (Work, f64) {
         let fixed = score_fixed_tokens(&self.token_lengths, self.model.canvas_tokens, self.draws);
         let shared = self.token_lengths[0];

@@ -1,6 +1,3 @@
-//! Build operators in the order of the plan.
-//! Set each scan's columns from the operators that read them.
-
 use super::binding::{Binder, check_labels, unsupported};
 use super::placement::{PlacedConditions, Term};
 use super::relation::{JoinSpec, Relation, check_calls, check_joins};
@@ -17,33 +14,18 @@ use quail_planner::operators::{Operators, Scan, SemanticColumn, SemanticJoin, so
 use quail_planner::physical::{ColumnRef, FilterPredicate, ModelCall, Projected, ValueExpression};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// The region's operators: the bound terms, named, and placed where the
-/// plan holds them.
 pub(super) struct Assembly<'w, 'a> {
     walk: &'w Walk<'a>,
     binder: &'w mut Binder,
-    /// alias -> its AI filters, in written order.
     filters: ByAlias<FilterPredicate>,
-    /// Each AI join and gate, by its node.
     joins: BTreeMap<usize, JoinSpec>,
     conditions: PlacedConditions,
     pub(super) found: Operators,
-    /// alias -> the column operators of that table, as (kind, position
-    /// in its list), in the plan's order.
     placed: ByAlias<(&'static str, usize)>,
-    /// The aliases whose AI filters or tests are placed, in order.
     noted: Vec<String>,
 }
 
 impl<'w, 'a> Assembly<'w, 'a> {
-    /// Name each column operator and place the relation's conditions.
-    ///
-    /// `columns` is the SELECT list.
-    ///
-    /// # Errors
-    ///
-    /// A term does not fit the query's tables, or the query has no AI
-    /// predicate where it needs one.
     pub(super) fn new(
         walk: &'w Walk<'a>,
         binder: &'w mut Binder,
@@ -99,12 +81,6 @@ impl<'w, 'a> Assembly<'w, 'a> {
         })
     }
 
-    /// Refuse a test of the result rows, which DataFusion runs above the
-    /// region.
-    ///
-    /// # Errors
-    ///
-    /// A condition reads more than one table's columns or answers.
     pub(super) fn check_row_tests(&self) -> Result<(), CompileError> {
         match self.conditions.row_test() {
             Some(test) => unsupported(&format!(
@@ -115,8 +91,6 @@ impl<'w, 'a> Assembly<'w, 'a> {
         }
     }
 
-    /// Each table's tests of answers, as its operators' column filters:
-    /// a test follows the last column operator whose answer it reads.
     fn place_tests(&mut self) -> Option<()> {
         for scan in &self.found.scans {
             if self.conditions.tests_answers(&scan.alias) {
@@ -138,7 +112,6 @@ impl<'w, 'a> Assembly<'w, 'a> {
         Some(())
     }
 
-    /// Whether `id` is an AI filter of one table.
     fn is_table_filter(&self, id: usize) -> bool {
         matches!(&self.walk.get(id).kind, Kind::Ai(node)
             if node.is_predicate()
@@ -146,10 +119,6 @@ impl<'w, 'a> Assembly<'w, 'a> {
                 && self.walk.call_tables(&node.call()).len() < 2)
     }
 
-    /// Whether the executor's stop key of `alias`'s AI.IF filters keeps
-    /// a per-key fetch's rows: the executor stops a key once a document
-    /// passes the table's filters, so the region asks only those filters
-    /// and joins nothing.
     fn stops_per_key(&self, alias: &str) -> bool {
         self.walk.ids().all(|id| match &self.walk.get(id).kind {
             Kind::Ai(node) => {
@@ -169,7 +138,6 @@ impl<'w, 'a> Assembly<'w, 'a> {
         }
     }
 
-    /// The `index`th input of `id`, passing through projections.
     fn input(&self, id: usize, index: usize) -> Option<usize> {
         let mut below = *self.walk.get(id).inputs.get(index)?;
         loop {
@@ -181,11 +149,8 @@ impl<'w, 'a> Assembly<'w, 'a> {
         }
     }
 
-    /// Place the region's operators in the plan's order; None when the
-    /// plan holds an operator Quail's operators do not read here.
     pub(super) fn place(&mut self) -> Option<()> {
         for id in self.walk.ids() {
-            // a column node's and an AI.IF filter's executors read a guard
             if let Kind::Ai(node) = &self.walk.get(id).kind
                 && node.guard().is_some()
                 && (node.function() == "ai_score" || node.semantics() != Semantics::Rows)
@@ -210,8 +175,6 @@ impl<'w, 'a> Assembly<'w, 'a> {
                         self.place_filters(id)?;
                     }
                 }
-                // Scores returned as values use the existing projected-score
-                // operator; this node keeps their SQL position during optimization.
                 Kind::Ai(node) if node.function() == "ai_score" => {}
                 Kind::Ai(node) => self.place_column(id, node)?,
                 _ => {}
@@ -223,7 +186,6 @@ impl<'w, 'a> Assembly<'w, 'a> {
         self.place_tests()
     }
 
-    /// Place a run of AI filters of one table, `top` the last.
     fn place_filters(&mut self, top: usize) -> Option<()> {
         let read = self.call_tables(top);
         let mut run = vec![top];
@@ -242,7 +204,6 @@ impl<'w, 'a> Assembly<'w, 'a> {
             Kind::Ai(node) if self.stops_per_key(&alias) => node.key_fetch(),
             _ => None,
         });
-        // the executor counts a key's survivors among the rows it asks
         if stop_key.is_some()
             && predicates
                 .iter()
@@ -297,16 +258,12 @@ impl<'w, 'a> Assembly<'w, 'a> {
         Some(())
     }
 
-    /// The column operators an AI column node runs: its call, or an
-    /// extraction's call per field, each with its name.
     fn bound_columns(&mut self, node: &AiNode) -> Option<(&'static str, Vec<(ModelCall, String)>)> {
         let kind = node.column_kind()?;
         let found = self.binder.answer(node.answer())?;
         Some((kind, found.calls.clone()))
     }
 
-    /// A column node's guard as a condition; the outer None when it does
-    /// not bind.
     fn bound_guard(&mut self, node: &AiNode) -> Option<Option<ValueExpression>> {
         match node.guard() {
             None => Some(None),
@@ -321,8 +278,6 @@ impl<'w, 'a> Assembly<'w, 'a> {
         let read: Vec<String> = self.call_tables(id).into_iter().collect();
         let is_column = |kind: &Kind| matches!(kind, Kind::Ai(found) if !found.is_predicate() && found.semantics() == Semantics::Rows);
         if read.len() == 2 {
-            // a run of classifications of the same joined rows is placed
-            // from its top, once
             let continues = |id: usize| {
                 self.walk.get(id).parent.is_some_and(|parent| {
                     is_column(&self.walk.get(parent).kind)
@@ -398,15 +353,7 @@ impl<'w, 'a> Assembly<'w, 'a> {
     }
 }
 
-/// Set each scan's columns: the values of its table that the region's
-/// operators read, the SELECT list's first, then each join's, column
-/// operator's, test's, and filter's.
-///
-/// A scan loads its document column as a value only when an operator
-/// reads the value, not only its tokens.
 pub(super) fn set_scan_columns(found: &mut Operators) {
-    // an AI filter's answer and a column operator's columns are computed,
-    // not loaded
     let read = found.clone();
     let answers = read.filter_answers();
     let added: BTreeSet<String> = read
@@ -433,7 +380,6 @@ pub(super) fn set_scan_columns(found: &mut Operators) {
         })
         .flatten()
         .collect();
-    // the references that read a column's value
     let mut valued: Vec<ColumnRef> = selected.clone();
     valued.extend(
         read.joins

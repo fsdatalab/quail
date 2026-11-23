@@ -1,10 +1,5 @@
-//! How long written answers run, as `quail/common/answers.py` estimates
-//! it: survival curves over answer tokens.
-
-/// Answers the prior counts as, until ended answers outweigh it.
 pub const PRIOR_WEIGHT: f64 = 20.0;
 
-/// The chance a geometric answer with the given mean goes on past a token.
 pub fn keep(expected_tokens: f64) -> f64 {
     let mean = if expected_tokens > 1.0 {
         expected_tokens
@@ -14,7 +9,6 @@ pub fn keep(expected_tokens: f64) -> f64 {
     1.0 - 1.0 / mean
 }
 
-/// S(t) for t = 0..=limit under geometric lengths with the given mean.
 pub fn prior_survival(expected_tokens: f64, limit: usize) -> Vec<f64> {
     let keep = keep(expected_tokens);
     let mut curve: Vec<f64> = (0..=limit).map(|t| keep.powf(t as f64)).collect();
@@ -22,11 +16,6 @@ pub fn prior_survival(expected_tokens: f64, limit: usize) -> Vec<f64> {
     curve
 }
 
-/// Kaplan-Meier curves, one per row, starting from each row's prior.
-///
-/// `counts` holds the answers observed last at each token, ended or
-/// censored; `events` the answers that ended at each token; `prior`
-/// each row's prior curve; `limits` each row's answer token limit.
 pub fn survival_rows(
     counts: &[Vec<i64>],
     events: &[Vec<i64>],
@@ -40,7 +29,6 @@ pub fn survival_rows(
         .zip(limits)
         .map(|(((counts, events), prior), limit)| {
             let width = counts.len();
-            // risk[j - 1] for j = 1..width: answers observed at j or later
             let mut at_or_after = vec![0_i64; width];
             let mut running = 0_i64;
             for j in (0..width).rev() {
@@ -65,7 +53,6 @@ pub fn survival_rows(
         .collect()
 }
 
-/// The expected tokens left after t tokens, t = 0..=limit.
 pub fn remaining_tokens(survival: &[f64]) -> Vec<f64> {
     let width = survival.len();
     let mut tail = vec![0.0; width];

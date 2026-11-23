@@ -1,5 +1,3 @@
-//! Filter IMDB reviews from an Arrow IPC file with a language model.
-
 const SQL: &str = r#"
 SELECT r.id
 FROM reviews AS r

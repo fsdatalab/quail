@@ -22,10 +22,8 @@ def verification_blocks(counts, stream_width, num_streams, num_options, num_keys
     widths = np.broadcast_to(stream_width, counts.shape)
     num_streams = np.maximum(1, np.broadcast_to(num_streams, counts.shape))
     order = np.lexsort((counts, num_streams, widths))
-    # Lookup's live int64 gathers dominate; score/trace passes retain its results.
     options = 64 * num_options + 32 * num_keys
     per_position = 512 + 96 * top_tokens + 16 * mask_words
-    # CUDA rounds each allocation to 512 bytes; fewer than 128 are live here.
     padding = 128 * 512
     start = 0
     while start < len(order):
@@ -64,7 +62,6 @@ def _padded(values, dtype=np.int64):
     return out
 
 
-# A stream stores position * STREAM_STRIDE + option.
 STREAM_STRIDE = 1 << 24
 
 
@@ -171,7 +168,6 @@ class StreamRows:
     def __init__(self, constraint, num_answers: int):
         self.constraint = constraint
         torch, device = constraint.torch, constraint.device
-        # per answer, its row of streams and alive, or -1
         self.rows = np.full(num_answers, -1, dtype=np.int64)
         self.unused = []
         self.streams = torch.full((0, 1), -1, dtype=torch.int64, device=device)
@@ -371,7 +367,6 @@ class CopyConstraint:
         mask = torch.zeros(
             (len(alive), self.mask_words), dtype=torch.int64, device=self.device
         )
-        # Each surviving stream has a distinct document position.
         mask.scatter_add_(1, positions // 64, alive.to(torch.int64) << (positions % 64))
         return mask
 
@@ -686,7 +681,6 @@ class CopyConstraint:
             .min(dim=1)
             .values
         )
-        # No finite candidate ends the answer; dead padding cannot choose its token.
         following = torch.where(best.isfinite(), following, -1)
         chosen = torch.where(at == 0, first_token, following) if first else following
         allows = (allowed & (tokens == top[:, None])).any(dim=1)
@@ -747,7 +741,6 @@ class CopyConstraint:
         active = use & ~ended & hit & (at[:, 0] + 1 < limits)
         if at.shape[1] == 1:
             return values, alive, following, traces, active
-        # The first choice can change a tied source after stream compaction.
         tail, alive, source, tail_traces, active = self._verify_tail(
             projected[:, 1:], streams, alive, following, at[:, 1:], documents,
             limits, valid[:, 1:], active)
@@ -762,7 +755,6 @@ class CopyConstraint:
         expanded = streams[:, None, :].expand(-1, num_steps, -1)
         tokens = self.tokens_at(expanded, at[:, :, None])
         drafted = self.tokens_at(source[:, None], at)
-        # A hit retains the earliest source, so it stays fixed until rejection.
         matches = tokens == drafted[:, :, None]
         prefixes = matches.to(torch.int32).cumprod(dim=1).bool()
         before = torch.cat((alive[:, None], alive[:, None] & prefixes[:, :-1]), dim=1)
@@ -780,7 +772,6 @@ class CopyConstraint:
         use = torch.cat((active[:, None], active[:, None] & prefixes), dim=1)
         use &= valid
         after = torch.where(ended[:, :, None], before, keep)
-        # Rejected and terminal choices update the state once; later rows do not.
         last = (use.sum(dim=1) - 1).clamp_min(0)
         rows = torch.arange(num_rows, device=self.device)
         final = torch.where(use[:, :1], after[rows, last], alive)
@@ -790,7 +781,6 @@ class CopyConstraint:
         values = torch.where(use[:, :, None], values, -2)
         traces = None
         if self.trace is not None:
-            # The sequential trace also records unused rows against frozen state.
             traced = torch.where(use[:, :, None], before, final[:, None])
             self.choose_readout(projected.flatten(0, 1), flat_streams,
                                 traced.flatten(0, 1), flat_at, flat_documents,

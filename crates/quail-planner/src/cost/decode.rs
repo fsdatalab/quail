@@ -1,16 +1,9 @@
-//! Decode pass time from the specs alone, as `quail/common/decode.py`
-//! prices it for the planner.
-//!
-//! The executor's per-row admission methods (`row_work`,
-//! `replay_seconds`, `gain`) stay in Python with the executor.
-
 use crate::cost::dense_decoder_cost::dense_decoder_components;
 use crate::cost::retention::{Coefficients, coefficients};
 use crate::cost::work::Work;
 use crate::cost::work::python_sum;
 use crate::specs::{DeviceSpec, ModelSpec};
 
-/// Prices decode passes and prefix recomputation in seconds.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodeCost {
     pub recompute_cost: Coefficients,
@@ -21,7 +14,6 @@ pub struct DecodeCost {
 }
 
 impl DecodeCost {
-    /// Coefficients from the model's shapes and the device's peak rates.
     pub fn from_specs(model: &ModelSpec, device: &DeviceSpec) -> Self {
         let weight_bytes = python_sum(
             dense_decoder_components(&Work::default(), model, 1.0)
@@ -37,11 +29,6 @@ impl DecodeCost {
         }
     }
 
-    /// The fewest seconds `passes` passes doing `work` in all take.
-    ///
-    /// # Panics
-    ///
-    /// A count in `work` is an array.
     pub fn lower_bound_seconds(&self, work: &Work, passes: f64) -> f64 {
         let value =
             |quantity: &crate::cost::work::Quantity| quantity.scalar().expect("summed work");

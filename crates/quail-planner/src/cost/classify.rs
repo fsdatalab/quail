@@ -1,6 +1,3 @@
-//! Classification costs, and the label trie a classification's scoring
-//! reads, as `quail/labels.py` builds it.
-
 use crate::budgets::parallel_copies;
 use crate::constants::{DECODE_SCORING, LETTERS_SCORING, TREE_SCORING};
 use crate::cost::score::python_min;
@@ -9,7 +6,6 @@ use crate::cost::work::{Quantity, Work, ask, decode, stream};
 use crate::specs::{DeviceSpec, ModelSpec};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Estimated classification time, work, and token counts.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClassifyCost {
     pub seconds: f64,
@@ -19,11 +15,6 @@ pub struct ClassifyCost {
     pub rounds: usize,
 }
 
-/// The request lengths of a scoring rule, the answer cue included.
-///
-/// # Errors
-///
-/// The scoring rule is unknown, or a label has no tokens.
 pub fn suffix_lengths(
     scoring: &str,
     labels: &[Vec<i64>],
@@ -64,7 +55,6 @@ fn length(values: &Quantity) -> usize {
     }
 }
 
-/// Every document's prefix-and-tail work: scan, or ask on resident KV.
 fn first_work(
     prefix: &Quantity,
     shared: &Quantity,
@@ -93,7 +83,6 @@ fn first_work(
     work
 }
 
-/// The second attention read of a multi-row answer canvas.
 fn canvas_work(work: Work, canvas_rows: i64) -> Work {
     if canvas_rows > 1 {
         let reread = Work {
@@ -134,7 +123,6 @@ fn rounds_work(
     &work + &canvas_work(rounds, canvas_rows)
 }
 
-/// The inputs of one classification estimate besides its suffixes.
 #[derive(Debug, Clone)]
 pub struct ClassifyInputs<'a> {
     pub head_tokens: i64,
@@ -149,7 +137,6 @@ pub struct ClassifyInputs<'a> {
     pub gpus: i64,
 }
 
-/// Expected classification work and its roofline time.
 pub fn estimate_suffixes(
     inputs: &ClassifyInputs,
     suffixes: &[i64],
@@ -254,11 +241,6 @@ pub fn estimate_suffixes(
     }
 }
 
-/// The cost of one classification scoring rule.
-///
-/// # Errors
-///
-/// The scoring rule is unknown, or a label has no tokens.
 pub fn estimate(
     inputs: &ClassifyInputs,
     scoring: &str,
@@ -295,14 +277,8 @@ pub fn estimate(
     ))
 }
 
-/// A node of the label trie: the label tokens from the root.
 pub type Node = Vec<i64>;
 
-/// Each proper label prefix and the sorted tokens that can follow it.
-///
-/// # Errors
-///
-/// A label has no tokens.
 pub fn label_trie(label_ids: &[Vec<i64>]) -> Result<BTreeMap<Node, Vec<i64>>, String> {
     let mut children: BTreeMap<Node, BTreeSet<i64>> = BTreeMap::new();
     for ids in label_ids {
@@ -322,15 +298,8 @@ pub fn label_trie(label_ids: &[Vec<i64>]) -> Result<BTreeMap<Node, Vec<i64>>, St
         .collect())
 }
 
-/// The trie nodes whose rows the trie_tree rule reads.
-///
-/// # Errors
-///
-/// A label has no tokens.
 pub fn read_nodes(label_ids: &[Vec<i64>]) -> Result<BTreeSet<Node>, String> {
     let trie = label_trie(label_ids)?;
-    // the root, each node with two or more next tokens, and each label
-    // that ends where another continues; any other node has one next token
     let mut read: BTreeSet<Node> = trie
         .into_iter()
         .filter(|(_, tokens)| tokens.len() > 1)
@@ -348,19 +317,12 @@ pub fn read_nodes(label_ids: &[Vec<i64>]) -> Result<BTreeSet<Node>, String> {
     Ok(read)
 }
 
-/// The read nodes and their ancestors, whose tokens are fed.
 pub fn fed_nodes(read: &BTreeSet<Node>) -> BTreeSet<Node> {
     read.iter()
         .flat_map(|node| (0..=node.len()).map(|depth| node[..depth].to_vec()))
         .collect()
 }
 
-/// The tokens a greedy decode feeds for each label, per round; the
-/// first round's count includes the answer cue.
-///
-/// # Errors
-///
-/// A label has no tokens.
 pub fn decode_round_tokens(label_ids: &[Vec<i64>]) -> Result<Vec<Vec<i64>>, String> {
     let trie = label_trie(label_ids)?;
     let mut choices: Vec<&Node> = trie

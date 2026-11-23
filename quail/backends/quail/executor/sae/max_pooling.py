@@ -42,7 +42,7 @@ class _PinnedSlabs:
         self.width = width
         self.rows_per_slab = rows_per_slab
         self.slabs = []
-        self.last_event = []    # per slab, the event of its latest copy
+        self.last_event = []
         self._next = rows_per_slab
 
     def take(self) -> tuple:
@@ -79,7 +79,7 @@ class _SlotMatrix:
         self.matrix = torch.zeros((capacity, width), device="cuda",
                                   dtype=torch.float32)
         self.free = list(range(capacity - 1, -1, -1))
-        self.dirty = []    # freed slots, zeroed before the next scatter
+        self.dirty = []
 
     def take(self) -> int:
         if not self.free:
@@ -123,8 +123,8 @@ class SaeMaxAccumulator:
         self.document_tokens = document_tokens
         self.document_slot = {}
         self.tail_slot = {}
-        self.calls = 0        # feature calls registered on this pipeline
-        self.settled = {}     # key -> calls settled so far
+        self.calls = 0
+        self.settled = {}
         self._slots = _SlotMatrix(torch, encoder.num_features)
         self._staging = InputStaging(torch)
         self._staging_index = 0

@@ -8,29 +8,11 @@ from quail.backends.quail.executor.stage_executor import StageExecutor
 from quail.backends.quail.executor.stages import Stage, filter_stages
 from quail.progress import Progress, logger, quiet
 
-# ------------------------------------------------------------- warmup
-#
-# compile_kernels JIT-compiles (nvcc/Triton) each kernel configuration
-# once per (software stack, GPU, model, budget) into the libraries'
-# kernel directories; a marker file records that the pass ran.
-# touch_kernels loads the cached binaries once per GPU process.
-#
-# Kernels key on token counts and model constants, never on token
-# values, so both passes run on synthetic ids.
 
-# Bump when either pass covers a different set of shapes. A bumped
-# version invalidates every marker, so the next boot re-runs the
-# compile pass.
 WARMUP_VERSION = 18
 
-# Triton compiles one copy of a kernel for each class of its integer
-# arguments: equal to 1, a multiple of 16, or neither. Quail's row
-# dependent strides come from a chunk's row count n and, under tree
-# attention, the count m of its rows that read cached KV (m <= n).
-# These (n, m) pairs cover every class pair.
 ROW_CLASSES = ((1, 1), (32, 1), (32, 16), (32, 17),
                (33, 1), (33, 16), (33, 17))
-# tokens of each cached document the reading rows attend to
 ROW_CLASS_CACHED = 64
 
 
@@ -54,7 +36,6 @@ def _warm_convolutions(torch, pipeline, budget):
     """Compile and load convolution kernels for every private state capacity."""
     from quail.backends.quail.executor.gdn import GdnPhase, causal_conv_kernel
 
-    # Each sequence uses at least one token of the chunk budget.
     largest = 1 << (budget - 1).bit_length()
     for weight, bias, activate in pipeline.convolutions():
         channels, width = weight.shape
@@ -163,7 +144,6 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
     _warm_convolutions(torch, pipeline, budget)
     _warm_recurrent(torch, arena, pipeline)
     _warm_short_attention(torch, arena, pipeline)
-    # a readout of several trailing rows needs a question that long
     trailing = 1 if async_ans is None else async_ans.trailing_rows
     warm_documents, question, document = _warm_inputs(budget, max(16, trailing))
     q_max = len(question)
@@ -182,8 +162,6 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
                            decide=lambda _, row: True),
                      Stage(suffixes=[question], readout=async_ans)],
                     warm_documents[:count], budget, attention_mode=mode)
-        # small chunks, one document each: the trailing-chunk shapes
-        # of gated multi-stage runs (see ModelPipeline.warm_tokens)
         for t in pipeline.warm_tokens:
             if t >= budget:
                 continue
@@ -204,9 +182,6 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
             torch, arena, pipeline,
             [Stage(suffixes=[question] * 8, readout=async_ans)], warm_documents, budget)
     if join_chunk and trailing == 1:
-        # a classification: the question as the frame after each
-        # document, then many short suffixes of mixed lengths; a
-        # decision model classifies with its own readout
         logger.debug("kernels: warming classification forward pass")
         labels = [question[:1 + i % 6] for i in range(26)]
         _warm_run(
@@ -214,8 +189,6 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
             [Stage(suffixes=labels, readout=async_ans, frame=question)],
             warm_documents, budget)
     if pipeline.whole_sequences and async_ans is not None:
-        # a set-attention pass of two questions runs the merge of each
-        # question's two attention reads
         logger.debug("kernels: warming a set-attention pass of two questions")
         half = len(question) // 2
         _warm_run(
@@ -251,8 +224,6 @@ def _warm_row_classes(torch, arena, pipeline, attention_mode):
 
     cached = ROW_CLASS_CACHED
     readers = max(m for _, m in ROW_CLASSES)
-    # each reader holds its document's checkpoint and a second slot for
-    # the token it keeps, and the filler holds one
     needed = 2 * readers + 1
     slots = getattr(arena, "num_state_slots", 0)
     if slots and slots < needed:
@@ -265,9 +236,6 @@ def _warm_row_classes(torch, arena, pipeline, attention_mode):
         arena.activate(key, cached, capacity_tokens=cached + 1,
                        base_tokens=cached)
     try:
-        # a forward pass ends in a norm over its answer rows, which
-        # fails with a CUDA error when there are none: each document
-        # takes a one-token question whose answer is not read
         forward_chunk(pipeline, arena, pack_chunk(
             torch, arena, [dict(key=key, prefix=prefix, f=cached, suffixes=[[11]])
                            for key in keys], attention_mode=attention_mode))
@@ -308,9 +276,6 @@ def warm_label_readout(torch, head):
     block = AsyncLabelLogprobs.BLOCK_ROWS
     hidden = torch.zeros((block + 300, head.shape[1]), dtype=torch.bfloat16,
                          device=head.device)
-    # a kernel's first launch waits for the GPU's queued work, which in
-    # a query is a whole forward pass; PyTorch selects up to 16 indices
-    # with one kernel and more with another
     for targets in (16, 128):
         for normalize, rows in ((True, 1), (True, 4), (False, 1)):
             readout = AsyncLabelLogprobs(torch, torch.nn.functional, head,
@@ -356,8 +321,6 @@ def compile_kernels(torch, arena, pipeline, async_ans, budget):
                         unit="configurations", emit=logger.info)
     logger.info("warming up %s matrix multiply shapes", len(work))
     with torch.inference_mode():
-        # one buffer per linear, row-sliced per call; the sweep only
-        # needs each kernel launched once
         cur, buf = None, None
         for done, (m, lin) in enumerate(work, 1):
             if lin is not cur:
@@ -434,8 +397,6 @@ def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
         os.makedirs(os.path.dirname(path), exist_ok=True)
         t0 = time.perf_counter()
         tier = "touch"
-        # The marker check, compilation, and publication must be one
-        # operation across processes sharing the kernel directory.
         with open(path + ".lock", "a") as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

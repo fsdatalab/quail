@@ -15,7 +15,6 @@ from quail.physical import ExtensionNode, PhysicalGraph, PhysicalNode
 from quail.physical.lowering import lower_prompt
 from quail.remote.client import QueryFailedError, QueryRun, QueryStatus
 
-# the label before each document in a prompt
 SHARED_PRE = _quail_native.SHARED_PRE
 
 __all__ = [

@@ -1,6 +1,3 @@
-//! Bind conditions and join equalities.
-//! Read each answer a condition tests as its operator's column.
-
 use quail_planner::constants::SPAN_SUFFIX;
 use std::collections::BTreeSet;
 
@@ -18,9 +15,6 @@ use quail_planner::expressions::{column_alias_of, repr_list, repr_str};
 use quail_planner::physical::{Equality, ModelCall, ValueExpression};
 use serde_json::Value;
 
-/// `term`, negated when `negate`, with each NOT moved down to the tests
-/// below AND and OR by De Morgan's laws, so the parts of an AND, such as
-/// `NOT (a OR b)`, are placed apart.
 pub(crate) fn negated_inward(term: Expr, negate: bool) -> Expr {
     match term {
         Expr::Not(inner) => negated_inward(*inner, !negate),
@@ -46,8 +40,6 @@ pub(crate) fn negated_inward(term: Expr, negate: bool) -> Expr {
 }
 
 impl Binder {
-    /// Bind `left = right`, an ON equality of the join of `joined` and a
-    /// table already in the query.
     pub(crate) fn bind_equality(
         &mut self,
         term: &Expr,
@@ -77,14 +69,8 @@ impl Binder {
         Ok(equality)
     }
 
-    // ------------------------------------------------------------ conditions
-
-    /// Bind a term that asks no model as a condition, each answer it
-    /// tests read as the answer's column.
     pub(crate) fn bind_condition(&mut self, term: &Expr) -> Result<ValueExpression, CompileError> {
         let read = self.answer_refs(term)?;
-        // a test that still holds a call is one DataFusion evaluates
-        // above the region
         if contains(&read, |inner| {
             crate::is_ai_call(inner) || is_call(inner, "prompt")
         }) {
@@ -93,12 +79,10 @@ impl Binder {
         self.computed(&read)
     }
 
-    /// The columns of the `AiNode` that adds the column `name`.
     pub(crate) fn answer(&self, name: &str) -> Option<&AnswerColumn> {
         self.answers.iter().rev().find(|found| found.answer == name)
     }
 
-    /// Record the columns an `AiNode` adds, which conditions may read.
     pub(crate) fn add_answer(&mut self, found: AnswerColumn) {
         if let Some(alias) = &found.alias {
             let data_type = match found.kind {
@@ -123,21 +107,11 @@ impl Binder {
         self.answers.push(found);
     }
 
-    /// `term` with each answer column it reads as the column of the
-    /// operator that computes it: a label, a map's text, an AI filter's
-    /// answer, or a field of an extraction or of its span.
-    ///
-    /// # Errors
-    ///
-    /// The term reads an answer no single table's operator computes, a
-    /// whole extraction, or an SAE feature list other than for NULL, or
-    /// it compares a label with a text its classification lacks.
     pub(crate) fn answer_refs(&self, term: &Expr) -> Result<Expr, CompileError> {
         let answer_of = |expr: &Expr| match expr {
             Expr::Column(column) if column.relation.is_none() => self.answer(&column.name),
             _ => None,
         };
-        // each label a test compares a classification with
         let mut compared: Vec<(&AnswerColumn, Value)> = Vec::new();
         let _ = term.apply(|node| {
             match node {
@@ -181,7 +155,6 @@ impl Binder {
                     return Ok(Transformed::no(node));
                 }
                 let found = match &node {
-                    // AI.SAE_FEATURES returns a list, which a test reads only here
                     Expr::IsNull(inner) | Expr::IsNotNull(inner)
                         if answer_of(inner).is_some_and(|found| found.kind == "features") =>
                     {
@@ -226,10 +199,6 @@ impl Binder {
         }
     }
 
-    /// The column of an extraction's field, or the field of its span, a
-    /// field path reads: `get_field(answer, field)`, or
-    /// `get_field(answer's span, field, start|end)`; None for another
-    /// expression.
     fn extract_column(&self, node: &Expr) -> Result<Option<Expr>, CompileError> {
         let mut path = Vec::new();
         let mut inner = node;
@@ -286,7 +255,6 @@ impl Binder {
         Ok(Some(read))
     }
 
-    /// The condition `alias.column IN (labels)` on a label's column.
     pub(crate) fn label_condition(
         &mut self,
         alias: &str,
@@ -315,8 +283,6 @@ fn is_get_field(expr: &Expr) -> bool {
     is_call(expr, "get_field")
 }
 
-/// Refuse a test of the label `name` that accepts a label its
-/// classification `call` lacks.
 pub(crate) fn check_labels(
     name: &str,
     accepted: &Value,
@@ -340,7 +306,6 @@ pub(crate) fn check_labels(
         .iter()
         .filter_map(|label| label.as_str().map(str::to_string))
         .collect();
-    // a call the query did not name has a name of Quail's
     let subject = if name.starts_with("__quail") {
         "an AI.CLASSIFY call".to_string()
     } else {

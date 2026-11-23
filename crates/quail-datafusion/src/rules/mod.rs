@@ -1,23 +1,3 @@
-//! The logical optimizer rules of a session with Quail.
-//!
-//! DataFusion's optimizer runs its own rules over the whole plan, each
-//! `AiNode` included, with Quail's rules among them. [`default_rule_names`]
-//! gives the default order: DataFusion's default rules, with Quail's three
-//! before `replace_distinct_aggregate`, which turns a `DISTINCT` into a
-//! GROUP BY, and `lower_ai_calls` after `decorrelate_lateral_join`.
-//! [`crate::claim_model_regions`] claims the model regions of the plan
-//! the optimizer leaves, before physical planning.
-//!
-//! [`crate::LowerAiCalls`] runs twice: as an analyzer rule on the plan
-//! the query wrote, and as the optimizer rule `lower_ai_calls` on the
-//! joins DataFusion makes of correlated subqueries, which hold the
-//! subquery's AI calls in their ON.
-//!
-//! Each `AiNode` tells DataFusion's rules what they may do around it:
-//! which filters may move below it and which columns it reads (see
-//! [`crate::ai::AiNode`]). A limit does not move below a node: it
-//! becomes the node's fetch ([`crate::Derive`]).
-
 pub(crate) mod derive;
 pub(crate) mod distinct;
 pub(crate) mod guards;
@@ -35,16 +15,12 @@ use datafusion::common::{Result, plan_err};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::optimizer::{ApplyOrder, Optimizer, OptimizerConfig, OptimizerRule};
 
-/// Quail's own rules, in the order they run.
 pub const QUAIL_RULES: [&str; 3] = ["merge_repeated_ai_calls", "derive", "place_ai_nodes"];
 
-/// The rule Quail's rules run before.
 const QUAIL_RULES_BEFORE: &str = "replace_distinct_aggregate";
 
-/// The rule that lowers the AI calls DataFusion's rules leave in a join.
 const LOWERING_RULE: &str = "lower_ai_calls";
 
-/// The last of DataFusion's rules that make a join of a subquery.
 const LOWERING_RULE_AFTER: &str = "decorrelate_lateral_join";
 
 #[cfg(test)]
@@ -80,13 +56,6 @@ const EXPECTED_DEFAULT_RULES: [&str; 29] = [
     "optimize_projections",
 ];
 
-/// A rule of Quail's, followed by a recomputation of every operator's
-/// schema from its inputs.
-///
-/// A rule that moves or reorders `AiNode`s changes the columns, or their
-/// order, of the operators it rebuilds. An operator above them keeps
-/// the schema it was built with, and DataFusion's rules read columns of
-/// that schema by position.
 #[derive(Debug)]
 struct Recomputed(Arc<dyn OptimizerRule + Send + Sync>);
 
@@ -104,9 +73,6 @@ impl OptimizerRule for Recomputed {
         plan: LogicalPlan,
         config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
-        // PREPARE optimizes a plan whose parameters EXECUTE fills in later,
-        // through the expressions each operator lists. An `AiNode` holds a
-        // test it absorbed outside that list, so the rules wait for values.
         if !plan.get_parameter_names()?.is_empty() {
             return Ok(Transformed::no(plan));
         }
@@ -136,12 +102,6 @@ fn unchecked_rule(name: &str) -> Option<Arc<dyn OptimizerRule + Send + Sync>> {
     })
 }
 
-/// The optimizer rule named `name`: one of Quail's, or one of
-/// DataFusion's default rules.
-///
-/// # Errors
-///
-/// No such rule is known.
 pub fn logical_rule(name: &str) -> Result<Arc<dyn OptimizerRule + Send + Sync>> {
     if let Some(rule) = quail_rule(name) {
         return Ok(rule);
@@ -156,11 +116,6 @@ pub fn logical_rule(name: &str) -> Result<Arc<dyn OptimizerRule + Send + Sync>> 
     }
 }
 
-/// The rules named `names`, in order.
-///
-/// # Errors
-///
-/// A name is unknown.
 pub fn logical_rules(names: &[String]) -> Result<Vec<Arc<dyn OptimizerRule + Send + Sync>>> {
     let mut rules = Vec::new();
     for name in names {
@@ -169,10 +124,6 @@ pub fn logical_rules(names: &[String]) -> Result<Vec<Arc<dyn OptimizerRule + Sen
     Ok(rules)
 }
 
-/// `existing`, a session's rules, with Quail's rules before
-/// `replace_distinct_aggregate`, or first when it has none, and
-/// `lower_ai_calls` after `decorrelate_lateral_join`, or last when it
-/// has none. A rule of Quail's already in the list is moved there.
 pub(crate) fn with_quail_rules(
     existing: &[Arc<dyn OptimizerRule + Send + Sync>],
 ) -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
@@ -208,13 +159,10 @@ pub(crate) fn with_quail_rules(
     rules
 }
 
-/// The default rules without the claim, which a trial of a model region
-/// runs over its operators.
 pub(crate) fn default_rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
     with_quail_rules(&Optimizer::new().rules)
 }
 
-/// The default logical optimizer rule names.
 pub fn default_rule_names() -> Vec<String> {
     default_rules()
         .iter()

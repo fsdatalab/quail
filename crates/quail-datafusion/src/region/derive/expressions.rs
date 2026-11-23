@@ -1,18 +1,3 @@
-//! The values and conditions of a model region's operators as DataFusion
-//! expressions.
-//!
-//! The binder reads each value or condition the executor computes, such
-//! as a scan's predicate or a test of a label, as an [`Expression`]: the
-//! DataFusion expression, encoded with datafusion-proto, with each
-//! column read by its position and its Arrow type. A process that reads
-//! a plan builds each one once as a [`PhysicalValue`], DataFusion's
-//! physical expression over those types, and evaluates it over the
-//! executor's rows as often as it needs.
-//!
-//! For example, `r.stars > 3` becomes an `Expression` that reads column
-//! `#0` where `columns` is `[r.stars]` and `types` is `[Int64]`, with the
-//! text `{0} > 3`.
-
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 
@@ -33,21 +18,13 @@ use quail_planner::error::CompileError;
 use quail_planner::expressions::{repr_float, repr_str};
 use quail_planner::physical::{ColumnRef, Expression, ValueExpression};
 
-/// Where a column's position starts and ends in an expression's text
-/// before braces are escaped.
 const OPEN: char = '\u{1}';
 const CLOSE: char = '\u{2}';
 
-/// The name an expression's `index`th column has in its encoded form.
 fn position_name(index: usize) -> String {
     format!("#{index}")
 }
 
-/// The DataFusion session whose functions decode and build
-/// expressions: DataFusion's own, `AI.PARSE_DOCUMENT`, and
-/// `AI.PDF_PAGES`. Quail's executor decodes a region's expressions
-/// outside the session that planned them, so an expression that calls
-/// a host's own function does not build.
 fn session() -> &'static SessionContext {
     static SESSION: OnceLock<SessionContext> = OnceLock::new();
     SESSION.get_or_init(|| {
@@ -67,8 +44,6 @@ fn session() -> &'static SessionContext {
     })
 }
 
-/// `data_type` with every nested field nullable and without metadata,
-/// as an expression's `types` hold it.
 fn plain_type(data_type: &DataType) -> DataType {
     let plain = |field: &FieldRef| -> FieldRef {
         Arc::new(Field::new(
@@ -86,13 +61,6 @@ fn plain_type(data_type: &DataType) -> DataType {
     }
 }
 
-/// An [`Expression`] of `expr`, each column resolved by `resolve` to the
-/// column it reads and that column's Arrow type.
-///
-/// # Errors
-///
-/// A column does not resolve, or DataFusion cannot encode the
-/// expression.
 pub fn expression(
     expr: &Expr,
     mut resolve: impl FnMut(&Column) -> Result<(ColumnRef, DataType), CompileError>,
@@ -145,12 +113,6 @@ pub fn expression(
     })
 }
 
-/// An [`Expression`] of SQL text over the columns of `schema`, each a
-/// column of table `alias` from `provider`, such as `stars > 3`.
-///
-/// # Errors
-///
-/// The text is not a SQL expression over the schema's columns.
 pub fn parse(
     sql: &str,
     schema: &Schema,
@@ -177,8 +139,6 @@ pub fn parse(
     })
 }
 
-/// The DataFusion expression an [`Expression`] encodes, reading column
-/// `#i` for its `i`th column.
 pub(crate) fn decode(expression: &Expression) -> Result<Expr, CompileError> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&expression.encoded)
@@ -187,10 +147,6 @@ pub(crate) fn decode(expression: &Expression) -> Result<Expr, CompileError> {
         .map_err(|error| CompileError::new(error.to_string()))
 }
 
-// ---------------------------------------------------------------- evaluation
-
-/// `array` with each struct's nulls on its fields too, so a field of a
-/// null struct reads as null, as SQL reads it.
 fn with_field_nulls(array: ArrayRef) -> ArrayRef {
     let Some(structs) = array.as_struct_opt() else {
         return array;
@@ -202,7 +158,6 @@ fn with_field_nulls(array: ArrayRef) -> ArrayRef {
             let column = with_field_nulls(column);
             match NullBuffer::union(nulls.as_ref(), column.logical_nulls().as_ref()) {
                 Some(merged) if column.null_count() != merged.null_count() => {
-                    // the field keeps its values; only its validity widens
                     match column.to_data().into_builder().nulls(Some(merged)).build() {
                         Ok(data) => make_array(data),
                         Err(_) => column,
@@ -215,10 +170,6 @@ fn with_field_nulls(array: ArrayRef) -> ArrayRef {
     Arc::new(StructArray::new(fields, columns, nulls))
 }
 
-/// The rows' column `name`; a dotted name the rows do not hold reads a
-/// field of a struct column, as result rows hold an extraction's
-/// answers. A dictionary column reads as its values, as result rows
-/// hold labels.
 fn column_of(batch: &RecordBatch, name: &str) -> Result<ArrayRef, CompileError> {
     if let Some(found) = batch.column_by_name(name) {
         if let DataType::Dictionary(_, values) = found.data_type() {
@@ -238,9 +189,6 @@ fn column_of(batch: &RecordBatch, name: &str) -> Result<ArrayRef, CompileError> 
     )))
 }
 
-/// An [`Expression`] built for evaluation: DataFusion's physical
-/// expression over the types of the columns it reads, with DataFusion's
-/// type coercion applied once, when it is built.
 #[derive(Debug, Clone)]
 pub struct PhysicalExpression {
     expression: Expression,
@@ -249,17 +197,10 @@ pub struct PhysicalExpression {
 }
 
 impl PhysicalExpression {
-    /// The columns the expression reads.
     fn columns(&self) -> Vec<&ColumnRef> {
         self.expression.columns.iter().collect()
     }
 
-    /// Decode `expression` and build it over the types it names.
-    ///
-    /// # Errors
-    ///
-    /// The encoded bytes do not decode, a type does not read, or
-    /// DataFusion cannot build the expression over those types.
     pub fn new(expression: &Expression) -> Result<Self, CompileError> {
         let failed = |error: String| {
             CompileError::new(format!(
@@ -267,8 +208,6 @@ impl PhysicalExpression {
                 expression.text_with(true)
             ))
         };
-        // an expression saved before types were written is built over the
-        // types of the rows it is evaluated on
         if expression.types.is_empty() && !expression.columns.is_empty() {
             return Ok(Self {
                 expression: expression.clone(),
@@ -306,16 +245,6 @@ impl PhysicalExpression {
         })
     }
 
-    /// Evaluate the expression over `batch`, one result per row.
-    ///
-    /// A column is read by its name, with its table alias when
-    /// `qualified`, as result rows name their columns.
-    ///
-    /// # Errors
-    ///
-    /// The rows lack a column the expression reads, a column's type is
-    /// not the one the expression was built for, or DataFusion cannot
-    /// evaluate it.
     pub fn evaluate(&self, batch: &RecordBatch, qualified: bool) -> Result<ArrayRef, CompileError> {
         let text = || self.expression.text_with(qualified);
         if self.schema.fields().len() != self.expression.columns.len() {
@@ -355,8 +284,6 @@ impl PhysicalExpression {
     }
 }
 
-/// A value or condition built for evaluation: a column, a field of a
-/// value, or a [`PhysicalExpression`].
 #[derive(Debug, Clone)]
 pub enum PhysicalValue {
     Column(ColumnRef),
@@ -365,12 +292,6 @@ pub enum PhysicalValue {
 }
 
 impl PhysicalValue {
-    /// Build `value` for evaluation, an alias as the value it names.
-    ///
-    /// # Errors
-    ///
-    /// The value is a model call, which the model answers, or an
-    /// expression DataFusion cannot build.
     pub fn new(value: &ValueExpression) -> Result<Self, CompileError> {
         Ok(match value {
             ValueExpression::ColumnRef(column) => Self::Column(column.clone()),
@@ -389,7 +310,6 @@ impl PhysicalValue {
         })
     }
 
-    /// The columns the value reads.
     pub fn columns(&self) -> Vec<&ColumnRef> {
         match self {
             Self::Column(column) => vec![column],
@@ -398,18 +318,6 @@ impl PhysicalValue {
         }
     }
 
-    /// Evaluate the value over `batch`, one result per row.
-    ///
-    /// A column is read by its name, with its table alias when
-    /// `qualified`, as result rows name their columns. A condition
-    /// gives a boolean array, null where SQL's three-valued logic leaves
-    /// it unknown.
-    ///
-    /// # Errors
-    ///
-    /// The rows lack a column the value reads, hold it with another
-    /// type than the value was built for, or DataFusion cannot evaluate
-    /// it.
     pub fn evaluate(&self, batch: &RecordBatch, qualified: bool) -> Result<ArrayRef, CompileError> {
         match self {
             Self::Column(column) => column_of(batch, &column.name(qualified)),
@@ -431,10 +339,6 @@ impl PhysicalValue {
     }
 }
 
-// ---------------------------------------------------------------- text
-
-/// The text of an expression whose columns are positional, with `{i}`
-/// for column `i` and doubled braces elsewhere.
 fn template(expr: &Expr) -> String {
     let written = text(expr);
     let mut out = String::new();
@@ -459,7 +363,6 @@ fn template(expr: &Expr) -> String {
     out
 }
 
-/// A literal as Python writes it: strings quoted, `True`, `None`.
 fn literal_text(value: &ScalarValue) -> String {
     if value.is_null() {
         return "None".to_string();
@@ -475,7 +378,6 @@ fn literal_text(value: &ScalarValue) -> String {
     }
 }
 
-/// An operand of a binary operator, in parentheses when it is one too.
 fn operand(expr: &Expr) -> String {
     match expr {
         Expr::BinaryExpr(_) => format!("({})", text(expr)),
@@ -483,7 +385,6 @@ fn operand(expr: &Expr) -> String {
     }
 }
 
-/// The operands of a chain of `op`, such as `a AND b AND c`.
 fn chain(expr: &Expr, op: Operator, found: &mut Vec<String>) {
     match expr {
         Expr::BinaryExpr(binary) if binary.op == op => {
@@ -498,10 +399,6 @@ fn chain(expr: &Expr, op: Operator, found: &mut Vec<String>) {
     }
 }
 
-/// The text `explain()` shows for an expression whose columns are
-/// positional: a column as its position between [`OPEN`] and
-/// [`CLOSE`], a comparison as `a > 3`, a test as `a IS NULL`, and a call
-/// as `name(arguments)`.
 fn text(expr: &Expr) -> String {
     match expr {
         Expr::Column(column) => format!("{OPEN}{}{CLOSE}", column.name.trim_start_matches('#')),
@@ -579,7 +476,6 @@ fn text(expr: &Expr) -> String {
             }
         }
         other => {
-            // DataFusion's own text, each column at its position
             let marked = other
                 .clone()
                 .transform_up(|node| match &node {
@@ -672,7 +568,6 @@ mod tests {
             mask.as_boolean(),
             &BooleanArray::from(vec![Some(true), Some(false), None])
         );
-        // a plan saved before types were written reads them from the rows
         let saved = Expression {
             types: Vec::new(),
             ..found

@@ -3,8 +3,6 @@
 import json
 from pathlib import Path
 
-# vLLM selects files by device and expert shape. Other devices use its defaults.
-# Measurements: /results/ablations/diffusion_gemma_moe_tiles*.json.
 TUNED = {
     "E=128,N=704,device_name=NVIDIA_H100_80GB_HBM3,dtype=fp8_w8a8.json": {
         "32768": {
