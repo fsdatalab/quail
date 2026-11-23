@@ -18,7 +18,7 @@ use crate::expressions::repr_str;
 use crate::graph::hash_join_nodes;
 use crate::operators::Operators;
 use crate::plan_statistics::CorpusStats;
-use crate::search::{StepKey, TableStep, default_order_rule, order_steps, search_joins};
+use crate::search::{TableStep, default_order_rule, order_steps, search_joins};
 use crate::statistics::effective_selectivity;
 
 /// One table's documents and tokens, before and after its scan's tests.
@@ -123,20 +123,10 @@ pub fn request_order(
             chunk,
             context,
         )?;
-        let steps: Vec<TableStep> = costs
-            .into_iter()
-            .enumerate()
-            .map(|(position, cost)| TableStep {
-                kind: "filter",
-                key: StepKey::Position(position),
-                selectivity: cost.selectivity,
-                or_term: None,
-                first: cost.first,
-                later: cost.later,
-                reuse_key: cost.reuse_key,
-                document_head: Vec::new(),
-                reads: Vec::new(),
-                answer: None,
+        // a request backend reuses no KV across operators
+        let steps: Vec<TableStep> = (predicates.iter().zip(costs).enumerate())
+            .map(|(position, (predicate, cost))| {
+                TableStep::ask(position, predicate, cost, Vec::new())
             })
             .collect();
         filter_orders.insert(

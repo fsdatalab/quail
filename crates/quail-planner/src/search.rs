@@ -11,13 +11,13 @@ use crate::cost::quantity::Quantity;
 use crate::cost::sol::{speed_of_light, unrounded_seconds};
 use crate::cost::statistics::AliasStats;
 use crate::cost::work::{Work, ask, scan};
-use crate::physical::{Prompt, ValueExpression};
+use crate::physical::{FilterPredicate, Prompt, ValueExpression};
 
 use crate::classify::classify_work;
 use crate::columns::{ColumnSpec, column_spec};
 use crate::context::PlanningContext;
 pub use crate::costs::StepCost;
-use crate::costs::{prepare_filter_costs, question_tokens};
+use crate::costs::{PredicateCost, prepare_filter_costs, question_tokens};
 use crate::error::CompileError;
 use crate::expressions::asked_call;
 use crate::expressions::{call_aliases, repr_str};
@@ -94,6 +94,28 @@ pub struct TableStep {
 }
 
 impl TableStep {
+    /// The step that asks `predicate`, the table's filter at written
+    /// `position`, at `cost`, after the prompt tokens `document_head`.
+    pub fn ask(
+        position: usize,
+        predicate: &FilterPredicate,
+        cost: PredicateCost,
+        document_head: Vec<i64>,
+    ) -> Self {
+        TableStep {
+            kind: ASK,
+            key: StepKey::Position(position),
+            selectivity: cost.selectivity,
+            or_term: OrTerm::of(predicate),
+            first: cost.first,
+            later: cost.later,
+            reuse_key: cost.reuse_key,
+            document_head,
+            reads: guard_reads(predicate.guard.iter().chain(&predicate.alternative)),
+            answer: predicate.answer.clone(),
+        }
+    }
+
     /// Whether no step of `later` is a term of this step's OR.
     pub fn is_last_of_or<'a>(&self, later: impl IntoIterator<Item = &'a TableStep>) -> bool {
         let name = |step: &TableStep| step.or_term.as_ref().map(|term| term.disjunction.clone());
@@ -184,21 +206,9 @@ pub fn table_steps(
         .collect();
     let costs = prepare_filter_costs(&chosen, mean_tokens, chunk, context)?;
     for (position, cost) in asks.iter().zip(costs) {
-        let prompt = &asked_call(&predicates[*position].expression).prompt;
-        steps.push(TableStep {
-            kind: ASK,
-            key: StepKey::Position(*position),
-            selectivity: cost.selectivity,
-            or_term: OrTerm::of(&predicates[*position]),
-            first: cost.first,
-            later: cost.later,
-            reuse_key: cost.reuse_key,
-            document_head: head(prompt)?,
-            reads: guard_reads(
-                (predicates[*position].guard.iter()).chain(&predicates[*position].alternative),
-            ),
-            answer: predicates[*position].answer.clone(),
-        });
+        let predicate = &predicates[*position];
+        let document_head = head(&asked_call(&predicate.expression).prompt)?;
+        steps.push(TableStep::ask(*position, predicate, cost, document_head));
     }
     let mut tests: Vec<(String, Vec<f64>)> = Vec::new();
     if let Some((_, filters)) = found
