@@ -55,6 +55,7 @@ Run every check before you push:
     cargo fmt --check
     cargo clippy --all-targets --locked
     cargo test --locked
+    deslop-please
 
 - CI runs the checks on every push to `main`. On a pull request, CI
   runs when you add the label `run-ci`; remove and add the label after
@@ -65,6 +66,18 @@ Run every check before you push:
   name says content: PROMPT, TEMPLATE, SQL, QUERY, HTML, or TEXT.
 - `check_names.py` flags two names for one concept, and one name for
   two.
+- [`deslop-please`](https://github.com/deterministic-machines/deslop-please)
+  checks the Rust structure: deep modules, narrow interfaces. Install
+  it with `cargo install deslop-please --version 0.1.3 --locked`. Fix
+  an error from first principles, never with a mechanical move that
+  hides it:
+  - `module-cycle` and `tangle`: decide which module belongs at which
+    layer.
+  - `field-leak` and `shallow-module`: find what callers do with the
+    fields or functions, and give the type a method for it, not a
+    getter.
+  - A widely read module stays one file at the crate root; a directory
+    must hide more functions than it shows.
 
 # Build
 
