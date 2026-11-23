@@ -12,7 +12,7 @@ CONFIG = (Path(__file__).parents[1] / "fixtures" / "qwen3_5_configs"
 SPEC = QWEN3_5_4B_BF16
 
 
-@pytest.mark.parametrize("name", ["qwen3.5-4b-bf16"])
+@pytest.mark.parametrize("name", ["qwen3.5-2b-bf16", "qwen3.5-4b-bf16"])
 def test_spec_matches_the_config(name):
     spec = MODELS[name]
     config = json.loads((CONFIG.parent / f"{name}.json").read_text())["text_config"]
