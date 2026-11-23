@@ -1,0 +1,72 @@
+---
+title: Quail or warehouse AI functions
+description: When to run AI-SQL with Quail on your own GPU instead of Snowflake Cortex AISQL, BigQuery AI functions, or Databricks AI Functions.
+---
+
+Snowflake Cortex AISQL, BigQuery AI functions, and Databricks AI
+Functions call a hosted language model from SQL inside your warehouse.
+Quail runs the same kind of query with an open-weight model on a GPU you
+choose, and Quail plans the SQL and the model calls together.
+
+## Choose by workload
+
+Warehouse AI functions fit a query that makes few model calls. For
+example, a query over a few thousand rows makes a few thousand calls, so
+the per-token bill stays small and you run no GPU.
+
+Quail fits a query that makes millions of model calls:
+
+- An AI filter, classifier, or extraction over millions of rows.
+- An AI join, where each pair of rows from two tables can need a model
+  call.
+- Data that can't go to a hosted model. Quail runs the model on your
+  GPU, on a GPU rented from [Modal](/docs/user-guide/models#no-local-gpu-use-modal),
+  or on [Quail Server](/docs/user-guide/server).
+- A query you run again and again, where you would rather pay for GPU
+  time than for every token.
+
+| | Warehouse AI functions | Quail |
+| --- | --- | --- |
+| Model location | The vendor's service | Your GPU, Modal, or Quail Server |
+| Models | Models the vendor hosts | Open-weight models in [Models and GPUs](/docs/user-guide/models) |
+| Price | The vendor's price per token or credit | GPU time |
+| SQL | The vendor's dialect | Snowflake syntax by default; BigQuery syntax with `dialect="bq"` |
+
+## Cost of a filter over 100,000 rows
+
+A [Quail query](https://github.com/fsdatalab/quail/blob/d8d31f14f9d5c40d6cf683a74ba860788ce0d500/demos/imdb_ending_filter.py)
+applied two AI filters to the 100,000 reviews in the Stanford IMDB
+dataset on one H100 rented from Modal. The run took 5.6 minutes,
+including model startup, and cost $0.37 at Modal's price of $3.95 per
+H100-hour. At GPT-5 nano prices, the same two filters would cost about
+$1.75. [Building an Ultra-High Throughput AI-SQL Engine](https://fsdatalab.github.io/blog/introducing-quail/)
+reports the full run.
+
+To estimate a hosted model's cost for your table, multiply the number of
+rows by the tokens in each prompt and by the vendor's price per token. A
+Quail run costs the GPU price per hour times the run's hours.
+
+## Speed compared with vLLM
+
+Quail ran the 29 queries in [QUAIL-B](https://github.com/fsdatalab/quail-bench)
+1.84 times faster on average than tuned vLLM on the same GPU and model,
+in the September 2026 benchmark. The largest gap came on BIO-4, a query
+with two AI joins over medical reports. Quail finished BIO-4 14.04 times
+faster, and the GPU cost fell from $27.03 to $1.93 per query.
+
+## Move a query from your warehouse
+
+Quail reads Snowflake's function names, such as `AI_FILTER` and
+`AI_CLASSIFY`, and BigQuery's names, such as `AI.IF` and `AI.CLASSIFY`.
+The query below uses Snowflake syntax:
+
+```sql
+SELECT r.id
+FROM reviews r
+WHERE AI_FILTER(PROMPT('Does the reviewer ask for a refund? {0}', r.body));
+```
+
+Pass `dialect="bq"` to `session.sql()` for BigQuery syntax. Quail has no
+Databricks dialect, so rewrite `ai_query` calls with
+[AI functions](/docs/user-guide/sql/ai-functions). The
+[Quickstart](/docs/user-guide/quickstart) runs a first query.
