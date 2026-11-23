@@ -2,11 +2,11 @@
 //! Read each derived table's column as the expression that defines it.
 
 use super::binding::unsupported;
-use crate::ai::{AiNode, Fetch, Semantics};
-use crate::extension::as_node;
+use crate::ai::{AiNode, Semantics};
+use crate::plan::as_node;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::logical_expr::{Expr, Join, JoinType, LogicalPlan};
+use datafusion::logical_expr::{Expr, Join, JoinType, LogicalPlan, UserDefinedLogicalNodeCore};
 use quail_planner::error::CompileError;
 use std::collections::BTreeSet;
 
@@ -59,10 +59,10 @@ pub(super) fn read_fetch(top: &Top<'_>) -> Option<Option<i64>> {
     let mut elsewhere = false;
     let _ = top.relation.apply(|plan| {
         if let Some(node) = as_node::<AiNode>(plan)
-            && let Some(Fetch::Global(rows)) = &node.fetch
+            && let Some(rows) = node.global_fetch()
         {
             match last {
-                Some(found) if std::ptr::eq(found, node) => fetch = Some(*rows as i64),
+                Some(found) if std::ptr::eq(found, node) => fetch = Some(rows as i64),
                 _ => elsewhere = true,
             }
         }
@@ -112,16 +112,31 @@ pub(super) struct Walk<'a> {
     visits: Vec<Option<Visit<'a>>>,
     /// The ids, children first.
     order: Vec<usize>,
-    pub(super) tables: Vec<Table>,
+    tables: Vec<Table>,
     /// (alias, its columns' expressions) of each derived table the
     /// binder merges into the query that reads it.
     merged: Vec<(String, Vec<(String, Expr)>)>,
     /// The binder's refusal of the FROM and JOIN shape, if any.
-    pub(super) refusal: Option<CompileError>,
+    refusal: Option<CompileError>,
 }
 
 impl<'a> Walk<'a> {
-    pub(super) fn visit(&mut self, plan: &'a LogicalPlan) -> usize {
+    /// The operators of `relation`, the plan below a region's SELECT
+    /// list, children first.
+    ///
+    /// # Errors
+    ///
+    /// The plan holds an operator or a join Quail's operators do not read.
+    pub(super) fn of(relation: &'a LogicalPlan) -> Result<Self, CompileError> {
+        let mut walk = Self::default();
+        walk.visit(relation);
+        match walk.refusal.take() {
+            Some(error) => Err(error),
+            None => Ok(walk),
+        }
+    }
+
+    fn visit(&mut self, plan: &'a LogicalPlan) -> usize {
         let id = self.visits.len();
         self.visits.push(None);
         let (kind, inputs) = match plan {
@@ -154,7 +169,7 @@ impl<'a> Walk<'a> {
                 None => unreachable!("a table scan reads a table"),
             },
             other => match as_node::<AiNode>(other) {
-                Some(node) => (Kind::Ai(node), vec![self.visit(&node.input)]),
+                Some(node) => (Kind::Ai(node), vec![self.visit(node.inputs()[0])]),
                 // the claim puts no other operator in a region
                 None => {
                     self.refuse(unsupported(
@@ -180,9 +195,9 @@ impl<'a> Walk<'a> {
             tables.push(self.tables[*table].alias.clone());
         }
         if let Kind::Ai(node) = &kind {
-            ai_join |= node.semantics != Semantics::Rows
-                || (node.is_predicate() && self.call_tables(&node.call).len() > 1);
-            if node.semantics != Semantics::Rows
+            ai_join |= node.semantics() != Semantics::Rows
+                || (node.is_predicate() && self.call_tables(&node.call()).len() > 1);
+            if node.semantics() != Semantics::Rows
                 && let Kind::Join(_) = &self.get(inputs[0]).kind
             {
                 // the gate's table is the right input of its join
@@ -250,6 +265,22 @@ impl<'a> Walk<'a> {
         self.tables
             .iter()
             .any(|table| table.alias == alias && table.gate)
+    }
+
+    /// The tables FROM and JOIN read, in scan order: every table but the
+    /// ones EXISTS gates read.
+    pub(super) fn joined_tables(&self) -> impl Iterator<Item = &Table> {
+        self.tables.iter().filter(|table| !table.gate)
+    }
+
+    /// The table the region scans as `alias`.
+    pub(super) fn scanned(&self, alias: &str) -> Option<&Table> {
+        self.tables.iter().find(|table| table.alias == alias)
+    }
+
+    /// The alias of the table a `Kind::Scan` reads, by its number.
+    pub(super) fn scan_alias(&self, table: usize) -> &str {
+        &self.tables[table].alias
     }
 
     pub(super) fn get(&self, id: usize) -> &Visit<'a> {

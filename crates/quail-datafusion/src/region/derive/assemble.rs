@@ -1,15 +1,17 @@
 //! Build operators in the order of the plan.
 //! Set each scan's columns from the operators that read them.
 
-use super::binding::Binder;
-use super::placement::PlacedConditions;
-use super::relation::JoinSpec;
+use super::binding::{Binder, check_labels, unsupported};
+use super::placement::{PlacedConditions, Term};
+use super::relation::{JoinSpec, Relation, check_calls, check_joins};
 use super::walk::{Kind, Walk};
 use super::{ByAlias, lookup, note, push};
-use crate::ai::{AiNode, Fetch, Semantics};
-use crate::functions::column_call_kind;
+use crate::ai::{AiNode, Semantics};
+use crate::rules::guards::guard_selectivity;
+use quail_planner::error::CompileError;
 use quail_planner::expressions::{
-    asked_call, asked_refs, call_aliases, call_refs, column_references, equality_refs, value_refs,
+    aliased_call, asked_call, asked_refs, call_aliases, call_refs, column_name, column_references,
+    condition_text, equality_refs, value_refs,
 };
 use quail_planner::operators::{Operators, Scan, SemanticColumn, SemanticJoin, source_columns};
 use quail_planner::physical::{ColumnRef, FilterPredicate, ModelCall, Projected, ValueExpression};
@@ -18,28 +20,130 @@ use std::collections::{BTreeMap, BTreeSet};
 /// The region's operators: the bound terms, named, and placed where the
 /// plan holds them.
 pub(super) struct Assembly<'w, 'a> {
-    pub(super) walk: &'w Walk<'a>,
-    pub(super) binder: &'w mut Binder,
+    walk: &'w Walk<'a>,
+    binder: &'w mut Binder,
     /// alias -> its AI filters, in written order.
-    pub(super) filters: ByAlias<FilterPredicate>,
+    filters: ByAlias<FilterPredicate>,
     /// Each AI join and gate, by its node.
-    pub(super) joins: BTreeMap<usize, JoinSpec>,
-    pub(super) conditions: PlacedConditions,
+    joins: BTreeMap<usize, JoinSpec>,
+    conditions: PlacedConditions,
     pub(super) found: Operators,
     /// alias -> the column operators of that table, as (kind, position
     /// in its list), in the plan's order.
-    pub(super) placed: ByAlias<(&'static str, usize)>,
+    placed: ByAlias<(&'static str, usize)>,
     /// The aliases whose AI filters or tests are placed, in order.
-    pub(super) noted: Vec<String>,
+    noted: Vec<String>,
 }
 
 impl<'w, 'a> Assembly<'w, 'a> {
+    /// Name each column operator and place the relation's conditions.
+    ///
+    /// `columns` is the SELECT list.
+    ///
+    /// # Errors
+    ///
+    /// A term does not fit the query's tables, or the query has no AI
+    /// predicate where it needs one.
+    pub(super) fn new(
+        walk: &'w Walk<'a>,
+        binder: &'w mut Binder,
+        relation: Relation,
+        columns: &[ValueExpression],
+    ) -> Result<Self, CompileError> {
+        let Relation {
+            filters,
+            joins,
+            label_tests,
+            mut conditions,
+            equalities,
+            join_filters,
+            tables,
+            ..
+        } = relation;
+        let projected: Vec<(&ModelCall, String)> = columns
+            .iter()
+            .filter_map(|column| Some((aliased_call(column, &[])?, column_name(column, true))))
+            .collect();
+        let specs: Vec<&JoinSpec> = joins.values().collect();
+        check_joins(&equalities, &join_filters, &tables, &specs, &projected)?;
+        check_calls(&filters, &specs, &projected)?;
+        let (names, computed) = binder.column_operators();
+        let mut terms: Vec<Term> = conditions
+            .drain(..)
+            .map(|(condition, selectivity)| Term::new(condition, selectivity, None))
+            .collect();
+        for (alias, found) in &label_tests {
+            for (name, labels, selectivity) in found {
+                let (call, _) = names
+                    .iter()
+                    .find(|(_, found)| found == name)
+                    .expect("a named label");
+                check_labels(name, labels, call)?;
+                terms.push(Term::new(
+                    binder.label_condition(alias, name, labels)?,
+                    *selectivity,
+                    Some(labels.clone()),
+                ));
+            }
+        }
+        let conditions = PlacedConditions::place(terms, &computed)?;
+        Ok(Self {
+            walk,
+            binder,
+            filters,
+            joins,
+            conditions,
+            found: Operators::default(),
+            placed: Vec::new(),
+            noted: Vec::new(),
+        })
+    }
+
+    /// Refuse a test of the result rows, which DataFusion runs above the
+    /// region.
+    ///
+    /// # Errors
+    ///
+    /// A condition reads more than one table's columns or answers.
+    pub(super) fn check_row_tests(&self) -> Result<(), CompileError> {
+        match self.conditions.row_test() {
+            Some(test) => unsupported(&format!(
+                "DataFusion must evaluate the result-row test {}.",
+                condition_text(test)
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// Each table's tests of answers, as its operators' column filters:
+    /// a test follows the last column operator whose answer it reads.
+    fn place_tests(&mut self) -> Option<()> {
+        for scan in &self.found.scans {
+            if self.conditions.tests_answers(&scan.alias) {
+                note(&mut self.noted, &scan.alias);
+            }
+        }
+        for alias in &self.noted {
+            let producers: Vec<&SemanticColumn> = lookup(&self.placed, alias)
+                .iter()
+                .map(|(kind, position)| self.column(kind, *position))
+                .collect();
+            let asks = lookup(&self.found.filters, alias).len();
+            let tests = self.conditions.column_tests(alias, &producers, asks)?;
+            if tests.is_empty() {
+                continue;
+            }
+            self.found.column_filters.push((alias.clone(), tests));
+        }
+        Some(())
+    }
+
     /// Whether `id` is an AI filter of one table.
     fn is_table_filter(&self, id: usize) -> bool {
         matches!(&self.walk.get(id).kind, Kind::Ai(node)
             if node.is_predicate()
-                && node.semantics == Semantics::Rows
-                && self.walk.call_tables(&node.call).len() < 2)
+                && node.semantics() == Semantics::Rows
+                && self.walk.call_tables(&node.call()).len() < 2)
     }
 
     /// Whether the executor's stop key of `alias`'s AI.IF filters keeps
@@ -60,7 +164,7 @@ impl<'w, 'a> Assembly<'w, 'a> {
 
     fn call_tables(&self, id: usize) -> BTreeSet<String> {
         match &self.walk.get(id).kind {
-            Kind::Ai(node) => self.walk.call_tables(&node.call),
+            Kind::Ai(node) => self.walk.call_tables(&node.call()),
             _ => BTreeSet::new(),
         }
     }
@@ -83,20 +187,20 @@ impl<'w, 'a> Assembly<'w, 'a> {
         for id in self.walk.ids() {
             // a column node's and an AI.IF filter's executors read a guard
             if let Kind::Ai(node) = &self.walk.get(id).kind
-                && node.guard.is_some()
-                && (node.function() == "ai_score" || node.semantics != Semantics::Rows)
+                && node.guard().is_some()
+                && (node.function() == "ai_score" || node.semantics() != Semantics::Rows)
             {
                 return None;
             }
             match &self.walk.get(id).kind {
                 Kind::Scan(table) => {
-                    let alias = &self.walk.tables[*table].alias;
+                    let alias = self.walk.scan_alias(*table);
                     self.found.scans.push(Scan {
-                        predicates: lookup(&self.conditions.scans, alias).to_vec(),
+                        predicates: self.conditions.at_scan(alias),
                         ..self.binder.scan(alias)
                     });
                 }
-                Kind::Ai(node) if node.is_predicate() || node.semantics != Semantics::Rows => {
+                Kind::Ai(node) if node.is_predicate() || node.semantics() != Semantics::Rows => {
                     if !self.is_table_filter(id) {
                         self.place_join(id)?;
                     } else if !self.walk.get(id).parent.is_some_and(|parent| {
@@ -135,10 +239,7 @@ impl<'w, 'a> Assembly<'w, 'a> {
         }
         let before_joins = !self.walk.get(below).ai_join;
         let stop_key = run.iter().find_map(|id| match &self.walk.get(*id).kind {
-            Kind::Ai(AiNode {
-                fetch: Some(Fetch::PerKey { key, n }),
-                ..
-            }) if self.stops_per_key(&alias) => Some((key.clone(), *n)),
+            Kind::Ai(node) if self.stops_per_key(&alias) => node.key_fetch(),
             _ => None,
         });
         // the executor counts a key's survivors among the rows it asks
@@ -199,18 +300,18 @@ impl<'w, 'a> Assembly<'w, 'a> {
     /// The column operators an AI column node runs: its call, or an
     /// extraction's call per field, each with its name.
     fn bound_columns(&mut self, node: &AiNode) -> Option<(&'static str, Vec<(ModelCall, String)>)> {
-        let kind = column_call_kind(&node.call)?;
-        let found = self.binder.answer(&node.answer)?;
+        let kind = node.column_kind()?;
+        let found = self.binder.answer(node.answer())?;
         Some((kind, found.calls.clone()))
     }
 
     /// A column node's guard as a condition; the outer None when it does
     /// not bind.
     fn bound_guard(&mut self, node: &AiNode) -> Option<Option<ValueExpression>> {
-        match &node.guard {
+        match node.guard() {
             None => Some(None),
             Some(guard) => {
-                let read = self.walk.through(guard);
+                let read = self.walk.through(&guard);
                 self.binder.bind_condition(&read).ok().map(Some)
             }
         }
@@ -218,7 +319,7 @@ impl<'w, 'a> Assembly<'w, 'a> {
 
     fn place_column(&mut self, id: usize, node: &AiNode) -> Option<()> {
         let read: Vec<String> = self.call_tables(id).into_iter().collect();
-        let is_column = |kind: &Kind| matches!(kind, Kind::Ai(found) if !found.is_predicate() && found.semantics == Semantics::Rows);
+        let is_column = |kind: &Kind| matches!(kind, Kind::Ai(found) if !found.is_predicate() && found.semantics() == Semantics::Rows);
         if read.len() == 2 {
             // a run of classifications of the same joined rows is placed
             // from its top, once
@@ -251,9 +352,8 @@ impl<'w, 'a> Assembly<'w, 'a> {
                         above_joins,
                         guard: guard.clone(),
                         guard_selectivity: found
-                            .guard
-                            .as_ref()
-                            .map(|found| crate::rules::guards::guard_selectivity(found, &[])),
+                            .guard()
+                            .map(|found| guard_selectivity(&found, &[])),
                     });
                 }
             }
@@ -270,10 +370,7 @@ impl<'w, 'a> Assembly<'w, 'a> {
                 name,
                 above_joins,
                 guard: guard.clone(),
-                guard_selectivity: node
-                    .guard
-                    .as_ref()
-                    .map(|found| crate::rules::guards::guard_selectivity(found, &[])),
+                guard_selectivity: node.guard().map(|found| guard_selectivity(&found, &[])),
             });
             let position = list.len() - 1;
             push(&mut self.placed, &alias, (kind, position));
@@ -290,7 +387,7 @@ impl<'w, 'a> Assembly<'w, 'a> {
         }
     }
 
-    pub(super) fn column(&self, kind: &str, position: usize) -> &SemanticColumn {
+    fn column(&self, kind: &str, position: usize) -> &SemanticColumn {
         let list = match kind {
             "label" => &self.found.classifies,
             "extract" => &self.found.extracts,

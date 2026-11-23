@@ -6,13 +6,17 @@
 //! Quail plans, become one `ModelRegion` node. DataFusion plans and runs
 //! everything else; a [`RegionRunner`] plans and runs each model region.
 //!
+//! The modules are layers: each uses only the ones above it in the table.
+//!
 //! | Module | Contents |
 //! | --- | --- |
-//! | [`functions`] | the AI functions as UDFs, and SQL dialect support |
+//! | [`functions`] | the AI functions as UDFs, their literal arguments, and SQL dialect support |
+//! | `plan` | Quail's extension nodes in a plan, and operators over new inputs |
+//! | `shared` | `SharedInput`, rows computed once and numbered |
 //! | [`ai`] | `AiNode`, one AI call as a plan node |
 //! | [`rules`] | `LowerAiCalls` and the optimizer rules around `AiNode`s |
-//! | [`region`] | `ModelRegion`, `claim_model_regions`, and `ModelRegionExec` |
-//! | [`derive`] | a region's operators, read from its DataFusion plan |
+//! | [`region`] | `ModelRegion`, its operators ([`derive`]), `claim_model_regions`, and `ModelRegionExec` |
+//! | `extension` | `QuailExtension`: all of the above added to a session |
 //!
 //! ```ignore
 //! let context = quail_datafusion::session_context(runner)?;
@@ -30,11 +34,12 @@
 use quail_dylib as _;
 
 pub mod ai;
-pub mod derive;
 mod extension;
 pub mod functions;
+mod plan;
 pub mod region;
 pub mod rules;
+mod shared;
 
 use std::sync::Arc;
 
@@ -61,6 +66,7 @@ pub fn external(error: quail_planner::error::CompileError) -> datafusion::error:
 }
 pub use region::ModelRegion;
 pub use region::claim::claim_model_regions;
+pub use region::derive;
 pub use region::exec::{
     InputBatches, InputRows, InputStream, ModelRegionExec, ModelRegionPlanner, RegionBatches,
     RegionRunner, collect_inputs,
@@ -68,12 +74,12 @@ pub use region::exec::{
 pub use region::filter_guard::GuardRegionFilters;
 pub use region::identified::IdentifiedTable;
 pub use region::region_hint::{RegionColumn, RegionColumns, RegionHint};
-pub use region::shared::{ROW_COLUMN, SharedInput, SharedInputExec};
 pub use rules::derive::{Derive, DeriveOption};
 pub use rules::lower::{LowerAiCalls, lower_ai_calls};
 pub use rules::placement::PlaceAiNodes;
 pub use rules::repeated::MergeRepeatedAiCalls;
 pub use rules::{default_rule_names, logical_rule};
+pub use shared::{ROW_COLUMN, SharedInput, SharedInputExec};
 
 /// Build a DataFusion session state with Quail registered.
 ///

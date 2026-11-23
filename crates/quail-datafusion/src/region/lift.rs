@@ -23,11 +23,14 @@ use std::sync::Arc;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column, Result};
 use datafusion::logical_expr::utils::{conjunction, split_conjunction};
-use datafusion::logical_expr::{Expr, JoinType, LogicalPlan, LogicalPlanBuilder, Projection};
+use datafusion::logical_expr::{
+    Expr, JoinType, LogicalPlan, LogicalPlanBuilder, Projection, UserDefinedLogicalNodeCore,
+};
 
-use crate::ai::{AiNode, Semantics};
-use crate::extension::{as_node, extension_node};
+use super::derive::is_join_filter;
+use crate::ai::AiNode;
 use crate::functions::{is_ai_call, is_quail_call};
+use crate::plan::{as_node, extension_node};
 
 /// The operators DataFusion runs above a region, lowest first.
 #[derive(Debug, Default)]
@@ -256,14 +259,10 @@ fn answer_tables(plan: &LogicalPlan) -> Answers {
     let mut found = BTreeMap::new();
     let _ = plan.apply(|node| {
         if let Some(ai) = as_node::<AiNode>(node) {
-            let tables: BTreeSet<String> = ai
-                .call
-                .column_refs()
-                .into_iter()
-                .filter_map(|column| column.relation.as_ref().map(|table| table.to_string()))
-                .collect();
-            for field in &ai.fields {
-                found.insert(field.name().clone(), (ai.answer.clone(), tables.clone()));
+            let tables: BTreeSet<String> =
+                ai.call_tables().iter().map(ToString::to_string).collect();
+            for name in ai.added_names() {
+                found.insert(name, (ai.answer().to_string(), tables.clone()));
             }
         }
         Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
@@ -303,37 +302,6 @@ fn is_row_test(term: &Expr, answers: &Answers, join_key: bool) -> bool {
         }
     }
     tables.len() > 1 || calls.len() > 1
-}
-
-/// Whether an inner join keeps a term as its filter: a test of exactly two
-/// tables' columns that calls no model and has no subquery. An equality
-/// of a value of each table stays a key, which DataFusion computes.
-pub(crate) fn is_join_filter(term: &Expr) -> bool {
-    let tables = |expr: &Expr| -> Option<BTreeSet<String>> {
-        expr.column_refs()
-            .into_iter()
-            .map(|column| column.relation.as_ref().map(ToString::to_string))
-            .collect()
-    };
-    if let Expr::BinaryExpr(binary) = term
-        && binary.op == datafusion::logical_expr::Operator::Eq
-        && let (Some(left), Some(right)) = (tables(&binary.left), tables(&binary.right))
-        && left.len() == 1
-        && right.len() == 1
-        && left != right
-    {
-        return false;
-    }
-    let special = term
-        .exists(|inner| {
-            Ok(is_quail_call(inner)
-                || matches!(
-                    inner,
-                    Expr::Exists(_) | Expr::InSubquery(_) | Expr::ScalarSubquery(_)
-                ))
-        })
-        .unwrap_or(true);
-    !special && tables(term).is_some_and(|found| found.len() == 2)
 }
 
 /// Whether a term is `a.x = b.y`, an equality of two tables' columns.
@@ -409,34 +377,15 @@ fn take_row_tests(
             Ok(LogicalPlan::Join(join))
         }
         LogicalPlan::Extension(_) if let Some(node) = as_node::<AiNode>(&plan) => {
-            let node = node.clone();
-            let rows = node.semantics == Semantics::Rows;
-            let below_fixed = fixed || node.fetch.is_some() || !rows;
+            let below_fixed = fixed || node.limits_rows();
             let input = take_row_tests(
-                node.input.as_ref().clone(),
+                node.inputs()[0].clone(),
                 answers,
                 (below_fixed, join_filters),
                 lifted,
             )?;
             let mut node = node.with_input(input)?;
-            if rows
-                && !node.is_predicate()
-                && let Some(filter) = node.filter.take()
-            {
-                let (moved, kept) = split(&filter, false);
-                if !moved.is_empty() && node.fetch.is_some() {
-                    // a fetch counts the rows that pass the whole filter
-                    node.filter = Some(filter);
-                } else {
-                    node.tests.retain(|test| {
-                        !split_conjunction(&test.test)
-                            .iter()
-                            .any(|term| moved.contains(term))
-                    });
-                    lifted.extend(moved);
-                    node.filter = conjunction(kept);
-                }
-            }
+            lifted.extend(node.lift_filter(|filter| split(filter, false)));
             Ok(extension_node(node.checked()?))
         }
         other => {
@@ -446,7 +395,7 @@ fn take_row_tests(
                 .cloned()
                 .map(|input| take_row_tests(input, answers, (fixed, join_filters), lifted))
                 .collect::<Result<Vec<_>>>()?;
-            crate::extension::with_inputs(&other, inputs)
+            crate::plan::with_inputs(&other, inputs)
         }
     }
 }

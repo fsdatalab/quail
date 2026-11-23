@@ -7,9 +7,9 @@ use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, Result, TableReference, internal_err};
 use datafusion::logical_expr::{Expr, Join, JoinType, LogicalPlan, LogicalPlanBuilder, Projection};
 
-use super::shared::{ROW_COLUMN, SharedInput};
-use crate::extension::extension_node;
 use crate::functions::is_ai_call;
+use crate::plan::extension_node;
+use crate::shared::{ROW_COLUMN, SharedInput};
 
 /// Lower an outer AI ON predicate through an inner matching relation.
 ///

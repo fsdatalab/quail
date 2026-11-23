@@ -1,8 +1,9 @@
 //! Bind AI calls and their prompts.
 //! Read literal arguments, options, and classification categories.
 
-use super::{Binder, Options};
+use super::Binder;
 use crate::functions::function_name;
+use crate::functions::options::{Options, number_of, object_fields, parse_options, string_literal};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, ScalarValue};
@@ -28,22 +29,6 @@ pub(super) fn is_call(expr: &Expr, name: &str) -> bool {
     function_name(expr) == Some(name)
 }
 
-pub(crate) fn string_literal(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::Literal(value, _) => value.try_as_str().flatten().map(str::to_string),
-        _ => None,
-    }
-}
-
-/// A numeric SQL literal cast to `to`, or None.
-fn numeric_literal(expr: &Expr, to: &DataType) -> Option<ScalarValue> {
-    match expr {
-        Expr::Literal(value, _) if value.data_type().is_numeric() => value.cast_to(to).ok(),
-        Expr::Negative(inner) => numeric_literal(inner, to)?.arithmetic_negate().ok(),
-        _ => None,
-    }
-}
-
 /// An integer SQL literal, or None.
 fn integer_of(expr: &Expr) -> Option<i64> {
     let Expr::Literal(value, _) = expr else {
@@ -57,64 +42,6 @@ fn integer_of(expr: &Expr) -> Option<i64> {
         Ok(ScalarValue::Int64(value)) => value,
         _ => None,
     }
-}
-
-/// The (key, value) pairs of an option object, `named_struct(k, v, ...)`.
-fn object_fields(expr: &Expr) -> Option<Vec<(String, &Expr)>> {
-    if !is_call(expr, "named_struct") {
-        return None;
-    }
-    arguments(expr)
-        .chunks(2)
-        .map(|pair| Some((string_literal(&pair[0])?, &pair[1])))
-        .collect()
-}
-
-fn sorted_keys(keys: &[&str]) -> String {
-    let mut keys: Vec<String> = keys.iter().map(|key| repr_str(key)).collect();
-    keys.sort();
-    format!("[{}]", keys.join(", "))
-}
-
-fn number_of(expr: &Expr) -> Option<f64> {
-    match numeric_literal(expr, &DataType::Float64)? {
-        ScalarValue::Float64(value) => value,
-        _ => None,
-    }
-}
-
-pub(super) fn parse_options(
-    node: Option<&Expr>,
-    allowed: &[&str],
-) -> Result<Options, CompileError> {
-    let Some(node) = node else {
-        return Ok(Options::default());
-    };
-    let Some(fields) = object_fields(node) else {
-        return compile_error("AI options must be an object such as {'selectivity': 0.3}.");
-    };
-    let mut options = Options::default();
-    for (key, value) in fields {
-        if !allowed.contains(&key.as_str()) {
-            return compile_error(format!(
-                "Unknown option {} must be replaced with one of {}.",
-                repr_str(&key),
-                sorted_keys(allowed)
-            ));
-        }
-        if key == "selectivity" {
-            match (string_literal(value), number_of(value)) {
-                (None, Some(number)) => options.selectivity = Some(number),
-                _ => return compile_error("The selectivity option must be a number."),
-            }
-        } else {
-            match string_literal(value) {
-                Some(text) => options.anchor = Some(text),
-                None => return compile_error("The anchor option must be a table alias string."),
-            }
-        }
-    }
-    Ok(options)
 }
 
 impl Binder {
@@ -317,7 +244,7 @@ impl Binder {
             comparison.1,
             Box::new(Expr::Literal(ScalarValue::Float64(Some(value)), None)),
         ));
-        let test = crate::derive::expressions::expression(&compared, |_| {
+        let test = crate::region::derive::expressions::expression(&compared, |_| {
             Ok((score.clone(), DataType::Float64))
         })?;
         let test = ValueExpression::Value(test);
@@ -692,7 +619,7 @@ mod tests {
 
     fn call(name: &str, args: Vec<Expr>) -> Expr {
         Expr::ScalarFunction(ScalarFunction::new_udf(
-            crate::rules::lower::quail_function(name),
+            crate::functions::quail_function(name),
             args,
         ))
     }

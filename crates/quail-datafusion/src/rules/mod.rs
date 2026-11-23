@@ -23,7 +23,6 @@ pub(crate) mod distinct;
 pub(crate) mod guards;
 
 pub(crate) mod lower;
-pub(crate) mod or_guards;
 pub(crate) mod placement;
 pub(crate) mod projection;
 pub(crate) mod repeated;

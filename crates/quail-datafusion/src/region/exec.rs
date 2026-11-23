@@ -41,7 +41,7 @@ use futures::{StreamExt, stream};
 
 use crate::region::ModelRegion;
 use crate::region::region_hint::RegionHint;
-use crate::region::shared::{SharedInput, SharedInputExec, SharedRowsByKey};
+use crate::shared::{SharedInput, SharedInputExec, SharedRowsByKey};
 
 /// The rows of one region input: its table name and its batches.
 pub type InputRows = (String, Vec<RecordBatch>);

@@ -6,17 +6,19 @@ mod conditions;
 mod select;
 
 use crate::functions::function_name;
+use crate::functions::options::string_literal;
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::common::Column;
 use datafusion::common::tree_node::TreeNode;
 use datafusion::logical_expr::Expr;
+use quail_planner::constants::SPAN_SUFFIX;
 use quail_planner::error::CompileError;
 use quail_planner::expressions::repr_str;
 use quail_planner::operators::{Scan, ScanColumn, Schema};
 use quail_planner::physical::{ColumnRef, GetField, ModelCall, ValueExpression};
 use quail_planner::prompts::Turn;
+use std::collections::BTreeMap;
 
-pub(crate) use calls::string_literal;
 pub(crate) use conditions::{check_labels, negated_inward};
 pub(crate) use select::{Selected, output_name};
 
@@ -24,16 +26,13 @@ pub(crate) fn unsupported<T>(message: &str) -> Result<T, CompileError> {
     Err(CompileError::unsupported(message))
 }
 
+/// By (alias, column), the kind of the column operator of that table
+/// that computes the column.
+pub(crate) type ComputedBy = BTreeMap<(String, String), &'static str>;
+
 /// Whether `expr` or an expression inside it is one `found` accepts.
 fn contains(expr: &Expr, found: impl Fn(&Expr) -> bool) -> bool {
     expr.exists(|inner| Ok(found(inner))).unwrap_or(false)
-}
-
-/// An AI predicate's options: selectivity and anchor.
-#[derive(Default, Clone)]
-pub(crate) struct Options {
-    pub(crate) selectivity: Option<f64>,
-    pub(crate) anchor: Option<String>,
 }
 
 /// The columns one `AiNode` adds, as the region's operators name them.
@@ -64,7 +63,7 @@ pub(crate) struct Binder {
     /// alias -> the document expression its prompts read.
     document_columns: Vec<(String, ValueExpression)>,
     /// The columns each `AiNode` adds, in the plan's order.
-    pub(crate) answers: Vec<AnswerColumn>,
+    answers: Vec<AnswerColumn>,
     /// (alias, column, type) of each answer column a test reads.
     answer_types: Vec<(String, String, DataType)>,
 }
@@ -81,6 +80,30 @@ impl Binder {
             answers: Vec::new(),
             answer_types: Vec::new(),
         }
+    }
+
+    /// The model call and name of each column a column operator adds, and
+    /// by (alias, column) the kind of the operator of one table that
+    /// computes it, an extraction's spans included.
+    pub(crate) fn column_operators(&self) -> (Vec<(ModelCall, String)>, ComputedBy) {
+        let mut names: Vec<(ModelCall, String)> = Vec::new();
+        let mut computed: ComputedBy = BTreeMap::new();
+        for found in &self.answers {
+            if !["label", "extract", "features", "map"].contains(&found.kind) {
+                continue;
+            }
+            for (call, name) in &found.calls {
+                names.push((call.clone(), name.clone()));
+                if let Some(alias) = &found.alias {
+                    computed.insert((alias.clone(), name.clone()), found.kind);
+                    if found.kind == "extract" {
+                        let span = format!("{name}{SPAN_SUFFIX}");
+                        computed.insert((alias.clone(), span), "extract");
+                    }
+                }
+            }
+        }
+        (names, computed)
     }
 
     fn provider(&self, alias: &str) -> Option<&str> {
@@ -199,7 +222,7 @@ impl Binder {
                 "DataFusion must evaluate this expression outside the model region.",
             );
         }
-        crate::derive::expressions::expression(expr, |column| {
+        crate::region::derive::expressions::expression(expr, |column| {
             let reference = self.resolve_column(column)?;
             let data_type = self.column_type(&reference)?;
             Ok((reference, data_type))

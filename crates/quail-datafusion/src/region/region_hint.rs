@@ -22,7 +22,7 @@ use datafusion::arrow::datatypes::DataType;
 use datafusion::common::cast::{as_boolean_array, as_float64_array};
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column as LogicalColumn, Result};
-use datafusion::logical_expr::{Expr, LogicalPlan, Operator};
+use datafusion::logical_expr::{Expr, LogicalPlan, Operator, UserDefinedLogicalNodeCore};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{
     BinaryExpr, Column, IsNotNullExpr, IsNullExpr, NotExpr,
@@ -33,8 +33,8 @@ use datafusion::physical_expr_common::physical_expr::{
 };
 
 use crate::ai::AiNode;
-use crate::derive::partial::{Completions, Decision, LISTED, decide_expr};
 use crate::region::ModelRegion;
+use crate::region::derive::partial::{Completions, Decision, LISTED, decide_expr};
 
 /// The tests above a region that it may drop rows by, over the region's
 /// columns. They may tighten while the query runs.
@@ -260,8 +260,9 @@ impl RegionColumns {
             if let LogicalPlan::Extension(extension) = node
                 && let Some(ai) = extension.node.as_any().downcast_ref::<AiNode>()
             {
-                for column in ai.call.column_refs() {
-                    if let Some(found) = passed_on(region, &ai.input, column)
+                let call = ai.call();
+                for column in call.column_refs() {
+                    if let Some(found) = passed_on(region, ai.inputs()[0], column)
                         && !documents.contains(&found)
                     {
                         documents.push(found);
@@ -321,7 +322,7 @@ fn score_columns(plan: &LogicalPlan) -> Vec<String> {
                 if let Some(ai) = extension.node.as_any().downcast_ref::<AiNode>()
                     && ai.function() == "ai_score"
                 {
-                    found.extend(ai.fields.iter().map(|field| field.name().clone()));
+                    found.extend(ai.added_names());
                 }
             }
             LogicalPlan::Projection(projection) => {

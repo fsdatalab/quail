@@ -8,7 +8,7 @@
 //! columns and options, whose text arguments differ only in
 //!
 //! - case, whitespace, or punctuation ([`Likeness::Spelling`]), which
-//!   [`crate::derive::derive_region`] refuses; or
+//!   [`crate::region::derive::derive_region`] refuses; or
 //! - at most two letter edits of a text at least 12 characters long,
 //!   with the same digits ([`Likeness::Typo`]), which Quail warns about.
 //!
@@ -23,7 +23,7 @@ use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::{Expr, LogicalPlan, lit};
 
 use crate::ai::AiNode;
-use crate::extension::as_node;
+use crate::plan::as_node;
 
 /// How alike two calls' texts are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -64,10 +64,11 @@ impl Similar {
 pub fn similar_calls(plan: &LogicalPlan) -> Vec<Similar> {
     let mut calls: Vec<Expr> = Vec::new();
     let _ = plan.apply(|node| {
-        if let Some(ai) = as_node::<AiNode>(node)
-            && !calls.contains(&ai.call)
-        {
-            calls.push(ai.call.clone());
+        if let Some(ai) = as_node::<AiNode>(node) {
+            let call = ai.call();
+            if !calls.contains(&call) {
+                calls.push(call);
+            }
         }
         Ok(TreeNodeRecursion::Continue)
     });
