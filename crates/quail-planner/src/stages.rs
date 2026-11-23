@@ -22,7 +22,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::physical::{Location, PhysicalGraph, PhysicalNode, PortRef, topological_nodes};
+use crate::physical::{Location, PhysicalGraph, PhysicalNode, PortRef};
+use crate::topology::topological_nodes;
 use serde::{Deserialize, Serialize};
 
 /// One port a stage reads from outside it.
@@ -139,7 +140,7 @@ pub fn compute_nodes(graph: &PhysicalGraph) -> Vec<usize> {
 ///
 /// The graph is invalid, or a node reads a port no scan or stage writes.
 pub fn stages(graph: &PhysicalGraph, gpus: usize) -> Result<Vec<Stage>, String> {
-    crate::physical::validate_graph(&graph.nodes, &graph.root)?;
+    crate::topology::validate_graph(&graph.nodes, &graph.root)?;
     let nodes: Vec<CutNode> = compute_nodes(graph)
         .into_iter()
         .map(|index| CutNode::of(&graph.nodes[index]))
@@ -313,7 +314,8 @@ mod tests {
 
     #[test]
     fn stages_reject_invalid_graphs_before_traversal() {
-        use crate::physical::{InputPort, Node, ScanAttributes, ValueType, port};
+        use crate::physical::{InputPort, Node, ScanAttributes, ValueType};
+        use crate::topology::port;
 
         let scan = PhysicalNode::Scan(Node {
             id: "scan:r".into(),
@@ -357,7 +359,7 @@ mod tests {
             role,
             inputs: inputs
                 .iter()
-                .map(|(node_id, port)| crate::physical::port(node_id, *port))
+                .map(|(node_id, port)| crate::topology::port(node_id, *port))
                 .collect(),
         }
     }

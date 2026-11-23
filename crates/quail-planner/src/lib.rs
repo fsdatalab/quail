@@ -46,6 +46,7 @@ pub mod sol;
 pub mod specs;
 pub mod stages;
 pub mod statistics;
+pub mod topology;
 pub mod validation;
 
 pub use error::{CompileError, ErrorKind, Refusal, compile_error};

@@ -1,11 +1,9 @@
-//! What each node offers a pipeline, and the pipelines of a graph.
+//! What each node of a physical graph offers a pipeline, and the
+//! pipelines, order, and validity of a graph.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::physical::expressions::ValueExpression;
-use crate::physical::nodes::*;
-use crate::physical::ports::{AnswerOutput, InputPort, OutputPort, PortRef, ValueType};
-use crate::physical::specs::ExtractSpec;
+use crate::physical::*;
 
 /// The outputs of a request backend's node: each table's survivors, then
 /// each operator's answers.

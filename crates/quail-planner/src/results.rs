@@ -5,8 +5,8 @@
 use crate::constants::{PROBABILITIES_SUFFIX, SPAN_SUFFIX};
 use crate::physical::{
     LimitAttributes, ModelCall, Node, PhysicalNode, PortRef, Projected, ValueExpression,
-    input_ports,
 };
+use crate::topology::input_ports;
 use serde_json::Value;
 
 use crate::expressions::{

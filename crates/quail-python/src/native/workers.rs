@@ -142,7 +142,7 @@ impl Workers {
     ) -> PyResult<Vec<(String, Vec<Bound<'py, PyAny>>)>> {
         let graph: PhysicalGraph = from_json(graph)?;
         let cut: Vec<Stage> = from_json(stages)?;
-        quail_planner::physical::validate_graph(&graph.nodes, &graph.root)
+        quail_planner::topology::validate_graph(&graph.nodes, &graph.root)
             .map_err(PyValueError::new_err)?;
         let region: serde_json::Value = from_json(region)?;
         let tables = tables

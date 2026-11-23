@@ -12,7 +12,8 @@ use crate::cost::sol::{speed_of_light, unrounded_seconds};
 use crate::cost::statistics::{AliasStats, round_half_even};
 use crate::cost::work::{Quantity, numpy_sum};
 use crate::cost::work::{Work, ask, packed, scan};
-use crate::physical::{AiFilterAttributes, PhysicalNode, build_pipelines, resident_inputs};
+use crate::physical::{AiFilterAttributes, PhysicalNode};
+use crate::topology::{build_pipelines, resident_inputs};
 use serde_json::{Map, Value};
 
 use crate::classify::classify_statistics;
@@ -193,7 +194,7 @@ pub fn expected_documents(node: &PhysicalNode) -> f64 {
 /// The positions of each pass group's operators, in execution order.
 pub fn pass_members(nodes: &[PhysicalNode]) -> Vec<Vec<usize>> {
     let mut groups: Vec<(i64, Vec<usize>)> = Vec::new();
-    for index in crate::physical::topological_nodes(nodes) {
+    for index in crate::topology::topological_nodes(nodes) {
         let group = nodes[index].pass_group();
         if group < 0 {
             continue;
@@ -372,7 +373,7 @@ impl PlanPricer {
         }
         let residents = resident_inputs(nodes, &pipelines);
         let mut out = Priced::new();
-        for index in crate::physical::topological_nodes(nodes) {
+        for index in crate::topology::topological_nodes(nodes) {
             let node = &nodes[index];
             let mut entry = Map::new();
             let resident = residents.contains(node.id());

@@ -7,7 +7,8 @@ use crate::budgets::{cheaper_attention_path, chunk_budget, tree_attention_allowe
 use crate::cost::packing::choose_pass_groups;
 use crate::cost::retention::coefficients;
 use crate::cost::statistics::AliasStats;
-use crate::physical::{PhysicalGraph, PhysicalNode, build_pipelines, topological_nodes};
+use crate::physical::{PhysicalGraph, PhysicalNode};
+use crate::topology::{build_pipelines, topological_nodes};
 use serde_json::{Map, Value};
 
 use crate::classify::classify_statistics;

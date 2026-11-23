@@ -11,8 +11,9 @@ use crate::physical::{
     AiClassifyAttributes, AiExtractAttributes, AiFilterAttributes, AiJoinAttributes,
     AiMapAttributes, AiSaeFeaturesAttributes, AiScoreAttributes, Asked, BarrierAttributes,
     ClassifySpec, ColumnRef, Expression, FilterAttributes, HashJoinAttributes, ModelCall, Node,
-    PhysicalNode, PortRef, Prompt, ScanAttributes, ScoreSpec, ValueExpression, input_ports, port,
+    PhysicalNode, PortRef, Prompt, ScanAttributes, ScoreSpec, ValueExpression,
 };
+use crate::topology::{input_ports, port};
 use serde_json::{Map, Value};
 
 use crate::classify::classify_statistics;
@@ -1565,7 +1566,7 @@ pub fn build_physical_plan(
 /// A refusal when a pair classification cannot run in its join's
 /// pipeline, as `joined_classification_refusal`.
 pub fn joined_classification_refusal(nodes: &[PhysicalNode]) -> Option<Refusal> {
-    let pipelines = crate::physical::build_pipelines(nodes, &[]);
+    let pipelines = crate::topology::build_pipelines(nodes, &[]);
     for node in nodes {
         let PhysicalNode::AiClassify(classify) = node else {
             continue;

@@ -7,7 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::budgets::chunk_budget;
 use crate::cost::statistics::AliasStats;
 use crate::cost::work::Work;
-use crate::physical::{PhysicalNode, PortRef, port};
+use crate::physical::{PhysicalNode, PortRef};
+use crate::topology::port;
 use serde::Serialize;
 
 use crate::context::PlanningContext;

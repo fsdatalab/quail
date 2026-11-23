@@ -60,7 +60,7 @@ impl Planned<'_> {
         let last = (nodes.last()).ok_or_else(|| failure("the plan has no compute operation"))?;
         let port = (last.output_ports().into_iter().next())
             .ok_or_else(|| failure("the plan's last node has no output"))?;
-        let root = quail_planner::physical::port(last.id(), &port.name);
+        let root = quail_planner::topology::port(last.id(), &port.name);
         Ok(PhysicalGraph { nodes, root })
     }
 

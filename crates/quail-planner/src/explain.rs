@@ -1725,7 +1725,7 @@ fn physical_tree(
     let known: Option<Vec<PhysicalNode>> =
         graph.nodes.iter().map(|node| node.known.clone()).collect();
     if let Some(known) = known {
-        let pipelines = crate::physical::build_pipelines(&known, &[]);
+        let pipelines = crate::topology::build_pipelines(&known, &[]);
         for members in &pipelines.members {
             if members.len() < 2 {
                 continue;

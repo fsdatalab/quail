@@ -20,6 +20,7 @@ use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PyString, PyTuple};
 use quail_datafusion::derive::expressions::PhysicalValue;
 use quail_planner::physical;
+use quail_planner::topology;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
@@ -1369,7 +1370,7 @@ leaf_classes! {
     fn same_decoding(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<bool> {
         let one: physical::ExtractSpec = held_value(slf.as_any())?;
         let two: physical::ExtractSpec = held_value(other)?;
-        Ok(physical::same_decoding(&one, &two))
+        Ok(topology::same_decoding(&one, &two))
     }
     },
     MapSpec = "MapSpec": InferenceSpec [InferenceSpec] {},
@@ -1731,7 +1732,7 @@ impl PhysicalGraph {
     fn from_json<'py>(py: Python<'py>, text: &str) -> PyResult<Bound<'py, Self>> {
         let graph: physical::PhysicalGraph =
             serde_json::from_str(text).map_err(|error| PyValueError::new_err(error.to_string()))?;
-        physical::validate_graph(&graph.nodes, &graph.root)
+        topology::validate_graph(&graph.nodes, &graph.root)
             .map_err(GraphValidationError::new_err)?;
         Self::of(py, graph)
     }
@@ -1768,7 +1769,7 @@ impl PhysicalGraph {
     /// given, that every node has a registered runtime.
     #[pyo3(signature = (runtime_keys=None))]
     fn validate(&self, runtime_keys: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
-        physical::validate_graph(&self.graph.nodes, &self.graph.root)
+        topology::validate_graph(&self.graph.nodes, &self.graph.root)
             .map_err(GraphValidationError::new_err)?;
         if let Some(keys) = runtime_keys {
             let mut missing: Vec<&str> = Vec::new();
@@ -1811,7 +1812,7 @@ impl PhysicalGraph {
     /// Return the nodes, each after all its inputs.
     fn topological_nodes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
         self.validate(None)?;
-        self.by_position(py, &physical::topological_nodes(&self.graph.nodes))
+        self.by_position(py, &topology::topological_nodes(&self.graph.nodes))
     }
 
     /// Return the nodes with one type name.
@@ -1844,7 +1845,7 @@ impl PhysicalGraph {
         completed: Vec<String>,
     ) -> PyResult<Bound<'py, PyDict>> {
         self.validate(None)?;
-        let pipelines = physical::build_pipelines(&self.graph.nodes, &completed);
+        let pipelines = topology::build_pipelines(&self.graph.nodes, &completed);
         let found = PyDict::new(py);
         let groups = pipelines
             .members
@@ -1868,8 +1869,8 @@ impl PhysicalGraph {
         completed: Vec<String>,
     ) -> PyResult<Bound<'py, PyFrozenSet>> {
         self.validate(None)?;
-        let pipelines = physical::build_pipelines(&self.graph.nodes, &completed);
-        PyFrozenSet::new(py, physical::resident_inputs(&self.graph.nodes, &pipelines))
+        let pipelines = topology::build_pipelines(&self.graph.nodes, &completed);
+        PyFrozenSet::new(py, topology::resident_inputs(&self.graph.nodes, &pipelines))
     }
 
     fn __eq__(&self, other: &Bound<'_, PyAny>) -> bool {
@@ -1930,7 +1931,7 @@ pub fn input_ports<'py>(
         .try_iter()?
         .map(|source| held_value::<physical::PortRef>(&source?))
         .collect::<PyResult<Vec<_>>>()?;
-    let ports = physical::input_ports(&sources)
+    let ports = topology::input_ports(&sources)
         .iter()
         .map(|port| to_python(py, &serde_json::to_value(port).expect("a port writes")))
         .collect::<PyResult<Vec<_>>>()?;

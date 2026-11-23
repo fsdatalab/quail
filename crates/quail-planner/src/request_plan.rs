@@ -6,7 +6,8 @@
 //! codecs read, since only the request executor reads them.
 
 use crate::constants::LABEL_PREFIX;
-use crate::physical::{Node, PhysicalNode, PortRef, ScanAttributes, input_ports, port};
+use crate::physical::{Node, PhysicalNode, PortRef, ScanAttributes};
+use crate::topology::{input_ports, port};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
