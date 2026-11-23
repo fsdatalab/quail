@@ -452,10 +452,25 @@ impl Executor {
         self.progress.lock().expect("the progress lock").clone()
     }
 
-    /// What each region of the last query ran on the workers, in the
-    /// order the regions ran; the executor keeps none of it.
-    pub fn take_regions(&self) -> Vec<RegionRan> {
-        std::mem::take(&mut *self.regions.lock().expect("the regions lock"))
+    /// Hand what each region of the last query ran on the workers to
+    /// `each`, in the order the regions ran, and return what `each`
+    /// makes of them; the executor keeps none of it.
+    ///
+    /// # Errors
+    ///
+    /// `each` fails; the regions after the one it failed on are dropped.
+    pub fn take_regions<T, E>(
+        &self,
+        each: impl FnMut(RegionRan) -> std::result::Result<T, E>,
+    ) -> std::result::Result<Vec<T>, E> {
+        let regions = std::mem::take(&mut *self.regions.lock().expect("the regions lock"));
+        regions.into_iter().map(each).collect()
+    }
+
+    /// Drop what each region of the last query ran, such as after the
+    /// query failed.
+    pub fn discard_regions(&self) {
+        self.regions.lock().expect("the regions lock").clear();
     }
 
     pub(crate) fn enter(&self, sender: UnboundedSender<RegionCall>) -> Result<CallerGuard<'_>> {
