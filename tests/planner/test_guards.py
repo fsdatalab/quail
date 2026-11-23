@@ -453,4 +453,25 @@ def test_an_extraction_guarded_by_a_returned_ai_filter_runs_after_the_filter():
         transcript = runs.query(
             f"SELECT r.id, CASE WHEN {LONG} = FALSE THEN {EXTRACT}['w'] ELSE 'none'"
             f" END AS c0 FROM reviews r WHERE NOT {KIND}")
-    assert_transcript(transcript, "")
+    assert_transcript(transcript, """\
+--- SELECT r.id, CASE WHEN AI_FILTER(PROMPT('long: {0}', r.body)) = FALSE THEN
+    AI.EXTRACT(r.body, {'w': 'Which word?'})['w'] ELSE 'none' END AS c0 FROM reviews r
+    WHERE NOT AI_FILTER(PROMPT('kind: {0}', r.body)) ---
+plan
+  __quail_call_2 = ai_extract(r.body, named_struct('w', 'Which word?')), guard:
+      __quail_call_1 IS FALSE, returns: [__quail_call_2]
+  __quail_call_1 = ai_filter('long: {0}', r.body)
+  __quail_answer_1 = ai_filter('kind: {0}', r.body), filter: NOT __quail_answer_1,
+      returns: []
+asked 17 of 18
+  'kind: {0}': r0 TRUE, r1 FALSE, r2 TRUE, r3 FALSE, r4 TRUE, r5 FALSE, r6 FALSE, r7
+      FALSE
+  'long: {0}': r1 FALSE, r3 TRUE, r5 FALSE, r6 FALSE, r7 FALSE
+  'Which word?': r1 'b1', r5 'b5', r6 'b6', r7 'b7'
+rows 5
+  r1, 'b1'
+  r3, 'none'
+  r5, 'b5'
+  r6, 'b6'
+  r7, 'b7'
+""")
