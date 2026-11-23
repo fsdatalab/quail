@@ -961,11 +961,11 @@ fn run_on_workers(
     let scanned: Vec<crate::request::Scanned> = scans
         .iter()
         .map(|scan| {
-            let tokens = (
-                Arc::clone(scan.tokens.schema()),
-                scan.tokens.record_batches().to_vec(),
-            );
-            (scan.alias.clone(), tokens, scan.columns.clone())
+            (
+                scan.alias.clone(),
+                scan.tokens.to_table(),
+                scan.columns.clone(),
+            )
         })
         .collect();
     // the workers and the answers name a scan by its alias

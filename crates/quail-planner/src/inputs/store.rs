@@ -163,14 +163,11 @@ impl TokenStore {
         }
     }
 
-    /// The store's schema: the token, count, and optional offset columns.
-    pub fn schema(&self) -> &SchemaRef {
-        &self.schema
-    }
-
-    /// The store's record batches.
-    pub fn record_batches(&self) -> &[RecordBatch] {
-        &self.batches
+    /// The store as the Arrow table Python's `TokenStore` reads: the
+    /// schema of the token, count, and optional offset columns, and the
+    /// record batches, over the store's buffers.
+    pub fn to_table(&self) -> (SchemaRef, Vec<RecordBatch>) {
+        (Arc::clone(&self.schema), self.batches.clone())
     }
 
     /// Each document's token count.
