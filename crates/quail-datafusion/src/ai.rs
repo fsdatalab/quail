@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use datafusion::arrow::datatypes::Field;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion::common::{DFSchema, DFSchemaRef, Result, TableReference, internal_err, plan_err};
+use datafusion::common::{
+    Column, DFSchema, DFSchemaRef, Result, TableReference, internal_err, plan_err,
+};
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::utils::{conjunction, disjunction, split_binary, split_conjunction};
 use datafusion::logical_expr::{

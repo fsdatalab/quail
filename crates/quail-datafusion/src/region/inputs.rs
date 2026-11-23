@@ -11,7 +11,7 @@ use datafusion::logical_expr::{
 
 use super::calls_ai;
 use super::identified::IdentifiedTable;
-use crate::ai::AiNode;
+use crate::ai::{AiNode, Semantics};
 use crate::functions::{is_ai_call, is_quail_call};
 use crate::plan::as_node;
 use crate::shared::{ROW_COLUMN, row_field};
@@ -533,7 +533,8 @@ fn merged_aliases(plan: &LogicalPlan) -> Vec<String> {
                     LogicalPlan::Filter(filter) => filter.input.as_ref(),
                     LogicalPlan::Extension(_) => match as_node::<AiNode>(base) {
                         Some(node) => {
-                            calls_model |= !node.is_predicate() || node.is_join();
+                            calls_model |=
+                                !node.is_predicate() || node.semantics() != Semantics::Rows;
                             node.inputs()[0]
                         }
                         None => break,

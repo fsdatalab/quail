@@ -115,7 +115,7 @@ impl<'w, 'a> Assembly<'w, 'a> {
     fn is_table_filter(&self, id: usize) -> bool {
         matches!(&self.walk.get(id).kind, Kind::Ai(node)
             if node.is_predicate()
-                && !node.is_join()
+                && node.semantics() == Semantics::Rows
                 && self.walk.call_tables(&node.call()).len() < 2)
     }
 
@@ -165,7 +165,7 @@ impl<'w, 'a> Assembly<'w, 'a> {
                         ..self.binder.scan(alias)
                     });
                 }
-                Kind::Ai(node) if !node.is_column() => {
+                Kind::Ai(node) if node.is_predicate() || node.semantics() != Semantics::Rows => {
                     if !self.is_table_filter(id) {
                         self.place_join(id)?;
                     } else if !self.walk.get(id).parent.is_some_and(|parent| {
@@ -276,7 +276,7 @@ impl<'w, 'a> Assembly<'w, 'a> {
 
     fn place_column(&mut self, id: usize, node: &AiNode) -> Option<()> {
         let read: Vec<String> = self.call_tables(id).into_iter().collect();
-        let is_column = |kind: &Kind| matches!(kind, Kind::Ai(found) if found.is_column());
+        let is_column = |kind: &Kind| matches!(kind, Kind::Ai(found) if !found.is_predicate() && found.semantics() == Semantics::Rows);
         if read.len() == 2 {
             let continues = |id: usize| {
                 self.walk.get(id).parent.is_some_and(|parent| {

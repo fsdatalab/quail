@@ -1,5 +1,5 @@
 use super::binding::unsupported;
-use crate::ai::AiNode;
+use crate::ai::{AiNode, Semantics};
 use crate::plan::as_node;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
@@ -156,9 +156,9 @@ impl<'a> Walk<'a> {
             tables.push(self.tables[*table].alias.clone());
         }
         if let Kind::Ai(node) = &kind {
-            ai_join |=
-                node.is_join() || (node.is_predicate() && self.call_tables(&node.call()).len() > 1);
-            if node.is_join()
+            ai_join |= node.semantics() != Semantics::Rows
+                || (node.is_predicate() && self.call_tables(&node.call()).len() > 1);
+            if node.semantics() != Semantics::Rows
                 && let Kind::Join(_) = &self.get(inputs[0]).kind
             {
                 let gated = self.get(self.get(inputs[0]).inputs[1]).tables.clone();

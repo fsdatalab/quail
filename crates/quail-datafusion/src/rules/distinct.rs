@@ -6,7 +6,7 @@ use datafusion::logical_expr::{
     Aggregate, Expr, JoinType, LogicalPlan, UserDefinedLogicalNodeCore,
 };
 
-use crate::ai::AiNode;
+use crate::ai::{AiNode, Semantics};
 use crate::plan::as_node;
 
 pub(crate) fn is_distinct(aggregate: &Aggregate) -> bool {

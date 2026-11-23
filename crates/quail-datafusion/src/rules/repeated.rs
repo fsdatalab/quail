@@ -7,7 +7,7 @@ use datafusion::logical_expr::{
 };
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
-use crate::ai::AiNode;
+use crate::ai::{AiNode, Semantics};
 use crate::plan::{as_node, extension_node};
 
 #[derive(Debug, Default)]
@@ -31,7 +31,7 @@ fn merge(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     let Some(upper) = as_node::<AiNode>(&plan) else {
         return Ok(Transformed::no(plan));
     };
-    if upper.is_join() || upper.has_options() {
+    if upper.semantics() != Semantics::Rows || upper.has_options() {
         return Ok(Transformed::no(plan));
     }
     let Some(lower) = same_call_below(upper) else {
@@ -214,7 +214,7 @@ fn same_call_below(upper: &AiNode) -> Option<&AiNode> {
             }
             LogicalPlan::Extension(_) => {
                 let node = as_node::<AiNode>(plan)?;
-                if node.is_join() {
+                if node.semantics() != Semantics::Rows {
                     return None;
                 }
                 if node.repeats(&call, upper) {

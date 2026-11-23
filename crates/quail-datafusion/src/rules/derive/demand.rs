@@ -758,7 +758,10 @@ fn prune_fields(node: &mut AiNode, above: &Demand) -> Option<(String, bool)> {
 }
 
 fn ask_read_fields(node: &mut AiNode, above: &Demand) -> Result<()> {
-    if node.function() != "ai_extract" || node.is_join() || above.reads.is_none() {
+    if node.function() != "ai_extract"
+        || node.semantics() != Semantics::Rows
+        || above.reads.is_none()
+    {
         return Ok(());
     }
     let call = unfolded(node.call());

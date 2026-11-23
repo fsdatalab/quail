@@ -129,7 +129,7 @@ impl Relation {
             };
             let Some(parts) = node
                 .or_parts()
-                .filter(|_| node.function() == "ai_filter" && !node.is_join())
+                .filter(|_| node.function() == "ai_filter" && node.semantics() == Semantics::Rows)
             else {
                 continue;
             };
@@ -158,7 +158,9 @@ impl Relation {
         let mut asked: Vec<(usize, &AiNode)> = walk
             .ids()
             .filter_map(|id| match &walk.get(id).kind {
-                Kind::Ai(node) if !node.is_column() => Some((id, *node)),
+                Kind::Ai(node) if node.is_predicate() || node.semantics() != Semantics::Rows => {
+                    Some((id, *node))
+                }
                 _ => None,
             })
             .collect();
@@ -241,7 +243,7 @@ impl Relation {
     ) -> Result<(), CompileError> {
         let join = node.in_on().then_some(true);
         let call = walk.through(&node.call());
-        if node.is_join() {
+        if node.semantics() != Semantics::Rows {
             let input = walk.get(walk.get(id).inputs[0]);
             let Kind::Join(_) = &input.kind else {
                 self.unplaced = true;
@@ -255,7 +257,7 @@ impl Relation {
             binder.add_table(&table.alias, &table.provider, table.schema.clone())?;
             let (call, options) =
                 binder.bind_ai_filter_call(&call, &["selectivity", "anchor"], Some(true))?;
-            let anti = node.is_anti();
+            let anti = node.semantics() == Semantics::Anti;
             let spec = gate(
                 &call,
                 &table.alias,
@@ -496,7 +498,7 @@ fn bind_answers(
         let Kind::Ai(node) = &walk.get(id).kind else {
             continue;
         };
-        if node.is_join() {
+        if node.semantics() != Semantics::Rows {
             continue;
         }
         let name = names

@@ -9,7 +9,7 @@ use datafusion::logical_expr::{
 };
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
-use crate::ai::AiNode;
+use crate::ai::{AiNode, Semantics};
 use crate::plan::{as_node, extension_node};
 
 #[derive(Debug, Default)]
@@ -118,7 +118,7 @@ fn role(node: &AiNode) -> Role {
     if !node.is_predicate() {
         return Role::Column;
     }
-    if !node.is_join() && expr_tables(&node.call(), &[]).len() < 2 {
+    if node.semantics() == Semantics::Rows && expr_tables(&node.call(), &[]).len() < 2 {
         return Role::TableFilter;
     }
     Role::Join

@@ -13,7 +13,7 @@ use quail_planner::error::CompileError;
 use super::inputs::{numbered, split_inputs};
 use super::lift::lift_relational;
 use super::{ModelRegion, calls_ai};
-use crate::ai::AiNode;
+use crate::ai::{AiNode, Semantics};
 use crate::functions::is_ai_call;
 use crate::plan::{as_node, extension_node};
 use crate::shared::SharedInput;
@@ -492,7 +492,7 @@ fn simpler_run(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
         let below = pass_on(node.inputs()[0])?;
         return Ok(Some(extension_node(node.with_input(below)?)));
     }
-    if node.is_join() {
+    if node.semantics() != Semantics::Rows {
         return Ok(None);
     }
     if node.is_bare() {
@@ -552,7 +552,7 @@ fn is_ai_join(node: &AiNode, input: &LogicalPlan) -> bool {
     let LogicalPlan::Join(join) = input else {
         return false;
     };
-    if node.is_join() {
+    if node.semantics() != Semantics::Rows {
         return true;
     }
     if join.join_type != datafusion::logical_expr::JoinType::Inner {
