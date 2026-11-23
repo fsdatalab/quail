@@ -250,13 +250,10 @@ pub fn scans_to_pyarrow<'py>(
 ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
     let found = pyo3::types::PyDict::new(py);
     for scan in scans {
-        let tokens = to_pyarrow(
-            py,
-            Arc::clone(scan.tokens.schema()),
-            scan.tokens.record_batches().to_vec(),
-        )?;
-        let (schema, batches) = &scan.columns;
-        let columns = to_pyarrow(py, Arc::clone(schema), batches.clone())?;
+        let (schema, batches) = scan.tokens.to_table();
+        let tokens = to_pyarrow(py, schema, batches)?;
+        let (schema, batches) = scan.columns.clone();
+        let columns = to_pyarrow(py, schema, batches)?;
         found.set_item(&scan.alias, (tokens, columns))?;
     }
     Ok(found)

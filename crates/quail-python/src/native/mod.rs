@@ -5,6 +5,7 @@
 
 mod budgets;
 mod cost;
+mod graph;
 mod physical;
 mod workers;
 
@@ -320,8 +321,7 @@ impl NativeSession {
         &self,
         py: Python<'py>,
     ) -> PyResult<Vec<Bound<'py, pyo3::types::PyTuple>>> {
-        let mut regions = Vec::new();
-        for region in self.session.take_regions() {
+        self.session.take_regions(|region| {
             let inputs = pyo3::types::PyDict::new(py);
             for (name, batches) in region.inputs {
                 if let Some(first) = batches.first() {
@@ -341,7 +341,7 @@ impl NativeSession {
                 .collect::<PyResult<Vec<_>>>()?;
             let boots: Vec<String> = region.boots.iter().map(ToString::to_string).collect();
             let rows = to_pyarrow(py, region.rows.schema(), vec![region.rows])?;
-            regions.push(pyo3::types::PyTuple::new(
+            pyo3::types::PyTuple::new(
                 py,
                 [
                     pyo3::types::PyString::new(py, &region.planned).into_any(),
@@ -353,9 +353,8 @@ impl NativeSession {
                     region.seconds.into_pyobject(py)?.into_any(),
                     region.total_seconds.into_pyobject(py)?.into_any(),
                 ],
-            )?);
-        }
-        Ok(regions)
+            )
+        })
     }
 
     /// Run a query, read in `dialect` ("Snowflake" by default), and
@@ -1451,6 +1450,7 @@ fn region_stages(graph: &str, gpus: usize) -> PyResult<String> {
 #[pymodule]
 pub fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     physical::register(module)?;
+    graph::register(module)?;
     // the rule lists Python's registry starts from
     module.add("LOGICAL_RULES", quail_datafusion::default_rule_names())?;
     module.add(

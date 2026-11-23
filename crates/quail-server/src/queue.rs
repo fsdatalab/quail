@@ -350,8 +350,10 @@ impl Queue {
         let home = self.directory.join(id);
         let mut reports = Vec::new();
         let mut saved = Vec::new();
-        for (region, ran) in self.session.take_regions().iter().enumerate() {
-            let (report, tables) = self.session.region_report(ran)?;
+        let reported = self
+            .session
+            .take_regions(|ran| self.session.region_report(&ran))?;
+        for (region, (report, tables)) in reported.into_iter().enumerate() {
             reports.push(report);
             for table in tables {
                 let metadata = table.0.metadata();
@@ -580,7 +582,7 @@ impl Queue {
             );
             self.session.observe(None, false);
             // a query that failed leaves its regions behind
-            drop(self.session.take_regions());
+            self.session.discard_regions();
             drop(done);
             if let Some(watcher) = watcher {
                 let _ = watcher.join();
