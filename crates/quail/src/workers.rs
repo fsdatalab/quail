@@ -131,6 +131,19 @@ impl Connection {
         }
     }
 
+    /// The next header as the other end sent it, or None once the other
+    /// end closed the socket.
+    fn next_header(&mut self) -> Result<Option<Value>> {
+        let frame = match read_frame(&mut self.reader) {
+            Ok(frame) => frame,
+            Err(DataFusionError::IoError(error)) if error.kind() == ErrorKind::UnexpectedEof => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        serde_json::from_slice(&frame).map(Some).map_err(failure)
+    }
+
     /// Share a table with the other end: write it to a file and send
     /// the file's path.
     fn send_table(&mut self, table: &Table) -> Result<()> {
@@ -265,14 +278,9 @@ impl WorkerEnd {
     /// A frame or a table does not read.
     pub fn read(&mut self) -> Result<Message> {
         let connection = &mut self.connection;
-        let frame = match read_frame(&mut connection.reader) {
-            Ok(frame) => frame,
-            Err(DataFusionError::IoError(error)) if error.kind() == ErrorKind::UnexpectedEof => {
-                return Ok(Message::Shutdown);
-            }
-            Err(error) => return Err(error),
+        let Some(mut header) = connection.next_header()? else {
+            return Ok(Message::Shutdown);
         };
-        let mut header: Value = serde_json::from_slice(&frame).map_err(failure)?;
         if header.get("describe").is_some() {
             return Ok(Message::Describe(header["describe"].take()));
         }
