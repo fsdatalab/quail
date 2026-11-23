@@ -4,6 +4,7 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
 mod demand;
+mod node;
 mod row_limit;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
