@@ -1,36 +1,19 @@
-//! Memory budgets and attention-path choice, as
-//! `quail/common/budgets.py` computes them.
-//!
-//! Python mixes integers and floats here; each function keeps the type
-//! Python's result has, and `//` on floats rounds as CPython's does.
-
 use crate::specs::{DeviceSpec, ModelSpec, Precision};
 
-/// Fraction of device memory the executor claims.
 pub const POOL_FRACTION: f64 = 0.95;
-/// Default KV page size; devices may require larger pages.
 pub const PAGE_TOKENS: i64 = 16;
 pub const INT32_MAX: i64 = (1 << 31) - 1;
-/// bf16 activations, bytes per element.
 pub const ACT_BYTES: i64 = 2;
-/// Chunks of activation memory reserved outside the arena.
 pub const ACT_RESERVE_CHUNKS: i64 = 2;
 pub const READOUT_BLOCK_ROWS: i64 = 512;
-/// Questions one pass may start from checkpoints at once.
 pub const CHECKPOINT_PASS_QUESTIONS: i64 = 1_024;
-/// Document length a hybrid model's retained pool is split for when the
-/// mean is unknown.
 pub const CHECKPOINT_DEFAULT_DOC_TOKENS: i64 = 1_000;
 pub const MIB: i64 = 1 << 20;
 pub const INTERMEDIATE_BLOCK_TOKENS: i64 = 64;
-/// Rows past a document that its pages also cover.
 pub const SPLIT_EXTRA_TOKENS: i64 = 64;
-/// Below this many dense parameters a model runs unified attention only.
 pub const TREE_ATTENTION_MIN_PARAMS: f64 = 2e9;
-/// Families whose pipelines split their forward pass into captured pieces.
 pub const GRAPH_ARCHS: [&str; 2] = ["qwen3", "qwen3_5"];
 
-/// CUDA graph capture sizes, in tokens per pass.
 pub fn graph_token_buckets_all() -> Vec<i64> {
     let mut sizes = vec![1, 2, 4];
     sizes.extend((8..256).step_by(8));
@@ -39,7 +22,6 @@ pub fn graph_token_buckets_all() -> Vec<i64> {
     sizes
 }
 
-/// CPython's `float // float` (`float_floor_div`).
 pub fn floor_divide(a: f64, b: f64) -> f64 {
     let remainder = a % b;
     let mut quotient = (a - remainder) / b;
@@ -58,7 +40,6 @@ pub fn floor_divide(a: f64, b: f64) -> f64 {
     }
 }
 
-/// Python's `int // int`, which rounds toward negative infinity.
 pub fn floor_divide_int(a: i64, b: i64) -> i64 {
     let quotient = a / b;
     if (a % b != 0) && ((a < 0) != (b < 0)) {
@@ -68,18 +49,14 @@ pub fn floor_divide_int(a: i64, b: i64) -> i64 {
     }
 }
 
-/// KV pages that hold `tokens`: `-(-tokens // page_tokens)`.
 pub fn pages(tokens: i64, page_tokens: i64) -> i64 {
     -floor_divide_int(-tokens, page_tokens)
 }
 
-/// `pages` of a float token count, which Python returns as a float.
 pub fn pages_of(tokens: f64, page_tokens: i64) -> f64 {
     -floor_divide(-tokens, page_tokens as f64)
 }
 
-/// Readout workspace shared with copy verification, capped by one
-/// activation chunk.
 pub fn copy_verification_workspace_bytes(model: &ModelSpec, chunk_tokens: i64) -> i64 {
     let activations = chunk_tokens as f64 * model.act_per_token();
     let logits = 2 * READOUT_BLOCK_ROWS * model.vocab * 4;
@@ -90,7 +67,6 @@ pub fn copy_verification_workspace_bytes(model: &ModelSpec, chunk_tokens: i64) -
     }
 }
 
-/// How many pooled GPU memories would hold the loaded weights.
 pub fn minimum_weight_gpus(model: &ModelSpec, device: &DeviceSpec) -> i64 {
     let mut gpus = 1;
     while model.W_mem() > device.mem_bytes * POOL_FRACTION * gpus as f64 {
@@ -99,14 +75,12 @@ pub fn minimum_weight_gpus(model: &ModelSpec, device: &DeviceSpec) -> i64 {
     gpus
 }
 
-/// Max tokens per chunk from the int32 element-offset limit.
 pub fn kernel_index_cap(model: &ModelSpec) -> i64 {
     let experts = model.experts_active * model.hidden.max(2 * model.expert_intermediate);
     let width = model.widest_projection().max(experts);
     floor_divide_int(INT32_MAX, width)
 }
 
-/// CUDA graph capture sizes of a dense Qwen3 or Qwen3.5 model.
 pub fn graph_token_buckets(model: &ModelSpec) -> Vec<i64> {
     if !GRAPH_ARCHS.contains(&model.arch.as_str())
         || model.experts != 0
@@ -122,7 +96,6 @@ pub fn graph_token_buckets(model: &ModelSpec) -> Vec<i64> {
         .collect()
 }
 
-/// Bytes of the shared CUDA graph boundary buffers and workspace.
 pub fn graph_memory_bytes(model: &ModelSpec) -> i64 {
     match graph_token_buckets(model).last() {
         None => 0,
@@ -130,13 +103,6 @@ pub fn graph_memory_bytes(model: &ModelSpec) -> i64 {
     }
 }
 
-/// Bytes left for KV after weights and activations, and after CUDA
-/// graph storage when the plan `writes_answers`.
-///
-/// Only a plan with AI.MAP or AI.EXTRACT, which write answers token by
-/// token, captures the CUDA graphs; any other plan gives their memory
-/// to KV. The chunk budget keeps the graph reserve for every plan,
-/// since a loaded model keeps its chunk budget across plans.
 pub fn arena_bytes(
     model: &ModelSpec,
     device: &DeviceSpec,
@@ -154,28 +120,23 @@ pub fn arena_bytes(
         - graphs
 }
 
-/// Sliding-layer pages one chunk's fresh prefixes take before trimming.
 pub fn transient_sliding_pages(chunk_tokens: i64, window: i64, page_tokens: i64) -> i64 {
     pages(chunk_tokens, page_tokens) + -floor_divide_int(-chunk_tokens, window)
 }
 
-/// KV pages of memory one document checkpoint takes.
 pub fn checkpoint_pages(model: &ModelSpec, page_tokens: i64) -> f64 {
     model.checkpoint_bytes() as f64 / (model.kappa() * page_tokens as f64)
 }
 
-/// Temporary bytes a pass of `questions` starts from checkpoints.
 pub fn checkpoint_pass_bytes(model: &ModelSpec, questions: i64, chunk_tokens: i64) -> i64 {
     let buffers = questions + -floor_divide_int(-chunk_tokens, INTERMEDIATE_BLOCK_TOKENS);
     questions * (model.gdn_state_bytes() + model.conv_state_bytes()) + buffers * MIB
 }
 
-/// KV pages kept free for two chunks of execution.
 pub fn execution_pages(chunk_tokens: i64, page_tokens: i64) -> i64 {
     2 * pages(chunk_tokens, page_tokens)
 }
 
-/// Workspace, execution KV, and one retained document's KV and state.
 pub fn checkpoint_memory_bytes(model: &ModelSpec, chunk_tokens: i64, page_tokens: i64) -> f64 {
     if model.checkpoint_bytes() == 0 || !model.reuses_kv() {
         return 0.0;
@@ -188,14 +149,12 @@ pub fn checkpoint_memory_bytes(model: &ModelSpec, chunk_tokens: i64, page_tokens
         + reserved as f64 * model.kappa() * page_tokens as f64
 }
 
-/// Resident weights, activation memory, and checkpoint reservations.
 pub fn chunk_memory_bytes(model: &ModelSpec, chunk_tokens: i64, page_tokens: i64) -> f64 {
     model.W_resident()
         + (ACT_RESERVE_CHUNKS * chunk_tokens) as f64 * model.act_per_token()
         + checkpoint_memory_bytes(model, chunk_tokens, page_tokens)
 }
 
-/// The largest chunk that fits its memory reservations, or zero.
 pub fn chunk_memory_bound(model: &ModelSpec, device: &DeviceSpec) -> i64 {
     let available = device.mem_bytes * POOL_FRACTION - graph_memory_bytes(model) as f64;
     let free = available - model.W_resident();
@@ -213,7 +172,6 @@ pub fn chunk_memory_bound(model: &ModelSpec, device: &DeviceSpec) -> i64 {
     lower
 }
 
-/// Pages a hybrid model shares between retained KV and checkpoints.
 pub fn hybrid_pool_pages(
     model: &ModelSpec,
     device: &DeviceSpec,
@@ -226,7 +184,6 @@ pub fn hybrid_pool_pages(
     floor_divide(free, page_bytes) as i64 - execution_pages(chunk_tokens, device.page_tokens)
 }
 
-/// Checkpoints the pool holds beside an arena of `kv_pages`; 0 without them.
 pub fn checkpoint_slots(
     model: &ModelSpec,
     device: &DeviceSpec,
@@ -243,12 +200,6 @@ pub fn checkpoint_slots(
     0_i64.max(floor_divide((pool - retained) as f64, checkpoint) as i64 - 1)
 }
 
-/// Arena KV pages of a hybrid model: two chunks of execution plus the
-/// retained KV.
-///
-/// # Errors
-///
-/// The pool cannot hold a chunk's KV, or one checkpoint beside a document.
 pub fn hybrid_arena_pages(
     model: &ModelSpec,
     device: &DeviceSpec,
@@ -282,11 +233,8 @@ pub fn hybrid_arena_pages(
     Ok(kv_pages + execution_pages(chunk_tokens, device.page_tokens))
 }
 
-/// An experiment's cap on the every-token KV pool, in tokens, for both
-/// engines.
 pub const KV_POOL_TOKENS_ENV: &str = "QUAIL_KV_POOL_TOKENS";
 
-/// The KV pool cap `QUAIL_KV_POOL_TOKENS` sets, in tokens, if any.
 pub fn kv_pool_cap_tokens() -> Option<i64> {
     std::env::var(KV_POOL_TOKENS_ENV)
         .ok()
@@ -294,13 +242,6 @@ pub fn kv_pool_cap_tokens() -> Option<i64> {
         .and_then(|value| value.parse().ok())
 }
 
-/// Pages of the two KV pools, the every-token pool capped by
-/// `QUAIL_KV_POOL_TOKENS`; see [`device_arena_pages`] for the pools
-/// memory allows.
-///
-/// # Errors
-///
-/// As [`device_arena_pages`].
 pub fn arena_pages(
     model: &ModelSpec,
     device: &DeviceSpec,
@@ -321,11 +262,6 @@ pub fn arena_pages(
     })
 }
 
-/// Pages of the two KV pools: (every-token pool, sliding-layer pool).
-///
-/// # Errors
-///
-/// The arena cannot hold one chunk's KV.
 pub fn device_arena_pages(
     model: &ModelSpec,
     device: &DeviceSpec,
@@ -396,11 +332,6 @@ pub fn device_arena_pages(
     Ok((full, sliding))
 }
 
-/// Admission budget: tokens of document KV that can be resident at once.
-///
-/// # Errors
-///
-/// The arena cannot hold one chunk's KV.
 pub fn arena_tokens(
     model: &ModelSpec,
     device: &DeviceSpec,
@@ -418,12 +349,10 @@ pub fn arena_tokens(
     Ok(full * device.page_tokens)
 }
 
-/// Whether the leftover arena holds one chunk's sliding KV.
 pub fn sliding_kv_fits(model: &ModelSpec, device: &DeviceSpec, chunk_tokens: Option<i64>) -> bool {
     model.sliding_window == 0 || arena_pages(model, device, chunk_tokens, None, true).is_ok()
 }
 
-/// Shrink a chunk until its activation reserve leaves its own KV.
 fn chunk_leaving_kv(model: &ModelSpec, device: &DeviceSpec, chunk: i64) -> i64 {
     if model.sliding_window != 0 || chunk < 1 {
         return chunk;
@@ -448,7 +377,6 @@ fn chunk_leaving_kv(model: &ModelSpec, device: &DeviceSpec, chunk: i64) -> i64 {
     chunk
 }
 
-/// The chunk budget allowed by the model and device.
 pub fn chunk_budget(model: &ModelSpec, device: &DeviceSpec) -> i64 {
     let mut budget = chunk_memory_bound(model, device).min(kernel_index_cap(model));
     if model.chunk_cap_tokens != 0 {
@@ -457,7 +385,6 @@ pub fn chunk_budget(model: &ModelSpec, device: &DeviceSpec) -> i64 {
     chunk_leaving_kv(model, device, budget)
 }
 
-/// (in dim, out dim, layers, precision) of each dense projection.
 fn projection_shapes(model: &ModelSpec) -> Vec<(i64, i64, i64, Precision)> {
     let query_width = if model.attn_output_gate { 2 } else { 1 };
     let qkv_out = (query_width * model.num_q_heads + 2 * model.num_kv_heads) * model.d_head;
@@ -501,11 +428,6 @@ fn projection_shapes(model: &ModelSpec) -> Vec<(i64, i64, i64, Precision)> {
     shapes
 }
 
-/// Chunk size (tokens) where the dense projections become compute-bound.
-///
-/// # Errors
-///
-/// The projections never cross the roofline ridge.
 pub fn compute_knee(model: &ModelSpec, device: &DeviceSpec) -> Result<f64, String> {
     let (mut compute_seconds, mut weight_bytes, mut activation_bytes) = (0.0, 0.0, 0.0);
     for (din, dout, layers, precision) in projection_shapes(model) {
@@ -522,7 +444,6 @@ pub fn compute_knee(model: &ModelSpec, device: &DeviceSpec) -> Result<f64, Strin
     Ok(weight_bytes / denominator)
 }
 
-/// Ideal seconds for the attention kernels in one chunk, all layers.
 fn attention_time(model: &ModelSpec, device: &DeviceSpec, chunk: f64, context: f64) -> f64 {
     let layers = model.attention_layers().len() as f64;
     let flops = 4.0 * chunk * context * model.num_q_heads as f64 * model.d_head as f64;
@@ -533,14 +454,12 @@ fn attention_time(model: &ModelSpec, device: &DeviceSpec, chunk: f64, context: f
     (if memory > compute { memory } else { compute }) * layers
 }
 
-/// Whether the planner and the executor may run the model's tree path.
 pub fn tree_attention_allowed(model: &ModelSpec) -> bool {
     model.canvas_tokens == 0
         && model.state_layers().is_empty()
         && model.params >= TREE_ATTENTION_MIN_PARAMS
 }
 
-/// Pick "unified" or "tree" attention for readers of one shared node.
 pub fn cheaper_attention_path(
     model: &ModelSpec,
     device: &DeviceSpec,
@@ -560,7 +479,6 @@ pub fn cheaper_attention_path(
     if tree < unified { "tree" } else { "unified" }
 }
 
-/// The model copies that share work spread evenly over documents.
 pub fn parallel_copies(gpus: i64, num_documents: f64) -> f64 {
     let fewer = if num_documents < gpus as f64 {
         num_documents

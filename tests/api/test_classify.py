@@ -124,7 +124,7 @@ def test_a_classification_returns_and_tests_its_labels():
     IN ('refund', 'shipping') ---
 plan
   topic = ai_classify('Which topic? {0}', d.body, make_array('refund', 'shipping',
-      'praise')), filter: topic = 'refund' OR topic = 'shipping'
+      'praise')), inline_predicate: topic = 'refund' OR topic = 'shipping'
 asked 3 of 3
   'Which topic? {0}': d0 'refund', d1 'praise', d2 'praise'
 rows 1
@@ -161,7 +161,7 @@ rows 3
     ARRAY['refund', 'shipping', 'praise']) = 'refund' ---
 plan
   __quail_column_1 = ai_classify('Which topic? {0}', d.body, make_array('refund',
-      'shipping', 'praise')), filter: __quail_column_1 = 'refund'
+      'shipping', 'praise')), inline_predicate: __quail_column_1 = 'refund'
 asked 3 of 3
   'Which topic? {0}': d0 'refund', d1 'praise', d2 'praise'
 rows 1
@@ -171,7 +171,7 @@ rows 1
     d.body), ARRAY['refund', 'shipping', 'praise']) ---
 plan
   __quail_column_1 = ai_classify('Which topic? {0}', d.body, make_array('refund',
-      'shipping', 'praise')), filter: __quail_column_1 = 'refund'
+      'shipping', 'praise')), inline_predicate: __quail_column_1 = 'refund'
 asked 3 of 3
   'Which topic? {0}': d0 'refund', d1 'praise', d2 'praise'
 rows 1
@@ -180,8 +180,8 @@ rows 1
 --- SELECT d.id FROM documents d WHERE AI.CLASSIFY(PROMPT('Number {0}', d.body), ['1',
     '2']) IN (1) ---
 plan
-  __quail_column_1 = ai_classify('Number {0}', d.body, make_array('1', '2')), filter:
-      CAST(__quail_column_1 AS Int64) = Int64(1)
+  __quail_column_1 = ai_classify('Number {0}', d.body, make_array('1', '2')),
+      inline_predicate: CAST(__quail_column_1 AS Int64) = Int64(1)
 asked 3 of 3
   'Number {0}': d0 '1', d1 '1', d2 '1'
 rows 3
@@ -194,9 +194,9 @@ rows 3
     ARRAY['a', 'b']) < 'b' AND AI.CLASSIFY(PROMPT('Topic? {0}', d.body), ARRAY['a',
     'b']) IS NOT NULL ---
 plan
-  __quail_column_1 = ai_classify('Topic? {0}', d.body, make_array('a', 'b')), filter:
-      (__quail_column_1 = 'a' OR __quail_column_1 = 'b') AND __quail_column_1 < 'b' AND
-      __quail_column_1 IS NOT NULL
+  __quail_column_1 = ai_classify('Topic? {0}', d.body, make_array('a', 'b')),
+      inline_predicate: (__quail_column_1 = 'a' OR __quail_column_1 = 'b') AND
+      __quail_column_1 < 'b' AND __quail_column_1 IS NOT NULL
 asked 3 of 3
   'Topic? {0}': d0 'a', d1 'b', d2 'b'
 rows 1
@@ -236,8 +236,8 @@ rows 2
     ARRAY['refund', 'shipping', 'praise'], {'probabilities': true}) IN ('praise') ---
 plan
   __quail_column_1 = ai_classify('Which topic? {0}', d.body, make_array('refund',
-      'shipping', 'praise'), named_struct('probabilities', Boolean(false))), filter:
-      __quail_column_1 = 'praise'
+      'shipping', 'praise'), named_struct('probabilities', Boolean(false))),
+      inline_predicate: __quail_column_1 = 'praise'
 asked 3 of 3
   'Which topic? {0}': d0 'praise', d1 'shipping', d2 'praise'
 rows 2
@@ -328,7 +328,7 @@ def test_a_classification_labels_only_the_pairs_a_join_keeps():
 plan
   stance = ai_classify('Stance? {0} {1}', d.body, a.aspect, make_array('praise',
       'complaint'))
-  __quail_answer_1 = ai_filter('Mentions? {0} {1}', d.body, a.aspect), filter:
+  __quail_answer_1 = ai_filter('Mentions? {0} {1}', d.body, a.aspect), inline_predicate:
       __quail_answer_1, returns: []
 asked 10 of 10
   'Mentions? {0} {1}': a0+d0 TRUE, a0+d1 TRUE, a0+d2 FALSE, a1+d0 TRUE, a1+d1 TRUE,
@@ -347,7 +347,7 @@ rows 4
 plan
   __quail_column_1 = ai_classify('Stance? {0} {1}', d.body, a.aspect,
       make_array('praise', 'complaint'))
-  __quail_answer_1 = ai_filter('Mentions? {0} {1}', d.body, a.aspect), filter:
+  __quail_answer_1 = ai_filter('Mentions? {0} {1}', d.body, a.aspect), inline_predicate:
       __quail_answer_1, returns: []
 asked 10 of 10
   'Mentions? {0} {1}': a0+d0 TRUE, a0+d1 TRUE, a0+d2 FALSE, a1+d0 TRUE, a1+d1 TRUE,
@@ -423,7 +423,7 @@ def test_a_label_test_drops_documents_before_the_next_classification_asks():
 plan
   kind = ai_classify('Which kind? {0}', d.body, make_array('complaint', 'question'))
   topic = ai_classify('Which topic? {0}', d.body, make_array('refund', 'shipping',
-      'praise')), filter: topic = 'refund' OR topic = 'shipping'
+      'praise')), inline_predicate: topic = 'refund' OR topic = 'shipping'
 asked 4 of 4
   'Which topic? {0}': d0 'shipping', d1 'praise', d2 'praise'
   'Which kind? {0}': d0 'complaint'
@@ -441,9 +441,10 @@ rows 1
     ---
 plan
   kind = ai_classify('Which kind? {0}', d.body, make_array('complaint', 'question')),
-      filter: kind = 'complaint'
+      inline_predicate: kind = 'complaint'
   topic = ai_classify('Which topic? {0}', d.body, make_array('refund', 'shipping',
-      'praise')), filter: (topic = 'refund' OR topic = 'shipping') AND topic = 'refund'
+      'praise')), inline_predicate: (topic = 'refund' OR topic = 'shipping') AND topic =
+      'refund'
 asked 3 of 3
   'Which topic? {0}': d0 'shipping', d1 'praise', d2 'praise'
 rows 0

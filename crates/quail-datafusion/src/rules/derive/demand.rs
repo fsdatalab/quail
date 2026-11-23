@@ -1,37 +1,3 @@
-//! The demand pass of [`super::Derive`]: what the plan above each operator
-//! needs of its rows, carried down the plan once, top to bottom.
-//!
-//! A demand on a plan's rows has three parts:
-//!
-//! - **tests**: terms the operators above apply to the rows. A row where a
-//!   test is not TRUE leaves the query, so it is not needed.
-//! - **reads**: for each column read above, the rows where its value is
-//!   read. A column read nowhere is absent.
-//! - **count**: how many of the rows that pass the tests are enough: all,
-//!   the first `n`, or the first `n` of each key.
-//!
-//! Each operator has one transfer function: given the demand on its
-//! rows, the demand on its input's rows. A `Filter` adds its terms to the
-//! tests; a `LIMIT` sets the count and clears the tests, which it does not
-//! pass; a SELECT list renames each part through its expressions, and
-//! reads an input column only where its expression needs it (a `CASE`
-//! reads a branch only where its condition holds); a join passes each
-//! test and read to the side whose columns it reads, where that side's
-//! rows reach the join's output. An operator with no transfer function
-//! needs every row and every column of its inputs.
-//!
-//! An `AiNode` the demand reaches takes what it can of it:
-//!
-//! - a test of its answer that it can decide becomes its filter;
-//! - the count becomes its fetch, when every test either became its filter
-//!   or reads only its input, and then moves below it;
-//! - where its answer is read becomes its guard, as far as the executor can
-//!   evaluate the condition on the rows the node reads.
-//!
-//! A test, a count, or a guard that a node takes leaves the operator that
-//! wrote it: a `Filter` drops the term, and a `LIMIT` with no offset
-//! leaves the plan.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -45,65 +11,51 @@ use datafusion::logical_expr::{
     SkipType, UserDefinedLogicalNodeCore, lit,
 };
 
-use super::fetch::{at_least, is_count_star};
+use super::row_limit::{at_least, is_count_star};
 use crate::ai::{AiNode, Semantics};
 use crate::functions::options::unfolded;
 use crate::plan::{as_node, extension_node, with_inputs};
 use crate::rules::distinct::{is_distinct, is_unique};
-use crate::rules::projection::{question_fields, replace_call, with_fields};
+use crate::rules::field_pruning::{question_fields, replace_call, with_fields};
 use crate::rules::repeated::{through_alias, through_projection};
 use crate::rules::substring::precheck;
 use quail_planner::constants::SPAN_SUFFIX;
 
-/// Which options the pass derives.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Options {
-    pub(super) filters: bool,
-    pub(super) fetch: bool,
-    pub(super) guard: bool,
-    pub(super) projection: bool,
+    pub(super) inline_predicates: bool,
+    pub(super) row_limit: bool,
+    pub(super) precondition: bool,
+    pub(super) field_pruning: bool,
 }
 
-/// How many of the rows that pass a demand's tests are enough.
 #[derive(Debug, Clone, PartialEq)]
 enum Count {
     All,
-    /// The first `n` rows.
     Rows(usize),
-    /// One row of each value of the keys, for a `DISTINCT`.
     Distinct(Vec<Column>),
-    /// `n` rows of each value of the keys, where the executor stops a key.
     PerKey(Vec<Column>, usize),
 }
 
-/// One test of a demand; `id` names it to the operator that wrote it.
 #[derive(Debug, Clone)]
-struct Test {
+struct Predicate {
     id: usize,
     expr: Expr,
 }
 
-/// What the operators above a plan need of its rows, as the module
-/// explains. `reads` is None when every column is read in every row; it
-/// leaves out what the tests read.
 #[derive(Debug, Clone)]
 struct Demand {
-    tests: Vec<Test>,
+    predicates: Vec<Predicate>,
     reads: Option<BTreeMap<Column, Expr>>,
     count: Count,
-    /// Whether every read reached here through operators that return
-    /// their input's rows as they are: a value every row below has, every
-    /// read above sees.
     carried: bool,
-    /// The columns of `reads` read only as named fields of a struct, such
-    /// as `a['who']`, with those fields.
     fields: BTreeMap<Column, BTreeSet<String>>,
 }
 
 impl Demand {
     fn everything() -> Self {
         Demand {
-            tests: Vec::new(),
+            predicates: Vec::new(),
             reads: None,
             count: Count::All,
             carried: false,
@@ -111,46 +63,46 @@ impl Demand {
         }
     }
 
-    /// Where `column` is read, by the tests or otherwise: None when
-    /// nowhere.
     fn read_where(&self, column: &Column) -> Option<Expr> {
         let Some(reads) = &self.reads else {
             return Some(lit(true));
         };
-        // a value is needed only in the rows that may pass the tests
-        let passing =
-            conjunction(self.tests.iter().map(|test| test.expr.clone())).unwrap_or(lit(true));
+        let passing = conjunction(
+            self.predicates
+                .iter()
+                .map(|predicate| predicate.expr.clone()),
+        )
+        .unwrap_or(lit(true));
         (reads
             .get(column)
             .map(|read| and(read, &passing))
             .into_iter())
-        .chain((self.tests.iter()).filter_map(|test| read_condition(&test.expr, column)))
+        .chain(
+            (self.predicates.iter())
+                .filter_map(|predicate| read_condition(&predicate.expr, column)),
+        )
         .reduce(|one, two| or(&one, &two))
     }
 
-    /// The fields of `column` read, by the tests or otherwise: None when
-    /// it is read whole, or may be.
     fn fields_read(&self, column: &Column) -> Option<BTreeSet<String>> {
         let reads = self.reads.as_ref()?;
         let mut found = BTreeSet::new();
         if reads.contains_key(column) {
             found.extend(self.fields.get(column)?.iter().cloned());
         }
-        for test in &self.tests {
-            if test.expr.column_refs().contains(column) {
-                found.extend(read_fields(&test.expr, column)?);
+        for predicate in &self.predicates {
+            if predicate.expr.column_refs().contains(column) {
+                found.extend(read_fields(&predicate.expr, column)?);
             }
         }
         Some(found)
     }
 
-    /// The reads with what the tests read, for an operator that does not
-    /// pass the tests on.
-    fn reads_with_tests(&self) -> Option<BTreeMap<Column, Expr>> {
+    fn reads_with_predicates(&self) -> Option<BTreeMap<Column, Expr>> {
         let mut reads = self.reads.clone()?;
-        for test in &self.tests {
-            for column in test.expr.column_refs() {
-                if let Some(within) = read_condition(&test.expr, column) {
+        for predicate in &self.predicates {
+            for column in predicate.expr.column_refs() {
+                if let Some(within) = read_condition(&predicate.expr, column) {
                     add_read(&mut reads, column, within);
                 }
             }
@@ -159,30 +111,23 @@ impl Demand {
     }
 }
 
-/// What a plan's operators took of the demand on its rows.
 #[derive(Debug, Default)]
 struct Taken {
-    /// The tests a node below took: as its filter, or below itself.
-    tests: BTreeSet<usize>,
-    /// Whether a node below took the count as its fetch.
+    predicates: BTreeSet<usize>,
     count: bool,
-    /// Answers a node below no longer returns, with the value every row
-    /// it returns has: each operator above that reads one reads the value.
     kept: Vec<(String, bool)>,
 }
 
-/// The state of one pass: the next test's id.
 struct Pass {
     options: Options,
-    next_test: usize,
+    next_predicate: usize,
 }
 
-/// Carry the demand of the whole query down `plan`, as the module explains.
 pub(super) fn demand_pass(plan: LogicalPlan, options: Options) -> Result<Transformed<LogicalPlan>> {
     let before = plan.clone();
     let mut pass = Pass {
         options,
-        next_test: 0,
+        next_predicate: 0,
     };
     let (after, _) = pass.down(plan, Demand::everything())?;
     let changed = after != before;
@@ -190,17 +135,15 @@ pub(super) fn demand_pass(plan: LogicalPlan, options: Options) -> Result<Transfo
 }
 
 impl Pass {
-    fn test(&mut self, expr: Expr) -> Test {
-        self.next_test += 1;
-        Test {
-            id: self.next_test,
+    fn predicate(&mut self, expr: Expr) -> Predicate {
+        self.next_predicate += 1;
+        Predicate {
+            id: self.next_predicate,
             expr,
         }
     }
 
-    /// `plan` with every node below it given what `demand` lets it take.
     fn down(&mut self, plan: LogicalPlan, demand: Demand) -> Result<(LogicalPlan, Taken)> {
-        // a subquery an expression holds has its own demand
         let plan = plan
             .map_subqueries(|subquery| {
                 let (found, _) = self.down(subquery, Demand::everything())?;
@@ -223,7 +166,6 @@ impl Pass {
         }
     }
 
-    /// An operator with no transfer function: each input is needed whole.
     fn barrier(&mut self, plan: LogicalPlan) -> Result<(LogicalPlan, Taken)> {
         let inputs: Vec<LogicalPlan> = plan.inputs().into_iter().cloned().collect();
         if inputs.is_empty() {
@@ -241,15 +183,17 @@ impl Pass {
             unreachable!()
         };
         let below = |expr: &Expr| through_projection(expr, projection);
-        let tests = (demand.tests.iter())
-            .filter_map(|test| below(&test.expr).map(|expr| Test { id: test.id, expr }))
+        let predicates = (demand.predicates.iter())
+            .filter_map(|predicate| {
+                below(&predicate.expr).map(|expr| Predicate {
+                    id: predicate.id,
+                    expr,
+                })
+            })
             .collect();
-        // each input column, where the SELECT list's expressions read it
         let mut reads = BTreeMap::new();
         for (index, expr) in projection.expr.iter().enumerate() {
             let column = Column::from(projection.schema.qualified_field(index));
-            // an output nothing reads is still computed, so its input
-            // columns must exist, though no row reads their values
             let read = match demand.read_where(&column) {
                 Some(read) => weaken_through(&read, &below),
                 None => lit(false),
@@ -268,7 +212,6 @@ impl Pass {
             }
             other => other.clone(),
         };
-        // the fields of each input column that the read outputs read
         let mut fields: BTreeMap<Column, BTreeSet<String>> = BTreeMap::new();
         let mut whole: BTreeSet<Column> = BTreeSet::new();
         for (index, expr) in projection.expr.iter().enumerate() {
@@ -297,7 +240,7 @@ impl Pass {
         let (input, taken) = self.down(
             input,
             Demand {
-                tests,
+                predicates,
                 reads: Some(reads),
                 count,
                 carried: demand.carried,
@@ -319,8 +262,13 @@ impl Pass {
             let index = alias.schema.index_of_column(column).ok()?;
             Some(Column::from(alias.input.schema().qualified_field(index)))
         };
-        let tests = (demand.tests.iter())
-            .filter_map(|test| below(&test.expr).map(|expr| Test { id: test.id, expr }))
+        let predicates = (demand.predicates.iter())
+            .filter_map(|predicate| {
+                below(&predicate.expr).map(|expr| Predicate {
+                    id: predicate.id,
+                    expr,
+                })
+            })
             .collect();
         let reads = demand.reads.as_ref().map(|reads| {
             (reads.iter())
@@ -344,7 +292,7 @@ impl Pass {
         let (input, taken) = self.down(
             input,
             Demand {
-                tests,
+                predicates,
                 reads,
                 count,
                 carried: demand.carried,
@@ -361,17 +309,17 @@ impl Pass {
         let LogicalPlan::Filter(filter) = plan else {
             unreachable!()
         };
-        let own: Vec<Test> = (split_conjunction(&filter.predicate).into_iter())
-            .map(|term| self.test(term.clone()))
+        let own: Vec<Predicate> = (split_conjunction(&filter.predicate).into_iter())
+            .map(|term| self.predicate(term.clone()))
             .collect();
         let reads = demand.reads.clone();
-        let mut tests = demand.tests.clone();
-        tests.extend(own.iter().cloned());
+        let mut predicates = demand.predicates.clone();
+        predicates.extend(own.iter().cloned());
         let input = Arc::unwrap_or_clone(filter.input);
         let (input, mut taken) = self.down(
             input,
             Demand {
-                tests,
+                predicates,
                 reads,
                 count: demand.count,
                 carried: demand.carried,
@@ -379,12 +327,12 @@ impl Pass {
             },
         )?;
         let kept: Vec<Expr> = (own.iter())
-            .filter(|test| !taken.tests.contains(&test.id))
-            .map(|test| test.expr.clone())
+            .filter(|predicate| !taken.predicates.contains(&predicate.id))
+            .map(|predicate| predicate.expr.clone())
             .collect();
         taken
-            .tests
-            .retain(|id| !own.iter().any(|test| test.id == *id));
+            .predicates
+            .retain(|id| !own.iter().any(|predicate| predicate.id == *id));
         let plan = match conjunction(kept) {
             Some(predicate) => LogicalPlan::Filter(Filter::try_new(predicate, Arc::new(input))?),
             None => input,
@@ -407,7 +355,7 @@ impl Pass {
             (Some((skip, fetch)), _) => Count::Rows(skip + fetch),
             (None, _) => Count::All,
         };
-        let count = if self.options.fetch {
+        let count = if self.options.row_limit {
             count
         } else {
             Count::All
@@ -416,14 +364,13 @@ impl Pass {
         let (input, taken) = self.down(
             input,
             Demand {
-                tests: Vec::new(),
-                reads: demand.reads_with_tests(),
+                predicates: Vec::new(),
+                reads: demand.reads_with_predicates(),
                 count,
                 carried: demand.carried,
-                fields: without_tests(&demand.fields, &demand.tests),
+                fields: without_predicates(&demand.fields, &demand.predicates),
             },
         )?;
-        // a LIMIT with no offset that a node took leaves the plan
         if taken.count && literal.is_some_and(|(skip, _)| skip == 0) {
             return Ok((
                 input,
@@ -463,19 +410,17 @@ impl Pass {
                 fields.remove(column);
             }
         }
-        // the sort decides which rows are first
         let input = sort.input.as_ref().clone();
         let (input, mut taken) = self.down(
             input,
             Demand {
-                tests: demand.tests,
+                predicates: demand.predicates,
                 reads,
                 count: Count::All,
                 carried: demand.carried,
                 fields,
             },
         )?;
-        // a count taken below is the sort's, not the demand's
         taken.count = false;
         Ok((
             read_kept(with_inputs(&plan, vec![input])?, &taken.kept)?,
@@ -486,11 +431,10 @@ impl Pass {
     fn distinct(&mut self, plan: LogicalPlan, demand: Demand) -> Result<(LogicalPlan, Taken)> {
         let input = plan.inputs()[0].clone();
         let keys = input.schema().columns();
-        // a DISTINCT that removes no row leaves, so a count reaches below
-        if self.options.fetch && is_unique(&input, &keys.iter().cloned().collect()) {
+        if self.options.row_limit && is_unique(&input, &keys.iter().cloned().collect()) {
             return self.down(input, demand);
         }
-        let count = if self.options.fetch {
+        let count = if self.options.row_limit {
             Count::Distinct(keys)
         } else {
             Count::All
@@ -498,14 +442,13 @@ impl Pass {
         let (input, mut taken) = self.down(
             input,
             Demand {
-                tests: demand.tests,
+                predicates: demand.predicates,
                 reads: None,
                 count,
                 carried: false,
                 fields: BTreeMap::new(),
             },
         )?;
-        // a count taken below is the DISTINCT's, not the demand's
         taken.count = false;
         Ok((with_inputs(&plan, vec![input])?, taken))
     }
@@ -523,26 +466,24 @@ impl Pass {
                 _ => None,
             })
             .collect();
-        // HAVING COUNT(*) >= k needs k rows of each group, when nothing
-        // else reads the count
         let count = match (aggregate.aggr_expr.as_slice(), &groups) {
             ([counted], Some(keys)) if is_count_star(counted) && !keys.is_empty() => {
                 let column =
                     Column::from(aggregate.schema.qualified_field(aggregate.group_expr.len()));
-                // the tests may read the count only to compare it with k
-                let tests_read: Vec<&Test> = (demand.tests.iter())
-                    .filter(|test| test.expr.column_refs().contains(&column))
+                let predicates_read: Vec<&Predicate> = (demand.predicates.iter())
+                    .filter(|predicate| predicate.expr.column_refs().contains(&column))
                     .collect();
                 let unread = demand
                     .reads
                     .as_ref()
                     .is_some_and(|reads| !reads.contains_key(&column))
-                    && (tests_read.iter()).all(|test| at_least(&test.expr, &column).is_some());
-                let threshold = (tests_read.iter())
-                    .filter_map(|test| at_least(&test.expr, &column))
+                    && (predicates_read.iter())
+                        .all(|predicate| at_least(&predicate.expr, &column).is_some());
+                let threshold = (predicates_read.iter())
+                    .filter_map(|predicate| at_least(&predicate.expr, &column))
                     .max();
                 match (unread, threshold) {
-                    (true, Some(n)) if self.options.fetch => Count::PerKey(keys.clone(), n),
+                    (true, Some(n)) if self.options.row_limit => Count::PerKey(keys.clone(), n),
                     _ => Count::All,
                 }
             }
@@ -552,7 +493,7 @@ impl Pass {
         let (input, _) = self.down(
             input,
             Demand {
-                tests: Vec::new(),
+                predicates: Vec::new(),
                 reads: None,
                 count,
                 carried: false,
@@ -566,14 +507,12 @@ impl Pass {
         let LogicalPlan::Join(join) = &plan else {
             unreachable!()
         };
-        // which side's rows reach the output as they are
         let (keeps_left, keeps_right) = match join.join_type {
             JoinType::Inner => (true, true),
             JoinType::Left | JoinType::LeftSemi | JoinType::LeftAnti => (true, false),
             JoinType::Right | JoinType::RightSemi | JoinType::RightAnti => (false, true),
             _ => (false, false),
         };
-        // an outer join's unmatched rows hold NULLs, not a kept value
         let carried = demand.carried && join.join_type == JoinType::Inner;
         let mut sides = Vec::new();
         for (input, keeps, filtered) in [
@@ -594,18 +533,18 @@ impl Pass {
                     .iter()
                     .all(|column| schema.has_column(column))
             };
-            let tests = if keeps {
+            let predicates = if keeps {
                 demand
-                    .tests
+                    .predicates
                     .iter()
-                    .filter(|test| within(&test.expr))
+                    .filter(|predicate| within(&predicate.expr))
                     .cloned()
                     .collect()
             } else {
                 Vec::new()
             };
-            let reads_with_tests = demand.reads_with_tests();
-            let reads = reads_with_tests.as_ref().map(|reads| {
+            let reads_with_predicates = demand.reads_with_predicates();
+            let reads = reads_with_predicates.as_ref().map(|reads| {
                 let mut found: BTreeMap<Column, Expr> = (reads.iter())
                     .filter(|(column, _)| schema.has_column(column))
                     .map(|(column, read)| (column.clone(), weaken(read, &within)))
@@ -624,18 +563,17 @@ impl Pass {
                 .chain(join.filter.iter())
                 .flat_map(|expr| expr.column_refs())
                 .collect::<BTreeSet<_>>();
-            let fields = (without_tests(&demand.fields, &demand.tests).into_iter())
+            let fields = (without_predicates(&demand.fields, &demand.predicates).into_iter())
                 .filter(|(column, _)| schema.has_column(column) && !on.contains(column))
                 .collect();
-            // a semi join needs one row of each key of its other side
             let count = match semi_join_keys(join, filtered) {
-                Some(keys) if self.options.fetch => Count::PerKey(keys, 1),
+                Some(keys) if self.options.row_limit => Count::PerKey(keys, 1),
                 _ => Count::All,
             };
             sides.push((
                 input.clone(),
                 Demand {
-                    tests,
+                    predicates,
                     reads,
                     count,
                     carried,
@@ -647,7 +585,7 @@ impl Pass {
         let mut inputs = Vec::new();
         for (input, demand) in sides {
             let (input, below) = self.down(input, demand)?;
-            taken.tests.extend(below.tests);
+            taken.predicates.extend(below.predicates);
             taken.kept.extend(below.kept);
             inputs.push(input);
         }
@@ -663,50 +601,53 @@ impl Pass {
                 .iter()
                 .all(|column| input_schema.has_column(column))
         };
-        // a test of the node's answer becomes its filter
-        if self.options.filters {
-            for test in &demand.tests {
-                if node.take_test(&test.expr) {
-                    taken.tests.insert(test.id);
+        if self.options.inline_predicates {
+            for predicate in &demand.predicates {
+                if node.take_predicate(&predicate.expr) {
+                    taken.predicates.insert(predicate.id);
                 }
             }
         }
-        // the count becomes its fetch when every test is its filter or reads
-        // only its input, which then moves below it
-        let below_tests: Vec<&Test> = (demand.tests.iter())
-            .filter(|test| !taken.tests.contains(&test.id) && reads_input_only(&test.expr))
+        let below_predicates: Vec<&Predicate> = (demand.predicates.iter())
+            .filter(|predicate| {
+                !taken.predicates.contains(&predicate.id) && reads_input_only(&predicate.expr)
+            })
             .collect();
-        let decided = (demand.tests.iter())
-            .all(|test| taken.tests.contains(&test.id) || reads_input_only(&test.expr));
-        let fetch = match &demand.count {
-            _ if !decided || !node.accepts_fetch() => None,
+        let decided = (demand.predicates.iter()).all(|predicate| {
+            taken.predicates.contains(&predicate.id) || reads_input_only(&predicate.expr)
+        });
+        let row_limit = match &demand.count {
+            _ if !decided || !node.accepts_row_limit() => None,
             Count::All => None,
-            Count::Rows(rows) => node.rows_fetch(*rows),
-            Count::Distinct(keys) => node.distinct_fetch(keys),
-            Count::PerKey(keys, n) => node.per_key_fetch(keys, *n),
+            Count::Rows(rows) => node.row_limit_for(*rows),
+            Count::Distinct(keys) => node.distinct_row_limit(keys),
+            Count::PerKey(keys, n) => node.per_key_row_limit(keys, *n),
         };
         let mut input = node.inputs()[0].clone();
-        let fetched = fetch.is_some() || node.has_fetch() && demand.count != Count::All;
-        if let Some(fetch) = fetch {
-            if let Some(predicate) = conjunction(below_tests.iter().map(|test| test.expr.clone())) {
+        let limited = row_limit.is_some() || node.has_row_limit() && demand.count != Count::All;
+        if let Some(row_limit) = row_limit {
+            if let Some(predicate) = conjunction(
+                below_predicates
+                    .iter()
+                    .map(|predicate| predicate.expr.clone()),
+            ) {
                 input = LogicalPlan::Filter(Filter::try_new(predicate, Arc::new(input))?);
             }
-            taken.tests.extend(below_tests.iter().map(|test| test.id));
-            node = node.with_fetch(fetch);
+            taken
+                .predicates
+                .extend(below_predicates.iter().map(|predicate| predicate.id));
+            node = node.with_row_limit(row_limit);
             taken.count = true;
         }
-        // an extraction whose answer must contain a literal reads only the
-        // documents that contain it
-        if self.options.filters
-            && !node.has_fetch()
+        if self.options.inline_predicates
+            && !node.has_row_limit()
             && let Some(test) = precheck(&node, &input)
         {
             input = LogicalPlan::Filter(Filter::try_new(test, Arc::new(input))?);
         }
-        // the tests the node took read its answer in its own filter
         let above = Demand {
-            tests: (demand.tests.iter())
-                .filter(|test| !taken.tests.contains(&test.id))
+            predicates: (demand.predicates.iter())
+                .filter(|predicate| !taken.predicates.contains(&predicate.id))
                 .cloned()
                 .collect(),
             reads: demand.reads.clone(),
@@ -714,28 +655,29 @@ impl Pass {
             carried: demand.carried,
             fields: demand.fields.clone(),
         };
-        // where the answer is read becomes the node's guard
-        if self.options.guard && !fetched {
-            guard(&mut node, &above);
+        if self.options.precondition && !limited {
+            precondition(&mut node, &above);
         }
         let mut kept = None;
-        if self.options.projection {
-            kept = project(&mut node, &above);
+        if self.options.field_pruning {
+            kept = prune_fields(&mut node, &above);
             ask_read_fields(&mut node, &above)?;
         }
-        // the node's input: the tests of its input, and the reads of its
-        // input's columns and of its own expressions
-        let tests = (demand.tests.iter())
-            .filter(|test| !taken.tests.contains(&test.id) && reads_input_only(&test.expr))
+        let predicates = (demand.predicates.iter())
+            .filter(|predicate| {
+                !taken.predicates.contains(&predicate.id) && reads_input_only(&predicate.expr)
+            })
             .cloned()
             .collect();
-        let passed: BTreeSet<usize> = (demand.tests.iter())
-            .filter(|test| !taken.tests.contains(&test.id) && reads_input_only(&test.expr))
-            .map(|test| test.id)
+        let passed: BTreeSet<usize> = (demand.predicates.iter())
+            .filter(|predicate| {
+                !taken.predicates.contains(&predicate.id) && reads_input_only(&predicate.expr)
+            })
+            .map(|predicate| predicate.id)
             .collect();
         let held = Demand {
-            tests: (demand.tests.iter())
-                .filter(|test| !passed.contains(&test.id))
+            predicates: (demand.predicates.iter())
+                .filter(|predicate| !passed.contains(&predicate.id))
                 .cloned()
                 .collect(),
             reads: demand.reads.clone(),
@@ -743,7 +685,7 @@ impl Pass {
             carried: demand.carried,
             fields: demand.fields.clone(),
         };
-        let reads = held.reads_with_tests().map(|reads| {
+        let reads = held.reads_with_predicates().map(|reads| {
             let mut found: BTreeMap<Column, Expr> = (reads.iter())
                 .filter(|(column, _)| input_schema.has_column(column))
                 .map(|(column, read)| (column.clone(), weaken(read, &reads_input_only)))
@@ -753,51 +695,51 @@ impl Pass {
                     add_read(&mut found, column, lit(true));
                 }
             }
-            if let Some(filter) = node.filter() {
-                for column in filter.column_refs() {
+            if let Some(inline_predicate) = node.inline_predicate() {
+                for column in inline_predicate.column_refs() {
                     if input_schema.has_column(column) {
-                        let within = read_condition(&filter, column).unwrap_or(lit(true));
+                        let within = read_condition(&inline_predicate, column).unwrap_or(lit(true));
                         let within = weaken(&within, &reads_input_only);
                         add_read(&mut found, column, within);
                     }
                 }
             }
-            for test in node.tests() {
-                for column in test.test.column_refs() {
+            for pred in node.written_predicates() {
+                for column in pred.predicate.column_refs() {
                     add_read(&mut found, column, lit(true));
                 }
             }
             found
         });
-        // a node that returns each input row as it is passes the count on
         let count = match &demand.count {
-            _ if taken.count || node.has_fetch() => Count::All,
+            _ if taken.count || node.has_row_limit() => Count::All,
             Count::Rows(_)
-                if node.semantics() == Semantics::Rows && node.filter().is_none() && decided =>
+                if node.semantics() == Semantics::Rows
+                    && node.inline_predicate().is_none()
+                    && decided =>
             {
                 demand.count.clone()
             }
             _ => Count::All,
         };
-        // the node's own expressions read their columns whole
         let own: BTreeSet<Column> = (node.asked_expressions().into_iter())
-            .chain(node.filter_expressions())
+            .chain(node.predicate_expressions())
             .flat_map(|expr| expr.column_refs().into_iter().cloned().collect::<Vec<_>>())
             .collect();
-        let fields = (without_tests(&held.fields, &held.tests).into_iter())
+        let fields = (without_predicates(&held.fields, &held.predicates).into_iter())
             .filter(|(column, _)| input_schema.has_column(column) && !own.contains(column))
             .collect();
         let (input, below) = self.down(
             input,
             Demand {
-                tests,
+                predicates,
                 reads,
                 count,
                 carried: demand.carried,
                 fields,
             },
         )?;
-        taken.tests.extend(below.tests);
+        taken.predicates.extend(below.predicates);
         taken.count |= below.count;
         let node = node.with_input(input)?;
         let rebuilt = read_kept(extension_node(node.checked()?), &below.kept)?;
@@ -807,19 +749,14 @@ impl Pass {
     }
 }
 
-/// Return only the added columns the plan above reads, as
-/// [`AiNode::project`] explains.
-fn project(node: &mut AiNode, above: &Demand) -> Option<(String, bool)> {
+fn prune_fields(node: &mut AiNode, above: &Demand) -> Option<(String, bool)> {
     above.reads.as_ref()?;
-    node.project(
+    node.prune_fields(
         |name| above.read_where(&Column::from_name(name)).is_some(),
         above.carried,
     )
 }
 
-/// Ask an extraction only the fields the plan above and its own filter
-/// and tests read, of its answer and its spans; each field is a question
-/// of its own, so leaving one out changes no other's answer.
 fn ask_read_fields(node: &mut AiNode, above: &Demand) -> Result<()> {
     if node.function() != "ai_extract"
         || node.semantics() != Semantics::Rows
@@ -847,7 +784,7 @@ fn ask_read_fields(node: &mut AiNode, above: &Demand) -> Result<()> {
             };
             read.extend(found);
         }
-        for expr in node.filter_expressions() {
+        for expr in node.predicate_expressions() {
             if expr.column_refs().contains(name) {
                 let Some(found) = read_fields(&expr, name) else {
                     return Ok(());
@@ -863,8 +800,6 @@ fn ask_read_fields(node: &mut AiNode, above: &Demand) -> Result<()> {
     if kept.is_empty() || kept.len() == questions.len() {
         return Ok(());
     }
-    // the call changes in this node alone: a node below with the same call
-    // asks the fields its own readers read
     let input = node.inputs()[0].clone();
     let alone = LogicalPlan::EmptyRelation(EmptyRelation {
         produce_one_row: false,
@@ -877,15 +812,13 @@ fn ask_read_fields(node: &mut AiNode, above: &Demand) -> Result<()> {
     Ok(())
 }
 
-/// `fields` without the columns the tests read, for an operator that
-/// reads them as it folds the tests into its reads.
-fn without_tests(
+fn without_predicates(
     fields: &BTreeMap<Column, BTreeSet<String>>,
-    tests: &[Test],
+    predicates: &[Predicate],
 ) -> BTreeMap<Column, BTreeSet<String>> {
-    let tested: BTreeSet<&Column> = tests
+    let tested: BTreeSet<&Column> = predicates
         .iter()
-        .flat_map(|test| test.expr.column_refs())
+        .flat_map(|predicate| predicate.expr.column_refs())
         .collect();
     (fields.iter())
         .filter(|(column, _)| !tested.contains(column))
@@ -893,8 +826,6 @@ fn without_tests(
         .collect()
 }
 
-/// The fields of `column` that `expr` reads when it reads `column` only as
-/// `get_field(column, 'name')`; None when it reads more of it.
 fn read_fields(expr: &Expr, column: &Column) -> Option<BTreeSet<String>> {
     let mut fields = BTreeSet::new();
     let mut whole = false;
@@ -927,8 +858,6 @@ fn read_fields(expr: &Expr, column: &Column) -> Option<BTreeSet<String>> {
     (!whole).then_some(fields)
 }
 
-/// `plan` with each read of a kept answer as its value, each expression
-/// keeping its name.
 fn read_kept(plan: LogicalPlan, kept: &[(String, bool)]) -> Result<LogicalPlan> {
     if kept.is_empty() {
         return Ok(plan);
@@ -940,7 +869,6 @@ fn read_kept(plan: LogicalPlan, kept: &[(String, bool)]) -> Result<LogicalPlan> 
         let saved = preserver.save(&expr);
         let read = expr.transform_up(|found| {
             let value = match &found {
-                // an answer's name is Quail's own, whatever qualifies it
                 Expr::Column(column) => (kept.iter())
                     .find(|(name, _)| *name == column.name)
                     .map(|(_, value)| *value),
@@ -961,12 +889,9 @@ fn read_kept(plan: LogicalPlan, kept: &[(String, bool)]) -> Result<LogicalPlan> 
     plan.with_new_exprs(exprs, inputs)
 }
 
-/// Guard a column node with where its answer is read, as far as the
-/// executor can evaluate it: the terms that read only the one table the
-/// call reads.
-fn guard(node: &mut AiNode, demand: &Demand) {
+fn precondition(node: &mut AiNode, demand: &Demand) {
     if node.function() == "ai_filter" {
-        return or_guard(node, demand);
+        return or_precondition(node, demand);
     }
     if !node.is_plain_column() {
         return;
@@ -977,18 +902,15 @@ fn guard(node: &mut AiNode, demand: &Demand) {
     else {
         return;
     };
-    // a part the node cannot evaluate may be anything
     let known = |atom: &Expr| node.evaluates_on_rows(atom);
     let read = bounds(&read, &known).may_be_true;
     let kept: Vec<Expr> = (split_conjunction(&read).into_iter())
         .filter(|term| !matches!(term, Expr::Literal(..)))
         .cloned()
         .collect();
-    node.add_guard(kept);
+    node.add_precondition(kept);
 }
 
-/// What a condition may and must be, where some of its parts are
-/// unknown: each is a condition of the known parts alone, never NULL.
 struct Bounds {
     may_be_true: Expr,
     may_be_false: Expr,
@@ -996,8 +918,6 @@ struct Bounds {
     is_false: Expr,
 }
 
-/// The bounds of `expr` when the parts `known` rejects may take any value.
-/// A part is a term other than AND, OR, NOT, and the IS TRUE family.
 fn bounds(expr: &Expr, known: &dyn Fn(&Expr) -> bool) -> Bounds {
     let not = |expr: Expr| match expr {
         Expr::Literal(..) if is_true(&expr) => lit(false),
@@ -1047,7 +967,6 @@ fn bounds(expr: &Expr, known: &dyn Fn(&Expr) -> bool) -> Bounds {
                 is_false: found.is_true,
             }
         }
-        // x IS NOT TRUE is TRUE where x is FALSE or NULL
         Expr::IsNotTrue(inner) => {
             let found = bounds(inner, known);
             Bounds {
@@ -1099,33 +1018,23 @@ fn bounds(expr: &Expr, known: &dyn Fn(&Expr) -> bool) -> Bounds {
     }
 }
 
-/// Guard an `AI.IF` of an OR with the OR's other terms, as
-/// [`crate::rules::guards`] explains: it is asked only
-/// where none of them is TRUE, as far as the executor can tell before
-/// asking. The OR's last `AI.IF` filters on the OR, so its own filter reads
-/// its answer; each earlier one returns its answer, which the last one's
-/// filter reads. A term the guard keeps reads only the one table the call
-/// reads, or is an earlier `AI.IF`'s answer not TRUE.
-fn or_guard(node: &mut AiNode, demand: &Demand) {
-    if !node.takes_or_guard() {
+fn or_precondition(node: &mut AiNode, demand: &Demand) {
+    if !node.takes_or_precondition() {
         return;
     }
     let answer = Column::from_name(node.answer());
-    let read = match node.filter() {
-        // nothing above reads the last one's answer, so it returns none
-        Some(filter) if unread(node, demand) && node.or_terms().is_some() => {
-            read_condition(&filter, &answer)
+    let read = match node.inline_predicate() {
+        Some(inline_predicate) if unread(node, demand) && node.or_terms().is_some() => {
+            read_condition(&inline_predicate, &answer)
         }
         Some(_) => None,
         None => demand.read_where(&answer),
     };
     if let Some(read) = read {
-        node.guard_or(&read);
+        node.precondition_or(&read);
     }
 }
 
-/// Whether no operator above reads the node's answer: it does not
-/// return it, or the demand reads it nowhere.
 fn unread(node: &AiNode, demand: &Demand) -> bool {
     let returned = (node.returned_fields().iter()).any(|field| field.name() == node.answer());
     !returned
@@ -1134,8 +1043,6 @@ fn unread(node: &AiNode, demand: &Demand) -> bool {
             .is_none()
 }
 
-/// The keys of a semi join's filtered side, when the join compares plain
-/// columns and has no other test.
 fn semi_join_keys(join: &datafusion::logical_expr::Join, filtered: bool) -> Option<Vec<Column>> {
     if !filtered || join.filter.is_some() || join.on.is_empty() {
         return None;
@@ -1158,8 +1065,6 @@ fn keys_below(keys: &[Column], below: &dyn Fn(&Expr) -> Option<Expr>) -> Option<
         .collect()
 }
 
-/// The conjunction of `cond`'s terms that `keep` accepts: a weaker
-/// condition, TRUE when it accepts none.
 fn weaken(cond: &Expr, keep: &dyn Fn(&Expr) -> bool) -> Expr {
     conjunction(
         split_conjunction(cond)
@@ -1170,8 +1075,6 @@ fn weaken(cond: &Expr, keep: &dyn Fn(&Expr) -> bool) -> Expr {
     .unwrap_or(lit(true))
 }
 
-/// `cond` below an operator that renames columns: each term `below`
-/// rewrites, TRUE when it rewrites none.
 fn weaken_through(cond: &Expr, below: &dyn Fn(&Expr) -> Option<Expr>) -> Expr {
     conjunction(split_conjunction(cond).into_iter().filter_map(below)).unwrap_or(lit(true))
 }
@@ -1217,10 +1120,6 @@ fn or(one: &Expr, two: &Expr) -> Expr {
     }
 }
 
-/// Where `expr`'s value depends on `column`'s: None when nowhere, TRUE
-/// when everywhere. A `CASE` reads a branch where its condition is TRUE;
-/// `a AND b` reads `b` where `a` is not FALSE, and `a OR b` where `a` is
-/// not TRUE.
 pub(super) fn read_condition(expr: &Expr, column: &Column) -> Option<Expr> {
     let reads = |expr: &Expr| expr.column_refs().contains(column);
     if !reads(expr) {
@@ -1232,7 +1131,6 @@ pub(super) fn read_condition(expr: &Expr, column: &Column) -> Option<Expr> {
         Expr::BinaryExpr(BinaryExpr { left, op, right })
             if matches!(op, Operator::And | Operator::Or) =>
         {
-            // `x OR y` is not TRUE where neither term is TRUE
             let gate = |other: &Expr| match op {
                 Operator::And => other.clone().is_not_false(),
                 _ => conjunction(

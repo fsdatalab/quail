@@ -66,14 +66,12 @@ def _allocate(risk, budget, price=None):
         return chosen, price
     pages = np.arange(risk.shape[1])
     rows = np.arange(len(risk))
-    # at this price no page saves more than it costs, so every row takes 0
     high = float(np.max(risk[:, 0] - risk[rows, chosen]))
     floor = high * 1e-12
 
     def choose(at):
         return np.argmin(risk + at * pages, axis=1)
 
-    # each row's choice at the bracket's low price (over budget) and high price
     upper = lower = None
     if price is not None and floor < price < high:
         at = price
@@ -229,12 +227,10 @@ class HeadroomAdmission:
         self.capacity = -(-(self.prefix + capacity_extra) // page_tokens) * page_tokens
         self.decode_cost = decode_cost
         self.page_holds = page_holds
-        # per document, the most tokens any of its branches borrows from it
         borrowed = np.where(self.parent == np.arange(len(self.prefix)), 0, shared)
         self.lead = np.zeros(len(self.prefix), dtype=np.int64)
         np.maximum.at(self.lead, self.parent, borrowed)
         self.choose_headroom = choose_headroom and decode_cost is not None
-        # each anchor's dependents, the anchor first: order[start[a]:start[a + 1]]
         order = np.argsort(self.parent, kind="stable")
         self.child_order = order
         self.child_start = np.searchsorted(self.parent[order],
@@ -243,48 +239,30 @@ class HeadroomAdmission:
         self.curves = decoder.answer_curves = AnswerCurves(
             decoder, self.prefix, bucket_answers)
         self.width = self.curves.width
-        # anchors whose answers allows() priced and admit() counted
         self.committed = np.zeros(len(self.prefix), dtype=bool)
         self.stages = np.full(len(self.prefix), -1)
-        # committed branches whose prompts are not placed yet
         self.unplaced = set()
-        # their prompt pages
         self.fixed_pages = 0
-        # per slot, the KV position its pages and headroom reach
         self.reach = np.zeros(len(self.prefix), dtype=np.int64)
         self.headroom_pages = 0
         self.replay_pages = 0
-        # answers holding pages: slots, risk grids, the pages each holds
-        # at headroom 0, the headroom each reserves, and the budget it fits
         grid = -(-(self.width - 1) // page_tokens) + 1
         self.held_slots = np.zeros(0, dtype=np.int64)
         self.held_risk = np.zeros((0, grid))
         self.held_base = np.zeros(0, dtype=np.int64)
         self.held_pages = np.zeros(0, dtype=np.int64)
         self.held_budget = None
-        # the page price of the last headroom chosen, where the next search starts
         self.price = None
-        # (anchor, the anchors it commits, budget, headroom of held answers
-        # then theirs) of the last anchor allows() accepted
         self._decision = None
         self.work = Work()
-        # per map, its mean answer tokens; per considered set of answers,
-        # their expected tokens and decode work, until the next refresh
         self._expected = np.zeros(len(decoder.limits))
         self._added = {}
-        # (anchors, their answer slots, their R(j) grid) for the last
-        # priced answers, valid until the work changes
         self._candidate = None
         self._refreshes = 0
-        # (refresh, map, bucket, answers, mean headroom pages) per rebuild,
-        # kept only when traced
         self.traced = trace
         self.trace = []
-        # headroom pages each admitted answer was given, and
-        # (refresh, bucket, pages) for each
         self.granted = []
         self.granted_at = []
-        # admissions that committed only some of a document's waiting answers
         self.partial_admissions = 0
 
     def refresh(self, stages, replays=(), replay_pages=0, free_pages=None):
@@ -497,7 +475,6 @@ class HeadroomAdmission:
         survived = flat[base + np.minimum(limits, written[:, None])]
         overrun = np.divide(flat[base + reach], survived, out=np.zeros(reach.shape),
                             where=survived > 0)
-        # an overrun is evicted with the tokens its pages held
         tokens = origin[:, None] + np.minimum(limits, held + pages * page_tokens)
         recover = self.decode_cost.replay_seconds(self.work, tokens,
                                                   self.chunk_tokens)
@@ -562,7 +539,6 @@ class HeadroomAdmission:
                 self.headroom_pages = self.fixed_pages + int(self.held_pages.sum())
             _, risk = self._admission_risk(members)
             expected, added = self._added_work(members)
-            # with nothing running, price joining a pass that holds such answers
             base = self.work if self.work.tokens else added
             gain = self.decode_cost.gain(base, added, expected)
             if held is None:

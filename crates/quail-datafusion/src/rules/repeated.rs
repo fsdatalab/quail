@@ -1,30 +1,3 @@
-//! The `MergeRepeatedAiCalls` optimizer rule: an AI call the rows below
-//! already answered reads that answer.
-//!
-//! When an `AiNode` makes the same call, with the same guard, as an
-//! `AiNode` below it, its answer for each row is the lower node's:
-//!
-//! ```text
-//! AI_{f → b}(AI_{f → a}(R)) ⇒ π_{*, a → b}(AI_{f → a}(R))
-//! ```
-//!
-//! For example, `WHERE AI.IF(q) AND AI.IF(q)` asks the model `q` once.
-//! The rule reads down from the upper node through filters, other
-//! `AiNode`s of the same rows, and the projections and aliases of
-//! derived tables and CTEs, to the first node with the same call, each
-//! column the call reads mapped to the column it names below. Across a
-//! derived table, the lower node's answers are added to its SELECT list
-//! where it does not return them already. For example, in `SELECT
-//! AI.CLASSIFY(d.body, ...) FROM (SELECT r.body, AI.CLASSIFY(r.body, ...)
-//! AS t FROM reviews r) d` the outer call reads `d.t`.
-//!
-//! The rule runs before [`crate::rules::derive`], while no node has a
-//! filter, guard, fetch, or projection, so one node stands for the call
-//! and `derive` gives it what every read of its answer needs together.
-//! It leaves a node that has one of those options, and a gate, alone.
-//! The upper node's `HINT` estimated the rows of a test the lower node
-//! already makes, and goes with it.
-
 use std::sync::Arc;
 
 use datafusion::common::tree_node::{Transformed, TreeNode};
@@ -37,8 +10,6 @@ use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 use crate::ai::{AiNode, Semantics};
 use crate::plan::{as_node, extension_node};
 
-/// Make each repeated AI call read the answer of the same call below it,
-/// as the module explains.
 #[derive(Debug, Default)]
 pub struct MergeRepeatedAiCalls;
 
@@ -69,8 +40,6 @@ fn merge(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     let answers = upper.added_names();
     let input = upper.inputs()[0].clone();
     let names = lower.added_names();
-    // the lower node's answers as the upper node's input names them,
-    // added to each derived table's SELECT list between them
     let Some((exposed, read)) = expose(&input, lower, &names)? else {
         return Ok(Transformed::no(plan));
     };
@@ -91,9 +60,6 @@ fn merge(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     )))
 }
 
-/// `plan` with the columns `names` of `lower`, a node below it, passed up
-/// through each projection and alias between them, and those columns as
-/// `plan` names them; None when a projection cannot pass one on.
 fn expose(
     plan: &LogicalPlan,
     lower: &AiNode,
@@ -167,8 +133,6 @@ fn expose(
     })
 }
 
-/// `expr` with each column of `projection`'s output read as the
-/// expression that computes it; None when one is not an output column.
 pub(crate) fn through_projection(expr: &Expr, projection: &Projection) -> Option<Expr> {
     let mut missing = false;
     let found = expr
@@ -198,8 +162,6 @@ pub(crate) fn through_projection(expr: &Expr, projection: &Projection) -> Option
     (!missing).then_some(found)
 }
 
-/// `expr` with each column of the derived table `alias` read as its
-/// input's column of the same name.
 pub(crate) fn through_alias(expr: &Expr, alias: &SubqueryAlias) -> Option<Expr> {
     let mut missing = false;
     let found = expr
@@ -236,10 +198,6 @@ pub(crate) fn through_alias(expr: &Expr, alias: &SubqueryAlias) -> Option<Expr> 
     (!missing).then_some(found)
 }
 
-/// The first `AiNode` below `upper`, through filters, other nodes of the
-/// same rows, and the projections and aliases of derived tables, that
-/// makes `upper`'s call, each column read by the name the node's input
-/// gives it, has no options, and adds columns of the same types.
 fn same_call_below(upper: &AiNode) -> Option<&AiNode> {
     let mut plan = upper.inputs()[0];
     let mut call = upper.call();

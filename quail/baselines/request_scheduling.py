@@ -188,15 +188,12 @@ def run_filter_sequence(
                     expected_rows -= 1
     finally:
         if inflight:
-            # the engine is reused by the next query; a request left
-            # queued would run there and take KV from it
             engine.abort_request(list(inflight))
     return sequence.result(
         time.perf_counter() - started,
         **_cap_settings(document_cap, budget_tokens, block_size,
                         max_num_seqs),
     )
-
 
 
 def extract_document_cap(
@@ -298,7 +295,6 @@ def run_extract_fields(
                     continue
                 document, field = inflight[output.request_id]
                 if field == 0 and document not in released:
-                    # the body's KV is computed, so the other fields hit it
                     released.add(document)
                     for later in range(1, fields):
                         submit(document, later)
@@ -311,8 +307,6 @@ def run_extract_fields(
                     expected_rows -= 1
     finally:
         if inflight:
-            # the engine is reused by the next query; a request left
-            # queued would run there and take KV from it
             engine.abort_request(list(inflight))
     return {
         "outputs": outputs,

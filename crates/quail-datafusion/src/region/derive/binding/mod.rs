@@ -1,6 +1,3 @@
-//! Bind query expressions and track tables, answers, and document columns.
-//! Build value expressions and scans from this shared state.
-
 mod calls;
 mod conditions;
 mod select;
@@ -26,51 +23,32 @@ pub(crate) fn unsupported<T>(message: &str) -> Result<T, CompileError> {
     Err(CompileError::unsupported(message))
 }
 
-/// By (alias, column), the kind of the column operator of that table
-/// that computes the column.
 pub(crate) type ComputedBy = BTreeMap<(String, String), &'static str>;
 
-/// Whether `expr` or an expression inside it is one `found` accepts.
 fn contains(expr: &Expr, found: impl Fn(&Expr) -> bool) -> bool {
     expr.exists(|inner| Ok(found(inner))).unwrap_or(false)
 }
 
-/// The columns one `AiNode` adds, as the region's operators name them.
 #[derive(Debug, Clone)]
 pub(crate) struct AnswerColumn {
-    /// The node's answer column, as the plan's expressions read it.
     pub(crate) answer: String,
-    /// The operator's name: the SELECT list's name for the answer, or
-    /// the answer column's.
     pub(crate) name: String,
-    /// `label`, `extract`, `map`, `features`, `score`, or `boolean`.
     pub(crate) kind: &'static str,
-    /// The one table the call reads, or None for a call over pairs.
     pub(crate) alias: Option<String>,
-    /// The model calls the node runs, an extraction's one per field,
-    /// each with its column's name; none for an AI filter's answer.
     pub(crate) calls: Vec<(ModelCall, String)>,
-    /// An extraction's fields.
     pub(crate) fields: Vec<String>,
 }
 
 pub(crate) struct Binder {
     turn: Turn,
     layout: String,
-    /// (alias, provider, schema) of each table in scope, in the order
-    /// they were added.
     tables: Vec<(String, String, SchemaRef)>,
-    /// alias -> the document expression its prompts read.
     document_columns: Vec<(String, ValueExpression)>,
-    /// The columns each `AiNode` adds, in the plan's order.
     answers: Vec<AnswerColumn>,
-    /// (alias, column, type) of each answer column a test reads.
     answer_types: Vec<(String, String, DataType)>,
 }
 
 impl Binder {
-    /// A binder with no table in scope yet, for prompts rendered with
-    /// `turn` and `layout`.
     pub(crate) fn new(turn: &Turn, layout: &str) -> Self {
         Self {
             turn: turn.clone(),
@@ -82,9 +60,6 @@ impl Binder {
         }
     }
 
-    /// The model call and name of each column a column operator adds, and
-    /// by (alias, column) the kind of the operator of one table that
-    /// computes it, an extraction's spans included.
     pub(crate) fn column_operators(&self) -> (Vec<(ModelCall, String)>, ComputedBy) {
         let mut names: Vec<(ModelCall, String)> = Vec::new();
         let mut computed: ComputedBy = BTreeMap::new();
@@ -127,8 +102,6 @@ impl Binder {
         Ok(())
     }
 
-    // ------------------------------------------------------------ values
-
     fn resolve_column(&self, column: &Column) -> Result<ColumnRef, CompileError> {
         let alias = match &column.relation {
             Some(relation) => relation.table().to_string(),
@@ -160,8 +133,6 @@ impl Binder {
         })
     }
 
-    /// Bind a value: a column or a field of one as itself, and any other
-    /// value as an `Expression`.
     fn bind_value(&mut self, expr: &Expr) -> Result<ValueExpression, CompileError> {
         match expr {
             Expr::Column(column) => {
@@ -204,8 +175,6 @@ impl Binder {
         self.computed(expr)
     }
 
-    /// A value or condition DataFusion computes, as an `Expression`
-    /// over the columns it reads.
     fn computed(&self, expr: &Expr) -> Result<ValueExpression, CompileError> {
         if contains(expr, |inner| {
             matches!(
@@ -230,8 +199,6 @@ impl Binder {
         .map(ValueExpression::Value)
     }
 
-    /// The Arrow type of a column a computed value reads: an answer's,
-    /// or a table's column's.
     fn column_type(&self, reference: &ColumnRef) -> Result<DataType, CompileError> {
         if let Some((_, _, data_type)) = self
             .answer_types
@@ -253,11 +220,6 @@ impl Binder {
             })
     }
 
-    /// The Scan of a table in scope, reading its document column.
-    ///
-    /// # Panics
-    ///
-    /// No table in scope has the alias.
     pub(crate) fn scan(&self, alias: &str) -> Scan {
         let (_, provider, schema) = self
             .tables
@@ -282,7 +244,6 @@ impl Binder {
     }
 }
 
-/// An Arrow schema as the plan codec writes it: IPC bytes in base64.
 fn schema_of(schema: &SchemaRef) -> Schema {
     use base64::Engine;
     use datafusion::arrow::ipc::writer::{

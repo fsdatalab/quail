@@ -1,8 +1,3 @@
-//! Plan a region: validate its operators, build the physical graph in
-//! the chosen order, refine it with the physical rules, cut it into
-//! stages, and say what it returns; the plan of a request backend; and
-//! the text of `explain()`.
-
 pub mod explain;
 pub mod facts;
 pub mod graph;

@@ -1,8 +1,3 @@
-//! Extraction costs.
-//!
-//! Each document's work is a record of scalars; the table's work sums
-//! them as numpy sums an array.
-
 use crate::constants::SAMPLE_ROWS;
 use std::collections::BTreeMap;
 
@@ -25,13 +20,10 @@ fn tri(tokens: f64, window: i64) -> f64 {
     value(&triangle(&scalar(tokens), window))
 }
 
-/// The keep chance of the answer prior, for a whole mean answer length.
 fn keep(answer_tokens: i64) -> f64 {
     crate::cost::answers::keep(answer_tokens as f64)
 }
 
-/// `ExtractAssumptions.survival`: the chance an answer has more than
-/// `tokens` tokens after its first.
 pub fn survival(answer_tokens: i64, tokens: f64) -> f64 {
     if answer_tokens == 0 {
         0.0
@@ -40,12 +32,10 @@ pub fn survival(answer_tokens: i64, tokens: f64) -> f64 {
     }
 }
 
-/// Rounds an answer may take at the limit: ceil((limit - 1) / per_round), at least 0.
 fn most_rounds(max_answer_tokens: i64, per_round: i64) -> i64 {
     0.max(-(-(max_answer_tokens - 1)).div_euclid(per_round))
 }
 
-/// `ExtractAssumptions.rounds`: the expected rounds an answer takes.
 pub fn expected_rounds(answer_tokens: i64, max_answer_tokens: i64, per_round: i64) -> f64 {
     let most = most_rounds(max_answer_tokens, per_round);
     let keep = keep(answer_tokens);
@@ -59,14 +49,10 @@ pub fn expected_rounds(answer_tokens: i64, max_answer_tokens: i64, per_round: i6
     }
 }
 
-/// Each round length's chance to run each round, and sums over rounds.
 struct RoundChances {
     num_rounds: i64,
-    /// round tokens -> chance of round r, r = 0..=num_rounds.
     chance: BTreeMap<i64, Vec<f64>>,
-    /// round tokens -> sum of chance over rounds below k, k = 0..=num_rounds + 1.
     sum_chance: BTreeMap<i64, Vec<f64>>,
-    /// round tokens -> sum of chance times r over rounds below k.
     sum_chance_round: BTreeMap<i64, Vec<f64>>,
 }
 
@@ -123,7 +109,6 @@ impl RoundChances {
         self.chance[&round_tokens][0]
     }
 
-    /// Sums of chance and of chance times j over rounds offset + j, j < count.
     fn sums(&self, round_tokens: i64, offset: i64, count: i64) -> (f64, f64) {
         let (sums, round_sums) = (
             &self.sum_chance[&round_tokens],
@@ -135,7 +120,6 @@ impl RoundChances {
         (chance, chance_round - offset as f64 * chance)
     }
 
-    /// The expected sum of ask(context + j step, multiple step) over rounds offset + j.
     fn asks(
         &self,
         round_tokens: i64,
@@ -188,7 +172,6 @@ impl RoundChances {
     }
 }
 
-/// The extraction settings every document shares.
 #[derive(Debug, Clone)]
 pub struct ExtractInputs {
     pub head_tokens: i64,
@@ -197,22 +180,12 @@ pub struct ExtractInputs {
     pub resident: bool,
     pub max_answer_tokens: i64,
     pub draft_tokens: i64,
-    /// "fixed" or "adaptive".
     pub draft_policy: String,
     pub round_cost_per_token: f64,
-    /// The assumed mean answer length.
     pub answer_tokens: i64,
     pub recurrent: bool,
 }
 
-/// Each document's work, fed tokens, and readout rows.
-///
-/// `shared` holds one borrowed prefix length per document, or is empty
-/// when no document borrows one.
-///
-/// # Errors
-///
-/// The draft policy is neither "fixed" nor "adaptive".
 pub fn document_work(
     lengths: &[f64],
     shared: &[f64],
@@ -319,14 +292,6 @@ fn column(records: &[(Work, f64, f64)], field: impl Fn(&Work) -> &Quantity) -> f
     )
 }
 
-/// The work, fed tokens, and readout rows of every document.
-///
-/// A table of more than `SAMPLE_ROWS` documents sums evenly
-/// spaced documents and scales the sum to the table.
-///
-/// # Errors
-///
-/// The draft policy is unknown.
 pub fn table_work(
     lengths: &[f64],
     shared: &[f64],
@@ -370,7 +335,6 @@ pub fn table_work(
     Ok((work, fed, rows))
 }
 
-/// Estimated extraction time, work, and token counts.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExtractCost {
     pub seconds: f64,
@@ -380,13 +344,6 @@ pub struct ExtractCost {
     pub rows: f64,
 }
 
-/// The cost of one extraction over a table.
-///
-/// The window and recurrence in `inputs` come from the model.
-///
-/// # Errors
-///
-/// The draft policy is unknown.
 #[allow(clippy::too_many_arguments)]
 pub fn estimate(
     expected_rows: f64,

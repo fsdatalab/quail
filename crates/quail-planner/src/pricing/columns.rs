@@ -1,5 +1,3 @@
-//! Each column operator's priced spec.
-
 use crate::budgets::chunk_budget;
 use crate::constants;
 use crate::constants::{EXTRACT_ANSWER_TOKENS, MAP_ANSWER_TOKENS};
@@ -20,7 +18,6 @@ use crate::operators::SemanticColumn;
 use crate::prompts::lowering::read_slot_offsets;
 use crate::prompts::prompt_layout;
 
-/// A column operator's spec.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum ColumnSpec {
@@ -29,7 +26,6 @@ pub enum ColumnSpec {
     SaeFeatures(SaeFeaturesSpec),
 }
 
-/// What `bind_inference` reads off a prompt: aliases, template, arguments.
 struct Bound {
     aliases: Vec<String>,
     query_template: String,
@@ -55,11 +51,6 @@ fn bind(prompt: &Prompt) -> Bound {
     }
 }
 
-/// The spec of one column operator over `expected_rows` documents.
-///
-/// # Errors
-///
-/// The model cannot run the call, or the tokenizer fails.
 pub fn column_spec(
     context: &PlanningContext,
     column: &SemanticColumn,
@@ -116,7 +107,6 @@ fn extract_spec(
         read_slots: Vec::new(),
     };
     if model.attention_mask == "set" {
-        // a set-attention model reads the document, then points at it
         let alias = argument_alias(&call.prompt.args[0]);
         let summary = AliasStats::summarize(context.lengths(&alias)?, model.sliding_window);
         let layout = prompt_layout(&model.prompt_layout)?;
@@ -150,7 +140,6 @@ fn extract_spec(
         )?;
         return Ok(spec);
     }
-    // one document token's KV read per round, in tokens of compute
     let token_seconds = coefficients(model, device, false).linear_seconds;
     spec.round_cost_per_token = model.kappa() / device.hbm_bw / token_seconds;
     let alias = argument_alias(&call.prompt.args[0]);
@@ -167,7 +156,6 @@ fn extract_spec(
     Ok(spec)
 }
 
-/// An extraction's settings as the cost model reads them.
 pub fn extract_inputs(spec: &ExtractSpec, resident: bool) -> ExtractInputs {
     ExtractInputs {
         head_tokens: spec.prompt_token_parts[0].len() as i64,
@@ -183,8 +171,6 @@ pub fn extract_inputs(spec: &ExtractSpec, resident: bool) -> ExtractInputs {
     }
 }
 
-/// A map's settings as the cost model reads them: an extraction that
-/// drafts no tokens.
 fn map_inputs(spec: &MapSpec, resident: bool) -> ExtractInputs {
     ExtractInputs {
         head_tokens: spec.prompt_token_parts[0].len() as i64,
@@ -200,11 +186,6 @@ fn map_inputs(spec: &MapSpec, resident: bool) -> ExtractInputs {
     }
 }
 
-/// The estimated cost of writing one answer per document of `alias`.
-///
-/// # Errors
-///
-/// The planner has no token counts for the alias's table.
 pub fn answer_cost(
     context: &PlanningContext,
     alias: &str,
@@ -231,11 +212,6 @@ pub fn answer_cost(
     .map_err(CompileError::new)
 }
 
-/// A map's estimated cost over its documents.
-///
-/// # Errors
-///
-/// The planner has no token counts for the map's table.
 pub fn map_cost(
     context: &PlanningContext,
     spec: &MapSpec,

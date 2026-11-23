@@ -1,20 +1,3 @@
-//! `AI.PARSE_DOCUMENT(document)`: the text of a PDF held as bytes.
-//!
-//! The function reads the text each page stores, with `pdf-extract`, on
-//! the CPU and without a model. DataFusion runs it as it runs any other
-//! scalar function, below the model regions that read its text, so it
-//! parses only the rows that pass the filters below it, once for each
-//! distinct call. For example, with `PDF` a binary column:
-//!
-//! ```sql
-//! SELECT f.path,
-//!        AI.CLASSIFY(AI.PARSE_DOCUMENT(f.pdf), ['lease', 'invoice']) AS kind
-//! FROM filings f
-//! WHERE f.year = 2025
-//! ```
-//!
-//! Snowflake SQL may write `AI_PARSE_DOCUMENT(f.pdf)`.
-
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, StringBuilder};
@@ -26,11 +9,8 @@ use datafusion::logical_expr::{
 
 use super::quiet::quietly;
 
-/// What separates one page's text from the next: a form feed, as
-/// `pdftotext` writes it.
 const PAGE_BREAK: &str = "\u{c}";
 
-/// `AI.PARSE_DOCUMENT`, which returns each PDF's text.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct ParseDocument {
     signature: Signature,
@@ -70,8 +50,6 @@ impl ScalarUDFImpl for ParseDocument {
     }
 }
 
-/// The text of each PDF in `documents`, a binary array: NULL for a NULL
-/// or unreadable PDF.
 fn document_texts(documents: &ArrayRef) -> Result<ArrayRef> {
     let mut texts = StringBuilder::with_capacity(documents.len(), 0);
     let mut append = |bytes: Option<&[u8]>| texts.append_option(bytes.and_then(pdf_text));
@@ -84,17 +62,12 @@ fn document_texts(documents: &ArrayRef) -> Result<ArrayRef> {
     Ok(Arc::new(texts.finish()))
 }
 
-/// The text a PDF stores, its pages in order and each page trimmed, or
-/// None when `pdf-extract` cannot read the file.
 fn pdf_text(bytes: &[u8]) -> Option<String> {
-    // pdf-extract panics on some malformed files: 3 of ParseBench's 2,037
     let pages = quietly(|| pdf_extract::extract_text_from_mem_by_pages(bytes))?.ok()?;
     let pages: Vec<&str> = pages.iter().map(|page| page.trim()).collect();
     Some(pages.join(PAGE_BREAK))
 }
 
-/// `AI.PARSE_DOCUMENT` as a DataFusion UDF, also named
-/// `AI.PARSE_DOCUMENT` and `ai.parse_document`.
 pub(crate) fn parse_document_function() -> Arc<ScalarUDF> {
     Arc::new(ScalarUDF::new_from_impl(ParseDocument {
         signature: Signature::variadic_any(Volatility::Immutable),

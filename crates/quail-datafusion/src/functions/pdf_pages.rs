@@ -1,23 +1,3 @@
-//! `AI.PDF_PAGES(pdf [, longest_edge [, first [, last]]])`: each page of
-//! a PDF in the range as a PNG.
-//!
-//! The function draws each page with `hayro`, on the CPU and without a
-//! model, for a vision model to read. DataFusion runs it as it runs any
-//! other scalar function, so it draws only the rows that pass the
-//! filters below it. For example, with `pdf` a binary column:
-//!
-//! ```sql
-//! SELECT p.path, p.u['page'] AS page, p.u['image'] AS image
-//! FROM (SELECT f.path, UNNEST(AI.PDF_PAGES(f.pdf)) AS u
-//!       FROM filings f
-//!       WHERE f.year = 2025) p
-//! ```
-//!
-//! `UNNEST` in the subquery returns one row per page, and the outer
-//! query reads each field of the page.
-//!
-//! Snowflake SQL may write `AI_PDF_PAGES(f.pdf)`.
-
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
@@ -42,22 +22,14 @@ use rayon::prelude::*;
 
 use super::quiet::quietly;
 
-/// The pixels each side of an image is a multiple of: one Qwen vision
-/// token covers 2 x 2 patches of 16 pixels.
 const SIDE_MULTIPLE: u16 = 32;
 
-/// The longest side of an image, in pixels, when the call names none.
 const DEFAULT_LONGEST_EDGE: u16 = 1536;
 
-/// The largest `longest_edge` a call may name: a square page of this
-/// size is 256 MB of pixels while hayro draws it.
 const MAX_LONGEST_EDGE: u16 = 8192;
 
-/// A PDF's pages, by number from 1, each with its PNG, or None for a
-/// page hayro cannot draw.
 type Pages = Vec<(usize, Option<Vec<u8>>)>;
 
-/// `AI.PDF_PAGES`, which returns each PDF's pages as PNG images.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct PdfPages {
     signature: Signature,
@@ -128,7 +100,6 @@ impl ScalarUDFImpl for PdfPages {
     }
 }
 
-/// The type of `AI.PDF_PAGES`: one struct per page, in page order.
 fn pages_type() -> DataType {
     DataType::List(Arc::new(Field::new(
         "item",
@@ -137,7 +108,6 @@ fn pages_type() -> DataType {
     )))
 }
 
-/// The fields of one page: its number, from 1, and its PNG.
 fn page_fields() -> Fields {
     Fields::from(vec![
         Field::new("page", DataType::Int32, true),
@@ -145,8 +115,6 @@ fn page_fields() -> Fields {
     ])
 }
 
-/// The `longest_edge` argument in pixels, or an error unless the
-/// argument is an integer literal and a multiple of 32 from 32 to 8192.
 fn longest_edge_pixels(longest_edge: Option<&ScalarValue>) -> Result<u16> {
     let Some(literal) = longest_edge.filter(|value| value.data_type().is_integer()) else {
         return plan_err!("AI.PDF_PAGES takes longest_edge as an integer literal, in pixels");
@@ -165,9 +133,6 @@ fn longest_edge_pixels(longest_edge: Option<&ScalarValue>) -> Result<u16> {
     }
 }
 
-/// The pages from `first` to `last`, counted from 1 and inclusive; `last`
-/// None reads to the end. An error unless each is a positive integer
-/// literal and `first` is at most `last`.
 fn page_range(
     first: Option<&ScalarValue>,
     last: Option<&ScalarValue>,
@@ -189,8 +154,6 @@ fn page_range(
     Ok((first, last))
 }
 
-/// The pages of each PDF in `pdfs`, a binary array, from the range's
-/// first page to its last: NULL for a NULL or unreadable PDF.
 fn pdf_pages(
     pdfs: &ArrayRef,
     longest_edge: u16,
@@ -224,12 +187,6 @@ fn pdf_pages(
     Ok(Arc::new(pages.finish()))
 }
 
-/// Each PDF's pages in the range, by number from 1, with their PNGs, or
-/// None for a NULL PDF or one hayro cannot read. A page hayro cannot
-/// draw has no PNG; only the pages in the range are drawn.
-///
-/// Every page of every PDF draws in parallel. DataFusion already reads
-/// each partition's rows on its own thread, but one long PDF is one row.
 fn page_images(
     files: &[Option<&[u8]>],
     longest_edge: u16,
@@ -255,7 +212,6 @@ fn page_images(
         .flat_map(|(file, num_pages)| in_range(num_pages).map(move |index| (file, index)))
         .collect();
     let settings = InterpreterSettings::default();
-    // a RenderCache is not Send, so each thread keeps its own
     let images: Vec<Option<Vec<u8>>> = tasks
         .par_iter()
         .map_init(RenderCache::new, |cache, &(file, index)| {
@@ -277,10 +233,6 @@ fn page_images(
         .collect()
 }
 
-/// The width and height in pixels of the image of a page `width_points`
-/// by `height_points`: the longer side is `longest_edge`, and the other
-/// side keeps the page's shape to the nearest multiple of 32. None for
-/// a page without a size.
 fn image_size(width_points: f32, height_points: f32, longest_edge: u16) -> Option<(u16, u16)> {
     let has_size = |points: f32| points.is_finite() && points > 0.0;
     if !has_size(width_points) || !has_size(height_points) {
@@ -298,15 +250,12 @@ fn image_size(width_points: f32, height_points: f32, longest_edge: u16) -> Optio
     })
 }
 
-/// One page as a PNG: the page at the largest scale that fits the image,
-/// in the image's center, on white.
 fn page_image<'a>(
     page: &'a Page<'a>,
     cache: &RenderCache<'a>,
     settings: &InterpreterSettings,
     longest_edge: u16,
 ) -> Option<Vec<u8>> {
-    // the page's size after its /Rotate, which initial_transform applies
     let (width_points, height_points) = page.render_dimensions();
     let (width, height) = image_size(width_points, height_points, longest_edge)?;
     let (width_points, height_points) = (f64::from(width_points), f64::from(height_points));
@@ -342,7 +291,6 @@ fn page_image<'a>(
     png_bytes(&pixmap)
 }
 
-/// A pixmap on an opaque background as an 8-bit RGB PNG.
 fn png_bytes(pixmap: &Pixmap) -> Option<Vec<u8>> {
     let rgb: Vec<u8> = pixmap
         .data_as_u8_slice()
@@ -367,8 +315,6 @@ fn png_bytes(pixmap: &Pixmap) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-/// `AI.PDF_PAGES` as a DataFusion UDF, also named `AI.PDF_PAGES` and
-/// `ai.pdf_pages`.
 pub(crate) fn pdf_pages_function() -> Arc<ScalarUDF> {
     Arc::new(ScalarUDF::new_from_impl(PdfPages {
         signature: Signature::variadic_any(Volatility::Immutable),
@@ -385,13 +331,10 @@ mod tests {
 
     const EVERY_PAGE: (usize, Option<usize>) = (1, None);
 
-    /// The content stream that shows one line of Helvetica text.
     fn line(text: &str) -> String {
         format!("BT /F1 12 Tf 72 540 Td ({text}) Tj ET")
     }
 
-    /// A PDF with one page for each content stream, on a `width` by
-    /// `height` point MediaBox turned by `rotate` degrees.
     fn pdf(pages: &[&str], width: u32, height: u32, rotate: u32) -> Vec<u8> {
         let font = 3 + 2 * pages.len();
         let kids: Vec<String> = (0..pages.len())
@@ -440,7 +383,6 @@ mod tests {
         out.into_bytes()
     }
 
-    /// A PNG's width and height, and its pixels as 8-bit RGB.
     fn decoded(image: &[u8]) -> (u32, u32, Vec<u8>) {
         let mut reader = png::Decoder::new(std::io::Cursor::new(image))
             .read_info()
@@ -455,14 +397,12 @@ mod tests {
         (info.width, info.height, pixels)
     }
 
-    /// The pages of one PDF, as `page_images` draws them.
     fn one_pdf(pdf: &[u8], longest_edge: u16, range: (usize, Option<usize>)) -> Option<Pages> {
         page_images(&[Some(pdf)], longest_edge, range)
             .pop()
             .unwrap()
     }
 
-    /// The width and height of each page's image, for one PDF.
     fn sizes(pdf: &[u8], longest_edge: u16) -> Vec<(u32, u32)> {
         one_pdf(pdf, longest_edge, EVERY_PAGE)
             .unwrap()
@@ -503,7 +443,6 @@ mod tests {
         let letter = pdf(&[&line("Lease from March 2025.")], 612, 792, 0);
         assert_eq!(sizes(&letter, 1024), [(800, 1024)]);
         assert_eq!(sizes(&letter, 2048), [(1568, 2048)]);
-        // a page 20 times as long as it is wide rounds to 64 pixels
         assert_eq!(image_size(100.0, 2000.0, 1536), Some((64, 1536)));
         assert_eq!(image_size(1.0, 2000.0, 1536), Some((32, 1536)));
         assert_eq!(image_size(500.0, 500.0, 1024), Some((1024, 1024)));
@@ -514,7 +453,6 @@ mod tests {
     fn a_landscape_page_has_a_landscape_image() {
         let landscape = pdf(&[&line("Invoice for one desk.")], 792, 612, 0);
         assert_eq!(sizes(&landscape, 1536), [(1536, 1184)]);
-        // /Rotate turns a portrait MediaBox on its side
         let turned = pdf(&[&line("Invoice for one desk.")], 612, 792, 90);
         assert_eq!(sizes(&turned, 1536), [(1536, 1184)]);
     }
@@ -540,8 +478,6 @@ mod tests {
 
     #[test]
     fn a_page_narrower_than_its_image_has_white_margins() {
-        // 100 x 1000 points fits a 96 x 1024 image at 96 pixels wide and
-        // 960 high, so 32 rows above and below the page stay white
         let tall = pdf(&["0 0 1 rg 0 0 100 1000 re f"], 100, 1000, 0);
         let images = one_pdf(&tall, 1024, EVERY_PAGE).unwrap();
         let (width, height, pixels) = decoded(images[0].1.as_ref().unwrap());

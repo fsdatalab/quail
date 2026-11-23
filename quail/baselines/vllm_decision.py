@@ -67,13 +67,12 @@ def pool_decision_rows(torch, head, chunks, finished, params, states) -> list:
     for index, (chunk, param, state, done) in enumerate(zip(
             chunks, params, states, finished)):
         offsets = (param.extra_kwargs or {}).get(OFFSETS_KEY)
-        if offsets is None:    # vLLM's profiling and warmup requests
+        if offsets is None:
             if done:
                 out[index] = chunk[-1, :1].float()
             continue
         need = max(offsets) + 1
         cache = state.hidden_states_cache
-        # the runner reuses the hidden-state buffer on the next step
         cache.append(chunk[-need:].clone())
         if len(cache) > 1:
             cache[:] = [torch.cat(cache)[-need:]]

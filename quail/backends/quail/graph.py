@@ -77,7 +77,6 @@ def execution_context(state, payload, graph: PhysicalGraph) -> ExecutionContext:
     for key in arena.resident_keys():
         arena.free_key(key)
     arena.reset_stats()
-    # the peak memory reported is this query's, not the process's
     state["gpu"].torch.cuda.reset_peak_memory_stats()
     retention = payload.get("retention", {})
     apply_retention(arena, retention, retention.get("initial", {}))
@@ -112,7 +111,6 @@ def execution_context(state, payload, graph: PhysicalGraph) -> ExecutionContext:
         sources=sources,
         model_result=record_model_result,
         state=runtime_state,
-        # an execution that runs node by node leaves the runner's chains out
         run_pipeline=(execution.execute_pipeline if execution.groups_operators
                       else None),
         deduplicate=payload.get("deduplicate", {}),
@@ -134,7 +132,6 @@ def execution_measurements(context: ExecutionContext) -> dict:
     }
 
 
-# the tables of a runtime payload, each a mapping from alias
 _PAYLOAD_TABLES = ("documents", "texts", "columns", "source_rows")
 
 
@@ -175,7 +172,6 @@ def serve_region(state, payload, graph: PhysicalGraph, end, wanted,
                 end, context, compute_subgraph(graph), payload["stages"],
                 wanted, hinted, payload_first_rows(payload) if hinted else None)
         torch.cuda.synchronize()
-        # the region is timed until its end, so the files fall inside it
         arena.write_trace_files()
     finally:
         images = getattr(pipeline, "images", None)

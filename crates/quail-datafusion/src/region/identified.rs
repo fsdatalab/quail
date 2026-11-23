@@ -1,5 +1,3 @@
-//! `IdentifiedTable`: a table whose rows have a content identity.
-
 use std::borrow::Cow;
 use std::fmt;
 use std::sync::Arc;
@@ -13,19 +11,12 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, LogicalPlan, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 
-/// A table whose rows are the same whenever it is scanned, named by its
-/// content identity, such as a registered Python provider's.
-///
-/// A model region reads it by name; the runner reads its rows and keeps
-/// its token store for later queries under the identity. DataFusion
-/// scans it for the operators outside model regions.
 pub struct IdentifiedTable {
     inner: Arc<dyn TableProvider>,
     identity: String,
 }
 
 impl IdentifiedTable {
-    /// `inner`, whose rows `identity` names.
     pub fn new(inner: Arc<dyn TableProvider>, identity: impl Into<String>) -> Self {
         Self {
             inner,
@@ -33,12 +24,10 @@ impl IdentifiedTable {
         }
     }
 
-    /// The identity of the table's rows.
     pub fn identity(&self) -> &str {
         &self.identity
     }
 
-    /// The table it marks.
     pub fn inner(&self) -> &Arc<dyn TableProvider> {
         &self.inner
     }

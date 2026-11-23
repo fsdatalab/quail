@@ -1,5 +1,3 @@
-//! Execution constraints checked before a graph is built.
-
 use crate::budgets::{
     POOL_FRACTION, arena_bytes, chunk_budget, chunk_memory_bytes, minimum_weight_gpus,
     sliding_kv_fits, transient_sliding_pages,
@@ -22,12 +20,10 @@ fn refusal(reason: impl Into<String>, constraint: &str) -> Refusal {
     Refusal::new(reason, constraint, 1.0, 0.0, "queries")
 }
 
-/// Whether a predicate compares an `AI.SCORE` value.
 pub fn is_score(asked: &Asked) -> bool {
     asked_call(asked).kind == "score"
 }
 
-/// Whether a plan computes an `AI.SCORE` value anywhere, as `has_score`.
 pub fn has_score(found: &Operators) -> bool {
     found
         .filters
@@ -40,7 +36,6 @@ pub fn has_score(found: &Operators) -> bool {
             .any(|expression| aliased_call(expression, &["score"]).is_some())
 }
 
-/// The `AI.SCORE` columns SELECT returns, as `score_projections`.
 pub fn score_projections(found: &Operators) -> Vec<(String, crate::physical::ModelCall)> {
     found
         .projection
@@ -55,8 +50,6 @@ pub fn score_projections(found: &Operators) -> Vec<(String, crate::physical::Mod
         .collect()
 }
 
-/// (alias, call kind) of each one-table column operator above a join,
-/// as `columns_above_joins`.
 pub fn columns_above_joins(found: &Operators) -> Vec<(String, String)> {
     let mut above: Vec<(String, String)> = Vec::new();
     for column in found.columns().filter(|column| column.above_joins) {
@@ -217,7 +210,6 @@ fn extraction_refusal(model: &ModelSpec, function: &str) -> Result<Option<Refusa
             repr_str(&model.name)
         )
     } else if prompt_layout(&model.prompt_layout)?.read_end.is_some() {
-        // the model answers by scoring options and document positions
         if function == "AI.EXTRACT" {
             return Ok(None);
         }
@@ -247,11 +239,6 @@ fn attention_device_refusal(model: &ModelSpec, device: &DeviceSpec) -> Option<Re
     ))
 }
 
-/// A refusal for what a bidirectional model cannot run yet.
-///
-/// Each prompt reads one document: a join or a prompt over two tables
-/// uses a layout the model was not trained on. Non-causal attention is
-/// checked on H100 SXM and B200.
 fn bidirectional_refusal(
     found: &Operators,
     context: &PlanningContext,
@@ -260,7 +247,6 @@ fn bidirectional_refusal(
     if !model.bidirectional() {
         return Ok(None);
     }
-    // every prompt a query asks, and its semantic columns
     let two_tables = !found.joins.is_empty()
         || plan_prompts(found)
             .iter()
@@ -294,8 +280,6 @@ fn bidirectional_refusal(
             "checked devices",
         )));
     }
-    // each document and its first question run in one pass: document rows
-    // read every later row of the block, so no pass splits a document
     let close = prompt_layout(&model.prompt_layout)?.document_close;
     let close_tokens = if close.is_empty() {
         0
@@ -340,11 +324,6 @@ fn bidirectional_refusal(
     Ok(None)
 }
 
-/// A refusal for unsupported inference or hardware, as `validate_query`.
-///
-/// # Errors
-///
-/// The model names an unknown prompt layout.
 pub fn validate_query(
     found: &Operators,
     context: &PlanningContext,

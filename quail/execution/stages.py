@@ -27,9 +27,6 @@ from quail.execution.runner import ExecutionContext, GenericRunner
 from quail.execution.types import output_table
 from quail.physical import PhysicalGraph, PortRef, Scan, ValueType
 
-# The longest a server goes without asking whether the hint tightened.
-# The hint only lets the model skip rows, so a late answer costs work,
-# not rows.
 _HINT_SECONDS = 0.005
 
 
@@ -197,8 +194,6 @@ def run_stage(context: ExecutionContext, graph: PhysicalGraph, stage: dict,
             if port.source.node_id not in inside | outside:
                 outside.add(port.source.node_id)
                 pending.append(port.source.node_id)
-    # a node outside the stage counts as run; only the ports the stage
-    # reads hold rows
     initial = {PortRef(node_id, port.name): None for node_id in outside
                for port in by_id[node_id].outputs}
     scanned = {}
@@ -216,7 +211,6 @@ def run_stage(context: ExecutionContext, graph: PhysicalGraph, stage: dict,
         tuple(node for node in graph.topological_nodes()
               if node.node_id in inside | outside),
         PortRef(last.node_id, last.outputs[0].name))
-    # the documents a scan sent here are this GPU's share of its rows
     scans = [spec["node_id"] for spec in stage["inputs"]
              if isinstance(by_id[spec["node_id"]], Scan)]
     rows.nodes = {*inside, *scans}
@@ -236,7 +230,6 @@ def run_stage(context: ExecutionContext, graph: PhysicalGraph, stage: dict,
 def _port_value(node, port, table: pa.Table, context: ExecutionContext):
     """Return an input table as the value the reading node takes."""
     if isinstance(node, Scan):
-        # the scan's own tests still apply to the documents sent here
         scanned = context.runtimes[node.runtime_key].execute(node, {}, context)
         ids = scanned.outputs[port.name].ids[node.alias]
         sent = table.column(node.alias).cast(ids.type)

@@ -64,7 +64,6 @@ class Session:
         self._tokenizer_directory = tokenizer
         self._tokenizer = None
         self._remote = None
-        # the session's tables and settings, which each local query runs over
         self.datafusion = None
         if endpoint is not None:
             from quail.remote.client import RemoteConnection
@@ -114,7 +113,6 @@ class Session:
             if self._remote is None:
                 self.datafusion.register_foreign(name, table)
                 return
-            # this process reads the table, and the server gets its rows
             reader = _quail_native.DataFusionContext()
             reader.register_foreign(name, table)
             table = reader.read(name)
@@ -185,7 +183,7 @@ class Session:
         from quail.api.query import Query
 
         query = Query(self, text, SQLDialect(dialect).value, order=order)
-        query.bound_whole()     # a statement that does not bind fails here
+        query.bound_whole()
         return query
 
     def get_run(self, query_id: str):

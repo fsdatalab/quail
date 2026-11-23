@@ -1,10 +1,3 @@
-//! The physical plan of a request backend: one `RequestExecution` node
-//! that submits each document or pair to vLLM or SGLang, with the scans
-//! before it and the result nodes after it.
-//!
-//! The request node and its specs are written as the JSON their Python
-//! codecs read, since only the request executor reads them.
-
 use crate::constants::LABEL_PREFIX;
 use crate::physical::{Node, PhysicalNode, PortRef, ScanAttributes};
 use crate::topology::{input_ports, port};
@@ -24,38 +17,22 @@ use crate::pricing::search::label_calls;
 use crate::prompts::lowering::answer_ids;
 use crate::prompts::{join_label, prompt_layout, render_join_frame};
 
-/// How a request backend submits its operators.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RequestSettings {
-    /// The backend the plan names, such as `stock_vllm`.
     pub backend_name: String,
-    /// How filter stages become requests.
     pub filter_submission: String,
-    /// How join tuples become requests.
     pub join_submission: String,
-    /// How each document's extraction and map prompts become requests.
     pub answer_submission: String,
-    /// Whether the engine decodes an answer as text, which AI.CLASSIFY
-    /// and AI.EXTRACT need.
     pub scores_labels: bool,
 }
 
 const SPECS: &str = "quail.baselines.nodes";
 
-/// Plan a plan's operators for a request backend.
-///
-/// Returns `{"graph": {"nodes", "root"}, "settings"}`, or
-/// `{"refusal": ...}` when the backend cannot run the plan.
-///
-/// # Errors
-///
-/// A prompt cannot be lowered, or the prompts do not share a preamble.
 pub fn request_plan(
     found: &Operators,
     context: &PlanningContext,
     settings: &RequestSettings,
 ) -> Result<Value, CompileError> {
-    // a decision model scores one option block per label
     let decides = context.model.role == "decision";
     if let Some(refusal) = refusal(found, context, settings, decides)? {
         return Ok(json!({"refusal": {
@@ -178,7 +155,6 @@ fn node_value(node: PhysicalNode) -> Result<Value, CompileError> {
     serde_json::to_value(node).map_err(json_error)
 }
 
-/// A spec of the request node, tagged with its Python dataclass.
 fn spec(name: &str, mut fields: Value) -> Value {
     fields["type"] = Value::from(format!("{SPECS}.{name}"));
     fields
@@ -194,7 +170,6 @@ fn refuse(reason: String, constraint: String, unit: &str) -> Option<Refusal> {
     })
 }
 
-/// Why the model cannot write AI.EXTRACT or AI.MAP answers, or None.
 fn extraction_refusal(
     context: &PlanningContext,
     function: &str,
@@ -207,7 +182,6 @@ fn extraction_refusal(
                 py_repr(&model.name)
             )
         } else if prompt_layout(&model.prompt_layout)?.read_end.is_some() {
-            // the model answers by scoring options and document positions
             if function == "AI.EXTRACT" {
                 return Ok(None);
             }
@@ -226,7 +200,6 @@ fn extraction_refusal(
     ))
 }
 
-/// Why the request backends cannot run the plan, or None.
 fn refusal(
     found: &Operators,
     context: &PlanningContext,
@@ -242,16 +215,16 @@ fn refusal(
             "backends",
         ));
     }
-    if found.columns().any(|column| column.guard.is_some()) {
+    if found.columns().any(|column| column.precondition.is_some()) {
         return Ok(refuse(
-            format!("a guarded AI column asks only some rows, which {backend} does not"),
-            "guard_needs_quail_backend".into(),
+            format!("a preconditioned AI column asks only some rows, which {backend} does not"),
+            "precondition_needs_quail_backend".into(),
             "backends",
         ));
     }
     let ored = found.filters.iter().flat_map(|(_, predicates)| predicates);
     if ored.clone().any(|predicate| {
-        predicate.guard.is_some()
+        predicate.precondition.is_some()
             || predicate.alternative.is_some()
             || predicate.answer.is_some()
             || predicate.disjunction.is_some()
@@ -319,8 +292,6 @@ fn refusal(
             "backends",
         ));
     }
-    // a diffusion model's vLLM canvas is sized for a filter's one answer
-    // token, not a label
     let scores_labels = settings.scores_labels && context.model.canvas_tokens == 0;
     if has_label(found) && !(scores_labels || decides) {
         return Ok(refuse(
@@ -346,8 +317,6 @@ fn refusal(
     Ok(None)
 }
 
-/// One filter spec per table with AI.IF filters, the first join's anchor
-/// last.
 fn filter_specs(
     context: &PlanningContext,
     aliases: &[String],
@@ -396,7 +365,6 @@ fn filter_specs(
     Ok(specs)
 }
 
-/// One classify spec per AI.CLASSIFY call.
 fn classify_specs(
     context: &PlanningContext,
     found: &Operators,
@@ -409,8 +377,6 @@ fn classify_specs(
         let mut pair = json!({"partner": null, "join_layout_token_ids": [],
             "join_written_position": null});
         if call_aliases_found.len() == 2 {
-            // a classification of the rows a join keeps: decoded after that
-            // join, one request per row
             let partner = call_aliases_found[1].clone();
             let part = |wanted: &str| {
                 lowered
@@ -496,7 +462,6 @@ fn classify_specs(
     Ok(specs)
 }
 
-/// One join spec per join, in the searched sequence.
 fn join_specs(
     context: &PlanningContext,
     found: &Operators,
@@ -549,9 +514,6 @@ fn join_specs(
     Ok(specs)
 }
 
-/// One answer spec per AI.EXTRACT field or AI.MAP column, each decoded
-/// once per surviving document after the joins; its prompt carries its
-/// own preamble, the model's turn, which stays out of the shared one.
 fn answer_specs(
     context: &PlanningContext,
     columns: &[SemanticColumn],
@@ -566,7 +528,6 @@ fn answer_specs(
             "tail_token_ids": lowered.tail_token_ids,
             "tail_text": strip_placeholders(&call.prompt.tail),
             "preamble_token_ids": lowered.preamble_token_ids,
-            // vLLM adds the model's beginning-of-text token itself
             "preamble_text": without_bos(&call.prompt.preamble, &context.model.bos_text),
             "max_answer_tokens": crate::constants::EXTRACT_MAX_ANSWER_TOKENS,
         });
@@ -580,7 +541,6 @@ fn answer_specs(
     Ok(specs)
 }
 
-/// The text with every `{N}` placeholder removed.
 fn strip_placeholders(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -607,7 +567,6 @@ fn without_bos(text: &str, bos_text: &str) -> String {
     }
 }
 
-/// The one preamble the prompts share, as token ids and text.
 fn request_preamble(
     context: &PlanningContext,
     prompts: &[crate::physical::Prompt],
@@ -648,12 +607,9 @@ fn request_preamble(
         .first()
         .filter(|text| !text.is_empty())
         .map_or(shared.clone(), |text| (*text).clone());
-    // vLLM adds the model's beginning-of-text token to a text prompt
     Ok((preamble, without_bos(&text, &context.model.bos_text)))
 }
 
-/// The Limit of the region's fetch, reading the request node's result
-/// rows, and the port that ends the plan.
 fn result_nodes(
     found: &Operators,
     request: &str,
@@ -677,7 +633,6 @@ fn result_nodes(
     }
 }
 
-/// A string as Python's repr writes it.
 fn py_repr(text: &str) -> String {
     if text.contains('\'') && !text.contains('"') {
         format!("\"{text}\"")

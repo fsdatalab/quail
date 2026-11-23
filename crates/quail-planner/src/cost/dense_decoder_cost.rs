@@ -1,13 +1,8 @@
-//! Decoder components, and each one's time at the device's limits by the
-//! roofline.
-
 use crate::cost::work::{Quantity, Work};
 use crate::specs::{DeviceSpec, ModelSpec, Precision};
 
-/// vLLM's `FLA_CHUNK_SIZE`: tokens per chunk of the chunked gated delta rule.
 pub const GDN_CHUNK_TOKENS: i64 = 64;
 
-/// Q, K, V, and output projection parameters over the layers.
 pub fn attention_projection_params(model: &ModelSpec) -> i64 {
     let h = model.hidden;
     let query_width = if model.attn_output_gate { 2 } else { 1 };
@@ -22,7 +17,6 @@ pub fn attention_projection_params(model: &ModelSpec) -> i64 {
         .sum()
 }
 
-/// Gated DeltaNet input and output projection parameters.
 pub fn gdn_projection_params(model: &ModelSpec) -> i64 {
     let key_width = model.gdn_key_heads * model.gdn_key_dim;
     let value_width = model.gdn_value_heads * model.gdn_value_dim;
@@ -31,12 +25,10 @@ pub fn gdn_projection_params(model: &ModelSpec) -> i64 {
     per_layer * model.gdn_layers().len() as i64
 }
 
-/// Short convolution input and output projection parameters.
 pub fn short_conv_projection_params(model: &ModelSpec) -> i64 {
     4 * model.hidden * model.hidden * model.short_conv_layers().len() as i64
 }
 
-/// FLOPs per token of the chunked gated delta rule, over all layers.
 pub fn gdn_core_flops_per_token(model: &ModelSpec) -> f64 {
     let c = GDN_CHUNK_TOKENS;
     let (k, v) = (model.gdn_key_dim, model.gdn_value_dim);
@@ -44,7 +36,6 @@ pub fn gdn_core_flops_per_token(model: &ModelSpec) -> f64 {
     per_head * model.gdn_value_heads as f64 * model.gdn_layers().len() as f64
 }
 
-/// FLOPs per token of the depthwise convolutions, over all layers.
 pub fn conv_flops_per_token(model: &ModelSpec) -> f64 {
     let gdn = model.gdn_layers().len() as i64 * model.conv_channels();
     let short = model.short_conv_layers().len() as i64 * model.hidden;
@@ -55,17 +46,14 @@ fn mlp_params_with(model: &ModelSpec, experts: i64) -> i64 {
     3 * model.hidden * (model.intermediate() + experts * model.expert_intermediate) * model.layers
 }
 
-/// The MLP parameters one token multiplies.
 pub fn mlp_params(model: &ModelSpec) -> i64 {
     mlp_params_with(model, model.experts_active)
 }
 
-/// The MLP parameters a full chunk reads: every expert.
 pub fn mlp_weight_params(model: &ModelSpec) -> i64 {
     mlp_params_with(model, model.experts)
 }
 
-/// Parameters used by the modeled dense components.
 pub fn dense_params(model: &ModelSpec) -> i64 {
     attention_projection_params(model)
         + gdn_projection_params(model)
@@ -73,7 +61,6 @@ pub fn dense_params(model: &ModelSpec) -> i64 {
         + mlp_params(model)
 }
 
-/// FLOPs per attention pair across the full layers and the sliding layers.
 pub fn attention_pair_flops(model: &ModelSpec) -> (i64, i64) {
     let sliding = model.sliding_layer_set();
     let (mut full, mut sliding_flops) = (0, 0);
@@ -87,11 +74,6 @@ pub fn attention_pair_flops(model: &ModelSpec) -> (i64, i64) {
     (full, sliding_flops)
 }
 
-/// The modeled decoder components, with a readout when the work has answer rows.
-///
-/// # Panics
-///
-/// `passes` is negative, or `work.sae_encoded` is an array.
 pub fn dense_decoder_components(work: &Work, model: &ModelSpec, passes: f64) -> Vec<CostComponent> {
     assert!(passes >= 0.0, "passes must be nonnegative");
     let separate_gdn = if model.gdn_has_own_precision() {
@@ -201,10 +183,8 @@ pub fn dense_decoder_components(work: &Work, model: &ModelSpec, passes: f64) -> 
     components
 }
 
-/// The answer readout: the decision head, or the output head's rows.
 fn readout(model: &ModelSpec, rows: f64, passes: f64, head_rows: f64) -> CostComponent {
     if model.reads_letter_logits() {
-        // every code row of the fp32 readout times the prompt's last row
         let codes = (crate::constants::MAX_LETTERS as i64 * model.hidden) as f64;
         return CostComponent {
             name: "readout",
@@ -236,7 +216,6 @@ fn readout(model: &ModelSpec, rows: f64, passes: f64, head_rows: f64) -> CostCom
     }
 }
 
-/// One model component's arithmetic and memory work.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CostComponent {
     pub name: &'static str,
@@ -246,7 +225,6 @@ pub struct CostComponent {
     pub gemm: bool,
 }
 
-/// A component's compute and memory limits.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ComponentLatency {
     pub component: CostComponent,
@@ -255,11 +233,6 @@ pub struct ComponentLatency {
 }
 
 impl ComponentLatency {
-    /// The slower of the two limits.
-    ///
-    /// # Panics
-    ///
-    /// A limit is a per-document array, which Python's `max` refuses.
     pub fn seconds(&self) -> f64 {
         let compute = self.compute_seconds.scalar().expect("scalar compute time");
         let memory = self.memory_seconds.scalar().expect("scalar memory time");
@@ -267,7 +240,6 @@ impl ComponentLatency {
     }
 }
 
-/// Price one component against the device's limits.
 pub fn component_latency(component: CostComponent, device: &DeviceSpec) -> ComponentLatency {
     let bandwidth = if component.gemm {
         device.gemm_flops(component.precision)
@@ -281,7 +253,6 @@ pub fn component_latency(component: CostComponent, device: &DeviceSpec) -> Compo
     }
 }
 
-/// Price model components in execution order.
 pub fn component_latencies(
     components: Vec<CostComponent>,
     device: &DeviceSpec,

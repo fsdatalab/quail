@@ -1,6 +1,3 @@
-//! Bind AI calls and their prompts.
-//! Read literal arguments, options, and classification categories.
-
 use super::Binder;
 use crate::functions::function_name;
 use crate::functions::options::{Options, number_of, object_fields, parse_options, string_literal};
@@ -29,7 +26,6 @@ pub(super) fn is_call(expr: &Expr, name: &str) -> bool {
     function_name(expr) == Some(name)
 }
 
-/// An integer SQL literal, or None.
 fn integer_of(expr: &Expr) -> Option<i64> {
     let Expr::Literal(value, _) = expr else {
         return None;
@@ -102,7 +98,6 @@ impl Binder {
         Ok((template, references))
     }
 
-    /// Bind an AI_FILTER or AI.SCORE prompt: (prompt, aliases).
     #[allow(clippy::too_many_arguments)]
     fn bind_ai_call(
         &mut self,
@@ -115,7 +110,6 @@ impl Binder {
         self.bind_prompt(template, references, function, join, classify)
     }
 
-    /// Bind a prompt's template and references: (prompt, aliases).
     fn bind_prompt(
         &mut self,
         template: String,
@@ -173,8 +167,6 @@ impl Binder {
         Ok((prompt, aliases))
     }
 
-    /// Bind an `AI_FILTER(PROMPT(...), options)` call: its model call
-    /// and options.
     pub(crate) fn bind_ai_filter_call(
         &mut self,
         term: &Expr,
@@ -198,8 +190,6 @@ impl Binder {
         Ok((model_call(prompt, "boolean"), options))
     }
 
-    /// Bind a comparison of an `AI.SCORE` call with a threshold: the
-    /// test and the call's options.
     pub(crate) fn bind_ai_score_test(
         &mut self,
         term: &Expr,
@@ -232,8 +222,6 @@ impl Binder {
         let (prompt, _) = self.bind_ai_call(prompt, "ai_score", join, None)?;
         let call = model_call(prompt, "score");
         quail_planner::expressions::validate_score_test(&call, comparison.0, Some(value))?;
-        // the planner names the score's column; the test reads it as its
-        // one column, shown as the call until then
         let score = ColumnRef {
             alias: String::new(),
             provider: String::new(),
@@ -251,8 +239,6 @@ impl Binder {
         Ok((ScoreTest { call, test }, options))
     }
 
-    /// The selectivity option of the `AI.CLASSIFY` call a test of its
-    /// label makes, as the query wrote the test; None without one.
     pub(crate) fn label_selectivity(&self, written: &Expr) -> Result<Option<f64>, CompileError> {
         let mut options = None;
         let _ = written.apply(|node| {
@@ -324,7 +310,6 @@ impl Binder {
         let (prompt, aliases) = if is_call(&args[0], "prompt") {
             self.bind_ai_call(&args[0], "ai_classify", Some(false), classify)?
         } else {
-            // a bare document column uses the default instruction
             let reference = self.bind_document_value(&args[0])?;
             self.bind_prompt(
                 "{0}".to_string(),
@@ -484,7 +469,6 @@ impl Binder {
         }
     }
 
-    /// Bind a score or classification to its model call.
     pub(crate) fn bind_ai_value(&mut self, node: &Expr) -> Result<ModelCall, CompileError> {
         if is_call(node, "ai_classify") {
             return Ok(self.bind_ai_classify(node)?.0);
@@ -502,7 +486,6 @@ impl Binder {
     }
 }
 
-/// The comparison a score test makes, as SQL writes it.
 fn comparison(op: Operator) -> Option<(&'static str, Operator)> {
     Some(match op {
         Operator::Lt => ("<", op),
@@ -513,7 +496,6 @@ fn comparison(op: Operator) -> Option<(&'static str, Operator)> {
     })
 }
 
-/// (comparison, AI.SCORE call, threshold) of a compared score, or None.
 pub(super) fn score_comparison(expr: &Expr) -> Option<((&'static str, Operator), &Expr, &Expr)> {
     let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr else {
         return None;

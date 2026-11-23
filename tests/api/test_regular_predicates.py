@@ -94,9 +94,9 @@ def test_column_tests_in_where_reject_rows_before_the_model_is_asked():
     0.5}) AND r.stars >= 3 AND r.lang IN ('en', 'fr') AND r.stars IS NOT NULL ---
 plan
   __quail_answer_2 = ai_filter('q2: {0}', r.review, named_struct('selectivity',
-      Float64(0.5))), filter: __quail_answer_2, returns: []
+      Float64(0.5))), inline_predicate: __quail_answer_2, returns: []
   __quail_answer_1 = ai_filter('q1: {0}', r.review, named_struct('selectivity',
-      Float64(0.5))), filter: __quail_answer_1, returns: []
+      Float64(0.5))), inline_predicate: __quail_answer_1, returns: []
 asked 5 of 5
   'q1: {0}': r0 TRUE, r2 FALSE, r4 TRUE
   'q2: {0}': r0 TRUE, r4 FALSE
@@ -106,8 +106,8 @@ rows 1
 --- SELECT r.id, r.stars FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.review)) AND
     r.stars < 4 AND r.lang = 'en' ---
 plan
-  __quail_answer_1 = ai_filter('q1: {0}', r.review), filter: __quail_answer_1, returns:
-      []
+  __quail_answer_1 = ai_filter('q1: {0}', r.review), inline_predicate: __quail_answer_1,
+      returns: []
 asked 2 of 2
   'q1: {0}': r1 TRUE, r4 TRUE
 rows 2
@@ -117,8 +117,8 @@ rows 2
 --- SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.review)) AND
     LENGTH(r.lang) > 2 ---
 plan
-  __quail_answer_1 = ai_filter('q1: {0}', r.review), filter: __quail_answer_1, returns:
-      []
+  __quail_answer_1 = ai_filter('q1: {0}', r.review), inline_predicate: __quail_answer_1,
+      returns: []
 asked 0 of 0
 rows 0
 
@@ -127,9 +127,9 @@ rows 0
     0.5}) AND NOT (LOWER(r.lang) LIKE '%e%' AND r.stars < 3) ---
 plan
   __quail_answer_2 = ai_filter('q2: {0}', r.review, named_struct('selectivity',
-      Float64(0.5))), filter: __quail_answer_2, returns: []
+      Float64(0.5))), inline_predicate: __quail_answer_2, returns: []
   __quail_answer_1 = ai_filter('q1: {0}', r.review, named_struct('selectivity',
-      Float64(0.5))), filter: __quail_answer_1, returns: []
+      Float64(0.5))), inline_predicate: __quail_answer_1, returns: []
 asked 6 of 6
   'q1: {0}': r0 TRUE, r2 FALSE, r4 TRUE, r5 FALSE
   'q2: {0}': r0 TRUE, r4 FALSE
@@ -141,9 +141,9 @@ rows 1
     0.5}) AND (r.stars IS NULL OR r.lang = 'de') ---
 plan
   __quail_answer_2 = ai_filter('q2: {0}', r.review, named_struct('selectivity',
-      Float64(0.5))), filter: __quail_answer_2, returns: []
+      Float64(0.5))), inline_predicate: __quail_answer_2, returns: []
   __quail_answer_1 = ai_filter('q1: {0}', r.review, named_struct('selectivity',
-      Float64(0.5))), filter: __quail_answer_1, returns: []
+      Float64(0.5))), inline_predicate: __quail_answer_1, returns: []
 asked 3 of 3
   'q1: {0}': r3 TRUE, r5 FALSE
   'q2: {0}': r3 TRUE
@@ -153,8 +153,8 @@ rows 1
 --- SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.review)) AND NOT
     (r.lang = 'fr' OR r.stars IS NULL) ---
 plan
-  __quail_answer_1 = ai_filter('q1: {0}', r.review), filter: __quail_answer_1, returns:
-      []
+  __quail_answer_1 = ai_filter('q1: {0}', r.review), inline_predicate: __quail_answer_1,
+      returns: []
 asked 4 of 4
   'q1: {0}': r0 TRUE, r1 TRUE, r4 TRUE, r5 FALSE
 rows 3
@@ -182,8 +182,8 @@ def test_where_and_select_take_the_same_datafusion_expressions():
     reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.review)) AND ABS(r.stars - 4) <= 1
     ORDER BY r.id ---
 plan
-  __quail_answer_1 = ai_filter('q1: {0}', r.review), filter: __quail_answer_1, returns:
-      []
+  __quail_answer_1 = ai_filter('q1: {0}', r.review), inline_predicate: __quail_answer_1,
+      returns: []
 asked 4 of 4
   'q1: {0}': r0 TRUE, r2 FALSE, r4 TRUE, r5 FALSE
 rows 2, in order
@@ -193,8 +193,8 @@ rows 2, in order
 --- SELECT r.id FROM pairs r WHERE AI_FILTER(PROMPT('q1: {0}', r.review)) AND
     UPPER(r.lang) = r.lang ---
 plan
-  __quail_answer_1 = ai_filter('q1: {0}', r.review), filter: __quail_answer_1, returns:
-      []
+  __quail_answer_1 = ai_filter('q1: {0}', r.review), inline_predicate: __quail_answer_1,
+      returns: []
 asked 3 of 3
   'q1: {0}': r0 TRUE, r3 TRUE, r5 FALSE
 rows 2
@@ -204,8 +204,8 @@ rows 2
 --- SELECT r.id FROM pairs r WHERE AI_FILTER(PROMPT('q1: {0}', r.review)) AND NOT
     (UPPER(r.lang) = r.lang) ---
 plan
-  __quail_answer_1 = ai_filter('q1: {0}', r.review), filter: __quail_answer_1, returns:
-      []
+  __quail_answer_1 = ai_filter('q1: {0}', r.review), inline_predicate: __quail_answer_1,
+      returns: []
 asked 3 of 3
   'q1: {0}': r1 TRUE, r2 FALSE, r4 TRUE
 rows 2
@@ -215,8 +215,8 @@ rows 2
 --- SELECT r.id FROM pairs r WHERE AI_FILTER(PROMPT('q1: {0}', r.review)) AND r.stars >
     r.floor ---
 plan
-  __quail_answer_1 = ai_filter('q1: {0}', r.review), filter: __quail_answer_1, returns:
-      []
+  __quail_answer_1 = ai_filter('q1: {0}', r.review), inline_predicate: __quail_answer_1,
+      returns: []
 asked 2 of 2
   'q1: {0}': r0 TRUE, r4 TRUE
 rows 2
@@ -226,8 +226,8 @@ rows 2
 --- SELECT r.id FROM pairs r WHERE AI_FILTER(PROMPT('q1: {0}', r.review)) AND (r.stars -
     r.floor >= 1 OR r.lang = 'en') ---
 plan
-  __quail_answer_1 = ai_filter('q1: {0}', r.review), filter: __quail_answer_1, returns:
-      []
+  __quail_answer_1 = ai_filter('q1: {0}', r.review), inline_predicate: __quail_answer_1,
+      returns: []
 asked 3 of 3
   'q1: {0}': r0 TRUE, r1 TRUE, r4 TRUE
 rows 3
@@ -238,8 +238,8 @@ rows 3
 --- SELECT r.id FROM pairs r WHERE AI_FILTER(PROMPT('q1: {0}', r.review)) AND
     ABS(-r.stars) <= r.floor ---
 plan
-  __quail_answer_1 = ai_filter('q1: {0}', r.review), filter: __quail_answer_1, returns:
-      []
+  __quail_answer_1 = ai_filter('q1: {0}', r.review), inline_predicate: __quail_answer_1,
+      returns: []
 asked 3 of 3
   'q1: {0}': r1 TRUE, r2 FALSE, r5 FALSE
 rows 1
@@ -248,8 +248,8 @@ rows 1
 --- SELECT r.id, r.stars > r.floor AS above FROM pairs r WHERE AI_FILTER(PROMPT('q1:
     {0}', r.review)) ---
 plan
-  __quail_answer_1 = ai_filter('q1: {0}', r.review), filter: __quail_answer_1, returns:
-      []
+  __quail_answer_1 = ai_filter('q1: {0}', r.review), inline_predicate: __quail_answer_1,
+      returns: []
 asked 6 of 6
   'q1: {0}': r0 TRUE, r1 TRUE, r2 FALSE, r3 TRUE, r4 TRUE, r5 FALSE
 rows 4
@@ -278,9 +278,9 @@ def test_a_regexp_matches_the_whole_value_in_snowflake_and_any_part_in_bigquery(
     0.5}) AND REGEXP_LIKE(r.lang, 'e') ---
 plan
   __quail_answer_2 = ai_filter('q2: {0}', r.review, named_struct('selectivity',
-      Float64(0.5))), filter: __quail_answer_2, returns: []
+      Float64(0.5))), inline_predicate: __quail_answer_2, returns: []
   __quail_answer_1 = ai_filter('q1: {0}', r.review, named_struct('selectivity',
-      Float64(0.5))), filter: __quail_answer_1, returns: []
+      Float64(0.5))), inline_predicate: __quail_answer_1, returns: []
 asked 0 of 0
 rows 0
 
@@ -289,9 +289,9 @@ rows 0
     0.5}) AND REGEXP_LIKE(r.lang, 'e.') ---
 plan
   __quail_answer_2 = ai_filter('q2: {0}', r.review, named_struct('selectivity',
-      Float64(0.5))), filter: __quail_answer_2, returns: []
+      Float64(0.5))), inline_predicate: __quail_answer_2, returns: []
   __quail_answer_1 = ai_filter('q1: {0}', r.review, named_struct('selectivity',
-      Float64(0.5))), filter: __quail_answer_1, returns: []
+      Float64(0.5))), inline_predicate: __quail_answer_1, returns: []
 asked 8 of 8
   'q1: {0}': r0 TRUE, r1 TRUE, r3 TRUE, r4 TRUE
   'q2: {0}': r0 TRUE, r1 FALSE, r3 TRUE, r4 FALSE
@@ -304,9 +304,9 @@ rows 2
     0.5}) AND RLIKE(r.lang, 'e') ---
 plan
   __quail_answer_2 = ai_filter('q2: {0}', r.review, named_struct('selectivity',
-      Float64(0.5))), filter: __quail_answer_2, returns: []
+      Float64(0.5))), inline_predicate: __quail_answer_2, returns: []
   __quail_answer_1 = ai_filter('q1: {0}', r.review, named_struct('selectivity',
-      Float64(0.5))), filter: __quail_answer_1, returns: []
+      Float64(0.5))), inline_predicate: __quail_answer_1, returns: []
 asked 0 of 0
 rows 0
 
@@ -315,9 +315,9 @@ rows 0
     0.5}) AND NOT RLIKE(r.lang, 'e') ---
 plan
   __quail_answer_2 = ai_filter('q2: {0}', r.review, named_struct('selectivity',
-      Float64(0.5))), filter: __quail_answer_2, returns: []
+      Float64(0.5))), inline_predicate: __quail_answer_2, returns: []
   __quail_answer_1 = ai_filter('q1: {0}', r.review, named_struct('selectivity',
-      Float64(0.5))), filter: __quail_answer_1, returns: []
+      Float64(0.5))), inline_predicate: __quail_answer_1, returns: []
 asked 10 of 10
   'q1: {0}': r0 TRUE, r1 TRUE, r2 FALSE, r3 TRUE, r4 TRUE, r5 FALSE
   'q2: {0}': r0 TRUE, r1 FALSE, r3 TRUE, r4 FALSE
@@ -330,9 +330,9 @@ rows 2
     0.5}) AND REGEXP_LIKE(r.lang, r.lang || '?') ---
 plan
   __quail_answer_2 = ai_filter('q2: {0}', r.review, named_struct('selectivity',
-      Float64(0.5))), filter: __quail_answer_2, returns: []
+      Float64(0.5))), inline_predicate: __quail_answer_2, returns: []
   __quail_answer_1 = ai_filter('q1: {0}', r.review, named_struct('selectivity',
-      Float64(0.5))), filter: __quail_answer_1, returns: []
+      Float64(0.5))), inline_predicate: __quail_answer_1, returns: []
 asked 10 of 10
   'q1: {0}': r0 TRUE, r1 TRUE, r2 FALSE, r3 TRUE, r4 TRUE, r5 FALSE
   'q2: {0}': r0 TRUE, r1 FALSE, r3 TRUE, r4 FALSE
@@ -343,10 +343,10 @@ rows 2
 --- SELECT r.id FROM reviews r WHERE AI.IF(PROMPT('q1: {0}', r.review)) AND
     AI.IF(PROMPT('q2: {0}', r.review)) AND REGEXP_CONTAINS(r.lang, 'e') ---
 plan
-  __quail_answer_2 = ai_filter('q2: {0}', r.review), filter: __quail_answer_2, returns:
-      []
-  __quail_answer_1 = ai_filter('q1: {0}', r.review), filter: __quail_answer_1, returns:
-      []
+  __quail_answer_2 = ai_filter('q2: {0}', r.review), inline_predicate: __quail_answer_2,
+      returns: []
+  __quail_answer_1 = ai_filter('q1: {0}', r.review), inline_predicate: __quail_answer_1,
+      returns: []
 asked 9 of 9
   'q1: {0}': r0 TRUE, r1 TRUE, r3 TRUE, r4 TRUE, r5 FALSE
   'q2: {0}': r0 TRUE, r1 FALSE, r3 TRUE, r4 FALSE
@@ -357,10 +357,10 @@ rows 2
 --- SELECT r.id FROM reviews r WHERE AI.IF(PROMPT('q1: {0}', r.review)) AND
     AI.IF(PROMPT('q2: {0}', r.review)) AND REGEXP_LIKE(r.lang, 'e') ---
 plan
-  __quail_answer_2 = ai_filter('q2: {0}', r.review), filter: __quail_answer_2, returns:
-      []
-  __quail_answer_1 = ai_filter('q1: {0}', r.review), filter: __quail_answer_1, returns:
-      []
+  __quail_answer_2 = ai_filter('q2: {0}', r.review), inline_predicate: __quail_answer_2,
+      returns: []
+  __quail_answer_1 = ai_filter('q1: {0}', r.review), inline_predicate: __quail_answer_1,
+      returns: []
 asked 9 of 9
   'q1: {0}': r0 TRUE, r1 TRUE, r3 TRUE, r4 TRUE, r5 FALSE
   'q2: {0}': r0 TRUE, r1 FALSE, r3 TRUE, r4 FALSE
@@ -381,7 +381,7 @@ def test_a_where_test_over_two_tables_keeps_the_pairs_it_passes():
 --- SELECT r.id, p.asin FROM reviews r JOIN products p ON AI_FILTER(PROMPT('x {0} {1}',
     r.review, p.description)) WHERE r.stars > 4 OR p.price > 15 ---
 plan
-  __quail_answer_1 = ai_filter('x {0} {1}', r.review, p.description), filter:
+  __quail_answer_1 = ai_filter('x {0} {1}', r.review, p.description), inline_predicate:
       __quail_answer_1, returns: []
 asked 8 of 8
   'x {0} {1}': p0+r0 TRUE, p0+r5 TRUE, p1+r0 TRUE, p1+r1 TRUE, p1+r2 TRUE, p1+r3 TRUE,
@@ -399,7 +399,7 @@ rows 8
 --- SELECT r.id, p.asin FROM reviews r JOIN items p ON AI_FILTER(PROMPT('x {0} {1}',
     r.review, p.description)) WHERE r.stars > p.price ---
 plan
-  __quail_answer_1 = ai_filter('x {0} {1}', r.review, p.description), filter:
+  __quail_answer_1 = ai_filter('x {0} {1}', r.review, p.description), inline_predicate:
       __quail_answer_1, returns: []
 asked 5 of 5
   'x {0} {1}': p0+r0 TRUE, p0+r2 TRUE, p0+r5 TRUE, p1+r0 TRUE, p1+r5 TRUE
@@ -422,7 +422,7 @@ def test_an_equality_of_two_tables_in_where_pairs_their_rows_before_the_ai_join(
 --- SELECT r.id, p.asin FROM reviews r JOIN products p ON AI_FILTER(PROMPT('x {0} {1}',
     r.review, p.description)) WHERE r.stars = p.stars ---
 plan
-  __quail_answer_1 = ai_filter('x {0} {1}', r.review, p.description), filter:
+  __quail_answer_1 = ai_filter('x {0} {1}', r.review, p.description), inline_predicate:
       __quail_answer_1, returns: []
 asked 3 of 3
   'x {0} {1}': p0+r0 TRUE, p0+r5 TRUE, p1+r1 TRUE
@@ -434,7 +434,7 @@ rows 3
 --- SELECT r.id, p.asin FROM reviews r, products p WHERE r.stars = p.stars AND
     AI_FILTER(PROMPT('x {0} {1}', r.review, p.description)) ---
 plan
-  __quail_answer_1 = ai_filter('x {0} {1}', r.review, p.description), filter:
+  __quail_answer_1 = ai_filter('x {0} {1}', r.review, p.description), inline_predicate:
       __quail_answer_1, returns: []
 asked 3 of 3
   'x {0} {1}': p0+r0 TRUE, p0+r5 TRUE, p1+r1 TRUE
@@ -468,8 +468,8 @@ def test_an_ai_join_asks_only_the_pairs_its_joins_filter_passes():
 --- SELECT r.id, t.id FROM r JOIN t ON AI.IF(PROMPT('{0} vs {1}', r.body, t.topic)) AND
     r.n < t.n ---
 plan
-  __quail_answer_1 = ai_filter('{0} vs {1}', r.body, t.topic), filter: __quail_answer_1,
-      returns: []
+  __quail_answer_1 = ai_filter('{0} vs {1}', r.body, t.topic), inline_predicate:
+      __quail_answer_1, returns: []
 asked 3 of 3
   '{0} vs {1}': r0+t1 TRUE, r0+t2 TRUE, r1+t2 TRUE
 rows 3
@@ -480,8 +480,8 @@ rows 3
 --- SELECT r.id, t.id FROM r JOIN t ON AI.IF(PROMPT('{0} vs {1}', r.body, t.topic)) AND
     r.n <> t.n ---
 plan
-  __quail_answer_1 = ai_filter('{0} vs {1}', r.body, t.topic), filter: __quail_answer_1,
-      returns: []
+  __quail_answer_1 = ai_filter('{0} vs {1}', r.body, t.topic), inline_predicate:
+      __quail_answer_1, returns: []
 asked 6 of 6
   '{0} vs {1}': r0+t1 TRUE, r0+t2 TRUE, r1+t0 TRUE, r1+t2 TRUE, r2+t0 TRUE, r2+t1 TRUE
 rows 6
@@ -495,8 +495,8 @@ rows 6
 --- SELECT r.id, t.id FROM r JOIN t ON AI.IF(PROMPT('{0} vs {1}', r.body, t.topic))
     WHERE r.n + t.n > 4 ---
 plan
-  __quail_answer_1 = ai_filter('{0} vs {1}', r.body, t.topic), filter: __quail_answer_1,
-      returns: []
+  __quail_answer_1 = ai_filter('{0} vs {1}', r.body, t.topic), inline_predicate:
+      __quail_answer_1, returns: []
 asked 3 of 3
   '{0} vs {1}': r1+t2 TRUE, r2+t1 TRUE, r2+t2 TRUE
 rows 3
@@ -507,8 +507,8 @@ rows 3
 --- SELECT a.id, b.id FROM r a JOIN r b ON AI.IF(PROMPT('{0} vs {1}', a.body, b.body))
     WHERE a.id < b.id ---
 plan
-  __quail_answer_1 = ai_filter('{0} vs {1}', a.body, b.body), filter: __quail_answer_1,
-      returns: []
+  __quail_answer_1 = ai_filter('{0} vs {1}', a.body, b.body), inline_predicate:
+      __quail_answer_1, returns: []
 asked 3 of 3
   '{0} vs {1}': r0+r1 TRUE, r0+r2 TRUE, r1+r2 TRUE
 rows 3
@@ -543,8 +543,8 @@ def test_sql_functions_have_datafusions_meaning_in_every_dialect():
     STRPOS(r.lang, 'n') AS v9, r.stars BETWEEN 2 AND 3 AS v10 FROM reviews r WHERE
     AI_FILTER(PROMPT('q1: {0}', r.review)) ---
 plan
-  __quail_answer_1 = ai_filter('q1: {0}', r.review), filter: __quail_answer_1, returns:
-      []
+  __quail_answer_1 = ai_filter('q1: {0}', r.review), inline_predicate: __quail_answer_1,
+      returns: []
 asked 6 of 6
   'q1: {0}': r0 TRUE, r1 TRUE, r2 FALSE, r3 TRUE, r4 TRUE, r5 FALSE
 rows 4
@@ -560,8 +560,8 @@ rows 4
     STRPOS(r.lang, 'n') AS v9, r.stars BETWEEN 2 AND 3 AS v10 FROM reviews r WHERE
     AI_FILTER(PROMPT('q1: {0}', r.review)) ---
 plan
-  __quail_answer_1 = ai_filter('q1: {0}', r.review), filter: __quail_answer_1, returns:
-      []
+  __quail_answer_1 = ai_filter('q1: {0}', r.review), inline_predicate: __quail_answer_1,
+      returns: []
 asked 6 of 6
   'q1: {0}': r0 TRUE, r1 TRUE, r2 FALSE, r3 TRUE, r4 TRUE, r5 FALSE
 rows 4
@@ -587,8 +587,8 @@ def test_order_by_group_by_on_and_prompt_take_expressions():
 --- SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.review)) ORDER BY
     ABS(r.stars - 3), r.id ---
 plan
-  __quail_answer_1 = ai_filter('q1: {0}', r.review), filter: __quail_answer_1, returns:
-      []
+  __quail_answer_1 = ai_filter('q1: {0}', r.review), inline_predicate: __quail_answer_1,
+      returns: []
 asked 6 of 6
   'q1: {0}': r0 TRUE, r1 TRUE, r2 FALSE, r3 TRUE, r4 TRUE, r5 FALSE
 rows 4, in order
@@ -601,8 +601,8 @@ rows 4, in order
     SUM(r.stars * 2) AS s FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.review))
     GROUP BY CASE WHEN r.stars > 2 THEN 'hi' ELSE 'lo' END ORDER BY band ---
 plan
-  __quail_answer_1 = ai_filter('q1: {0}', r.review), filter: __quail_answer_1, returns:
-      []
+  __quail_answer_1 = ai_filter('q1: {0}', r.review), inline_predicate: __quail_answer_1,
+      returns: []
 asked 6 of 6
   'q1: {0}': r0 TRUE, r1 TRUE, r2 FALSE, r3 TRUE, r4 TRUE, r5 FALSE
 rows 2, in order
@@ -612,8 +612,8 @@ rows 2, in order
 --- SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', UPPER(TRIM(r.review))))
     ---
 plan
-  __quail_answer_1 = ai_filter('q1: {0}', r.__quail_expr_0), filter: __quail_answer_1,
-      returns: []
+  __quail_answer_1 = ai_filter('q1: {0}', r.__quail_expr_0), inline_predicate:
+      __quail_answer_1, returns: []
 asked 6 of 6
   'q1: {0}': 'B0' TRUE, 'B1' TRUE, 'B2' FALSE, 'B3' TRUE, 'B4' TRUE, 'B5' FALSE
 rows 4
@@ -625,7 +625,7 @@ rows 4
 --- SELECT r.id, l.code FROM reviews r JOIN langs l ON UPPER(TRIM(r.lang)) = l.code AND
     AI_FILTER(PROMPT('x {0} {1}', r.review, l.notes)) ---
 plan
-  __quail_answer_1 = ai_filter('x {0} {1}', r.review, l.notes), filter:
+  __quail_answer_1 = ai_filter('x {0} {1}', r.review, l.notes), inline_predicate:
       __quail_answer_1, returns: []
 asked 5 of 5
   'x {0} {1}': EN+r0 TRUE, EN+r1 TRUE, EN+r3 TRUE, EN+r4 TRUE, FR+r2 TRUE
@@ -734,8 +734,8 @@ def test_an_ai_join_pairs_nan_keys_as_datafusion_does():
 --- SELECT r.id, l.id FROM r JOIN l ON r.x = l.x AND AI.IF(PROMPT('{0} vs {1}', r.body,
     l.topic)) ---
 plan
-  __quail_answer_1 = ai_filter('{0} vs {1}', r.body, l.topic), filter: __quail_answer_1,
-      returns: []
+  __quail_answer_1 = ai_filter('{0} vs {1}', r.body, l.topic), inline_predicate:
+      __quail_answer_1, returns: []
 asked 3 of 3
   '{0} vs {1}': l0+r0 TRUE, l0+r1 TRUE, l1+r2 TRUE
 rows 3

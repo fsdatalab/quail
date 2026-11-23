@@ -21,7 +21,6 @@ from quail.execution.result import (
 from quail.execution.rows import Rows
 from quail.execution.spans import held_prefix, read_phrase
 
-# the order shuffled map submission sends prompts in
 SHUFFLE_SEED = 0
 
 

@@ -1,12 +1,8 @@
-//! Survivor and pair counts, and the arena's size.
-
 use crate::operators::effective_selectivity;
 use std::collections::BTreeMap;
 
 use crate::cost::joins::PricedJoin;
 
-/// The fraction of the rows an AI filter reads that it passes: every row
-/// for a filter that returns its answer, else its selectivity.
 pub fn row_selectivity(predicate: &crate::physical::FilterPredicate) -> f64 {
     if predicate.answer.is_some() {
         1.0
@@ -15,17 +11,13 @@ pub fn row_selectivity(predicate: &crate::physical::FilterPredicate) -> f64 {
     }
 }
 
-/// An AI filter's place in an OR of several `AI.IF` calls.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OrTerm {
-    /// The OR's name.
     pub disjunction: String,
-    /// Whether the filter asks only the rows no earlier term passed.
     pub short_circuit: bool,
 }
 
 impl OrTerm {
-    /// The place of `predicate` in an OR, when it is a term of one.
     pub fn of(predicate: &crate::physical::FilterPredicate) -> Option<Self> {
         Some(Self {
             disjunction: predicate.disjunction.clone()?,
@@ -34,25 +26,13 @@ impl OrTerm {
     }
 }
 
-/// The rows of one table that reach each of its steps, as the planner
-/// estimates them while the steps run in order.
-///
-/// A step that is no term of an OR passes its selectivity of the rows.
-/// The terms of an OR pass `1 - (1 - p_1)...(1 - p_k)` of them together,
-/// for terms that pass `p_i` each, independently (Selinger et al., 1979).
-/// The rows leave at the OR's last term, in whatever order the terms
-/// run and whatever other steps run between them; until then the flow
-/// keeps the fraction of the rows no term has passed, which is all a
-/// short-circuit term asks about.
 #[derive(Debug, Clone)]
 pub struct RowFlow {
     rows: f64,
-    /// By OR, the fraction of the rows no term has passed yet.
     undecided: BTreeMap<String, f64>,
 }
 
 impl RowFlow {
-    /// The flow of a table with `rows` rows, before any step.
     pub fn new(rows: f64) -> Self {
         Self {
             rows,
@@ -60,20 +40,15 @@ impl RowFlow {
         }
     }
 
-    /// The rows that reach the next step.
     pub fn rows(&self) -> f64 {
         self.rows
     }
 
-    /// This flow with `rows` reaching the next step, for a caller that
-    /// reads them from the step's input.
     pub fn with_rows(mut self, rows: f64) -> Self {
         self.rows = rows;
         self
     }
 
-    /// The rows the next step asks the model about, when it is `term`
-    /// of an OR or no term of one.
     pub fn asked(&self, term: Option<&OrTerm>) -> f64 {
         match term {
             Some(term) if term.short_circuit => {
@@ -83,9 +58,6 @@ impl RowFlow {
         }
     }
 
-    /// Move past a step that passes `selectivity` of the rows it asks.
-    ///
-    /// `last` says whether the step is the last term of its OR to run.
     pub fn pass(&mut self, selectivity: f64, term: Option<&OrTerm>, last: bool) {
         let Some(term) = term else {
             self.rows *= selectivity;
@@ -101,7 +73,6 @@ impl RowFlow {
     }
 }
 
-/// Expected documents with at least one matching tuple.
 pub fn surviving_documents(num_documents: f64, num_partners: f64, selectivity: Option<f64>) -> f64 {
     let selectivity = effective_selectivity(selectivity);
     let probability = if selectivity >= 1.0 {
@@ -112,7 +83,6 @@ pub fn surviving_documents(num_documents: f64, num_partners: f64, selectivity: O
     num_documents * probability
 }
 
-/// Update live document counts after one join's selectivity.
 pub fn thin(expected_rows: &mut BTreeMap<String, f64>, spec: &PricedJoin) {
     let selectivity = effective_selectivity(spec.selectivity) * spec.pair_fraction;
     let others = |rows: &BTreeMap<String, f64>, alias: &str| {
@@ -156,7 +126,6 @@ pub fn thin(expected_rows: &mut BTreeMap<String, f64>, spec: &PricedJoin) {
     }
 }
 
-/// Expected tuples of one join.
 pub fn cross_tuples(spec: &PricedJoin, expected_rows: &BTreeMap<String, f64>) -> f64 {
     let mut tuples = 1.0;
     for alias in &spec.aliases {
@@ -165,7 +134,6 @@ pub fn cross_tuples(spec: &PricedJoin, expected_rows: &BTreeMap<String, f64>) ->
     tuples * spec.pair_fraction
 }
 
-/// Expected pairs and first documents with at least one pair.
 pub fn pair_counts(
     expected_rows: &BTreeMap<String, f64>,
     aliases: &[String],
@@ -191,17 +159,13 @@ mod row_flow_tests {
 
     #[test]
     fn an_or_passes_the_rows_any_term_passes_whatever_runs_between_its_terms() {
-        // (a OR b) AND c over 100 rows, run as a, c, b: a and b pass 20%
-        // each and c keeps half
         let mut flow = RowFlow::new(100.0);
         assert_eq!(flow.asked(Some(&term())), 100.0);
         flow.pass(0.2, Some(&term()), false);
         assert_eq!(flow.rows(), 100.0);
         flow.pass(0.5, None, false);
-        // b asks the 40 of the 50 rows left that a did not pass
         assert!((flow.asked(Some(&term())) - 40.0).abs() < 1e-9);
         flow.pass(0.2, Some(&term()), true);
-        // 10 rows a passed and 8 rows b passed
         assert!((flow.rows() - 18.0).abs() < 1e-9);
     }
 
@@ -213,7 +177,6 @@ mod row_flow_tests {
             flow.pass(second, Some(&term()), true);
             flow.rows()
         };
-        // 1 - 0.9 * 0.5
         assert!((run(0.1, 0.5) - 55.0).abs() < 1e-9);
         assert!((run(0.5, 0.1) - 55.0).abs() < 1e-9);
     }

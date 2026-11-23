@@ -76,7 +76,6 @@ class Rows:
         """Return the rows at the indices, in that order."""
         if not isinstance(indices, (pa.Array, pa.ChunkedArray)):
             indices = pa.array(np.asarray(indices))
-        # an empty numpy array is float; a take wants integer positions
         indices = indices.cast(pa.int64())
         return Rows({alias: pc.take(ids, indices) for alias, ids in self.ids.items()},
                     self.values.take(indices))

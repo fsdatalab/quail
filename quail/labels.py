@@ -2,17 +2,10 @@
 
 from dataclasses import dataclass
 
-# The label scoring rules the executor runs; each rule returns one of
-# the classification's labels.
-# every label is one letter token, read at one row
 LETTERS_SCORING = "letters"
-# the nodes where the labels split, in one request: tree attention only
 TREE_SCORING = "trie_tree"
-# one token per round along the greedy path: fewest tokens, most rounds
 DECODE_SCORING = "trie_decode"
-# a decision model's head scores one option block per label, in one request
 DECISION_SCORING = "decision_choice"
-# a set-attention model's option codes, read at each question's last row
 SET_CHOICE_SCORING = "set_choice"
 
 
@@ -109,7 +102,6 @@ def decode_runs(label_ids) -> DecodeRuns:
         return node
 
     first = follow(())
-    # the only label is decided at the cue's row, with nothing fed
     runs = [list(first) if first in trie else []]
     after = {}
     reads = {first: 1}

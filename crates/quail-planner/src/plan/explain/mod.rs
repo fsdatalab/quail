@@ -1,14 +1,3 @@
-//! The text of `explain()`: a region's logical plan and physical plan,
-//! with the planner's estimates and, after a run, what was measured.
-//!
-//! The logical plan is DataFusion's plan of the region, as its
-//! `display_indent` writes it. The request is JSON from Python: that
-//! text, the region's operators, the physical plan
-//! as its envelope with its per node estimates in the plan's order, or a
-//! refusal, and optionally the run's report and per node metrics. A node
-//! whose type is not one of Quail's comes with its inputs, outputs, and
-//! fields, which its own Python class reports.
-
 mod tree;
 mod values;
 
@@ -23,31 +12,22 @@ use crate::plan::stages::Stage;
 use tree::{Graph, physical_tree, stage_lines};
 use values::{Shown, commas, commas_int, field_lines, number, py_str, seconds, width};
 
-/// What to explain, as Python sends it.
 #[derive(Debug, Deserialize)]
 pub struct ExplainRequest {
-    /// DataFusion's plan of the region, one operator per line.
     pub logical: Option<String>,
-    /// The operators the physical plan lowers.
     pub operators: Option<Operators>,
     pub physical: Option<PhysicalRequest>,
-    /// The refusal's fields, when no configuration can run the region.
     pub refusal: Option<Value>,
     #[serde(default)]
     pub verbose: bool,
-    /// The registered rules in order, each (name, kind).
     pub rules: Option<Vec<(String, String)>>,
     pub usd_per_hour: Option<f64>,
-    /// The registered spec of the plan's model, without type tags.
     pub model_spec: Option<Value>,
     pub run: Option<RunRequest>,
-    /// Only the physical tree, as `QueryResult.explain` shows it.
     #[serde(default)]
     pub tree_only: bool,
 }
 
-/// A physical plan: its envelope fields, with the settings and the per
-/// node estimates as (key, value) pairs in the plan's order.
 #[derive(Debug, Deserialize)]
 pub struct PhysicalRequest {
     #[serde(default)]
@@ -60,41 +40,28 @@ pub struct PhysicalRequest {
     pub gpus: i64,
     #[serde(default)]
     pub settings: Vec<(String, Value)>,
-    /// The settings as Python's `str` shows each value, for the verbose
-    /// settings section: a mapping, or a list of mappings, nests.
     #[serde(default)]
     pub shown_settings: Vec<(String, Shown)>,
-    /// The encoded graph: `nodes` and `root`.
     pub graph: Value,
     #[serde(default)]
     pub estimates: Vec<(String, Value)>,
 }
 
-/// A node that explain shows by its fields alone: an extension's, or a
-/// request backend's.
 #[derive(Debug)]
 pub struct ExtensionNode {
     pub type_name: String,
-    /// Each input as (port name, source node id, source port).
     pub inputs: Vec<(String, String, String)>,
     pub outputs: Vec<String>,
     pub fields: Vec<(String, Shown)>,
 }
 
-/// What a run measured.
 #[derive(Debug, Deserialize)]
 pub struct RunRequest {
     pub report: Value,
-    /// node id -> its metrics as (field, value) pairs.
     #[serde(default)]
     pub metrics: HashMap<String, Vec<(String, Value)>>,
 }
 
-/// Format the request as `explain()` text.
-///
-/// # Errors
-///
-/// A graph node does not read as a physical node.
 pub fn explain_text(request: &ExplainRequest) -> Result<String, String> {
     if request.tree_only {
         let Some(physical) = &request.physical else {
@@ -226,7 +193,6 @@ pub fn explain_text(request: &ExplainRequest) -> Result<String, String> {
             ("model".to_string(), Shown::Text(physical.model.clone())),
             ("device".to_string(), Shown::Text(physical.device.clone())),
         ];
-        // the stages have lines of their own under the tree
         fields.extend(
             physical
                 .shown_settings
@@ -246,9 +212,6 @@ pub fn explain_text(request: &ExplainRequest) -> Result<String, String> {
     Ok(lines.join("\n"))
 }
 
-// ---------------------------------------------------------------- footers
-
-/// The measured totals of one run as labeled lines.
 fn run_summary(report: &Value, graph: &Graph, gpus: i64, usd_per_hour: Option<f64>) -> Vec<String> {
     let Some(wall) = report.get("wall_s").and_then(Value::as_f64) else {
         return vec!["query time   not measured".to_string()];
@@ -324,7 +287,6 @@ fn run_summary(report: &Value, graph: &Graph, gpus: i64, usd_per_hour: Option<f6
         .collect()
 }
 
-/// The rule categories and the order used during search.
 fn rule_lines(rules: &[(String, String)]) -> Vec<String> {
     let names = |kind: &str| {
         let names: Vec<&str> = rules
@@ -348,17 +310,10 @@ fn rule_lines(rules: &[(String, String)]) -> Vec<String> {
     ]
 }
 
-/// Whether a model keeps documents' KV for later questions: every model
-/// but one whose attention is set attention.
 fn reuses_kv(spec: Option<&Value>) -> bool {
     spec.is_none_or(|spec| spec["attention_mask"].as_str() != Some("set"))
 }
 
-/// The architecture, weight precision, and kernel path lines of a model,
-/// or none without its spec.
-///
-/// The gated delta net recurrence kernel is read from QUAIL_GDN_PREFILL
-/// in this process.
 fn architecture_lines(spec: Option<&Value>) -> Vec<String> {
     let Some(spec) = spec else {
         return Vec::new();

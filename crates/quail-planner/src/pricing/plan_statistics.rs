@@ -1,5 +1,3 @@
-//! What the cost model knows about a plan before any decision.
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::budgets::{arena_pages, chunk_budget};
@@ -18,7 +16,6 @@ use crate::pricing::costs::join_specs;
 use crate::pricing::statistics::{OrTerm, RowFlow, row_selectivity};
 use crate::prompts::lowering::LoweredPrompt;
 
-/// One table's document count and token sums, as `CorpusStats`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CorpusStats {
     pub num_documents: i64,
@@ -27,13 +24,11 @@ pub struct CorpusStats {
 }
 
 impl CorpusStats {
-    /// The mean document length in tokens.
     pub fn mean_document_tokens(&self) -> f64 {
         int_true_divide(self.total_tokens as i128, self.num_documents.max(1) as i128)
     }
 }
 
-/// What the cost model knows about one plan before any decision.
 #[derive(Debug, Clone)]
 pub struct PlanStatistics {
     pub stats: BTreeMap<String, CorpusStats>,
@@ -44,18 +39,11 @@ pub struct PlanStatistics {
     pub cap_pages: i64,
     pub pre: i64,
     pub specs: Vec<PricedJoin>,
-    /// alias -> written positions of its AI.IF predicates, in filter order.
     pub asks: Vec<(String, Vec<usize>)>,
-    /// Every prompt of the plan, lowered.
     pub lowered: Vec<(Prompt, LoweredPrompt)>,
 }
 
 impl PlanStatistics {
-    /// A prompt's lowered form.
-    ///
-    /// # Panics
-    ///
-    /// The prompt is not one of the plan's.
     pub fn lowered(&self, prompt: &Prompt) -> &LoweredPrompt {
         self.lowered
             .iter()
@@ -64,7 +52,6 @@ impl PlanStatistics {
             .expect("a prompt of the plan")
     }
 
-    /// The written positions of an alias's AI.IF predicates.
     pub fn asks_of(&self, alias: &str) -> &[usize] {
         self.asks
             .iter()
@@ -74,8 +61,6 @@ impl PlanStatistics {
     }
 }
 
-/// The prompts of a plan's filters, label tests, joins, and remaining
-/// result columns, as `Operators.prompts`.
 pub fn plan_prompts(found: &Operators) -> Vec<Prompt> {
     let mut calls: Vec<&crate::physical::ModelCall> = Vec::new();
     for (_, predicates) in &found.filters {
@@ -100,12 +85,6 @@ pub fn plan_prompts(found: &Operators) -> Vec<Prompt> {
     prompts
 }
 
-/// Gather the statistics of one plan's operators, as `plan_statistics`.
-///
-/// # Errors
-///
-/// A scanned alias has no token counts, the arena does not fit the
-/// device, or the tokenizer fails.
 pub fn plan_statistics(
     found: &Operators,
     context: &PlanningContext,
@@ -242,7 +221,6 @@ pub fn plan_statistics(
     })
 }
 
-/// The aliases whose documents a filter before the joins computed.
 pub fn filtered_before_joins(found: &Operators) -> BTreeSet<String> {
     let mut aliases = BTreeSet::new();
     for (alias, flags) in &found.filters_before_joins {
@@ -258,7 +236,6 @@ pub fn filtered_before_joins(found: &Operators) -> BTreeSet<String> {
     aliases
 }
 
-/// The expected live documents per alias after its filters run.
 pub fn expected_rows_after_filters(
     found: &Operators,
     statistics: &PlanStatistics,

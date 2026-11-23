@@ -325,7 +325,8 @@ rows 1, in order
     contracts c WHERE AI.SCORE(PROMPT('Is this a lease? {0}', c.text)) > 0.25 ---
 plan
   lease = ai_extract(c.text, named_struct('ends', 'When does the lease end?'))
-  score = ai_score('Is this a lease? {0}', c.text), filter: score > Float64(0.25)
+  score = ai_score('Is this a lease? {0}', c.text), inline_predicate: score >
+      Float64(0.25)
 asked 6 of 6
   'Is this a lease? {0}': c1 0.125, c2 0.25, c3 0.375, c4 0.5
   'When does the lease end?': c3 'March 3, 2027', c4 NULL
@@ -412,7 +413,7 @@ def test_tests_of_answers_keep_the_documents_whose_answers_pass():
     much?'})['rent']) < 20, {'selectivity': 0.5}) ---
 plan
   lease = ai_extract(c.text, named_struct('ends', 'When does the lease end?', 'rent',
-      'How much?')), filter: hint(get_field(lease, 'ends') IS NOT NULL,
+      'How much?')), inline_predicate: hint(get_field(lease, 'ends') IS NOT NULL,
       named_struct('selectivity', Float64(0.5))) AND hint(get_field(lease, 'ends') ILIKE
       '%march%', named_struct('selectivity', Float64(0.5))) AND
       hint(get_field(lease_span, 'ends', 'start') < Int32(20),
@@ -429,8 +430,8 @@ rows 1
     contracts c WHERE NOT (AI.EXTRACT(c.text, {'ends': 'When does the lease
     end?'})['ends'] LIKE 'March%') ---
 plan
-  lease = ai_extract(c.text, named_struct('ends', 'When does the lease end?')), filter:
-      get_field(lease, 'ends') NOT LIKE 'March%', returns: [lease]
+  lease = ai_extract(c.text, named_struct('ends', 'When does the lease end?')),
+      inline_predicate: get_field(lease, 'ends') NOT LIKE 'March%', returns: [lease]
 asked 4 of 4
   'When does the lease end?': c1 'March 3, 2027', c2 NULL, c3 'March 3, 2027', c4 NULL
 rows 0
@@ -439,8 +440,8 @@ rows 0
     it end?'})['ends'], ' ', 1) = 'March' ---
 plan
   __quail_column_1 = ai_extract(c.text, named_struct('ends', 'When does it end?')),
-      filter: split_part(get_field(__quail_column_1, 'ends'), ' ', Int64(1)) = 'March',
-      returns: [__quail_column_1]
+      inline_predicate: split_part(get_field(__quail_column_1, 'ends'), ' ', Int64(1)) =
+      'March', returns: [__quail_column_1]
 asked 4 of 4
   'When does it end?': c1 'March 3, 2027', c2 'June 1, 2030', c3 NULL, c4 NULL
 rows 1
@@ -469,7 +470,7 @@ def test_not_and_or_of_answers_labels_and_columns_keep_the_rows_sql_would():
     {'ends': 'When does the lease end?', 'rent': 'How much?'})['ends']['start'] < 0) ---
 plan
   lease = ai_extract(c.text, named_struct('ends', 'When does the lease end?', 'rent',
-      'How much?')), filter: get_field(lease, 'ends') IS NOT NULL AND
+      'How much?')), inline_predicate: get_field(lease, 'ends') IS NOT NULL AND
       get_field(lease_span, 'ends', 'start') >= Int32(0), returns: [lease]
 asked 6 of 6
   'When does the lease end?': c1 'March 3, 2027', c2 NULL, c3 'March 3, 2027', c4 NULL
@@ -484,8 +485,8 @@ rows 2
     {'ends': 'When does the lease end?', 'rent': 'How much?'})['ends']['start'] >= 0 ---
 plan
   lease = ai_extract(c.text, named_struct('ends', 'When does the lease end?', 'rent',
-      'How much?')), filter: get_field(lease, 'ends') IS NULL OR get_field(lease_span,
-      'ends', 'start') >= Int32(0), returns: [lease]
+      'How much?')), inline_predicate: get_field(lease, 'ends') IS NULL OR
+      get_field(lease_span, 'ends', 'start') >= Int32(0), returns: [lease]
 asked 8 of 8
   'When does the lease end?': c1 'March 3, 2027', c2 NULL, c3 'March 3, 2027', c4 NULL
   'How much?': c1 '$2,000', c2 NULL, c3 NULL, c4 NULL
@@ -500,8 +501,8 @@ rows 4
     the lease end?', 'rent': 'How much?'})['ends'] IS NULL AND c.id = 'c2') ---
 plan
   lease = ai_extract(c.text, named_struct('ends', 'When does the lease end?', 'rent',
-      'How much?')), filter: get_field(lease, 'ends') IS NOT NULL OR c.id != 'c2',
-      returns: [lease]
+      'How much?')), inline_predicate: get_field(lease, 'ends') IS NOT NULL OR c.id !=
+      'c2', returns: [lease]
 asked 7 of 7
   'When does the lease end?': c1 'March 3, 2027', c2 NULL, c3 'March 3, 2027', c4 NULL
   'How much?': c1 '$2,000', c3 NULL, c4 NULL
@@ -516,8 +517,8 @@ rows 3
     'When does the lease end?', 'rent': 'How much?'})['rent'] IS NOT NULL ---
 plan
   lease = ai_extract(c.text, named_struct('ends', 'When does the lease end?', 'rent',
-      'How much?')), filter: get_field(lease, 'ends') = 'x' OR get_field(lease, 'rent')
-      IS NOT NULL, returns: [lease]
+      'How much?')), inline_predicate: get_field(lease, 'ends') = 'x' OR
+      get_field(lease, 'rent') IS NOT NULL, returns: [lease]
 asked 8 of 8
   'How much?': c1 '$2,000', c2 NULL, c3 NULL, c4 NULL
   'When does the lease end?': c1 'March 3, 2027', c2 NULL, c3 'March 3, 2027', c4 NULL

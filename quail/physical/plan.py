@@ -13,12 +13,10 @@ from quail.physical import PhysicalGraph, PortRef
 class Refusal:
     """Returned when a configuration cannot execute the query."""
     reasons: tuple
-    constraint: str    # "weights_need_more_cards" | "suffix_over_chunk"
-    #                    | "unknown_model" | "sliding_kv_needs_more_memory"
-    #                    | "flash_attention_4_unsupported"
+    constraint: str
     needed: float
     available: float
-    unit: str          # "cards" | "tokens" | "bytes" | "version"
+    unit: str
 
 
 def refusal_from_fields(fields: dict) -> Refusal:
@@ -99,14 +97,13 @@ class PhysicalPlan:
     gpus: int
     backend: str = "quail"
     estimated_seconds: float = 0.0
-    nodes: tuple = ()          # typed nodes in topological order
+    nodes: tuple = ()
     settings: Mapping[str, Any] = field(default_factory=dict, repr=False)
     root: PortRef | None = None
     estimates: Mapping[str, Mapping[str, float]] = field(
         default_factory=dict, repr=False)
     pricing: Mapping[str, Any] | None = field(default=None, repr=False,
                                               compare=False)
-    # the operators the graph lowers, as Rust's JSON
     operators: str | None = field(default=None, repr=False, compare=False)
     graph: PhysicalGraph = field(init=False, repr=False)
 

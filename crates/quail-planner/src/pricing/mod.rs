@@ -1,15 +1,3 @@
-//! Price a query: each AI operator's statistics, cost, and spec
-//! (`classify`, `columns`, `scores`), each table step's cost and the
-//! search that orders steps and joins by it (`costs`, `search`,
-//! `plan_statistics`, `statistics`), a physical plan's price (this
-//! module), and the speed of light estimate (`sol`).
-//!
-//! Price a physical plan: each node on its own, and the plan as a whole.
-//!
-//! Every node's price is its work. The plan's seconds are the seconds
-//! of all that work together, packed into forward passes, so node
-//! seconds do not add up to the plan's.
-
 pub mod classify;
 pub mod columns;
 pub mod costs;
@@ -38,22 +26,18 @@ use crate::pricing::columns::{answer_cost, extract_inputs, map_cost};
 use crate::pricing::plan_statistics::CorpusStats;
 use crate::prompts::prompt_layout;
 
-/// One node's price: its packed work, or its own estimated seconds.
 #[derive(Debug, Clone, Default)]
 struct NodePrice {
     work: Option<Work>,
     seconds: f64,
 }
 
-/// What prices the nodes of a plan's graph, as `PlanPricer`.
 #[derive(Debug, Clone)]
 pub struct PlanPricer {
     pub chunk: i64,
     pub cap_pages: i64,
     pub stats: BTreeMap<String, CorpusStats>,
-    /// Join written position -> the work its stage does.
     pub stage_works: BTreeMap<usize, Work>,
-    /// alias -> documents expected after its filters.
     pub expected_rows: BTreeMap<String, f64>,
 }
 
@@ -116,7 +100,6 @@ fn spec_seconds(node: &PhysicalNode) -> Option<f64> {
     }
 }
 
-/// The work an inference node's spec was priced with, when it has it.
 fn spec_work(node: &PhysicalNode) -> Option<Work> {
     let values = match node {
         PhysicalNode::AiScore(node) => &node.attributes.spec.as_ref()?.estimated_work,
@@ -150,7 +133,6 @@ fn spec_state_tail(node: &PhysicalNode) -> i64 {
     }
 }
 
-/// Whether a node borrows its documents' shared prefix KV.
 fn shares_prefixes(node: &PhysicalNode) -> bool {
     match node {
         PhysicalNode::AiFilter(node) => node.attributes.share_prefixes,
@@ -184,7 +166,6 @@ fn shares_prefixes(node: &PhysicalNode) -> bool {
     }
 }
 
-/// The prompt tokens before each document, as `passes.head_tokens`.
 pub fn head_tokens(node: &PhysicalNode) -> i64 {
     match node {
         PhysicalNode::AiFilter(node) => node.attributes.preamble_tokens,
@@ -192,8 +173,6 @@ pub fn head_tokens(node: &PhysicalNode) -> i64 {
     }
 }
 
-/// An operator's question tokens after the state tail, as
-/// `passes.question_tokens`.
 pub fn pass_question_tokens(node: &PhysicalNode, state_tail: i64) -> i64 {
     match node {
         PhysicalNode::AiFilter(node) => (node.attributes.question_tokens - state_tail).max(1),
@@ -201,12 +180,10 @@ pub fn pass_question_tokens(node: &PhysicalNode, state_tail: i64) -> i64 {
     }
 }
 
-/// The documents an operator is expected to be asked about.
 pub fn expected_documents(node: &PhysicalNode) -> f64 {
     spec_expected_rows(node)
 }
 
-/// The positions of each pass group's operators, in execution order.
 pub fn pass_members(nodes: &[PhysicalNode]) -> Vec<Vec<usize>> {
     let mut groups: Vec<(i64, Vec<usize>)> = Vec::new();
     for index in crate::topology::topological_nodes(nodes) {
@@ -222,11 +199,6 @@ pub fn pass_members(nodes: &[PhysicalNode]) -> Vec<Vec<usize>> {
     groups.into_iter().map(|(_, members)| members).collect()
 }
 
-/// A set-attention pass's state tail and later-question header lengths.
-///
-/// # Errors
-///
-/// The layout is unknown, or the tokenizer fails.
 pub fn set_pass_tokens(context: &PlanningContext) -> Result<(i64, i64), CompileError> {
     let layout = prompt_layout(&context.model.prompt_layout)?;
     let label = layout.question_label;
@@ -238,23 +210,15 @@ pub fn set_pass_tokens(context: &PlanningContext) -> Result<(i64, i64), CompileE
 }
 
 impl PlanPricer {
-    /// The seconds of packed work.
     pub fn seconds_of(&self, context: &PlanningContext, work: &Work) -> f64 {
         speed_of_light(work, &context.model, &context.device, self.chunk, 0).seconds()
     }
 
-    /// Price a graph: its seconds, and node id -> its explain entry.
-    ///
-    /// # Errors
-    ///
-    /// A spec's estimator fails.
     pub fn price(
         &self,
         context: &PlanningContext,
         nodes: &[PhysicalNode],
     ) -> Result<(f64, Map<String, Value>), CompileError> {
-        // Graphs may arrive from Python rather than the planner. Costing reads
-        // each inference spec's document alias and head/tail token parts.
         for node in nodes {
             if matches!(
                 node,
@@ -308,8 +272,6 @@ impl PlanPricer {
         Ok(out)
     }
 
-    /// A set-attention plan's passes: each group's first operator carries
-    /// the work of its passes, the others none.
     fn set_passes(
         &self,
         context: &PlanningContext,
@@ -419,8 +381,6 @@ impl PlanPricer {
                         .cloned()
                         .unwrap_or_default();
                     if attributes.pairs_from.is_empty() {
-                        // over every pair, the model is asked once per pair of
-                        // distinct texts; pairs from a hash join are priced in full
                         for alias in std::iter::once(&attributes.anchor).chain(&attributes.partners)
                         {
                             work = &work * self.distinct(context, alias);
@@ -438,7 +398,6 @@ impl PlanPricer {
                 _ if spec_seconds(node).is_some() => {
                     let share = self.computed_share(context, node, resident)?;
                     match spec_work(node) {
-                        // its work joins the plan's, packed with the rest
                         Some(work) => {
                             let copies = parallel_copies(context.gpus, spec_expected_rows(node));
                             let work = &work * (share / copies);
@@ -454,7 +413,6 @@ impl PlanPricer {
                                 seconds: 0.0,
                             }
                         }
-                        // a spec built without its work has its seconds alone
                         None => {
                             let seconds = spec_seconds(node).unwrap_or(0.0) * share;
                             entry.insert("seconds".into(), Value::from(seconds));
@@ -472,7 +430,6 @@ impl PlanPricer {
         Ok(out)
     }
 
-    /// The share of an alias's documents the model is asked about.
     fn distinct(&self, context: &PlanningContext, alias: &str) -> f64 {
         match context.key_documents(alias) {
             None => 1.0,
@@ -484,7 +441,6 @@ impl PlanPricer {
         attributes.preamble_tokens as f64 + self.stats[&attributes.alias].mean_document_tokens()
     }
 
-    /// Per document, the prefix tokens a node borrows, or None without sharing.
     fn shared<'a>(
         &self,
         context: &'a PlanningContext,
@@ -497,7 +453,6 @@ impl PlanPricer {
         context.page_shared.get(alias).map(Vec::as_slice)
     }
 
-    /// A filter's work: its question over resident KV, else a scan of each.
     fn filter_work(
         &self,
         context: &PlanningContext,
@@ -526,7 +481,6 @@ impl PlanPricer {
                 continue;
             }
             let prefix = attributes.preamble_tokens + length;
-            // a borrowed prefix includes the prompt head the documents share
             let borrowed = if *shared != 0 {
                 shared + attributes.preamble_tokens
             } else {
@@ -551,7 +505,6 @@ impl PlanPricer {
         Ok(&work * (attributes.expected_rows / lengths.len() as f64))
     }
 
-    /// What a later join pays if the sequence's KV is released, not pinned.
     fn release_recompute(
         &self,
         context: &PlanningContext,
@@ -583,9 +536,6 @@ impl PlanPricer {
         );
     }
 
-    /// The share of its spec's estimate an inference node computes: what
-    /// its documents do not borrow from another's KV, over its key
-    /// documents.
     fn computed_share(
         &self,
         context: &PlanningContext,
@@ -615,7 +565,6 @@ impl PlanPricer {
         Ok(share)
     }
 
-    /// The share of a node's fresh tokens that its key documents compute.
     fn asked_fraction(
         &self,
         context: &PlanningContext,
@@ -693,8 +642,6 @@ impl PlanPricer {
                 Ok(ratio(part, whole))
             }
             _ => {
-                // a score's or a feature call's time is taken as proportional
-                // to the tokens it computes
                 let parts: Vec<i64> = node
                     .prompt_token_parts()
                     .iter()

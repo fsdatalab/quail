@@ -27,8 +27,6 @@ from rich.progress import Progress as Bar
 from rich.text import Text
 
 _GPU_INDEX = None
-# names the run in every line's prefix, such as a benchmark's query
-# family; read from the environment so worker processes inherit it
 LOG_TAG_ENV = "QUAIL_LOG_TAG"
 
 
@@ -63,12 +61,9 @@ class _ConsoleHandler(logging.Handler):
 
     def emit(self, record):
         found = console()
-        # a record of a child logger skips this logger's filter; format()
-        # adds a logged exception's traceback
         tag, text = getattr(record, "gpu", ""), self.format(record)
         if not found.is_terminal:
             stamp = time.strftime("%m-%d %H:%M:%S", time.localtime(record.created))
-            # a log file keeps one unwrapped line per message
             print(f"{record.levelname} {stamp} [quail]{tag} {text}",
                   file=found.file, flush=True)
         elif not getattr(record, "detail", False):
@@ -116,7 +111,6 @@ class _TimeColumn(ProgressColumn):
 
 logger = logging.getLogger("quail")
 if not logger.handlers:
-    # INFO lines reach stdout unless the program configures the logger itself
     logger.addHandler(_ConsoleHandler())
     logger.addFilter(_GpuFilter())
     logger.setLevel(logging.INFO)
@@ -240,7 +234,6 @@ class Progress:
             return
         self._last = now
         self._report()
-        # a tenth of the total since the last line, or any change without one
         step = (self.total or 0) / 10
         if self._bar is None and done - self._logged >= step:
             self._logged = done

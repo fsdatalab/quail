@@ -156,7 +156,7 @@ rows 2
     AI.SCORE(PROMPT('Refund? {0}', d.body)) >= 0.15 ---
 plan
   topic = ai_classify('Topic {0}', d.body, make_array('refund', 'praise'))
-  s = ai_score('Refund? {0}', d.body), filter: s >= Float64(0.15)
+  s = ai_score('Refund? {0}', d.body), inline_predicate: s >= Float64(0.15)
 asked 3 of 3
   'Refund? {0}': d1 0.125, d2 0.25
   'Topic {0}': d2 'praise'
@@ -169,9 +169,9 @@ rows 1
     AI.CLASSIFY(PROMPT('Topic {0}', d.body), ARRAY['refund','praise']) IN ('praise') AND
     AI.SCORE(PROMPT('Refund? {0}', d.body)) >= 0.15 ---
 plan
-  topic = ai_classify('Topic {0}', d.body, make_array('refund', 'praise')), filter:
-      topic = 'praise'
-  s = ai_score('Refund? {0}', d.body), filter: s >= Float64(0.15)
+  topic = ai_classify('Topic {0}', d.body, make_array('refund', 'praise')),
+      inline_predicate: topic = 'praise'
+  s = ai_score('Refund? {0}', d.body), inline_predicate: s >= Float64(0.15)
 asked 3 of 3
   'Refund? {0}': d1 0.125, d2 0.25
   'Topic {0}': d2 'praise'
@@ -197,7 +197,7 @@ rows 2
     AI.SCORE(PROMPT('Refund? {0}', d.body)) >= 0.15 ---
 plan
   topic = ai_classify('Topic {0}', d.body, make_array('refund', 'praise'))
-  s = ai_score('Refund? {0}', d.body), filter: s >= Float64(0.15)
+  s = ai_score('Refund? {0}', d.body), inline_predicate: s >= Float64(0.15)
 asked 3 of 3
   'Refund? {0}': d1 0.125, d2 0.25
   'Topic {0}': d2 'praise'
@@ -210,9 +210,9 @@ rows 1
     AI.CLASSIFY(PROMPT('Topic {0}', d.body), ARRAY['refund','praise']) IN ('praise') AND
     AI.SCORE(PROMPT('Refund? {0}', d.body)) >= 0.15 ---
 plan
-  topic = ai_classify('Topic {0}', d.body, make_array('refund', 'praise')), filter:
-      topic = 'praise'
-  s = ai_score('Refund? {0}', d.body), filter: s >= Float64(0.15)
+  topic = ai_classify('Topic {0}', d.body, make_array('refund', 'praise')),
+      inline_predicate: topic = 'praise'
+  s = ai_score('Refund? {0}', d.body), inline_predicate: s >= Float64(0.15)
 asked 3 of 3
   'Refund? {0}': d1 0.125, d2 0.25
   'Topic {0}': d2 'praise'

@@ -1,14 +1,3 @@
-//! Model regions: the part of a plan that Quail runs as one unit.
-//!
-//! - `claim`: `claim_model_regions`, which cuts each region out
-//!   of the optimized plan.
-//! - `lift`: the operators DataFusion keeps above a region.
-//! - `inputs`: the relations DataFusion computes for a region.
-//! - `derive`: a region's operators, read from its DataFusion plan.
-//! - `region_hint`: the tests above a region that may drop its rows.
-//! - `exec`: `ModelRegionExec`, which hands a region to a `RegionRunner`.
-//! - this module: the `ModelRegion` logical node.
-
 pub(crate) mod claim;
 pub mod derive;
 pub(crate) mod exec;
@@ -31,30 +20,15 @@ use crate::ai::AiNode;
 use crate::functions::is_ai_call;
 use crate::plan::as_node;
 
-/// Connected logical model work that Quail plans as one unit.
-///
-/// The claimed operators are held in `plan`, not as inputs, so
-/// DataFusion's optimizer rules never rewrite them again. The node's
-/// inputs are the relations DataFusion computes for the region, such as
-/// a table's plain filters or a CTE that groups rows, which `plan` reads
-/// as tables named in `input_names`. Quail's planner reads `plan` when
-/// the node is planned physically.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd)]
 pub struct ModelRegion {
-    /// Query-local identity assigned in logical traversal order after claiming.
-    /// Preserved through physical planning, independent of execution order.
     pub id: Option<usize>,
-    /// The claimed operators after DataFusion's optimizer, with the AI
-    /// calls as `AiNode`s, from the region's root down to its scans.
     pub plan: LogicalPlan,
-    /// The relations DataFusion computes for the region, in order.
     pub inputs: Vec<LogicalPlan>,
-    /// The table name `plan` reads each input by.
     pub input_names: Vec<String>,
 }
 
 impl ModelRegion {
-    /// Create a model region over the given operators.
     pub fn new(plan: LogicalPlan) -> Self {
         Self {
             id: None,
@@ -66,8 +40,6 @@ impl ModelRegion {
 }
 
 impl ModelRegion {
-    /// Whether an input of the region is sorted: the region then returns
-    /// its rows in its input's order, as DataFusion reads them.
     pub fn has_sorted_input(&self) -> bool {
         self.inputs.iter().any(|input| {
             input
@@ -76,8 +48,6 @@ impl ModelRegion {
         })
     }
 
-    /// The region's AI calls and the tables it reads, for EXPLAIN:
-    /// `calls=[ai_filter], tables=[reviews]`.
     pub fn summary(&self) -> String {
         let (mut calls, mut tables) = (Vec::new(), Vec::new());
         let _ = self.plan.apply(|node| {
@@ -101,8 +71,6 @@ impl ModelRegion {
     }
 }
 
-/// Whether any operator in the subtree is an `AiNode`, or calls an AI
-/// function in its expressions or in an EXISTS or IN subquery.
 fn calls_ai(plan: &LogicalPlan) -> Result<bool> {
     let mut found = false;
     plan.apply_with_subqueries(|node| {
@@ -137,7 +105,6 @@ impl UserDefinedLogicalNodeCore for ModelRegion {
         vec![]
     }
 
-    // the region's columns are not its inputs' columns
     fn prevent_predicate_push_down_columns(&self) -> HashSet<String> {
         self.plan
             .schema()
@@ -148,7 +115,6 @@ impl UserDefinedLogicalNodeCore for ModelRegion {
     }
 
     fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        // Quail's explain shows the region's plan
         write!(f, "ModelRegion: {}", self.summary())
     }
 

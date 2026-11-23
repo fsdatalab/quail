@@ -1,12 +1,3 @@
-//! `SharedInput`: a region input whose rows are computed once and
-//! numbered.
-//!
-//! A model region names each row it returns by its table's id column.
-//! An input DataFusion computes for the region without one, such as a
-//! join or a CTE that groups rows, gets [`ROW_COLUMN`], each row's
-//! position among those rows. Every reader of one `SharedInput` reads
-//! the same rows, computed by whichever reads first.
-
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -35,11 +26,8 @@ use datafusion::physical_plan::{
 use futures::lock::Mutex as AsyncMutex;
 use futures::{StreamExt, stream};
 
-/// The id column of a region input without one: each row's position
-/// among the input's rows, from zero.
 pub const ROW_COLUMN: &str = "__quail_row";
 
-/// The field of [`ROW_COLUMN`].
 pub(crate) fn row_field() -> Field {
     Field::new(ROW_COLUMN, DataType::Int64, false).with_metadata(HashMap::from([(
         "quail.row_identity".to_string(),
@@ -49,26 +37,16 @@ pub(crate) fn row_field() -> Field {
 
 static NEXT_KEY: AtomicU64 = AtomicU64::new(0);
 
-/// A region input whose rows every reader of the same `key` shares.
 #[derive(Debug, Clone)]
 pub struct SharedInput {
-    /// Names the rows: each `SharedInput` of one key reads the same rows.
     pub key: u64,
     pub input: LogicalPlan,
-    /// Whether the rows get [`ROW_COLUMN`].
     pub numbered: bool,
-    /// An opaque output scope for completed fallback values.
     scope: Option<TableReference>,
     schema: DFSchemaRef,
 }
 
 impl SharedInput {
-    /// A new shared input over `input`, numbering its rows when
-    /// `numbered`.
-    ///
-    /// # Errors
-    ///
-    /// The input already has a column named [`ROW_COLUMN`].
     pub fn try_new(input: LogicalPlan, numbered: bool) -> Result<Self> {
         let key = NEXT_KEY.fetch_add(1, Ordering::Relaxed);
         Self::with_key(key, input, numbered, None)
@@ -122,7 +100,6 @@ impl Hash for SharedInput {
 
 impl PartialOrd for SharedInput {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        // nodes have no meaningful order; this agrees with `Eq`
         (self == other).then_some(std::cmp::Ordering::Equal)
     }
 }
@@ -156,8 +133,6 @@ impl UserDefinedLogicalNodeCore for SharedInput {
         let Ok([input]) = <[LogicalPlan; 1]>::try_from(inputs) else {
             return internal_err!("SharedInput reads one input");
         };
-        // A rule may prune the input's columns, but not add one: every
-        // reader of these rows reads the columns the node was built with.
         let own = self.input.schema();
         let added = input
             .schema()
@@ -182,23 +157,16 @@ impl UserDefinedLogicalNodeCore for SharedInput {
     }
 }
 
-/// The rows of one shared input, once its first reader has computed
-/// them, with the memory they hold reserved from the query's pool.
 type Rows = AsyncMutex<Option<(Vec<RecordBatch>, MemoryReservation)>>;
 
-/// The rows of one shared input, as each of its readers holds them.
 pub(crate) type SharedRows = Arc<Rows>;
 
-/// The rows of each shared input a planner has planned, by key, while a
-/// reader holds them.
 #[derive(Debug, Default)]
 pub(crate) struct SharedRowsByKey {
     found: Mutex<HashMap<u64, Weak<Rows>>>,
 }
 
 impl SharedRowsByKey {
-    /// The rows of the shared input `key`, shared with every other
-    /// reader of it still planned.
     pub(crate) fn rows(&self, key: u64) -> SharedRows {
         let mut found = self.found.lock().expect("the shared rows lock");
         found.retain(|_, rows| rows.strong_count() > 0);
@@ -211,8 +179,6 @@ impl SharedRowsByKey {
     }
 }
 
-/// The physical operator of a [`SharedInput`]: one partition of the
-/// input's rows, computed by the first of its readers.
 #[derive(Debug)]
 pub struct SharedInputExec {
     input: Arc<dyn ExecutionPlan>,
@@ -286,8 +252,6 @@ impl ExecutionPlan for SharedInputExec {
         parent_filters: Vec<Arc<dyn PhysicalExpr>>,
         _config: &ConfigOptions,
     ) -> Result<FilterDescription> {
-        // every reader gets the rows the first computes, so no reader's
-        // filter, such as a join's dynamic filter, may reach the input
         Ok(FilterDescription::all_unsupported(
             &parent_filters,
             &self.children(),
@@ -346,7 +310,6 @@ impl ExecutionPlan for SharedInputExec {
                 }
                 if numbered {
                     batches = with_positions(batches, &schema)?;
-                    // each batch now also holds its rows' positions
                     let held: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
                     reservation.try_resize(held)?;
                 }
@@ -366,7 +329,6 @@ impl ExecutionPlan for SharedInputExec {
     }
 }
 
-/// `batches` with [`ROW_COLUMN`] added: each row's position among them.
 fn with_positions(batches: Vec<RecordBatch>, schema: &SchemaRef) -> Result<Vec<RecordBatch>> {
     let mut next = 0i64;
     batches

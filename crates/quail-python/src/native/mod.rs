@@ -1,8 +1,3 @@
-//! The `_quail_native` Python module: Quail's Rust crates for Python.
-//!
-//! `NativeSession` is `crate::Session`; Python's `quail.Session` runs
-//! queries through it, as a Rust program does.
-
 mod budgets;
 mod cost;
 mod graph;
@@ -23,20 +18,14 @@ fn python_error(error: DataFusionError) -> PyErr {
     PyRuntimeError::new_err(error.to_string())
 }
 
-/// A DataFusion context without Quail, which holds a Python session's
-/// tables and settings for its whole life. Each query's
-/// `NativeSession` runs over it.
 #[pyclass(name = "DataFusionContext", module = "_quail_native")]
 struct DataFusionContext {
     context: datafusion::prelude::SessionContext,
-    /// The context, which each FFI codec handed to a foreign table
-    /// refers to weakly.
     tasks: std::sync::Arc<datafusion::prelude::SessionContext>,
 }
 
 #[pymethods]
 impl DataFusionContext {
-    /// A context that reads SQL as Quail's sessions read it.
     #[new]
     fn new() -> PyResult<Self> {
         let state = quail_datafusion::base_state().map_err(python_error)?;
@@ -47,11 +36,6 @@ impl DataFusionContext {
         })
     }
 
-    /// Register a table by its schema, given as the IPC stream bytes of
-    /// an empty table, and a function `scan(columns)` that returns
-    /// those columns' rows as an Arrow stream, such as a pyarrow
-    /// RecordBatchReader. `id_column` names the
-    /// column whose values are unique, and `identity` the rows.
     #[pyo3(signature = (name, schema, scan, id_column=None, identity=""))]
     fn register(
         &self,
@@ -74,9 +58,6 @@ impl DataFusionContext {
         .map_err(python_error)
     }
 
-    /// Register the rows of `data`, a Python object with an Arrow
-    /// stream such as a pyarrow Table, without copying them.
-    /// `id_column` and `identity` are as [`Self::register`] has them.
     #[pyo3(signature = (name, data, id_column=None, identity=""))]
     fn register_batches(
         &self,
@@ -97,10 +78,6 @@ impl DataFusionContext {
         .map_err(python_error)
     }
 
-    /// Register local files of one `format` ("parquet", "arrow",
-    /// "json", or "csv"), read by DataFusion in the order of `paths`.
-    /// `schema` is the IPC stream bytes of an empty table; `id_column`
-    /// and `identity` are as [`Self::register`] has them.
     #[pyo3(signature = (name, format, paths, schema, id_column=None, identity=""))]
     #[allow(clippy::too_many_arguments)]
     fn register_files(
@@ -130,9 +107,6 @@ impl DataFusionContext {
         .map_err(python_error)
     }
 
-    /// Register `table`, a Python object with
-    /// `__datafusion_table_provider__`, such as a datafusion-python
-    /// table, read through DataFusion's FFI.
     fn register_foreign(
         slf: &Bound<'_, Self>,
         name: &str,
@@ -141,7 +115,6 @@ impl DataFusionContext {
         use datafusion_ffi::table_provider::FFI_TableProvider;
 
         let method = table.getattr("__datafusion_table_provider__")?;
-        // datafusion-python 52 and later pass a session that holds a codec
         let capsule = match method.call1((slf,)) {
             Ok(capsule) => capsule,
             Err(error) if error.is_instance_of::<pyo3::exceptions::PyTypeError>(slf.py()) => {
@@ -151,7 +124,6 @@ impl DataFusionContext {
         };
         let capsule = capsule.cast::<pyo3::types::PyCapsule>()?;
         let pointer = capsule.pointer_checked(Some(c"datafusion_table_provider"))?;
-        // the capsule owns the provider; the table takes a clone
         let provider = unsafe { &*pointer.as_ptr().cast::<FFI_TableProvider>() };
         let (theirs, ours) = (unsafe { (provider.version)() }, datafusion_ffi::version());
         if theirs != ours {
@@ -165,7 +137,6 @@ impl DataFusionContext {
         quail::register_table(&slf.borrow().context, name, table).map_err(python_error)
     }
 
-    /// Every row of the table `name`, as a pyarrow Table.
     fn read<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyAny>> {
         let (schema, batches) = py
             .detach(|| {
@@ -180,8 +151,6 @@ impl DataFusionContext {
         to_pyarrow(py, schema, batches)
     }
 
-    /// The logical extension codec a foreign table encodes expressions
-    /// with, as a PyCapsule, which datafusion-python's protocol asks for.
     fn __datafusion_logical_extension_codec__<'py>(
         &self,
         py: Python<'py>,
@@ -196,8 +165,6 @@ impl DataFusionContext {
     }
 }
 
-/// Quail's Rust `Session`: DataFusion with Quail's AI functions, whose
-/// model regions run on a Python engine.
 #[pyclass(name = "NativeSession", module = "_quail_native")]
 struct NativeSession {
     session: crate::Session,
@@ -205,8 +172,6 @@ struct NativeSession {
 
 #[pymethods]
 impl NativeSession {
-    /// Create a session whose model regions run on `engine`, planned by
-    /// `planner` when given, as `crate::session_with_planner` describes.
     #[new]
     #[pyo3(signature = (engine, planner=None, base=None))]
     fn new(
@@ -221,10 +186,6 @@ impl NativeSession {
         })
     }
 
-    /// Create a session that runs model regions on `workers` itself,
-    /// as `crate::Executor::described` describes; no Python engine runs
-    /// a region. `description` is what a worker describes of the
-    /// session's configuration, as JSON.
     #[staticmethod]
     #[pyo3(signature = (workers, description, planner=None, base=None))]
     fn on_workers(
@@ -235,7 +196,6 @@ impl NativeSession {
         base: Option<PyRef<'_, DataFusionContext>>,
     ) -> PyResult<Self> {
         let base = base.map(|found| found.context.clone());
-        // the session's planner keeps the tables it tokenized
         let planner = planner.map(|found| std::sync::Arc::clone(&found.planner));
         let workers = workers.shared()?;
         let description: serde_json::Value = from_json(description)?;
@@ -255,8 +215,6 @@ impl NativeSession {
         Ok(Self { session })
     }
 
-    /// The plan of each model region of a query, as
-    /// `crate::Session::explain_regions` explains it.
     #[pyo3(signature = (query, dialect=None, verbose=false))]
     fn explain_regions(
         &self,
@@ -272,9 +230,6 @@ impl NativeSession {
         .map_err(python_error)
     }
 
-    /// Run a query and explain each model region that ran with its
-    /// measurements, as `crate::Session::explain_analyze` does; returns
-    /// the query's rows and each region's text.
     #[pyo3(signature = (query, dialect=None, verbose=false))]
     fn explain_analyze<'py>(
         &self,
@@ -292,15 +247,12 @@ impl NativeSession {
         Ok((to_pyarrow(py, schema, batches)?, explained))
     }
 
-    /// Call `ready()` each time the workers have the model loaded for
-    /// a region, before the region runs; None calls nothing.
     #[pyo3(signature = (ready=None))]
     fn when_ready(&self, ready: Option<Py<PyAny>>) {
         let observer = ready.map(|ready| {
             let call: quail::Observer = std::sync::Arc::new(move |event| {
                 if matches!(event, quail::RegionEvent::Ready) {
                     Python::attach(|py| {
-                        // a hook that fails must not stop the region
                         let _ = ready.call0(py);
                     });
                 }
@@ -310,12 +262,6 @@ impl NativeSession {
         self.session.observe(observer, false);
     }
 
-    /// What each model region of the last query ran on the workers, in
-    /// the order the regions ran: the planned region as JSON, its scans
-    /// as [`crate::scans_to_pyarrow`] gives them, the rows of each input
-    /// it read by table name, its rows, per worker what it ran as JSON
-    /// with its nodes' output tables, each worker's boot record as JSON,
-    /// and the seconds it took. The session keeps none of it.
     #[allow(clippy::type_complexity)]
     fn take_regions<'py>(
         &self,
@@ -357,8 +303,6 @@ impl NativeSession {
         })
     }
 
-    /// Run a query, read in `dialect` ("Snowflake" by default), and
-    /// return its rows as a pyarrow Table over DataFusion's buffers.
     #[pyo3(signature = (query, dialect=None))]
     fn sql<'py>(
         &self,
@@ -372,8 +316,6 @@ impl NativeSession {
         to_pyarrow(py, schema, batches)
     }
 
-    /// Run a query, read in `dialect` ("Snowflake" by default), and
-    /// return a `RowStream` of its rows as DataFusion produces them.
     #[pyo3(signature = (query, dialect=None))]
     fn sql_stream(
         slf: Py<Self>,
@@ -393,14 +335,6 @@ impl NativeSession {
         })
     }
 
-    /// Derive each model region of a query's operators from its plan.
-    ///
-    /// Returns one (the region as JSON, None, false) or (None, CompileError
-    /// message, whether DataFusion runs that shape instead) per region,
-    /// and whether one region is the whole query. The region's JSON holds
-    /// `operators`, its operators as JSON text, `logical`, DataFusion's
-    /// plan of the region, and `warnings`, such as two calls a typo apart. `turn` and
-    /// `layout` are the model's chat-turn text and prompt layout.
     #[allow(clippy::type_complexity)]
     #[pyo3(signature = (query, turn, layout, dialect=None))]
     fn region_plans(
@@ -431,10 +365,6 @@ impl NativeSession {
         .map_err(python_error)
     }
 
-    /// Plan each model region of a query without running it: per region,
-    /// (the region as JSON, None when Python plans it or else (its
-    /// planned region as JSON, its scans as `crate::scans_to_pyarrow`
-    /// hands them over))).
     #[allow(clippy::type_complexity)]
     #[pyo3(signature = (query, dialect=None))]
     fn plans<'py>(
@@ -459,8 +389,6 @@ impl NativeSession {
             .collect()
     }
 
-    /// Return the inputs of each model region of a query that call no
-    /// model, as dicts of pyarrow Tables by input name.
     #[pyo3(signature = (query, dialect=None))]
     fn region_inputs<'py>(
         &self,
@@ -483,8 +411,6 @@ impl NativeSession {
             .collect()
     }
 
-    /// Return DataFusion's optimized logical plan for a query read in
-    /// `dialect` ("Snowflake" by default).
     #[pyo3(signature = (query, dialect=None))]
     fn explain(&self, py: Python<'_>, query: &str, dialect: Option<String>) -> PyResult<String> {
         py.detach(|| self.session.explain(query, dialect.as_deref()))
@@ -492,18 +418,14 @@ impl NativeSession {
     }
 }
 
-/// A query's rows as DataFusion produces them, as [`quail::RowStream`]:
-/// an iterator of pyarrow Tables, one per batch.
 #[pyclass(name = "RowStream", module = "_quail_native", frozen)]
 struct RowStream {
     rows: std::sync::Mutex<quail::RowStream>,
-    /// The session whose runtime runs the query while the stream reads it.
     _session: Py<NativeSession>,
 }
 
 #[pymethods]
 impl RowStream {
-    /// The schema of every batch, as a pyarrow Schema.
     #[getter]
     fn schema<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let schema = self.rows.lock().expect("the stream lock").schema();
@@ -514,7 +436,6 @@ impl RowStream {
         slf
     }
 
-    /// The next batch as a pyarrow Table, waiting for it without the GIL.
     fn __next__<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
         let (schema, found) = py.detach(|| {
             let mut rows = self.rows.lock().expect("the stream lock");
@@ -527,10 +448,6 @@ impl RowStream {
     }
 }
 
-/// Read a physical plan envelope into the Rust plan types and write
-/// it back as JSON.
-///
-/// Raises a ValueError when the plan does not fit the Rust types.
 #[pyfunction]
 fn read_and_write_plan(text: &str) -> PyResult<String> {
     let plan = quail_planner::physical::read_plan(text)
@@ -539,12 +456,6 @@ fn read_and_write_plan(text: &str) -> PyResult<String> {
         .map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
-/// The (width, height) a model reads an image at, as the planner counts
-/// its tokens: `token_pixels` along each side of a token, and from
-/// `min_pixels` to `max_pixels`.
-///
-/// Raises a ValueError when the bytes are not a PNG or a JPEG the model
-/// reads.
 #[pyfunction]
 fn image_size(
     image: &[u8],
@@ -560,9 +471,6 @@ fn image_size(
     quail::image_size(image, sizing).map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
-/// Bind one AI function call's prompt, as `PromptBinder.bind` does.
-///
-/// Returns (the Prompt as JSON, None), or (None, the CompileError's message).
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 fn bind_prompt(
@@ -593,10 +501,6 @@ fn bind_prompt(
     }
 }
 
-/// The placements of a region's column operators that physical planning
-/// prices, as `quail_planner::plan::placements::placements` returns them.
-///
-/// Returns [(operators JSON, rewrite names), ...].
 #[pyfunction]
 fn column_placements(operators: &str) -> PyResult<Vec<(String, Vec<String>)>> {
     let invalid = |error: serde_json::Error| PyValueError::new_err(error.to_string());
@@ -613,7 +517,6 @@ fn column_placements(operators: &str) -> PyResult<Vec<(String, Vec<String>)>> {
         .collect()
 }
 
-/// A Rust tokenizer that calls a Python callable text -> token ids.
 fn python_tokenizer<'py>(
     py: Python<'py>,
     tokenizer: &'py Bound<'py, PyAny>,
@@ -626,7 +529,6 @@ fn python_tokenizer<'py>(
     }
 }
 
-/// Serialize a lowering result: (JSON, None), or (None, the error's message).
 fn lowering_result<T: serde::Serialize>(
     found: Result<T, quail_planner::CompileError>,
 ) -> PyResult<(Option<String>, Option<String>)> {
@@ -646,11 +548,6 @@ fn from_json<T: serde::de::DeserializeOwned>(text: &str) -> PyResult<T> {
     serde_json::from_str(text).map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
-/// Run one function of the planner's prompt lowering (`quail_planner::prompts::lowering`).
-///
-/// `name` is the function; `arguments` its JSON-encoded arguments other
-/// than the tokenizer. Returns (the result as JSON, None), or (None, the
-/// error's message).
 #[pyfunction]
 fn prompt_lowering<'py>(
     py: Python<'py>,
@@ -696,10 +593,6 @@ fn prompt_lowering<'py>(
     }
 }
 
-/// The token ids a model's answer readout reads, from its spec as JSON:
-/// (TRUE ids, FALSE ids, the decision readout's row offsets).
-///
-/// The GPU worker calls this when it loads a model, before any plan.
 #[pyfunction]
 fn model_answers<'py>(
     py: Python<'py>,
@@ -722,8 +615,6 @@ fn model_answers<'py>(
     Ok((true_ids, false_ids, offsets))
 }
 
-/// Every model or device spec in a directory, by name, as JSON; each
-/// model's `base` is already applied. `kind` is "models" or "devices".
 #[pyfunction]
 fn read_specs(kind: &str, directory: &str) -> PyResult<String> {
     let directory = std::path::Path::new(directory);
@@ -738,7 +629,6 @@ fn read_specs(kind: &str, directory: &str) -> PyResult<String> {
         .map_err(|error| PyRuntimeError::new_err(error.to_string()))
 }
 
-/// A prompt layout's fixed text, by layout name, as JSON.
 #[pyfunction]
 fn prompt_layout(name: &str) -> PyResult<String> {
     let layout = quail_planner::prompts::prompt_layout(name)
@@ -746,8 +636,6 @@ fn prompt_layout(name: &str) -> PyResult<String> {
     serde_json::to_string(&layout).map_err(|error| PyRuntimeError::new_err(error.to_string()))
 }
 
-/// The planning context's fields, as `tests/helpers/planning.py` and
-/// `NativePlanner.plan` write them.
 #[derive(serde::Deserialize)]
 struct ContextFields {
     model: serde_json::Value,
@@ -779,11 +667,6 @@ fn quail_backend() -> String {
     "quail".to_string()
 }
 
-/// Run one planning function of `quail_planner` by name.
-///
-/// `context` is the planning context's fields as JSON, and `arguments`
-/// the function's other arguments. Returns (the result as JSON, None),
-/// or (None, the refusal's message).
 #[pyfunction]
 #[pyo3(signature = (name, context, arguments, tokenizer, decode=None, callbacks=None))]
 fn plan_operator<'py>(
@@ -922,12 +805,10 @@ fn json_value<T: serde::de::DeserializeOwned>(found: serde_json::Value) -> PyRes
     serde_json::from_value(found).map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
-/// A refusal, as the test helpers compare it.
 fn refusal_fields(refusal: &quail_planner::error::Refusal) -> serde_json::Value {
     serde_json::json!({"refusal": crate::planning::refusal_json(refusal)})
 }
 
-/// The token lists of a pyarrow Table's first column, as int32 lists.
 fn token_batches(
     table: &Bound<'_, PyAny>,
 ) -> PyResult<Vec<datafusion::arrow::array::LargeListArray>> {
@@ -950,9 +831,6 @@ fn token_batches(
         .collect()
 }
 
-/// The documents of a token store or any token sequences sorted by their
-/// tokens, as `quail_planner::inputs::PrefixIndex`; its trees at each page size
-/// share the sort.
 #[pyclass(name = "PrefixIndex", module = "_quail_native", frozen)]
 struct PrefixIndex {
     index: quail_planner::inputs::PrefixIndex,
@@ -960,8 +838,6 @@ struct PrefixIndex {
 
 #[pymethods]
 impl PrefixIndex {
-    /// Sort the documents of `tokens`, a pyarrow Table whose first column
-    /// holds each document's integer token ids.
     #[new]
     fn new(py: Python<'_>, tokens: &Bound<'_, PyAny>) -> PyResult<Self> {
         let batches = token_batches(tokens)?;
@@ -973,9 +849,6 @@ impl PrefixIndex {
         Ok(Self { index })
     }
 
-    /// The prefix tree whose shares round down to `page_tokens`: each
-    /// document's position in sorted order, the position it borrows from
-    /// or None, and the tokens it borrows.
     #[allow(clippy::type_complexity)]
     fn tree(&self, page_tokens: i64) -> PyResult<(Vec<usize>, Vec<Option<usize>>, Vec<i64>)> {
         if page_tokens < 1 {
@@ -986,10 +859,6 @@ impl PrefixIndex {
     }
 }
 
-/// Each document's first document with the same tokens and the same
-/// values in each column of `columns`, as `quail_planner::inputs::first_documents`:
-/// an int32 pyarrow Array. `tokens` is a pyarrow Table whose first column
-/// holds each document's token ids; `columns` a pyarrow Table or None.
 #[pyfunction]
 #[pyo3(signature = (tokens, columns=None))]
 fn first_documents<'py>(
@@ -1030,13 +899,9 @@ fn first_documents<'py>(
     crate::pyarrow::array_to_pyarrow(py, &first)
 }
 
-/// A model's tokenizer, read from its `tokenizer.json`: the one the
-/// planner tokenizes documents with and the GPU worker decodes with.
 #[pyclass(name = "Tokenizer", module = "_quail_native", frozen)]
 struct Tokenizer {
     inner: quail_planner::inputs::HfTokenizer,
-    /// The ids that end an answer: the model's turn close and its end of
-    /// text, which no document holds.
     #[pyo3(get)]
     stop_ids: Vec<u32>,
 }
@@ -1047,9 +912,6 @@ fn arrow_error(error: datafusion::arrow::error::ArrowError) -> PyErr {
 
 #[pymethods]
 impl Tokenizer {
-    /// The tokenizer at `path`, a model directory or its
-    /// `tokenizer.json`; `turn_suffix` is the model's chat-turn text after
-    /// a prompt, whose first token closes a turn.
     #[new]
     #[pyo3(signature = (path, turn_suffix=""))]
     fn new(path: std::path::PathBuf, turn_suffix: &str) -> PyResult<Self> {
@@ -1065,7 +927,6 @@ impl Tokenizer {
         Ok(Self { inner, stop_ids })
     }
 
-    /// The token ids of a text, without special tokens.
     fn __call__(&self, text: &str) -> PyResult<Vec<u32>> {
         self.inner.encode(text).map_err(arrow_error)
     }
@@ -1074,16 +935,11 @@ impl Tokenizer {
         self.inner.len()
     }
 
-    /// The end-of-text token the model's config names, or None.
     #[getter]
     fn eos_token_id(&self) -> Option<u32> {
         self.inner.eos_token_id()
     }
 
-    /// Every text's token ids, encoded together, with each token's
-    /// character range: three buffers of little-endian int64, the ids,
-    /// the (start, end) pairs, and each text's first token with one past
-    /// the last.
     fn encode_packed<'py>(
         &self,
         py: Python<'py>,
@@ -1120,8 +976,6 @@ impl Tokenizer {
         ))
     }
 
-    /// The bytes of each token id's text, or None for an id the
-    /// vocabulary does not hold.
     fn token_bytes<'py>(&self, py: Python<'py>) -> Vec<Option<Bound<'py, pyo3::types::PyBytes>>> {
         self.inner
             .token_bytes()
@@ -1134,38 +988,25 @@ impl Tokenizer {
             .collect()
     }
 
-    /// Each token id's text in the tokenizer's own spelling.
     fn token_texts(&self) -> Vec<String> {
         self.inner.token_texts()
     }
 
-    /// The bytes of token ids' texts, joined.
     fn decode<'py>(&self, py: Python<'py>, ids: Vec<u32>) -> Bound<'py, pyo3::types::PyBytes> {
         pyo3::types::PyBytes::new(py, &self.inner.decode_bytes(&ids))
     }
 
-    /// The text of each token id list, without special tokens.
     fn decode_batch(&self, lists: Vec<Vec<u32>>) -> PyResult<Vec<String>> {
         self.inner.decode_batch(&lists).map_err(arrow_error)
     }
 }
 
-/// The `explain()` text of a request, as JSON: see
-/// `quail_planner::plan::explain::ExplainRequest`.
 #[pyfunction]
 fn explain_plan(request: &str) -> PyResult<String> {
     let request: quail_planner::plan::explain::ExplainRequest = from_json(request)?;
     quail_planner::plan::explain::explain_text(&request).map_err(PyRuntimeError::new_err)
 }
 
-/// Collect a run's answers from its output relations, as
-/// `crate::results::collect_answers` does.
-///
-/// `request` is the AnswerRequest as JSON; `outputs` maps (node id,
-/// port) to a pyarrow Table. Returns (answer tables as (kind, key,
-/// table), survivors as alias -> one-column table, true join tables by
-/// written position, stages as JSON). A key is a name, an (alias,
-/// written position) pair, or a written position.
 #[pyfunction]
 #[allow(clippy::type_complexity)]
 fn collect_answers<'py>(
@@ -1218,7 +1059,6 @@ fn collect_answers<'py>(
     ))
 }
 
-/// Each pyarrow Table of `outputs` as one record batch, by (node id, port).
 fn read_relations(
     outputs: std::collections::HashMap<(String, String), Bound<'_, PyAny>>,
 ) -> PyResult<std::collections::HashMap<(String, String), datafusion::arrow::array::RecordBatch>> {
@@ -1229,7 +1069,6 @@ fn read_relations(
     Ok(relations)
 }
 
-/// A pyarrow Table as one record batch.
 fn one_batch(table: &Bound<'_, PyAny>) -> PyResult<datafusion::arrow::array::RecordBatch> {
     let reader = crate::pyarrow::stream_from_pyarrow(table)?;
     let schema = datafusion::arrow::array::RecordBatchReader::schema(&reader);
@@ -1240,14 +1079,6 @@ fn one_batch(table: &Bound<'_, PyAny>) -> PyResult<datafusion::arrow::array::Rec
         .map_err(|error| python_error(error.into()))
 }
 
-/// A region's rows, built as its operators report the rows they finish,
-/// as `crate::finished::FinishedRows` builds them.
-///
-/// `request` is the AnswerRequest as JSON, listing the ports the run
-/// returns; `evaluate(name, expression)` returns a one-column pyarrow
-/// Table of the values a source column's expression, as JSON, computes
-/// for each document; `on_rows`, when given, is handed each pyarrow
-/// Table of rows as they are built.
 #[pyclass(name = "FinishedRows", module = "_quail_native")]
 struct NativeFinishedRows {
     rows: crate::finished::FinishedRows,
@@ -1280,14 +1111,10 @@ impl NativeFinishedRows {
         Ok(NativeFinishedRows { rows, on_rows })
     }
 
-    /// Whether the rows read the reports of a node's port.
     fn wants(&self, node: &str, port: &str) -> bool {
         self.rows.wants(node, port)
     }
 
-    /// Take a pyarrow Table of rows a port finished, the node and port in
-    /// its schema's `quail.node` and `quail.port` metadata; hand the
-    /// region rows they complete to `on_rows`.
     fn report(&mut self, py: Python<'_>, table: &Bound<'_, PyAny>) -> PyResult<()> {
         let reader = crate::pyarrow::stream_from_pyarrow(table)?;
         let schema = datafusion::arrow::array::RecordBatchReader::schema(&reader);
@@ -1301,7 +1128,6 @@ impl NativeFinishedRows {
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|error| python_error(error.into()))?;
         if batches.is_empty() {
-            // an empty table still gives its columns' types
             batches.push(datafusion::arrow::array::RecordBatch::new_empty(schema));
         }
         for batch in batches {
@@ -1311,13 +1137,11 @@ impl NativeFinishedRows {
         Ok(())
     }
 
-    /// Hand `on_rows` the rows complete before any report.
     fn finish(&mut self, py: Python<'_>) -> PyResult<()> {
         let built = self.rows.finish();
         self.hand_on(py, built)
     }
 
-    /// Every row built so far, as a pyarrow Table ordered by document ids.
     fn rows<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let rows = self.rows.rows().map_err(PyValueError::new_err)?;
         to_pyarrow(py, rows.schema(), vec![rows])
@@ -1338,8 +1162,6 @@ impl NativeFinishedRows {
     }
 }
 
-/// The report of one region's run, as `crate::results::execution_report`
-/// builds it; `metrics` is the backend's measurements as JSON.
 #[pyfunction]
 #[pyo3(signature = (backend, estimated_seconds, order_rule, metrics, coordinator_wall))]
 fn execution_report(
@@ -1360,16 +1182,12 @@ fn execution_report(
     .to_string())
 }
 
-/// Run Quail Server with a command line's arguments until Ctrl-C or
-/// SIGTERM, as the `quail-server` program does.
 #[pyfunction]
 fn serve(py: Python<'_>, arguments: Vec<String>) -> PyResult<()> {
     py.detach(|| quail_server::run(arguments))
         .map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
-/// A region's facts as JSON, as `quail_planner::plan::facts::region_facts`
-/// reads them from its operators, given as JSON.
 #[pyfunction]
 fn region_facts(operators: &str) -> PyResult<String> {
     quail_planner::plan::facts::region_facts(&read_operators(operators)?)
@@ -1377,7 +1195,6 @@ fn region_facts(operators: &str) -> PyResult<String> {
         .map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
-/// A region's operators, as JSON, that return at most `fetch` rows.
 #[pyfunction]
 fn limited_operators(operators: &str, fetch: i64) -> PyResult<String> {
     serde_json::to_string(&read_operators(operators)?.limited(fetch))
@@ -1388,8 +1205,6 @@ fn read_operators(operators: &str) -> PyResult<quail_planner::operators::Operato
     serde_json::from_str(operators).map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
-/// Plans model regions in Rust for one session, with the session's
-/// tokenizer, keeping the token stores of tables read whole.
 #[pyclass(name = "NativePlanner", module = "_quail_native")]
 struct NativePlanner {
     planner: std::sync::Arc<crate::planning::Planner>,
@@ -1397,7 +1212,6 @@ struct NativePlanner {
 
 #[pymethods]
 impl NativePlanner {
-    /// A planner with the `tokenizer.json` at `tokenizer_file`.
     #[new]
     fn new(tokenizer_file: &str) -> PyResult<Self> {
         Ok(Self {
@@ -1409,10 +1223,6 @@ impl NativePlanner {
     }
 }
 
-/// An `Expression` of SQL text over the columns of `rows`, a pyarrow
-/// Table or RecordBatch, each a column of table `alias` from `provider`:
-/// (the Expression, built for evaluation, None), or (None, why it does
-/// not parse).
 #[pyfunction]
 #[pyo3(signature = (sql, rows, alias="", provider=""))]
 fn parse_expression<'py>(
@@ -1435,9 +1245,6 @@ fn parse_expression<'py>(
     }
 }
 
-/// Cut a plan's graph, as JSON, into stages for `gpus` GPUs, as the
-/// planner cuts it into the plan's `stages` setting; returns the stages
-/// as JSON.
 #[pyfunction]
 fn region_stages(graph: &str, gpus: usize) -> PyResult<String> {
     let graph: quail_planner::physical::PhysicalGraph = from_json(graph)?;
@@ -1445,13 +1252,10 @@ fn region_stages(graph: &str, gpus: usize) -> PyResult<String> {
     serde_json::to_string(&cut).map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
-/// The `_quail_native` module. A Rust program that embeds Python adds it
-/// with `pyo3::append_to_inittab!` before Python starts.
 #[pymodule]
 pub fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     physical::register(module)?;
     graph::register(module)?;
-    // the rule lists Python's registry starts from
     module.add("LOGICAL_RULES", quail_datafusion::default_rule_names())?;
     module.add(
         "PHYSICAL_RULES",
@@ -1476,7 +1280,6 @@ pub fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(prompt_layout, module)?)?;
     module.add_function(wrap_pyfunction!(read_specs, module)?)?;
     module.add("SHARED_PRE", quail_planner::prompts::SHARED_PRE)?;
-    // the names and numbers Python shares with the planner
     {
         use quail_planner::constants as shared;
         use quail_planner::specs;
@@ -1504,8 +1307,6 @@ pub fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(read_and_write_plan, module)?)
 }
 
-/// Which answers a one-column condition accepts, each answer text or
-/// null, with every null rejected.
 fn accepted_answers(
     condition: &quail_planner::physical::ValueExpression,
     values: &[serde_json::Value],
@@ -1539,9 +1340,7 @@ fn accepted_answers(
         .collect())
 }
 
-/// Values the speed of light callbacks pass to Python as JSON text.
 mod erased_json {
-    /// A value written as JSON text.
     pub trait Json {
         fn json(&self) -> String;
     }

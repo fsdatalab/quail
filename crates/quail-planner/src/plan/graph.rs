@@ -1,6 +1,3 @@
-//! Build the physical graph of one plan's operators in the chosen operator
-//! order.
-
 use crate::constants::SPAN_SUFFIX;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -39,7 +36,6 @@ use crate::pricing::search::{
 use crate::pricing::statistics::{RowFlow, pair_counts};
 use crate::prompts::prompt_layout;
 
-/// A physical plan: its graph, settings, and estimates, as `PhysicalPlan`.
 #[derive(Debug, Clone)]
 pub struct PhysicalPlan {
     pub model: String,
@@ -50,15 +46,11 @@ pub struct PhysicalPlan {
     pub nodes: Vec<PhysicalNode>,
     pub settings: Map<String, Value>,
     pub root: PortRef,
-    /// node id -> its explain entry: its seconds, and what releasing a
-    /// filter sequence's KV would cost.
     pub estimates: Map<String, Value>,
-    /// What prices the graph again after a physical rule rewrites it.
     pub pricer: PlanPricer,
 }
 
 impl PhysicalPlan {
-    /// The plan as it crosses to the executor.
     pub fn envelope(&self) -> crate::physical::PlanEnvelope {
         crate::physical::PlanEnvelope {
             backend: self.backend.clone(),
@@ -74,11 +66,9 @@ impl PhysicalPlan {
     }
 }
 
-/// A plan, or why the configuration cannot run it.
 pub type Planned = Result<PhysicalPlan, Refusal>;
 
 fn round_one(value: f64) -> f64 {
-    // Python's round(value, 1): the decimal nearest the exact value
     format!("{value:.1}").parse().expect("a float")
 }
 
@@ -90,8 +80,6 @@ fn tagged_node<A>(id: &str, inputs: &[PortRef], attributes: A) -> Node<A> {
     }
 }
 
-/// One HashJoin per join with equality conditions or a filter, over the
-/// scans.
 pub fn hash_join_nodes(
     found: &Operators,
     pair_fractions: &BTreeMap<usize, f64>,
@@ -100,7 +88,6 @@ pub fn hash_join_nodes(
     let mut nodes = Vec::new();
     for (position, join) in found.joins.iter().enumerate() {
         let conditions = &join.on;
-        // a join with only a filter pairs its call's two tables
         let (left, right) = match (conditions.first(), &join.filter) {
             (Some(first), _) => (argument_alias(&first.left), argument_alias(&first.right)),
             (None, Some(_)) => match call_aliases(asked_call(&join.predicate)).as_slice() {
@@ -135,8 +122,6 @@ pub fn hash_join_nodes(
     nodes
 }
 
-/// The longest input of a score: its resident prefix and streamed suffix
-/// tokens, as `score_input_tokens`.
 fn score_input_tokens(
     spec: &ScoreSpec,
     context: &PlanningContext,
@@ -163,7 +148,6 @@ fn score_input_tokens(
     Ok((prefix, longest[1] + parts[2].len() as i64 + canvas))
 }
 
-/// What the AI joins leave for the operators after them, as `JoinPorts`.
 #[derive(Debug, Default)]
 struct JoinPorts {
     node_ids: BTreeMap<usize, String>,
@@ -172,7 +156,6 @@ struct JoinPorts {
     score_pairs: Option<PortRef>,
 }
 
-/// The score operators of a plan, as `ScoreLowering`.
 struct ScoreLowering {
     projected: Vec<(String, ModelCall)>,
     chunk: i64,
@@ -191,7 +174,6 @@ impl ScoreLowering {
     }
 }
 
-/// The step kinds of one table's steps.
 type Kinds = BTreeSet<&'static str>;
 
 struct GraphBuilder<'a, 'c> {
@@ -375,8 +357,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
             }
             self.nodes.push(node);
         }
-        // aliases whose filter sequence runs in one pipeline with the
-        // classification or join after it
         let between: BTreeSet<&String> =
             self.classified.difference(&self.classified_after).collect();
         self.pipelined = self.streamed.clone();
@@ -400,7 +380,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
             .map(|scan| scan.alias.clone())
             .collect();
         for alias in aliases {
-            // a column operator the planner lifted above the joins is emitted after them
             let lifted = self.after_joins.get(&alias).cloned().unwrap_or_default();
             let kinds: Kinds = [ASK, "classify", "extract", "features", "map"]
                 .into_iter()
@@ -413,7 +392,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         Ok(ports)
     }
 
-    /// Emit the given kinds of a table's steps in run order.
     fn emit_steps(
         &mut self,
         alias: &str,
@@ -443,8 +421,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         }
         let mut port = port;
         let mut flow = RowFlow::new(expected_rows);
-        // the scores SELECT returns follow the score predicates, before
-        // the classifications and extractions read the rows
         let mut scores_pending = kinds.contains(ASK) && self.scoring.is_some();
         let mut previous: Option<usize> = None;
         for run in &runs {
@@ -456,7 +432,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                 port = self.emit_projected_scores(alias, expected_rows, port)?;
                 scores_pending = false;
             }
-            // the rows each step of the run asks about
             let mut asked = Vec::new();
             for index in run {
                 asked.push(flow.asked(steps[*index].or_term.as_ref()));
@@ -517,8 +492,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
             .unwrap_or(&[])
     }
 
-    /// Append a run of the alias's AI filters in their chosen order, as
-    /// `emit_filter`; `asked` holds the rows each asks about.
     fn emit_filter(
         &mut self,
         alias: &str,
@@ -540,7 +513,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                 .context
                 .lowered(&asked_call(&predicate.expression).prompt)?;
             let model = &self.context.model;
-            // whether a term of the predicate's OR runs after it
             let later_term = order
                 .iter()
                 .skip_while(|found| *found != position)
@@ -561,7 +533,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                     question_tokens: question_tokens(&lowered, model.canvas_tokens)?,
                     preamble_tokens: lowered.preamble_token_ids.len() as i64,
                     selectivity: predicate.selectivity,
-                    // a guarded filter asks the model about its guard's rows alone
                     expected_rows: round_one(asked * predicate_asked_fraction(&predicate)),
                     question_token_ids: Vec::new(),
                     document_head: lowered.preamble_token_ids.clone(),
@@ -578,7 +549,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                     state_tail_tokens: 0,
                     question_header_token_ids: Vec::new(),
                     document_ends: Value::Array(Vec::new()),
-                    guard: predicate.guard.clone(),
+                    precondition: predicate.precondition.clone(),
                     alternative: predicate.alternative.clone(),
                     answer: predicate.answer.clone(),
                     negated: predicate.negated,
@@ -592,7 +563,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         Ok(port)
     }
 
-    /// Append one score node, as `ScoreLowering.score`.
     #[allow(clippy::too_many_arguments)]
     fn score(
         &mut self,
@@ -633,7 +603,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
             )
         };
         let (mut needed, mut available, mut unit) = (prefix + suffix, scoring.chunk, "tokens");
-        // a set-attention pass keeps no KV, so only the chunk bounds it
         if needed <= available && context.model.reuses_kv() {
             let page_tokens = context.device.page_tokens;
             needed = pages(prefix, page_tokens) + pages(suffix, page_tokens);
@@ -679,8 +648,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         Ok(port_of(&node_id, rows_port))
     }
 
-    /// Append the Filter comparing a score with a constant, as
-    /// `ScoreLowering.comparison`.
     fn comparison(
         &mut self,
         asked: &Asked,
@@ -742,7 +709,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         self.order.statistics.stats[alias].mean_document_tokens()
     }
 
-    /// Append a run of the alias's score predicates, as `emit_scores`.
     fn emit_scores(
         &mut self,
         alias: &str,
@@ -779,7 +745,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         Ok(port)
     }
 
-    /// Append the alias's scores returned in SELECT, as `emit_projected_scores`.
     fn emit_projected_scores(
         &mut self,
         alias: &str,
@@ -810,7 +775,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         Ok(port)
     }
 
-    /// Append the score of one pair prompt, as `emit_score_pair`.
     fn emit_score_pair(
         &mut self,
         prompt: &Prompt,
@@ -848,7 +812,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
             .unwrap_or_default()
     }
 
-    /// Append the scores and comparisons of one group of score joins.
     fn emit_score_joins(
         &mut self,
         group: &[usize],
@@ -882,8 +845,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         Ok(score_pairs)
     }
 
-    /// Emit one table's column operators in run order, each followed by its
-    /// tests, as `GraphBuilder.emit_columns`.
     fn emit_columns(
         &mut self,
         alias: &str,
@@ -980,7 +941,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                 port = port_of(&filter_id, format!("rows:{alias}"));
                 expected_rows *= effective_selectivity(test.selectivity);
             }
-            // the port after the tests still carries the operator's columns
             for name in &names {
                 self.set_computed(alias, name, port.clone());
             }
@@ -1000,7 +960,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         }
     }
 
-    /// A document Filter's input ports: its rows, then each other column's.
     fn filter_inputs(
         &self,
         alias: &str,
@@ -1031,7 +990,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
             .count()
     }
 
-    /// One column operator's physical node, as its ColumnPlanner's `node`.
     fn column_operator(
         &mut self,
         column: &SemanticColumn,
@@ -1042,7 +1000,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         let context = self.context;
         let model = context.model.name.clone();
         let inputs = std::slice::from_ref(&port);
-        // a guarded operator asks the model about its guard's rows alone
         let expected_rows = expected_rows * column.asked_fraction();
         if column.call.kind == "label" {
             let table = classify_statistics(context, &column.alias(), &[])?;
@@ -1057,7 +1014,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                 inputs,
                 spec,
                 model,
-                column.guard.clone(),
+                column.precondition.clone(),
             ));
         }
         let spec = column_spec(context, column, expected_rows, resident)?;
@@ -1075,7 +1032,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                         pass_group: -1,
                         document_ends: Value::Array(Vec::new()),
                         attention: String::new(),
-                        guard: column.guard.clone(),
+                        precondition: column.precondition.clone(),
                         stop_tests: Vec::new(),
                         stop_when_true: false,
                     },
@@ -1094,7 +1051,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                         pass_group: -1,
                         document_ends: Value::Array(Vec::new()),
                         attention: String::new(),
-                        guard: column.guard.clone(),
+                        precondition: column.precondition.clone(),
                         stop_tests: Vec::new(),
                         stop_when_true: false,
                     },
@@ -1112,7 +1069,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                         keep_kv: false,
                         pass_group: -1,
                         document_ends: Value::Array(Vec::new()),
-                        guard: column.guard.clone(),
+                        precondition: column.precondition.clone(),
                     },
                 ))
             }
@@ -1130,7 +1087,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         }
     }
 
-    /// The tokens before each anchor document, as `join_document_head`.
     fn join_document_head(&self, prompt: &Prompt, anchor: &str) -> Result<Vec<i64>, CompileError> {
         let lowered = self.context.lowered(prompt)?;
         let mut head = lowered.preamble_token_ids.clone();
@@ -1146,7 +1102,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         Ok(head)
     }
 
-    /// Create the joins and the barriers between anchor groups.
     fn emit_joins(
         &mut self,
         ports: BTreeMap<String, PortRef>,
@@ -1257,8 +1212,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         Ok((ports, joins))
     }
 
-    /// Append the classifications of joined rows after their joins, as
-    /// `emit_joined_classify`.
     fn emit_join_answers(&mut self, joins: &JoinPorts) -> Result<(), CompileError> {
         let context = self.context;
         for (call, _) in label_calls(self.operators) {
@@ -1327,14 +1280,10 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         Ok(())
     }
 
-    /// Create the column operators the planner lifted above the joins.
     fn emit_after_joins(
         &mut self,
         ports: &mut BTreeMap<String, PortRef>,
     ) -> Result<(), CompileError> {
-        // a column operator after the joins runs over the documents the
-        // joins matched: a document with at least one true pair, expected as the
-        // join selectivity times the partners it met, at most every document
         for (alias, kinds) in self.after_joins.clone() {
             let expected = &self.order.expected_rows;
             let met = python_sum(self.operators.joins.iter().enumerate().filter_map(
@@ -1371,7 +1320,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         Ok(())
     }
 
-    /// Create the pair scores SELECT returns.
     fn emit_pair_scores(
         &mut self,
         ports: &BTreeMap<String, PortRef>,
@@ -1390,9 +1338,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         Ok(score_pairs)
     }
 
-    /// End the plan with the Limit of the region's fetch, which reads
-    /// the region's rows: the scored pairs, the one full join's answers,
-    /// or the surviving rows of the first table.
     fn emit_result(
         &mut self,
         ports: &BTreeMap<String, PortRef>,
@@ -1407,11 +1352,9 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         self.nodes.extend(limit_node(self.operators, &rows));
     }
 
-    /// Build the plan and price it.
     fn finish(self) -> Result<PhysicalPlan, CompileError> {
         let context = self.context;
         let statistics = &self.order.statistics;
-        // a score join's work is in its AiScore's estimate
         let stage_works: BTreeMap<usize, Work> = self
             .order
             .join_steps
@@ -1436,8 +1379,6 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                 Value::from(statistics.arena_pages.1),
             ]),
         );
-        // the arena above leaves the CUDA graph reserve only for a plan
-        // that writes answers, so the worker captures graphs by this value
         settings.insert(
             "writes_answers".into(),
             Value::from(context.writes_answers()),
@@ -1527,7 +1468,7 @@ fn classify_node(
     inputs: &[PortRef],
     spec: ClassifySpec,
     model: String,
-    guard: Option<ValueExpression>,
+    precondition: Option<ValueExpression>,
 ) -> PhysicalNode {
     PhysicalNode::AiClassify(tagged_node(
         id,
@@ -1539,17 +1480,11 @@ fn classify_node(
             keep_kv: false,
             pass_group: -1,
             document_ends: Value::Array(Vec::new()),
-            guard,
+            precondition,
         },
     ))
 }
 
-/// Compile a plan's operators into a physical plan or a refusal, as
-/// `build_physical_plan`.
-///
-/// # Errors
-///
-/// A callback fails, or the plan is malformed.
 pub fn build_physical_plan(
     found: &Operators,
     context: &PlanningContext,
@@ -1564,8 +1499,6 @@ pub fn build_physical_plan(
     GraphBuilder::new(found, context, order)?.build()
 }
 
-/// A refusal when a pair classification cannot run in its join's
-/// pipeline, as `joined_classification_refusal`.
 pub fn joined_classification_refusal(nodes: &[PhysicalNode]) -> Option<Refusal> {
     let pipelines = crate::topology::build_pipelines(nodes, &[]);
     for node in nodes {
@@ -1605,13 +1538,6 @@ pub fn joined_classification_refusal(nodes: &[PhysicalNode]) -> Option<Refusal> 
     None
 }
 
-/// Put tokenized prompts and answer tokens in the physical plan, as
-/// `bind_runtime_data`.
-///
-/// # Errors
-///
-/// A filter prompt has no token ids, the layout cannot run a
-/// set-attention question, or the tokenizer fails.
 pub fn bind_runtime_data(
     plan: &mut PhysicalPlan,
     found: &Operators,
@@ -1702,17 +1628,10 @@ pub fn bind_runtime_data(
     Ok(())
 }
 
-/// Whether a plan classifies documents or joined rows.
 pub fn has_label(found: &Operators) -> bool {
     !found.classifies.is_empty()
 }
 
-/// Build a Quail plan of one alternative's operators without the optimizer
-/// rules, as `plan_region`.
-///
-/// # Errors
-///
-/// A callback fails, or the plan is malformed.
 pub fn plan_region(found: &Operators, context: &PlanningContext) -> Result<Planned, CompileError> {
     let model = &context.model;
     if model.role == "reranker" {

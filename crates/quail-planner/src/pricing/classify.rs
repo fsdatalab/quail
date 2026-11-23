@@ -1,5 +1,3 @@
-//! AI.CLASSIFY's statistics, scoring rule, cost, and spec.
-
 use crate::constants::{DECODE_SCORING, LETTERS_SCORING, TREE_SCORING};
 use std::collections::BTreeSet;
 
@@ -26,7 +24,6 @@ use crate::prompts::prompt_layout;
 pub const DECISION_SCORING: &str = "decision_choice";
 pub const SET_CHOICE_SCORING: &str = "set_choice";
 
-/// Whether every label's token sequence ends at a trie leaf.
 pub fn decodable(labels: &[Vec<i64>]) -> bool {
     let ids: BTreeSet<&[i64]> = labels.iter().map(Vec::as_slice).collect();
     !labels
@@ -34,7 +31,6 @@ pub fn decodable(labels: &[Vec<i64>]) -> bool {
         .any(|label| (1..label.len()).any(|depth| ids.contains(&label[..depth])))
 }
 
-/// A classification no scoring rule can run, as `ClassifyRefusedError`.
 fn refused_with<T>(
     reason: impl Into<String>,
     needed: i64,
@@ -64,8 +60,6 @@ fn over_budget<T>(what: &str, need: i64, budget: i64) -> Result<T, CompileError>
     )
 }
 
-/// One table's lengths, model, and budgets for its classifications, as
-/// `ClassifyStatistics`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClassifyTable {
     pub alias: String,
@@ -83,12 +77,6 @@ pub struct ClassifyTable {
     pub gpus: i64,
 }
 
-/// The table's statistics, as `classify_statistics`.
-///
-/// # Errors
-///
-/// The planner has no token counts for the table, or the arena does
-/// not fit the device.
 pub fn classify_statistics(
     context: &PlanningContext,
     alias: &str,
@@ -134,7 +122,6 @@ fn labels_of(call: &ModelCall) -> Vec<String> {
     }
 }
 
-/// A ClassifySpec with `bind_inference`'s fields and the class's defaults.
 fn base_spec(
     prompt: &Prompt,
     name: &str,
@@ -202,11 +189,6 @@ impl ClassifyTable {
         }
     }
 
-    /// One scoring rule's cost on this table.
-    ///
-    /// # Errors
-    ///
-    /// The scoring rule is unknown, or a label has no tokens.
     #[allow(clippy::too_many_arguments)]
     pub fn estimate(
         &self,
@@ -226,11 +208,6 @@ impl ClassifyTable {
         .map_err(CompileError::new)
     }
 
-    /// The cost of a spec's chosen scoring rule on this table.
-    ///
-    /// # Errors
-    ///
-    /// The spec's scoring rule is unknown.
     pub fn estimate_spec(
         &self,
         spec: &ClassifySpec,
@@ -260,11 +237,6 @@ impl ClassifyTable {
         )
     }
 
-    /// The supported scoring rule with the lowest estimated time.
-    ///
-    /// # Errors
-    ///
-    /// No supported scoring rule can run.
     #[allow(clippy::too_many_arguments)]
     pub fn choose(
         &self,
@@ -310,11 +282,6 @@ impl ClassifyTable {
         Ok((scoring.to_string(), estimated))
     }
 
-    /// The prepared spec with its scoring rule chosen, as `choose_scoring`.
-    ///
-    /// # Errors
-    ///
-    /// No scoring rule can run, or the tokenizer fails.
     pub fn choose_scoring(
         &self,
         spec: &ClassifySpec,
@@ -376,12 +343,6 @@ impl ClassifyTable {
         Ok(chosen)
     }
 
-    /// A classification's spec and work before its scoring rule is chosen,
-    /// as `ClassifyBuilder.prepare`.
-    ///
-    /// # Errors
-    ///
-    /// The prompt does not fit a forward pass, or a callback fails.
     pub fn prepare(
         &self,
         call: &ModelCall,
@@ -419,12 +380,6 @@ impl ClassifyTable {
         Ok((spec, Work::default()))
     }
 
-    /// A classification of joined rows, as `ClassifyBuilder.classify_joined`.
-    ///
-    /// # Errors
-    ///
-    /// Probabilities are asked for, the prompt has no lettered form, or
-    /// a row does not fit the budget.
     #[allow(clippy::too_many_arguments)]
     pub fn classify_joined(
         &self,
@@ -710,11 +665,6 @@ impl ClassifyTable {
     }
 }
 
-/// A one-table classification's spec, as `ClassifyPlanner.spec`.
-///
-/// # Errors
-///
-/// As `ClassifyTable::prepare`.
 pub fn classify_spec(
     context: &PlanningContext,
     call: &ModelCall,
@@ -728,12 +678,6 @@ pub fn classify_spec(
         .0)
 }
 
-/// A one-table classification's work with its cheapest scoring rule,
-/// or None when no rule can run.
-///
-/// # Errors
-///
-/// As `ClassifyTable::prepare`.
 pub fn classify_work(
     context: &PlanningContext,
     call: &ModelCall,

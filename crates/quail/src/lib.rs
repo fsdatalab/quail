@@ -1,32 +1,3 @@
-//! Quail: AI functions in SQL, on DataFusion.
-//!
-//! Quail adds AI functions to DataFusion and runs the model work of a
-//! query on the GPU:
-//!
-//! - [`extension::QuailExtension`] is the DataFusion extension: the
-//!   AI functions, Quail's optimizer rules, and model regions. It hands
-//!   each model region to a `RegionRunner`.
-//! - [`Executor`] is Quail's `RegionRunner`. It plans each model region
-//!   and runs it on Quail's GPU workers: one process per GPU, which
-//!   Quail starts and which loads the model ([`workers`]).
-//! - [`Session`] is a DataFusion session with the extension registered
-//!   and an [`Executor`] as its runner, and a blocking `sql()`.
-//!
-//! ```ignore
-//! let config = quail::EngineConfig::new("qwen3-4b-fp8", "h100-sxm");
-//! let session = quail::Session::new(&config)?;
-//! session.register_table("reviews", reviews)?;
-//! let batches = session.sql(
-//!     "SELECT r.id FROM reviews r \
-//!      WHERE AI.IF(PROMPT('Does the review discuss the ending?\n\n{0}', r.body))",
-//! )?;
-//!
-//! // or add Quail to a DataFusion session of your own
-//! let executor = Arc::new(quail::Executor::open(&config)?);
-//! let state = quail::extension::QuailExtension::new(executor).register(state)?;
-//! ```
-
-// links DataFusion and Quail from the shared library
 #[cfg(test)]
 use quail_dylib as _;
 
@@ -60,22 +31,13 @@ use tokio::sync::mpsc::unbounded_channel;
 
 use crate::executor::RegionCall;
 
-/// A multi-threaded tokio runtime whose threads, blocking ones included,
-/// have the stack a query's planning needs.
-///
-/// # Errors
-///
-/// The runtime cannot start.
 pub fn runtime() -> std::io::Result<Runtime> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(quail_datafusion::PLANNING_STACK_BYTES)
         .build()
 }
-/// Quail's DataFusion extension: the AI functions, the optimizer rules,
-/// and model regions, for a program with its own DataFusion session.
 pub use quail_datafusion as extension;
-/// The planner of one model region.
 pub use quail_planner as planner;
 
 pub use crate::images::{ImageSizing, image_size};
@@ -85,22 +47,15 @@ pub use crate::executor::{
     ScannedTable, region_json,
 };
 
-/// The model and hardware a [`Session`] runs on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineConfig {
-    /// A model name Quail knows, such as `qwen3-4b-fp8`.
     pub model: String,
-    /// A device name Quail knows, such as `h100-sxm`.
     pub device: String,
-    /// The number of GPUs.
     pub gpus: usize,
-    /// The execution backend, `quail` by default.
     pub backend: String,
 }
 
 impl EngineConfig {
-    /// A configuration of `model` on one `device` GPU, with the `quail`
-    /// backend.
     pub fn new(model: impl Into<String>, device: impl Into<String>) -> Self {
         Self {
             model: model.into(),
@@ -111,18 +66,9 @@ impl EngineConfig {
     }
 }
 
-/// A DataFusion session with Quail's AI functions, whose model regions
-/// run on Quail's executor.
-///
-/// `sql` blocks until the query finishes; call it outside an async
-/// runtime, or from `spawn_blocking`. Each model region runs on the
-/// thread that called `sql`.
 pub struct Session {
     context: SessionContext,
-    /// The context whose catalog `context` shares, which keeps each
-    /// `SET` after the session drops; None when `context` is its own.
     base: Option<SessionContext>,
-    /// Taken when the session drops, to shut down without blocking.
     runtime: Option<Runtime>,
     runner: Arc<Executor>,
 }
@@ -133,12 +79,6 @@ impl std::fmt::Debug for Session {
     }
 }
 
-/// Register `table` under `name` in `context`.
-///
-/// # Errors
-///
-/// DataFusion refuses the name, or it has
-/// `quail_planner::operators::INPUT_SEPARATOR` in it.
 pub fn register_table(
     context: &SessionContext,
     name: &str,
@@ -155,14 +95,6 @@ pub fn register_table(
     Ok(())
 }
 
-/// Register `table` in `context`, whose rows are the same whenever it
-/// is scanned, which `identity` names. `id_column` names the column
-/// whose values are unique. Model regions read the table through the
-/// planner, which keeps its token counts under `identity`.
-///
-/// # Errors
-///
-/// DataFusion refuses the name.
 pub fn register_scanned_table(
     context: &SessionContext,
     name: &str,
@@ -180,8 +112,6 @@ pub fn register_scanned_table(
     } else {
         Constraints::new_unverified(vec![Constraint::PrimaryKey(keys)])
     };
-    // the context's configuration and object stores, without its
-    // catalog, which will hold the table
     let state = context.state();
     let state = datafusion::execution::SessionStateBuilder::new()
         .with_config(state.config().clone())
@@ -197,28 +127,10 @@ pub fn register_scanned_table(
 }
 
 impl Session {
-    /// Open a session on `config`: Quail's [`Executor`] for `config`, as
-    /// [`Executor::open`] opens it, with a DataFusion session that runs
-    /// every model region on it.
-    ///
-    /// # Errors
-    ///
-    /// A GPU worker does not start, or Quail refuses the configuration.
     pub fn new(config: &EngineConfig) -> Result<Self> {
         Self::with_executor(Arc::new(Executor::open(config)?))
     }
 
-    /// A session that runs each model region on `executor`, with the
-    /// optimizer rules the executor's engine names.
-    ///
-    /// SQL calls sharing an executor, even across sessions, are serialized.
-    /// Each model region runs on its query's calling thread. Nested SQL on
-    /// the same executor from that thread returns an error rather than
-    /// deadlocking or replacing the outer query's caller route.
-    ///
-    /// # Errors
-    ///
-    /// A rule name is unknown.
     pub fn with_executor(executor: Arc<Executor>) -> Result<Self> {
         let context = quail_datafusion::session_context_with_rules(
             Arc::clone(&executor) as Arc<dyn RegionRunner>,
@@ -232,16 +144,6 @@ impl Session {
         })
     }
 
-    /// A session that runs each model region on `executor`, over the
-    /// tables and settings of `base`, a context without Quail such as
-    /// [`quail_datafusion::base_state`] builds.
-    ///
-    /// The session shares `base`'s catalog, so a table one creates
-    /// stays in the other. A `SET` the session runs changes `base` too.
-    ///
-    /// # Errors
-    ///
-    /// A rule name is unknown.
     pub fn with_executor_on(executor: Arc<Executor>, base: SessionContext) -> Result<Self> {
         let state =
             quail_datafusion::QuailExtension::new(Arc::clone(&executor) as Arc<dyn RegionRunner>)
@@ -255,34 +157,22 @@ impl Session {
         })
     }
 
-    /// Tell `observer` what happens as each model region runs, as
-    /// [`Executor::observe`] does.
     pub fn observe(&self, observer: Option<Observer>, answers: bool) {
         self.runner.observe(observer, answers);
     }
 
-    /// Stop the running query, as [`Executor::interrupt`] does.
     pub fn interrupt(&self) {
         self.runner.interrupt();
     }
 
-    /// Let queries run again, as [`Executor::resume`] does.
     pub fn resume(&self) {
         self.runner.resume();
     }
 
-    /// The running region's latest progress, as [`Executor::progress`]
-    /// gives it.
     pub fn progress(&self) -> Option<serde_json::Value> {
         self.runner.progress()
     }
 
-    /// Hand what each model region of the last query ran on the workers
-    /// to `each`, as [`Executor::take_regions`] does.
-    ///
-    /// # Errors
-    ///
-    /// `each` fails.
     pub fn take_regions<T, E>(
         &self,
         each: impl FnMut(RegionRan) -> std::result::Result<T, E>,
@@ -290,35 +180,18 @@ impl Session {
         self.runner.take_regions(each)
     }
 
-    /// Drop what each model region of the last query ran, such as after
-    /// the query failed.
     pub fn discard_regions(&self) {
         self.runner.discard_regions();
     }
 
-    /// The DataFusion context, for registering tables or functions.
     pub fn context(&self) -> &SessionContext {
         &self.context
     }
 
-    /// Register a table under `name`.
-    ///
-    /// DataFusion scans it, and a model region that reads it receives
-    /// its rows.
-    ///
-    /// # Errors
-    ///
-    /// DataFusion refuses the name, or it has
-    /// `quail_planner::operators::INPUT_SEPARATOR` in it.
     pub fn register_table(&self, name: &str, table: Arc<dyn TableProvider>) -> Result<()> {
         register_table(&self.context, name, table)
     }
 
-    /// Register `table` as [`register_scanned_table`] does.
-    ///
-    /// # Errors
-    ///
-    /// DataFusion refuses the name.
     pub fn register_scanned_table(
         &self,
         name: &str,
@@ -329,24 +202,10 @@ impl Session {
         register_scanned_table(&self.context, name, table, id_column, identity)
     }
 
-    /// Run a query and return its rows, with each column named as
-    /// Quail names it, such as `r.id`.
-    ///
-    /// # Errors
-    ///
-    /// The query does not plan, or a region or operator fails.
     pub fn sql(&self, query: &str) -> Result<Vec<RecordBatch>> {
         Ok(self.sql_in_dialect(query, None)?.1)
     }
 
-    /// Run a query read in `dialect`, a DataFusion dialect name such as
-    /// "BigQuery" ("Snowflake" by default), and return its schema and
-    /// rows. Concurrent calls sharing this executor wait their turn.
-    ///
-    /// # Errors
-    ///
-    /// The query does not plan, a region or operator fails, or the caller
-    /// tries to run nested SQL on the same executor.
     pub fn sql_in_dialect(
         &self,
         query: &str,
@@ -371,21 +230,6 @@ impl Session {
         Ok((schema, batches))
     }
 
-    /// Run a query read in `dialect`, as [`Session::sql_in_dialect`]
-    /// does, and return its rows as DataFusion produces them.
-    ///
-    /// The query runs on a thread of its own, which runs each model
-    /// region, so a region's rows reach the stream as the workers finish
-    /// them. An operator that reads every row first, such as an
-    /// aggregate or a sort, sends its rows once the regions below it end.
-    /// The stream reads rows while the session lives: dropping the
-    /// session stops the query. Dropping the stream stops reading; a
-    /// running region still runs to its end.
-    ///
-    /// # Errors
-    ///
-    /// The query does not plan, or the thread does not start. A region
-    /// or operator that fails later ends the stream with its error.
     pub fn sql_stream(&self, query: &str, dialect: Option<&str>) -> Result<RowStream> {
         let (sender, received) = std::sync::mpsc::channel();
         let run = self.query_run();
@@ -411,7 +255,6 @@ impl Session {
         }
     }
 
-    /// What a query's run needs of the session, apart from the session.
     fn query_run(&self) -> QueryRun {
         QueryRun {
             context: self.context.clone(),
@@ -421,12 +264,6 @@ impl Session {
         }
     }
 
-    /// Return DataFusion's physical plan for a query, with each model
-    /// region as one `ModelRegionExec` operator.
-    ///
-    /// # Errors
-    ///
-    /// The query does not plan.
     pub fn explain(&self, query: &str, dialect: Option<&str>) -> Result<String> {
         self.runtime().block_on(async {
             let plan = frame(&self.context, query, dialect)
@@ -440,12 +277,6 @@ impl Session {
         })
     }
 
-    /// Return DataFusion's optimized logical plan for a query, with its
-    /// model regions claimed.
-    ///
-    /// # Errors
-    ///
-    /// The query does not plan.
     pub fn optimized_plan(&self, query: &str, dialect: Option<&str>) -> Result<LogicalPlan> {
         let optimized = self.runtime().block_on(async {
             frame(&self.context, query, dialect)
@@ -455,15 +286,9 @@ impl Session {
         quail_datafusion::claim_model_regions(optimized, &self.context.state())
     }
 
-    /// Return each model region of a query, in plan order.
-    ///
-    /// # Errors
-    ///
-    /// The query does not plan.
     pub fn regions(&self, query: &str, dialect: Option<&str>) -> Result<Vec<ModelRegion>> {
         let plan = self.optimized_plan(query, dialect)?;
         let mut regions = Vec::new();
-        // a shared input's rows are computed once, however often it is read
         let mut shared = Vec::new();
         plan.apply_with_subqueries(|node| {
             if let LogicalPlan::Extension(extension) = node {
@@ -484,13 +309,6 @@ impl Session {
 }
 
 impl Session {
-    /// Compute the inputs of a query's model regions that call no model,
-    /// each as its name, schema, and rows, region by region, so a region
-    /// can be planned on its real rows before the query runs.
-    ///
-    /// # Errors
-    ///
-    /// The query does not plan, or an input fails.
     #[allow(clippy::type_complexity)]
     pub fn region_inputs(
         &self,
@@ -523,16 +341,6 @@ impl Session {
 }
 
 impl Session {
-    /// The plan of each model region of a query, as Quail's planner
-    /// explains it: DataFusion's plan of the region, then the physical
-    /// operators with their estimated rows and time. `verbose` adds the
-    /// run-time settings, node fields, and the rules.
-    ///
-    /// [`Session::explain`] gives DataFusion's plan of the whole query.
-    ///
-    /// # Errors
-    ///
-    /// The query does not plan, or a region does not bind.
     pub fn explain_regions(
         &self,
         query: &str,
@@ -544,7 +352,6 @@ impl Session {
             .into_iter()
             .map(|(region, planned)| {
                 let Some((planned, _)) = planned else {
-                    // a region Rust does not plan shows its operators alone
                     return Ok(region);
                 };
                 let planned: serde_json::Value = serde_json::from_str(&planned).map_err(read)?;
@@ -556,15 +363,6 @@ impl Session {
             .collect()
     }
 
-    /// Run a query, like `EXPLAIN ANALYZE`: its schema and rows, and
-    /// for each model region that ran, the plan as
-    /// [`Session::explain_regions`] gives it with each node's measured
-    /// rows, time, and tokens beside the estimates, then the run's
-    /// totals.
-    ///
-    /// # Errors
-    ///
-    /// The query fails, or a region's results do not read.
     pub fn explain_analyze(
         &self,
         query: &str,
@@ -581,12 +379,6 @@ impl Session {
         Ok((schema, batches, explained))
     }
 
-    /// The report and the operator port rows of a region that ran, as
-    /// [`Executor::region_report`] gives them.
-    ///
-    /// # Errors
-    ///
-    /// The planned region or a worker's results do not read.
     pub fn region_report(
         &self,
         region: &RegionRan,
@@ -594,14 +386,6 @@ impl Session {
         self.runner.region_report(region)
     }
 
-    /// Plan each model region of a query without running it, region by
-    /// region: (the region as [`region_json`] writes it, its planned
-    /// region as JSON when Rust plans it). A region's inputs that call no
-    /// model are computed first, so it plans on their real rows.
-    ///
-    /// # Errors
-    ///
-    /// The query does not plan, an input fails, or a region does not bind.
     #[allow(clippy::type_complexity)]
     pub fn plans(
         &self,
@@ -647,16 +431,12 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // Python may free a session while another one runs a query, inside
-        // that one's runtime, where a blocking shutdown is not allowed
         if let Some(runtime) = self.runtime.take() {
             runtime.shutdown_background();
         }
     }
 }
 
-/// One message of a query's run: its schema, a batch of its rows, its
-/// failure, or its end.
 enum Streamed {
     Schema(SchemaRef),
     Batch(RecordBatch),
@@ -664,9 +444,6 @@ enum Streamed {
     Done,
 }
 
-/// A query's rows as DataFusion produces them; see [`Session::sql_stream`].
-///
-/// Each read blocks until the next batch arrives.
 pub struct RowStream {
     schema: SchemaRef,
     received: std::sync::mpsc::Receiver<Streamed>,
@@ -680,7 +457,6 @@ impl std::fmt::Debug for RowStream {
 }
 
 impl RowStream {
-    /// The schema of every batch, with each column named as Quail names it.
     pub fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -700,7 +476,6 @@ impl Iterator for RowStream {
             Ok(Streamed::Schema(_)) => Some(Err(DataFusionError::Internal(
                 "a query sent its schema twice".into(),
             ))),
-            // the query's thread panicked
             Err(_) => Some(Err(DataFusionError::Execution(
                 "the query stopped before its end".into(),
             ))),
@@ -710,7 +485,6 @@ impl Iterator for RowStream {
     }
 }
 
-/// A session's context, runtime, and executor, which run one query.
 struct QueryRun {
     context: SessionContext,
     base: Option<SessionContext>,
@@ -719,14 +493,6 @@ struct QueryRun {
 }
 
 impl QueryRun {
-    /// Run `query` and send `sent` its schema, each batch of its rows as
-    /// DataFusion produces it, and its end. This thread runs each model
-    /// region of the query.
-    ///
-    /// # Errors
-    ///
-    /// The query does not plan, a region or operator fails, or the caller
-    /// tries to run nested SQL on the same executor.
     fn run(
         self,
         query: String,
@@ -740,20 +506,13 @@ impl QueryRun {
             runner,
         } = self;
         let (sender, mut calls) = unbounded_channel::<RegionCall>();
-        // An executor can be shared by sessions, but its workers and
-        // caller route belong to one query at a time. Acquire before block_on
-        // so waiting callers do not occupy a runtime worker.
         let _caller = runner.enter(sender)?;
         let out = sent.clone();
         runtime.block_on(async {
-            // a worker runs the query, so the operators above a region
-            // read its rows while this thread runs the region
             let query = runtime.spawn(async move {
                 let frame = frame(&context, &query, dialect.as_deref()).await?;
                 let (state, plan) = frame.into_parts();
                 let frame = match plan {
-                    // SET, PREPARE, and related statements update this session,
-                    // not a temporary copy of its state.
                     LogicalPlan::Statement(statement) => {
                         if let Some(base) = &base
                             && matches!(
@@ -768,10 +527,6 @@ impl QueryRun {
                             .execute_logical_plan(LogicalPlan::Statement(statement))
                             .await?
                     }
-                    // DDL needs DataFusion's execution dispatcher: collecting a
-                    // DataFrame containing CreateMemoryTable does not create it.
-                    // The per-query state preserves dialect settings and shares
-                    // the session's catalog, where created tables and views live.
                     LogicalPlan::Ddl(_) => {
                         SessionContext::new_with_state(state)
                             .execute_logical_plan(plan)
@@ -781,12 +536,10 @@ impl QueryRun {
                 };
                 let schema = quail_schema(frame.logical_plan());
                 let mut batches = frame.execute_stream().await?;
-                // the reader is gone once it stops reading
                 if out.send(Streamed::Schema(Arc::clone(&schema))).is_err() {
                     return Ok(());
                 }
                 while let Some(batch) = batches.next().await {
-                    // renaming the columns keeps each column's buffers
                     let batch =
                         RecordBatch::try_new(Arc::clone(&schema), batch?.columns().to_vec())?;
                     if out.send(Streamed::Batch(batch)).is_err() {
@@ -796,8 +549,6 @@ impl QueryRun {
                 Ok::<_, DataFusionError>(())
             });
             tokio::pin!(query);
-            // DataFusion's workers run the operators; this thread runs
-            // each model region they hand it
             loop {
                 tokio::select! {
                     done = &mut query => break done
@@ -812,12 +563,6 @@ impl QueryRun {
     }
 }
 
-/// DataFusion's plan of `query`, read in `dialect` (a DataFusion dialect
-/// name, such as "BigQuery") or the session's dialect.
-///
-/// # Errors
-///
-/// The dialect is unknown, or the query does not plan.
 async fn frame(
     context: &SessionContext,
     query: &str,
@@ -829,14 +574,11 @@ async fn frame(
         let options = state.config_mut().options_mut();
         options.sql_parser.dialect = dialect;
         if matches!(dialect, datafusion::config::Dialect::BigQuery) {
-            // BigQuery sorts NULLs first in ascending order
             options.sql_parser.default_null_ordering = "nulls_min".to_string();
         }
     }
     let dialect = state.config().options().sql_parser.dialect;
     let statement = match state.sql_to_statement(query, &dialect) {
-        // Keep Snowflake's expression semantics, but accept standard syntax
-        // such as aggregate FILTER that its parser does not implement.
         Err(original) if matches!(dialect, datafusion::config::Dialect::Snowflake) => state
             .sql_to_statement(query, &datafusion::config::Dialect::Generic)
             .map_err(|_| original)?,

@@ -1,20 +1,8 @@
-//! Pass groups of a set-attention chain.
-
 use crate::cost::sol::unrounded_seconds;
 use crate::cost::work::Quantity;
 use crate::cost::work::packed;
 use crate::specs::{DeviceSpec, ModelSpec};
 
-/// Split an ordered chain of questions into consecutive pass groups,
-/// the cheapest split by dynamic programming.
-///
-/// Returns each question's pass group, numbered from 0 in chain order.
-///
-/// # Errors
-///
-/// Inputs have inconsistent lengths, invalid counts or selectivities,
-/// a cost is not finite, or a question with the longest state does not
-/// fit one chunk.
 #[allow(clippy::too_many_arguments)]
 pub fn choose_pass_groups(
     question_tokens: &[i64],
@@ -60,8 +48,6 @@ pub fn choose_pass_groups(
     let state = Quantity::Scalar(state_tokens);
     for b in 1..=m {
         for a in (1..=b).rev() {
-            // Compare in a wider integer type before adding headers: even
-            // individually valid i64 token counts can overflow a chunk sum.
             let tokens = i128::from(longest_state)
                 + question_tokens[a - 1..b]
                     .iter()

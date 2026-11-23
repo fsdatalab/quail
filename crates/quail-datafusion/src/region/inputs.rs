@@ -1,6 +1,3 @@
-//! Prepare the table and subquery inputs that DataFusion computes.
-//! Replace each input with a scan, and restore it after lowering.
-
 use std::sync::Arc;
 
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
@@ -19,14 +16,6 @@ use crate::functions::{is_ai_call, is_quail_call};
 use crate::plan::as_node;
 use crate::shared::{ROW_COLUMN, row_field};
 
-/// Compute each plain expression of a region that reads one table as a
-/// column of that table's input, so DataFusion evaluates it.
-///
-/// A plain expression is not a column, calls no model, aggregate,
-/// window, or subquery, and reads columns of one table alias whose part
-/// of the plan calls no model. The alias's part gains a projection with
-/// the expression as `__quail_expr_<n>`, and the region reads that
-/// column; a SELECT item keeps its name.
 pub(super) fn precompute_plain_expressions(plan: LogicalPlan) -> Result<LogicalPlan> {
     let mut tables: Vec<TableReference> = Vec::new();
     plan.apply(|node| {
@@ -52,14 +41,12 @@ pub(super) fn precompute_plain_expressions(plan: LogicalPlan) -> Result<LogicalP
         );
         Ok(TreeNodeRecursion::Continue)
     })?;
-    // (table, expression, column name), in the order first seen
     let mut computed: Vec<(TableReference, Expr, String)> = Vec::new();
     let mut find = |expr: &Expr| {
         let _ = expr.apply(|inner| {
             let Some(table) = plain_table(inner) else {
                 return Ok(TreeNodeRecursion::Continue);
             };
-            // a struct field is a column path the region reads as it is
             let field = matches!(inner, Expr::ScalarFunction(call) if call.name() == "get_field");
             if matches!(inner, Expr::Column(_) | Expr::Literal(..) | Expr::Alias(_))
                 || field
@@ -95,8 +82,6 @@ pub(super) fn precompute_plain_expressions(plan: LogicalPlan) -> Result<LogicalP
         }
         for expr in node.expressions() {
             if let LogicalPlan::Filter(_) = node {
-                // a whole plain term is the input's filter; only a model
-                // call's arguments are computed
                 for term in split_conjunction(&expr) {
                     if plain_table(term).is_none() {
                         find(term);
@@ -123,7 +108,6 @@ pub(super) fn precompute_plain_expressions(plan: LogicalPlan) -> Result<LogicalP
             },
         )
     };
-    // a filter's whole plain terms stay as written; they are the input's
     let replace = |expr: Expr, filter: bool| -> Result<Transformed<Expr>> {
         if !filter {
             return replace_inner(expr);
@@ -184,7 +168,6 @@ pub(super) fn precompute_plain_expressions(plan: LogicalPlan) -> Result<LogicalP
                 let name = expr.schema_name().to_string();
                 let found = replace(expr, is_filter)?;
                 changed |= found.transformed;
-                // a SELECT item keeps the name it had
                 Ok(
                     if is_projection && found.transformed && !matches!(found.data, Expr::Alias(_)) {
                         found.data.alias(name)
@@ -205,8 +188,6 @@ pub(super) fn precompute_plain_expressions(plan: LogicalPlan) -> Result<LogicalP
     .map(|done| done.data)
 }
 
-/// The one table a plain term reads, or None for a term that calls a
-/// model, has a subquery, or reads several tables or none.
 fn plain_table(term: &Expr) -> Option<TableReference> {
     let special = term
         .exists(|inner| Ok(is_quail_call(inner) || is_subquery_expr(inner)))
@@ -231,11 +212,9 @@ fn is_subquery_expr(expr: &Expr) -> bool {
     )
 }
 
-/// The one table a subtree reads, or None when it reads several or none.
 fn single_scan(plan: &LogicalPlan) -> Option<TableScan> {
     let mut scans = Vec::new();
     plan.apply(|node| {
-        // Shared rows have their own identity, not the source table's key.
         if crate::plan::as_node::<crate::shared::SharedInput>(node).is_some() {
             return Ok(TreeNodeRecursion::Jump);
         }
@@ -251,8 +230,6 @@ fn single_scan(plan: &LogicalPlan) -> Option<TableScan> {
     }
 }
 
-/// Whether a subtree is a table the runner reads by name: an identified
-/// table's scan, alone or under its alias.
 fn read_by_name(plan: &LogicalPlan) -> bool {
     let scan = match plan {
         LogicalPlan::TableScan(scan) => scan,
@@ -262,15 +239,12 @@ fn read_by_name(plan: &LogicalPlan) -> bool {
         },
         _ => return false,
     };
-    // a filter or limit DataFusion moved into the scan is the input's
     scan.filters.is_empty()
         && scan.fetch.is_none()
         && source_as_provider(&scan.source)
             .is_ok_and(|provider| provider.downcast_ref::<IdentifiedTable>().is_some())
 }
 
-/// The inputs a region's plan reads with [`ROW_COLUMN`], by name: those
-/// without an id column of their own.
 pub(super) fn numbered(plan: &LogicalPlan) -> Vec<String> {
     let mut found = Vec::new();
     let _ = plan.apply(|node| {
@@ -293,8 +267,6 @@ pub(super) fn numbered(plan: &LogicalPlan) -> Vec<String> {
     found
 }
 
-/// The schema of a placeholder for a region input: the input's columns,
-/// then [`ROW_COLUMN`] when `numbered`, as [`crate::shared::SharedInput`] returns them.
 fn placeholder_schema(
     schema: &datafusion::arrow::datatypes::Schema,
     numbered: bool,
@@ -306,32 +278,19 @@ fn placeholder_schema(
     Arc::new(datafusion::arrow::datatypes::Schema::new(fields))
 }
 
-/// Whether DataFusion computes this part of a region as an input: it
-/// calls no model, reads one table, and is more than an identified table
-/// the runner reads by name.
 fn plain_input(plan: &LogicalPlan) -> Result<Option<TableScan>> {
-    // DataFusion computes a part's subqueries too, such as a filter
-    // `stars > (SELECT AVG(stars) ...)` its optimizer moved to the table
     if read_by_name(plan) || calls_ai(plan)? {
         return Ok(None);
     }
     Ok(single_scan(plan))
 }
 
-/// Take out of a region's plan each part DataFusion computes as an
-/// input: a part that calls no model and reads one table, such as a
-/// table's plain filters, each CTE or FROM subquery that groups or
-/// windows rows, and each one the region does not read through
-/// ([`merged_aliases`]). The plan reads each input as a table of its name.
-///
-/// Returns the plan and each input's table name and plan.
 pub(super) fn split_inputs(plan: LogicalPlan) -> Result<Split> {
     let mut inputs: Vec<(String, LogicalPlan)> = Vec::new();
     let merged = merged_aliases(&plan);
     let mut root = true;
     let plan = plan
         .transform_down(|node| {
-            // a subquery at the root is the region itself
             let at_root = std::mem::take(&mut root);
             let cut = if let Some(scan) = plain_input(&node)? {
                 Some(cut_input(node.clone(), &scan, &mut inputs)?)
@@ -346,9 +305,6 @@ pub(super) fn split_inputs(plan: LogicalPlan) -> Result<Split> {
             let LogicalPlan::SubqueryAlias(alias) = &node else {
                 return Ok(Transformed::no(node));
             };
-            // a subquery the region does not read through runs before the
-            // query that reads it, as an input: its own model region when it
-            // calls a model, or DataFusion's when it groups or windows
             let groups = alias.input.exists(|inner| {
                 Ok(matches!(
                     inner,
@@ -360,8 +316,6 @@ pub(super) fn split_inputs(plan: LogicalPlan) -> Result<Split> {
             if !groups && !staged {
                 return Ok(Transformed::no(node));
             }
-            // `FROM clauses a` reads the CTE `clauses` under the alias `a`;
-            // every read of one CTE is one input, which runs once
             let (mut name, body) = match alias.input.as_ref() {
                 LogicalPlan::SubqueryAlias(cte) => {
                     (cte.alias.table().to_string(), cte.input.as_ref().clone())
@@ -374,7 +328,6 @@ pub(super) fn split_inputs(plan: LogicalPlan) -> Result<Split> {
             if !read_before && inputs.iter().any(|(found, _)| *found == name) {
                 name = format!("{name}_{}", inputs.len());
             }
-            // a CTE's rows have no id column; the region numbers them
             let schema = placeholder_schema(body.schema().as_arrow(), true);
             let Ok(table) = MemTable::try_new(schema, vec![vec![]]) else {
                 return Ok(Transformed::no(node));
@@ -392,15 +345,8 @@ pub(super) fn split_inputs(plan: LogicalPlan) -> Result<Split> {
     Ok((plan, inputs))
 }
 
-/// A region's plan and each input's table name and plan, as
-/// [`split_inputs`] returns them.
 pub(super) type Split = (LogicalPlan, Vec<(String, LogicalPlan)>);
 
-/// Replace `node`, a plain part of a region that reads `scan`'s table,
-/// with a scan of an input DataFusion computes from it.
-///
-/// The input is named `<table>__<alias>`; its id column stays a primary
-/// key when the part returns it.
 fn cut_input(
     node: LogicalPlan,
     scan: &TableScan,
@@ -420,16 +366,12 @@ fn cut_input(
     {
         return Ok(Transformed::no(node));
     }
-    // the input's name ends with the alias after the last separator, which
-    // an alias with the separator in it would make ambiguous; the region
-    // then reads the table itself
     if qualifier
         .table()
         .contains(quail_planner::operators::INPUT_SEPARATOR)
     {
         return Ok(Transformed::no(node));
     }
-    // not the table's own name: two aliases of one table read different rows
     let name = format!(
         "{}{}{}",
         scan.table_name.table(),
@@ -445,8 +387,6 @@ fn cut_input(
             _ => None,
         })
     });
-    // the region reads each document by its id, which DataFusion's
-    // projection pruning drops when no operator reads it
     let key = key.map(|index| (index, provider.schema().field(index).name().clone()));
     let node = match &key {
         Some((index, name)) => with_key(node, *index, name)?,
@@ -472,9 +412,6 @@ fn cut_input(
     Ok(Transformed::new(read, true, TreeNodeRecursion::Jump))
 }
 
-/// `plan`, a part that reads one table, returning the table's column
-/// `name` at `index` too: each scan reads it, and each `Projection`
-/// passes it on.
 fn with_key(plan: LogicalPlan, index: usize, name: &str) -> Result<LogicalPlan> {
     plan.transform_up(|node| match node {
         LogicalPlan::TableScan(scan) => match scan.projection.clone() {
@@ -513,9 +450,6 @@ fn with_key(plan: LogicalPlan, index: usize, name: &str) -> Result<LogicalPlan> 
     .map(|done| done.data)
 }
 
-/// A scan of a table without an identity, as a scan of a region input of
-/// the table's name: DataFusion scans the table and passes its rows. A
-/// table read twice, as in a self join, is one input.
 fn table_input(
     scan: &TableScan,
     inputs: &mut Vec<(String, LogicalPlan)>,
@@ -531,7 +465,6 @@ fn table_input(
             matches!(constraint, datafusion::common::Constraint::PrimaryKey(indices) if indices.len() == 1)
         })
     });
-    // a table without an id column has its rows numbered
     let mut placeholder = MemTable::try_new(placeholder_schema(&schema, !keyed), vec![vec![]])?;
     let mut projection = scan.projection.clone();
     if keyed && let Some(constraints) = provider.constraints() {
@@ -555,8 +488,6 @@ fn table_input(
     Ok(Transformed::new(read, true, TreeNodeRecursion::Jump))
 }
 
-/// The CTE name and body of a FROM subquery: `x` over the CTE `clauses`,
-/// or the subquery itself.
 fn subquery_body(alias: &datafusion::logical_expr::SubqueryAlias) -> (String, &LogicalPlan) {
     match alias.input.as_ref() {
         LogicalPlan::SubqueryAlias(cte) => (cte.alias.table().to_string(), cte.input.as_ref()),
@@ -564,18 +495,9 @@ fn subquery_body(alias: &datafusion::logical_expr::SubqueryAlias) -> (String, &L
     }
 }
 
-/// The aliases of the JOIN inputs a region reads through, and the CTE
-/// each reads: each subquery that selects and filters one table, with
-/// AI.IF filters but no other model call, and is read once. Any other
-/// FROM or JOIN subquery runs before the region, as its own input.
-///
-/// For example, `FROM contracts a JOIN kept b ON AI.IF(...b.text...)`,
-/// with `kept` as `SELECT c.id, c.text FROM contracts c WHERE AI.IF(...)`,
-/// reads `kept` through: the region scans `contracts` as `c` under `b`.
 fn merged_aliases(plan: &LogicalPlan) -> Vec<String> {
     let mut readers: std::collections::BTreeMap<String, usize> = Default::default();
     let _ = plan.apply(|node| {
-        // each read of a CTE is one copy of its body under the CTE's name
         if let LogicalPlan::SubqueryAlias(alias) = node
             && !matches!(
                 alias.input.as_ref(),
@@ -596,8 +518,6 @@ fn merged_aliases(plan: &LogicalPlan) -> Vec<String> {
                 continue;
             };
             let (name, body) = subquery_body(alias);
-            // DataFusion's optimizer removes a SELECT list that passes its
-            // input's columns on, and lowers an AI.IF filter to an `AiNode`
             let (mut base, mut calls_model) = match body {
                 LogicalPlan::Projection(projection) => (
                     projection.input.as_ref(),
@@ -634,7 +554,6 @@ fn merged_aliases(plan: &LogicalPlan) -> Vec<String> {
             };
             if is_table && readers.get(&name).copied().unwrap_or(0) <= 1 && !calls_model {
                 merged.push(alias.alias.table().to_string());
-                // `kept b` reads the CTE `kept` through `b`
                 if name != alias.alias.table() {
                     merged.push(name);
                 }

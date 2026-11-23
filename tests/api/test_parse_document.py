@@ -72,7 +72,7 @@ def test_a_model_reads_a_parsed_pdf():
         "AS kind FROM files f",
         "SELECT f.id FROM files f "
         "WHERE AI.IF(PROMPT('Is the file a lease? {0}', AI.PARSE_DOCUMENT(f.pdf)))",
-        # the region evaluates the parse in its guard
+        # the region evaluates the parse in its precondition
         "SELECT f.id FROM files f "
         "WHERE AI.IF(PROMPT('Is the file a lease? {0}', AI.PARSE_DOCUMENT(f.pdf))) "
         "OR AI.PARSE_DOCUMENT(f.pdf) LIKE '%desk%'"),
@@ -93,8 +93,8 @@ rows 3
 --- SELECT f.id FROM files f WHERE AI.IF(PROMPT('Is the file a lease? {0}',
     AI.PARSE_DOCUMENT(f.pdf))) ---
 plan
-  __quail_answer_1 = ai_filter('Is the file a lease? {0}', f.__quail_expr_0), filter:
-      __quail_answer_1, returns: []
+  __quail_answer_1 = ai_filter('Is the file a lease? {0}', f.__quail_expr_0),
+      inline_predicate: __quail_answer_1, returns: []
 asked 3 of 3
   'Is the file a lease? {0}': 'Invoice for one desk.' FALSE, 'Invoice for two chairs.'
       FALSE, 'Lease from March 2025.\\x0cRent is $2,400 a month.' TRUE
@@ -104,9 +104,9 @@ rows 1
 --- SELECT f.id FROM files f WHERE AI.IF(PROMPT('Is the file a lease? {0}',
     AI.PARSE_DOCUMENT(f.pdf))) OR AI.PARSE_DOCUMENT(f.pdf) LIKE '%desk%' ---
 plan
-  __quail_answer_1 = ai_filter('Is the file a lease? {0}', f.__quail_expr_0), guard:
-      f.__quail_expr_1, filter: __quail_answer_1 OR ai_parse_document(f.pdf) LIKE
-      '%desk%', returns: []
+  __quail_answer_1 = ai_filter('Is the file a lease? {0}', f.__quail_expr_0),
+      precondition: f.__quail_expr_1, inline_predicate: __quail_answer_1 OR
+      ai_parse_document(f.pdf) LIKE '%desk%', returns: []
 asked 2 of 3
   'Is the file a lease? {0}': 'Invoice for two chairs.' FALSE, 'Lease from March
       2025.\\x0cRent is $2,400 a month.' TRUE

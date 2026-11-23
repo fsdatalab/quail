@@ -1,10 +1,7 @@
-//! Bind tables, join predicates, and WHERE terms in written order.
-//! Check which tables each AI join and gate reads.
-
 use super::binding::{AnswerColumn, Binder, negated_inward, unsupported};
 use super::walk::{Kind, Walk};
 use super::{ByAlias, push};
-use crate::ai::{AiNode, Semantics, WrittenTest};
+use crate::ai::{AiNode, Semantics, WrittenPredicate};
 use crate::functions::is_quail_call;
 use crate::functions::options::{string_literal, unwrap_hint};
 use datafusion::common::tree_node::{Transformed, TreeNode};
@@ -19,56 +16,29 @@ use quail_planner::physical::{Asked, Equality, FilterPredicate, ModelCall, Value
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// The relation's terms, bound in the order the query wrote them, each
-/// where it runs.
 #[derive(Default)]
 pub(super) struct Relation {
-    /// alias -> its AI filters.
     pub(super) filters: ByAlias<FilterPredicate>,
-    /// Each AI join and gate, by its node.
     pub(super) joins: BTreeMap<usize, JoinSpec>,
-    /// alias -> its tests of a label: the label's column, the labels the
-    /// test accepts, and the test's selectivity.
     pub(super) label_tests: ByAlias<(String, Value, Option<f64>)>,
-    /// The conditions that ask no model, and their HINT's selectivity.
     pub(super) conditions: Vec<(ValueExpression, Option<f64>)>,
-    /// alias -> the ON equalities of the JOIN of that table that no AI
-    /// join has claimed, last JOIN first.
     pub(super) equalities: Vec<(String, Vec<Equality>)>,
-    /// alias -> the filter terms of the JOIN of that table, each a test
-    /// of two tables' columns, that no AI join has claimed, last JOIN
-    /// first.
     pub(super) join_filters: Vec<(String, Vec<Expr>)>,
-    /// The JOINed tables whose ON equalities and filters an AI join has
-    /// claimed.
     claimed: Vec<String>,
-    /// The FROM table, then the JOINed tables.
     pub(super) tables: Vec<String>,
-    /// Whether a gate is not over a join, which the operators cannot
-    /// read.
     pub(super) unplaced: bool,
-    /// The answer of each AI filter that keeps every row, and its
-    /// selectivity hint, for the guards that read it.
     answers: Vec<(String, Option<f64>)>,
-    /// By answer, the `AI.IF` nodes that are terms of an OR.
     or_terms: BTreeMap<String, OrTerm>,
 }
 
-/// One `AI.IF` term of an OR.
 #[derive(Clone, Default)]
 struct OrTerm {
-    /// The OR's terms that ask no model, if it has any.
     plain: Option<Expr>,
-    /// Whether the OR reads the call's answer as `NOT`.
     negated: bool,
-    /// The OR's name, when it has more than one `AI.IF`.
     disjunction: Option<String>,
-    /// Whether the OR's last call is guarded on another call's answer:
-    /// each call then asks only the rows no earlier call passed.
     short_circuit: bool,
 }
 
-/// Whether a term is `a.x = b.y`, an equality of two tables' columns.
 fn is_column_equality(term: &Expr) -> bool {
     matches!(term, Expr::BinaryExpr(binary)
         if binary.op == datafusion::logical_expr::Operator::Eq
@@ -76,9 +46,6 @@ fn is_column_equality(term: &Expr) -> bool {
                 (Expr::Column(left), Expr::Column(right)) if left.relation != right.relation))
 }
 
-/// Whether an inner join keeps a term as its filter: a test of exactly two
-/// tables' columns that calls no model and has no subquery. An equality
-/// of a value of each table stays a key, which DataFusion computes.
 pub(crate) fn is_join_filter(term: &Expr) -> bool {
     let tables = |expr: &Expr| -> Option<BTreeSet<String>> {
         expr.column_refs()
@@ -108,16 +75,10 @@ pub(crate) fn is_join_filter(term: &Expr) -> bool {
 }
 
 impl Relation {
-    /// Whether `answer` is the answer of an AI.IF that an OR tests.
     pub(super) fn in_or(&self, answer: &str) -> bool {
         self.or_terms.contains_key(answer)
     }
 
-    /// Bind the relation's tables and terms in the order the query wrote
-    /// them: the tables, each JOIN's ON, the ON AI predicates, then WHERE.
-    ///
-    /// `names` maps an answer column to the name the SELECT list returns
-    /// it by.
     pub(super) fn bind(
         walk: &Walk<'_>,
         binder: &mut Binder,
@@ -147,9 +108,6 @@ impl Relation {
             let (mut equalities, mut filters) = (Vec::new(), Vec::new());
             for term in terms {
                 let term = walk.through(&term);
-                // DataFusion pushes a WHERE test of the two sides into the
-                // join; an equality of their columns is the join's key,
-                // and another test of them its filter
                 if is_column_equality(&term) {
                     equalities.push(binder.bind_equality(&term, &joined)?);
                 } else if is_join_filter(&term) {
@@ -175,10 +133,9 @@ impl Relation {
             else {
                 continue;
             };
-            // the OR is named by its last call's answer
             let disjunction = (!parts.others.is_empty()).then(|| node.answer().to_string());
-            let short_circuit = node.guard().is_some_and(|guard| {
-                guard.column_refs().iter().any(|column| {
+            let short_circuit = node.precondition().is_some_and(|precondition| {
+                precondition.column_refs().iter().any(|column| {
                     parts
                         .others
                         .iter()
@@ -207,7 +164,6 @@ impl Relation {
                 _ => None,
             })
             .collect();
-        // the ON predicates by their JOINs, then WHERE's by their terms
         asked.sort_by_key(|(_, node)| {
             node.written()
                 .map_or((true, usize::MAX, usize::MAX), |written| match written.on {
@@ -216,7 +172,6 @@ impl Relation {
                 })
         });
         let (on, rest): (Vec<_>, Vec<_>) = asked.into_iter().partition(|(_, node)| node.in_on());
-        // one question per JOIN: its pairs are asked once
         for (_, node) in &on {
             let written = node.written().expect("an ON term's place");
             let num_asked = on
@@ -238,53 +193,47 @@ impl Relation {
         for (id, node) in rest {
             relation.bind_asked(walk, binder, id, node)?;
         }
-        // each column node's tests: the terms no written test holds, in
-        // the plan's order, then the written tests in written order
-        let mut tests: Vec<WrittenTest> = Vec::new();
+        let mut predicates: Vec<WrittenPredicate> = Vec::new();
         let mut terms: Vec<Expr> = Vec::new();
         for id in walk.ids() {
             let Kind::Ai(node) = &walk.get(id).kind else {
                 continue;
             };
-            for test in node.tests() {
-                if !tests
+            for pred in node.written_predicates() {
+                if !predicates
                     .iter()
-                    .any(|found| (found.clause, found.position) == (test.clause, test.position))
+                    .any(|found| (found.clause, found.position) == (pred.clause, pred.position))
                 {
-                    tests.push(test);
+                    predicates.push(pred);
                 }
             }
             if !node.is_predicate()
                 && node.semantics() == Semantics::Rows
-                && let Some(filter) = node.filter()
+                && let Some(inline_predicate) = node.inline_predicate()
             {
-                terms.extend(split_conjunction(&filter).into_iter().cloned());
+                terms.extend(split_conjunction(&inline_predicate).into_iter().cloned());
             }
         }
-        // DataFusion may write one test as several terms
         terms.retain(|term| {
-            !tests
+            !predicates
                 .iter()
-                .any(|test| split_conjunction(&test.test).contains(&term))
+                .any(|pred| split_conjunction(&pred.predicate).contains(&term))
         });
         for term in terms {
             relation.bind_term(binder, &walk.through(&term), None)?;
         }
-        tests.sort_by_key(|test| (test.clause, test.position));
-        for test in tests {
-            // the lowering keeps a call's selectivity option on the test
-            // as written, not on the node's call
-            let (written, hint) = unwrap_hint(&test.written)?;
+        predicates.sort_by_key(|pred| (pred.clause, pred.position));
+        for pred in predicates {
+            let (written, hint) = unwrap_hint(&pred.written)?;
             let hint = match hint {
                 Some(hint) => Some(hint),
                 None => binder.label_selectivity(&written)?,
             };
-            relation.bind_term(binder, &walk.through(&test.test), hint)?;
+            relation.bind_term(binder, &walk.through(&pred.predicate), hint)?;
         }
         Ok(relation)
     }
 
-    /// Bind an AI filter, AI join, or gate.
     fn bind_asked(
         &mut self,
         walk: &Walk<'_>,
@@ -319,9 +268,10 @@ impl Relation {
             self.joins.insert(id, spec);
             return Ok(());
         }
-        // an AI.IF in an OR passes the rows where the OR's plain terms are TRUE
-        let filter = node.filter().filter(|_| node.function() == "ai_filter");
-        let term = match (filter, self.or_terms.get(node.answer())) {
+        let inline_predicate = node
+            .inline_predicate()
+            .filter(|_| node.function() == "ai_filter");
+        let term = match (inline_predicate, self.or_terms.get(node.answer())) {
             (_, Some(term)) => term.clone(),
             (Some(filter), None) => match node.answer_term(&filter) {
                 Some(negated) => OrTerm {
@@ -347,10 +297,9 @@ impl Relation {
             Some(plain) => Some(binder.bind_condition(&walk.through(plain))?),
             None => None,
         };
-        // a guard on another call's answer is the OR's short circuit
-        let guard = node.guard().and_then(|guard| {
+        let precondition = node.precondition().and_then(|precondition| {
             conjunction(
-                split_conjunction(&guard)
+                split_conjunction(&precondition)
                     .into_iter()
                     .filter(|term| {
                         !term
@@ -361,16 +310,16 @@ impl Relation {
                     .cloned(),
             )
         });
-        let guard = match &guard {
-            Some(guard) => Some(binder.bind_condition(&walk.through(guard))?),
+        let precondition = match &precondition {
+            Some(precondition) => Some(binder.bind_condition(&walk.through(precondition))?),
             None => None,
         };
-        let answer = (node.function() == "ai_filter" && node.filter().is_none() && !in_or)
-            .then(|| node.answer().to_string());
+        let answer =
+            (node.function() == "ai_filter" && node.inline_predicate().is_none() && !in_or)
+                .then(|| node.answer().to_string());
         let (predicate, options) = if node.function() == "ai_score" {
-            // the test compares the score's call with a threshold
             let term = walk
-                .through(&node.filter().expect("a test"))
+                .through(&node.inline_predicate().expect("a predicate"))
                 .transform_up(|found| {
                     Ok(match &found {
                         Expr::Column(column)
@@ -397,23 +346,22 @@ impl Relation {
                     "anchor is a join option; a one-provider AI_FILTER takes only selectivity",
                 );
             }
-            let guard_selectivity = node
-                .guard()
-                .map(|found| crate::rules::guards::guard_selectivity(&found, &self.answers));
+            let precondition_selectivity = node.precondition().map(|found| {
+                crate::rules::preconditions::precondition_selectivity(&found, &self.answers)
+            });
             if let Some(answer) = &answer {
                 self.answers.push((answer.clone(), options.selectivity));
             }
-            // the call's selectivity is the fraction the model answers yes for
             let selectivity = options
                 .selectivity
                 .map(|yes| if negated { 1.0 - yes } else { yes });
             let filter = FilterPredicate {
                 expression: predicate,
                 selectivity,
-                guard,
+                precondition,
                 alternative,
                 answer,
-                guard_selectivity,
+                precondition_selectivity,
                 negated,
                 disjunction,
                 short_circuit,
@@ -421,10 +369,10 @@ impl Relation {
             push(&mut self.filters, &read[0], filter);
             return Ok(());
         }
-        if in_or || guard.is_some() || answer.is_some() || negated {
+        if in_or || precondition.is_some() || answer.is_some() || negated {
             return unsupported(&format!(
                 "DataFusion must evaluate {} over joined model results.",
-                walk.through(&node.filter().unwrap_or_else(|| node.call()))
+                walk.through(&node.inline_predicate().unwrap_or_else(|| node.call()))
             ));
         }
         let spec = JoinSpec {
@@ -451,9 +399,6 @@ impl Relation {
         Ok(())
     }
 
-    /// Bind a term that asks no model: a test of one label, or a plain
-    /// condition, one per part of an AND unless `hint`, a HINT's
-    /// selectivity, estimates the whole term.
     fn bind_term(
         &mut self,
         binder: &mut Binder,
@@ -505,8 +450,6 @@ impl Relation {
     }
 }
 
-/// The answer column and tested values of an `=` or `IN` test of one
-/// unqualified column, or None.
 fn label_test(expr: &Expr) -> Option<(&str, Vec<&Expr>)> {
     fn answer(expr: &Expr) -> Option<&str> {
         match expr {
@@ -520,7 +463,6 @@ fn label_test(expr: &Expr) -> Option<(&str, Vec<&Expr>)> {
             list,
             negated: false,
         }) => Some((answer(expr)?, list.iter().collect())),
-        // DataFusion writes a short IN list as an OR of equalities
         Expr::BinaryExpr(BinaryExpr {
             left,
             op: Operator::Or,
@@ -547,9 +489,6 @@ fn label_test(expr: &Expr) -> Option<(&str, Vec<&Expr>)> {
     }
 }
 
-/// Bind the call of each `AiNode` that adds columns, in the plan's
-/// order, and record the columns with `binder`; an AI filter that keeps
-/// every row adds its Boolean answer.
 fn bind_answers(
     walk: &Walk<'_>,
     binder: &mut Binder,
@@ -574,11 +513,13 @@ fn bind_answers(
             calls: Vec::new(),
             fields: Vec::new(),
         };
-        // a tested score that returns its score is also a score column
         let returned_score = node.function() == "ai_score" && !node.returned_fields().is_empty();
         if node.is_predicate() && !returned_score {
             let tables: Vec<String> = walk.call_tables(&node.call()).into_iter().collect();
-            if node.function() != "ai_filter" || node.filter().is_some() || tables.len() != 1 {
+            if node.function() != "ai_filter"
+                || node.inline_predicate().is_some()
+                || tables.len() != 1
+            {
                 continue;
             }
             found.alias = tables.into_iter().next();
@@ -619,7 +560,6 @@ fn bind_answers(
     }
     Ok(())
 }
-/// A list of names as Python writes a tuple of them.
 fn repr_tuple(items: &[String]) -> String {
     let parts: Vec<String> = items.iter().map(|item| repr_str(item)).collect();
     match parts.as_slice() {
@@ -628,12 +568,6 @@ fn repr_tuple(items: &[String]) -> String {
     }
 }
 
-/// An EXISTS or NOT EXISTS gate over the table `inner`.
-///
-/// # Errors
-///
-/// The call does not read the inner table and one outer table, or the
-/// anchor is not the outer table.
 fn gate(
     call: &ModelCall,
     inner: &str,
@@ -669,13 +603,6 @@ fn gate(
     })
 }
 
-/// An AI join over `aliases`, with the ON equalities of each JOINed
-/// table it is the first to read, and the filter terms of those JOINs.
-///
-/// # Errors
-///
-/// The predicate reads a table outside FROM and JOIN, its anchor is not
-/// one of its tables, or an ON condition reads a table it does not.
 fn join_spec(
     mut spec: JoinSpec,
     aliases: &[String],
@@ -750,8 +677,6 @@ fn join_spec(
     Ok((spec, filters))
 }
 
-/// Refuse JOINs that no AI predicate covers, or that do not connect to
-/// the FROM table.
 pub(super) fn check_joins(
     equalities: &[(String, Vec<Equality>)],
     join_filters: &[(String, Vec<Expr>)],
@@ -838,7 +763,6 @@ pub(super) fn check_joins(
     Ok(())
 }
 
-/// Refuse AI.SCORE beside generative predicates.
 pub(super) fn check_calls(
     filters: &ByAlias<FilterPredicate>,
     joins: &[&JoinSpec],
@@ -861,7 +785,6 @@ pub(super) fn check_calls(
     }
     Ok(())
 }
-/// An AI join or gate, before it is placed.
 #[derive(Debug, Clone)]
 pub(super) struct JoinSpec {
     pub(super) predicate: Asked,

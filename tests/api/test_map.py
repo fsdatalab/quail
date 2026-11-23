@@ -139,8 +139,8 @@ def test_a_map_writes_only_the_documents_the_filter_before_it_keeps():
     1 ---
 plan
   summary = ai_map(r.body, 'Summarize the review in one sentence.', Int64(64))
-  __quail_answer_1 = ai_filter('Negative? {0}', r.body), filter: __quail_answer_1,
-      returns: []
+  __quail_answer_1 = ai_filter('Negative? {0}', r.body), inline_predicate:
+      __quail_answer_1, returns: []
 asked 5 of 5
   'Negative? {0}': r1 FALSE, r2 TRUE, r3 TRUE
   'Summarize the review in one sentence.': r2 'summarize r2', r3 'summarize r3'
@@ -217,7 +217,8 @@ def test_a_plain_test_keeps_only_matching_map_answers():
 --- SELECT r.id, AI.MAP(r.body, 'Name the topic.', 16) AS topic FROM reviews r WHERE
     AI.MAP(r.body, 'Name the topic.', 16) = 'name r1' ---
 plan
-  topic = ai_map(r.body, 'Name the topic.', Int64(16)), filter: topic = 'name r1'
+  topic = ai_map(r.body, 'Name the topic.', Int64(16)), inline_predicate: topic = 'name
+      r1'
 asked 3 of 3
   'Name the topic.': r1 'name r1', r2 'name r2', r3 'name r3'
 rows 1
@@ -226,7 +227,8 @@ rows 1
 --- WITH m AS (SELECT r.id, AI.MAP(r.body, 'Name the topic.', 16) AS topic FROM reviews
     r) SELECT m.id, m.topic FROM m WHERE m.topic = 'name r1' ---
 plan
-  topic = ai_map(r.body, 'Name the topic.', Int64(16)), filter: topic = 'name r1'
+  topic = ai_map(r.body, 'Name the topic.', Int64(16)), inline_predicate: topic = 'name
+      r1'
 asked 3 of 3
   'Name the topic.': r1 'name r1', r2 'name r2', r3 'name r3'
 rows 1
@@ -235,7 +237,7 @@ rows 1
 --- SELECT r.id FROM reviews r WHERE LENGTH(AI.MAP(r.body, 'Name the topic.', 16)) > 3
     AND AI.MAP(r.body, 'Name the topic.', 16) LIKE '% r1' ---
 plan
-  __quail_column_1 = ai_map(r.body, 'Name the topic.', Int64(16)), filter:
+  __quail_column_1 = ai_map(r.body, 'Name the topic.', Int64(16)), inline_predicate:
       character_length(__quail_column_1) > Int32(3) AND __quail_column_1 LIKE '% r1'
 asked 3 of 3
   'Name the topic.': r1 'name r1', r2 'name r2', r3 'name r3'

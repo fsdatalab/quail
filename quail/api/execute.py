@@ -46,7 +46,6 @@ class _BackendState:
         self.configuration = self.release = None
 
 
-# Loaded models outlive individual sessions.
 _BACKEND_STATE = _BackendState()
 atexit.register(_BACKEND_STATE.close)
 
@@ -56,7 +55,6 @@ def gpu_problem() -> str | None:
         import torch
     except ImportError:
         return "torch is not installed"
-    # the default check initializes CUDA, which breaks vLLM's forked engine
     os.environ.setdefault("PYTORCH_NVML_BASED_CUDA_CHECK", "1")
     if not torch.cuda.is_available():
         return "no CUDA GPU is visible to this process"
@@ -143,9 +141,6 @@ def _execute_in_datafusion(query, physical_executor, on_backend_ready,
     results, region_tables, region_s = [], [], []
     region_results = {}
     started = time.perf_counter()
-    # Rust runs the regions of Quail's own backend on GPU workers
-    # itself. A request backend, and a callable that stands in for one,
-    # go through the Python engine.
     if streams(query, physical_executor):
         def ready():
             for called in (on_backend_ready, on_execution_ready):
@@ -155,7 +150,6 @@ def _execute_in_datafusion(query, physical_executor, on_backend_ready,
         table, context, startup_s = _run_in_rust(
             query, physical_executor, ready, results, region_tables,
             region_s, region_results)
-        # starting the workers is model startup, not query time
         return _query_result(query, context, table, whole, started + startup_s,
                              results, region_tables, region_s, region_results)
 
@@ -239,7 +233,6 @@ def _run_in_rust(query, source, ready, results, region_tables, region_s,
             finish_s=0.0, worker_total_s=round(total_s, 4))
         results.append(result)
         region_tables.append(result.collect())
-        # the boot is the region's time, not DataFusion's
         region_s.append(total_s)
         region_results[region.region_id] = result
     return table, context, startup_s
@@ -267,7 +260,6 @@ def _start_workers(session, source):
         workers = session.registry.backend(config.backend).workers(config)
     else:
         workers = source.start_workers(config.gpus)["workers"]
-    # loading the tokenizer into the planner is startup as well
     _ = session.planner
     return workers
 
@@ -327,7 +319,6 @@ def stream_query(query, physical_executor=None, batch_rows: int = 65_536,
         closing = stack.pop_all()
 
     def batches():
-        # the workers run the query until the stream ends
         with closing:
             yield from limited_batches(
                 (batch for table in rows for batch in table.to_batches()),
@@ -346,8 +337,6 @@ def _query_result(query, context, table, whole, started, results, region_tables,
         result.region_results = region_results
         return result
     (region,) = results
-    # the time outside the region: building the context, planning the
-    # SQL, gathering the region's rows, and the operators around it
     region.report["datafusion_s"] = round(
         time.perf_counter() - started - region_s[0], 4)
     result = QueryResult.from_table(region_tables[0] if whole else table,
@@ -393,7 +382,6 @@ def _execute_region(query, physical_executor, on_backend_ready,
                 "and the backend installed."
             )
     if has_compute and physical_executor is None:
-        # Backend startup must not wait for background tokenization.
         _prepare_backend(plan, query.session.registry)
     if has_compute and on_backend_ready is not None:
         on_backend_ready()
@@ -410,7 +398,6 @@ def _execute_region(query, physical_executor, on_backend_ready,
         if hint is not None:
             first = first_rows(request.column_tables(),
                                plan.settings.get("deduplicate", {}))
-        # with no one taking rows as they finish, they are built at the end
         with reporting(None if on_rows is None else finished, hint, tables,
                        first):
             response = (physical_executor(request) if physical_executor is not None
@@ -427,7 +414,6 @@ def _execute_region(query, physical_executor, on_backend_ready,
     model_wall_s = result.report["wall_s"]
     result.report.update(
         planning_s=round(query.planning_s, 4),
-        # the planner tokenizes the inputs, so they are ready once planned
         input_ready_s=round(query.planning_s, 4),
         physical_prepare_s=round(physical_prepare_s, 4),
         model_wall_s=model_wall_s,

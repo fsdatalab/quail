@@ -1,6 +1,3 @@
-//! The cost model's budgets and run-time curves, as the GPU executor
-//! reads them: the same functions the planner prices plans with.
-
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -10,7 +7,6 @@ use quail_planner::cost::decode::DecodeCost;
 use quail_planner::cost::{answers, draft_policy, retention};
 use quail_planner::specs::{DeviceSpec, ModelSpec};
 
-/// One model's memory and time budgets, on one device when given.
 #[pyclass(name = "Budgets", module = "_quail_native", frozen)]
 pub struct Budgets {
     model: ModelSpec,
@@ -27,7 +23,6 @@ impl Budgets {
 
 #[pymethods]
 impl Budgets {
-    /// Read the model and device specs, as JSON without type tags.
     #[new]
     #[pyo3(signature = (model, device=None))]
     fn new(model: &str, device: Option<&str>) -> PyResult<Self> {
@@ -38,8 +33,6 @@ impl Budgets {
         })
     }
 
-    /// Bytes left for KV after weights and activations, and after CUDA
-    /// graphs when the plan writes answers.
     #[pyo3(signature = (chunk_tokens, writes_answers=true))]
     fn arena_bytes(&self, chunk_tokens: i64, writes_answers: bool) -> PyResult<f64> {
         Ok(budgets::arena_bytes(
@@ -50,7 +43,6 @@ impl Budgets {
         ))
     }
 
-    /// Tokens of document KV that can be resident at once.
     #[pyo3(signature = (chunk_tokens=None, mean_document_tokens=None, writes_answers=true))]
     fn arena_tokens(
         &self,
@@ -68,7 +60,6 @@ impl Budgets {
         .map_err(PyValueError::new_err)
     }
 
-    /// A hybrid model's arena KV pages.
     #[pyo3(signature = (chunk_tokens, mean_document_tokens=None, writes_answers=true))]
     fn hybrid_arena_pages(
         &self,
@@ -86,7 +77,6 @@ impl Budgets {
         .map_err(PyValueError::new_err)
     }
 
-    /// Pages a hybrid model shares between retained KV and checkpoints.
     #[pyo3(signature = (chunk_tokens, writes_answers=true))]
     fn hybrid_pool_pages(&self, chunk_tokens: i64, writes_answers: bool) -> PyResult<i64> {
         Ok(budgets::hybrid_pool_pages(
@@ -97,7 +87,6 @@ impl Budgets {
         ))
     }
 
-    /// "unified" or "tree" attention for the readers of one shared node.
     fn cheaper_attention_path(
         &self,
         readers: f64,
@@ -113,7 +102,6 @@ impl Budgets {
         ))
     }
 
-    /// Whether the leftover arena holds one chunk's sliding KV.
     #[pyo3(signature = (chunk_tokens=None))]
     fn sliding_kv_fits(&self, chunk_tokens: Option<i64>) -> PyResult<bool> {
         Ok(budgets::sliding_kv_fits(
@@ -123,54 +111,42 @@ impl Budgets {
         ))
     }
 
-    /// GPUs whose pooled memory holds the loaded weights.
     fn minimum_weight_gpus(&self) -> PyResult<i64> {
         Ok(budgets::minimum_weight_gpus(&self.model, self.device()?))
     }
 
-    /// The largest chunk that fits its memory reservations, or zero.
     fn chunk_memory_bound(&self) -> PyResult<i64> {
         Ok(budgets::chunk_memory_bound(&self.model, self.device()?))
     }
 
-    /// Resident weights, activation memory, and checkpoint reservations.
     fn chunk_memory_bytes(&self, chunk_tokens: i64, page_tokens: i64) -> f64 {
         budgets::chunk_memory_bytes(&self.model, chunk_tokens, page_tokens)
     }
 
-    /// Workspace, execution KV, and one retained document's KV and state.
     fn checkpoint_memory_bytes(&self, chunk_tokens: i64, page_tokens: i64) -> f64 {
         budgets::checkpoint_memory_bytes(&self.model, chunk_tokens, page_tokens)
     }
 
-    /// Temporary bytes a pass of `questions` starts from checkpoints.
     fn checkpoint_pass_bytes(&self, questions: i64, chunk_tokens: i64) -> i64 {
         budgets::checkpoint_pass_bytes(&self.model, questions, chunk_tokens)
     }
 
-    /// KV pages of memory one document checkpoint takes.
     fn checkpoint_pages(&self, page_tokens: i64) -> f64 {
         budgets::checkpoint_pages(&self.model, page_tokens)
     }
 
-    /// Readout workspace for copy verification, capped by one chunk.
     fn copy_verification_workspace_bytes(&self, chunk_tokens: i64) -> i64 {
         budgets::copy_verification_workspace_bytes(&self.model, chunk_tokens)
     }
 
-    /// Tokens per forward pass.
     fn chunk_budget(&self) -> PyResult<i64> {
         Ok(budgets::chunk_budget(&self.model, self.device()?))
     }
 
-    /// The most tokens one kernel call indexes.
     fn kernel_index_cap(&self) -> i64 {
         budgets::kernel_index_cap(&self.model)
     }
 
-    /// Pages of the two KV pools: (every-token pool, sliding-layer pool).
-    ///
-    /// Raises ValueError when the pool cannot hold a chunk's KV.
     #[pyo3(signature = (chunk_tokens=None, mean_document_tokens=None, writes_answers=true))]
     fn arena_pages(
         &self,
@@ -188,7 +164,6 @@ impl Budgets {
         .map_err(PyValueError::new_err)
     }
 
-    /// Checkpoints the pool holds beside an arena of `kv_pages`.
     #[pyo3(signature = (chunk_tokens, kv_pages, writes_answers=true))]
     fn checkpoint_slots(
         &self,
@@ -205,29 +180,22 @@ impl Budgets {
         ))
     }
 
-    /// Tokens per pass past which a pass is compute bound.
     fn compute_knee(&self) -> PyResult<f64> {
         budgets::compute_knee(&self.model, self.device()?).map_err(PyValueError::new_err)
     }
 
-    /// The pass sizes captured as CUDA graphs.
     fn graph_token_buckets(&self) -> Vec<i64> {
         budgets::graph_token_buckets(&self.model)
     }
 
-    /// Memory the captured CUDA graphs hold.
     fn graph_memory_bytes(&self) -> i64 {
         budgets::graph_memory_bytes(&self.model)
     }
 
-    /// Whether the model may use the tree attention path.
     fn tree_attention_allowed(&self) -> bool {
         budgets::tree_attention_allowed(&self.model)
     }
 
-    /// Seconds per token and per attention pair a pass spends:
-    /// `linear_seconds`, `pair_seconds`, `sliding_pair_seconds`,
-    /// `sliding_window`, and `checkpoint_pages` when the model has them.
     #[pyo3(signature = (peak=false))]
     fn coefficients<'py>(&self, py: Python<'py>, peak: bool) -> PyResult<Bound<'py, PyDict>> {
         let values = retention::coefficients(&self.model, self.device()?, peak);
@@ -242,8 +210,6 @@ impl Budgets {
         Ok(found)
     }
 
-    /// Seconds a decode pass spends reading the weights, a token's full
-    /// KV, a token's sliding KV, and one recurrent state.
     fn decode_seconds(&self) -> PyResult<(f64, f64, f64, f64)> {
         let cost = DecodeCost::from_specs(&self.model, self.device()?);
         Ok((
@@ -255,31 +221,26 @@ impl Budgets {
     }
 }
 
-/// KV pages kept free for two chunks of execution.
 #[pyfunction]
 pub fn execution_pages(chunk_tokens: i64, page_tokens: i64) -> i64 {
     budgets::execution_pages(chunk_tokens, page_tokens)
 }
 
-/// Pages that hold `tokens` tokens.
 #[pyfunction]
 pub fn pages(tokens: i64, page_tokens: i64) -> i64 {
     budgets::pages(tokens, page_tokens)
 }
 
-/// Model copies worth running for `num_documents` documents on `gpus` GPUs.
 #[pyfunction]
 pub fn parallel_copies(gpus: i64, num_documents: f64) -> f64 {
     budgets::parallel_copies(gpus, num_documents)
 }
 
-/// KV pages a retained document may hold beside a chunk's execution.
 #[pyfunction]
 pub fn retention_pages(arena_tokens: i64, chunk_tokens: i64, page_tokens: i64) -> i64 {
     retention::retention_pages(arena_tokens, chunk_tokens, page_tokens)
 }
 
-/// Values as little-endian bytes, which Python reads with `np.frombuffer`.
 fn le_bytes<'py, T: Copy>(
     py: Python<'py>,
     values: &[T],
@@ -296,8 +257,6 @@ fn rows<T: Clone>(values: Vec<T>, width: usize) -> Vec<Vec<T>> {
     values.chunks(width).map(<[T]>::to_vec).collect()
 }
 
-/// The prior survival curve of an answer expected to run
-/// `expected_tokens`, as float64 bytes.
 #[pyfunction]
 pub fn prior_survival(py: Python<'_>, expected_tokens: f64, limit: usize) -> Bound<'_, PyBytes> {
     le_bytes(
@@ -307,8 +266,6 @@ pub fn prior_survival(py: Python<'_>, expected_tokens: f64, limit: usize) -> Bou
     )
 }
 
-/// Kaplan-Meier survival curves, one per row of `width` tokens, starting
-/// from each row's prior, as float64 bytes.
 #[pyfunction]
 pub fn survival_rows<'py>(
     py: Python<'py>,
@@ -332,8 +289,6 @@ pub fn survival_rows<'py>(
     Ok(le_bytes(py, &curves.concat(), f64::to_le_bytes))
 }
 
-/// The expected tokens still to write after each written length, as
-/// float64 bytes.
 #[pyfunction]
 pub fn remaining_tokens<'py>(
     py: Python<'py>,
@@ -343,7 +298,6 @@ pub fn remaining_tokens<'py>(
     Ok(le_bytes(py, &remaining, f64::to_le_bytes))
 }
 
-/// Each count of live positions' range in `LIVE_BUCKETS`, as int64 bytes.
 #[pyfunction]
 pub fn live_buckets<'py>(
     py: Python<'py>,
@@ -357,8 +311,6 @@ pub fn live_buckets<'py>(
     Ok(le_bytes(py, &buckets, i64::to_le_bytes))
 }
 
-/// The chance the position each round follows is the answer's source,
-/// as float64 bytes.
 #[pyfunction]
 pub fn source_odds<'py>(
     py: Python<'py>,
@@ -375,8 +327,6 @@ pub fn source_odds<'py>(
     Ok(le_bytes(py, &odds, f64::to_le_bytes))
 }
 
-/// Each answer's expected writes from each of `cap` draft tokens, as
-/// float64 bytes, one row per answer.
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 pub fn draft_gains<'py>(
@@ -401,8 +351,6 @@ pub fn draft_gains<'py>(
     Ok(le_bytes(py, &gains.concat(), f64::to_le_bytes))
 }
 
-/// The draft lengths that keep the most expected writes in `room` rows,
-/// from gains of `cap` columns per answer, as int64 bytes.
 #[pyfunction]
 pub fn fit_drafts<'py>(
     py: Python<'py>,
@@ -415,13 +363,11 @@ pub fn fit_drafts<'py>(
     Ok(le_bytes(py, &fitted, i64::to_le_bytes))
 }
 
-/// The KV pool cap `QUAIL_KV_POOL_TOKENS` sets, in tokens, if any.
 #[pyfunction]
 pub fn kv_pool_cap_tokens() -> Option<i64> {
     budgets::kv_pool_cap_tokens()
 }
 
-/// Each answer's copy draft length, as int64 bytes.
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 pub fn draft_lengths<'py>(
@@ -451,8 +397,6 @@ pub fn draft_lengths<'py>(
     Ok(le_bytes(py, &lengths, i64::to_le_bytes))
 }
 
-/// A model's derived sizes, from its spec as JSON: layer sets, state and
-/// KV bytes, weight memory, and activation memory, by name, as JSON.
 #[pyfunction]
 pub fn model_properties(model: &str) -> PyResult<String> {
     let model: ModelSpec =
@@ -483,7 +427,6 @@ pub fn model_properties(model: &str) -> PyResult<String> {
     .to_string())
 }
 
-/// Add the budget functions and constants to the native module.
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Budgets>()?;
     for function in [
