@@ -88,13 +88,6 @@ pub fn attention_pair_flops(model: &ModelSpec) -> (i64, i64) {
     (full, sliding_flops)
 }
 
-/// Weight bytes per MLP parameter: its own precision's, or the model's.
-fn mlp_weight_bytes(model: &ModelSpec) -> f64 {
-    model
-        .mlp_weight_precision
-        .map_or(model.w_bytes, Precision::bytes)
-}
-
 /// The modeled decoder components, with a readout when the work has answer rows.
 ///
 /// # Panics
@@ -102,7 +95,7 @@ fn mlp_weight_bytes(model: &ModelSpec) -> f64 {
 /// `passes` is negative, or `work.sae_encoded` is an array.
 pub fn dense_decoder_components(work: &Work, model: &ModelSpec, passes: f64) -> Vec<CostComponent> {
     assert!(passes >= 0.0, "passes must be nonnegative");
-    let separate_gdn = if model.gdn_weight_precision.is_some() {
+    let separate_gdn = if model.gdn_has_own_precision() {
         gdn_projection_params(model)
     } else {
         0
@@ -125,9 +118,9 @@ pub fn dense_decoder_components(work: &Work, model: &ModelSpec, passes: f64) -> 
             name: "mlp",
             flops: (2.0 * mlp as f64) * &work.tokens,
             bytes_moved: Quantity::Scalar(
-                mlp_weight_params(model) as f64 * mlp_weight_bytes(model) * passes,
+                mlp_weight_params(model) as f64 * model.mlp_weight_bytes() * passes,
             ),
-            precision: model.mlp_weight_precision.unwrap_or(model.weight_precision),
+            precision: model.mlp_precision(),
             gemm: true,
         },
         CostComponent {
@@ -150,9 +143,8 @@ pub fn dense_decoder_components(work: &Work, model: &ModelSpec, passes: f64) -> 
             gemm: true,
         });
     }
-    if let Some(precision) = model.gdn_weight_precision
-        && separate_gdn != 0
-    {
+    if separate_gdn != 0 {
+        let precision = model.gdn_precision();
         components.push(CostComponent {
             name: "gdn_proj",
             flops: (2.0 * separate_gdn as f64) * &work.tokens,
@@ -189,15 +181,15 @@ pub fn dense_decoder_components(work: &Work, model: &ModelSpec, passes: f64) -> 
             gemm: false,
         });
     }
-    if let Some(sae) = &model.sae
+    if let Some((num_features, keep)) = model.sae_shape()
         && work.sae_encoded.is_nonzero()
     {
-        let encode = 2.0 * model.hidden as f64 * sae.num_features as f64;
+        let encode = 2.0 * model.hidden as f64 * num_features as f64;
         components.push(CostComponent {
             name: "sae_encode",
             flops: encode * &work.sae_encoded,
             bytes_moved: &Quantity::Scalar(encode * passes)
-                + &(&work.sae_encoded * (2.0 * model.hidden as f64 + 8.0 * sae.keep as f64)),
+                + &(&work.sae_encoded * (2.0 * model.hidden as f64 + 8.0 * keep as f64)),
             precision: Precision::Bf16,
             gemm: true,
         });
@@ -212,7 +204,7 @@ pub fn dense_decoder_components(work: &Work, model: &ModelSpec, passes: f64) -> 
 
 /// The answer readout: the decision head, or the output head's rows.
 fn readout(model: &ModelSpec, rows: f64, passes: f64, head_rows: f64) -> CostComponent {
-    if !model.readout.is_empty() {
+    if model.reads_letter_logits() {
         // every code row of the fp32 readout times the prompt's last row
         let codes = (crate::constants::MAX_LETTERS as i64 * model.hidden) as f64;
         return CostComponent {

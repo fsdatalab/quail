@@ -110,7 +110,7 @@ pub fn kernel_index_cap(model: &ModelSpec) -> i64 {
 pub fn graph_token_buckets(model: &ModelSpec) -> Vec<i64> {
     if !GRAPH_ARCHS.contains(&model.arch.as_str())
         || model.experts != 0
-        || model.sae.is_some()
+        || model.has_sae()
         || model.canvas_tokens != 0
     {
         return Vec::new();
@@ -463,7 +463,7 @@ fn projection_shapes(model: &ModelSpec) -> Vec<(i64, i64, i64, Precision)> {
     let qkv_out = (query_width * model.num_q_heads + 2 * model.num_kv_heads) * model.d_head;
     let attention = model.attention_layers().len() as i64;
     let precision = model.weight_precision;
-    let mlp_precision = model.mlp_weight_precision.unwrap_or(precision);
+    let mlp_precision = model.mlp_precision();
     let mut shapes = vec![
         (model.hidden, qkv_out, attention, precision),
         (
@@ -484,7 +484,7 @@ fn projection_shapes(model: &ModelSpec) -> Vec<(i64, i64, i64, Precision)> {
     if gdn != 0 {
         let key_width = model.gdn_key_heads * model.gdn_key_dim;
         let value_width = model.gdn_value_heads * model.gdn_value_dim;
-        let gdn_precision = model.gdn_weight_precision.unwrap_or(precision);
+        let gdn_precision = model.gdn_precision();
         shapes.push((
             model.hidden,
             2 * key_width + 2 * value_width + 2 * model.gdn_value_heads,

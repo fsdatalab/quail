@@ -108,7 +108,7 @@ pub fn classify_statistics(
         model: model.clone(),
         device: context.device.clone(),
         capacity,
-        draws: if model.answer_canvas.is_some() {
+        draws: if model.has_answer_canvas() {
             context.canvas_draws
         } else {
             1

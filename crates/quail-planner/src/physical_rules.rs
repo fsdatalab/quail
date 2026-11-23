@@ -1163,10 +1163,7 @@ pub fn apply_plan_rules(
             }
             Ok(_) => {}
             Err(error) => {
-                return match error.refusal() {
-                    Some(refusal) => Ok(Err(refusal.clone())),
-                    None => Err(error),
-                };
+                return error.into_refusal().map(Err);
             }
         }
     }

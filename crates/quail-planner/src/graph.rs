@@ -287,10 +287,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
         let (ports, joins, score_pairs) = match emitted {
             Ok(found) => found,
             Err(error) => {
-                return match error.refusal() {
-                    Some(refusal) => Ok(Err(refusal.clone())),
-                    None => Err(error),
-                };
+                return error.into_refusal().map(Err);
             }
         };
         self.emit_result(&ports, &joins, score_pairs);
@@ -1490,7 +1487,7 @@ impl<'a, 'c> GraphBuilder<'a, 'c> {
                     "after joins"
                 }),
             );
-            if model.answer_canvas.is_some() {
+            if model.has_answer_canvas() {
                 settings.insert("canvas_draws".into(), Value::from(context.canvas_draws));
             }
         }

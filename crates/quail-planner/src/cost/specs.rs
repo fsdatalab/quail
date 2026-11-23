@@ -225,6 +225,55 @@ pub struct ModelSpec {
 }
 
 impl ModelSpec {
+    /// The precision of the MLP weights: their own, or the model's.
+    pub fn mlp_precision(&self) -> Precision {
+        self.mlp_weight_precision.unwrap_or(self.weight_precision)
+    }
+
+    /// Bytes per MLP weight parameter: its own precision's, or the model's.
+    pub fn mlp_weight_bytes(&self) -> f64 {
+        self.mlp_weight_precision
+            .map_or(self.w_bytes, Precision::bytes)
+    }
+
+    /// Whether the GDN projections have a precision of their own, and so
+    /// are priced apart from the other attention projections.
+    pub fn gdn_has_own_precision(&self) -> bool {
+        self.gdn_weight_precision.is_some()
+    }
+
+    /// The precision of the GDN projection weights: their own, or the model's.
+    pub fn gdn_precision(&self) -> Precision {
+        self.gdn_weight_precision.unwrap_or(self.weight_precision)
+    }
+
+    /// Whether the answer is read from the output head's logits of the
+    /// option letters, rather than from a decision head.
+    pub fn reads_letter_logits(&self) -> bool {
+        !self.readout.is_empty()
+    }
+
+    /// Whether the model reads labels on an answer canvas.
+    pub fn has_answer_canvas(&self) -> bool {
+        self.answer_canvas.is_some()
+    }
+
+    /// The rows of the answer canvas, or 0 without one.
+    pub fn answer_canvas_rows(&self) -> i64 {
+        self.answer_canvas.as_ref().map_or(0, |canvas| canvas.rows)
+    }
+
+    /// Whether the model is loaded with a sparse autoencoder.
+    pub fn has_sae(&self) -> bool {
+        self.sae.is_some()
+    }
+
+    /// The sparse autoencoder's features, and the most it keeps per token,
+    /// when the model is loaded with one.
+    pub fn sae_shape(&self) -> Option<(i64, i64)> {
+        self.sae.as_ref().map(|sae| (sae.num_features, sae.keep))
+    }
+
     /// The kind of one layer.
     pub fn layer_kind(&self, layer: i64) -> &str {
         self.layer_kinds

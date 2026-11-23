@@ -285,7 +285,7 @@ fn sae_features_spec(
     resident: bool,
 ) -> Result<SaeFeaturesSpec, CompileError> {
     let model = &context.model;
-    if model.sae.is_none() {
+    if !model.has_sae() {
         return Err(CompileError::refused(Refusal::new(
             format!(
                 "AI.SAE_FEATURES needs a model loaded with an SAE; {} has none",

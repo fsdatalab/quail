@@ -268,11 +268,7 @@ pub fn estimate(
     draws: i64,
 ) -> Result<ClassifyCost, String> {
     let model = inputs.model;
-    let canvas_rows = model
-        .answer_canvas
-        .as_ref()
-        .map(|canvas| canvas.rows)
-        .unwrap_or(0);
+    let canvas_rows = model.answer_canvas_rows();
     let suffixes = suffix_lengths(scoring, labels, canvas_rows, draws)?;
     let mut runs = None;
     let mut answer_rows = None;

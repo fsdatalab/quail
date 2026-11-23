@@ -80,7 +80,7 @@ fn sae_features_refusal(found: &Operators, model: &ModelSpec, scored: bool) -> O
         || scored
         || !label_calls(found).is_empty()
         || !found.extracts.is_empty();
-    if features && model.sae.is_none() {
+    if features && !model.has_sae() {
         return Some(refusal(
             format!(
                 "AI.SAE_FEATURES needs a model loaded with an SAE; {} has none",
@@ -96,7 +96,7 @@ fn sae_features_refusal(found: &Operators, model: &ModelSpec, scored: bool) -> O
             constraint,
         ));
     }
-    if !features && model.sae.is_some() {
+    if !features && model.has_sae() {
         return Some(refusal(
             format!(
                 "{} reads the residual stream for AI.SAE_FEATURES only; run other operators on \
@@ -364,7 +364,7 @@ pub fn validate_query(
             "unsupported_set_attention_query",
         )));
     }
-    if (!found.sae_features.is_empty() || model.sae.is_some())
+    if (!found.sae_features.is_empty() || model.has_sae())
         && let Some(refused) = sae_features_refusal(found, model, scored)
     {
         return Ok(Some(refused));
@@ -384,7 +384,7 @@ pub fn validate_query(
                 constraint,
             )));
         }
-        if model.canvas_tokens != 0 && model.answer_canvas.is_none() {
+        if model.canvas_tokens != 0 && !model.has_answer_canvas() {
             return Ok(Some(refusal(
                 format!(
                     "{} names no answer canvas to read labels on",
