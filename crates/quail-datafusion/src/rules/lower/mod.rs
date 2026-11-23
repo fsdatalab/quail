@@ -36,6 +36,9 @@
 //! only a test reads it. A call anywhere else stays as DataFusion bound
 //! it.
 
+mod extract;
+mod outer_join;
+
 use quail_planner::constants::SPAN_SUFFIX;
 use std::sync::Arc;
 
@@ -54,9 +57,9 @@ use datafusion::optimizer::simplify_expressions::ExprSimplifier;
 use datafusion::optimizer::{AnalyzerRule, OptimizerConfig, OptimizerRule};
 
 use crate::ai::{AiNode, Semantics, Written, WrittenTest};
-use crate::extension::{as_node, extension_node};
 use crate::functions::column_call_kind;
-use crate::functions::function_name;
+use crate::functions::{function_name, is_ai_call, quail_function};
+use crate::plan::{as_node, extension_node};
 
 /// Rewrite the AI calls of each part of a query that Quail plans into
 /// Quail's plan nodes, as the module explains.
@@ -73,7 +76,7 @@ impl AnalyzerRule for LowerAiCalls {
     }
 
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
-        crate::region::claim::lower_regions(plan)
+        extract::lower_plan(plan)
     }
 }
 
@@ -87,11 +90,11 @@ impl OptimizerRule for LowerAiCalls {
         plan: LogicalPlan,
         _config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
-        if !crate::region::claim::calls_ai_function(&plan)? {
+        if !calls_ai_function(&plan)? {
             return Ok(Transformed::no(plan));
         }
         // a call no operator can lower stays, and the plan with it
-        let lowered = crate::region::claim::lower_regions(plan.clone())?;
+        let lowered = extract::lower_plan(plan.clone())?;
         Ok(if lowered == plan {
             Transformed::no(plan)
         } else {
@@ -119,6 +122,29 @@ fn unhint(expr: &Expr) -> (Expr, Option<Expr>) {
         }
         other => (other.clone(), None),
     }
+}
+
+/// Whether any operator in the subtree, or an EXISTS or IN subquery in
+/// it, calls an AI function that is not yet lowered into an `AiNode`.
+fn calls_ai_function(plan: &LogicalPlan) -> Result<bool> {
+    plan.exists(|node| {
+        // an `AiNode`'s expressions hold its lowered call
+        if as_node::<AiNode>(node).is_some() {
+            return Ok(false);
+        }
+        for expr in node.expressions() {
+            let found = expr.exists(|inner| match inner {
+                Expr::Exists(exists) => calls_ai_function(&exists.subquery.subquery),
+                Expr::InSubquery(found) => calls_ai_function(&found.subquery.subquery),
+                Expr::ScalarSubquery(found) => calls_ai_function(&found.subquery),
+                other => Ok(is_ai_call(other)),
+            })?;
+            if found {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })
 }
 
 /// Whether a term is a comparison of an `AI.SCORE` call.
@@ -222,14 +248,15 @@ fn answer_node(
     (answer, index): (String, usize),
     written: &Written,
 ) -> Result<AiNode> {
-    let (_, field) = call.to_field(input.schema())?;
-    let field = field.as_ref().clone().with_name(answer.clone());
-    let mut node = AiNode::try_new(Arc::new(input), call.clone(), answer, vec![field])?;
-    node.written = Some(Written {
-        index,
-        ..written.clone()
-    });
-    node.checked()
+    AiNode::answering(
+        input,
+        call.clone(),
+        answer,
+        Written {
+            index,
+            ..written.clone()
+        },
+    )
 }
 
 /// An `AiNode` over `input` asking `term`, an `AI.IF` call or a
@@ -254,15 +281,8 @@ fn asked_node(
         }
         call => (call, read),
     };
-    let (_, field) = call.to_field(input.schema())?;
-    let field = field.as_ref().clone().with_name(answer.clone());
-    let mut node = AiNode::try_new(Arc::new(input), call, answer, vec![field])?;
-    node.filter = Some(filter);
-    node.hint = hint;
-    node.projection = Some(Vec::new());
-    node.semantics = semantics;
-    node.written = Some(Written { index, ..written });
-    Ok(extension_node(node.checked()?))
+    let node = AiNode::answering(input, call, answer, Written { index, ..written })?;
+    Ok(extension_node(node.hinted(hint).tested(filter, semantics)?))
 }
 
 /// Stack the `AiNode`s of each asked term on `input`, in written order.
@@ -302,13 +322,13 @@ fn stack_asked(
         for (number, call) in calls.iter().enumerate() {
             let (mut answer, index) = columns.answer_name();
             // a call the SELECT list also returns takes its name there
-            if columns.selected.iter().any(|(found, _)| found == call) {
+            if columns.selects(call) {
                 answer = columns.name_for(call, input.schema());
             }
             let read = Expr::Column(Column::from_name(answer.clone()));
             let mut node = answer_node(input, call, (answer, index), &written)?;
             if number + 1 == calls.len() {
-                node.hint = hint.clone();
+                node = node.hinted(hint.clone());
             }
             input = extension_node(node);
             test = replace_call(test, call, &read)?;
@@ -344,6 +364,18 @@ impl Columns {
                 return (name, self.num_answers);
             }
         }
+    }
+
+    /// Whether a SELECT list returns `call`.
+    fn selects(&self, call: &Expr) -> bool {
+        self.selected.iter().any(|(found, _)| found == call)
+    }
+
+    /// `name`, the SELECT list's own name for a call, which no generated
+    /// name may take after it.
+    fn take_selected_name(&mut self, name: &str) -> String {
+        self.reserved.insert(name.to_string());
+        name.to_string()
     }
 
     /// The number of the next WHERE or ON.
@@ -400,13 +432,6 @@ fn selected_calls(plan: &LogicalPlan) -> Vec<(Expr, String)> {
         Ok(TreeNodeRecursion::Continue)
     });
     found
-}
-
-pub(crate) fn quail_function(name: &str) -> Arc<datafusion::logical_expr::ScalarUDF> {
-    crate::functions::quail_functions()
-        .into_iter()
-        .find(|function| function.name() == name)
-        .expect("a Quail function")
 }
 
 /// Whether an argument is a `{'selectivity': ...}` hint and nothing else.
@@ -472,10 +497,9 @@ fn column_calls(term: &Expr) -> Vec<Expr> {
 fn added_column(plan: &LogicalPlan, call: &Expr) -> Option<String> {
     fn search(node: &LogicalPlan, call: &Expr) -> Option<String> {
         if let Some(column) = as_node::<AiNode>(node)
-            && (!column.is_predicate() || column.filter.is_none())
-            && column.call == *call
+            && column.answers_every_row(call)
         {
-            return Some(column.answer.clone());
+            return Some(column.answer().to_string());
         }
         let inputs: Vec<&LogicalPlan> = match node {
             LogicalPlan::Join(_)
@@ -683,12 +707,12 @@ fn with_tests(plan: LogicalPlan, names: &[String], tests: &[WrittenTest]) -> Res
             let Some(column) = as_node::<AiNode>(&node) else {
                 return Ok(Transformed::no(node));
             };
-            if column.is_predicate() || !names.contains(&column.answer) {
+            if column.is_predicate() || !names.iter().any(|name| name == column.answer()) {
                 return Ok(Transformed::no(node));
             }
-            let mut column = column.clone();
-            column.tests.extend(tests.iter().cloned());
-            Ok(Transformed::yes(extension_node(column)))
+            Ok(Transformed::yes(extension_node(
+                column.clone().with_tests(tests),
+            )))
         })?
         .data)
 }
@@ -922,14 +946,12 @@ fn lower_projection(
                         .strip_suffix(SPAN_SUFFIX)
                         .unwrap_or(&alias.name)
                         .to_string()
-                } else if columns.selected.iter().any(|(found, _)| *found == call)
+                } else if columns.selects(&call)
                     || input.schema().has_column_with_unqualified_name(&alias.name)
                 {
                     columns.name_for(&call, input.schema())
                 } else {
-                    // the SELECT list's own name for the call
-                    columns.reserved.insert(alias.name.clone());
-                    alias.name.clone()
+                    columns.take_selected_name(&alias.name)
                 };
                 let name = if names_input(input.schema(), &name) {
                     columns.unnamed()

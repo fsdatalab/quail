@@ -839,7 +839,7 @@ pub fn decide(
     answer: &str,
     answers: &Completions,
 ) -> Result<Decision, CompileError> {
-    let expr = crate::derive::expressions::decode(condition)?;
+    let expr = crate::region::derive::expressions::decode(condition)?;
     let positions: Vec<String> = condition
         .columns
         .iter()

@@ -11,10 +11,12 @@ use std::collections::BTreeSet;
 
 use datafusion::common::Column;
 use datafusion::common::Dependency;
-use datafusion::logical_expr::{Aggregate, Expr, JoinType, LogicalPlan};
+use datafusion::logical_expr::{
+    Aggregate, Expr, JoinType, LogicalPlan, UserDefinedLogicalNodeCore,
+};
 
 use crate::ai::{AiNode, Semantics};
-use crate::extension::as_node;
+use crate::plan::as_node;
 
 /// Whether an `Aggregate` is a `DISTINCT`: it groups by each of its
 /// input's columns, in order, and computes nothing else.
@@ -69,7 +71,9 @@ pub(crate) fn is_unique(plan: &LogicalPlan, columns: &BTreeSet<Column>) -> bool 
         LogicalPlan::Limit(found) => is_unique(&found.input, columns),
         LogicalPlan::Extension(_) => match as_node::<AiNode>(plan) {
             // a node of rows returns at most one row for each input row
-            Some(node) if node.semantics == Semantics::Rows => is_unique(&node.input, columns),
+            Some(node) if node.semantics() == Semantics::Rows => {
+                is_unique(node.inputs()[0], columns)
+            }
             _ => false,
         },
         LogicalPlan::Join(join) => {

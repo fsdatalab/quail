@@ -9,10 +9,10 @@ use std::collections::BTreeSet;
 
 use datafusion::common::Result;
 use datafusion::common::tree_node::TreeNode;
-use datafusion::logical_expr::{Expr, LogicalPlan};
+use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore};
 
-use crate::ai::{AiNode, Semantics};
-use crate::extension::as_node;
+use crate::ai::AiNode;
+use crate::plan::as_node;
 
 /// `plan` without the `AiNode`s that filter no row and add only columns
 /// no operator above them reads.
@@ -54,19 +54,15 @@ fn read_names(exprs: &[Expr]) -> Option<BTreeSet<String>> {
 fn drop_unread(plan: LogicalPlan, read: Option<&BTreeSet<String>>) -> Result<LogicalPlan> {
     if let Some(node) = as_node::<AiNode>(&plan)
         && let Some(read) = read
-        && node.semantics == Semantics::Rows
-        && node.filter.is_none()
-        && node.tests.is_empty()
-        && node.fetch.is_none()
-        && !node.fields.iter().any(|field| read.contains(field.name()))
+        && node.only_adds_columns()
+        && !node.added_names().iter().any(|name| read.contains(name))
     {
-        return drop_unread(node.input.as_ref().clone(), Some(read));
+        return drop_unread(node.inputs()[0].clone(), Some(read));
     }
     // a node's filter and tests read columns too, beside its expressions
     let mut exprs = plan.expressions();
     if let Some(node) = as_node::<AiNode>(&plan) {
-        exprs.extend(node.filter.clone());
-        exprs.extend(node.tests.iter().map(|found| found.test.clone()));
+        exprs.extend(node.filter_expressions());
     }
     let own = read_names(&exprs);
     let below: Option<BTreeSet<String>> = match &plan {
@@ -94,5 +90,5 @@ fn drop_unread(plan: LogicalPlan, read: Option<&BTreeSet<String>>) -> Result<Log
         .into_iter()
         .map(|input| drop_unread(input.clone(), below.as_ref()))
         .collect::<Result<Vec<_>>>()?;
-    crate::extension::with_inputs(&plan, inputs)
+    crate::plan::with_inputs(&plan, inputs)
 }

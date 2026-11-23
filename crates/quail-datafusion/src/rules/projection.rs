@@ -42,13 +42,11 @@ use std::sync::Arc;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Result, internal_err};
 use datafusion::logical_expr::expr::ScalarFunction;
-use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan};
+use datafusion::logical_expr::{Expr, LogicalPlan};
 
 use crate::ai::AiNode;
-use crate::derive::unfolded;
-use crate::extension::{as_node, extension_node};
-use crate::functions::function_name;
-use crate::rules::lower::quail_function;
+use crate::functions::options::unfolded;
+use crate::plan::{as_node, extension_node};
 
 /// The field names of an unfolded extraction call's questions argument,
 /// in order; None when it is not a `named_struct` of named fields.
@@ -129,21 +127,10 @@ pub(crate) fn replace_call(plan: LogicalPlan, old: &Expr, new: &Expr) -> Result<
             return node.recompute_schema().map(Transformed::yes);
         };
         let mut ai = ai.map_expressions(rewrite)?;
-        if function_name(&ai.call) == Some("ai_extract")
-            && let Expr::ScalarFunction(call) = &ai.call
-            && call.args == new.args
+        if ai.function() == "ai_extract"
+            && matches!(ai.call(), Expr::ScalarFunction(call) if call.args == new.args)
         {
-            let schema = ai.input.schema();
-            let spans = Expr::ScalarFunction(ScalarFunction::new_udf(
-                quail_function("ai_extract_span"),
-                call.args.clone(),
-            ));
-            for (index, typed) in [&ai.call, &spans].into_iter().enumerate() {
-                if let Some(field) = ai.fields.get(index) {
-                    let (_, found) = typed.to_field(schema)?;
-                    ai.fields[index] = found.as_ref().clone().with_name(field.name());
-                }
-            }
+            ai = ai.retyped_extraction()?;
         }
         Ok(Transformed::yes(extension_node(ai.checked()?)))
     })

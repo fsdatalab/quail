@@ -10,8 +10,9 @@ use datafusion::logical_expr::{
     Aggregate, Expr, JoinType, LogicalPlan, LogicalPlanBuilder, Projection, Window,
 };
 
-use super::claim::calls_ai_function;
+use super::{Columns, calls_ai_function, is_join_predicate, lower_node, names_input};
 use crate::functions::is_ai_call;
+use crate::functions::options::unwrap_hint;
 
 /// `plan` with every AI call as an `AiNode` below the operator that held
 /// it.
@@ -19,52 +20,10 @@ use crate::functions::is_ai_call;
 /// # Errors
 ///
 /// A rewritten operator's schema does not fit DataFusion's rules.
-pub(crate) fn lower_regions(plan: LogicalPlan) -> Result<LogicalPlan> {
+pub(super) fn lower_plan(plan: LogicalPlan) -> Result<LogicalPlan> {
     let plan = drop_written_names(plan)?;
-    let mut extracted = Extracted::default();
-    // the call each written name, such as `AI.CLASSIFY(...)`, names
-    let mut written: Vec<(String, String)> = Vec::new();
-    plan.apply(|node| {
-        for (qualifier, field) in node.schema().iter() {
-            extracted.reserved.push(field.name().clone());
-            if let Some(qualifier) = qualifier {
-                extracted.reserved.push(qualifier.table().to_string());
-            }
-        }
-        for expr in node.expressions() {
-            if let Expr::Alias(alias) = &expr
-                && is_ai_call(&alias.expr)
-            {
-                written.push((alias.name.clone(), alias.expr.schema_name().to_string()));
-            }
-        }
-        Ok(TreeNodeRecursion::Continue)
-    })?;
-    let call_named = |name: &str| {
-        written
-            .iter()
-            .find(|(found, _)| found == name)
-            .map_or_else(|| name.to_string(), |(_, call)| call.clone())
-    };
-    // a moved call keeps the name the SELECT list gives it
-    plan.apply(|node| {
-        if let LogicalPlan::Projection(projection) = node {
-            for expr in &projection.expr {
-                // the call itself, or the column a GROUP BY makes of it
-                let Expr::Alias(alias) = expr else { continue };
-                let named = match alias.expr.as_ref() {
-                    Expr::Column(column) => Some(call_named(&column.name)),
-                    inner if is_ai_call(inner) => Some(inner.schema_name().to_string()),
-                    _ => None,
-                };
-                if let Some(named) = named {
-                    extracted.aliases.push((named, alias.name.clone()));
-                }
-            }
-        }
-        Ok(TreeNodeRecursion::Continue)
-    })?;
-    let mut columns = crate::rules::lower::Columns::of(&plan)?;
+    let mut extracted = Extracted::of(&plan)?;
+    let mut columns = Columns::of(&plan)?;
     extracted.lower(plan, &mut columns)
 }
 
@@ -120,7 +79,7 @@ fn terms_above(plan: LogicalPlan) -> Result<LogicalPlan> {
     let mut above = Vec::new();
     for term in join.filter.iter().flat_map(split_conjunction) {
         let calls = !ai_calls(term)?.is_empty();
-        if calls && !crate::rules::lower::is_join_predicate(term) {
+        if calls && !is_join_predicate(term) {
             above.push(term.clone());
         } else {
             kept.push(term.clone());
@@ -151,13 +110,62 @@ struct Extracted {
 }
 
 impl Extracted {
+    /// Nothing moved yet out of `plan`: its column and relation names
+    /// reserved, and the SELECT list's name for each call, which a moved
+    /// call keeps.
+    ///
+    /// # Errors
+    ///
+    /// Walking the plan fails.
+    fn of(plan: &LogicalPlan) -> Result<Self> {
+        let mut extracted = Self::default();
+        // the call each written name, such as `AI.CLASSIFY(...)`, names
+        let mut written: Vec<(String, String)> = Vec::new();
+        plan.apply(|node| {
+            for (qualifier, field) in node.schema().iter() {
+                extracted.reserved.push(field.name().clone());
+                if let Some(qualifier) = qualifier {
+                    extracted.reserved.push(qualifier.table().to_string());
+                }
+            }
+            for expr in node.expressions() {
+                if let Expr::Alias(alias) = &expr
+                    && is_ai_call(&alias.expr)
+                {
+                    written.push((alias.name.clone(), alias.expr.schema_name().to_string()));
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        let call_named = |name: &str| {
+            written
+                .iter()
+                .find(|(found, _)| found == name)
+                .map_or_else(|| name.to_string(), |(_, call)| call.clone())
+        };
+        plan.apply(|node| {
+            if let LogicalPlan::Projection(projection) = node {
+                for expr in &projection.expr {
+                    // the call itself, or the column a GROUP BY makes of it
+                    let Expr::Alias(alias) = expr else { continue };
+                    let named = match alias.expr.as_ref() {
+                        Expr::Column(column) => Some(call_named(&column.name)),
+                        inner if is_ai_call(inner) => Some(inner.schema_name().to_string()),
+                        _ => None,
+                    };
+                    if let Some(named) = named {
+                        extracted.aliases.push((named, alias.name.clone()));
+                    }
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        Ok(extracted)
+    }
+
     /// `plan` with every AI call as an `AiNode` below the operator that
     /// held it.
-    fn lower(
-        &mut self,
-        plan: LogicalPlan,
-        columns: &mut crate::rules::lower::Columns,
-    ) -> Result<LogicalPlan> {
+    fn lower(&mut self, plan: LogicalPlan, columns: &mut Columns) -> Result<LogicalPlan> {
         if !calls_ai_function(&plan)? {
             return Ok(plan);
         }
@@ -200,7 +208,7 @@ impl Extracted {
         self.num_inputs += 1;
         let plan = self.join_keys_below(plan)?;
         let plan = terms_above(plan)?;
-        if let Some(join) = super::join::lower_outer_join(&plan, self.num_inputs, |input| {
+        if let Some(join) = super::outer_join::lower_outer_join(&plan, self.num_inputs, |input| {
             self.lower(input, columns)
         })? {
             return Ok(join);
@@ -211,7 +219,7 @@ impl Extracted {
             .cloned()
             .map(|input| self.lower(input, columns))
             .collect::<Result<Vec<_>>>()?;
-        let plan = crate::extension::with_inputs(&plan, inputs)?;
+        let plan = crate::plan::with_inputs(&plan, inputs)?;
         let plan = self.lower_arguments(plan, columns)?;
         // an operator that is no filter, inner join, or SELECT list reads
         // its calls from a SELECT list below it
@@ -219,10 +227,10 @@ impl Extracted {
             LogicalPlan::Aggregate(_) | LogicalPlan::Window(_) | LogicalPlan::Sort(_) => {
                 self.extract(plan)?
                     .data
-                    .map_children(|child| crate::rules::lower::lower_node(child, columns))?
+                    .map_children(|child| lower_node(child, columns))?
                     .data
             }
-            plan => crate::rules::lower::lower_node(plan, columns)?.data,
+            plan => lower_node(plan, columns)?.data,
         };
         // a call inside a larger expression is read from a SELECT list below
         let nested = !matches!(plan, LogicalPlan::Extension(_))
@@ -234,7 +242,7 @@ impl Extracted {
             return Ok(self
                 .extract_calls(plan, true)?
                 .data
-                .map_children(|child| crate::rules::lower::lower_node(child, columns))?
+                .map_children(|child| lower_node(child, columns))?
                 .data);
         }
         Ok(plan)
@@ -245,7 +253,7 @@ impl Extracted {
     fn lower_arguments(
         &mut self,
         mut plan: LogicalPlan,
-        columns: &mut crate::rules::lower::Columns,
+        columns: &mut Columns,
     ) -> Result<LogicalPlan> {
         loop {
             if plan.inputs().len() != 1 {
@@ -289,7 +297,7 @@ impl Extracted {
                 .collect();
             exprs.extend(named.iter().map(|(call, name)| call.clone().alias(name)));
             let below = LogicalPlan::Projection(Projection::try_new(exprs, Arc::new(input))?);
-            let below = crate::rules::lower::lower_node(below, columns)?.data;
+            let below = lower_node(below, columns)?.data;
             let exprs = plan
                 .expressions()
                 .iter()
@@ -517,9 +525,7 @@ impl Extracted {
                     .aliases
                     .iter()
                     .find(|(found, name)| {
-                        *found == key
-                            && !self.used.contains(name)
-                            && !crate::rules::lower::names_input(input, name)
+                        *found == key && !self.used.contains(name) && !names_input(input, name)
                     })
                     .map(|(_, name)| name.clone());
                 let name = named.unwrap_or_else(|| {
@@ -571,58 +577,9 @@ fn read_calls(expr: &Expr, named: &[(Expr, String)]) -> Result<Expr> {
             if crate::functions::function_name(&expr) != Some("hint") {
                 return Ok(Transformed::no(expr));
             }
-            let mut binder =
-                crate::derive::binding::Binder::new(&(String::new(), String::new()), "ai-if");
-            let (test, _) = binder
-                .unwrap_hint(&expr)
+            let (test, _) = unwrap_hint(&expr)
                 .map_err(|error| datafusion::common::DataFusionError::Plan(error.to_string()))?;
             Ok(Transformed::yes(test))
         })?
         .data)
-}
-
-/// The columns of `input` that `plan` reads, when the operator above
-/// `plan` reads `needed` of its columns.
-pub(super) fn read_from(
-    plan: &LogicalPlan,
-    input: &LogicalPlan,
-    needed: Option<&[Column]>,
-) -> Option<Vec<Column>> {
-    let mut read: Vec<Column> = Vec::new();
-    let mut add = |column: Column| {
-        if !read.contains(&column) {
-            read.push(column);
-        }
-    };
-    for expr in plan.expressions() {
-        for column in expr.column_refs() {
-            add(column.clone());
-        }
-    }
-    match plan {
-        // these pass their input's columns on
-        LogicalPlan::Filter(_)
-        | LogicalPlan::Sort(_)
-        | LogicalPlan::Limit(_)
-        | LogicalPlan::Distinct(_)
-        | LogicalPlan::Window(_)
-        | LogicalPlan::Join(_) => needed?.iter().cloned().for_each(&mut add),
-        // a union's inputs line up by position, not by name
-        LogicalPlan::Union(_) => return None,
-        LogicalPlan::SubqueryAlias(_) => {
-            // the alias renames the qualifier; the input's columns keep their names
-            let names: Vec<String> = needed?.iter().map(|column| column.name.clone()).collect();
-            for (qualifier, field) in input.schema().iter() {
-                if names.contains(field.name()) {
-                    add(Column::new(qualifier.cloned(), field.name()));
-                }
-            }
-        }
-        _ => {}
-    }
-    Some(
-        read.into_iter()
-            .filter(|column| input.schema().has_column(column))
-            .collect(),
-    )
 }

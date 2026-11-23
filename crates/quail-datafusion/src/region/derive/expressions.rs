@@ -249,6 +249,11 @@ pub struct PhysicalExpression {
 }
 
 impl PhysicalExpression {
+    /// The columns the expression reads.
+    fn columns(&self) -> Vec<&ColumnRef> {
+        self.expression.columns.iter().collect()
+    }
+
     /// Decode `expression` and build it over the types it names.
     ///
     /// # Errors
@@ -389,7 +394,7 @@ impl PhysicalValue {
         match self {
             Self::Column(column) => vec![column],
             Self::Field(input, _) => input.columns(),
-            Self::Expression(built) => built.expression.columns.iter().collect(),
+            Self::Expression(built) => built.columns(),
         }
     }
 

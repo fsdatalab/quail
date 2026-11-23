@@ -37,14 +37,15 @@ use crate::ai::{AiNode, Semantics};
 /// The test of `input`'s documents that an extraction node's filter
 /// implies, as the module explains, when `input` does not test it already.
 pub(crate) fn precheck(node: &AiNode, input: &LogicalPlan) -> Option<Expr> {
-    if node.function() != "ai_extract" || node.semantics != Semantics::Rows {
+    if node.function() != "ai_extract" || node.semantics() != Semantics::Rows {
         return None;
     }
-    let Expr::ScalarFunction(call) = &node.call else {
+    let Expr::ScalarFunction(call) = node.call() else {
         return None;
     };
     let document = call.args.first()?;
-    let literal = split_conjunction(node.filter.as_ref()?)
+    let filter = node.filter()?;
+    let literal = split_conjunction(&filter)
         .into_iter()
         .filter_map(|term| required_literal(term, node))
         .max_by_key(|literal| literal.chars().count())?;
@@ -79,7 +80,7 @@ fn required_literal(term: &Expr, node: &AiNode) -> Option<String> {
     };
     let reads_answer = field.name() == "get_field"
         && matches!(field.args.first(), Some(Expr::Column(column))
-            if column.relation.is_none() && column.name == node.answer);
+            if column.relation.is_none() && column.name == node.answer());
     if !reads_answer {
         return None;
     }

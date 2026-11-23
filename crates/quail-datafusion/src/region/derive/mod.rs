@@ -36,21 +36,23 @@ mod walk;
 
 use std::collections::BTreeMap;
 
-use datafusion::common::ScalarValue;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::logical_expr::{Expr, LogicalPlan};
 use quail_planner::error::{CompileError, compile_error};
-use quail_planner::expressions::{condition_text, projected_call};
+use quail_planner::expressions::projected_call;
 use quail_planner::operators::{Operators, Projection};
 use quail_planner::physical::Projected;
 use quail_planner::prompts::Turn;
+
+pub(crate) use self::relation::is_join_filter;
 
 use self::assemble::{Assembly, set_scan_columns};
 use self::binding::{Binder, Selected, output_name, unsupported};
 use self::relation::Relation;
 use self::walk::{Walk, read_fetch, read_top, with_select_list};
+use super::ModelRegion;
 use crate::ai::AiNode;
-use crate::region::ModelRegion;
+use crate::functions::options::unfolded;
 
 /// A model region's operators and the plan after DataFusion's optimizer
 /// they are read from.
@@ -71,9 +73,9 @@ pub fn derive_region(
 ) -> Result<(Operators, LogicalPlan), CompileError> {
     let plan = as_bound(region.plan.clone())
         .map_err(|error| CompileError::unsupported(error.to_string()))?;
-    if let Some(found) = crate::derive::similar::similar_calls(&plan)
+    if let Some(found) = crate::region::derive::similar::similar_calls(&plan)
         .into_iter()
-        .find(|found| found.likeness == crate::derive::similar::Likeness::Spelling)
+        .find(|found| found.likeness == crate::region::derive::similar::Likeness::Spelling)
     {
         return compile_error(found.message());
     }
@@ -101,80 +103,13 @@ pub fn derive_region(
 /// fields from the calls the query wrote.
 fn as_bound(plan: LogicalPlan) -> datafusion::common::Result<LogicalPlan> {
     plan.transform_up(|node| {
-        let Some(ai) = crate::extension::as_node::<AiNode>(&node) else {
+        let Some(ai) = crate::plan::as_node::<AiNode>(&node) else {
             return Ok(Transformed::no(node));
         };
         let ai = ai.map_expressions(|expr| Ok(unfolded(expr)))?;
-        Ok(Transformed::yes(crate::extension::extension_node(
-            ai.checked()?,
-        )))
+        Ok(Transformed::yes(crate::plan::extension_node(ai.checked()?)))
     })
     .map(|done| done.data)
-}
-
-/// `expr` with each struct or list literal in it written as the call it
-/// was folded from, as [`as_bound`] reads an `AiNode`'s expressions.
-pub(crate) fn unfolded(expr: Expr) -> Expr {
-    expr.transform_up(|inner| Ok(unfold(inner)))
-        .map(|done| done.data)
-        .expect("unfolding a literal does not fail")
-}
-
-/// `expr` as the `named_struct`, `struct`, or `make_array` call of
-/// literals it was folded from, when it is a struct or list literal.
-fn unfold(expr: Expr) -> Transformed<Expr> {
-    use datafusion::arrow::array::Array;
-    use datafusion::logical_expr::expr::ScalarFunction as Call;
-    let Expr::Literal(value, _) = &expr else {
-        return Transformed::no(expr);
-    };
-    let element = |array: &dyn Array, index: usize| {
-        ScalarValue::try_from_array(array, index)
-            .map(|value| unfold(Expr::Literal(value, None)).data)
-    };
-    match value {
-        ScalarValue::Struct(array) if array.len() == 1 => {
-            let fields = array.fields();
-            let positional = fields
-                .iter()
-                .enumerate()
-                .all(|(index, field)| *field.name() == format!("c{index}"));
-            let mut args = Vec::new();
-            for (index, field) in fields.iter().enumerate() {
-                let Ok(value) = element(array.column(index).as_ref(), 0) else {
-                    return Transformed::no(expr);
-                };
-                if !positional {
-                    args.push(Expr::Literal(
-                        ScalarValue::Utf8(Some(field.name().clone())),
-                        None,
-                    ));
-                }
-                args.push(value);
-            }
-            let function = if positional {
-                datafusion::functions::core::r#struct()
-            } else {
-                datafusion::functions::core::named_struct()
-            };
-            Transformed::yes(Expr::ScalarFunction(Call::new_udf(function, args)))
-        }
-        ScalarValue::List(array) if array.len() == 1 => {
-            let values = array.value(0);
-            let mut args = Vec::new();
-            for index in 0..values.len() {
-                let Ok(value) = element(values.as_ref(), index) else {
-                    return Transformed::no(expr);
-                };
-                args.push(value);
-            }
-            Transformed::yes(Expr::ScalarFunction(Call::new_udf(
-                datafusion::functions_nested::make_array::make_array_udf(),
-                args,
-            )))
-        }
-        _ => Transformed::no(expr),
-    }
 }
 
 /// A model region's operators, read from its plan after DataFusion's
@@ -191,11 +126,7 @@ fn derive_operators(
     let listed = with_select_list(plan);
     let top = read_top(&listed)?;
     let fetch = read_fetch(&top).ok_or_else(|| unplaced(plan))?;
-    let mut walk = Walk::default();
-    walk.visit(top.relation);
-    if let Some(error) = walk.refusal.take() {
-        return Err(error);
-    }
+    let walk = Walk::of(top.relation)?;
     let select: Vec<Expr> = top
         .projection
         .iter()
@@ -249,13 +180,7 @@ fn derive_operators(
     if columns.is_empty() {
         return unsupported("DataFusion must run a projection without output columns.");
     }
-    if let Some(test) = assembly.conditions.rows.first() {
-        // DataFusion runs a test of the result rows above the region
-        return unsupported(&format!(
-            "DataFusion must evaluate the result-row test {}.",
-            condition_text(test)
-        ));
-    }
+    assembly.check_row_tests()?;
     found.projection = Projection {
         columns: columns.iter().cloned().map(Projected::Expression).collect(),
         structs,

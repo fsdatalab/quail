@@ -4,8 +4,9 @@
 use quail_planner::constants::SPAN_SUFFIX;
 use std::collections::BTreeSet;
 
-use super::calls::{arguments, is_call, parse_options, string_literal};
+use super::calls::{arguments, is_call};
 use super::{AnswerColumn, Binder, contains, unsupported};
+use crate::functions::options::string_literal;
 use crate::functions::{sae_features_type, span_type};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
@@ -74,22 +75,6 @@ impl Binder {
             );
         }
         Ok(equality)
-    }
-
-    /// The test a `HINT` wraps and the selectivity it gives; `term` and
-    /// None without one.
-    pub(crate) fn unwrap_hint(&mut self, term: &Expr) -> Result<(Expr, Option<f64>), CompileError> {
-        if !is_call(term, "hint") {
-            return Ok((term.clone(), None));
-        }
-        let args = arguments(term);
-        if args.len() != 2 {
-            return compile_error(
-                "HINT takes a test and an option object like {'selectivity': 0.4}",
-            );
-        }
-        let options = parse_options(Some(&args[1]), &["selectivity"])?;
-        Ok((args[0].clone(), options.selectivity))
     }
 
     // ------------------------------------------------------------ conditions

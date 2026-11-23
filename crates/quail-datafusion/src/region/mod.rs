@@ -2,22 +2,21 @@
 //!
 //! - `claim`: `claim_model_regions`, which cuts each region out
 //!   of the optimized plan.
-//! - `lift`, `shared`: the operators DataFusion keeps above
-//!   a region, and the numbered rows DataFusion computes for one.
+//! - `lift`: the operators DataFusion keeps above a region.
+//! - `inputs`: the relations DataFusion computes for a region.
+//! - `derive`: a region's operators, read from its DataFusion plan.
 //! - `region_hint`: the tests above a region that may drop its rows.
 //! - `exec`: `ModelRegionExec`, which hands a region to a `RegionRunner`.
 //! - this module: the `ModelRegion` logical node.
 
 pub(crate) mod claim;
+pub mod derive;
 pub(crate) mod exec;
 pub(crate) mod filter_guard;
 pub(crate) mod identified;
 mod inputs;
-mod join;
 pub(crate) mod lift;
-mod lowering;
 pub mod region_hint;
-pub(crate) mod shared;
 pub(crate) mod stream_filters;
 mod unread;
 
@@ -27,6 +26,10 @@ use std::fmt;
 
 use datafusion::common::{DFSchemaRef, Result, internal_err};
 use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore};
+
+use crate::ai::AiNode;
+use crate::functions::is_ai_call;
+use crate::plan::as_node;
 
 /// Connected logical model work that Quail plans as one unit.
 ///
@@ -78,8 +81,12 @@ impl ModelRegion {
     pub fn summary(&self) -> String {
         let (mut calls, mut tables) = (Vec::new(), Vec::new());
         let _ = self.plan.apply(|node| {
-            if let Some(found) = crate::extension::as_node::<crate::ai::AiNode>(node) {
-                calls.extend(crate::functions::function_name(&found.call).map(str::to_string));
+            if let Some(found) = as_node::<AiNode>(node) {
+                calls.extend(
+                    Some(found.function())
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_string),
+                );
             }
             if let LogicalPlan::TableScan(scan) = node {
                 tables.push(scan.table_name.to_string());
@@ -92,6 +99,25 @@ impl ModelRegion {
             tables.join(", ")
         )
     }
+}
+
+/// Whether any operator in the subtree is an `AiNode`, or calls an AI
+/// function in its expressions or in an EXISTS or IN subquery.
+fn calls_ai(plan: &LogicalPlan) -> Result<bool> {
+    let mut found = false;
+    plan.apply_with_subqueries(|node| {
+        found = as_node::<AiNode>(node).is_some()
+            || node
+                .expressions()
+                .iter()
+                .any(|expr| expr.exists(|inner| Ok(is_ai_call(inner))).unwrap_or(false));
+        Ok(if found {
+            TreeNodeRecursion::Stop
+        } else {
+            TreeNodeRecursion::Continue
+        })
+    })?;
+    Ok(found)
 }
 
 impl UserDefinedLogicalNodeCore for ModelRegion {
