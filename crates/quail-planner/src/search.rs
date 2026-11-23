@@ -11,7 +11,7 @@ use crate::cost::quantity::Quantity;
 use crate::cost::sol::{speed_of_light, unrounded_seconds};
 use crate::cost::statistics::AliasStats;
 use crate::cost::work::{Work, ask, scan};
-use crate::physical::Prompt;
+use crate::physical::{Prompt, ValueExpression};
 
 use crate::classify::classify_work;
 use crate::columns::{ColumnSpec, column_spec};
@@ -87,8 +87,9 @@ pub struct TableStep {
     pub document_head: Vec<i64>,
     /// The columns its guard reads, which may hold another step's answers.
     pub reads: Vec<String>,
-    /// The column an ask adds with its answer, when it keeps every row
-    /// it reads; None for a column operator, whose key names its answer.
+    /// The column it adds with its answer: a column operator's name, or
+    /// an ask's answer when it keeps every row it reads. None for an ask
+    /// that drops the rows it rejects.
     pub answer: Option<String>,
 }
 
@@ -193,7 +194,9 @@ pub fn table_steps(
             later: cost.later,
             reuse_key: cost.reuse_key,
             document_head: head(prompt)?,
-            reads: Vec::new(),
+            reads: guard_reads(
+                (predicates[*position].guard.iter()).chain(&predicates[*position].alternative),
+            ),
             answer: predicates[*position].answer.clone(),
         });
     }
@@ -268,14 +271,20 @@ pub fn table_steps(
             later,
             reuse_key: None,
             document_head: head(&call.prompt)?,
-            reads: (column.guard.iter())
-                .flat_map(crate::expressions::column_references)
-                .map(|reference| reference.column)
-                .collect(),
-            answer: None,
+            reads: guard_reads(&column.guard),
+            answer: Some(column.name.clone()),
         });
     }
     Ok(steps)
+}
+
+/// The columns the conditions of a step's guard read.
+fn guard_reads<'a>(conditions: impl IntoIterator<Item = &'a ValueExpression>) -> Vec<String> {
+    conditions
+        .into_iter()
+        .flat_map(crate::expressions::column_references)
+        .map(|reference| reference.column)
+        .collect()
 }
 
 /// The classification calls a filter tests or SELECT returns, as `LabelWork.calls`.
@@ -354,17 +363,19 @@ struct Reached {
 /// `order_filters_indexed` with the steps' own residency rule.
 ///
 /// The search places units: a step, or the terms of one OR together.
-/// With at most [`MAX_EXACT_UNITS`] units it finds the order of the
-/// fewest seconds: a unit's seconds depend only on the units before it
-/// and the step right before it, so it keeps the cheapest way to reach
-/// each such pair (Selinger et al., 1979). With more units it tries
-/// each unit first and then takes the unit of the lowest rank, its
-/// seconds over the fraction of rows it spares the steps after it
-/// (Hellerstein and Stonebraker, 1993). The terms of an OR run in the
-/// order of their own rank, seconds over the fraction of rows a term
-/// passes, and the OR ranks as one filter that passes the rows any
-/// term passes. Each step is priced at the rows that reach it. A step
-/// whose guard reads another step's answers then moves after it.
+/// A unit is placed only after the units whose answers its guards read
+/// (Monma and Sidney, 1979). With at most [`MAX_EXACT_UNITS`] units it
+/// finds the order of the fewest seconds: a unit's seconds depend only
+/// on the units before it and the step right before it, so it keeps
+/// the cheapest way to reach each such pair (Selinger et al., 1979).
+/// With more units it tries each unit first and then takes the unit of
+/// the lowest rank, its seconds over the fraction of rows it spares the
+/// steps after it (Hellerstein and Stonebraker, 1993). The terms of an
+/// OR run in the order of their own rank, seconds over the fraction of
+/// rows a term passes, and the OR ranks as one filter that passes the
+/// rows any term passes. Each step is priced at the rows that reach it.
+/// The `as_written` rule keeps the written order, each unit moved after
+/// the units it reads.
 ///
 /// # Errors
 ///
@@ -376,51 +387,76 @@ pub fn order_steps(
     chunk: i64,
     context: &PlanningContext,
 ) -> Result<Vec<usize>, CompileError> {
-    let ordered = searched_order(steps, rule, count, chunk, context)?;
-    Ok(after_the_answers_read(steps, ordered))
+    let units = units(steps);
+    let reads = unit_reads(steps, &units);
+    if rule == "as_written" || steps.len() < 2 {
+        return Ok(written_order(&units, &reads));
+    }
+    searched_order(steps, &units, &reads, count, chunk, context)
 }
 
-/// `ordered` with each step moved after the steps whose answers its
-/// guard reads, the others kept in order.
-fn after_the_answers_read(steps: &[TableStep], ordered: Vec<usize>) -> Vec<usize> {
-    let answers = |step: &TableStep, read: &str| match &step.key {
-        StepKey::Name(name) => read
-            .strip_prefix(name.as_str())
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.')),
-        StepKey::Position(_) => step.answer.as_deref() == Some(read),
-    };
-    let mut placed: Vec<usize> = Vec::with_capacity(ordered.len());
-    let mut waiting: Vec<usize> = Vec::new();
-    let ready = |index: usize, placed: &[usize]| {
-        steps[index].reads.iter().all(|read| {
-            (0..steps.len())
-                .filter(|other| *other != index && answers(&steps[*other], read))
-                .all(|other| placed.contains(&other))
+/// Whether `step` adds the column `read`, or the struct it is a field of.
+fn answers(step: &TableStep, read: &str) -> bool {
+    step.answer.as_deref().is_some_and(|answer| {
+        read.strip_prefix(answer)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+    })
+}
+
+/// For each unit, the other units whose answers its steps' guards read;
+/// none for any unit when the reads form a cycle.
+fn unit_reads(steps: &[TableStep], units: &[Vec<usize>]) -> Vec<BTreeSet<usize>> {
+    let reads: Vec<BTreeSet<usize>> = units
+        .iter()
+        .enumerate()
+        .map(|(number, unit)| {
+            let read = || unit.iter().flat_map(|index| &steps[*index].reads);
+            (0..units.len())
+                .filter(|other| *other != number)
+                .filter(|other| {
+                    read().any(|read| {
+                        units[*other]
+                            .iter()
+                            .any(|index| answers(&steps[*index], read))
+                    })
+                })
+                .collect()
         })
-    };
-    for index in ordered {
-        waiting.push(index);
-        // place every waiting step whose reads are answered, in order
-        while let Some(position) = waiting.iter().position(|found| ready(*found, &placed)) {
-            placed.push(waiting.remove(position));
-        }
+        .collect();
+    if written_order_of(units.len(), &reads).len() < units.len() {
+        return vec![BTreeSet::new(); units.len()];
     }
-    // a cycle of reads keeps the order it had
-    placed.extend(waiting);
+    reads
+}
+
+/// Unit numbers in written order, each moved after the units it reads;
+/// short of every unit when the reads form a cycle.
+fn written_order_of(num_units: usize, reads: &[BTreeSet<usize>]) -> Vec<usize> {
+    let mut placed: Vec<usize> = Vec::with_capacity(num_units);
+    while let Some(next) = (0..num_units).find(|number| {
+        !placed.contains(number) && reads[*number].iter().all(|read| placed.contains(read))
+    }) {
+        placed.push(next);
+    }
     placed
+}
+
+/// The steps in written order, each unit moved after the units it reads.
+fn written_order(units: &[Vec<usize>], reads: &[BTreeSet<usize>]) -> Vec<usize> {
+    written_order_of(units.len(), reads)
+        .into_iter()
+        .flat_map(|number| units[number].iter().copied())
+        .collect()
 }
 
 fn searched_order(
     steps: &[TableStep],
-    rule: &str,
+    units: &[Vec<usize>],
+    reads: &[BTreeSet<usize>],
     count: f64,
     chunk: i64,
     context: &PlanningContext,
 ) -> Result<Vec<usize>, CompileError> {
-    let indices: Vec<usize> = (0..steps.len()).collect();
-    if rule == "as_written" || indices.len() < 2 {
-        return Ok(indices);
-    }
     let mut cache: HashMap<(usize, u64, bool), f64> = HashMap::new();
     let mut cost = |index: usize, rows: f64, first: bool| -> Result<f64, CompileError> {
         let key = (index, rows.to_bits(), first);
@@ -501,14 +537,24 @@ fn searched_order(
             }
             Ok((next, step_rank(seconds, unit_spared(steps, unit))))
         };
-    let units = units(steps);
-    let starters: Vec<&Vec<usize>> = units
-        .iter()
-        .filter(|unit| unit_spared(steps, unit) > 0.0)
-        .collect();
-    if starters.is_empty() {
-        return Ok(indices);
-    }
+    // a unit can run once every unit it reads has run
+    let ready = |number: usize, placed: &dyn Fn(usize) -> bool| {
+        !placed(number) && reads[number].iter().all(|read| placed(*read))
+    };
+    // the units the search may place first: those that can run first and
+    // spare later steps rows; without one, the written order stands
+    let starters: Vec<usize> = {
+        let first: Vec<usize> = (0..units.len())
+            .filter(|number| ready(*number, &|_| false))
+            .collect();
+        let sparing: Vec<usize> = (first.iter().copied())
+            .filter(|number| unit_spared(steps, &units[*number]) > 0.0)
+            .collect();
+        if sparing.is_empty() {
+            return Ok(written_order(units, reads));
+        }
+        sparing
+    };
     let start = Reached {
         flow: RowFlow::new(count),
         previous: None,
@@ -532,8 +578,12 @@ fn searched_order(
             };
             for before in &from {
                 for (number, unit) in units.iter().enumerate() {
-                    let first = placed == 0;
-                    if placed & (1 << number) != 0 || (first && !starters.contains(&unit)) {
+                    let allowed = if placed == 0 {
+                        starters.contains(&number)
+                    } else {
+                        ready(number, &|other| placed & (1 << other) != 0)
+                    };
+                    if !allowed {
                         continue;
                     }
                     let (next, _) = after_unit(before, unit)?;
@@ -553,22 +603,23 @@ fn searched_order(
     }
     let mut best: Option<Reached> = None;
     for first in starters {
-        let (mut reached, _) = after_unit(&start, first)?;
-        let mut remaining: Vec<&Vec<usize>> = units.iter().filter(|unit| *unit != first).collect();
-        while !remaining.is_empty() {
+        let (mut reached, _) = after_unit(&start, &units[first])?;
+        let mut placed = vec![first];
+        while placed.len() < units.len() {
             let mut choice: Option<(f64, usize, Reached)> = None;
-            for unit in &remaining {
-                let (next, candidate) = after_unit(&reached, unit)?;
-                if choice
-                    .as_ref()
-                    .is_none_or(|found| (candidate, unit[0]) < (found.0, found.1))
-                {
-                    choice = Some((candidate, unit[0], next));
+            for number in
+                (0..units.len()).filter(|number| ready(*number, &|other| placed.contains(&other)))
+            {
+                let (next, candidate) = after_unit(&reached, &units[number])?;
+                if choice.as_ref().is_none_or(|found| {
+                    (candidate, units[number][0]) < (found.0, units[found.1][0])
+                }) {
+                    choice = Some((candidate, number, next));
                 }
             }
-            let (_, selected, next) = choice.expect("a remaining unit");
+            let (_, selected, next) = choice.expect("a unit whose reads have run");
             reached = next;
-            remaining.retain(|unit| unit[0] != selected);
+            placed.push(selected);
         }
         if best.as_ref().is_none_or(|found| {
             (reached.seconds, reached.ordered[0]) < (found.seconds, found.ordered[0])
