@@ -441,3 +441,9 @@ rows 4
   r2
   r4
 """)
+
+
+def test_an_extraction_guarded_by_a_returned_ai_filter_reads_its_answer():
+    assert_transcript(_transcript(
+        f"SELECT r.id, CASE WHEN {LONG} = FALSE THEN {EXTRACT}['w'] ELSE 'none' END"
+        f" AS c0 FROM reviews r WHERE NOT {KIND}"), "")
