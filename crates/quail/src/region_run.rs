@@ -16,8 +16,8 @@ use quail_planner::error::CompileError;
 use quail_planner::expressions::column_references;
 use quail_planner::operators::Operators;
 use quail_planner::physical::{PhysicalGraph, PhysicalNode};
-use quail_planner::results::source_columns;
-use quail_planner::stages::{Stage, compute_nodes};
+use quail_planner::plan::results::source_columns;
+use quail_planner::plan::stages::{Stage, compute_nodes};
 use serde_json::{Value, json};
 
 use crate::finished::FinishedRows;

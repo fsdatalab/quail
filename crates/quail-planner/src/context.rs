@@ -7,8 +7,8 @@ use crate::cost::statistics::AliasStats;
 use crate::specs::{DeviceSpec, ModelSpec};
 
 use crate::error::CompileError;
-use crate::lowering::{Decoder, LoweredPrompt, PromptModel, Tokenizer, lower_prompt};
 use crate::operators::Operators;
+use crate::prompts::lowering::{Decoder, LoweredPrompt, PromptModel, Tokenizer, lower_prompt};
 
 /// The model, device, table statistics, and tokenizer of one query's planning.
 #[derive(Clone)]

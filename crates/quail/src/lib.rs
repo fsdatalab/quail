@@ -537,7 +537,8 @@ impl Session {
                 let planned: serde_json::Value = serde_json::from_str(&planned).map_err(read)?;
                 let request = self.runner.explain_request(&planned, verbose)?;
                 let request = serde_json::from_value(request).map_err(read)?;
-                quail_planner::explain::explain_text(&request).map_err(DataFusionError::Execution)
+                quail_planner::plan::explain::explain_text(&request)
+                    .map_err(DataFusionError::Execution)
             })
             .collect()
     }
@@ -563,7 +564,8 @@ impl Session {
             .map(|region| {
                 let request = self.runner.analyzed_request(region, verbose)?;
                 let request = serde_json::from_value(request).map_err(read)?;
-                quail_planner::explain::explain_text(&request).map_err(DataFusionError::Execution)
+                quail_planner::plan::explain::explain_text(&request)
+                    .map_err(DataFusionError::Execution)
             })
             .collect::<Result<Vec<_>>>()?;
         Ok((schema, batches, explained))

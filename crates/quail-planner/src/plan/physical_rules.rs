@@ -11,13 +11,13 @@ use crate::physical::{PhysicalGraph, PhysicalNode};
 use crate::topology::{build_pipelines, topological_nodes};
 use serde_json::{Map, Value};
 
-use crate::classify::classify_statistics;
 use crate::context::PlanningContext;
 use crate::error::CompileError;
-use crate::graph::{PhysicalPlan, Planned};
-use crate::plan_statistics::{expected_rows_after_filters, plan_statistics};
+use crate::plan::graph::{PhysicalPlan, Planned};
+use crate::plan::retention::schedule;
+use crate::pricing::classify::classify_statistics;
+use crate::pricing::plan_statistics::{expected_rows_after_filters, plan_statistics};
 use crate::pricing::{expected_documents, head_tokens, pass_question_tokens, set_pass_tokens};
-use crate::retention::schedule;
 
 /// The built-in physical rules, in the order the registry applies them.
 pub const PHYSICAL_RULES: [&str; 9] = [

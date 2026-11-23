@@ -9,13 +9,14 @@ use crate::cost::statistics::{AliasStats, int_true_divide};
 use crate::physical::Prompt;
 
 use crate::context::PlanningContext;
-use crate::costs::join_specs;
 use crate::error::{CompileError, compile_error};
 use crate::expressions::asked_call;
 use crate::expressions::repr_str;
-use crate::lowering::LoweredPrompt;
 use crate::operators::Operators;
-use crate::statistics::{OrTerm, RowFlow, effective_selectivity, row_selectivity};
+use crate::operators::effective_selectivity;
+use crate::pricing::costs::join_specs;
+use crate::pricing::statistics::{OrTerm, RowFlow, row_selectivity};
+use crate::prompts::lowering::LoweredPrompt;
 
 /// One table's document count and token sums, as `CorpusStats`.
 #[derive(Debug, Clone, Copy, PartialEq)]

@@ -10,7 +10,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyString, PyTuple};
 use quail_planner::physical::PhysicalGraph;
-use quail_planner::stages::Stage;
+use quail_planner::plan::stages::Stage;
 
 use super::{from_json, python_error};
 use crate::pyarrow::{stream_from_pyarrow, to_pyarrow};

@@ -224,7 +224,7 @@ pub fn request_tables(
         Some(found) => serde_json::from_value(found.clone()).map_err(decode)?,
         None => BTreeMap::new(),
     };
-    let facts = quail_planner::facts::region_facts(operators)?;
+    let facts = quail_planner::plan::facts::region_facts(operators)?;
     let read: BTreeMap<String, Vec<String>> =
         serde_json::from_value(facts["value_columns"].clone()).map_err(decode)?;
     let scanned = |alias: &str| {

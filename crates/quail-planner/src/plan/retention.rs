@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::cost::joins::PricedJoin;
 use serde_json::{Map, Value};
 
-use crate::statistics::thin;
+use crate::pricing::statistics::thin;
 
 /// Group consecutive full joins that share an anchor: each group's
 /// positions in the sequence.

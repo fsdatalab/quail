@@ -302,7 +302,7 @@ impl Executor {
 
     /// What the planner's explain reads of a planned region, as
     /// [`outcome_json`] writes the region: a
-    /// `quail_planner::explain::ExplainRequest` as JSON.
+    /// `quail_planner::plan::explain::ExplainRequest` as JSON.
     pub(crate) fn explain_request(
         &self,
         planned: &serde_json::Value,
@@ -858,7 +858,7 @@ impl Executor {
                     if planned.get("envelope").is_some() {
                         let request = self.explain_request(&planned, false)?;
                         let request = serde_json::from_value(request).map_err(read)?;
-                        let explained = quail_planner::explain::explain_text(&request)
+                        let explained = quail_planner::plan::explain::explain_text(&request)
                             .map_err(DataFusionError::Execution)?;
                         observer(RegionEvent::Planned {
                             explained: &explained,

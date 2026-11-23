@@ -11,12 +11,12 @@ use crate::context::PlanningContext;
 use crate::error::{CompileError, Refusal};
 use crate::expressions::asked_call;
 use crate::expressions::{aliased_call, call_aliases, repr_str};
-use crate::lowering::score_token_parts;
 use crate::operators::Operators;
-use crate::plan_statistics::plan_prompts;
+use crate::pricing::plan_statistics::plan_prompts;
+use crate::pricing::scores::prompt_aliases;
+use crate::pricing::search::label_calls;
+use crate::prompts::lowering::score_token_parts;
 use crate::prompts::prompt_layout;
-use crate::scores::prompt_aliases;
-use crate::search::label_calls;
 
 fn refusal(reason: impl Into<String>, constraint: &str) -> Refusal {
     Refusal::new(reason, constraint, 1.0, 0.0, "queries")

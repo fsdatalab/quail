@@ -26,9 +26,9 @@ use quail_planner::inputs::{
 };
 use quail_planner::operators::Operators;
 use quail_planner::operators::{Scan, ScanColumn};
-use quail_planner::optimize::Selected;
 use quail_planner::physical::ValueExpression;
-use quail_planner::placements::{Alternative, placements};
+use quail_planner::plan::optimize::Selected;
+use quail_planner::plan::placements::{Alternative, placements};
 
 /// The configuration a region is planned for.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -52,7 +52,7 @@ pub struct Settings {
     /// How a request backend, such as stock vLLM, submits its operators;
     /// None plans for Quail's backend.
     #[serde(default)]
-    pub request: Option<quail_planner::request_plan::RequestSettings>,
+    pub request: Option<quail_planner::plan::request_plan::RequestSettings>,
 }
 
 /// The rows of one table a region scans.
@@ -368,8 +368,11 @@ impl Planner {
             .iter()
             .map(|alternative| (alternative.operators.clone(), alternative.rules.clone()))
             .collect();
-        let searched =
-            quail_planner::optimize::search_plan(&operators, &context, &settings.physical_rules)?;
+        let searched = quail_planner::plan::optimize::search_plan(
+            &operators,
+            &context,
+            &settings.physical_rules,
+        )?;
         let outcome = match searched {
             Ok(selected) => PlanOutcome::Planned(Box::new(Planned {
                 operators: alternatives[selected.alternative].operators.clone(),
@@ -726,11 +729,11 @@ fn is_column(expression: &ValueExpression) -> bool {
 fn request_outcome(
     alternatives: &[Alternative],
     context: &PlanningContext,
-    request: &quail_planner::request_plan::RequestSettings,
+    request: &quail_planner::plan::request_plan::RequestSettings,
 ) -> Result<PlanOutcome, CompileError> {
     let mut found = Vec::new();
     for alternative in alternatives {
-        found.push(quail_planner::request_plan::request_plan(
+        found.push(quail_planner::plan::request_plan::request_plan(
             &alternative.operators,
             context,
             request,

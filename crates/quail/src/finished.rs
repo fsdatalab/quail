@@ -25,7 +25,9 @@ use arrow::compute::{
 use arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
 use quail_planner::expressions::{asked_call, call_aliases, column_references};
 use quail_planner::operators::Operators;
-use quail_planner::results::{answer_columns, region_columns, region_structs, source_columns};
+use quail_planner::plan::results::{
+    answer_columns, region_columns, region_structs, source_columns,
+};
 use serde_json::Value;
 
 use crate::results::{AnswerRequest, arrow_error, document_ids};

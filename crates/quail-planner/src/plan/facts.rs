@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use crate::expressions::asked_call;
 use crate::expressions::{argument_alias, call_aliases, column_name, column_references};
 use crate::operators::{Operators, ScanColumn};
-use crate::plan_statistics::plan_prompts;
+use crate::pricing::plan_statistics::plan_prompts;
 
 /// A region's facts as JSON:
 ///

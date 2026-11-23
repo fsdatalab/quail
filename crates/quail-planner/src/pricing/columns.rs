@@ -16,8 +16,8 @@ use serde::Serialize;
 use crate::context::PlanningContext;
 use crate::error::{CompileError, Refusal, compile_error};
 use crate::expressions::{argument_alias, column_name, repr_str};
-use crate::lowering::read_slot_offsets;
 use crate::operators::SemanticColumn;
+use crate::prompts::lowering::read_slot_offsets;
 use crate::prompts::prompt_layout;
 
 /// A column operator's spec.
@@ -120,8 +120,11 @@ fn extract_spec(
         let alias = argument_alias(&call.prompt.args[0]);
         let summary = AliasStats::summarize(context.lengths(&alias)?, model.sliding_window);
         let layout = prompt_layout(&model.prompt_layout)?;
-        let (state_tail, question_header) =
-            crate::lowering::set_question_parts(&prompt, &model.prompt_layout, context.tokenizer)?;
+        let (state_tail, question_header) = crate::prompts::lowering::set_question_parts(
+            &prompt,
+            &model.prompt_layout,
+            context.tokenizer,
+        )?;
         let head = prompt.preamble_token_ids.len() as i64;
         let tail = prompt.tail_token_ids.len() as i64;
         let work = packed(

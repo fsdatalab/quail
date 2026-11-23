@@ -11,9 +11,9 @@ use crate::physical::{Prompt, ScoreSpec};
 use crate::context::PlanningContext;
 use crate::error::CompileError;
 use crate::expressions::{argument_alias, column_name};
-use crate::lowering::{lower_prompt, score_query_template, score_token_parts};
+use crate::pricing::statistics::pair_counts;
+use crate::prompts::lowering::{lower_prompt, score_query_template, score_token_parts};
 use crate::prompts::{bind_prompt, prompt_layout};
-use crate::statistics::pair_counts;
 
 /// A prompt's table aliases in placeholder order.
 pub fn prompt_aliases(prompt: &Prompt) -> Vec<String> {
@@ -88,7 +88,7 @@ pub fn set_score_parts(
         &bind_prompt(&prompt.template, &prompt.args, &turn, &layout)?,
         context.tokenizer,
     )?;
-    crate::lowering::set_question_parts(&lowered, &model.prompt_layout, context.tokenizer)
+    crate::prompts::lowering::set_question_parts(&lowered, &model.prompt_layout, context.tokenizer)
 }
 
 /// A score's spec and its work, as `score_spec`.

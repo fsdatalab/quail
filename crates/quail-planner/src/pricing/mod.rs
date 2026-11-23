@@ -1,8 +1,23 @@
+//! Price a query: each AI operator's statistics, cost, and spec
+//! (`classify`, `columns`, `scores`), each table step's cost and the
+//! search that orders steps and joins by it (`costs`, `search`,
+//! `plan_statistics`, `statistics`), a physical plan's price (this
+//! module), and the speed of light estimate (`sol`).
+//!
 //! Price a physical plan: each node on its own, and the plan as a whole.
 //!
 //! Every node's price is its work. The plan's seconds are the seconds
 //! of all that work together, packed into forward passes, so node
 //! seconds do not add up to the plan's.
+
+pub mod classify;
+pub mod columns;
+pub mod costs;
+pub mod plan_statistics;
+pub mod scores;
+pub mod search;
+pub mod sol;
+pub mod statistics;
 
 use std::collections::BTreeMap;
 
@@ -16,11 +31,11 @@ use crate::physical::{AiFilterAttributes, PhysicalNode};
 use crate::topology::{build_pipelines, resident_inputs};
 use serde_json::{Map, Value};
 
-use crate::classify::classify_statistics;
-use crate::columns::{answer_cost, extract_inputs, map_cost};
 use crate::context::PlanningContext;
 use crate::error::CompileError;
-use crate::plan_statistics::CorpusStats;
+use crate::pricing::classify::classify_statistics;
+use crate::pricing::columns::{answer_cost, extract_inputs, map_cost};
+use crate::pricing::plan_statistics::CorpusStats;
 use crate::prompts::prompt_layout;
 
 /// One node's price: its packed work, or its own estimated seconds.

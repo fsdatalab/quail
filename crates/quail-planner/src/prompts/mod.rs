@@ -4,6 +4,8 @@
 //! arguments into a `Prompt`: the text before the document, the text
 //! after it, and the pieces the planner tokenizes on their own.
 
+pub mod lowering;
+
 use crate::constants::{LABEL_PREFIX, MAX_LETTERS};
 use std::collections::BTreeMap;
 

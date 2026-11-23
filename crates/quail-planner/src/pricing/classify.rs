@@ -17,7 +17,7 @@ use serde_json::Value;
 use crate::context::PlanningContext;
 use crate::error::{CompileError, Refusal};
 use crate::expressions::{argument_alias, column_name, repr_str};
-use crate::lowering::{
+use crate::prompts::lowering::{
     LoweredPrompt, Tokenizer, choice_token_parts, classify_prompt_tokens, lower_prompt,
     option_spellings,
 };
@@ -531,8 +531,11 @@ impl ClassifyTable {
     ) -> Result<(ClassifySpec, Work), CompileError> {
         let head = lowered.preamble_token_ids.clone();
         let tail = lowered.tail_token_ids.clone();
-        let (state_tail, question_header) =
-            crate::lowering::set_question_parts(lowered, &self.model.prompt_layout, tokenizer)?;
+        let (state_tail, question_header) = crate::prompts::lowering::set_question_parts(
+            lowered,
+            &self.model.prompt_layout,
+            tokenizer,
+        )?;
         let need = head.len() as i64 + self.longest + tail.len() as i64;
         if need > self.chunk {
             return over_budget(

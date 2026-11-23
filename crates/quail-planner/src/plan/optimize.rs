@@ -5,9 +5,9 @@ use serde_json::{Map, Value};
 
 use crate::context::PlanningContext;
 use crate::error::{CompileError, Refusal};
-use crate::graph::{PhysicalPlan, Planned, plan_region};
 use crate::operators::Operators;
-use crate::physical_rules::apply_plan_rules;
+use crate::plan::graph::{PhysicalPlan, Planned, plan_region};
+use crate::plan::physical_rules::apply_plan_rules;
 
 /// The selected plan and the index of the alternative it lowers.
 pub struct Selected {
@@ -95,7 +95,7 @@ pub fn search_plan(
         .insert("candidates".into(), Value::Array(comparison));
     if plan.backend == "quail" {
         let graph = plan.envelope().graph;
-        let cut = crate::stages::stages(&graph, context.gpus.max(1) as usize)
+        let cut = crate::plan::stages::stages(&graph, context.gpus.max(1) as usize)
             .map_err(CompileError::new)?;
         let cut =
             serde_json::to_value(cut).map_err(|error| CompileError::new(error.to_string()))?;

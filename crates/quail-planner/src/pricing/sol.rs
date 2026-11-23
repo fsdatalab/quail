@@ -25,15 +25,15 @@ use crate::context::PlanningContext;
 use crate::error::CompileError;
 use crate::expressions::asked_call;
 use crate::expressions::{aliased_call, call_aliases, condition_columns, condition_text, repr_str};
-use crate::lowering::LoweredPrompt;
+use crate::operators::predicate_asked_fraction;
 use crate::operators::{Operators, SemanticColumn};
-use crate::plan_statistics::plan_prompts;
-use crate::prompts::prompt_layout;
-use crate::search::{
+use crate::pricing::plan_statistics::plan_prompts;
+use crate::pricing::search::{
     ASK, StepKey, StepPricing, default_order_rule, label_calls, order_steps, resident_after,
     table_steps,
 };
-use crate::statistics::predicate_asked_fraction;
+use crate::prompts::lowering::LoweredPrompt;
+use crate::prompts::prompt_layout;
 
 const FILTER: &str = "AI.IF";
 const CLASSIFY: &str = "AI.CLASSIFY";

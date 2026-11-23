@@ -14,20 +14,18 @@ use crate::cost::work::{Work, ask, scan};
 use crate::physical::Prompt;
 
 use crate::context::PlanningContext;
-pub use crate::costs::StepCost;
-use crate::costs::{prepare_filter_costs, question_tokens};
 use crate::error::CompileError;
 use crate::expressions::asked_call;
 use crate::expressions::{call_aliases, repr_str};
 use crate::operators::{Operators, SemanticColumn};
-use crate::plan_statistics::{
+use crate::operators::{effective_selectivity, predicate_asked_fraction};
+pub use crate::pricing::costs::StepCost;
+use crate::pricing::costs::{prepare_filter_costs, question_tokens};
+use crate::pricing::plan_statistics::{
     PlanStatistics, expected_rows_after_filters, filtered_before_joins, plan_statistics,
 };
-use crate::scores::score_join_work;
-use crate::statistics::{
-    OrTerm, RowFlow, cross_tuples, effective_selectivity, predicate_asked_fraction,
-    surviving_documents, thin,
-};
+use crate::pricing::scores::score_join_work;
+use crate::pricing::statistics::{OrTerm, RowFlow, cross_tuples, surviving_documents, thin};
 
 pub const ASK: &str = "ask";
 

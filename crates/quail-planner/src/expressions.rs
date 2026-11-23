@@ -573,3 +573,16 @@ mod tests {
         assert_eq!(repr_str("a\nb"), "'a\\nb'");
     }
 }
+
+#[cfg(test)]
+mod repr_tests {
+    use crate::expressions::repr_str;
+
+    #[test]
+    fn a_repr_escapes_what_python_does_not_print() {
+        assert_eq!(repr_str("a\u{a0}b"), "'a\\xa0b'");
+        assert_eq!(repr_str("\u{200b}"), "'\\u200b'");
+        assert_eq!(repr_str("café — ok"), "'café — ok'");
+        assert_eq!(repr_str("it's"), "\"it's\"");
+    }
+}

@@ -63,7 +63,7 @@ pub(crate) fn reads_call_table(test: &Expr, node: &AiNode) -> bool {
 /// each term taken as independent.
 pub(crate) fn guard_selectivity(guard: &Expr, answers: &[(String, Option<f64>)]) -> f64 {
     use datafusion::logical_expr::{BinaryExpr, Operator};
-    use quail_planner::statistics::effective_selectivity;
+    use quail_planner::operators::effective_selectivity;
     match guard {
         Expr::IsNotTrue(inner) | Expr::Not(inner) => 1.0 - guard_selectivity(inner, answers),
         Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::And => {

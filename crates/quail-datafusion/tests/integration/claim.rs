@@ -315,12 +315,12 @@ async fn a_projected_ai_if_returns_a_boolean_without_filtering_rows() -> Result<
                 .all(|scan| !scan.columns.contains(answer))
         );
         assert!(
-            quail_planner::results::source_columns(&operators)
+            quail_planner::plan::results::source_columns(&operators)
                 .iter()
                 .all(|(name, _)| name != answer)
         );
         assert!(
-            quail_planner::results::answer_columns(&operators)
+            quail_planner::plan::results::answer_columns(&operators)
                 .iter()
                 .any(|(name, _, kind, _, _)| name == answer && kind == "boolean")
         );

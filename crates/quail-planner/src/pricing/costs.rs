@@ -10,15 +10,15 @@ use crate::cost::work::Work;
 use crate::cost::work::filter_work;
 use crate::physical::{Equality, FilterPredicate, Prompt};
 
-use crate::classify::classify_work;
-use crate::columns::{ColumnSpec, column_spec};
 use crate::context::PlanningContext;
 use crate::error::{CompileError, compile_error};
 use crate::expressions::asked_call;
 use crate::expressions::{argument_alias, column_name};
-use crate::lowering::LoweredPrompt;
 use crate::operators::{SemanticColumn, SemanticJoin};
-use crate::scores::{prompt_aliases, score_statistics};
+use crate::pricing::classify::classify_work;
+use crate::pricing::columns::{ColumnSpec, column_spec};
+use crate::pricing::scores::{prompt_aliases, score_statistics};
+use crate::prompts::lowering::LoweredPrompt;
 
 /// A step's work as a function of the documents it reads.
 #[derive(Debug, Clone, PartialEq)]
@@ -135,7 +135,7 @@ pub fn prepare_filter_costs(
         } else {
             let question = question_tokens(&context.lowered(&call.prompt)?, model.canvas_tokens)?;
             // a guarded filter asks the model about its guard's rows alone
-            let asked = crate::statistics::predicate_asked_fraction(predicate);
+            let asked = crate::operators::predicate_asked_fraction(predicate);
             let cost = |fresh: bool| {
                 StepCost::PerDocument(Box::new(
                     &filter_work(question, mean_tokens, model, fresh) * asked,
@@ -144,7 +144,7 @@ pub fn prepare_filter_costs(
             (cost(true), cost(false), None)
         };
         prepared.push(PredicateCost {
-            selectivity: crate::statistics::row_selectivity(predicate),
+            selectivity: crate::pricing::statistics::row_selectivity(predicate),
             first,
             later,
             reuse_key,

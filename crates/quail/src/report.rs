@@ -13,7 +13,7 @@ use arrow::compute::{cast, concat_batches, take_record_batch};
 use arrow::row::{RowConverter, SortField};
 use datafusion::common::Result;
 use quail_planner::physical::{PhysicalGraph, PhysicalNode, ValueType};
-use quail_planner::stages::compute_nodes;
+use quail_planner::plan::stages::compute_nodes;
 use quail_planner::topology::topological_nodes;
 use serde_json::{Map, Value, json};
 

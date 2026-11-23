@@ -12,15 +12,15 @@ use crate::topology::port;
 use serde::Serialize;
 
 use crate::context::PlanningContext;
-use crate::costs::{join_specs, prepare_filter_costs};
 use crate::error::CompileError;
 use crate::expressions::asked_call;
 use crate::expressions::repr_str;
-use crate::graph::hash_join_nodes;
 use crate::operators::Operators;
-use crate::plan_statistics::CorpusStats;
-use crate::search::{StepKey, TableStep, default_order_rule, order_steps, search_joins};
-use crate::statistics::effective_selectivity;
+use crate::operators::effective_selectivity;
+use crate::plan::graph::hash_join_nodes;
+use crate::pricing::costs::{join_specs, prepare_filter_costs};
+use crate::pricing::plan_statistics::CorpusStats;
+use crate::pricing::search::{StepKey, TableStep, default_order_rule, order_steps, search_joins};
 
 /// One table's documents and tokens, before and after its scan's tests.
 #[derive(Debug, Clone, Serialize)]

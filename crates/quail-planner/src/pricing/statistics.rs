@@ -1,14 +1,9 @@
 //! Survivor and pair counts, and the arena's size.
 
-use crate::constants::DEFAULT_SELECTIVITY;
+use crate::operators::effective_selectivity;
 use std::collections::BTreeMap;
 
 use crate::cost::joins::PricedJoin;
-
-/// The selectivity the planner uses: the given one or the default.
-pub fn effective_selectivity(selectivity: Option<f64>) -> f64 {
-    selectivity.unwrap_or(DEFAULT_SELECTIVITY)
-}
 
 /// The fraction of the rows an AI filter reads that it passes: every row
 /// for a filter that returns its answer, else its selectivity.
@@ -104,24 +99,6 @@ impl RowFlow {
             self.undecided.insert(term.disjunction.clone(), undecided);
         }
     }
-}
-
-/// The fraction of the rows a model node reads that it asks about: the
-/// guard's estimated selectivity, the default selectivity for a guard
-/// without an estimate, and every row without a guard.
-pub fn guarded_fraction(
-    guard: Option<&crate::physical::ValueExpression>,
-    selectivity: Option<f64>,
-) -> f64 {
-    match guard {
-        Some(_) => effective_selectivity(selectivity),
-        None => 1.0,
-    }
-}
-
-/// The fraction of the rows an AI filter reads that it asks about.
-pub fn predicate_asked_fraction(predicate: &crate::physical::FilterPredicate) -> f64 {
-    guarded_fraction(predicate.guard.as_ref(), predicate.guard_selectivity)
 }
 
 /// Expected documents with at least one matching tuple.

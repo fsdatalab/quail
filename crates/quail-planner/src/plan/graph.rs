@@ -16,27 +16,28 @@ use crate::physical::{
 use crate::topology::{input_ports, port};
 use serde_json::{Map, Value};
 
-use crate::classify::classify_statistics;
-use crate::columns::{ColumnSpec, column_spec};
 use crate::context::PlanningContext;
-use crate::costs::question_tokens;
 use crate::error::{CompileError, Refusal};
 use crate::expressions::asked_call;
 use crate::expressions::{argument_alias, call_aliases, condition_columns, repr_str};
 use crate::operators::{ColumnTest, Operators, SemanticColumn};
+use crate::operators::{effective_selectivity, predicate_asked_fraction};
+use crate::plan::results::limit_node;
+use crate::plan::retention::{group_sequence, streamed_aliases};
+use crate::plan::validation::{
+    columns_above_joins, has_score, is_score, score_projections, validate_query,
+};
 use crate::pricing::PlanPricer;
-use crate::prompts::prompt_layout;
-use crate::results::limit_node;
-use crate::retention::{group_sequence, streamed_aliases};
-use crate::scores::score_spec;
-use crate::search::{
+use crate::pricing::classify::classify_statistics;
+use crate::pricing::columns::{ColumnSpec, column_spec};
+use crate::pricing::costs::question_tokens;
+use crate::pricing::scores::score_spec;
+use crate::pricing::search::{
     ASK, OperatorOrder, StepKey, TableStep, choose_operator_order, column_step_kind, label_calls,
     resident_after,
 };
-use crate::statistics::{RowFlow, effective_selectivity, pair_counts, predicate_asked_fraction};
-use crate::validation::{
-    columns_above_joins, has_score, is_score, score_projections, validate_query,
-};
+use crate::pricing::statistics::{RowFlow, pair_counts};
+use crate::prompts::prompt_layout;
 
 /// A physical plan: its graph, settings, and estimates, as `PhysicalPlan`.
 #[derive(Debug, Clone)]
@@ -1689,7 +1690,7 @@ pub fn bind_runtime_data(
         }
     }
     let (true_ids, false_ids) =
-        crate::lowering::answer_ids(&context.prompt_model(), context.tokenizer)?;
+        crate::prompts::lowering::answer_ids(&context.prompt_model(), context.tokenizer)?;
     plan.settings.insert(
         "true_ids".into(),
         Value::Array(true_ids.into_iter().map(Value::from).collect()),
