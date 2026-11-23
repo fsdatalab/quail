@@ -87,6 +87,9 @@ pub struct TableStep {
     pub document_head: Vec<i64>,
     /// The columns its guard reads, which may hold another step's answers.
     pub reads: Vec<String>,
+    /// The column an ask adds with its answer, when it keeps every row
+    /// it reads; None for a column operator, whose key names its answer.
+    pub answer: Option<String>,
 }
 
 impl TableStep {
@@ -191,6 +194,7 @@ pub fn table_steps(
             reuse_key: cost.reuse_key,
             document_head: head(prompt)?,
             reads: Vec::new(),
+            answer: predicates[*position].answer.clone(),
         });
     }
     let mut tests: Vec<(String, Vec<f64>)> = Vec::new();
@@ -268,6 +272,7 @@ pub fn table_steps(
                 .flat_map(crate::expressions::column_references)
                 .map(|reference| reference.column)
                 .collect(),
+            answer: None,
         });
     }
     Ok(steps)
@@ -382,7 +387,7 @@ fn after_the_answers_read(steps: &[TableStep], ordered: Vec<usize>) -> Vec<usize
         StepKey::Name(name) => read
             .strip_prefix(name.as_str())
             .is_some_and(|rest| rest.is_empty() || rest.starts_with('.')),
-        StepKey::Position(_) => false,
+        StepKey::Position(_) => step.answer.as_deref() == Some(read),
     };
     let mut placed: Vec<usize> = Vec::with_capacity(ordered.len());
     let mut waiting: Vec<usize> = Vec::new();

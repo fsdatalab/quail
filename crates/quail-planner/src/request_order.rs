@@ -136,6 +136,7 @@ pub fn request_order(
                 reuse_key: cost.reuse_key,
                 document_head: Vec::new(),
                 reads: Vec::new(),
+                answer: None,
             })
             .collect();
         filter_orders.insert(

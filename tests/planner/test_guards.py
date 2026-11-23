@@ -443,7 +443,14 @@ rows 4
 """)
 
 
-def test_an_extraction_guarded_by_a_returned_ai_filter_reads_its_answer():
-    assert_transcript(_transcript(
-        f"SELECT r.id, CASE WHEN {LONG} = FALSE THEN {EXTRACT}['w'] ELSE 'none' END"
-        f" AS c0 FROM reviews r WHERE NOT {KIND}"), "")
+def test_an_extraction_guarded_by_a_returned_ai_filter_runs_after_the_filter():
+    # on this table, the cost search places the extraction before the AI filter
+    reviews = pa.table({
+        "id": [f"r{index}" for index in range(9)],
+        "body": [f"Globex acme b{index}" for index in range(8)] + [None],
+    })
+    with Transcripts({"reviews": reviews}, _answers()) as runs:
+        transcript = runs.query(
+            f"SELECT r.id, CASE WHEN {LONG} = FALSE THEN {EXTRACT}['w'] ELSE 'none'"
+            f" END AS c0 FROM reviews r WHERE NOT {KIND}")
+    assert_transcript(transcript, "")
