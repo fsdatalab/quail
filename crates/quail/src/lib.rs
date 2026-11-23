@@ -534,7 +534,13 @@ impl QueryRun {
                     }
                     _ => datafusion::dataframe::DataFrame::new(state, plan),
                 };
-                let schema = quail_schema(frame.logical_plan());
+                let dialect = frame
+                    .task_ctx()
+                    .session_config()
+                    .options()
+                    .sql_parser
+                    .dialect;
+                let schema = quail_schema(frame.logical_plan(), &query, dialect);
                 let mut batches = frame.execute_stream().await?;
                 if out.send(Streamed::Schema(Arc::clone(&schema))).is_err() {
                     return Ok(());

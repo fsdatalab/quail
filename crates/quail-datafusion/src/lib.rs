@@ -13,9 +13,13 @@ use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::common::{Result, ScalarValue};
+use datafusion::config::Dialect;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::context::{SessionConfig, SessionContext, SessionState};
 use datafusion::logical_expr::{Expr, LogicalPlan};
+use datafusion::sql::sqlparser::ast::{SelectItem, SetExpr, Statement as SqlStatement};
+use datafusion::sql::sqlparser::dialect::dialect_from_str;
+use datafusion::sql::sqlparser::parser::Parser;
 
 pub use extension::QuailExtension;
 pub use functions::field_access::StructFieldAccess;
@@ -157,13 +161,50 @@ fn computed_by<'a>(plan: &'a LogicalPlan, name: &str) -> Option<(&'a Expr, &'a L
     }
 }
 
-pub fn quail_schema(plan: &LogicalPlan) -> SchemaRef {
+pub fn quail_schema(plan: &LogicalPlan, query: &str, dialect: Dialect) -> SchemaRef {
+    let aliases = select_aliases(query, dialect);
     let fields: Vec<Field> = plan
         .schema()
         .fields()
         .iter()
         .zip(quail_column_names(plan))
-        .map(|(field, name)| field.as_ref().clone().with_name(name))
+        .enumerate()
+        .map(|(index, (field, name))| {
+            let written = aliases
+                .get(index)
+                .and_then(Option::as_deref)
+                .filter(|alias| alias.eq_ignore_ascii_case(field.name()));
+            let name = match written {
+                Some(alias) if matches!(dialect, Dialect::BigQuery) => alias.to_string(),
+                Some(_) => field.name().clone(),
+                None => name,
+            };
+            field.as_ref().clone().with_name(name)
+        })
         .collect();
     Arc::new(Schema::new(fields))
+}
+
+fn select_aliases(query: &str, dialect: Dialect) -> Vec<Option<String>> {
+    let Some(parser_dialect) = dialect_from_str(dialect.to_string().to_lowercase()) else {
+        return Vec::new();
+    };
+    let Ok(statements) = Parser::parse_sql(parser_dialect.as_ref(), query) else {
+        return Vec::new();
+    };
+    let [SqlStatement::Query(query)] = statements.as_slice() else {
+        return Vec::new();
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Vec::new();
+    };
+    let mut aliases = Vec::new();
+    for item in &select.projection {
+        match item {
+            SelectItem::ExprWithAlias { alias, .. } => aliases.push(Some(alias.value.clone())),
+            SelectItem::UnnamedExpr(_) => aliases.push(None),
+            _ => return Vec::new(),
+        }
+    }
+    aliases
 }
