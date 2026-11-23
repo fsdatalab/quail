@@ -92,8 +92,6 @@ def region_query(session, operators: str, *, tables: dict | None = None,
             if found is not None and keep_order:
                 rows[name] = found
             elif found is not None:
-                # DataFusion scans in parallel; the region reads the rows in
-                # the table's order
                 order = pc.sort_indices(found)
                 table, rows[name] = table.take(order), pc.take(found, order)
         else:

@@ -1,5 +1,3 @@
-//! Planned anchor reuse at each execution boundary.
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cost::joins::PricedJoin;
@@ -7,8 +5,6 @@ use serde_json::{Map, Value};
 
 use crate::pricing::statistics::thin;
 
-/// Group consecutive full joins that share an anchor: each group's
-/// positions in the sequence.
 pub fn group_sequence(sequence: &[(PricedJoin, String)]) -> Vec<Vec<usize>> {
     let mut groups: Vec<Vec<usize>> = Vec::new();
     for (index, (spec, anchor)) in sequence.iter().enumerate() {
@@ -25,8 +21,6 @@ pub fn group_sequence(sequence: &[(PricedJoin, String)]) -> Vec<Vec<usize>> {
     groups
 }
 
-/// The aliases whose filter sequence feeds the join anchored on it, as
-/// `streamed_aliases`.
 pub fn streamed_aliases(
     sequence: &[(PricedJoin, String)],
     groups: &[Vec<usize>],
@@ -53,8 +47,6 @@ pub fn streamed_aliases(
     streamed
 }
 
-/// The next anchor use and conditional survival at each boundary, as
-/// `schedule`: {"initial", "before", "after"}.
 pub fn schedule(
     sequence: &[(PricedJoin, String)],
     expected_rows: &BTreeMap<String, f64>,

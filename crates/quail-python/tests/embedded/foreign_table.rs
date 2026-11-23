@@ -1,7 +1,3 @@
-//! A table another library exports through DataFusion's FFI, as
-//! datafusion-python's table protocol hands it over, answers an AI
-//! filter in a Python session.
-
 use std::sync::Arc;
 
 use datafusion::arrow::array::{RecordBatch, StringArray};
@@ -12,8 +8,6 @@ use datafusion_ffi::table_provider::FFI_TableProvider;
 use pyo3::prelude::*;
 use pyo3::types::{PyCapsule, PyModule};
 
-/// A table with `__datafusion_table_provider__`, as Delta Lake and
-/// Iceberg export one.
 #[pyclass]
 struct Exported {
     table: Arc<MemTable>,
@@ -29,7 +23,6 @@ impl Exported {
         let codec = session.call_method0("__datafusion_logical_extension_codec__")?;
         let codec = codec.cast::<PyCapsule>()?;
         let pointer = codec.pointer_checked(Some(c"datafusion_logical_extension_codec"))?;
-        // the session's capsule keeps its codec; the table takes a clone
         let codec = unsafe { &*pointer.as_ptr().cast::<FFI_LogicalExtensionCodec>() }.clone();
         let provider =
             FFI_TableProvider::new_with_ffi_codec(Arc::clone(&self.table) as _, false, None, codec);
@@ -37,7 +30,6 @@ impl Exported {
     }
 }
 
-/// Registers `reviews` and returns the ids the oracle keeps for `q1:`.
 const QUERY: &std::ffi::CStr = c"
 from helpers.oracle import Oracle, oracle_executor
 from helpers.sessions import CONFIG, TOKENIZER

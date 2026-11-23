@@ -483,7 +483,8 @@ def test_sql_around_a_region_runs_in_datafusion():
 --- SELECT r.id FROM reviews r WHERE AI_FILTER(PROMPT('q1: {0}', r.body)) UNION ALL
     SELECT a.id FROM aspects a ORDER BY id ---
 plan
-  __quail_answer_1 = ai_filter('q1: {0}', r.body), filter: __quail_answer_1, returns: []
+  __quail_answer_1 = ai_filter('q1: {0}', r.body), inline_predicate: __quail_answer_1,
+      returns: []
 asked 4 of 4
   'q1: {0}': r0 TRUE, r1 FALSE, r2 TRUE, r3 TRUE
 columns id string
@@ -498,9 +499,10 @@ rows 5, in order
     r.body)) ORDER BY r.id LIMIT 2) SELECT r.id FROM kept r WHERE AI_FILTER(PROMPT('q2:
     {0}', r.body)) ORDER BY r.id ---
 plan
-  __quail_answer_2 = ai_filter('q2: {0}', r.column_1), filter: __quail_answer_2,
+  __quail_answer_2 = ai_filter('q2: {0}', r.column_1), inline_predicate:
+      __quail_answer_2, returns: []
+  __quail_answer_1 = ai_filter('q1: {0}', r.body), inline_predicate: __quail_answer_1,
       returns: []
-  __quail_answer_1 = ai_filter('q1: {0}', r.body), filter: __quail_answer_1, returns: []
 asked 6 of 6
   'q1: {0}': r0 TRUE, r1 FALSE, r2 TRUE, r3 TRUE
   'q2: {0}': r0 TRUE, r2 FALSE
@@ -510,7 +512,8 @@ rows 1, in order
 --- SELECT r.id FROM reviews__archive r WHERE r.stars > 1 AND AI_FILTER(PROMPT('q1:
     {0}', r.body)) ---
 plan
-  __quail_answer_1 = ai_filter('q1: {0}', r.body), filter: __quail_answer_1, returns: []
+  __quail_answer_1 = ai_filter('q1: {0}', r.body), inline_predicate: __quail_answer_1,
+      returns: []
 asked 3 of 3
   'q1: {0}': r0 TRUE, r1 FALSE, r2 TRUE
 rows 2
@@ -522,8 +525,8 @@ rows 2
     contracts c WHERE AI.EXTRACT_SPAN(c.text, {'end': 'q6: When does it
     end?'})['end']['start'] < 15 ---
 plan
-  lease = ai_extract(c.text, named_struct('end', 'q6: When does it end?')), filter:
-      get_field(lease_span, 'end', 'start') < Int32(15)
+  lease = ai_extract(c.text, named_struct('end', 'q6: When does it end?')),
+      inline_predicate: get_field(lease_span, 'end', 'start') < Int32(15)
 asked 3 of 3
   'q6: When does it end?': c0 '2027', c1 '2030', c2 NULL
 columns c.id string, lease struct<end: string>, lease_span struct<end: struct<start:
@@ -589,7 +592,8 @@ rows 4
 --- SELECT r.id, v.id FROM r JOIN v ON r.id = v.rid AND AI.IF(PROMPT('q: {0}', r.body))
     ---
 plan
-  __quail_call_1 = ai_filter('q: {0}', r.body), filter: __quail_call_1, returns: []
+  __quail_call_1 = ai_filter('q: {0}', r.body), inline_predicate: __quail_call_1,
+      returns: []
 asked 2 of 2
   'q: {0}': r0 TRUE, r1 TRUE
 rows 2
@@ -630,8 +634,8 @@ rows 2
 --- SELECT v.id FROM v WHERE EXISTS (SELECT 1 FROM r WHERE r.id = v.rid AND
     AI.IF(PROMPT('q: {0}', r.body))) ---
 plan
-  __quail_answer_1 = ai_filter('q: {0}', r.body), filter: __quail_answer_1, fetch: 1 per
-      [id], returns: []
+  __quail_answer_1 = ai_filter('q: {0}', r.body), inline_predicate: __quail_answer_1,
+      row_limit: 1 per [id], returns: []
 asked 2 of 2
   'q: {0}': r0 TRUE, r1 TRUE
 rows 2
@@ -641,7 +645,8 @@ rows 2
 --- SELECT v.id FROM v WHERE NOT EXISTS (SELECT 1 FROM r WHERE r.id = v.rid AND
     AI.IF(PROMPT('q: {0}', r.body))) ---
 plan
-  __quail_answer_1 = ai_filter('q: {0}', r.body), filter: __quail_answer_1, returns: []
+  __quail_answer_1 = ai_filter('q: {0}', r.body), inline_predicate: __quail_answer_1,
+      returns: []
 asked 2 of 2
   'q: {0}': r0 TRUE, r1 TRUE
 rows 1
@@ -650,7 +655,8 @@ rows 1
 --- SELECT v.id, (SELECT COUNT(*) FROM r WHERE r.id = v.rid AND AI.IF(PROMPT('q: {0}',
     r.body))) AS n FROM v ---
 plan
-  __quail_answer_1 = ai_filter('q: {0}', r.body), filter: __quail_answer_1, returns: []
+  __quail_answer_1 = ai_filter('q: {0}', r.body), inline_predicate: __quail_answer_1,
+      returns: []
 asked 2 of 2
   'q: {0}': r0 TRUE, r1 TRUE
 rows 3
@@ -677,7 +683,8 @@ def test_a_join_filter_keeps_a_document_while_it_keeps_one_of_its_copies(
 --- SELECT r.id, d.id FROM r JOIN d ON r.id = d.rid WHERE r.stars >= 2 AND
     AI.IF(PROMPT('ok? {0}', d.name)) ---
 plan
-  __quail_answer_1 = ai_filter('ok? {0}', d.name), filter: __quail_answer_1, returns: []
+  __quail_answer_1 = ai_filter('ok? {0}', d.name), inline_predicate: __quail_answer_1,
+      returns: []
 asked 3 of 3
   'ok? {0}': d0/d2 TRUE, d1 TRUE, d3 TRUE
 rows 3
@@ -708,8 +715,8 @@ def test_a_test_of_a_null_documents_label_keeps_the_null_row():
 --- SELECT r.id FROM r WHERE AI.CLASSIFY(PROMPT('q: {0}', r.body), ['a', 'b']) IS NULL
     ---
 plan
-  __quail_column_1 = ai_classify('q: {0}', r.body, make_array('a', 'b')), filter:
-      __quail_column_1 IS NULL
+  __quail_column_1 = ai_classify('q: {0}', r.body, make_array('a', 'b')),
+      inline_predicate: __quail_column_1 IS NULL
 asked 1 of 1
   'q: {0}': r0 'a'
 rows 1
@@ -741,7 +748,8 @@ rows 2
 
 --- SELECT r.id FROM r WHERE AI.IF(PROMPT('q: {0}', r.body)) ---
 plan
-  __quail_answer_1 = ai_filter('q: {0}', r.body), filter: __quail_answer_1, returns: []
+  __quail_answer_1 = ai_filter('q: {0}', r.body), inline_predicate: __quail_answer_1,
+      returns: []
 asked 1 of 1
   'q: {0}': r0 TRUE
 rows 1
@@ -749,8 +757,8 @@ rows 1
 
 --- SELECT r.id FROM r WHERE NOT AI.IF(PROMPT('q: {0}', r.body)) ---
 plan
-  __quail_answer_1 = ai_filter('q: {0}', r.body), filter: NOT __quail_answer_1, returns:
-      []
+  __quail_answer_1 = ai_filter('q: {0}', r.body), inline_predicate: NOT
+      __quail_answer_1, returns: []
 asked 1 of 1
   'q: {0}': r0 TRUE
 rows 0

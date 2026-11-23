@@ -1,11 +1,3 @@
-//! Tables two processes share through a file both map.
-//!
-//! The writer puts a table in a file once, as an Arrow IPC file, and
-//! sends the reader the file's path. The reader maps the file and reads
-//! batches whose buffers are the mapped pages: no byte of the table
-//! goes through a socket, and the reader copies none. A file in
-//! `/dev/shm` is memory only.
-
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
@@ -22,26 +14,16 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::{DataFusionError, Result};
 use memmap2::Mmap;
 
-/// A table's schema and batches.
 pub type Table = (SchemaRef, Vec<RecordBatch>);
 
-/// The bytes after an IPC file's footer: the footer's length and the
-/// magic string.
 const TRAILER: usize = 10;
 
-/// The alignment Arrow asks of every buffer, which a mapped file keeps
-/// because a mapping starts on a page.
 const ALIGNMENT: usize = 64;
 
 fn failure(error: impl std::fmt::Display) -> DataFusionError {
     DataFusionError::Execution(error.to_string())
 }
 
-/// Write a table to a new file at `path`.
-///
-/// # Errors
-///
-/// The file exists or does not write.
 pub fn write_table(path: &Path, (schema, batches): &Table) -> Result<()> {
     let file = File::create_new(path)?;
     let options = IpcWriteOptions::try_new(ALIGNMENT, false, MetadataVersion::V5)?;
@@ -53,17 +35,8 @@ pub fn write_table(path: &Path, (schema, batches): &Table) -> Result<()> {
     Ok(())
 }
 
-/// Read the table at `path` over the file's mapped pages; the pages
-/// live as long as a batch reads them. `remove` removes the file's
-/// name, for a table no other process reads.
-///
-/// # Errors
-///
-/// The file does not open or map, or is not an Arrow IPC file.
 pub fn read_table(path: &Path, remove: bool) -> Result<Table> {
     let file = File::open(path)?;
-    // the writer finished the file before it sent its path, and no one
-    // writes it again
     let mapped = unsafe { Mmap::map(&file) }?;
     if remove {
         std::fs::remove_file(path)?;
@@ -71,7 +44,6 @@ pub fn read_table(path: &Path, remove: bool) -> Result<Table> {
     let length = mapped.len();
     let start = NonNull::new(mapped.as_ptr().cast_mut())
         .ok_or_else(|| failure("a shared table mapped at no address"))?;
-    // the buffer owns the mapping, so the pages outlive every batch
     let buffer = unsafe { Buffer::from_custom_allocation(start, length, Arc::new(mapped)) };
     let malformed = || failure("a shared table is not an Arrow IPC file");
     let trailer = length.checked_sub(TRAILER).ok_or_else(malformed)?;
@@ -79,7 +51,6 @@ pub fn read_table(path: &Path, remove: bool) -> Result<Table> {
     let footer_start = trailer.checked_sub(footer_length).ok_or_else(malformed)?;
     let footer = root_as_footer(&buffer[footer_start..trailer]).map_err(failure)?;
     let schema = Arc::new(fb_to_schema(footer.schema().ok_or_else(malformed)?));
-    // a misaligned buffer is an error, not a silent copy
     let mut decoder =
         FileDecoder::new(Arc::clone(&schema), footer.version()).with_require_alignment(true);
     let block = |offset: i64, metadata: i32, body: i64| -> Result<Buffer> {
@@ -142,7 +113,6 @@ mod tests {
         assert_eq!(found, schema);
         assert_eq!(batches, vec![batch]);
         assert!(!path.exists());
-        // each buffer lies inside one mapping the size of the file
         let ids = batches[0].column(0).to_data();
         let text = batches[0].column(1).to_data();
         let starts: Vec<usize> = [&ids.buffers()[0], &text.buffers()[0], &text.buffers()[1]]

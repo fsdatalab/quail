@@ -1,7 +1,3 @@
-//! What a region returns: the columns its rows hold, as its operators
-//! name them, and the Limit of the region's fetch that a physical plan
-//! ends with.
-
 use crate::constants::{PROBABILITIES_SUFFIX, SPAN_SUFFIX};
 use crate::physical::{
     LimitAttributes, ModelCall, Node, PhysicalNode, PortRef, Projected, ValueExpression,
@@ -14,15 +10,8 @@ use crate::expressions::{
 };
 use crate::operators::Operators;
 
-/// A column a model call adds: its name, the call's table aliases, kind,
-/// and labels, and whether it is the call's answer.
 pub type AnswerColumn = (String, Vec<String>, String, Value, bool);
 
-/// The columns of a region's rows, in order, before struct packing.
-///
-/// Each SELECT list column, then a label's probabilities and an
-/// extraction's spans, when the SELECT list returns them, after the
-/// column they belong to.
 pub fn region_columns(found: &Operators) -> Vec<String> {
     let mut columns = Vec::new();
     for column in &found.projection.columns {
@@ -44,13 +33,10 @@ pub fn region_columns(found: &Operators) -> Vec<String> {
     columns
 }
 
-/// The struct columns of a region's rows: (struct column, [(field,
-/// member column)]).
 pub fn region_structs(found: &Operators) -> Vec<(String, Vec<(String, String)>)> {
     packing(&found.projection.structs, &found.projection.spans)
 }
 
-/// Each region column a source expression computes, by name.
 pub fn source_columns(found: &Operators) -> Vec<(String, ValueExpression)> {
     let answers = found.filter_answers();
     let projected = found
@@ -80,9 +66,6 @@ pub fn source_columns(found: &Operators) -> Vec<(String, ValueExpression)> {
     found
 }
 
-/// Each column a model call adds: its name, the call's aliases, kind,
-/// and labels, and whether it is the call's answer, not a label's
-/// probabilities or an answer's span.
 pub fn answer_columns(found: &Operators) -> Vec<AnswerColumn> {
     let mut columns: Vec<AnswerColumn> = Vec::new();
     let mut put = |name: String, call: &ModelCall, answer: bool| {
@@ -138,8 +121,6 @@ pub fn answer_columns(found: &Operators) -> Vec<AnswerColumn> {
     columns
 }
 
-/// The Limit of the region's fetch, reading the region's rows at
-/// `input`; `should_push_down_limit` stops the model at it.
 pub fn limit_node(found: &Operators, input: &PortRef) -> Option<PhysicalNode> {
     found.fetch.map(|count| {
         PhysicalNode::Limit(Node {

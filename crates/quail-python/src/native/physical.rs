@@ -1,15 +1,3 @@
-//! Quail's physical plan types for Python: the nodes, their specs, ports,
-//! and expressions of `quail_planner::physical`.
-//!
-//! Every class is the same mechanism over a Rust value. A constructor
-//! takes the fields Python names, fills the defaults the class table
-//! gives, and reads the result as the Rust type, which refuses a missing,
-//! unknown, or mistyped field. An instance's attributes are filled into
-//! its `__dict__` on first access: plain JSON values become Python values,
-//! with arrays as tuples, and tagged values become instances of their
-//! classes. Derived attributes, such as a node's outputs, come from the
-//! Rust methods that the planner uses.
-
 use quail_planner::constants as shared;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,12 +15,8 @@ use serde_json::{Map, Value};
 
 const EXPRESSIONS: &str = "quail.common.expressions";
 
-/// One field of a class: its name, and its default as JSON, or None when
-/// the caller must give it.
 type Field = (&'static str, Option<&'static str>);
 
-/// A Python class over a Rust value: its name, its JSON tag, and its
-/// fields in positional order.
 struct Kind {
     class: &'static str,
     tag: &'static str,
@@ -137,7 +121,7 @@ static KINDS: &[Kind] = &[
             "document_head" = EMPTY, "share_prefixes" = NO, "attention" = S,
             "stop_key" = EMPTY, "pass_group" = Some("-1"), "state_tail_tokens" = ZERO,
             "question_header_token_ids" = EMPTY, "document_ends" = EMPTY,
-            "num_key_survivors" = Some("1"), "guard" = NONE, "alternative" = NONE,
+            "num_key_survivors" = Some("1"), "precondition" = NONE, "alternative" = NONE,
             "answer" = NONE, "negated" = NO, "disjunction" = NONE,
             "short_circuit" = NO, "closes_disjunction" = NO),
     },
@@ -158,27 +142,27 @@ static KINDS: &[Kind] = &[
         class: "AiClassify",
         tag: "quail.ai_classify",
         node: true,
-        fields: fields!(NODE, MODEL_NODE; "guard" = NONE),
+        fields: fields!(NODE, MODEL_NODE; "precondition" = NONE),
     },
     Kind {
         class: "AiExtract",
         tag: "quail.ai_extract",
         node: true,
-        fields: fields!(NODE, MODEL_NODE; "attention" = S, "guard" = NONE,
+        fields: fields!(NODE, MODEL_NODE; "attention" = S, "precondition" = NONE,
             "stop_tests" = EMPTY, "stop_when_true" = NO),
     },
     Kind {
         class: "AiMap",
         tag: "quail.ai_map",
         node: true,
-        fields: fields!(NODE, MODEL_NODE; "attention" = S, "guard" = NONE,
+        fields: fields!(NODE, MODEL_NODE; "attention" = S, "precondition" = NONE,
             "stop_tests" = EMPTY, "stop_when_true" = NO),
     },
     Kind {
         class: "AiSaeFeatures",
         tag: "quail.ai_sae_features",
         node: true,
-        fields: fields!(NODE, MODEL_NODE; "guard" = NONE),
+        fields: fields!(NODE, MODEL_NODE; "precondition" = NONE),
     },
     Kind {
         class: "Barrier",
@@ -383,8 +367,8 @@ static KINDS: &[Kind] = &[
         class: "FilterPredicate",
         tag: "quail.common.expressions.FilterPredicate",
         node: false,
-        fields: fields!(; "expression" = REQUIRED, "selectivity" = NONE, "guard" = NONE,
-            "alternative" = NONE, "answer" = NONE, "guard_selectivity" = NONE,
+        fields: fields!(; "expression" = REQUIRED, "selectivity" = NONE, "precondition" = NONE,
+            "alternative" = NONE, "answer" = NONE, "precondition_selectivity" = NONE,
             "negated" = NO, "disjunction" = NONE, "short_circuit" = NO),
     },
     Kind {
@@ -408,13 +392,10 @@ fn kind_of_class(class: &str) -> &'static Kind {
         .expect("every class has a kind")
 }
 
-/// Whether `tag` names a class of this module.
 pub(super) fn is_known_tag(tag: &str) -> bool {
     kind_of_value(tag).is_some()
 }
 
-/// The kind a JSON tag names, including a tag from before the
-/// expressions moved from `quail.logical.expressions`.
 fn kind_of_value(tag: &str) -> Option<&'static Kind> {
     let moved = tag
         .strip_prefix("quail.logical.expressions.")
@@ -423,8 +404,6 @@ fn kind_of_value(tag: &str) -> Option<&'static Kind> {
     KINDS.iter().find(|kind| kind.tag == tag)
 }
 
-/// What an instance holds: a node, as Rust's planner reads it, or any
-/// other value, as its JSON with its tag.
 enum Held {
     Node(Arc<physical::PhysicalNode>),
     Value(Value),
@@ -444,8 +423,6 @@ fn round<T: Serialize + DeserializeOwned>(value: Value) -> Result<Value, String>
     serde_json::to_value(typed).map_err(|error| error.to_string())
 }
 
-/// Read a tagged value as its Rust type and write it back: the value
-/// with its canonical tag, or why it does not read.
 fn canonical(kind: &Kind, value: Value) -> Result<Value, String> {
     use physical::*;
     let name = kind.class;
@@ -473,8 +450,6 @@ fn canonical(kind: &Kind, value: Value) -> Result<Value, String> {
     }
 }
 
-// ------------------------------------------------------------- Python enums
-
 static VALUE_TYPE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static LOCATION: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static ENUM: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
@@ -498,7 +473,6 @@ fn python_enum<'py>(
     Ok(found.bind(py))
 }
 
-/// The value a port carries: `ValueType.ROWS` and the others.
 fn value_type(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
     python_enum(
         py,
@@ -516,7 +490,6 @@ fn value_type(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
     )
 }
 
-/// Where a node runs: `ExecutionLocation.COORDINATOR` or `GPU_EXECUTOR`.
 fn location(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
     python_enum(
         py,
@@ -529,10 +502,6 @@ fn location(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
     )
 }
 
-// --------------------------------------------------------------- conversion
-
-/// A JSON value as Python: arrays as tuples, tagged objects as instances
-/// of their classes, and other objects as dicts.
 pub fn to_python<'py>(py: Python<'py>, value: &Value) -> PyResult<Bound<'py, PyAny>> {
     Ok(match value {
         Value::Null => py.None().into_bound(py),
@@ -583,8 +552,6 @@ pub fn to_python<'py>(py: Python<'py>, value: &Value) -> PyResult<Bound<'py, PyA
     })
 }
 
-/// A Python value as JSON: the inverse of [`to_python`], which also
-/// reads enums by their value and NumPy scalars by their item.
 pub fn from_python(value: &Bound<'_, PyAny>) -> PyResult<Value> {
     let py = value.py();
     if value.is_none() {
@@ -640,16 +607,10 @@ pub fn from_python(value: &Bound<'_, PyAny>) -> PyResult<Value> {
     )))
 }
 
-// ---------------------------------------------------------------- the base
-
-/// The base of every class: a Rust value and the attributes filled from
-/// it on first access.
 #[pyclass(name = "Tagged", module = "quail.physical", subclass, dict, frozen)]
 pub struct Tagged {
     held: Held,
     filled: AtomicBool,
-    /// A value or condition built for evaluation when the object is
-    /// made; None for any other value and for one a model answers.
     physical: Option<PhysicalValue>,
 }
 
@@ -678,7 +639,6 @@ impl Tagged {
         })
     }
 
-    /// The node `object` holds; an error for any other object.
     pub(super) fn held_node(object: &Bound<'_, PyAny>) -> PyResult<Arc<physical::PhysicalNode>> {
         match &object.cast::<Tagged>()?.get().held {
             Held::Node(node) => Ok(Arc::clone(node)),
@@ -688,13 +648,11 @@ impl Tagged {
         }
     }
 
-    /// The value `object` holds, read as `T`; an error for any other object.
     pub(super) fn held_value<T: DeserializeOwned>(object: &Bound<'_, PyAny>) -> PyResult<T> {
         serde_json::from_value(object.cast::<Tagged>()?.get().held.json())
             .map_err(|error| PyTypeError::new_err(error.to_string()))
     }
 
-    /// The names of the instance's fields, in its constructor's order.
     fn field_order(slf: &Bound<'_, Self>) -> PyResult<Vec<String>> {
         Ok(match kind_of_object(slf.as_any())? {
             Some(kind) => kind
@@ -709,7 +667,6 @@ impl Tagged {
         })
     }
 
-    /// Fill the instance's `__dict__` from its value, once.
     fn fill(slf: &Bound<'_, Self>) -> PyResult<()> {
         let tagged = slf.get();
         if tagged.filled.load(Ordering::Acquire) {
@@ -725,7 +682,6 @@ impl Tagged {
         Ok(())
     }
 
-    /// Write a node's fields, and those derived from them, into `dict`.
     fn fill_node(
         py: Python<'_>,
         dict: &Bound<'_, PyDict>,
@@ -796,7 +752,6 @@ impl Tagged {
         Ok(())
     }
 
-    /// Write a value's fields, and those derived from them, into `dict`.
     fn fill_value(py: Python<'_>, dict: &Bound<'_, PyDict>, value: &Value) -> PyResult<()> {
         let Value::Object(map) = value else {
             return Ok(());
@@ -864,7 +819,6 @@ impl Tagged {
                 dict.set_item("prompt", to_python(py, &prompt)?)?;
             }
             "ColumnRef" | "GetField" | "Alias" | "Expression" => {
-                // the columns the executor gathers to evaluate the value
                 let expression: physical::ValueExpression =
                     serde_json::from_value(value.clone())
                         .map_err(|error| PyValueError::new_err(error.to_string()))?;
@@ -882,10 +836,8 @@ impl Tagged {
     }
 }
 
-/// The classes whose values DataFusion evaluates.
 const EVALUATED: [&str; 4] = ["ColumnRef", "GetField", "Alias", "Expression"];
 
-/// Whether a value asks the model anywhere.
 fn asks_model(value: &physical::ValueExpression) -> bool {
     match value {
         physical::ValueExpression::ModelCall(_) => true,
@@ -895,8 +847,6 @@ fn asks_model(value: &physical::ValueExpression) -> bool {
     }
 }
 
-/// A column name for Python, rejecting unnamed model calls before the
-/// planner's column-name helper assumes the expression has a name.
 fn expression_name(expression: &physical::ValueExpression) -> PyResult<String> {
     match expression {
         physical::ValueExpression::ModelCall(_) => {
@@ -911,8 +861,6 @@ fn expression_name(expression: &physical::ValueExpression) -> PyResult<String> {
     }
 }
 
-/// A value of a class DataFusion evaluates, built for evaluation; None
-/// for another value or one that asks the model.
 fn physical_value(value: &Value) -> PyResult<Option<PhysicalValue>> {
     let class = value
         .get("type")
@@ -932,7 +880,6 @@ fn physical_value(value: &Value) -> PyResult<Option<PhysicalValue>> {
         .map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
-/// Quail's `CompileError` with a message.
 fn compile_error(py: Python<'_>, message: String) -> PyErr {
     match py
         .import(EXPRESSIONS)
@@ -946,7 +893,6 @@ fn compile_error(py: Python<'_>, message: String) -> PyErr {
     }
 }
 
-/// Evaluate a value's built form over rows, as `evaluate` documents.
 fn evaluate_rows<'py>(
     object: &Bound<'py, PyAny>,
     rows: &Bound<'py, PyAny>,
@@ -963,7 +909,6 @@ fn evaluate_rows<'py>(
     let rows = if rows.hasattr("__arrow_c_stream__")? {
         rows.clone()
     } else {
-        // an object that reads its columns by name, such as a scan's input
         let columns = PyDict::new(py);
         for column in built.columns() {
             let name = column.name(qualified);
@@ -1002,7 +947,6 @@ fn kind_of_object(object: &Bound<'_, PyAny>) -> PyResult<Option<&'static Kind>> 
     Ok(KINDS.iter().find(|kind| kind.class == class))
 }
 
-/// The fields of a held value as its constructor takes them.
 fn constructor_fields(held: &Held) -> Map<String, Value> {
     let value = held.json();
     let Value::Object(mut map) = value else {
@@ -1016,7 +960,6 @@ fn constructor_fields(held: &Held) -> Map<String, Value> {
         if let Some(Value::Object(attributes)) = map.remove("attributes") {
             fields.extend(attributes);
         }
-        // an extension node's own fields
         fields.extend(map);
         return fields;
     }
@@ -1027,7 +970,6 @@ fn tuple_of<'py, T: AsRef<str>>(py: Python<'py>, items: &[T]) -> PyResult<Bound<
     PyTuple::new(py, items.iter().map(AsRef::as_ref))
 }
 
-/// Read the constructor's arguments as fields, by position then by name.
 fn given_fields(
     kind: &Kind,
     args: &Bound<'_, PyTuple>,
@@ -1058,7 +1000,6 @@ fn given_fields(
     Ok(given)
 }
 
-/// The value a class's fields describe, read as its Rust type.
 fn build(kind: &Kind, mut given: Map<String, Value>) -> PyResult<Held> {
     let mut fields = Map::new();
     for (name, default) in kind.fields {
@@ -1098,7 +1039,6 @@ fn build(kind: &Kind, mut given: Map<String, Value>) -> PyResult<Held> {
         .map_err(|error| PyValueError::new_err(format!("{}: {error}", kind.class)))
 }
 
-/// An extension node's value from its constructor's fields.
 fn build_extension(mut given: Map<String, Value>) -> PyResult<Held> {
     let mut take = |name: &str, default: Value| given.remove(name).unwrap_or(default);
     let type_name = take("type_name", Value::Null);
@@ -1189,7 +1129,6 @@ impl Tagged {
         Ok(format!("{}({})", slf.get_type().name()?, parts.join(", ")))
     }
 
-    /// Return a copy with the given fields replaced.
     #[pyo3(signature = (**changes))]
     fn replace<'py>(
         slf: &Bound<'py, Self>,
@@ -1228,7 +1167,6 @@ impl Tagged {
         }
     }
 
-    /// The value as JSON, as plans write it.
     fn to_json(&self) -> String {
         self.held.json().to_string()
     }
@@ -1269,21 +1207,15 @@ impl Tagged {
     }
 }
 
-// --------------------------------------------------------------- the classes
-
-/// The base class of every physical node.
 #[pyclass(name = "PhysicalNode", module = "quail.physical", extends = Tagged, subclass, frozen)]
 pub struct NodeBase;
 
-/// The base class of the model nodes that carry a spec.
 #[pyclass(name = "AiInference", module = "quail.physical", extends = NodeBase, subclass, frozen)]
 pub struct AiInference;
 
-/// The base class of the specs of model nodes.
 #[pyclass(name = "InferenceSpec", module = "quail.physical", extends = Tagged, subclass, frozen)]
 pub struct InferenceSpec;
 
-/// The base class of a request backend's answer specs.
 #[pyclass(name = "RequestAnswerSpec", module = "quail.physical", extends = Tagged, subclass, frozen)]
 pub struct RequestAnswerSpec;
 
@@ -1356,11 +1288,6 @@ leaf_classes! {
     Barrier = "Barrier": NodeBase [NodeBase] {},
     HashJoin = "HashJoin": NodeBase [NodeBase] {},
     AiJoin = "AiJoin": NodeBase [NodeBase] {
-    /// Return which anchors the join keeps, given whether each matched.
-    ///
-    /// An anti join keeps the anchors that matched none; any other join
-    /// keeps those that matched. `matched` is a bool or a NumPy bool
-    /// array.
     fn keeps<'py>(slf: &Bound<'py, Self>, matched: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         let node = Tagged::held_node(slf.as_any())?;
         let physical::PhysicalNode::AiJoin(join) = node.as_ref() else {
@@ -1376,7 +1303,6 @@ leaf_classes! {
     RequestExecution = "RequestExecution": NodeBase [NodeBase] {},
     AiScore = "AiScore": AiInference [NodeBase, AiInference] {},
     AiClassify = "AiClassify": AiInference [NodeBase, AiInference] {
-    /// Return whether this classification reads the join's surviving pairs.
     fn classifies_join(slf: &Bound<'_, Self>, join: &Bound<'_, PyAny>) -> PyResult<bool> {
         Ok(Tagged::held_node(slf.as_any())?.classifies_join(Tagged::held_node(join)?.as_ref()))
     }
@@ -1387,7 +1313,6 @@ leaf_classes! {
     ScoreSpec = "ScoreSpec": InferenceSpec [InferenceSpec] {},
     ClassifySpec = "ClassifySpec": InferenceSpec [InferenceSpec] {},
     ExtractSpec = "ExtractSpec": InferenceSpec [InferenceSpec] {
-    /// Return whether two extractions can use the same decoder.
     fn same_decoding(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<bool> {
         let one: physical::ExtractSpec = Tagged::held_value(slf.as_any())?;
         let two: physical::ExtractSpec = Tagged::held_value(other)?;
@@ -1406,26 +1331,6 @@ leaf_classes! {
     OutputPort = "OutputPort": Tagged [] {},
     AnswerOutput = "AnswerOutput": Tagged [] {},
     ColumnRef = "ColumnRef": Tagged [] {
-    /// Evaluate the value over rows with DataFusion.
-    ///
-    /// The value was built when this object was made; this only reads
-    /// its columns and evaluates it.
-    ///
-    /// Args:
-    ///     rows: A table or record batch holding the columns it reads,
-    ///         or an object that reads them with ``column(name)``, such
-    ///         as a scan's input.
-    ///     qualified: Whether the rows name each column with its table
-    ///         alias, as result rows do.
-    ///
-    /// Returns:
-    ///     One value per row; a condition's are booleans, null where
-    ///     SQL's three-valued logic leaves a row unknown.
-    ///
-    /// Raises:
-    ///     CompileError: The rows lack a column the value reads, hold it
-    ///         with another type than the plan gives it, or DataFusion
-    ///         cannot evaluate the value.
     #[pyo3(signature = (rows, qualified=false))]
     fn evaluate<'py>(
         slf: &Bound<'py, Self>,
@@ -1436,26 +1341,6 @@ leaf_classes! {
     }
     },
     GetField = "GetField": Tagged [] {
-    /// Evaluate the value over rows with DataFusion.
-    ///
-    /// The value was built when this object was made; this only reads
-    /// its columns and evaluates it.
-    ///
-    /// Args:
-    ///     rows: A table or record batch holding the columns it reads,
-    ///         or an object that reads them with ``column(name)``, such
-    ///         as a scan's input.
-    ///     qualified: Whether the rows name each column with its table
-    ///         alias, as result rows do.
-    ///
-    /// Returns:
-    ///     One value per row; a condition's are booleans, null where
-    ///     SQL's three-valued logic leaves a row unknown.
-    ///
-    /// Raises:
-    ///     CompileError: The rows lack a column the value reads, hold it
-    ///         with another type than the plan gives it, or DataFusion
-    ///         cannot evaluate the value.
     #[pyo3(signature = (rows, qualified=false))]
     fn evaluate<'py>(
         slf: &Bound<'py, Self>,
@@ -1466,26 +1351,6 @@ leaf_classes! {
     }
     },
     Expression = "Expression": Tagged [] {
-    /// Evaluate the value over rows with DataFusion.
-    ///
-    /// The value was built when this object was made; this only reads
-    /// its columns and evaluates it.
-    ///
-    /// Args:
-    ///     rows: A table or record batch holding the columns it reads,
-    ///         or an object that reads them with ``column(name)``, such
-    ///         as a scan's input.
-    ///     qualified: Whether the rows name each column with its table
-    ///         alias, as result rows do.
-    ///
-    /// Returns:
-    ///     One value per row; a condition's are booleans, null where
-    ///     SQL's three-valued logic leaves a row unknown.
-    ///
-    /// Raises:
-    ///     CompileError: The rows lack a column the value reads, hold it
-    ///         with another type than the plan gives it, or DataFusion
-    ///         cannot evaluate the value.
     #[pyo3(signature = (rows, qualified=false))]
     fn evaluate<'py>(
         slf: &Bound<'py, Self>,
@@ -1495,24 +1360,6 @@ leaf_classes! {
         evaluate_rows(slf.as_any(), rows, qualified)
     }
 
-    /// Decide the condition on a partial answer.
-    ///
-    /// Args:
-    ///     answer: The name of the column that holds the answer.
-    ///     prefix: The answer's text so far.
-    ///     complete: Whether the answer is complete.
-    ///     may_be_null: Whether the answer may still be NULL.
-    ///     tails: The texts the answer may go on with, each cut
-    ///         anywhere, or None for any text.
-    ///     max_chars: The most characters the answer may add, or None.
-    ///
-    /// Returns:
-    ///     ``"true"`` when the condition is TRUE for every complete
-    ///     answer still possible, ``"not true"`` when it is TRUE for
-    ///     none, and ``"undecided"`` otherwise.
-    ///
-    /// Raises:
-    ///     CompileError: The expression does not decode.
     #[pyo3(signature = (answer, prefix, complete=false, may_be_null=false, tails=None, max_chars=None))]
     #[allow(clippy::too_many_arguments)]
     fn decide(
@@ -1545,26 +1392,6 @@ leaf_classes! {
     }
     },
     Alias = "Alias": Tagged [] {
-    /// Evaluate the value over rows with DataFusion.
-    ///
-    /// The value was built when this object was made; this only reads
-    /// its columns and evaluates it.
-    ///
-    /// Args:
-    ///     rows: A table or record batch holding the columns it reads,
-    ///         or an object that reads them with ``column(name)``, such
-    ///         as a scan's input.
-    ///     qualified: Whether the rows name each column with its table
-    ///         alias, as result rows do.
-    ///
-    /// Returns:
-    ///     One value per row; a condition's are booleans, null where
-    ///     SQL's three-valued logic leaves a row unknown.
-    ///
-    /// Raises:
-    ///     CompileError: The rows lack a column the value reads, hold it
-    ///         with another type than the plan gives it, or DataFusion
-    ///         cannot evaluate the value.
     #[pyo3(signature = (rows, qualified=false))]
     fn evaluate<'py>(
         slf: &Bound<'py, Self>,
@@ -1576,7 +1403,6 @@ leaf_classes! {
     },
     Prompt = "Prompt": Tagged [] {},
     ModelCall = "ModelCall": Tagged [] {
-    /// Return the table aliases the prompt reads, in placeholder order.
     fn aliases<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyTuple>> {
         let call: physical::ValueExpression = Tagged::held_value(slf.as_any())?;
         let physical::ValueExpression::ModelCall(call) = call else {
@@ -1599,10 +1425,6 @@ leaf_classes! {
     ExtractStruct = "ExtractStruct": Tagged [] {},
 }
 
-/// A node of a type an extension registers.
-///
-/// It names its type, inputs, and outputs, the backend of a model node,
-/// and where it runs; its other keyword arguments are its attributes.
 #[pyclass(name = "ExtensionNode", module = "quail.physical", extends = NodeBase, frozen)]
 pub struct ExtensionNode;
 
@@ -1654,7 +1476,6 @@ fn create<'py>(py: Python<'py>, class: &str, held: Held) -> PyResult<Bound<'py, 
     create_class(py, class, held)
 }
 
-/// The Python object of a node.
 pub(super) fn node_object(
     py: Python<'_>,
     node: Arc<physical::PhysicalNode>,
@@ -1667,7 +1488,6 @@ pub(super) fn node_object(
     create(py, kind.class, Held::Node(node))
 }
 
-/// Add the classes, the enums, and the functions to the module.
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = module.py();
     module.add_class::<Tagged>()?;

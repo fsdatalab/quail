@@ -169,8 +169,6 @@ def joined_labels(state, node, join) -> NodeResult:
     rows = np.zeros((0, 2), dtype=np.int32)
     values = np.zeros(0, dtype=object)
     if passes.states:
-        # every pass's question rows, in pass order, and their pairs: an
-        # anchor's passes cover its kept partners in order
         logits = np.concatenate([np.asarray(value, dtype=np.float64)
                                  for value in passes.values])
         chosen = option_probabilities(

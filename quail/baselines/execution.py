@@ -48,7 +48,7 @@ class RequestModelExecution:
         self.sampling_params = settings["sampling_params"]
         self.documents = settings["documents"]
         self.document_texts = settings.get("document_texts", {})
-        self.pairs = {}         # written position -> pair table, from ports
+        self.pairs = {}
         true_ids = set(settings["true_ids"])
         if context.model.canvas_tokens == 1:
             self.read_answer = partial(
@@ -103,7 +103,6 @@ class RequestModelExecution:
                 position = int(port.source.port.split(":", 1)[1])
                 self.pairs[position] = inputs[port.name]
         started = time.perf_counter()
-        # the scans supply the documents their regular predicates kept
         survivors = {
             alias: list(range(len(self.documents[alias])))
             for alias in node.aliases
@@ -112,7 +111,6 @@ class RequestModelExecution:
             if port.source.port.startswith("rows:"):
                 alias = port.source.port.split(":", 1)[1]
                 if alias in survivors:
-                    # the request steps grow and reorder these lists
                     survivors[alias] = id_positions(inputs[port.name]).tolist()
         outputs = {}
         steps = []
@@ -234,8 +232,6 @@ class RequestModelExecution:
                     token_list(node.preamble_token_ids)
                     + token_list(self.documents[spec.alias][document])
                     for document in document_ids])
-            # a document whose answer names no label has no label row
-            # and leaves the query
             labels = classification_rows(
                 spec, {spec.alias: document_ids}, result["labels"])
             outputs[f"label_answers:{spec.output}"] = labels
@@ -336,7 +332,6 @@ class RequestModelExecution:
                 suffixes.append(suffix)
                 if suffix_texts is not None:
                     suffix_texts.append(suffix_text + spec.tail_text)
-            # a join over pairs asks each anchor about its own members
             allowed = None
             request_pairs = None
             if spec.written_position in self.pairs:
@@ -418,8 +413,6 @@ class RequestModelExecution:
         for spec in node.classifies:
             if spec.partner is None:
                 continue
-            # the rows the join kept, each decoded as anchor, note,
-            # partner block, and the question
             answers = outputs[f"join_answers:{spec.join_written_position}"]
             kept = answers.filter(answer_values(answers))
             pairs = list(zip(kept.column(spec.alias).to_pylist(),

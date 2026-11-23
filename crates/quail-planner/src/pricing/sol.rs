@@ -1,12 +1,3 @@
-//! The speed of light estimate of one query: every distinct document prefix computed once and kept
-//! without limit, passes packed across the query, and exact survivors
-//! from the caller's answer and label oracles.
-//!
-//! The data the estimate reads from the tables (token counts, the pairs
-//! each join's equality conditions keep, stop key values) and the
-//! oracles come from the caller, as do the tests of reference answers,
-//! which Arrow evaluates.
-
 use crate::constants::SPAN_SUFFIX;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -43,38 +34,22 @@ const ANSWER_TEST: &str = "ANSWER TEST";
 const FEATURES: &str = "AI.SAE_FEATURES";
 const MAP: &str = "AI.MAP";
 
-/// A row assignment: each alias in a prompt and one of its row indexes.
 pub type Assignment = [(String, i64)];
 
-/// The reference label of a classification for one assignment.
 pub type LabelOracle<'a> = dyn Fn(&Prompt, &Assignment) -> Result<String, CompileError> + 'a;
-/// Which answers a one-column condition accepts.
 pub type Accepts<'a> = dyn Fn(&ValueExpression, &[Value]) -> Result<Vec<bool>, CompileError> + 'a;
-/// Per document of an alias, the shared prefix tokens when only some rows compute.
 pub type SubsetShared<'a> = dyn Fn(&str, &[i64]) -> Result<Vec<i64>, CompileError> + 'a;
-/// alias -> (row, the partner rows its equality conditions keep).
 pub type AllowedPairs = BTreeMap<String, Vec<(i64, Vec<i64>)>>;
-/// row -> its partner rows.
 type Partners = BTreeMap<i64, BTreeSet<i64>>;
-/// Each alias's (partner label, anchor frame) tokens.
 type LabelCounts = BTreeMap<String, (i64, i64)>;
 
-/// The oracles and table callbacks the estimate calls.
 pub struct Oracles<'a> {
-    /// The exact answer of a prompt for one assignment: a filter's or
-    /// join's bool, an extraction's text, a list of spans, or null, a
-    /// map's text.
     pub answer: &'a dyn Fn(&Prompt, &Assignment) -> Result<Value, CompileError>,
-    /// The reference label of a classification for one assignment.
     pub label: Option<&'a LabelOracle<'a>>,
-    /// Which answers a one-column condition accepts.
     pub accepts: &'a Accepts<'a>,
-    /// Per document of an alias, the shared prefix tokens when only the
-    /// given rows compute.
     pub subset_shared: &'a SubsetShared<'a>,
 }
 
-/// One scanned alias's column and documents.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AliasData {
     pub alias: String,
@@ -83,15 +58,10 @@ pub struct AliasData {
     pub shared: Vec<i64>,
 }
 
-/// What the estimate reads from the query's tables.
 #[derive(Debug, Clone, Deserialize)]
 pub struct EstimateInputs {
     pub aliases: Vec<AliasData>,
-    /// alias -> each row's stop key value, for aliases whose filters stop
-    /// a key at its first survivor.
     pub stop_groups: BTreeMap<String, Vec<Value>>,
-    /// join written position -> alias -> (row, the partner rows its
-    /// equality conditions keep).
     pub allowed_pairs: BTreeMap<usize, AllowedPairs>,
     pub order: Option<String>,
     pub credit_shared: bool,
@@ -109,7 +79,6 @@ fn round_to(value: f64, digits: usize) -> f64 {
     format!("{value:.digits$}").parse().expect("a float")
 }
 
-/// Refuse any operator the estimate cannot price, as `_refuse_unpriced`.
 fn refuse_unpriced(found: &Operators) -> Result<(), CompileError> {
     if found.fetch.is_some() {
         return not_priced("the speed of light estimate does not price LIMIT");
@@ -253,7 +222,6 @@ fn label_name(found: &Operators, call: &ModelCall) -> String {
         .unwrap_or_default()
 }
 
-/// One work record of the join search and the choices that produced it.
 #[derive(Debug, Clone)]
 struct Candidate {
     work: Work,
@@ -262,7 +230,6 @@ struct Candidate {
     steps: Vec<Value>,
 }
 
-/// The exact passing row pairs of one binary join predicate.
 #[derive(Debug, Clone)]
 struct PairRelation {
     left: String,
@@ -282,7 +249,6 @@ fn scalar(value: f64) -> Quantity {
     Quantity::Scalar(value)
 }
 
-/// Each alias's partner label and anchor frame tokens, and the tail.
 fn prompt_token_counts(lowered: &LoweredPrompt) -> Result<(LabelCounts, i64), CompileError> {
     let mut labels = BTreeMap::new();
     for (alias, label, frame) in &lowered.label_token_ids {
@@ -296,13 +262,10 @@ fn prompt_token_counts(lowered: &LoweredPrompt) -> Result<(LabelCounts, i64), Co
     Ok((labels, lowered.tail_token_ids.len() as i64))
 }
 
-/// Rows that occur in at least one exact satisfying assignment, as
-/// `exact_survivors`.
 fn exact_survivors(
     base_rows: &[(String, Vec<i64>)],
     relations: &[&PairRelation],
 ) -> BTreeMap<String, Vec<i64>> {
-    // combine parallel relations, oriented by sorted alias pair
     let mut oriented: BTreeMap<(String, String), BTreeSet<(i64, i64)>> = BTreeMap::new();
     for relation in relations {
         let key = if relation.left <= relation.right {
@@ -523,7 +486,6 @@ struct Estimate<'a, 'c> {
     decode_passes: i64,
     map_passes: BTreeMap<(String, i64), i64>,
     max_pooling: BTreeSet<String>,
-    /// By OR, the rows a term has passed so far.
     decided: BTreeMap<String, BTreeSet<i64>>,
 }
 
@@ -584,13 +546,6 @@ impl<'a, 'c> Estimate<'a, 'c> {
         })
     }
 
-    /// The pairs a block of `tokens` reads beyond causal ones.
-    ///
-    /// A bidirectional model's full-attention layers read every key of a
-    /// block: its document block (the preamble and the document) and each
-    /// question block, which also reads the document. A block reads
-    /// `tokens` squared pairs, where a causal one reads
-    /// `tokens (tokens + 1) / 2`.
     fn block_work(&self, tokens: i64) -> Work {
         if !self.context.model.bidirectional() {
             return Work::default();
@@ -601,7 +556,6 @@ impl<'a, 'c> Estimate<'a, 'c> {
         }
     }
 
-    /// Compute one document's prefix for the first time in the query.
     fn first_use(&self, alias: &str, row: i64, suffix: i64) -> Work {
         let data = &self.aliases[alias];
         let prefix = self.pre + data.tokens[row as usize];
@@ -612,7 +566,6 @@ impl<'a, 'c> Estimate<'a, 'c> {
                 + &self.block_work(suffix);
         }
         let resident = self.pre + shared;
-        // the document saves its own state after reading the parent's
         &ask(
             &scalar(resident as f64),
             &scalar((prefix - resident + suffix) as f64),
@@ -620,7 +573,6 @@ impl<'a, 'c> Estimate<'a, 'c> {
         ) + &work_with(1.0, 0.0)
     }
 
-    /// One question asked of every live document.
     fn question_work(&mut self, alias: &str, rows: &[i64], tail: i64, first: bool) -> Work {
         let column = self.aliases[alias].column.clone();
         let computed = self
@@ -710,22 +662,17 @@ impl<'a, 'c> Estimate<'a, 'c> {
             };
             let prefix = self.pre + self.aliases[anchor].tokens[*row as usize];
             if resident.contains(row) {
-                // the frame's state is saved for every partner to start from
                 work = &(&work + &ask(&scalar(prefix as f64), &scalar(frame as f64), self.window))
                     + &work_with(1.0, 0.0);
             } else {
                 work = &work + &self.first_use(anchor, *row, frame);
             }
-            // every partner starts from the frame's saved state
             work = &(&work + &partner_stream_work((prefix + frame) as f64, &streamed, self.window))
                 + &work_with(0.0, streamed.len() as f64);
         }
         Ok(work)
     }
 
-    /// Per stage, the rows read when each key stops once its number of
-    /// survivors pass: its shortest survivors, or every row of a key
-    /// with too few.
     fn stop_key_rows(
         &self,
         alias: &str,
@@ -810,7 +757,6 @@ impl<'a, 'c> Estimate<'a, 'c> {
             .collect())
     }
 
-    /// Apply each alias's filters and column operators with exact answers.
     #[allow(clippy::type_complexity)]
     fn run_filters(
         &mut self,
@@ -893,7 +839,6 @@ impl<'a, 'c> Estimate<'a, 'c> {
                     .collect();
                 let found = self.stop_key_rows(&alias, &rows, &order, &predicates)?;
                 if self.inputs.credit_shared {
-                    // a skipped document computes no prefix for another
                     let shared = (self.oracles.subset_shared)(&alias, &found[0])?;
                     self.aliases.get_mut(&alias).expect("an alias").shared = shared;
                 }
@@ -947,8 +892,6 @@ impl<'a, 'c> Estimate<'a, 'c> {
                     }
                 };
                 rows = passed;
-                // a guarded operator asks the model about an estimated
-                // fraction of its rows, its guard's
                 work = &work + &(&stage_work * asked);
             }
             survivors
@@ -985,10 +928,6 @@ impl<'a, 'c> Estimate<'a, 'c> {
             None => rows.to_vec(),
         };
         let work = self.question_work(alias, &asked, tail, first);
-        // a filter that returns its answer keeps every row. A term of an
-        // OR asks the rows no earlier term passed and keeps every row
-        // until the OR's last term, which returns the rows a term
-        // passed; the estimate leaves out the OR's plain terms
         let mut passed = Vec::new();
         match &predicate.disjunction {
             Some(name) => {
@@ -1270,7 +1209,6 @@ impl<'a, 'c> Estimate<'a, 'c> {
                     repr_str(alias)
                 )));
             };
-            // text can tokenize longer than the tokens the model wrote
             let count = self.token_count(&answer)?;
             let written = (if count == 0 { 1 } else { count }).min(call.max_answer_tokens);
             let fed = written - 1;
@@ -1474,13 +1412,6 @@ fn allowed_map(rows: &[(i64, Vec<i64>)]) -> BTreeMap<i64, BTreeSet<i64>> {
         .collect()
 }
 
-/// The ideal time of one query on one device, as `speed_of_light_estimate`:
-/// its record, as `SpeedOfLightEstimate.as_dict` writes it.
-///
-/// # Errors
-///
-/// The plan holds an operator the estimate does not price (the message
-/// starts with "NotImplementedError: "), or a callback fails.
 pub fn speed_of_light_estimate(
     found: &Operators,
     context: &PlanningContext,
@@ -1507,8 +1438,6 @@ pub fn speed_of_light_estimate(
         .filter(|column| column.call.pooling == "max")
         .map(SemanticColumn::alias)
         .collect();
-    // the worker appends the layout's document_close to every document, so
-    // the model reads it in the document's block
     let close = prompt_layout(&context.model.prompt_layout)?.document_close;
     let close = if close.is_empty() {
         0
@@ -1617,8 +1546,6 @@ pub fn speed_of_light_estimate(
 
 type StateKey = (BTreeSet<String>, BTreeSet<usize>, BTreeSet<String>);
 
-/// Search every feasible left deep plan over the exact filtered rows, as
-/// `search_joins_sol` with `search_left_deep`.
 fn search_joins(
     estimate: &Estimate,
     base_rows: &[(String, Vec<i64>)],

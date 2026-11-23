@@ -1,5 +1,3 @@
-//! Choose each table's step order, the join order, and the anchors.
-
 use crate::constants::{DEFAULT_SELECTIVITY, MAX_EXACT_UNITS};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -29,46 +27,36 @@ use crate::pricing::statistics::{OrTerm, RowFlow, cross_tuples, surviving_docume
 
 pub const ASK: &str = "ask";
 
-/// A step's key: an ask's written position, or a column operator's name.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StepKey {
     Position(usize),
     Name(String),
 }
 
-/// One step of a table's sequence and its costs, as `TableStep`.
 #[derive(Debug, Clone)]
 pub struct TableStep {
     pub kind: &'static str,
     pub key: StepKey,
-    /// The fraction of the rows it asks about that it passes.
     pub selectivity: f64,
-    /// Its place in an OR, for an AI filter that is a term of one.
     pub or_term: Option<OrTerm>,
     pub first: StepCost,
     pub later: StepCost,
     pub reuse_key: Option<Prompt>,
     pub document_head: Vec<i64>,
-    /// The columns its guard reads, which may hold another step's answers.
     pub reads: Vec<String>,
 }
 
 impl TableStep {
-    /// Whether no step of `later` is a term of this step's OR.
     pub fn is_last_of_or<'a>(&self, later: impl IntoIterator<Item = &'a TableStep>) -> bool {
         let name = |step: &TableStep| step.or_term.as_ref().map(|term| term.disjunction.clone());
         !later.into_iter().any(|step| name(step) == name(self))
     }
 
-    /// The rows `flow` holds once this step has run before `later`.
     pub fn pass<'a>(&self, flow: &mut RowFlow, later: impl IntoIterator<Item = &'a TableStep>) {
         let last = self.is_last_of_or(later);
         flow.pass(self.selectivity, self.or_term.as_ref(), last);
     }
 
-    /// The fraction of the rows this step asks about that the steps
-    /// after it need not: the rows a filter drops, or the rows a
-    /// short-circuit term of an OR passes.
     fn spared(&self) -> f64 {
         match &self.or_term {
             Some(term) if term.short_circuit => self.selectivity,
@@ -78,11 +66,6 @@ impl TableStep {
     }
 }
 
-/// Whether a step reads the KV the step before it left.
-///
-/// `plan_kv_retention` keeps a pipeline's KV exactly when the next
-/// pipeline over the same table has the same document head, so
-/// `resident_inputs` finds the same steps resident in the built graph.
 pub fn resident_after(previous: &TableStep, step: &TableStep) -> bool {
     previous.document_head == step.document_head
 }
@@ -96,14 +79,6 @@ pub fn column_step_kind(kind: &str) -> &'static str {
     }
 }
 
-/// A table's steps in written order, priced, as `table_steps`.
-///
-/// # Errors
-///
-/// The tokenizer fails, or the arena does not fit the device.
-/// How a table's steps are priced: by the planner's operator planners,
-/// or, for the speed of light estimate, each as one question over the
-/// live documents under no prompt head.
 pub enum StepPricing<'a> {
     Plan(&'a PlanStatistics),
     Estimate { mean_tokens: f64, chunk: i64 },
@@ -228,7 +203,7 @@ pub fn table_steps(
             later,
             reuse_key: None,
             document_head: head(&call.prompt)?,
-            reads: (column.guard.iter())
+            reads: (column.precondition.iter())
                 .flat_map(crate::expressions::column_references)
                 .map(|reference| reference.column)
                 .collect(),
@@ -237,7 +212,6 @@ pub fn table_steps(
     Ok(steps)
 }
 
-/// The classification calls a filter tests or SELECT returns, as `LabelWork.calls`.
 pub fn label_calls(found: &Operators) -> Vec<(crate::physical::ModelCall, String)> {
     let mut calls: Vec<(crate::physical::ModelCall, String)> = Vec::new();
     for (alias, tests) in &found.column_filters {
@@ -257,8 +231,6 @@ pub fn label_calls(found: &Operators) -> Vec<(crate::physical::ModelCall, String
     calls
 }
 
-/// `seconds` over the fraction of rows `spared`: the rank the search
-/// places next the lowest of.
 fn step_rank(seconds: f64, spared: f64) -> f64 {
     if spared > 0.0 {
         seconds / spared
@@ -269,8 +241,6 @@ fn step_rank(seconds: f64, spared: f64) -> f64 {
     }
 }
 
-/// The steps the search places together, in written order: each step
-/// alone, and the terms of one OR as one unit.
 fn units(steps: &[TableStep]) -> Vec<Vec<usize>> {
     let mut found: Vec<Vec<usize>> = Vec::new();
     for (index, step) in steps.iter().enumerate() {
@@ -285,8 +255,6 @@ fn units(steps: &[TableStep]) -> Vec<Vec<usize>> {
     found
 }
 
-/// The fraction of the rows a unit reads that the steps after it need
-/// not: the rows a filter drops, or the rows no term of an OR passes.
 fn unit_spared(steps: &[TableStep], unit: &[usize]) -> f64 {
     match unit {
         [alone] if steps[*alone].or_term.is_none() => steps[*alone].spared(),
@@ -297,37 +265,15 @@ fn unit_spared(steps: &[TableStep], unit: &[usize]) -> f64 {
     }
 }
 
-/// Where a sequence of steps stands: the rows that reach the next step,
-/// the last step, and the prompts already scored.
 #[derive(Clone)]
 struct Reached {
     flow: RowFlow,
     previous: Option<usize>,
     scored: Vec<Prompt>,
-    /// The steps so far, in run order, and their seconds.
     ordered: Vec<usize>,
     seconds: f64,
 }
 
-/// Choose an order using costs at each expected survivor count, as
-/// `order_filters_indexed` with the steps' own residency rule.
-///
-/// The search places units: a step, or the terms of one OR together.
-/// With at most [`MAX_EXACT_UNITS`] units it finds the order of the
-/// fewest seconds: a unit's seconds depend only on the units before it
-/// and the step right before it, so it keeps the cheapest way to reach
-/// each such pair (Selinger et al., 1979). With more units it tries
-/// each unit first and then takes the unit of the lowest rank, its
-/// seconds over the fraction of rows it spares the steps after it
-/// (Hellerstein and Stonebraker, 1993). The terms of an OR run in the
-/// order of their own rank, seconds over the fraction of rows a term
-/// passes, and the OR ranks as one filter that passes the rows any
-/// term passes. Each step is priced at the rows that reach it. A step
-/// whose guard reads another step's answers then moves after it.
-///
-/// # Errors
-///
-/// A step's cost fails.
 pub fn order_steps(
     steps: &[TableStep],
     rule: &str,
@@ -339,8 +285,6 @@ pub fn order_steps(
     Ok(after_the_answers_read(steps, ordered))
 }
 
-/// `ordered` with each step moved after the steps whose answers its
-/// guard reads, the others kept in order.
 fn after_the_answers_read(steps: &[TableStep], ordered: Vec<usize>) -> Vec<usize> {
     let answers = |step: &TableStep, read: &str| match &step.key {
         StepKey::Name(name) => read
@@ -359,12 +303,10 @@ fn after_the_answers_read(steps: &[TableStep], ordered: Vec<usize>) -> Vec<usize
     };
     for index in ordered {
         waiting.push(index);
-        // place every waiting step whose reads are answered, in order
         while let Some(position) = waiting.iter().position(|found| ready(*found, &placed)) {
             placed.push(waiting.remove(position));
         }
     }
-    // a cycle of reads keeps the order it had
     placed.extend(waiting);
     placed
 }
@@ -387,7 +329,6 @@ fn searched_order(
             return Ok(*found);
         }
         let step = &steps[index];
-        // the one place a step's work becomes the seconds it ranks by
         let seconds = match if first { &step.first } else { &step.later }.work(context, rows)? {
             Some(work) => unrounded_seconds(&work, &context.model, &context.device, chunk),
             None => f64::INFINITY,
@@ -395,7 +336,6 @@ fn searched_order(
         cache.insert(key, seconds);
         Ok(seconds)
     };
-    // `reached` after one more step, and the seconds the step ranks by
     let mut after_step = |reached: &Reached,
                           index: usize,
                           later: &[usize]|
@@ -418,7 +358,6 @@ fn searched_order(
             }
         };
         let mut next = reached.clone();
-        // a step no row reaches costs nothing, whatever it ranks by
         next.seconds += if asked > 0.0 || reached.previous.is_none() {
             seconds
         } else {
@@ -430,7 +369,6 @@ fn searched_order(
         step.pass(&mut next.flow, later.iter().map(|index| &steps[*index]));
         Ok((next, seconds))
     };
-    // `reached` after a unit, its terms in rank order, and the unit's rank
     let mut after_unit =
         |reached: &Reached, unit: &[usize]| -> Result<(Reached, f64), CompileError> {
             let mut next = reached.clone();
@@ -476,8 +414,6 @@ fn searched_order(
         seconds: 0.0,
     };
     if units.len() <= MAX_EXACT_UNITS {
-        // every order, by the units placed and the step placed last:
-        // what a unit costs next depends on nothing else
         let full = (1usize << units.len()) - 1;
         let mut reached: Vec<HashMap<usize, Reached>> = vec![HashMap::new(); full + 1];
         let cheaper = |found: &Reached, other: &Reached| {
@@ -538,9 +474,6 @@ fn searched_order(
     Ok(best.expect("a starter").ordered)
 }
 
-// ---------------------------------------------------------------- joins
-
-/// The small physical state needed for guaranteed group reuse.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct KvState {
     pub pending_anchor: Option<String>,
@@ -548,12 +481,10 @@ pub struct KvState {
     pub used_anchors: BTreeSet<String>,
 }
 
-/// One join as the search priced it in its place in the sequence.
 #[derive(Debug, Clone, PartialEq)]
 pub struct JoinStep {
     pub written_position: usize,
     pub anchor: String,
-    /// "filter", "kept", or "none".
     pub resident: &'static str,
     pub resident_documents: i64,
     pub anchor_documents: f64,
@@ -563,13 +494,11 @@ pub struct JoinStep {
 }
 
 impl JoinStep {
-    /// One model copy's share when the anchors are spread evenly.
     pub fn copy_work(&self, gpus: i64) -> Work {
         &self.work * (1.0 / parallel_copies(gpus, self.anchor_documents))
     }
 }
 
-/// The cheapest join sequence the search found.
 #[derive(Debug, Clone)]
 pub struct JoinSearch {
     pub seq: Vec<(usize, String)>,
@@ -577,7 +506,6 @@ pub struct JoinSearch {
     pub work: Work,
 }
 
-/// Candidate anchors for one join, as `anchor_candidates`.
 pub fn anchor_candidates(spec: &PricedJoin, honor_forced: bool) -> Vec<String> {
     if spec.semantics != "full" || (honor_forced && !spec.anchor_free) {
         return vec![spec.anchor.clone().unwrap_or_default()];
@@ -585,7 +513,6 @@ pub fn anchor_candidates(spec: &PricedJoin, honor_forced: bool) -> Vec<String> {
     spec.aliases.clone()
 }
 
-/// Tokens of the longest input under one join orientation.
 pub fn join_input_tokens(
     spec: &PricedJoin,
     anchor: &str,
@@ -656,7 +583,6 @@ fn residency(
     }
 }
 
-/// Expected anchors the join reads: those with a candidate partner.
 pub fn anchor_documents(spec: &PricedJoin, anchor: &str, expected: &BTreeMap<String, f64>) -> f64 {
     let partners: f64 = spec
         .aliases
@@ -667,11 +593,6 @@ pub fn anchor_documents(spec: &PricedJoin, anchor: &str, expected: &BTreeMap<Str
     surviving_documents(expected[anchor], partners, Some(spec.pair_fraction))
 }
 
-/// A prepared join's work at the current survivor counts, as `stage_work`.
-///
-/// # Errors
-///
-/// The anchor's length summary uses another window.
 #[allow(clippy::too_many_arguments)]
 pub fn stage_work(
     spec: &PricedJoin,
@@ -764,11 +685,6 @@ fn join_step(
     Ok((work, step, next))
 }
 
-/// Cost one sequence of (join, anchor), as `walk`.
-///
-/// # Errors
-///
-/// A join cannot be priced.
 pub fn walk(
     seq: &[(PricedJoin, String)],
     live: &BTreeMap<String, f64>,
@@ -799,10 +715,8 @@ pub fn walk(
     Ok((total, records))
 }
 
-/// A search candidate's ranking: seconds, then the work's leading fields.
 type Rank = (f64, f64, f64, f64, f64);
 
-/// The best fixed-order assignment so far: its rank, work, steps, and sequence.
 type FixedBest = (Rank, Work, Vec<JoinStep>, Vec<(PricedJoin, String)>);
 
 fn rank(base: &Work, work: &Work, context: &PlanningContext, chunk: i64) -> Rank {
@@ -845,12 +759,6 @@ fn insert_nondominated(frontier: &mut Vec<Candidate>, candidate: Candidate) {
 
 type StateKey = (BTreeSet<String>, BTreeSet<usize>, KvState);
 
-/// Search stage order and anchor choice, as `search_joins`; None when
-/// the joins have no connected left-deep order.
-///
-/// # Errors
-///
-/// A join cannot be priced.
 #[allow(clippy::too_many_arguments)]
 pub fn search_joins(
     specs: &[PricedJoin],
@@ -894,7 +802,6 @@ pub fn search_joins(
             if best.as_ref().is_none_or(|found| key < found.0) {
                 best = Some((key, work, records, seq));
             }
-            // the next assignment, last join fastest, as itertools.product
             let mut position = specs.len();
             loop {
                 if position == 0 {
@@ -1065,15 +972,10 @@ pub fn search_joins(
     }))
 }
 
-// ---------------------------------------------------------------- operator order
-
-/// Operator order, statistics, and work estimates, as `OperatorOrder`.
 #[derive(Debug, Clone)]
 pub struct OperatorOrder {
     pub statistics: PlanStatistics,
-    /// alias -> its asks' written positions in run order.
     pub filter_orders: Vec<(String, Vec<usize>)>,
-    /// alias -> its steps in run order.
     pub step_orders: Vec<(String, Vec<TableStep>)>,
     pub join_sequence: Vec<(PricedJoin, String)>,
     pub join_steps: Vec<JoinStep>,
@@ -1085,7 +987,6 @@ pub struct OperatorOrder {
 
 use crate::error::Refusal;
 
-/// The default stage order rule, as `default_order_rule`: (rule, source).
 pub fn default_order_rule(found: &Operators) -> (String, String) {
     let missing = found
         .filters
@@ -1107,11 +1008,6 @@ pub fn default_order_rule(found: &Operators) -> (String, String) {
     ("by_cost".to_string(), "default: by cost".to_string())
 }
 
-/// Each table's asks' work in run order, as `filter_works`.
-///
-/// # Errors
-///
-/// A prompt has no question tail.
 pub fn filter_works(
     found: &Operators,
     statistics: &PlanStatistics,
@@ -1159,12 +1055,6 @@ pub fn filter_works(
     Ok(works)
 }
 
-/// Choose operator order and estimate work, as `choose_operator_order`.
-///
-/// # Errors
-///
-/// A cost cannot be computed; a join pair too long for a forward pass
-/// is a Refusal instead.
 pub fn choose_operator_order(
     found: &Operators,
     context: &PlanningContext,
@@ -1398,7 +1288,6 @@ mod tests {
                     ];
                     let (work, steps) =
                         walk(&sequence, &expected, &lengths, &resident, 5, &context).unwrap();
-                    // a table's filter KV is read once, by its first anchor use
                     let anchors: Vec<&String> = steps.iter().map(|step| &step.anchor).collect();
                     if anchors[0] == anchors[1] {
                         assert_ne!(steps[1].resident, "filter");

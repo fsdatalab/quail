@@ -1,29 +1,3 @@
-//! A model region's operators, read from its optimized DataFusion plan.
-//!
-//! [`derive_region`] walks the region's plan once, children first and
-//! the left input before the right, which is the order Quail numbers
-//! operators in: each table's scan, the `AiNode`s on it, then the joins
-//! and the AI joins above them. It then
-//!
-//! 1. binds each table and each `AiNode`'s call with the [`Binder`],
-//!    naming the columns a node adds by the SELECT list's name for them
-//!    or the node's own, then each ON term, filter, and guard, which
-//!    read those columns, and the SELECT list;
-//! 2. places each condition: at a table's scan, after the operator that
-//!    computes the columns it reads, or on the result rows;
-//! 3. assembles [`Operators`] in the plan's order, each `AiNode` giving
-//!    one AI filter, AI join, gate, or column operator.
-//!
-//! The engine plans each region from these operators, and a region whose
-//! shape they cannot hold is refused with an unsupported
-//! [`CompileError`].
-//!
-//! For example, `SELECT r.id, AI.CLASSIFY(...) AS sentiment FROM reviews
-//! r WHERE AI.IF(...)` plans as an `AiNode` adding `sentiment` over an
-//! `AiNode` filtering `r`, over the scan of `r`. The walk meets the scan,
-//! the filter, then the classification, and the operators hold one
-//! scan, one AI filter of `r`, and one classification named `sentiment`.
-
 pub(crate) mod binding;
 pub mod expressions;
 pub mod partial;
@@ -54,18 +28,6 @@ use super::ModelRegion;
 use crate::ai::AiNode;
 use crate::functions::options::unfolded;
 
-/// A model region's operators and the plan after DataFusion's optimizer
-/// they are read from.
-///
-/// `turn` and `layout` are the session model's chat-turn text and prompt
-/// layout.
-///
-/// # Errors
-///
-/// The region uses SQL outside Quail's language; an unsupported error
-/// ([`CompileError::is_unsupported`]) names a shape DataFusion can run
-/// instead. Two calls that differ only in their texts' spelling are
-/// refused.
 pub fn derive_region(
     region: &ModelRegion,
     turn: &Turn,
@@ -85,7 +47,6 @@ pub fn derive_region(
         .iter()
         .flat_map(|(_, predicates)| predicates)
         .any(|predicate| predicate.alternative.is_some());
-    // `AiNode::accepts_fetch` keeps a fetch off a region with an OR filter
     if ored && operators.fetch.is_some() {
         return Err(CompileError::new(
             "internal error: a model region has a fetch and an OR filter",
@@ -94,13 +55,6 @@ pub fn derive_region(
     Ok((operators, plan))
 }
 
-/// `plan` with each struct or list literal in an `AiNode`'s expressions
-/// written as the call it was folded from.
-///
-/// DataFusion's `SimplifyExpressions` runs over a region's operators and
-/// folds a `named_struct`, `struct`, or `make_array` of literals into one
-/// literal. The binder reads an AI call's options, categories, and
-/// fields from the calls the query wrote.
 fn as_bound(plan: LogicalPlan) -> datafusion::common::Result<LogicalPlan> {
     plan.transform_up(|node| {
         let Some(ai) = crate::plan::as_node::<AiNode>(&node) else {
@@ -112,12 +66,6 @@ fn as_bound(plan: LogicalPlan) -> datafusion::common::Result<LogicalPlan> {
     .map(|done| done.data)
 }
 
-/// A model region's operators, read from its plan after DataFusion's
-/// rules as the module explains.
-///
-/// # Errors
-///
-/// As [`derive_region`].
 fn derive_operators(
     plan: &LogicalPlan,
     turn: &Turn,
@@ -132,7 +80,6 @@ fn derive_operators(
         .iter()
         .map(|expr| walk.selected(expr))
         .collect();
-    // an answer takes the name the SELECT list first returns it by
     let mut names: BTreeMap<String, String> = BTreeMap::new();
     for item in &select {
         let mut inner = item;
@@ -149,8 +96,6 @@ fn derive_operators(
     }
     let mut binder = Binder::new(turn, layout);
     let relation = Relation::bind(&walk, &mut binder, &names)?;
-    // the executor answers an OR's AI.IF only where the OR needs it, so
-    // it has no answer for every row to return
     let returns_or_term = select.iter().any(|item| {
         item.column_refs()
             .iter()
@@ -204,15 +149,12 @@ fn derive_operators(
     Ok(found)
 }
 
-/// The refusal of a plan whose operators Quail's operators do not read.
 fn unplaced(_plan: &LogicalPlan) -> CompileError {
     CompileError::unsupported("These operators must run outside the model region.")
 }
 
-/// Values kept per table alias, in the order the aliases first appear.
 type ByAlias<T> = Vec<(String, Vec<T>)>;
 
-/// Add `value` to `key`'s values, keeping keys in first use order.
 fn push<V>(map: &mut ByAlias<V>, key: &str, value: V) {
     match map.iter_mut().find(|(found, _)| found == key) {
         Some((_, values)) => values.push(value),

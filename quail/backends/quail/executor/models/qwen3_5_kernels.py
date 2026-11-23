@@ -4,8 +4,6 @@ from quail.backends.quail.executor.attention import launch_triton, pdl_enabled
 
 _KERNELS = {}
 _SM100_CAPABLE = {}
-# Measured B200 (SM100) crossovers for Qwen3.8 27B widths: CUTLASS leads up to
-# 2,048 rows; above 16,384 rows, 8,192-row slices give 10-14% higher throughput.
 _FP4_CUTLASS_MAX_ROWS = 2_048
 _ROW_TILE_ABOVE = 16_384
 ROW_TILE = 8_192
@@ -18,7 +16,6 @@ def _kernels() -> dict:
     import triton
     import triton.language as tl
 
-    # PDL invariant: loads before gdc_wait read only weights, scales, or positions.
     @triton.jit
     def gemma_add_norm_fp8(
         x_ptr, res_ptr, w_ptr, fp8_ptr, bf16_ptr, stride_x, stride_res,
@@ -215,8 +212,6 @@ def _kernels() -> dict:
         up = tl.load(
             gate_up_ptr + row * stride_gu + WIDTH + offs, mask=mask, other=0.0
         ).to(tl.float32)
-        # matches vLLM's silu_and_mul bit for bit: IEEE expf and division,
-        # and silu(gate) rounds to the output dtype before the product
         silu = tl.extra.cuda.libdevice.div_rn(
             gate, 1.0 + tl.extra.cuda.libdevice.exp(-gate)).to(
             dst_ptr.dtype.element_ty)

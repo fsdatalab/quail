@@ -1,12 +1,7 @@
-//! What each node of a physical graph offers a pipeline, and the
-//! pipelines, order, and validity of a graph.
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::physical::*;
 
-/// The outputs of a request backend's node: each table's survivors, then
-/// each operator's answers.
 fn request_outputs(attributes: &RequestExecutionAttributes) -> Vec<OutputPort> {
     let port =
         |name: String, value_type: ValueType, schema: Vec<String>, kind: Option<&str>| OutputPort {
@@ -100,7 +95,6 @@ fn request_outputs(attributes: &RequestExecutionAttributes) -> Vec<OutputPort> {
     outputs
 }
 
-/// The value type a port name carries.
 pub fn value_type_for_port(name: &str) -> ValueType {
     if name == "rows" || name.starts_with("rows:") {
         ValueType::Rows
@@ -115,7 +109,6 @@ pub fn value_type_for_port(name: &str) -> ValueType {
     }
 }
 
-/// Typed input ports reading the given outputs, named `input:<index>`.
 pub fn input_ports(values: &[PortRef]) -> Vec<InputPort> {
     values
         .iter()
@@ -129,7 +122,6 @@ pub fn input_ports(values: &[PortRef]) -> Vec<InputPort> {
         .collect()
 }
 
-/// A port of a node.
 pub fn port(node_id: &str, port: impl Into<String>) -> PortRef {
     PortRef {
         node_id: node_id.to_string(),
@@ -137,7 +129,6 @@ pub fn port(node_id: &str, port: impl Into<String>) -> PortRef {
     }
 }
 
-/// Whether two extractions can use the same decoder.
 pub fn same_decoding(one: &ExtractSpec, other: &ExtractSpec) -> bool {
     one.max_answer_tokens == other.max_answer_tokens
         && one.draft_tokens == other.draft_tokens
@@ -158,7 +149,6 @@ fn rows_port_of(aliases: &[String]) -> String {
 }
 
 impl PhysicalNode {
-    /// The aliases of a model node's spec; empty without a spec.
     pub fn spec_aliases(&self) -> Vec<String> {
         match self {
             PhysicalNode::AiScore(node) => node.attributes.spec.as_ref().map(|s| s.aliases.clone()),
@@ -177,7 +167,6 @@ impl PhysicalNode {
         .unwrap_or_default()
     }
 
-    /// A model node's prompt token parts; empty without a spec.
     pub fn prompt_token_parts(&self) -> Vec<Vec<i64>> {
         match self {
             PhysicalNode::AiScore(node) => node
@@ -210,7 +199,6 @@ impl PhysicalNode {
         .unwrap_or_default()
     }
 
-    /// Whether the node is a model call carrying a spec.
     pub fn is_inference(&self) -> bool {
         matches!(
             self,
@@ -233,7 +221,6 @@ impl PhysicalNode {
         }
     }
 
-    /// The port carrying the rows a model node or a condition keeps.
     pub fn rows_port(&self) -> String {
         match self {
             PhysicalNode::Filter(node) => rows_port_of(&node.attributes.aliases),
@@ -241,7 +228,6 @@ impl PhysicalNode {
         }
     }
 
-    /// The kind of answer a model node's rows output reports.
     fn answer_kind(&self) -> &'static str {
         match self {
             PhysicalNode::AiClassify(_) => "classifies",
@@ -252,7 +238,6 @@ impl PhysicalNode {
         }
     }
 
-    /// A model node's spec name; empty without a spec.
     pub fn spec_name(&self) -> String {
         match self {
             PhysicalNode::AiScore(node) => node.attributes.spec.as_ref().map(|s| s.name.clone()),
@@ -267,8 +252,6 @@ impl PhysicalNode {
         .unwrap_or_default()
     }
 
-    /// The node's outputs: each port's name, value type, columns, and
-    /// model answer.
     pub fn output_ports(&self) -> Vec<OutputPort> {
         let output = |name: String, value_type: ValueType, schema: Vec<String>| OutputPort {
             name,
@@ -286,8 +269,6 @@ impl PhysicalNode {
             }
             PhysicalNode::AiFilter(node) => {
                 let alias = &node.attributes.alias;
-                // a filter that returns its answer adds it to the rows, and
-                // a term of an OR its column until the OR's last term
                 let mut schema = of(alias);
                 schema.extend(node.attributes.answer.iter().cloned());
                 if !node.attributes.closes_disjunction {
@@ -385,7 +366,6 @@ impl PhysicalNode {
         }
     }
 
-    /// The node's outputs: each port's name and value type.
     pub fn outputs(&self) -> Vec<(String, ValueType)> {
         self.output_ports()
             .into_iter()
@@ -393,8 +373,6 @@ impl PhysicalNode {
             .collect()
     }
 
-    /// Where the node runs: a model node, or a condition on documents, on
-    /// the GPU executor; every other node on the coordinator.
     pub fn location(&self) -> Location {
         match self {
             PhysicalNode::Filter(_)
@@ -408,7 +386,6 @@ impl PhysicalNode {
         }
     }
 
-    /// The aliases whose documents the node processes one at a time.
     pub fn document_aliases(&self) -> Vec<String> {
         match self {
             PhysicalNode::AiFilter(node) => vec![node.attributes.alias.clone()],
@@ -425,7 +402,6 @@ impl PhysicalNode {
         }
     }
 
-    /// The token ids the node shows each document under.
     pub fn document_head(&self) -> Vec<i64> {
         match self {
             PhysicalNode::AiFilter(node) => node.attributes.document_head.clone(),
@@ -438,7 +414,6 @@ impl PhysicalNode {
         }
     }
 
-    /// The outputs that can feed the next operator for a document.
     pub fn document_outputs(&self, alias: &str) -> Vec<String> {
         match self {
             PhysicalNode::AiJoin(node) => vec![
@@ -449,7 +424,6 @@ impl PhysicalNode {
         }
     }
 
-    /// Whether this classification reads a join's surviving pairs.
     pub fn classifies_join(&self, join: &PhysicalNode) -> bool {
         let (PhysicalNode::AiClassify(node), PhysicalNode::AiJoin(join)) = (self, join) else {
             return false;
@@ -468,9 +442,7 @@ impl PhysicalNode {
         mine == theirs
     }
 
-    /// Whether this node can use the KV the node before it left.
     pub fn can_follow(&self, previous: &PhysicalNode, first: &PhysicalNode) -> bool {
-        // the executor asks a guarded node about its guard's rows alone
         if self.runs_alone() {
             return false;
         }
@@ -500,7 +472,6 @@ impl PhysicalNode {
         }
     }
 
-    /// Whether a consumer can run before other documents finish.
     pub fn can_precede(&self, consumer: &PhysicalNode) -> bool {
         if self.runs_alone() {
             return false;
@@ -519,32 +490,23 @@ impl PhysicalNode {
         }
     }
 
-    /// A column node's or AI filter's guard: the condition that says
-    /// which rows the model is asked about. None for every other node.
-    pub fn guard(&self) -> Option<&ValueExpression> {
+    pub fn precondition(&self) -> Option<&ValueExpression> {
         match self {
-            PhysicalNode::AiFilter(node) => node.attributes.guard.as_ref(),
-            PhysicalNode::AiClassify(node) => node.attributes.guard.as_ref(),
-            PhysicalNode::AiExtract(node) => node.attributes.guard.as_ref(),
-            PhysicalNode::AiMap(node) => node.attributes.guard.as_ref(),
-            PhysicalNode::AiSaeFeatures(node) => node.attributes.guard.as_ref(),
+            PhysicalNode::AiFilter(node) => node.attributes.precondition.as_ref(),
+            PhysicalNode::AiClassify(node) => node.attributes.precondition.as_ref(),
+            PhysicalNode::AiExtract(node) => node.attributes.precondition.as_ref(),
+            PhysicalNode::AiMap(node) => node.attributes.precondition.as_ref(),
+            PhysicalNode::AiSaeFeatures(node) => node.attributes.precondition.as_ref(),
             _ => None,
         }
     }
 
-    /// Whether the executor runs the node in a pipeline of its own: a
-    /// node with a guard, an AI filter with an alternative, or an AI
-    /// filter of an OR.
     pub fn runs_alone(&self) -> bool {
         let ored = matches!(self, PhysicalNode::AiFilter(node)
             if node.attributes.disjunction.is_some());
-        // an AI filter that returns its answer keeps every row, so the next
-        // node asks about each document from the same KV
-        self.guard().is_some() || self.alternative().is_some() || ored
+        self.precondition().is_some() || self.alternative().is_some() || ored
     }
 
-    /// The column an AI filter that keeps every row adds with its
-    /// answer. None for every other node.
     pub fn answer(&self) -> Option<&String> {
         match self {
             PhysicalNode::AiFilter(node) => node.attributes.answer.as_ref(),
@@ -552,8 +514,6 @@ impl PhysicalNode {
         }
     }
 
-    /// An AI filter's alternative: the condition under which a row
-    /// passes whatever the model answers. None for every other node.
     pub fn alternative(&self) -> Option<&ValueExpression> {
         match self {
             PhysicalNode::AiFilter(node) => node.attributes.alternative.as_ref(),
@@ -561,8 +521,6 @@ impl PhysicalNode {
         }
     }
 
-    /// A map's or extraction's stop tests, and whether it stops once
-    /// every stop test is decided TRUE; empty for every other node.
     pub fn answer_stops(&self) -> (&[ValueExpression], bool) {
         match self {
             PhysicalNode::AiMap(node) => {
@@ -575,7 +533,6 @@ impl PhysicalNode {
         }
     }
 
-    /// The backend of a model node; None for every other node.
     pub fn backend(&self) -> Option<&str> {
         match self {
             PhysicalNode::RequestExecution(node) => Some(&node.attributes.backend_name),
@@ -590,7 +547,6 @@ impl PhysicalNode {
         }
     }
 
-    /// Whether the node keeps its documents' KV after it finishes.
     pub fn keep_kv(&self) -> bool {
         match self {
             PhysicalNode::AiFilter(node) => node.attributes.keep_kv,
@@ -604,7 +560,6 @@ impl PhysicalNode {
         }
     }
 
-    /// The node's set-attention pass group; -1 for none.
     pub fn pass_group(&self) -> i64 {
         match self {
             PhysicalNode::AiFilter(node) => node.attributes.pass_group,
@@ -618,7 +573,6 @@ impl PhysicalNode {
     }
 }
 
-/// The graph's node positions, each after the nodes it reads.
 pub fn topological_nodes(nodes: &[PhysicalNode]) -> Vec<usize> {
     let by_id: BTreeMap<&str, usize> = nodes
         .iter()
@@ -655,8 +609,6 @@ pub fn topological_nodes(nodes: &[PhysicalNode]) -> Vec<usize> {
     ordered
 }
 
-/// The pipelines of a graph: each pipeline's node positions in order,
-/// and node id -> the pipeline holding it.
 #[derive(Debug, Clone, Default)]
 pub struct Pipelines {
     pub members: Vec<Vec<usize>>,
@@ -664,7 +616,6 @@ pub struct Pipelines {
 }
 
 impl Pipelines {
-    /// The positions of the pipeline holding a node, if any.
     pub fn get(&self, node_id: &str) -> Option<&[usize]> {
         self.of
             .get(node_id)
@@ -672,8 +623,6 @@ impl Pipelines {
     }
 }
 
-/// Whether the pipelines and single nodes can run in some order: no
-/// two groups read each other's outputs.
 pub fn groups_acyclic(nodes: &[PhysicalNode], pipeline_of: &BTreeMap<String, Vec<usize>>) -> bool {
     let mut owners: BTreeMap<&str, &str> = BTreeMap::new();
     for node in nodes {
@@ -694,7 +643,6 @@ pub fn groups_acyclic(nodes: &[PhysicalNode], pipeline_of: &BTreeMap<String, Vec
             }
         }
     }
-    // Kahn's algorithm: every group is placed exactly when there is no cycle
     let mut remaining: BTreeMap<&str, usize> = dependencies
         .iter()
         .map(|(owner, needs)| (*owner, needs.len()))
@@ -720,8 +668,6 @@ pub fn groups_acyclic(nodes: &[PhysicalNode], pipeline_of: &BTreeMap<String, Vec
     placed == dependencies.len()
 }
 
-/// Group compatible per-document operators into pipelines, as
-/// `build_pipelines`.
 pub fn build_pipelines(nodes: &[PhysicalNode], completed: &[String]) -> Pipelines {
     let mut consumers: BTreeMap<(&str, &str), Vec<usize>> = BTreeMap::new();
     for (index, node) in nodes.iter().enumerate() {
@@ -867,8 +813,6 @@ pub fn build_pipelines(nodes: &[PhysicalNode], completed: &[String]) -> Pipeline
     result
 }
 
-/// The ids of the model nodes whose documents' KV is already resident,
-/// as `resident_inputs`.
 pub fn resident_inputs(nodes: &[PhysicalNode], pipelines: &Pipelines) -> BTreeSet<String> {
     let mut resident = BTreeSet::new();
     let mut kept: BTreeMap<String, Vec<i64>> = BTreeMap::new();
@@ -895,7 +839,6 @@ pub fn resident_inputs(nodes: &[PhysicalNode], pipelines: &Pipelines) -> BTreeSe
     resident
 }
 
-/// The name of a value type, as plans write it.
 pub fn value_type_name(value_type: ValueType) -> &'static str {
     match value_type {
         ValueType::FilterAnswers => "filter_answers",
@@ -908,12 +851,6 @@ pub fn value_type_name(value_type: ValueType) -> &'static str {
     }
 }
 
-/// Check node ids, that every input reads an output of its type and
-/// columns, that the root exists, and that the graph has no cycle.
-///
-/// # Errors
-///
-/// The graph breaks one of those rules.
 pub fn validate_graph(nodes: &[PhysicalNode], root: &PortRef) -> Result<(), String> {
     let mut by_id: BTreeMap<&str, &PhysicalNode> = BTreeMap::new();
     for node in nodes {
@@ -982,7 +919,6 @@ pub fn validate_graph(nodes: &[PhysicalNode], root: &PortRef) -> Result<(), Stri
             root_key.0, root_key.1
         ));
     }
-    // depth-first, each node after its inputs
     fn visit<'a>(
         id: &'a str,
         by_id: &BTreeMap<&'a str, &'a PhysicalNode>,

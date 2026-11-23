@@ -48,8 +48,6 @@ class AnswerCurves:
         self.slots = None
         self.buckets = None
         self.whole = None
-        # per slot, the tokens it was last counted at and whether it had
-        # ended; per map and per curve row, those counts by token
         self._observed = np.zeros(num_slots, dtype=np.int64)
         self._ended = np.zeros(num_slots, dtype=bool)
         self._watched = np.zeros(0, dtype=np.int64)
@@ -57,7 +55,6 @@ class AnswerCurves:
     def _bind(self):
         decoder = self.decoder
         limits = decoder.limits
-        # per map, the planner's geometric prior, 0 past the map's limit
         self.prior = np.zeros((len(limits), self.width))
         for q, limit in enumerate(limits):
             self.prior[q, :limit + 1] = prior_survival(
@@ -152,7 +149,6 @@ class AnswerCurves:
                                          self.decoder.limits[mine])
         rows = self.rows[changed[self.rows // self.num_buckets]]
         self.buckets[rows] = self.whole[rows // self.num_buckets]
-        # a bucket with few ended answers keeps its map's curve
         rows = rows[self.num_ended[rows] >= self.bucket_answers]
         if len(rows):
             self.buckets[rows] = survival_rows(self.row_counts[rows],

@@ -1,9 +1,3 @@
-//! Prompt text for each model call.
-//!
-//! A front end binds each AI function call's template and column
-//! arguments into a `Prompt`: the text before the document, the text
-//! after it, and the pieces the planner tokenizes on their own.
-
 pub mod lowering;
 
 use crate::constants::{LABEL_PREFIX, MAX_LETTERS};
@@ -34,7 +28,6 @@ const EXTRACT_FORMAT: &str = "Answer in this format:";
 const EXTRACT_PHRASE_FORMAT: &str = "Phrase: <copied words>";
 const EXTRACT_PHRASE_CUE: &str = "Phrase:";
 
-/// The fixed text of an AI.IF filter or join prompt in one model's format.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PromptLayout {
     pub name: &'static str,
@@ -50,16 +43,8 @@ pub struct PromptLayout {
     pub option_end: Option<&'static str>,
     pub read_end: Option<&'static str>,
     pub read_slots: Vec<&'static str>,
-    /// For a layout that lists a classification's labels as coded option
-    /// lines, the text before the lines; None writes one option block per
-    /// label.
     pub options_label: Option<&'static str>,
-    /// The question text a prompt without one asks; empty keeps it empty.
     pub empty_question: &'static str,
-    /// The text after each document that the model reads in the
-    /// document's attention block, so every question shares it. The
-    /// planner sends its tokens as the plan's `document_close` setting
-    /// and the worker appends them to every document.
     pub document_close: &'static str,
 }
 
@@ -85,7 +70,6 @@ impl PromptLayout {
         }
     }
 
-    /// The text after a document: one entry per tokenized segment.
     pub fn question_segments(&self, question: &str, separator: &str) -> Vec<String> {
         let separator = self.question_separator.unwrap_or(separator);
         let question = if question.is_empty() {
@@ -115,7 +99,6 @@ impl PromptLayout {
     }
 }
 
-/// The codes a coded prompt may use, in order: A to Z, then AA to ZZ.
 pub fn code_candidates() -> Vec<String> {
     let upper: Vec<String> = ('A'..='Z').map(String::from).collect();
     let mut codes = upper.clone();
@@ -127,12 +110,7 @@ pub fn code_candidates() -> Vec<String> {
     codes
 }
 
-// Base Labs' mammoth-1 and elephant-1 (qev/prompt.py in OneJev at
-// 81ce62f): the document in a state block, then the question, its
-// lettered options, and the answer line. A filter asks the yes/no
-// question as two options, yes then no.
 const MAMMOTH_OPTIONS_LABEL: &str = "\n\nOptions:";
-// the answer line; "{letters}" becomes the codes, joined by ", "
 const MAMMOTH_CLOSING: &str = "\n\nAnswer with one letter: {letters}.";
 const MAMMOTH_LABEL_CLOSING: &str = "\n\nAnswer with one label: {letters}.";
 const MAMMOTH_FILTER_END: &str = "\n\nOptions:\
@@ -151,11 +129,6 @@ fn decision2_option(key: &str, description: Option<&str>) -> String {
     format!("\n<option>\n{option}\n</option>")
 }
 
-/// The layout a ModelSpec's `prompt_layout` names.
-///
-/// # Errors
-///
-/// No layout has the name.
 pub fn prompt_layout(name: &str) -> Result<PromptLayout, CompileError> {
     match name {
         "ai-if" => Ok(PromptLayout::plain("ai-if")),
@@ -229,7 +202,6 @@ pub(crate) fn render_join_frame(
     )
 }
 
-/// The length of a `{N}` placeholder at the start of the text.
 fn leading_placeholder(text: &str) -> Option<usize> {
     let rest = text.strip_prefix('{')?;
     let digits = rest.chars().take_while(char::is_ascii_digit).count();
@@ -250,11 +222,6 @@ fn placeholders(template: &str) -> Vec<u64> {
     found
 }
 
-/// Validate that a prompt refers to every argument and no nonexistent argument.
-///
-/// # Errors
-///
-/// The numbered placeholders do not match the supplied arguments.
 pub fn check_placeholders(template: &str, num_args: usize) -> Result<(), CompileError> {
     let mut slots = placeholders(template);
     slots.sort_unstable();
@@ -272,7 +239,6 @@ pub fn check_placeholders(template: &str, num_args: usize) -> Result<(), Compile
     Ok(())
 }
 
-/// Split into (pre-placeholder text, placeholder-onward text).
 fn split_template(template: &str) -> (String, String) {
     match template.find('{') {
         Some(index) => (template[..index].to_string(), template[index..].to_string()),
@@ -284,8 +250,6 @@ fn python_strip(text: &str) -> &str {
     text.trim()
 }
 
-/// Split into (frame, canonical template), moving text before the first
-/// placeholder to after it.
 fn split_frame(template: &str, document_label: &str) -> Result<(String, String), CompileError> {
     let (user_pre, tail) = split_template(template);
     if tail.is_empty() {
@@ -342,7 +306,6 @@ fn prompt(template: String, args: &[ValueExpression], kind: &str) -> Prompt {
     }
 }
 
-/// The model's chat-turn text: before the preamble, and after the answer cue.
 pub type Turn = (String, String);
 
 fn filter_question_segments(tail: &str, layout: &PromptLayout) -> Vec<String> {
@@ -356,7 +319,6 @@ fn filter_question_segments(tail: &str, layout: &PromptLayout) -> Vec<String> {
     layout.question_segments(content, separator)
 }
 
-/// Build a filter Prompt from a template and column arguments.
 pub fn bind_prompt(
     template: &str,
     args: &[ValueExpression],
@@ -364,8 +326,6 @@ pub fn bind_prompt(
     layout: &PromptLayout,
 ) -> Result<Prompt, CompileError> {
     check_placeholders(template, args.len())?;
-    // one table's filter reads one document: several columns are one
-    // computed document, which DataFusion builds before the region
     if args.len() > 1 {
         return Err(CompileError::unsupported(
             "This filter must read a materialized document expression.",
@@ -454,7 +414,6 @@ fn render_classify_question(
     )
 }
 
-/// d1's option codes: the labels when each is one letter, else A to Z, then AA, AB, ...
 fn option_codes(labels: &[String]) -> Vec<String> {
     let stripped: Vec<&str> = labels.iter().map(|label| label.trim()).collect();
     if !stripped.is_empty()
@@ -516,7 +475,6 @@ fn distinct_aliases(args: &[ValueExpression]) -> bool {
     aliases.len() == count
 }
 
-/// The classification fields every classification prompt records.
 struct Recipe {
     categories: Vec<String>,
     descriptions: Vec<String>,
@@ -537,7 +495,6 @@ impl Recipe {
     }
 }
 
-/// Bind a classification prompt to one or two document columns.
 #[allow(clippy::too_many_arguments)]
 pub fn bind_classify_prompt(
     template: &str,
@@ -764,10 +721,6 @@ fn bind_option_classify_prompt(
     Ok(bound)
 }
 
-/// The text after a document: the question, one block per label, the close.
-///
-/// A layout with an `options_label` returns one segment: the question,
-/// the options label, one coded line per label, and the closing.
 fn choice_segments(
     question: &str,
     labels: &[String],
@@ -798,7 +751,6 @@ fn choice_segments(
                 _ => format!("\n{letter}. {label}"),
             })
             .collect();
-        // mammoth's, the one coded layout: a two-letter code asks for a label
         let closing = if letters.iter().any(|letter| letter.chars().count() > 1) {
             MAMMOTH_LABEL_CLOSING
         } else {
@@ -916,7 +868,6 @@ fn bind_choice_classify_prompt(
     Ok(bound)
 }
 
-/// Bind an AI.SAE_FEATURES prompt over one document column.
 pub fn bind_sae_features_prompt(
     template: &str,
     args: &[ValueExpression],
@@ -943,7 +894,6 @@ pub fn bind_sae_features_prompt(
     Ok(bound)
 }
 
-/// Build an AI.SCORE Prompt that keeps the template as written.
 pub fn bind_score_prompt(template: &str, args: &[ValueExpression]) -> Result<Prompt, CompileError> {
     check_placeholders(template, args.len())?;
     if !distinct_aliases(args) {
@@ -954,7 +904,6 @@ pub fn bind_score_prompt(template: &str, args: &[ValueExpression]) -> Result<Pro
     Ok(prompt(template.to_string(), args, "score"))
 }
 
-/// Bind an AI.EXTRACT prompt over one document column.
 pub fn bind_extract_prompt(
     args: &[ValueExpression],
     question: &str,
@@ -1001,7 +950,6 @@ pub fn bind_extract_prompt(
     Ok(bound)
 }
 
-/// Bind an AI.MAP prompt over one document column.
 pub fn bind_map_prompt(
     args: &[ValueExpression],
     instruction: &str,
@@ -1010,8 +958,6 @@ pub fn bind_map_prompt(
     if args.len() != 1 {
         return compile_error("AI.MAP reads one document column");
     }
-    // a {N} would read as a document placeholder; other braces, as in a
-    // JSON example, stay in the prompt as written
     if instruction.trim().is_empty() || !placeholders(instruction).is_empty() {
         return compile_error(
             "AI.MAP needs an instruction with at least one word and no {N} placeholder",
@@ -1031,7 +977,6 @@ pub fn bind_map_prompt(
     Ok(bound)
 }
 
-/// Build a join Prompt with one placeholder per table.
 pub fn bind_join_prompt(
     template: &str,
     args: &[ValueExpression],
@@ -1108,11 +1053,6 @@ pub fn bind_join_prompt(
     Ok(bound)
 }
 
-/// Bind the prompt of one AI function call, as `PromptBinder.bind`.
-///
-/// # Errors
-///
-/// The template or arguments do not fit the call, or the kind is unknown.
 #[allow(clippy::too_many_arguments)]
 pub fn bind(
     kind: &str,

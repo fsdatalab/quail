@@ -9,15 +9,14 @@ from quail.execution.runtimes import built_in_runtimes
 from quail.extensions import ExtensionRegistry, LogicalRule, PhysicalRule
 from quail.specs import DEVICES, MODELS
 
-# the logical optimizer rules, in order: DataFusion's default rules with
-# Quail's before replace_distinct_aggregate
 LOGICAL_RULES = tuple(_quail_native.LOGICAL_RULES)
-# the built-in physical rules, in the order they apply
 PHYSICAL_RULES = tuple(_quail_native.PHYSICAL_RULES)
-# the rules that each derive one option of an AI operator; listed in
-# place of "derive", they leave the others out
-DERIVE_OPTIONS = ("derive.filters", "derive.fetch", "derive.projection",
-                  "derive.guard")
+DERIVE_OPTIONS = (
+    "derive.inline_predicates",
+    "derive.row_limit",
+    "derive.field_pruning",
+    "derive.precondition",
+)
 
 
 def logical_rules_without(name: str) -> tuple[str, ...]:
@@ -59,5 +58,4 @@ def built_in_registry(logical_rules=LOGICAL_RULES,
     for runtimes in (built_in_runtimes(), quail_runtimes()):
         for runtime_key, runtime in runtimes.items():
             registry.register_runtime(runtime, key=runtime_key)
-    # the comparison backends, for the benchmark runner and the server
     return register_baselines(registry)

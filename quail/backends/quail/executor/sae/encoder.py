@@ -4,9 +4,6 @@ import numpy as np
 
 from quail.backends.quail.executor.readout import _HostReadout
 
-# bytes of fp32 pre-activation one encode block materializes: it lives
-# in the device memory the arena leaves unclaimed (POOL_FRACTION in
-# quail.common.budgets), and fewer, larger blocks mean fewer launches
 ENCODE_BLOCK_BYTES = 256 * 2**20
 
 
@@ -20,8 +17,8 @@ class SaeEncoder:
     def __init__(self, torch, F, weight, bias, keep: int):
         self.torch = torch
         self.F = F
-        self.weight = weight    # (num_features, hidden) bf16
-        self.bias = bias        # (num_features,) fp32
+        self.weight = weight
+        self.bias = bias
         self.keep = keep
         self.num_features = weight.shape[0]
 
@@ -56,9 +53,6 @@ class SaeEncoder:
         indices, strengths = [], []
         block = max(1, ENCODE_BLOCK_BYTES // (4 * self.num_features))
         for start in range(0, rows.shape[0], block):
-            # the fp32 bias promotes the bf16 GEMM output in one pass; a
-            # negative value is selected only when a row has fewer than
-            # keep positives, and the clamp on the selection zeroes it
             pre = self.F.linear(rows[start:start + block].to(torch.bfloat16),
                                 self.weight) + self.bias
             values, index = torch.topk(pre, self.keep, dim=1)

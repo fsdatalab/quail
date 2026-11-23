@@ -1,5 +1,3 @@
-//! How `explain()` writes numbers, values, and prompts.
-
 use crate::constants::DEFAULT_SELECTIVITY;
 
 use serde::Deserialize;
@@ -7,14 +5,9 @@ use serde_json::Value;
 
 use crate::expressions::{repr_float, repr_str};
 
-/// The mark beside a selectivity the planner assumed.
 const DEFAULT_MARK: &str = "*";
-/// The characters of a prompt template a predicate row shows.
 const PROMPT_CHARS: usize = 32;
 
-// ---------------------------------------------------------------- numbers
-
-/// Python's `format(value, f".{precision}g")`.
 pub fn format_g(value: f64, precision: usize) -> String {
     if value.is_nan() {
         return "nan".to_string();
@@ -49,7 +42,6 @@ fn strip_zeros(text: &str) -> &str {
     }
 }
 
-/// `text`, a decimal number, with commas between thousands.
 fn group_thousands(text: &str) -> String {
     let (sign, unsigned) = match text.strip_prefix('-') {
         Some(rest) => ("-", rest),
@@ -73,7 +65,6 @@ fn group_thousands(text: &str) -> String {
     }
 }
 
-/// Python's `f"{value:,}"`.
 pub(super) fn commas(value: &Value) -> String {
     match value {
         Value::Number(number) if number.is_f64() => {
@@ -84,13 +75,10 @@ pub(super) fn commas(value: &Value) -> String {
     }
 }
 
-/// Python's `f"{value:,}"` of an integer.
 pub(super) fn commas_int(value: i64) -> String {
     group_thousands(&value.to_string())
 }
 
-/// A row count or rate: three significant digits below one, else one
-/// decimal with commas, without a trailing `.0`.
 pub(super) fn number(value: f64) -> String {
     if value != 0.0 && value.abs() < 1.0 {
         return format_g(value, 3);
@@ -129,10 +117,6 @@ pub(super) fn default_note() -> String {
     )
 }
 
-// ---------------------------------------------------------------- values
-
-/// Python's `repr` of a JSON value, reading each array as a tuple when
-/// `tuples` holds, as a frozen dataclass's fields are.
 fn repr_as(value: &Value, tuples: bool) -> String {
     match value {
         Value::Null => "None".to_string(),
@@ -159,7 +143,6 @@ fn repr_as(value: &Value, tuples: bool) -> String {
     }
 }
 
-/// Python's `str` of a JSON value.
 pub(super) fn py_str(value: &Value) -> String {
     str_as(value, false)
 }
@@ -171,12 +154,10 @@ fn str_as(value: &Value, tuples: bool) -> String {
     }
 }
 
-/// `key=value` lines, nesting a mapping and a list of mappings.
 pub(super) fn field_lines(fields: &[(String, Shown)], depth: usize) -> Vec<String> {
     field_lines_as(fields, depth, false)
 }
 
-/// `key=value` lines, each array shown as a tuple when `tuples` holds.
 pub(super) fn field_lines_as(
     fields: &[(String, Shown)],
     depth: usize,
@@ -205,7 +186,6 @@ pub(super) fn field_lines_as(
     lines
 }
 
-/// The first `count` characters of `text`.
 pub(super) fn prefix(text: &str, count: usize) -> String {
     text.chars().take(count).collect()
 }
@@ -213,8 +193,6 @@ pub(super) fn prefix(text: &str, count: usize) -> String {
 pub(super) fn width(text: &str) -> usize {
     text.chars().count()
 }
-
-// ---------------------------------------------------------------- prompts
 
 pub(super) fn short_prompt(prompt: &crate::physical::Prompt) -> String {
     let mut template = prompt.template.clone();
@@ -224,8 +202,6 @@ pub(super) fn short_prompt(prompt: &crate::physical::Prompt) -> String {
     format!("PROMPT({})", repr_str(&template))
 }
 
-/// A JSON value with each object's keys in written order, as explain's
-/// `key=value` lines show it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Shown {
     Null,
@@ -312,8 +288,6 @@ impl From<&Value> for Shown {
 }
 
 impl Shown {
-    /// Python's `repr`, each array a tuple when `tuples` holds and each
-    /// object with a class tag the dataclass it encodes.
     fn repr(&self, tuples: bool) -> String {
         match self {
             Shown::Null => "None".to_string(),
@@ -362,7 +336,6 @@ impl Shown {
         }
     }
 
-    /// Python's `str`.
     fn text(&self, tuples: bool) -> String {
         match self {
             Shown::Text(text) => text.clone(),

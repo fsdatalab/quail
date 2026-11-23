@@ -1,41 +1,3 @@
-//! The `LowerAiCalls` analyzer rule: AI calls as Quail's plan nodes.
-//!
-//! DataFusion binds a query's AI calls as scalar functions inside its
-//! own operators. The rule rewrites each part of the query that Quail
-//! plans so each call is an [`AiNode`] of its own, and DataFusion's
-//! operators hold only the relational work:
-//!
-//! - A `Filter` keeps its other terms. Each `AI.IF` call of a term is an
-//!   `AiNode` above it that returns its answer, in written order, and
-//!   the term is a `Filter` above them that reads each answer in its
-//!   call's place: `b` for `AI.IF(...)`, `NOT b` for `NOT AI.IF(...)`,
-//!   `r.flagged OR b1 OR b2` for an OR of two calls.
-//!   [`crate::rules::derive`] then makes the `Filter` the last node's
-//!   own, as DataFusion has simplified it. A call that reads two tables
-//!   is an AI join.
-//! - A comparison of an `AI.SCORE` call is an `AiNode` whose filter is
-//!   the comparison.
-//! - An inner `Join` keeps its other ON terms; each `AI.IF` term is an
-//!   `AiNode` above it.
-//! - Each such node records where the query wrote its term
-//!   ([`crate::ai::Written`]).
-//! - A `Filter`'s test of an `AI.CLASSIFY`, `AI.EXTRACT`, `AI.MAP`, or
-//!   `AI.SAE_FEATURES` answer, such as `sentiment IN ('negative')`,
-//!   reads the column an `AiNode` below it adds. Each node whose answer
-//!   it reads keeps the test as written and its place in the WHERE
-//!   ([`crate::ai::WrittenTest`]).
-//! - A `Projection` of such a call `AS name` reads the column `name`,
-//!   which an `AiNode` below it adds unless one already does. An
-//!   extraction's column holds its answer, and `name` with the span
-//!   suffix its spans.
-//! - An `EXISTS` gate, `EXISTS (SELECT 1 FROM t s WHERE AI.IF(...))`,
-//!   joins the table and keeps the rows of the outer one: an `AiNode`
-//!   of semi semantics, or anti for `NOT EXISTS`.
-//!
-//! A column takes its SELECT alias as its name, or a name of its own when
-//! only a test reads it. A call anywhere else stays as DataFusion bound
-//! it.
-
 mod extract;
 mod outer_join;
 
@@ -56,17 +18,11 @@ use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 use datafusion::optimizer::simplify_expressions::ExprSimplifier;
 use datafusion::optimizer::{AnalyzerRule, OptimizerConfig, OptimizerRule};
 
-use crate::ai::{AiNode, Semantics, Written, WrittenTest};
+use crate::ai::{AiNode, Semantics, Written, WrittenPredicate};
 use crate::functions::column_call_kind;
 use crate::functions::{function_name, is_ai_call, quail_function};
 use crate::plan::{as_node, extension_node};
 
-/// Rewrite the AI calls of each part of a query that Quail plans into
-/// Quail's plan nodes, as the module explains.
-///
-/// The rule runs first among the analyzer rules, on the plan as
-/// DataFusion's SQL planner bound it; [`crate::region::claim`] explains which
-/// parts Quail plans.
 #[derive(Debug, Default)]
 pub struct LowerAiCalls;
 
@@ -93,7 +49,6 @@ impl OptimizerRule for LowerAiCalls {
         if !calls_ai_function(&plan)? {
             return Ok(Transformed::no(plan));
         }
-        // a call no operator can lower stays, and the plan with it
         let lowered = extract::lower_plan(plan.clone())?;
         Ok(if lowered == plan {
             Transformed::no(plan)
@@ -103,7 +58,6 @@ impl OptimizerRule for LowerAiCalls {
     }
 }
 
-/// The term inside a `HINT`, or the term itself.
 fn hinted(expr: &Expr) -> &Expr {
     match expr {
         Expr::ScalarFunction(call) if call.name() == "hint" && !call.args.is_empty() => {
@@ -113,7 +67,6 @@ fn hinted(expr: &Expr) -> &Expr {
     }
 }
 
-/// The term inside a `HINT`, and the `HINT`'s options, if it has any.
 fn unhint(expr: &Expr) -> (Expr, Option<Expr>) {
     match expr {
         Expr::ScalarFunction(call) if call.name() == "hint" && !call.args.is_empty() => {
@@ -124,11 +77,8 @@ fn unhint(expr: &Expr) -> (Expr, Option<Expr>) {
     }
 }
 
-/// Whether any operator in the subtree, or an EXISTS or IN subquery in
-/// it, calls an AI function that is not yet lowered into an `AiNode`.
 fn calls_ai_function(plan: &LogicalPlan) -> Result<bool> {
     plan.exists(|node| {
-        // an `AiNode`'s expressions hold its lowered call
         if as_node::<AiNode>(node).is_some() {
             return Ok(false);
         }
@@ -147,7 +97,6 @@ fn calls_ai_function(plan: &LogicalPlan) -> Result<bool> {
     })
 }
 
-/// Whether a term is a comparison of an `AI.SCORE` call.
 fn is_score_test(term: &Expr) -> bool {
     matches!(term, Expr::BinaryExpr(binary)
     if matches!(
@@ -159,18 +108,12 @@ fn is_score_test(term: &Expr) -> bool {
             | Operator::Gt
             | Operator::GtEq
     ) && match (function_name(&binary.left), function_name(&binary.right)) {
-        // the other side is a value DataFusion computes for each row
         (Some("ai_score"), _) => !binary.right.exists(|found| Ok(crate::is_ai_call(found))).unwrap_or(true),
         (_, Some("ai_score")) => !binary.left.exists(|found| Ok(crate::is_ai_call(found))).unwrap_or(true),
         _ => false,
     })
 }
 
-/// The `AI.IF` and `AI.SCORE` calls of a term that asks the model
-/// nothing else and has no subquery, in written order: `AI.IF(...)`
-/// itself, or any expression of such calls and the input's columns, such
-/// as `NOT AI.IF(...)`, `r.flagged OR AI.IF(...)`, or `AI.SCORE(...) >
-/// 0.5`. None for any other term.
 fn filter_calls(term: &Expr) -> Option<Vec<Expr>> {
     let mut calls: Vec<Expr> = Vec::new();
     let mut other = false;
@@ -192,24 +135,17 @@ fn filter_calls(term: &Expr) -> Option<Vec<Expr>> {
     (!other && !calls.is_empty()).then_some(calls)
 }
 
-/// Whether a term is a predicate the model answers: an `AI.IF` call or a
-/// comparison of an `AI.SCORE` call.
 fn is_asked(term: &Expr) -> bool {
     let term = hinted(term);
     function_name(term) == Some("ai_filter") || is_score_test(term)
 }
 
-/// Whether a term of a join's ON is the join's own AI predicate, which
-/// [`lower_join`] makes an AI join of.
 pub(crate) fn is_join_predicate(term: &Expr) -> bool {
     is_score_test(hinted(term)) || filter_calls(hinted(term)).is_some()
 }
 
-/// Terms of one WHERE or ON, each with its position among them.
 type Terms = Vec<(usize, Expr)>;
 
-/// A predicate's terms of `AI.IF` answers and comparisons of `AI.SCORE`
-/// calls, and the rest, in written order, and how many terms it has.
 fn split_asked(predicate: &Expr) -> (Terms, Terms, usize) {
     let terms = split_conjunction(predicate);
     let num_terms = terms.len();
@@ -224,7 +160,6 @@ fn split_asked(predicate: &Expr) -> (Terms, Terms, usize) {
     (asked, rest, num_terms)
 }
 
-/// `term` with each occurrence of `call` replaced by `with`.
 fn replace_call(term: Expr, call: &Expr, with: &Expr) -> Result<Expr> {
     Ok(term
         .transform_down(|found| {
@@ -240,8 +175,6 @@ fn replace_call(term: Expr, call: &Expr, with: &Expr) -> Result<Expr> {
         .data)
 }
 
-/// An `AiNode` over `input` asking an `AI.IF` call and returning its
-/// answer as the column `answer`: the term's `Filter` above reads it.
 fn answer_node(
     input: LogicalPlan,
     call: &Expr,
@@ -259,8 +192,6 @@ fn answer_node(
     )
 }
 
-/// An `AiNode` over `input` asking `term`, an `AI.IF` call or a
-/// comparison of an `AI.SCORE` call, whose filter tests the answer.
 fn asked_node(
     input: LogicalPlan,
     term: &Expr,
@@ -270,7 +201,7 @@ fn asked_node(
 ) -> Result<LogicalPlan> {
     let (term, hint) = unhint(term);
     let read = Expr::Column(Column::from_name(answer.clone()));
-    let (call, filter) = match term {
+    let (call, inline_predicate) = match term {
         Expr::BinaryExpr(mut binary) if function_name(&binary.left) == Some("ai_score") => {
             let call = std::mem::replace(binary.left.as_mut(), read);
             (call, Expr::BinaryExpr(binary))
@@ -282,17 +213,11 @@ fn asked_node(
         call => (call, read),
     };
     let node = AiNode::answering(input, call, answer, Written { index, ..written })?;
-    Ok(extension_node(node.hinted(hint).tested(filter, semantics)?))
+    Ok(extension_node(
+        node.hinted(hint).tested(inline_predicate, semantics)?,
+    ))
 }
 
-/// Stack the `AiNode`s of each asked term on `input`, in written order.
-///
-/// A term of `AI.IF` or `AI.SCORE` answers is one node per call, each
-/// returning its answer, below a `Filter` of the term with each answer
-/// in its call's place.
-///
-/// `on` is the alias of the table whose JOIN's ON holds the terms, or
-/// None for a WHERE.
 fn stack_asked(
     mut input: LogicalPlan,
     asked: Terms,
@@ -321,7 +246,6 @@ fn stack_asked(
         let (mut test, hint) = unhint(&term);
         for (number, call) in calls.iter().enumerate() {
             let (mut answer, index) = columns.answer_name();
-            // a call the SELECT list also returns takes its name there
             if columns.selects(call) {
                 answer = columns.name_for(call, input.schema());
             }
@@ -338,24 +262,16 @@ fn stack_asked(
     Ok(input)
 }
 
-/// The column each call a filter tests or a SELECT list returns is
-/// added under: a SELECT alias, or a name of its own.
 #[derive(Debug, Default)]
 pub(crate) struct Columns {
-    /// (call, name) of each column call a SELECT list returns.
     selected: Vec<(Expr, String)>,
     reserved: std::collections::BTreeSet<String>,
-    /// How many columns took a name of their own.
     num_unnamed: usize,
-    /// How many answers of tests took a name.
     num_answers: usize,
-    /// How many WHEREs and ONs the lowering met.
     num_clauses: usize,
 }
 
 impl Columns {
-    /// A name for the answer of an `AI.IF` or `AI.SCORE` test, and the
-    /// test's number among the region's AI predicates.
     fn answer_name(&mut self) -> (String, usize) {
         loop {
             self.num_answers += 1;
@@ -366,27 +282,20 @@ impl Columns {
         }
     }
 
-    /// Whether a SELECT list returns `call`.
     fn selects(&self, call: &Expr) -> bool {
         self.selected.iter().any(|(found, _)| found == call)
     }
 
-    /// `name`, the SELECT list's own name for a call, which no generated
-    /// name may take after it.
     fn take_selected_name(&mut self, name: &str) -> String {
         self.reserved.insert(name.to_string());
         name.to_string()
     }
 
-    /// The number of the next WHERE or ON.
     fn clause(&mut self) -> usize {
         self.num_clauses += 1;
         self.num_clauses
     }
 
-    /// The name of `call`'s answer column over `input`: the SELECT
-    /// list's name for the call, or a new one when `input` has a column
-    /// or a table of that name, which then goes to the SELECT list alone.
     fn name_for(&mut self, call: &Expr, input: &datafusion::common::DFSchema) -> String {
         match self.selected.iter().find(|(found, _)| found == call) {
             Some((_, name)) if !names_input(input, name) => name.clone(),
@@ -394,7 +303,6 @@ impl Columns {
         }
     }
 
-    /// A new name that is no column of the plan.
     fn unnamed(&mut self) -> String {
         loop {
             self.num_unnamed += 1;
@@ -406,8 +314,6 @@ impl Columns {
     }
 }
 
-/// Whether `name` is a column or a table of `input`, so that no answer
-/// column over it may take the name.
 pub(crate) fn names_input(input: &datafusion::common::DFSchema, name: &str) -> bool {
     input.has_column_with_unqualified_name(name)
         || input
@@ -415,7 +321,6 @@ pub(crate) fn names_input(input: &datafusion::common::DFSchema, name: &str) -> b
             .any(|(qualifier, _)| qualifier.is_some_and(|found| found.table() == name))
 }
 
-/// The calls a SELECT list returns as columns, as `call AS name`.
 fn selected_calls(plan: &LogicalPlan) -> Vec<(Expr, String)> {
     let mut found = Vec::new();
     let _ = plan.apply(|node| {
@@ -434,7 +339,6 @@ fn selected_calls(plan: &LogicalPlan) -> Vec<(Expr, String)> {
     found
 }
 
-/// Whether an argument is a `{'selectivity': ...}` hint and nothing else.
 fn is_selectivity_hint(arg: &Expr) -> bool {
     match arg {
         Expr::ScalarFunction(call) if call.name() == "named_struct" => {
@@ -446,9 +350,6 @@ fn is_selectivity_hint(arg: &Expr) -> bool {
     }
 }
 
-/// The call a column operator runs for `call`: an extraction for the
-/// spans of one, and a test's call without its selectivity hint, which
-/// the test keeps.
 fn base_call(call: &Expr) -> Expr {
     let Expr::ScalarFunction(found) = call else {
         return call.clone();
@@ -471,7 +372,6 @@ fn is_span_call(expr: &Expr) -> bool {
     function_name(expr) == Some("ai_extract_span")
 }
 
-/// The column calls a term reads, outermost first, without repeats.
 fn column_calls(term: &Expr) -> Vec<Expr> {
     let mut found: Vec<Expr> = Vec::new();
     let _ = term.apply(|expr| {
@@ -487,13 +387,6 @@ fn column_calls(term: &Expr) -> Vec<Expr> {
     found
 }
 
-/// The name of the column an `AiNode` below `plan` adds for `call`, if
-/// `plan` returns that column with the node's answer in every row.
-///
-/// An outer join fills the rows of one input with NULL, and the call
-/// above the join is NULL there too, as its document is. The search
-/// stops at an operator that returns other rows than it reads, such as
-/// an aggregate.
 fn added_column(plan: &LogicalPlan, call: &Expr) -> Option<String> {
     fn search(node: &LogicalPlan, call: &Expr) -> Option<String> {
         if let Some(column) = as_node::<AiNode>(node)
@@ -510,7 +403,6 @@ fn added_column(plan: &LogicalPlan, call: &Expr) -> Option<String> {
             | LogicalPlan::Limit(_)
             | LogicalPlan::Repartition(_)
             | LogicalPlan::Extension(_) => node.inputs(),
-            // a derived table's columns are named by its alias
             _ => Vec::new(),
         };
         inputs.into_iter().find_map(|input| search(input, call))
@@ -518,8 +410,6 @@ fn added_column(plan: &LogicalPlan, call: &Expr) -> Option<String> {
     search(plan, call).filter(|name| plan.schema().has_column_with_unqualified_name(name))
 }
 
-/// `input` with an `AiNode` adding `call`'s answer as `name`,
-/// and an extraction's spans as `name` with the span suffix.
 fn add_column(input: LogicalPlan, call: Expr, name: &str) -> Result<LogicalPlan> {
     let schema = input.schema();
     let field = |expr: &Expr, name: String| -> Result<Field> {
@@ -545,7 +435,6 @@ fn add_column(input: LogicalPlan, call: Expr, name: &str) -> Result<LogicalPlan>
     )?))
 }
 
-/// `term` reading each call's column instead of calling it.
 fn read_columns(term: Expr, columns: &[(Expr, String)]) -> Result<Expr> {
     Ok(term
         .transform_down(|expr| {
@@ -570,9 +459,6 @@ fn read_columns(term: Expr, columns: &[(Expr, String)]) -> Result<Expr> {
         .data)
 }
 
-/// An EXISTS gate the binder reads: `EXISTS (SELECT 1 FROM table alias
-/// WHERE <one AI.IF over a row of each table>)`, as the table's plan and
-/// the predicate with the outer row's columns as columns.
 fn exists_gate(term: &Expr) -> Option<(LogicalPlan, Expr, bool)> {
     let Expr::Exists(exists) = hinted(term) else {
         return None;
@@ -605,7 +491,6 @@ fn lower_filter(filter: &Filter, columns: &mut Columns) -> Result<Transformed<Lo
         return Ok(Transformed::no(LogicalPlan::Filter(filter.clone())));
     }
     let mut input = match conjunction(plain.into_iter().map(|(_, term)| term)) {
-        // a term DataFusion cannot type keeps its operator, for the binder to refuse
         Some(predicate) => match boolean_filter(predicate, &filter.input)? {
             Some(kept) => LogicalPlan::Filter(kept),
             None => return Ok(Transformed::no(LogicalPlan::Filter(filter.clone()))),
@@ -659,8 +544,8 @@ fn lower_filter(filter: &Filter, columns: &mut Columns) -> Result<Transformed<Lo
     let mut written = Vec::new();
     for (position, term) in tested {
         let test = read_columns(term.clone(), &added)?;
-        written.push(WrittenTest {
-            test: simplified(test.clone(), &input),
+        written.push(WrittenPredicate {
+            predicate: simplified(test.clone(), &input),
             written: term,
             position,
             clause,
@@ -668,7 +553,7 @@ fn lower_filter(filter: &Filter, columns: &mut Columns) -> Result<Transformed<Lo
         tests.push(test);
     }
     let names: Vec<String> = added.iter().map(|(_, name)| name.clone()).collect();
-    input = with_tests(input, &names, &written)?;
+    input = with_written_predicates(input, &names, &written)?;
     match boolean_filter(
         conjunction(tests).unwrap_or(datafusion::logical_expr::lit(true)),
         &Arc::new(input),
@@ -678,9 +563,6 @@ fn lower_filter(filter: &Filter, columns: &mut Columns) -> Result<Transformed<Lo
     }
 }
 
-/// `test` as DataFusion's type coercion and `SimplifyExpressions`
-/// rewrite it in a filter over `input`, or as it is when they fail: the
-/// `AiNode`s whose answers it reads find the filter's term by this form.
 fn simplified(test: Expr, input: &LogicalPlan) -> Expr {
     let Ok(coerced) = test
         .clone()
@@ -696,11 +578,13 @@ fn simplified(test: Expr, input: &LogicalPlan) -> Expr {
         .unwrap_or(test)
 }
 
-/// `plan` with `tests` kept by each `AiNode` that adds a column of `names`.
-fn with_tests(plan: LogicalPlan, names: &[String], tests: &[WrittenTest]) -> Result<LogicalPlan> {
+fn with_written_predicates(
+    plan: LogicalPlan,
+    names: &[String],
+    predicates: &[WrittenPredicate],
+) -> Result<LogicalPlan> {
     Ok(plan
         .transform_down(|node| {
-            // a derived table's columns are named by its alias
             if matches!(node, LogicalPlan::SubqueryAlias(_)) {
                 return Ok(Transformed::new(node, false, TreeNodeRecursion::Jump));
             }
@@ -711,18 +595,12 @@ fn with_tests(plan: LogicalPlan, names: &[String], tests: &[WrittenTest]) -> Res
                 return Ok(Transformed::no(node));
             }
             Ok(Transformed::yes(extension_node(
-                column.clone().with_tests(tests),
+                column.clone().with_written_predicates(predicates),
             )))
         })?
         .data)
 }
 
-/// A filter over `input` that keeps the rows where `predicate` is true,
-/// or `None` when DataFusion cannot type the predicate.
-///
-/// # Errors
-///
-/// The predicate is not true or false.
 fn boolean_filter(predicate: Expr, input: &Arc<LogicalPlan>) -> Result<Option<Filter>> {
     let Ok(data_type) = predicate.get_type(input.schema()) else {
         return Ok(None);
@@ -737,8 +615,6 @@ fn lower_join(join: &Join, columns: &mut Columns) -> Result<Transformed<LogicalP
     let Some(predicate) = &join.filter else {
         return Ok(Transformed::no(LogicalPlan::Join(join.clone())));
     };
-    // an OR of AI tests in an inner join's ON keeps the same pairs as a
-    // WHERE above the join, where one term may read one table alone
     let is_or = |term: &Expr| {
         matches!(hinted(term), Expr::BinaryExpr(found) if found.op == Operator::Or)
             && is_join_predicate(term)
@@ -758,7 +634,6 @@ fn lower_join(join: &Join, columns: &mut Columns) -> Result<Transformed<LogicalP
     if asked.is_empty() || join.join_type != JoinType::Inner {
         return Ok(Transformed::no(LogicalPlan::Join(join.clone())));
     }
-    // the joined table's alias, which names the ON
     let joined = join
         .right
         .schema()
@@ -777,8 +652,6 @@ fn lower_join(join: &Join, columns: &mut Columns) -> Result<Transformed<LogicalP
     )?))
 }
 
-/// Give a fallback call one document per row, even when its prompt reads
-/// several columns. The original question still refers to labeled documents.
 fn combine_prompt_documents(
     prompt: &mut datafusion::logical_expr::expr::ScalarFunction,
 ) -> Result<()> {
@@ -787,7 +660,7 @@ fn combine_prompt_documents(
         return Ok(());
     }
     let Some(Expr::Literal(value, _)) = prompt.args.first() else {
-        return Ok(()); // The binder reports a nonliteral template.
+        return Ok(());
     };
     let Some(template) = value.try_as_str().flatten() else {
         return Ok(());
@@ -801,8 +674,6 @@ fn combine_prompt_documents(
         documents.push(lit(format!("\n\nDOCUMENT {index}:\n")));
         documents.push(document.clone());
     }
-    // the one document is NULL when any of its parts is, as `concat`
-    // alone reads a NULL part as empty text
     let absent = prompt
         .args
         .iter()
@@ -819,8 +690,6 @@ fn combine_prompt_documents(
     Ok(())
 }
 
-/// Compute document expressions in DataFusion before binding their model calls.
-/// Even a SELECT without FROM has one input row, which the region can identify.
 pub(crate) fn precompute_prompt_arguments(projection: Projection) -> Result<Projection> {
     let mut computed: Vec<(Expr, String)> = Vec::new();
     let mut compute = |argument: &mut Expr| {
@@ -882,7 +751,6 @@ pub(crate) fn precompute_prompt_arguments(projection: Projection) -> Result<Proj
                             compute(argument);
                         }
                     }
-                    // Nested calls belong to the computed input, not this projection.
                     Ok(Transformed::new(
                         Expr::ScalarFunction(call),
                         true,
@@ -984,8 +852,6 @@ fn lower_projection(
 }
 
 impl Columns {
-    /// The names for the calls of `plan`: its SELECT lists' aliases, and
-    /// new ones that are no column of it.
     pub(crate) fn of(plan: &LogicalPlan) -> Result<Self> {
         let mut reserved = std::collections::BTreeSet::new();
         plan.apply_with_subqueries(|node| {
@@ -1005,9 +871,6 @@ impl Columns {
     }
 }
 
-/// `node` with the AI calls of its own expressions as `AiNode`s below
-/// it, as the module explains. Any operator but a `Filter`, an inner
-/// `Join`, or a `Projection` is unchanged.
 pub(crate) fn lower_node(
     node: LogicalPlan,
     columns: &mut Columns,
@@ -1020,12 +883,6 @@ pub(crate) fn lower_node(
     }
 }
 
-/// Rewrite the AI calls of a plan into Quail's plan nodes, as the module
-/// explains.
-///
-/// # Errors
-///
-/// A rewritten operator's schema does not fit DataFusion's rules.
 pub fn lower_ai_calls(plan: LogicalPlan) -> Result<LogicalPlan> {
     let mut columns = Columns::of(&plan)?;
     Ok(plan

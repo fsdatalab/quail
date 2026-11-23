@@ -1,6 +1,3 @@
-//! Quail's physical graph for Python: the graph that holds the nodes of
-//! [`super::physical`], and the plan values Python reads and writes.
-
 use std::sync::Arc;
 
 use pyo3::exceptions::{PyKeyError, PyValueError};
@@ -19,10 +16,6 @@ pyo3::create_exception!(
     "Raised when a physical graph is invalid."
 );
 
-// ----------------------------------------------------------------- the graph
-
-/// An immutable graph of physical nodes and the port that returns the
-/// result.
 #[pyclass(name = "PhysicalGraph", module = "quail.physical", frozen)]
 pub struct PhysicalGraph {
     nodes: Py<PyTuple>,
@@ -89,7 +82,6 @@ impl PhysicalGraph {
         })
     }
 
-    /// Read and validate a graph written as `{"nodes", "root"}` JSON.
     #[staticmethod]
     fn from_json<'py>(py: Python<'py>, text: &str) -> PyResult<Bound<'py, Self>> {
         let graph: physical::PhysicalGraph =
@@ -99,7 +91,6 @@ impl PhysicalGraph {
         Self::of(py, graph)
     }
 
-    /// The graph as JSON, as plans write it.
     fn to_json(&self) -> String {
         serde_json::to_string(&self.graph).expect("a graph writes")
     }
@@ -114,7 +105,6 @@ impl PhysicalGraph {
         self.root.clone_ref(py)
     }
 
-    /// Return the node with an id.
     fn node<'py>(&self, py: Python<'py>, node_id: &str) -> PyResult<Bound<'py, PyAny>> {
         match self
             .graph
@@ -127,8 +117,6 @@ impl PhysicalGraph {
         }
     }
 
-    /// Validate ids, ports, types, columns, cycles, the root, and, when
-    /// given, that every node has a registered runtime.
     #[pyo3(signature = (runtime_keys=None))]
     fn validate(&self, runtime_keys: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
         topology::validate_graph(&self.graph.nodes, &self.graph.root)
@@ -150,7 +138,6 @@ impl PhysicalGraph {
         Ok(())
     }
 
-    /// Check that every model node uses the selected backend.
     fn validate_backend(&self, backend: &str) -> PyResult<()> {
         let mut wrong: Vec<String> = self
             .graph
@@ -171,13 +158,11 @@ impl PhysicalGraph {
         )))
     }
 
-    /// Return the nodes, each after all its inputs.
     fn topological_nodes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
         self.validate(None)?;
         self.by_position(py, &topology::topological_nodes(&self.graph.nodes))
     }
 
-    /// Return the nodes with one type name.
     fn nodes_by_type<'py>(
         &self,
         py: Python<'py>,
@@ -189,17 +174,6 @@ impl PhysicalGraph {
         self.by_position(py, &positions)
     }
 
-    /// Group compatible per-document operators into pipelines.
-    ///
-    /// A pipeline runs the same way on one GPU and on each worker of
-    /// several, over that worker's share of the documents.
-    ///
-    /// Args:
-    ///     completed: Nodes whose outputs are already available.
-    ///
-    /// Returns:
-    ///     A mapping from each node id in a pipeline to the pipeline's
-    ///     nodes, in order.
     #[pyo3(signature = (completed=Vec::new()))]
     fn pipelines<'py>(
         &self,
@@ -220,10 +194,6 @@ impl PhysicalGraph {
         Ok(found)
     }
 
-    /// Return the ids of the model nodes whose documents' KV is already
-    /// resident: each pipeline member after the first, and a pipeline's
-    /// first node on a table whose previous pipeline kept its KV under
-    /// the same document head.
     #[pyo3(signature = (completed=Vec::new()))]
     fn resident_inputs<'py>(
         &self,
@@ -258,8 +228,6 @@ impl PhysicalGraph {
     }
 }
 
-/// Read a value of a physical plan from JSON: a node, a spec, a port, or
-/// an expression as its class, and any other value as Python's.
 #[pyfunction]
 pub fn decode_plan_value<'py>(py: Python<'py>, text: &str) -> PyResult<Bound<'py, PyAny>> {
     let value: Value =
@@ -275,15 +243,11 @@ pub fn decode_plan_value<'py>(py: Python<'py>, text: &str) -> PyResult<Bound<'py
     to_python(py, &value)
 }
 
-/// Write a value of a physical plan as JSON: the inverse of
-/// `decode_plan_value`.
 #[pyfunction]
 pub fn encode_plan_value(value: &Bound<'_, PyAny>) -> PyResult<String> {
     Ok(from_python(value)?.to_string())
 }
 
-/// Typed input ports that read the given outputs, named `input:<index>`,
-/// each carrying the value type its source port's name implies.
 #[pyfunction]
 pub fn input_ports<'py>(
     py: Python<'py>,
@@ -300,7 +264,6 @@ pub fn input_ports<'py>(
     PyTuple::new(py, ports)
 }
 
-/// Register the graph class, its error, and the plan value functions.
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = module.py();
     module.add_class::<PhysicalGraph>()?;

@@ -1,5 +1,3 @@
-//! CPU-only concurrent callers, including sessions sharing one executor.
-
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
@@ -125,8 +123,6 @@ fn queries_own_their_caller_route_until_success_or_failure() -> Result<()> {
             );
             let two = run(Arc::clone(&second), 1);
             assert_eq!(starting.recv_timeout(Duration::from_secs(10)).unwrap(), 1);
-            // The first callback releases the GIL while blocked, allowing a
-            // second query to expose the old shared-route race.
             std::thread::sleep(Duration::from_millis(100));
             Python::attach(|py| {
                 engine
@@ -151,7 +147,6 @@ fn queries_own_their_caller_route_until_success_or_failure() -> Result<()> {
             }
             one.join().unwrap();
             two.join().unwrap();
-            // An error before any model region must release ownership too.
             assert!(second.sql("SELECT * FROM missing_table").is_err());
             Python::attach(|py| engine.call_method1(py, "mark_caller", (2,)).unwrap());
             second.sql("SELECT r.id FROM reviews r WHERE AI.IF(PROMPT('q2: {0}', r.body))")?;

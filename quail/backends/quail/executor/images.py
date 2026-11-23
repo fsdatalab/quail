@@ -26,14 +26,9 @@ import numpy as np
 import pyarrow as pa
 from _quail_native import IMAGE_TOKEN_BASE, image_size
 
-# the frames each of Qwen's vision patches covers; a still image fills
-# both with the same pixels
 TEMPORAL_PATCH = 2
 IMAGE_SIGNATURES = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff")
-# threads that decode a region's images ahead of the vision encoder
 DECODE_THREADS = 8
-# the most patches one vision encoder call reads, which bounds its
-# activations; a model spec's vision_mem_bytes reserves them
 ENCODER_PATCHES = 32_768
 
 
@@ -120,7 +115,6 @@ def decode_image(image: Image, token_pixels: int) -> np.ndarray:
     width, height = image.columns * token_pixels, image.rows * token_pixels
     with PILImage.open(io.BytesIO(image.encoded)) as opened:
         rgb = opened.convert("RGB")
-        # Qwen's image processor resizes with bicubic interpolation
         if rgb.size != (width, height):
             rgb = rgb.resize((width, height), PILImage.Resampling.BICUBIC)
         return np.asarray(rgb)
@@ -143,7 +137,6 @@ class RegionImages:
         self.token_pixels = self.patch_pixels * self.merge
         bounds = (spec.image_min_pixels, spec.image_max_pixels)
         self.images: dict[int, Image] = {}
-        # by alias, each document's images' first token ids, in order
         self.firsts: dict[str, list[tuple[int, ...]]] = {}
         for alias, table in columns.items():
             column = _binary_column(table)
@@ -153,7 +146,6 @@ class RegionImages:
             firsts = []
             for index, value in enumerate(column.to_pylist()):
                 parts = value if isinstance(value, list) else [value]
-                # the pages AI.PDF_PAGES returns: each its number and image
                 parts = [part.get("image") if isinstance(part, dict) else part
                          for part in parts]
                 encoded = [part for part in parts
@@ -170,7 +162,6 @@ class RegionImages:
             self.firsts[alias] = firsts
         order = sorted(self.images)
         self._sorted = np.asarray(order, dtype=np.int64)
-        # each image's pixels, decoded off the GPU loop's thread
         self._pool = None
         self._pixels: dict = {}
         if self.images:
@@ -181,12 +172,9 @@ class RegionImages:
                                                      self.token_pixels)
                             for first, image in self.images.items()}
         self._embeddings: dict[int, object] = {}
-        # (start, end) CUDA events around each encoder call, the seconds
-        # the GPU loop waited for decoded pixels, and the images encoded
         self._encoder_events: list = []
         self.decode_wait_s = 0.0
         self.encoded = 0
-        # by arena key, and by image, the position of the image's first token
         self._starts: dict = {}
         self._image_starts: dict[int, int] = {}
 
@@ -218,7 +206,6 @@ class RegionImages:
             return []
         return [self.images[first] for first in self.firsts[found[0]][found[1]]]
 
-    # ---- embeddings ---------------------------------------------------
 
     def embed(self, torch, visual, chunk, text_embed):
         """The input embeddings of a chunk's token ids.
@@ -244,7 +231,6 @@ class RegionImages:
         self._encode(torch, visual, [first for first in firsts
                                      if first not in self._embeddings],
                      hidden.dtype)
-        # each image's embeddings stacked, and each row's index into them
         stacked = torch.cat([self._embeddings[first] for first in firsts])
         offsets = dict(zip(firsts, np.cumsum([0] + [self.images[first].tokens
                                                      for first in firsts])))
@@ -252,8 +238,6 @@ class RegionImages:
         device = hidden.device
         hidden[_upload(torch, image_rows, device)] = stacked[
             _upload(torch, index, device)]
-        # an image's KV holds it once its last token is written; a
-        # document recomputed after eviction encodes it again
         written = set(tokens.tolist())
         for first in firsts:
             if first + self.images[first].tokens - 1 in written:
@@ -312,7 +296,6 @@ class RegionImages:
         for first, found in zip(firsts, embeddings.split(sizes), strict=True):
             self._embeddings[first] = found.to(dtype)
 
-    # ---- positions ----------------------------------------------------
 
     def rotary_positions(self, chunk, answer_keys):
         """Each row's rotary position, or None for a chunk of no image.
@@ -348,8 +331,6 @@ class RegionImages:
                                 - (found[index[at]] - first))
                     starts[first] = start
                     self._image_starts[first] = start
-            # a document that borrowed an image's KV starts it where its
-            # lender does
             for image in images:
                 if image.first not in starts and image.first in self._image_starts:
                     starts[image.first] = self._image_starts[image.first]

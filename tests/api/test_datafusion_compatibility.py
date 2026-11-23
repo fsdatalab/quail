@@ -284,7 +284,9 @@ def test_a_negated_ai_filter_runs_in_one_model_region():
             if shape == "under a LIMIT":
                 # the LIMIT is the filter's fetch: the model stops once a row passes
                 plan = session.sql(query).explain()
-                assert "filter: NOT __quail_answer_1, fetch: 1" in plan, shape
+                assert (
+                    "inline_predicate: NOT __quail_answer_1, row_limit: 1" in plan
+                ), shape
             if shape == "in an OR":
                 # r0 passes on its stars, so the model is not asked about it
                 assert ("r", 0) not in oracle.asked, shape

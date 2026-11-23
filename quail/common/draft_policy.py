@@ -16,7 +16,6 @@ import numpy as np
 
 from quail.common.answers import _array, _float64, _int64
 
-# ranges of live positions the source odds are learned per
 LIVE_BUCKETS = tuple(_quail_native.LIVE_BUCKETS)
 
 

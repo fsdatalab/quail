@@ -1,10 +1,3 @@
-//! A region's run, reported from what each worker ran.
-//!
-//! Each worker answers a region's end with its counters as JSON and
-//! its nodes' output tables ([`crate::workers::Ran`]). [`region_report`]
-//! merges the workers: one table per output port, one set of metrics
-//! per node, and the run's totals, throughput, and GPU cost.
-
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -20,8 +13,6 @@ use serde_json::{Map, Value, json};
 use crate::shared::Table;
 use crate::workers::{Ran, failure};
 
-/// A node's measured metrics, in the order a report lists them; every
-/// one adds across workers but the peak, which is the largest.
 const METRICS: [&str; 14] = [
     "wall_s",
     "input_rows",
@@ -39,7 +30,6 @@ const METRICS: [&str; 14] = [
     "chunks",
 ];
 
-/// The fields a report shows of each executed join and barrier.
 const JOIN_FIELDS: [(&str, &[&str]); 2] = [
     (
         "quail.ai_join",
@@ -64,7 +54,6 @@ const JOIN_FIELDS: [(&str, &[&str]); 2] = [
     ("quail.barrier", &["next_anchor", "aliases"]),
 ];
 
-/// The sum of two counters: an integer when both are.
 fn added(left: &Value, right: &Value) -> Value {
     match (left.as_i64(), right.as_i64()) {
         (Some(left), Some(right)) => json!(left + right),
@@ -76,8 +65,6 @@ fn is_count(value: &Value) -> bool {
     value.is_number()
 }
 
-/// One node's metrics from two workers: counters add, the peak is the
-/// larger, and an extension keeps the later worker's descriptive values.
 fn merged_metrics(left: &Map<String, Value>, right: &Map<String, Value>) -> Map<String, Value> {
     let zero = json!(0);
     let mut merged = Map::new();
@@ -129,8 +116,6 @@ fn no_metrics() -> Map<String, Value> {
     metrics
 }
 
-/// A node's metrics as a report lists them: the standard fields, then
-/// each extension metric that is a number.
 fn scalar_metrics(metrics: &Map<String, Value>) -> Value {
     let mut scalars = Map::new();
     for name in METRICS {
@@ -146,17 +131,11 @@ fn scalar_metrics(metrics: &Map<String, Value>) -> Value {
     Value::Object(scalars)
 }
 
-/// The node and port a worker's output table is tagged with.
 fn tag(table: &Table) -> Option<(&String, &String)> {
     let metadata = table.0.metadata();
     Some((metadata.get("quail.node")?, metadata.get("quail.port")?))
 }
 
-/// One port's rows from every worker as one table: each worker's rows
-/// in turn, and for a rows port each set of ids once.
-///
-/// A worker with no rows of a port may type its columns apart, so its
-/// empty table is left out.
 fn merged_table(tables: &[&Table], rows_port: bool) -> Result<Table> {
     let filled: Vec<&&Table> = (tables.iter())
         .filter(|(_, batches)| batches.iter().any(|batch| batch.num_rows() > 0))
@@ -172,7 +151,6 @@ fn merged_table(tables: &[&Table], rows_port: bool) -> Result<Table> {
                 batches.push(batch.clone());
                 continue;
             }
-            // the same columns under another type
             let columns = (schema.fields().iter())
                 .map(|field| {
                     let column = batch.column_by_name(field.name()).ok_or_else(|| {
@@ -209,8 +187,6 @@ fn merged_table(tables: &[&Table], rows_port: bool) -> Result<Table> {
     Ok((schema, vec![kept]))
 }
 
-/// The workers' memory reports as one: capacity and bytes add, the
-/// peak is the largest, and the trace sums each worker's latest sample.
 fn merged_memory(workers: &[Value]) -> Map<String, Value> {
     let rows = |worker: &Value, name: &str| -> Vec<Value> {
         worker[name].as_array().cloned().unwrap_or_default()
@@ -275,8 +251,6 @@ fn merged_memory(workers: &[Value]) -> Map<String, Value> {
     merged
 }
 
-/// A counter from every worker as one: numbers add, and counters by
-/// alias add alias by alias.
 fn summed(values: &[&Value]) -> Value {
     if values.first().is_some_and(|value| value.is_object()) {
         let mut totals = Map::new();
@@ -295,15 +269,6 @@ fn summed(values: &[&Value]) -> Value {
         .fold(json!(0), |sum, value| added(&sum, value))
 }
 
-/// The report of a region's run on its workers, and the run's output
-/// tables, one per port, tagged with node and port.
-///
-/// `graph` is the region's graph; `ran` what each worker ran; `wall`
-/// the seconds the region took. `usd_per_hour` prices one GPU.
-///
-/// # Errors
-///
-/// A worker's results do not read, or a port's rows do not merge.
 pub fn region_report(
     graph: &PhysicalGraph,
     ran: &[Ran],
@@ -332,7 +297,6 @@ pub fn region_report(
                 continue;
             }
             let (schema, batches) = merged_table(&tables, port.value_type == ValueType::Rows)?;
-            // the first table's tag names the port
             outputs.push((Arc::clone(&tables[0].0), batches, schema));
         }
         nodes.push((node, metrics));

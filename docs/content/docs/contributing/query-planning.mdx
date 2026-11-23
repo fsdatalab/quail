@@ -30,16 +30,16 @@ Quail starts with the logical plan from DataFusion.
 
 ### Algorithm 1: derive
 
-`derive` moves filters, output columns, limits, and guards onto the AI
+`derive` moves inline predicates, field pruning, row limits, and preconditions onto the AI
 operators able to use them. Each move removes model work without changing the
 query result.
 
 | Option | Quail uses the option to |
 | --- | --- |
-| `filter` | Stop an answer or drop a row as soon as a condition is known. |
-| `projection` | Return only the answer columns used later in the query. |
-| `fetch` | Stop after enough rows pass the operators below. |
-| `guard` | Skip an AI call when a row does not need an answer. |
+| `inline_predicates` | Stop an answer or drop a row as soon as a condition is known. |
+| `field_pruning` | Return only the answer columns and fields used later in the query. |
+| `row_limit` | Stop after enough rows pass the operators below. |
+| `precondition` | Skip an AI call when a row does not need an answer. |
 
 <PlannerAlgorithm name="derive" />
 
@@ -110,10 +110,10 @@ planner puts `AI.IF` first because each no answer removes a row before
 
 <DeriveFigure />
 
-`AI.CLASSIFY` receives the fetch because it is the last AI operator. The
-fetch counts rows returned by the region. `AI.IF` applies the only remaining
+`AI.CLASSIFY` receives the row limit because it is the last AI operator. The
+row limit counts rows returned by the region. `AI.IF` applies the only remaining
 answer condition, so every row reaching `AI.CLASSIFY` counts toward the
-fetch.
+row limit.
 
 ## Plan several model regions
 

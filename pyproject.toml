@@ -48,6 +48,8 @@ dev = [
     "pandas==3.0.5",
     "hf-transfer==0.1.9",
     "import-linter==2.3",
+    "tree-sitter==0.26.1",
+    "tree-sitter-rust==0.24.2",
 ]
 
 [tool.uv.sources]

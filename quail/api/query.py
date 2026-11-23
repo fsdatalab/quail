@@ -25,8 +25,6 @@ from quail.explain import explain
 from quail.physical import Limit, Scan, decode_plan_value
 from quail.physical.plan import Refusal, RefusalError, plan_from_json
 
-# the start of Rust's message for a document that is an expression
-
 if TYPE_CHECKING:
     from quail.api.session import Session
 
@@ -152,7 +150,6 @@ class Query:
 
                 raise CompileError(compile_message(error, self.text)) from None
             for region, message, unsupported in bound:
-                # DataFusion runs the operators of a shape Quail does not read
                 if message is not None and not unsupported:
                     raise CompileError(message)
                 for warning in json.loads(region).get("warnings", []) if region else []:
@@ -266,7 +263,6 @@ class Query:
                         if result is not None else None)
             text = region._explain(executed, verbose)
             if result is not None and executed is None:
-                # LIMIT and other SQL operators need not read every model region.
                 text = "not executed (estimated plan):\n" + text
             texts.append(text)
         if len(regions) == 1 and self._whole and not regions[0].has_inputs():
@@ -340,20 +336,15 @@ class RegionQuery:
         self.session = session
         self.region_id = region_id
         self.catalog = session.catalog if catalog is None else catalog
-        # the region's operators, as Rust's JSON: as derived, then as the
-        # planner chose them
         self.operators = operators
         self._operators_input = operators
-        # DataFusion's plan of the region, one operator per line
         self.logical = logical
         self._facts = {}
         self.order = order
         self._plan = None
         self._document_tokens = None
         self._token_inputs = None
-        # seconds Rust took to tokenize the inputs and plan the region
         self._planning_s = 0.0
-        # each filtered input's rows' positions in its registered table
         self.source_rows = {}
 
     def facts(self, operators: str | None = None) -> dict:
@@ -386,7 +377,6 @@ class RegionQuery:
         """
         if self._plan is not None:
             return self._plan
-        # Rust plans every region a backend accepts as the query runs
         refusal = backend_refusal(self.session)
         if refusal is None:
             raise RuntimeError("a model region is planned by Rust's session")
@@ -446,12 +436,9 @@ class RegionQuery:
             result: The QueryResult of running the plan, or None.
             verbose: Include runtime settings and internal node fields.
         """
-        # A downstream region may have been inspected with empty placeholder
-        # inputs. ANALYZE must use the plan chosen for its actual input rows.
         physical = (result.physical_plan if result is not None
                     and result.physical_plan is not None else self.plan())
         if result is not None:
-            # the root relation is lazy, so its row count is taken here
             rows = (result.region_rows if result.region_rows is not None
                     else result.count())
             root = physical.graph.root.node_id
@@ -487,8 +474,6 @@ class RegionQuery:
         plan.graph.validate(runtime_keys=set(self.session.registry.runtimes))
         plan.graph.validate_backend(plan.backend)
         envelope = plan.to_envelope()
-        # Rust builds what the workers read: each document's text, and
-        # the value columns with each table's first documents
         tables = dict(_quail_native.request_tables(
             json.dumps(envelope), self.operators, self.scan_tables()))
         inputs = {}
@@ -555,13 +540,11 @@ class RegionQuery:
         measured = dict(out.get("node_metrics", {}))
         for node in plan.nodes:
             if isinstance(node, Limit):
-                # Rust keeps the region's first rows as it builds them
                 measured[node.node_id] = scalar_node_metrics({node.node_id: NodeResult(
                     {}, NodeMetrics(output_rows=relation.num_rows))})[node.node_id]
         result.node_metrics = {
             node_id: NodeMetrics.from_scalars(metrics)
             for node_id, metrics in measured.items()}
-        # Saved reports need the graph and metrics without Python objects.
         report["executed_plan"] = json.loads(plan.graph.to_json())
         report["node_metrics"] = {
             node_id: dict(metrics) for node_id, metrics in measured.items()}

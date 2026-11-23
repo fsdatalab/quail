@@ -1,41 +1,3 @@
-//! Quail's AI operator as a DataFusion plan node.
-//!
-//! [`AiNode`] asks the model one AI call `f` about each row of its input
-//! `R`, adding the call's answer as the column `a`:
-//!
-//! ```text
-//! AI(R; g, p, h, P, n) = π_P(Limit_n(σ_p(π_{*, f_g → a}(R))))
-//! f_g = CASE WHEN g THEN f END
-//! ```
-//!
-//! - `g`, the guard, says which rows the model is asked about.
-//! - `p`, the filter, is an exact test of the input's columns and `a`.
-//! - `h`, the hint, is the query's inexact `HINT` options, and the hint
-//!   test: the node may drop rows where it is not TRUE. A node with a
-//!   hint test has no fetch, and the filter that holds the test stays
-//!   above it.
-//! - `P`, the projection, names the added columns the node returns.
-//! - `n`, the fetch, keeps the first rows: of all rows, or of each key.
-//!
-//! An `AI.IF` filter is the node with `p = a` and none of the added
-//! columns returned; a comparison of an `AI.SCORE` is the node with `p`
-//! the comparison. An `AI.IF` join is the node over a join of its inputs.
-//! An `EXISTS` gate is the node over a join, returning the left input's
-//! rows that have a pair passing `p` (semi) or none (anti).
-//!
-//! The call's function names the node's kind: `ai_filter` (`AI.IF`),
-//! `ai_score`, `ai_classify`, `ai_extract`, `ai_map`, or
-//! `ai_sae_features`. The columns the call, guard, and filter read are
-//! DataFusion expressions, which `expressions()` returns; a prompt is not
-//! rendered for a model here: physical planning renders it for the model
-//! it plans for.
-//!
-//! DataFusion's optimizer rules move filters and column lists around the
-//! node as its `UserDefinedLogicalNodeCore` methods allow; each method
-//! says which rewrites keep the node's meaning. A LIMIT or DISTINCT above
-//! the node becomes its fetch (`Derive`,
-//! `Derive`).
-
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
 use std::fmt;
@@ -55,111 +17,60 @@ use datafusion::logical_expr::{
 use crate::functions::{column_call_kind, is_ai_call, quail_function};
 use crate::plan::{as_node, extension_node};
 
-/// Which rows an [`AiNode`] returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Semantics {
-    /// Each row that passes the filter.
     Rows,
-    /// Each row of the input join's left input with a pair that passes.
     Semi,
-    /// Each row of the input join's left input with no pair that passes.
     Anti,
 }
 
-/// How many rows an [`AiNode`] returns after its filter.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Fetch {
-    /// The first `n` rows.
+pub enum RowLimit {
     Global(usize),
-    /// The first `n` rows of each value of the `key` columns: a DISTINCT
-    /// on `key` stops each key at its first row.
     PerKey { key: Vec<String>, n: usize },
 }
 
-/// Where the query wrote an AI predicate's term.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Written {
-    /// The term's position among the terms of its WHERE or ON.
     pub position: usize,
-    /// How many terms that WHERE or ON has.
     pub num_terms: usize,
-    /// Which WHERE or ON it is, numbered as the lowering meets them.
     pub clause: usize,
-    /// The predicate's number among the region's AI predicates, in
-    /// written order.
     pub index: usize,
-    /// The alias of the table whose JOIN's ON holds the term, or None
-    /// for a WHERE.
     pub on: Option<String>,
 }
 
-/// A test of answer columns, as the query wrote it in a WHERE.
-///
-/// The optimizer rules move the test with the columns it reads, which
-/// loses its place among the WHERE's terms; the `AiNode`s whose answers
-/// it reads keep it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct WrittenTest {
-    /// The test as the plan holds it once DataFusion's
-    /// `SimplifyExpressions` has rewritten it, such as
-    /// `sentiment = 'negative' OR sentiment = 'mixed'`.
-    pub test: Expr,
-    /// The test with each AI call as the query wrote it, such as
-    /// `ai_classify(...) IN ('negative')`.
+pub struct WrittenPredicate {
+    pub predicate: Expr,
     pub written: Expr,
-    /// The term's position among the terms of its WHERE.
     pub position: usize,
-    /// Which WHERE it is, numbered as the lowering meets them.
     pub clause: usize,
 }
 
-/// The parts of the OR an `AI.IF` node filters on
-/// ([`AiNode::or_parts`]).
 pub(crate) struct OrParts {
-    /// The terms that ask no model, as one OR; None when it has none.
     pub(crate) plain: Option<Expr>,
-    /// The answer of each other `AI.IF` of the OR, and whether the OR
-    /// reads it as `NOT`.
     pub(crate) others: Vec<(String, bool)>,
-    /// Whether the OR reads the node's own answer as `NOT`.
     pub(crate) negated: bool,
 }
 
-/// One AI call over the rows of its input, as `AiNode`; the module
-/// explains each part.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AiNode {
-    pub(crate) input: Arc<LogicalPlan>,
-    /// The query's own call, such as `ai_classify(...)`, without its `HINT`.
-    pub(crate) call: Expr,
-    /// The answer column's name.
-    pub(crate) answer: String,
-    /// The columns the call adds, the answer first.
-    pub(crate) fields: Vec<Field>,
-    pub(crate) guard: Option<Expr>,
-    pub(crate) filter: Option<Expr>,
-    /// The options of the `HINT` the query wraps the call's term in,
-    /// such as `{'selectivity': 0.4}`.
-    pub(crate) hint: Option<Expr>,
-    /// The positions in `fields` of the added columns the node returns;
-    /// None returns every one.
-    pub(crate) projection: Option<Vec<usize>>,
-    pub(crate) fetch: Option<Fetch>,
-    pub(crate) semantics: Semantics,
-    /// Where the query wrote the call's term, if in a WHERE or ON.
-    pub(crate) written: Option<Written>,
-    /// The tests of the node's answers the query wrote in a WHERE.
-    pub(crate) tests: Vec<WrittenTest>,
-    pub(crate) schema: DFSchemaRef,
+    input: Arc<LogicalPlan>,
+    call: Expr,
+    answer: String,
+    fields: Vec<Field>,
+    precondition: Option<Expr>,
+    inline_predicate: Option<Expr>,
+    hint: Option<Expr>,
+    pruned_fields: Option<Vec<usize>>,
+    row_limit: Option<RowLimit>,
+    semantics: Semantics,
+    written: Option<Written>,
+    written_predicates: Vec<WrittenPredicate>,
+    schema: DFSchemaRef,
 }
 
 impl AiNode {
-    /// A node adding `fields`, the answer of `call` first, to each row of
-    /// `input`, and returning every row with every added column.
-    ///
-    /// # Errors
-    ///
-    /// A field's name is already a column of the input.
     pub fn try_new(
         input: Arc<LogicalPlan>,
         call: Expr,
@@ -171,27 +82,19 @@ impl AiNode {
             call,
             answer,
             fields,
-            guard: None,
-            filter: None,
+            precondition: None,
+            inline_predicate: None,
             hint: None,
-            projection: None,
-            fetch: None,
+            pruned_fields: None,
+            row_limit: None,
             semantics: Semantics::Rows,
             written: None,
-            tests: Vec::new(),
+            written_predicates: Vec::new(),
             schema: Arc::new(DFSchema::empty()),
         }
         .checked()
     }
 
-    /// A node over `input` asking `call`, an `AI.IF` or `AI.SCORE`, and
-    /// returning its answer as the column `answer`; the query wrote the
-    /// call's term at `written`.
-    ///
-    /// # Errors
-    ///
-    /// The call's type does not read, or `answer` is already a column of
-    /// the input.
     pub(crate) fn answering(
         input: LogicalPlan,
         call: Expr,
@@ -207,38 +110,25 @@ impl AiNode {
         .checked()
     }
 
-    /// This node with the options of the `HINT` the query wraps its
-    /// term in.
     pub(crate) fn hinted(self, hint: Option<Expr>) -> Self {
         Self { hint, ..self }
     }
 
-    /// This node keeping the rows `filter`, a test of its answer, passes,
-    /// as `semantics` says, and returning none of the columns it adds.
-    ///
-    /// # Errors
-    ///
-    /// As [`AiNode::checked`].
-    pub(crate) fn tested(self, filter: Expr, semantics: Semantics) -> Result<Self> {
+    pub(crate) fn tested(self, inline_predicate: Expr, semantics: Semantics) -> Result<Self> {
         Self {
-            filter: Some(filter),
-            projection: Some(Vec::new()),
+            inline_predicate: Some(inline_predicate),
+            pruned_fields: Some(Vec::new()),
             semantics,
             ..self
         }
         .checked()
     }
 
-    /// This node keeping `tests`, the tests of its answers the query
-    /// wrote in a WHERE, beside its own.
-    pub(crate) fn with_tests(mut self, tests: &[WrittenTest]) -> Self {
-        self.tests.extend(tests.iter().cloned());
+    pub(crate) fn with_written_predicates(mut self, predicates: &[WrittenPredicate]) -> Self {
+        self.written_predicates.extend(predicates.iter().cloned());
         self
     }
 
-    /// Whether the node asks `call`, as `other` asks its own, with no
-    /// options, adding columns of the types `other` adds: its answers
-    /// are `other`'s.
     pub(crate) fn repeats(&self, call: &Expr, other: &AiNode) -> bool {
         let same_types = self.fields.len() == other.fields.len()
             && self
@@ -249,19 +139,10 @@ impl AiNode {
         self.call == *call && same_types && !self.has_options()
     }
 
-    /// Whether the node adds `call`'s answer as a column every row it
-    /// returns has: a column node, or an `AI.IF` or `AI.SCORE` that
-    /// filters no row.
     pub(crate) fn answers_every_row(&self, call: &Expr) -> bool {
-        (!self.is_predicate() || self.filter.is_none()) && self.call == *call
+        (!self.is_predicate() || self.inline_predicate.is_none()) && self.call == *call
     }
 
-    /// This extraction with its answer and span columns typed by its
-    /// call, once a rewrite of the call has changed the fields it asks.
-    ///
-    /// # Errors
-    ///
-    /// The call's type does not read.
     pub(crate) fn retyped_extraction(mut self) -> Result<Self> {
         let Expr::ScalarFunction(call) = &self.call else {
             return Ok(self);
@@ -280,13 +161,6 @@ impl AiNode {
         Ok(self)
     }
 
-    /// This node with its schema computed from its parts.
-    ///
-    /// # Errors
-    ///
-    /// A field's name is already a column of the input, a projection
-    /// position is not a field's, a gate's input is not a join, or the
-    /// node reads a column its input does not have.
     pub fn checked(mut self) -> Result<Self> {
         if let Some(missing) = self
             .reads()
@@ -302,8 +176,10 @@ impl AiNode {
         if all.fields().len() != self.input.schema().fields().len() + self.fields.len() {
             return plan_err!("{} is already a column of the input", self.answer);
         }
-        if let Some(projection) = &self.projection
-            && projection.iter().any(|index| *index >= self.fields.len())
+        if let Some(pruned_fields) = &self.pruned_fields
+            && pruned_fields
+                .iter()
+                .any(|index| *index >= self.fields.len())
         {
             return plan_err!("{} returns a column it does not add", self.answer);
         }
@@ -325,14 +201,15 @@ impl AiNode {
         Ok(self)
     }
 
-    /// Every column the node reads from its input: the columns of its
-    /// call, guard, and filter that it does not add itself. A rule may
-    /// put the node only over an input that has them all.
     pub fn reads(&self) -> Vec<datafusion::common::Column> {
         let mut reads = Vec::new();
-        for expr in [Some(&self.call), self.guard.as_ref(), self.filter.as_ref()]
-            .into_iter()
-            .flatten()
+        for expr in [
+            Some(&self.call),
+            self.precondition.as_ref(),
+            self.inline_predicate.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
         {
             for column in expr.column_refs() {
                 let own = column.relation.is_none() && self.is_field(&column.name);
@@ -344,18 +221,7 @@ impl AiNode {
         reads
     }
 
-    /// Whether the node can take `term`, a test that reads its answer,
-    /// into its filter. A test it does not accept stays a `Filter` above
-    /// the node, which DataFusion runs on the answers.
-    ///
-    /// An `AI.IF` takes one test: its answer `b`; for a call that reads
-    /// one table, also `NOT b` or an OR of `b` with other `AI.IF`
-    /// answers and tests of that table. Any other call takes a test of
-    /// its own answers and its input's columns, not one that reads
-    /// another call's answer.
-    pub fn accepts_test(&self, term: &Expr) -> bool {
-        // DataFusion decorrelates a subquery it finds in a `Filter`, not
-        // one a node holds
+    pub fn accepts_predicate(&self, term: &Expr) -> bool {
         let subquery = |expr: &Expr| {
             Ok(matches!(
                 expr,
@@ -379,14 +245,14 @@ impl AiNode {
             };
             return term.column_refs().iter().all(own);
         }
-        if self.filter.is_some() {
+        if self.inline_predicate.is_some() {
             return false;
         }
         match self.answer_term(term) {
             Some(negated) => one_table || !negated,
             None => {
                 let mut tested = self.clone();
-                tested.filter = Some(term.clone());
+                tested.inline_predicate = Some(term.clone());
                 one_table
                     && tested.or_parts().is_some_and(|parts| {
                         parts
@@ -397,16 +263,21 @@ impl AiNode {
         }
     }
 
-    /// The terms of an `AI.IF` node's filter OR other than its answer
-    /// `b`, when the filter is `a ∨ b`, and whether the OR reads the
-    /// answer as `NOT b`.
-    ///
-    /// The lowering writes `WHERE r.flagged OR AI.IF(...)` as such a
-    /// node: its filter is the OR, with the answer in the call's place.
-    /// No other term of the filter may read `b`, and the OR reads `b`
-    /// one way: `b OR NOT b` is no test of it.
+    pub fn accepts_row_limit(&self) -> bool {
+        self.hint.is_none() && !self.filters_on_or() && !Self::any_filters_on_or(&self.input)
+    }
+
+    fn filters_on_or(&self) -> bool {
+        self.or_terms().is_some()
+    }
+
+    fn any_filters_on_or(plan: &LogicalPlan) -> bool {
+        plan.exists(|below| Ok(as_node::<AiNode>(below).is_some_and(AiNode::filters_on_or)))
+            .unwrap_or(false)
+    }
+
     pub(crate) fn or_terms(&self) -> Option<(Expr, bool)> {
-        let filter = self.filter.as_ref()?;
+        let filter = self.inline_predicate.as_ref()?;
         let reads_answer = |term: &Expr| {
             term.column_refs()
                 .iter()
@@ -437,14 +308,6 @@ impl AiNode {
         found
     }
 
-    /// The parts of the OR the node filters on, when its filter is one
-    /// ([`Self::or_terms`]): its terms that ask no model, and the answers
-    /// of the other `AI.IF`s of the OR, which nodes below it return.
-    ///
-    /// An OR of several `AI.IF`s, `a ∨ f_1 ∨ … ∨ f_k`, lowers to one
-    /// node per call: each `f_j` but the last returns its answer `b_j`
-    /// and drops no row, in written order, below the last, whose filter
-    /// is `a ∨ b_1 ∨ … ∨ b_k`.
     pub(crate) fn or_parts(&self) -> Option<OrParts> {
         let (rest, negated) = self.or_terms()?;
         let answers = Self::answers_below(&self.input);
@@ -472,15 +335,13 @@ impl AiNode {
         })
     }
 
-    /// The answers of the `AI.IF` nodes in `plan` that return their
-    /// answer and drop no row: the other `AI.IF`s of an OR.
     fn answers_below(plan: &LogicalPlan) -> Vec<String> {
         let mut found = Vec::new();
         let _ = plan.apply(|below| {
             if let Some(asked) = as_node::<AiNode>(below)
                 && asked.semantics == Semantics::Rows
                 && asked.function() == "ai_filter"
-                && asked.filter.is_none()
+                && asked.inline_predicate.is_none()
             {
                 found.push(asked.answer.clone());
             }
@@ -489,9 +350,6 @@ impl AiNode {
         found
     }
 
-    /// Whether `test` reads columns of the node's input, of the one table
-    /// its call reads, and calls no AI function: a test the executor can
-    /// evaluate on the rows the node reads, as a guard.
     pub(crate) fn reads_call_table(&self, test: &Expr) -> bool {
         let tables = |expr: &Expr| -> Vec<String> {
             let mut found: Vec<String> = Vec::new();
@@ -513,7 +371,6 @@ impl AiNode {
         let input = self.input.schema();
         call.len() == 1
             && read == call
-            // an unqualified column is another node's answer, not the table's
             && test
                 .column_refs()
                 .iter()
@@ -521,8 +378,6 @@ impl AiNode {
             && !test.exists(|inner| Ok(is_ai_call(inner))).unwrap_or(true)
     }
 
-    /// Whether `term` is the node's answer column or its `NOT`, and which:
-    /// true for the `NOT`. None for any other term.
     pub fn answer_term(&self, term: &Expr) -> Option<bool> {
         let (read, negated) = match term {
             Expr::Not(inner) => (inner.as_ref(), true),
@@ -533,11 +388,6 @@ impl AiNode {
         .then_some(negated)
     }
 
-    /// This node over `input` instead of its own.
-    ///
-    /// # Errors
-    ///
-    /// As [`AiNode::checked`].
     pub fn with_input(&self, input: LogicalPlan) -> Result<Self> {
         Self {
             input: Arc::new(input),
@@ -546,7 +396,6 @@ impl AiNode {
         .checked()
     }
 
-    /// The name of the call's function, such as `ai_classify`.
     pub fn function(&self) -> &str {
         match &self.call {
             Expr::ScalarFunction(call) => call.name(),
@@ -554,31 +403,27 @@ impl AiNode {
         }
     }
 
-    /// Whether the call uses a predicate operator: every `AI.IF` (including
-    /// one that keeps all rows and returns its answer), or a tested `AI.SCORE`.
     pub fn is_predicate(&self) -> bool {
-        self.function() == "ai_filter" || (self.function() == "ai_score" && self.filter.is_some())
+        self.function() == "ai_filter"
+            || (self.function() == "ai_score" && self.inline_predicate.is_some())
     }
 
-    /// Whether the query wrote the call's term in a JOIN's ON.
     pub fn in_on(&self) -> bool {
         self.written
             .as_ref()
             .is_some_and(|written| written.on.is_some())
     }
 
-    /// Whether a rule gave the node a filter, guard, fetch, or projection.
     pub fn has_options(&self) -> bool {
-        self.filter.is_some()
-            || self.guard.is_some()
-            || self.fetch.is_some()
-            || self.projection.is_some()
+        self.inline_predicate.is_some()
+            || self.precondition.is_some()
+            || self.row_limit.is_some()
+            || self.pruned_fields.is_some()
     }
 
-    /// The added columns the node returns.
     pub fn returned_fields(&self) -> Vec<Field> {
-        match &self.projection {
-            Some(projection) => projection
+        match &self.pruned_fields {
+            Some(pruned_fields) => pruned_fields
                 .iter()
                 .map(|index| self.fields[*index].clone())
                 .collect(),
@@ -594,103 +439,68 @@ impl AiNode {
         }
     }
 
-    /// This node with `rewrite` applied to its call, guard, filter, hint
-    /// test, and each test as the plan holds it and as written.
-    ///
-    /// # Errors
-    ///
-    /// `rewrite` fails.
     pub(crate) fn map_expressions(&self, rewrite: impl Fn(Expr) -> Result<Expr>) -> Result<Self> {
         let mut node = self.clone();
         node.call = rewrite(node.call)?;
-        node.guard = node.guard.map(&rewrite).transpose()?;
-        node.filter = node.filter.map(&rewrite).transpose()?;
-        for test in &mut node.tests {
-            test.test = rewrite(test.test.clone())?;
-            test.written = rewrite(test.written.clone())?;
+        node.precondition = node.precondition.map(&rewrite).transpose()?;
+        node.inline_predicate = node.inline_predicate.map(&rewrite).transpose()?;
+        for pred in &mut node.written_predicates {
+            pred.predicate = rewrite(pred.predicate.clone())?;
+            pred.written = rewrite(pred.written.clone())?;
         }
         Ok(node)
     }
 
-    /// Whether `name` is a column the node adds.
     pub(crate) fn is_field(&self, name: &str) -> bool {
         self.fields.iter().any(|field| field.name() == name)
     }
 
-    /// The answer column's name.
     pub fn answer(&self) -> &str {
         &self.answer
     }
 
-    /// Whether the node asks about the pairs of its input join and
-    /// returns the join's left rows: a semi or anti join, not a node of
-    /// rows.
-    pub fn is_join(&self) -> bool {
-        self.semantics != Semantics::Rows
+    pub fn semantics(&self) -> Semantics {
+        self.semantics
     }
 
-    /// Whether the node adds its call's answers as columns to each row of
-    /// its input: neither an `AI.IF` or tested score, nor a join.
-    pub fn is_column(&self) -> bool {
-        !self.is_predicate() && !self.is_join()
-    }
-
-    /// Whether the node returns the left rows with no pair that passes.
-    pub fn is_anti(&self) -> bool {
-        self.semantics == Semantics::Anti
-    }
-
-    /// The query's own call, such as `ai_classify(...)`, without its
-    /// `HINT`.
     pub fn call(&self) -> Expr {
         self.call.clone()
     }
 
-    /// The model call kind of a column node: `label`, `extract`, `map`,
-    /// or `features`; None for an `AI.IF` or `AI.SCORE`.
     pub(crate) fn column_kind(&self) -> Option<&'static str> {
         column_call_kind(&self.call)
     }
 
-    /// Which rows the model is asked about, as the binder reads it.
-    pub(crate) fn guard(&self) -> Option<Expr> {
-        self.guard.clone()
+    pub(crate) fn precondition(&self) -> Option<Expr> {
+        self.precondition.clone()
     }
 
-    /// The exact test of the input's columns and the answer, as the
-    /// binder reads it.
-    pub(crate) fn filter(&self) -> Option<Expr> {
-        self.filter.clone()
+    pub(crate) fn inline_predicate(&self) -> Option<Expr> {
+        self.inline_predicate.clone()
     }
 
-    /// Where the query wrote the call's term, if in a WHERE or ON.
     pub(crate) fn written(&self) -> Option<Written> {
         self.written.clone()
     }
 
-    /// The tests of the node's answers the query wrote in a WHERE.
-    pub(crate) fn tests(&self) -> Vec<WrittenTest> {
-        self.tests.clone()
+    pub(crate) fn written_predicates(&self) -> Vec<WrittenPredicate> {
+        self.written_predicates.clone()
     }
 
-    /// The number of rows a global fetch keeps.
-    pub(crate) fn global_fetch(&self) -> Option<usize> {
-        match self.fetch {
-            Some(Fetch::Global(rows)) => Some(rows),
+    pub(crate) fn global_row_limit(&self) -> Option<usize> {
+        match self.row_limit {
+            Some(RowLimit::Global(rows)) => Some(rows),
             _ => None,
         }
     }
 
-    /// The key columns and the number of rows of each key that a per-key
-    /// fetch keeps.
-    pub(crate) fn key_fetch(&self) -> Option<(Vec<String>, usize)> {
-        match &self.fetch {
-            Some(Fetch::PerKey { key, n }) => Some((key.clone(), *n)),
+    pub(crate) fn key_row_limit(&self) -> Option<(Vec<String>, usize)> {
+        match &self.row_limit {
+            Some(RowLimit::PerKey { key, n }) => Some((key.clone(), *n)),
             _ => None,
         }
     }
 
-    /// The tables whose columns the call reads.
     pub(crate) fn call_tables(&self) -> BTreeSet<TableReference> {
         self.call
             .column_refs()
@@ -699,12 +509,10 @@ impl AiNode {
             .collect()
     }
 
-    /// The columns of the rows the node reads.
     pub(crate) fn input_schema(&self) -> &DFSchemaRef {
         self.input.schema()
     }
 
-    /// The names of the columns the node adds, the answer first.
     pub(crate) fn added_names(&self) -> Vec<String> {
         self.fields
             .iter()
@@ -712,8 +520,6 @@ impl AiNode {
             .collect()
     }
 
-    /// The run of `AiNode`s at `plan`'s root, top first, and the plan
-    /// below the run.
     pub(crate) fn run(plan: &LogicalPlan) -> (Vec<&AiNode>, &LogicalPlan) {
         let mut nodes = Vec::new();
         let mut bottom = plan;
@@ -724,60 +530,180 @@ impl AiNode {
         (nodes, bottom)
     }
 
-    /// This node without the tests of its answers the query wrote; None
-    /// when it keeps none.
-    pub(crate) fn without_tests(&self) -> Option<Self> {
-        if self.tests.is_empty() {
+    pub(crate) fn without_predicates(&self) -> Option<Self> {
+        if self.written_predicates.is_empty() {
             return None;
         }
         Some(Self {
-            tests: Vec::new(),
+            written_predicates: Vec::new(),
             ..self.clone()
         })
     }
 
-    /// Whether the node has no option at all: no filter, guard, hint,
-    /// fetch, projection, or test.
     pub(crate) fn is_bare(&self) -> bool {
-        !self.has_options() && self.hint.is_none() && self.tests.is_empty()
+        !self.has_options() && self.hint.is_none() && self.written_predicates.is_empty()
     }
 
-    /// The node's filter and each test of its answers as the plan holds
-    /// it: what the node reads beside its expressions, the answer
-    /// included.
-    pub(crate) fn filter_expressions(&self) -> Vec<Expr> {
-        self.filter
+    pub(crate) fn predicate_expressions(&self) -> Vec<Expr> {
+        self.inline_predicate
             .iter()
             .cloned()
-            .chain(self.tests.iter().map(|test| test.test.clone()))
+            .chain(
+                self.written_predicates
+                    .iter()
+                    .map(|test| test.predicate.clone()),
+            )
             .collect()
     }
 
-    /// Whether the node drops no row and returns each row of its input
-    /// with the columns it adds: no filter, written test, or fetch.
     pub(crate) fn only_adds_columns(&self) -> bool {
         self.semantics == Semantics::Rows
-            && self.filter.is_none()
-            && self.tests.is_empty()
-            && self.fetch.is_none()
+            && self.inline_predicate.is_none()
+            && self.written_predicates.is_empty()
+            && self.row_limit.is_none()
     }
 
-    /// This node keeping only the rows `fetch` keeps after its filter.
-    pub(crate) fn with_fetch(self, fetch: Fetch) -> Self {
+    pub(crate) fn take_predicate(&mut self, predicate: &Expr) -> bool {
+        if self.row_limit.is_some() || self.semantics != Semantics::Rows {
+            return false;
+        }
+        let returned: BTreeSet<String> = (self.returned_fields().iter())
+            .map(|field| field.name().clone())
+            .collect();
+        let reads_returned = (predicate.column_refs().iter())
+            .any(|column| column.relation.is_none() && returned.contains(&column.name));
+        let held = (self.inline_predicate.iter().flat_map(split_conjunction))
+            .any(|term| term == predicate);
+        if !reads_returned || !(held || self.accepts_predicate(predicate)) {
+            return false;
+        }
+        if !held {
+            self.inline_predicate = conjunction(
+                self.inline_predicate
+                    .take()
+                    .into_iter()
+                    .chain([predicate.clone()]),
+            );
+        }
+        true
+    }
+
+    pub(crate) fn row_limit_for(&self, rows: usize) -> Option<RowLimit> {
+        match &self.row_limit {
+            Some(RowLimit::PerKey { .. }) => None,
+            Some(RowLimit::Global(found)) if *found <= rows => None,
+            _ => Some(RowLimit::Global(rows)),
+        }
+    }
+
+    pub(crate) fn distinct_row_limit(&self, keys: &[Column]) -> Option<RowLimit> {
+        if self.semantics != Semantics::Rows || self.row_limit.is_some() {
+            return None;
+        }
+        let returns_answer = self.function() != "ai_filter"
+            && self
+                .returned_fields()
+                .iter()
+                .any(|field| field.name() == &self.answer);
+        let key = match keys {
+            [column]
+                if column.relation.is_none() && column.name == self.answer && returns_answer =>
+            {
+                vec![self.answer.clone()]
+            }
+            _ => self.input_key(keys)?,
+        };
+        Some(RowLimit::PerKey { key, n: 1 })
+    }
+
+    pub(crate) fn per_key_row_limit(&self, keys: &[Column], n: usize) -> Option<RowLimit> {
+        if !self.stops_per_key() {
+            return None;
+        }
+        Some(RowLimit::PerKey {
+            key: self.input_key(keys)?,
+            n,
+        })
+    }
+
+    pub(crate) fn with_row_limit(self, row_limit: RowLimit) -> Self {
         Self {
-            fetch: Some(fetch),
+            row_limit: Some(row_limit),
             ..self
         }
     }
 
-    /// Return only the added columns the plan above reads, by `read`, the
-    /// answer always. An `AI.IF` that keeps only the rows whose answer is
-    /// `b`, or only those whose answer is `NOT b`, returns no column:
-    /// where every read reached the node through operators that return
-    /// their input's rows as they are (`carried`), a read of the answer
-    /// above reads the value every row it returns has, which this
-    /// returns with the answer's name.
-    pub(crate) fn project(
+    fn input_key(&self, keys: &[Column]) -> Option<Vec<String>> {
+        let input = self.input.schema();
+        let mut names: Vec<String> = Vec::new();
+        for key in keys {
+            let named = input
+                .fields()
+                .iter()
+                .filter(|field| field.name() == &key.name)
+                .count();
+            if !input.has_column(key) || named != 1 {
+                return None;
+            }
+            if !names.contains(&key.name) {
+                names.push(key.name.clone());
+            }
+        }
+        (!names.is_empty()).then_some(names)
+    }
+
+    fn stops_per_key(&self) -> bool {
+        let tables = |node: &AiNode| -> Vec<String> {
+            let mut found: Vec<String> = Vec::new();
+            for column in node.call.column_refs() {
+                if let Some(table) = &column.relation
+                    && !found.contains(&table.table().to_string())
+                {
+                    found.push(table.table().to_string());
+                }
+            }
+            found
+        };
+        let table = tables(self);
+        let filters = |found: &AiNode| {
+            found.function() == "ai_filter"
+                && found.semantics == Semantics::Rows
+                && found.row_limit.is_none()
+                && found.hint.is_none()
+                && found.precondition.is_none()
+                && tables(found) == table
+        };
+        if table.len() != 1 || !filters(self) {
+            return false;
+        }
+        let mut plain = true;
+        let _ = self.input.apply(|below| {
+            let joins = matches!(below, LogicalPlan::Join(_));
+            let other_call = as_node::<AiNode>(below).is_some_and(|found| !filters(found));
+            let unknown =
+                matches!(below, LogicalPlan::Extension(_)) && as_node::<AiNode>(below).is_none();
+            if joins || other_call || unknown {
+                plain = false;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        plain
+    }
+
+    pub(crate) fn asked_expressions(&self) -> Vec<Expr> {
+        [
+            Some(&self.call),
+            self.precondition.as_ref(),
+            self.hint.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect()
+    }
+
+    pub(crate) fn prune_fields(
         &mut self,
         read: impl Fn(&str) -> bool,
         carried: bool,
@@ -787,63 +713,169 @@ impl AiNode {
         }
         if !self.is_predicate() {
             let returned =
-                (self.projection.clone()).unwrap_or_else(|| (0..self.fields.len()).collect());
+                (self.pruned_fields.clone()).unwrap_or_else(|| (0..self.fields.len()).collect());
             let kept: Vec<usize> = (returned.iter().copied())
                 .filter(|index| *index == 0 || read(self.fields[*index].name()))
                 .collect();
             if kept.len() < returned.len() {
-                self.projection = Some(kept);
+                self.pruned_fields = Some(kept);
             }
             return None;
         }
         let returns_answer =
             (self.returned_fields().iter()).any(|field| *field.name() == self.answer);
-        // a score only its own test reads returns nothing
         if self.function() == "ai_score" && returns_answer && !read(&self.answer) {
-            self.projection = Some(Vec::new());
+            self.pruned_fields = Some(Vec::new());
         }
         if self.function() != "ai_filter" || !returns_answer {
             return None;
         }
-        let filter = self.filter.as_ref()?;
+        let filter = self.inline_predicate.as_ref()?;
         if !read(&self.answer) {
-            self.projection = Some(Vec::new());
+            self.pruned_fields = Some(Vec::new());
             return None;
         }
         let negated = self.answer_term(filter)?;
         if !carried {
             return None;
         }
-        self.projection = Some(Vec::new());
+        self.pruned_fields = Some(Vec::new());
         Some((self.answer.clone(), !negated))
     }
 
-    /// Whether the node keeps only its first rows, in all or per key: a
-    /// rule that moves an operator past it would limit other rows.
-    pub(crate) fn has_fetch(&self) -> bool {
-        self.fetch.is_some()
+    pub(crate) fn is_plain_column(&self) -> bool {
+        self.semantics == Semantics::Rows
+            && !self.is_predicate()
+            && self.inline_predicate.is_none()
+            && self.hint.is_none()
+            && self.row_limit.is_none()
     }
 
-    /// Whether the node asks the model about every row of its input and
-    /// returns each: no filter, guard, or fetch.
+    pub(crate) fn evaluates_on_rows(&self, term: &Expr) -> bool {
+        if self.reads_call_table(term) {
+            return true;
+        }
+        let tables: BTreeSet<String> = (self.call.column_refs().into_iter())
+            .filter_map(|column| {
+                column
+                    .relation
+                    .as_ref()
+                    .map(|table| table.table().to_string())
+            })
+            .collect();
+        let mut earlier = Self::rows_answers(&self.input);
+        if self.function() == "ai_classify" {
+            earlier.retain(|name| !Self::classified(&self.input, name));
+        }
+        let input = self.input.schema();
+        tables.len() == 1
+            && !term.exists(|inner| Ok(is_ai_call(inner))).unwrap_or(true)
+            && term.column_refs().iter().all(|column| {
+                input.has_column(column)
+                    && match &column.relation {
+                        Some(table) => tables.contains(table.table()),
+                        None => earlier.contains(&column.name),
+                    }
+            })
+    }
+
+    fn classified(plan: &LogicalPlan, name: &str) -> bool {
+        plan.exists(|below| {
+            Ok(as_node::<AiNode>(below)
+                .is_some_and(|asked| asked.function() == "ai_classify" && asked.is_field(name)))
+        })
+        .unwrap_or(true)
+    }
+
+    fn rows_answers(plan: &LogicalPlan) -> BTreeSet<String> {
+        let mut found = BTreeSet::new();
+        let _ = plan.apply(|below| {
+            if let Some(asked) = as_node::<AiNode>(below)
+                && asked.semantics == Semantics::Rows
+                && !matches!(asked.function(), "ai_map" | "ai_sae_features")
+            {
+                found.extend(asked.added_names());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        found
+    }
+
+    pub(crate) fn add_precondition(&mut self, terms: Vec<Expr>) {
+        let new: Vec<Expr> = terms
+            .into_iter()
+            .filter(|term| {
+                !self
+                    .precondition
+                    .as_ref()
+                    .is_some_and(|precondition| split_conjunction(precondition).contains(&term))
+            })
+            .collect();
+        if let Some(found) = conjunction(new) {
+            self.precondition = Some(match self.precondition.take() {
+                Some(precondition) => precondition.and(found),
+                None => found,
+            });
+        }
+    }
+
+    pub(crate) fn takes_or_precondition(&self) -> bool {
+        self.semantics == Semantics::Rows
+            && self.precondition.is_none()
+            && self.hint.is_none()
+            && self.row_limit.is_none()
+    }
+
+    pub(crate) fn precondition_or(&mut self, read: &Expr) {
+        let earlier = Self::earlier_answers(&self.input);
+        let is_earlier = |expr: &Expr| {
+            let read = match expr {
+                Expr::Not(inner) => inner.as_ref(),
+                other => other,
+            };
+            read.try_as_col()
+                .is_some_and(|column| column.relation.is_none() && earlier.contains(&column.name))
+        };
+        let kept = (split_conjunction(read).into_iter()).filter(|term| match term {
+            Expr::IsNotTrue(inner) if is_earlier(inner) => true,
+            Expr::Literal(..) => false,
+            other => self.reads_call_table(other),
+        });
+        self.precondition = conjunction(kept.cloned().collect::<Vec<_>>());
+    }
+
+    fn earlier_answers(plan: &LogicalPlan) -> Vec<String> {
+        let mut found = Vec::new();
+        let _ = plan.apply(|below| {
+            if let Some(asked) = as_node::<AiNode>(below)
+                && asked.semantics == Semantics::Rows
+                && asked.function() == "ai_filter"
+                && asked.inline_predicate.is_none()
+                && asked.hint.is_none()
+                && asked.row_limit.is_none()
+            {
+                found.push(asked.answer.clone());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        found
+    }
+
+    pub(crate) fn has_row_limit(&self) -> bool {
+        self.row_limit.is_some()
+    }
+
     pub(crate) fn asks_every_row(&self) -> bool {
         self.semantics == Semantics::Rows
-            && self.filter.is_none()
-            && self.fetch.is_none()
-            && self.guard.is_none()
+            && self.inline_predicate.is_none()
+            && self.row_limit.is_none()
+            && self.precondition.is_none()
     }
 
-    /// Whether the node returns other rows than the ones of its input
-    /// that pass its filter: a fetch cuts them off, and a gate returns
-    /// its join's left rows.
     pub(crate) fn limits_rows(&self) -> bool {
-        self.fetch.is_some() || self.semantics != Semantics::Rows
+        self.row_limit.is_some() || self.semantics != Semantics::Rows
     }
 
-    /// Take out of a column node's filter the terms `split` moves, the
-    /// first part of what it returns, and the written tests that hold
-    /// them; return the moved terms. A node with a fetch keeps its
-    /// filter whole: it counts the rows that pass all of it.
     pub(crate) fn lift_filter(
         &mut self,
         split: impl FnOnce(&Expr) -> (Vec<Expr>, Vec<Expr>),
@@ -851,45 +883,38 @@ impl AiNode {
         if self.semantics != Semantics::Rows || self.is_predicate() {
             return Vec::new();
         }
-        let Some(filter) = self.filter.take() else {
+        let Some(filter) = self.inline_predicate.take() else {
             return Vec::new();
         };
         let (moved, kept) = split(&filter);
-        if !moved.is_empty() && self.fetch.is_some() {
-            self.filter = Some(filter);
+        if !moved.is_empty() && self.row_limit.is_some() {
+            self.inline_predicate = Some(filter);
             return Vec::new();
         }
-        self.tests.retain(|test| {
-            !split_conjunction(&test.test)
+        self.written_predicates.retain(|test| {
+            !split_conjunction(&test.predicate)
                 .iter()
                 .any(|term| moved.contains(term))
         });
-        self.filter = conjunction(kept);
+        self.inline_predicate = conjunction(kept);
         moved
     }
 
-    /// This node without its options, under a `Filter` of its filter and
-    /// a `Limit` of its global fetch: the same rows, as its guard, hint,
-    /// and tests only save work.
-    ///
-    /// # Errors
-    ///
-    /// The `Filter` or `Limit` does not fit the node's columns.
     pub(crate) fn options_above(&self) -> Result<LogicalPlan> {
         let bare = Self {
-            filter: None,
-            guard: None,
+            inline_predicate: None,
+            precondition: None,
             hint: None,
-            fetch: None,
-            projection: None,
-            tests: Vec::new(),
+            row_limit: None,
+            pruned_fields: None,
+            written_predicates: Vec::new(),
             ..self.clone()
         };
         let mut above = extension_node(bare.checked()?);
-        if let Some(filter) = &self.filter {
+        if let Some(filter) = &self.inline_predicate {
             above = LogicalPlan::Filter(Filter::try_new(filter.clone(), Arc::new(above))?);
         }
-        if let Some(Fetch::Global(rows)) = &self.fetch {
+        if let Some(RowLimit::Global(rows)) = &self.row_limit {
             above = LogicalPlanBuilder::from(above)
                 .limit(0, Some(*rows))?
                 .build()?;
@@ -897,29 +922,29 @@ impl AiNode {
         Ok(above)
     }
 
-    /// Write the node's line in a plan's text, before line breaks are
-    /// escaped.
     fn write_explain(&self, f: &mut impl fmt::Write) -> fmt::Result {
         write!(f, "AiNode: ")?;
         if self.semantics != Semantics::Rows {
             write!(f, "{} ", self.semantics_name())?;
         }
         write!(f, "{} = {}", self.answer, self.call)?;
-        if let Some(guard) = &self.guard {
-            write!(f, ", guard: {guard}")?;
+        if let Some(precondition) = &self.precondition {
+            write!(f, ", precondition: {precondition}")?;
         }
-        if let Some(filter) = &self.filter {
-            write!(f, ", filter: {filter}")?;
+        if let Some(inline_predicate) = &self.inline_predicate {
+            write!(f, ", inline_predicate: {inline_predicate}")?;
         }
         if let Some(hint) = &self.hint {
             write!(f, ", hint: {hint}")?;
         }
-        match &self.fetch {
-            Some(Fetch::Global(n)) => write!(f, ", fetch: {n}")?,
-            Some(Fetch::PerKey { key, n }) => write!(f, ", fetch: {n} per [{}]", key.join(", "))?,
+        match &self.row_limit {
+            Some(RowLimit::Global(n)) => write!(f, ", row_limit: {n}")?,
+            Some(RowLimit::PerKey { key, n }) => {
+                write!(f, ", row_limit: {n} per [{}]", key.join(", "))?
+            }
             None => {}
         }
-        if self.projection.is_some() {
+        if self.pruned_fields.is_some() {
             let names: Vec<String> = self
                 .returned_fields()
                 .iter()
@@ -933,7 +958,6 @@ impl AiNode {
 
 impl PartialOrd for AiNode {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        // nodes have no meaningful order; this agrees with `Eq`
         (self == other).then_some(Ordering::Equal)
     }
 }
@@ -951,37 +975,23 @@ impl UserDefinedLogicalNodeCore for AiNode {
         &self.schema
     }
 
-    /// The call and the guard: the expressions over the input's columns.
-    ///
-    /// The filter and tests also read the answer, which is not a column
-    /// of the input; DataFusion's rules resolve a node's expressions
-    /// against its input, so they do not rewrite these.
     fn expressions(&self) -> Vec<Expr> {
         let mut exprs = vec![self.call.clone()];
-        exprs.extend(self.guard.clone());
+        exprs.extend(self.precondition.clone());
         exprs
     }
 
-    /// The columns a filter above the node must not read to move below it.
-    ///
-    /// A test of the answer waits for it. A test of the input's columns
-    /// moves below a node with no fetch, `σ_q(AI(R)) = AI(σ_q(R))`. Above
-    /// a fetch it stays: limiting rows before the test is not limiting
-    /// them after. Only a test of a per-key fetch's key columns moves,
-    /// as it keeps or drops each key's rows whole.
     fn prevent_predicate_push_down_columns(&self) -> HashSet<String> {
         let mut prevent: HashSet<String> = self
             .fields
             .iter()
             .map(|field| field.name().clone())
             .collect();
-        let key: &[String] = match &self.fetch {
+        let key: &[String] = match &self.row_limit {
             None => return prevent,
-            Some(Fetch::Global(_)) => &[],
-            Some(Fetch::PerKey { key, .. }) => key,
+            Some(RowLimit::Global(_)) => &[],
+            Some(RowLimit::PerKey { key, .. }) => key,
         };
-        // DataFusion names the columns by name alone, so a key name that
-        // two input columns share stays blocked
         let names: Vec<&String> = self
             .input
             .schema()
@@ -1002,7 +1012,6 @@ impl UserDefinedLogicalNodeCore for AiNode {
     fn necessary_children_exprs(&self, output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
         let input = self.input.schema();
         let width = input.fields().len();
-        // the output starts with the input's columns, or a gate's left input's
         let mut needed: Vec<usize> = output_columns
             .iter()
             .copied()
@@ -1011,7 +1020,7 @@ impl UserDefinedLogicalNodeCore for AiNode {
         let read = self
             .expressions()
             .into_iter()
-            .chain(self.filter_expressions());
+            .chain(self.predicate_expressions());
         for expr in read {
             for column in expr.column_refs() {
                 match input.index_of_column(column) {
@@ -1021,8 +1030,7 @@ impl UserDefinedLogicalNodeCore for AiNode {
                 }
             }
         }
-        // a per-key fetch reads its key columns, unless the key is the answer
-        if let Some(Fetch::PerKey { key, .. }) = &self.fetch {
+        if let Some(RowLimit::PerKey { key, .. }) = &self.row_limit {
             for name in key.iter().filter(|name| !self.is_field(name)) {
                 let found: Vec<usize> = input
                     .fields()
@@ -1042,15 +1050,11 @@ impl UserDefinedLogicalNodeCore for AiNode {
         Some(vec![needed])
     }
 
-    /// False: a limit above the node becomes its fetch
-    /// ([`crate::Derive`]) rather than a copy below it,
-    /// so the executor counts the rows that pass the node.
     fn supports_limit_pushdown(&self) -> bool {
         false
     }
 
     fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        // a prompt literal's line break would break the plan's indentation
         let mut text = String::new();
         self.write_explain(&mut text)?;
         write!(f, "{}", text.replace('\r', "\\r").replace('\n', "\\n"))
@@ -1060,19 +1064,17 @@ impl UserDefinedLogicalNodeCore for AiNode {
         let Ok([input]) = <[LogicalPlan; 1]>::try_from(inputs) else {
             return internal_err!("AiNode reads one input");
         };
-        // a rule that rewrites an expression may alias it to keep its name;
-        // the node's schema does not name its expressions
         let mut exprs = exprs.into_iter().map(Expr::unalias);
-        let (Some(call), guard, None) = (exprs.next(), exprs.next(), exprs.next()) else {
-            return internal_err!("AiNode has its call and an optional guard");
+        let (Some(call), precondition, None) = (exprs.next(), exprs.next(), exprs.next()) else {
+            return internal_err!("AiNode has its call and an optional precondition");
         };
-        if guard.is_some() != self.guard.is_some() {
-            return internal_err!("AiNode's guard was added or removed");
+        if precondition.is_some() != self.precondition.is_some() {
+            return internal_err!("AiNode's precondition was added or removed");
         }
         let mut node = self.clone();
         node.input = Arc::new(input);
         node.call = call;
-        node.guard = guard;
+        node.precondition = precondition;
         node.checked()
     }
 }
@@ -1123,8 +1125,8 @@ mod tests {
             vec![Field::new("kind", DataType::Boolean, true)],
         )
         .unwrap();
-        node.filter = Some(col("kind"));
-        node.projection = Some(Vec::new());
+        node.inline_predicate = Some(col("kind"));
+        node.pruned_fields = Some(Vec::new());
         node.checked().unwrap()
     }
 
@@ -1150,11 +1152,11 @@ mod tests {
         )
         .unwrap();
         assert!(!node.is_predicate());
-        node.filter = Some(col("score").gt(lit(0.5)));
+        node.inline_predicate = Some(col("score").gt(lit(0.5)));
         assert!(node.is_predicate());
 
         let mut boolean = ai_filter("Is {0} kind?");
-        boolean.filter = None;
+        boolean.inline_predicate = None;
         assert!(boolean.is_predicate());
     }
 
@@ -1192,8 +1194,6 @@ mod tests {
             .optimize(plan, &OptimizerContext::new(), |_, _| {})
             .unwrap();
         let text = optimized.display_indent().to_string();
-        // the table's own test runs below the model's, and the scan reads
-        // only the columns above it and the prompt's
         let lines: Vec<&str> = text.lines().map(str::trim).collect();
         let asked = lines
             .iter()
@@ -1210,7 +1210,7 @@ mod tests {
         );
     }
 
-    fn tone(fetch: Option<Fetch>, hint: Option<Expr>) -> LogicalPlan {
+    fn tone(row_limit: Option<RowLimit>, hint: Option<Expr>) -> LogicalPlan {
         let mut node = AiNode::try_new(
             Arc::new(reviews()),
             ask("ai_classify", "Tone of {0}?"),
@@ -1218,12 +1218,11 @@ mod tests {
             vec![Field::new("tone", DataType::Utf8, true)],
         )
         .unwrap();
-        node.fetch = fetch;
+        node.row_limit = row_limit;
         node.hint = hint;
         crate::plan::extension_node(node.checked().unwrap())
     }
 
-    /// The plan after the default optimizer rules, one line per operator.
     fn optimized(plan: LogicalPlan) -> Vec<String> {
         Optimizer::with_rules(crate::rules::default_rules())
             .optimize(plan, &OptimizerContext::new(), |_, _| {})
@@ -1243,19 +1242,18 @@ mod tests {
     }
 
     #[test]
-    fn a_filter_of_the_input_stays_above_a_node_with_a_fetch() {
-        let per_key = Fetch::PerKey {
+    fn a_filter_of_the_input_stays_above_a_node_with_a_row_limit() {
+        let per_key = RowLimit::PerKey {
             key: vec!["id".into()],
             n: 1,
         };
-        for fetch in [Fetch::Global(2), per_key] {
-            let plan = LogicalPlanBuilder::from(tone(Some(fetch), None))
+        for row_limit in [RowLimit::Global(2), per_key] {
+            let plan = LogicalPlanBuilder::from(tone(Some(row_limit), None))
                 .filter(col("r.stars").gt(lit(3)))
                 .unwrap()
                 .build()
                 .unwrap();
             let lines = optimized(plan);
-            // limiting rows before the test is not limiting them after
             assert!(
                 position(&lines, "Filter") < position(&lines, "AiNode"),
                 "{lines:?}"
@@ -1264,18 +1262,17 @@ mod tests {
     }
 
     #[test]
-    fn a_filter_of_a_per_key_fetchs_key_moves_below_the_node() {
-        let fetch = Fetch::PerKey {
+    fn a_filter_of_a_per_key_row_limits_key_moves_below_the_node() {
+        let row_limit = RowLimit::PerKey {
             key: vec!["id".into()],
             n: 1,
         };
-        let plan = LogicalPlanBuilder::from(tone(Some(fetch), None))
+        let plan = LogicalPlanBuilder::from(tone(Some(row_limit), None))
             .filter(col("r.id").gt(lit(3)))
             .unwrap()
             .build()
             .unwrap();
         let lines = optimized(plan);
-        // the test keeps or drops each key's rows whole
         assert!(
             position(&lines, "AiNode") < position(&lines, "Filter"),
             "{lines:?}"
@@ -1283,8 +1280,8 @@ mod tests {
     }
 
     #[test]
-    fn a_test_of_the_answer_stays_above_a_node_with_a_fetch() {
-        let plan = LogicalPlanBuilder::from(tone(Some(Fetch::Global(2)), None))
+    fn a_predicate_of_the_answer_stays_above_a_node_with_a_row_limit() {
+        let plan = LogicalPlanBuilder::from(tone(Some(RowLimit::Global(2)), None))
             .filter(col("tone").eq(lit("kind")))
             .unwrap()
             .build()
@@ -1292,11 +1289,11 @@ mod tests {
         let lines = optimized(plan);
         let node = position(&lines, "AiNode");
         assert!(position(&lines, "Filter") < node, "{lines:?}");
-        assert!(!lines[node].contains("filter:"), "{lines:?}");
+        assert!(!lines[node].contains("inline_predicate:"), "{lines:?}");
     }
 
     #[test]
-    fn a_limit_becomes_the_fetch_of_a_node_without_a_hint() {
+    fn a_limit_becomes_the_row_limit_of_a_node_without_a_hint() {
         let limited = |hint: Option<Expr>| {
             let plan = LogicalPlanBuilder::from(tone(None, hint))
                 .limit(0, Some(2))
@@ -1307,7 +1304,7 @@ mod tests {
         };
         let lines = limited(None);
         assert!(
-            lines[position(&lines, "AiNode")].contains("fetch: 2"),
+            lines[position(&lines, "AiNode")].contains("row_limit: 2"),
             "{lines:?}"
         );
         assert!(
@@ -1324,7 +1321,7 @@ mod tests {
     }
 
     #[test]
-    fn a_where_filter_under_a_distinct_moves_below_its_per_key_fetch() {
+    fn a_where_filter_under_a_distinct_moves_below_its_per_key_row_limit() {
         let filter = LogicalPlan::Extension(Extension {
             node: Arc::new(ai_filter("Is {0} kind?")),
         });
@@ -1347,9 +1344,8 @@ mod tests {
             .lines()
             .map(|line| line.trim().to_string())
             .collect();
-        // the WHERE runs before the DISTINCT stops each key at one row
         let node = position(&lines, "AiNode");
-        assert!(lines[node].contains("fetch: 1 per [id]"), "{lines:?}");
+        assert!(lines[node].contains("row_limit: 1 per [id]"), "{lines:?}");
         assert!(node < position(&lines, "Filter"), "{lines:?}");
     }
 }

@@ -97,7 +97,7 @@ print(query.explain())
 ```text title="Output"
 logical:
   Projection: r.id
-    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Is the following review positive? {0}"), r.body)), filter: __quail_answer_1, returns: []
+    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Is the following review positive? {0}"), r.body)), inline_predicate: __quail_answer_1, returns: []
       SubqueryAlias: r
         TableScan: reviews projection=[id, body]
 

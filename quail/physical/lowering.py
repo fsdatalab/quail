@@ -19,9 +19,7 @@ import numpy as np
 from quail.common.expressions import CompileError, Prompt
 from quail.physical import decode_plan_value
 
-# interned word ids start here, above any vocabulary
 _WORDS = 1 << 40
-
 
 
 class Vocabulary:
@@ -203,7 +201,6 @@ def option_aliases(codes, tokenizer) -> tuple[str, ...]:
     return tuple(found)
 
 
-# Jev's limit on one choice's options; the planner's MAX_LETTERS
 MAX_LETTERS = 255
 
 

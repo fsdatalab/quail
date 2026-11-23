@@ -1,23 +1,13 @@
-//! Model and device specs, read from the TOML files in `quail/specs/data`.
-//!
-//! The fields and methods mirror `quail/specs/base.py`. Integer
-//! arithmetic stays integral and converts to `f64` where Python's
-//! `int * float` does, so results equal Python's.
-
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-/// Bytes per element of a Gated DeltaNet layer's recurrent state.
 pub const GDN_STATE_ELEMENT_BYTES: i64 = 4;
-/// Bytes per element of a convolution's kept input columns.
 pub const CONV_STATE_ELEMENT_BYTES: i64 = 2;
-/// Reserved activation bytes per hidden unit of a batched token.
 pub const ACT_BYTES_PER_HIDDEN: i64 = 32;
 
-/// Token layout for a diffusion model's classification answer.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AnswerCanvas {
@@ -26,7 +16,6 @@ pub struct AnswerCanvas {
     pub pad_id: i64,
 }
 
-/// A sparse autoencoder read beside a model, for `AI.SAE_FEATURES`.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SaeSpec {
@@ -37,7 +26,6 @@ pub struct SaeSpec {
     pub keep: i64,
 }
 
-/// Arithmetic precision used by a model component.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Precision {
@@ -48,10 +36,8 @@ pub enum Precision {
 }
 
 impl Precision {
-    /// Bytes per element at this precision.
     pub fn bytes(self) -> f64 {
         match self {
-            // NVFP4: a 4-bit value and one fp8 scale per 16 values
             Self::Fp4 => 0.5625,
             Self::Fp8 => 1.0,
             Self::Bf16 => 2.0,
@@ -94,7 +80,6 @@ fn sixteen() -> i64 {
     16
 }
 
-/// One model's shape, weights, prompt format, and measured constants.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelSpec {
@@ -127,8 +112,6 @@ pub struct ModelSpec {
     pub arch: String,
     #[serde(default = "generative")]
     pub role: String,
-    /// A decision model's head: empty is Decision 2.0's option head,
-    /// "slot_lm" the output head's logits of the option letters.
     #[serde(default)]
     pub readout: String,
     #[serde(default)]
@@ -183,15 +166,8 @@ pub struct ModelSpec {
     pub layer_kinds: Vec<String>,
     #[serde(default)]
     pub vision_tower: bool,
-    /// Bytes the vision tower takes beside the text weights: its weights,
-    /// its encoder calls' activations, and a chunk's image embeddings.
     #[serde(default)]
     pub vision_mem_bytes: f64,
-    /// The image processor's patch side in pixels, its patches merged
-    /// along each side of one image token, and the fewest and most pixels
-    /// it reads an image at (`patch_size`, `merge_size`,
-    /// `size.shortest_edge`, and `size.longest_edge` in a checkpoint's
-    /// preprocessor_config.json).
     #[serde(default)]
     pub image_patch_pixels: i64,
     #[serde(default)]
@@ -225,56 +201,43 @@ pub struct ModelSpec {
 }
 
 impl ModelSpec {
-    /// The precision of the MLP weights: their own, or the model's.
     pub fn mlp_precision(&self) -> Precision {
         self.mlp_weight_precision.unwrap_or(self.weight_precision)
     }
 
-    /// Bytes per MLP weight parameter: its own precision's, or the model's.
     pub fn mlp_weight_bytes(&self) -> f64 {
         self.mlp_weight_precision
             .map_or(self.w_bytes, Precision::bytes)
     }
 
-    /// Whether the GDN projections have a precision of their own, and so
-    /// are priced apart from the other attention projections.
     pub fn gdn_has_own_precision(&self) -> bool {
         self.gdn_weight_precision.is_some()
     }
 
-    /// The precision of the GDN projection weights: their own, or the model's.
     pub fn gdn_precision(&self) -> Precision {
         self.gdn_weight_precision.unwrap_or(self.weight_precision)
     }
 
-    /// Whether the answer is read from the output head's logits of the
-    /// option letters, rather than from a decision head.
     pub fn reads_letter_logits(&self) -> bool {
         !self.readout.is_empty()
     }
 
-    /// Whether the model reads labels on an answer canvas.
     pub fn has_answer_canvas(&self) -> bool {
         self.answer_canvas.is_some()
     }
 
-    /// The rows of the answer canvas, or 0 without one.
     pub fn answer_canvas_rows(&self) -> i64 {
         self.answer_canvas.as_ref().map_or(0, |canvas| canvas.rows)
     }
 
-    /// Whether the model is loaded with a sparse autoencoder.
     pub fn has_sae(&self) -> bool {
         self.sae.is_some()
     }
 
-    /// The sparse autoencoder's features, and the most it keeps per token,
-    /// when the model is loaded with one.
     pub fn sae_shape(&self) -> Option<(i64, i64)> {
         self.sae.as_ref().map(|sae| (sae.num_features, sae.keep))
     }
 
-    /// The kind of one layer.
     pub fn layer_kind(&self, layer: i64) -> &str {
         self.layer_kinds
             .get(layer as usize)
@@ -282,7 +245,6 @@ impl ModelSpec {
             .unwrap_or("full_attention")
     }
 
-    /// Whether the layer stores KV.
     pub fn keeps_kv(&self, layer: i64) -> bool {
         matches!(
             self.layer_kind(layer),
@@ -290,14 +252,10 @@ impl ModelSpec {
         )
     }
 
-    /// Whether the full-attention layers read whole blocks, earlier and
-    /// later tokens, as a "document_isolated" model's do; its Gated
-    /// DeltaNet layers stay causal.
     pub fn bidirectional(&self) -> bool {
         self.attention_mask == "document_isolated"
     }
 
-    /// Whether a document's KV can be kept and read again.
     pub fn reuses_kv(&self) -> bool {
         self.attention_mask != "set"
     }
@@ -308,29 +266,24 @@ impl ModelSpec {
             .collect()
     }
 
-    /// The layers that store KV.
     pub fn attention_layers(&self) -> Vec<i64> {
         (0..self.layers)
             .filter(|layer| self.keeps_kv(*layer))
             .collect()
     }
 
-    /// The layers that keep a Gated DeltaNet state.
     pub fn gdn_layers(&self) -> Vec<i64> {
         self.layers_of(&["gated_delta_net"])
     }
 
-    /// The layers that keep a short convolution's input columns.
     pub fn short_conv_layers(&self) -> Vec<i64> {
         self.layers_of(&["short_conv"])
     }
 
-    /// The layers that keep state between a document's tokens.
     pub fn state_layers(&self) -> Vec<i64> {
         self.layers_of(&["gated_delta_net", "short_conv"])
     }
 
-    /// Channels of the convolution input a state layer keeps.
     pub fn conv_state_channels(&self) -> i64 {
         if self.gdn_layers().is_empty() {
             self.hidden
@@ -339,22 +292,18 @@ impl ModelSpec {
         }
     }
 
-    /// Channels of a Gated DeltaNet layer's convolution.
     pub fn conv_channels(&self) -> i64 {
         2 * self.gdn_key_heads * self.gdn_key_dim + self.gdn_value_heads * self.gdn_value_dim
     }
 
-    /// Bytes of one layer's recurrent state.
     pub fn gdn_state_bytes(&self) -> i64 {
         self.gdn_value_heads * self.gdn_value_dim * self.gdn_key_dim * GDN_STATE_ELEMENT_BYTES
     }
 
-    /// Bytes of one layer's convolution input columns.
     pub fn conv_state_bytes(&self) -> i64 {
         self.conv_channels() * (self.conv_width - 1) * CONV_STATE_ELEMENT_BYTES
     }
 
-    /// Bytes of the state a sequence leaves in every state layer.
     pub fn checkpoint_bytes(&self) -> i64 {
         self.gdn_layers().len() as i64 * (self.gdn_state_bytes() + self.conv_state_bytes())
             + self.short_conv_layers().len() as i64
@@ -363,12 +312,10 @@ impl ModelSpec {
                 * CONV_STATE_ELEMENT_BYTES
     }
 
-    /// Whether the layer keeps every token with the full KV geometry.
     pub fn is_full_layer(&self, layer: i64) -> bool {
         self.layer_kind(layer) == "full_attention"
     }
 
-    /// Per layer, the (KV heads, head dim) its KV stores.
     pub fn kv_shapes(&self) -> Vec<(i64, i64)> {
         let full_heads = if self.full_num_kv_heads != 0 {
             self.full_num_kv_heads
@@ -393,7 +340,6 @@ impl ModelSpec {
             .collect()
     }
 
-    /// Output columns of the widest dense projection in any layer.
     pub fn widest_projection(&self) -> i64 {
         let query_width = if self.attn_output_gate { 2 } else { 1 };
         let attention = self
@@ -407,7 +353,6 @@ impl ModelSpec {
         self.ffn_width.max(attention).max(gdn)
     }
 
-    /// KV elements per token: twice the sum of KV heads times head dim.
     pub fn kv_elements_per_token(&self) -> i64 {
         2 * self
             .kv_shapes()
@@ -416,12 +361,10 @@ impl ModelSpec {
             .sum::<i64>()
     }
 
-    /// KV bytes per cached token, summed over the layers.
     pub fn kappa(&self) -> f64 {
         self.kv_elements_per_token() as f64 * self.kv_bytes
     }
 
-    /// The layers that keep only the last `sliding_window` tokens of KV.
     pub fn sliding_layer_set(&self) -> Vec<i64> {
         if self.sliding_window == 0 {
             return Vec::new();
@@ -429,7 +372,6 @@ impl ModelSpec {
         self.layers_of(&["sliding_attention"])
     }
 
-    /// KV bytes per token on the sliding layers alone.
     pub fn kappa_sliding(&self) -> f64 {
         let sliding = self.sliding_layer_set();
         let elements: i64 = self
@@ -442,12 +384,10 @@ impl ModelSpec {
         2.0 * self.kv_bytes * elements as f64
     }
 
-    /// KV bytes per token on the layers that keep every token.
     pub fn kappa_full(&self) -> f64 {
         self.kappa() - self.kappa_sliding()
     }
 
-    /// Weight bytes as loaded.
     #[allow(non_snake_case)]
     pub fn W_mem(&self) -> f64 {
         if self.w_mem_bytes != 0.0 {
@@ -457,7 +397,6 @@ impl ModelSpec {
         }
     }
 
-    /// Untied output-head bytes, or zero for tied weights.
     pub fn head_mem_bytes(&self) -> f64 {
         if self.tied_head {
             0.0
@@ -466,13 +405,11 @@ impl ModelSpec {
         }
     }
 
-    /// Model weight bytes resident on the GPU.
     #[allow(non_snake_case)]
     pub fn W_resident(&self) -> f64 {
         self.W_mem() + self.vision_mem_bytes
     }
 
-    /// Reserved activation bytes per batched token.
     pub fn act_per_token(&self) -> f64 {
         let dense = ACT_BYTES_PER_HIDDEN * self.hidden;
         let expert = 2
@@ -484,13 +421,11 @@ impl ModelSpec {
         (dense + expert + routing) as f64
     }
 
-    /// MLP intermediate width; gate_up packs two of them.
     pub fn intermediate(&self) -> i64 {
         self.ffn_width / 2
     }
 }
 
-/// One GPU's memory, bandwidth, and compute rates.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeviceSpec {
@@ -519,7 +454,6 @@ pub struct DeviceSpec {
 }
 
 impl DeviceSpec {
-    /// Arithmetic throughput for one component precision.
     pub fn arithmetic_bandwidth(&self, precision: Precision) -> f64 {
         match precision {
             Precision::Fp4 => self.fp4_flops,
@@ -529,7 +463,6 @@ impl DeviceSpec {
         }
     }
 
-    /// Measured GEMM throughput, or the specification rate.
     pub fn gemm_flops(&self, precision: Precision) -> f64 {
         let measured = match precision {
             Precision::Fp8 => self.mamf_fp8_flops,
@@ -544,7 +477,6 @@ impl DeviceSpec {
     }
 }
 
-/// An error reading a spec directory.
 #[derive(Debug)]
 pub struct SpecError(pub String);
 
@@ -607,7 +539,6 @@ fn merged(
     Ok(values)
 }
 
-/// Read every model spec in a directory, by name.
 pub fn read_models(directory: &Path) -> Result<BTreeMap<String, ModelSpec>, SpecError> {
     let tables = read_tables(directory)?;
     tables
@@ -621,7 +552,6 @@ pub fn read_models(directory: &Path) -> Result<BTreeMap<String, ModelSpec>, Spec
         .collect()
 }
 
-/// Read every device spec in a directory, by name.
 pub fn read_devices(directory: &Path) -> Result<BTreeMap<String, DeviceSpec>, SpecError> {
     read_tables(directory)?
         .into_iter()

@@ -1,8 +1,3 @@
-//! Lower a prompt's text to the token ids one model reads.
-//!
-//! Rust does not tokenize: the planner passes a [`Tokenizer`], which in
-//! Quail calls back into Python's gigatoken tokenizer.
-
 use std::collections::BTreeSet;
 
 use crate::physical::Prompt;
@@ -14,22 +9,12 @@ use crate::prompts::{
     Turn, bind_classify_prompt, bind_join_prompt, bind_prompt, code_candidates, prompt_layout,
 };
 
-/// Text -> token ids, without special tokens.
 pub type Tokenizer<'a> = dyn Fn(&str) -> Result<Vec<i64>, CompileError> + 'a;
 
-/// A token id -> its text, as a tokenizer's `decode` of one token.
 pub type Decoder<'a> = dyn Fn(&[i64]) -> Result<String, CompileError> + 'a;
 
-/// AI.CLASSIFY's most labels; Jev's limit on one choice's options.
 use crate::constants::MAX_LETTERS;
 
-/// A set-attention question's state tail length and later-question header:
-/// the tokens of the tail's first segment, which the state keeps, and the
-/// ids of the layout's question label, which each later question starts with.
-///
-/// # Errors
-///
-/// The layout is unknown, or the tokenizer fails.
 pub fn set_question_parts(
     lowered: &LoweredPrompt,
     layout: &str,
@@ -42,12 +27,6 @@ pub fn set_question_parts(
     ))
 }
 
-/// Per row a decision readout reads, its distance before the prompt's
-/// last row, then 0.
-///
-/// # Errors
-///
-/// The model's layout is unknown, or the tokenizer fails.
 pub fn answer_row_offsets(
     model: &PromptModel,
     tokenizer: &Tokenizer,
@@ -71,13 +50,10 @@ pub fn answer_row_offsets(
     Ok(offsets)
 }
 
-/// A classification's head, tail, and label token sequences.
 pub type ClassifyTokens = (Vec<i64>, Vec<i64>, Vec<Vec<i64>>);
 
-/// A decision classification's tail tokens, frame length, and option blocks.
 pub type ChoiceTokens = (Vec<i64>, i64, Vec<Vec<i64>>);
 
-/// A prompt's text with the token ids one tokenizer gives it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoweredPrompt {
@@ -85,18 +61,14 @@ pub struct LoweredPrompt {
     pub preamble_token_ids: Vec<i64>,
     pub tail_token_ids: Vec<i64>,
     pub frame_tokens: i64,
-    /// Per placeholder: alias, its label's ids, its frame's ids.
     pub label_token_ids: Vec<(String, Vec<i64>, Vec<i64>)>,
     pub lettered: Option<Box<LoweredPrompt>>,
 }
 
-/// The model fields lowering reads.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PromptModel {
-    /// "generative", "reranker", or another role.
     pub role: String,
-    /// (true spellings, false spellings), or empty.
     pub answer_spellings: Vec<Vec<String>>,
     pub turn: Turn,
     pub prompt_layout: String,
@@ -110,7 +82,6 @@ fn tokenize_segments(segments: &[String], tokenizer: &Tokenizer) -> Result<Vec<i
     Ok(ids)
 }
 
-/// Text with every `{N}` placeholder removed.
 fn without_placeholders(text: &str) -> String {
     let mut out = String::new();
     let mut rest = text;
@@ -129,7 +100,6 @@ fn without_placeholders(text: &str) -> String {
     out
 }
 
-/// The text after a filter document or a join's last partner, by segment.
 fn tail_segments(prompt: &Prompt) -> Vec<String> {
     if prompt.tail_segments.is_empty() {
         vec![without_placeholders(&prompt.tail)]
@@ -138,7 +108,6 @@ fn tail_segments(prompt: &Prompt) -> Vec<String> {
     }
 }
 
-/// Candidate label letters: A to Z, a to z, then AA to ZZ.
 fn letter_candidates() -> Vec<String> {
     let upper: Vec<String> = ('A'..='Z').map(String::from).collect();
     let lower: Vec<String> = ('a'..='z').map(String::from).collect();
@@ -152,11 +121,6 @@ fn letter_candidates() -> Vec<String> {
     found
 }
 
-/// Distinct one-token letters to stand for the labels, as `choice_letters`.
-///
-/// # Errors
-///
-/// More than `MAX_LETTERS` labels, or the tokenizer fails.
 pub fn choice_letters(
     count: usize,
     tokenizer: &Tokenizer,
@@ -181,16 +145,6 @@ pub fn choice_letters(
     Ok(letters)
 }
 
-/// The codes a coded prompt lists its labels under.
-///
-/// Decision 3.0's rule (`d3_format.answer_codes`), shared by Base Labs'
-/// models: candidates in `code_candidates` order, each kept when it is
-/// one token of its own, a token no earlier code took, and still the
-/// same single token right after the assistant turn opens.
-///
-/// # Errors
-///
-/// The tokenizer keeps fewer than `count` codes, or it fails.
 pub fn code_letters(
     count: usize,
     tokenizer: &Tokenizer,
@@ -230,11 +184,6 @@ fn option_fallbacks() -> Vec<String> {
     found
 }
 
-/// Each option's code as d1 writes it, as `option_aliases`.
-///
-/// # Errors
-///
-/// No one-token code is left for an option, or the tokenizer fails.
 pub fn option_aliases(
     codes: &[String],
     tokenizer: &Tokenizer,
@@ -274,11 +223,6 @@ pub fn option_aliases(
     Ok(out)
 }
 
-/// Per option, the token ids d1 scores, as `option_spellings`.
-///
-/// # Errors
-///
-/// A code is not one token, or the tokenizer fails.
 pub fn option_spellings(
     codes: &[String],
     tokenizer: &Tokenizer,
@@ -302,12 +246,6 @@ pub fn option_spellings(
     Ok(out)
 }
 
-/// Each read slot's row, counted back from the segment's last token.
-///
-/// # Errors
-///
-/// The segment does not end in its slot lines, or a colon's token
-/// differs between the segment and the text through it.
 pub fn read_slot_offsets(
     segment: &str,
     names: &[String],
@@ -338,11 +276,6 @@ pub fn read_slot_offsets(
     Ok(offsets)
 }
 
-/// Tokenize a prompt's pieces, and letter a classification when possible.
-///
-/// # Errors
-///
-/// The tokenizer fails, or rebinding a classification with letters is refused.
 pub fn lower_prompt(prompt: &Prompt, tokenizer: &Tokenizer) -> Result<LoweredPrompt, CompileError> {
     if prompt.kind == "score" {
         return Ok(LoweredPrompt {
@@ -374,7 +307,6 @@ pub fn lower_prompt(prompt: &Prompt, tokenizer: &Tokenizer) -> Result<LoweredPro
         }
     }
     if prompt.kind == "label" && prompt.letters.is_empty() && layout.options_label.is_some() {
-        // the codes a coded classification lists depend on the tokenizer
         let codes = code_letters(prompt.categories.len(), tokenizer, &prompt.turn.1)?;
         return lower_prompt(&rebind(&codes)?, tokenizer);
     }
@@ -429,11 +361,6 @@ fn without_document(template: &str, marker: &str) -> String {
     text.replace(marker, "this document")
 }
 
-/// The query text a reranker reads, as `score_query_template`.
-///
-/// # Errors
-///
-/// The prompt reads more than a pair.
 pub fn score_query_template(prompt: &Prompt) -> Result<String, CompileError> {
     let aliases = prompt_aliases(prompt);
     if aliases.len() == 1 {
@@ -462,12 +389,6 @@ fn render_qwen3_reranker_input(query: &str, document: &str) -> String {
     )
 }
 
-/// Tokenize the fixed pieces of a score's rendered prompt around the
-/// documents, as `score_token_parts`.
-///
-/// # Errors
-///
-/// The prompt reads more than a pair, or the tokenizer fails.
 pub fn score_token_parts(
     prompt: &Prompt,
     model: &PromptModel,
@@ -522,7 +443,6 @@ fn answer_token_parts(
     Ok(vec![bound.preamble_token_ids, middle, bound.tail_token_ids])
 }
 
-/// The sorted ids of the spellings that are one token each.
 fn spelling_token_ids(
     tokenizer: &Tokenizer,
     spellings: &[Vec<String>],
@@ -552,11 +472,6 @@ fn spelling_token_ids(
     Ok((trues, falses))
 }
 
-/// The token ids an answer compares: the model's true and false spellings.
-///
-/// # Errors
-///
-/// A side has no one-token spelling, or the tokenizer fails.
 pub fn answer_ids(
     model: &PromptModel,
     tokenizer: &Tokenizer,
@@ -581,11 +496,6 @@ pub fn answer_ids(
     Ok((trues.into_iter().collect(), falses.into_iter().collect()))
 }
 
-/// A classification's head, tail, and label token sequences.
-///
-/// # Errors
-///
-/// The tokenizer fails.
 pub fn classify_prompt_tokens(
     lowered: &LoweredPrompt,
     labels: &[String],
@@ -605,14 +515,6 @@ pub fn classify_prompt_tokens(
     ))
 }
 
-/// A decision classification's tail tokens, frame length, and option blocks.
-///
-/// A layout with coded options has no frame and no blocks: the whole
-/// tail is one request, and every option is read at its last row.
-///
-/// # Errors
-///
-/// The tokenizer fails.
 pub fn choice_token_parts(
     lowered: &LoweredPrompt,
     tokenizer: &Tokenizer,

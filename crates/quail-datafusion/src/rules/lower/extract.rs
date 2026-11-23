@@ -1,6 +1,3 @@
-//! Lower AI calls into plan nodes before optimization.
-//! Move calls below operators that DataFusion runs.
-
 use std::sync::Arc;
 
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
@@ -14,12 +11,6 @@ use super::{Columns, calls_ai_function, is_join_predicate, lower_node, names_inp
 use crate::functions::is_ai_call;
 use crate::functions::options::unwrap_hint;
 
-/// `plan` with every AI call as an `AiNode` below the operator that held
-/// it.
-///
-/// # Errors
-///
-/// A rewritten operator's schema does not fit DataFusion's rules.
 pub(super) fn lower_plan(plan: LogicalPlan) -> Result<LogicalPlan> {
     let plan = drop_written_names(plan)?;
     let mut extracted = Extracted::of(&plan)?;
@@ -27,10 +18,6 @@ pub(super) fn lower_plan(plan: LogicalPlan) -> Result<LogicalPlan> {
     extracted.lower(plan, &mut columns)
 }
 
-/// Remove the name DataFusion gives an AI call written by a dotted
-/// name, such as `AI.IF(...)`, where a SELECT alias replaces it or
-/// where it names no column: inside a `WHERE` or `ON` test, or
-/// under the SELECT alias.
 fn drop_written_names(plan: LogicalPlan) -> Result<LogicalPlan> {
     fn written(expr: &Expr) -> Option<&Expr> {
         match expr {
@@ -65,9 +52,6 @@ fn drop_written_names(plan: LogicalPlan) -> Result<LogicalPlan> {
     .map(|done| done.data)
 }
 
-/// An inner join with each ON term that calls the model, and is not the
-/// join's own AI predicate, as a WHERE term above it: an inner join
-/// keeps a pair exactly when every ON term is TRUE.
 fn terms_above(plan: LogicalPlan) -> Result<LogicalPlan> {
     let LogicalPlan::Join(join) = &plan else {
         return Ok(plan);
@@ -95,31 +79,18 @@ fn terms_above(plan: LogicalPlan) -> Result<LogicalPlan> {
         .build()
 }
 
-/// The AI calls moved out of DataFusion's operators so far.
 #[derive(Debug, Default)]
 struct Extracted {
     num_calls: usize,
     num_inputs: usize,
-    /// The SELECT list's names, by the name of the call or column each
-    /// one renames.
     aliases: Vec<(String, String)>,
-    /// The names given to moved calls.
     used: Vec<String>,
-    /// User column and relation names that generated names must not shadow.
     reserved: Vec<String>,
 }
 
 impl Extracted {
-    /// Nothing moved yet out of `plan`: its column and relation names
-    /// reserved, and the SELECT list's name for each call, which a moved
-    /// call keeps.
-    ///
-    /// # Errors
-    ///
-    /// Walking the plan fails.
     fn of(plan: &LogicalPlan) -> Result<Self> {
         let mut extracted = Self::default();
-        // the call each written name, such as `AI.CLASSIFY(...)`, names
         let mut written: Vec<(String, String)> = Vec::new();
         plan.apply(|node| {
             for (qualifier, field) in node.schema().iter() {
@@ -146,7 +117,6 @@ impl Extracted {
         plan.apply(|node| {
             if let LogicalPlan::Projection(projection) = node {
                 for expr in &projection.expr {
-                    // the call itself, or the column a GROUP BY makes of it
                     let Expr::Alias(alias) = expr else { continue };
                     let named = match alias.expr.as_ref() {
                         Expr::Column(column) => Some(call_named(&column.name)),
@@ -163,13 +133,10 @@ impl Extracted {
         Ok(extracted)
     }
 
-    /// `plan` with every AI call as an `AiNode` below the operator that
-    /// held it.
     fn lower(&mut self, plan: LogicalPlan, columns: &mut Columns) -> Result<LogicalPlan> {
         if !calls_ai_function(&plan)? {
             return Ok(plan);
         }
-        // an expression's subquery is a plan of its own
         let plan = plan
             .map_uncorrelated_subqueries(|subquery| {
                 let LogicalPlan::Subquery(mut found) = subquery else {
@@ -180,7 +147,6 @@ impl Extracted {
                 Ok(Transformed::yes(LogicalPlan::Subquery(found)))
             })?
             .data;
-        // VALUES has no input: each row is a SELECT list over one empty row
         if let LogicalPlan::Values(values) = &plan {
             let mut rows = Vec::new();
             for row in &values.values {
@@ -221,8 +187,6 @@ impl Extracted {
             .collect::<Result<Vec<_>>>()?;
         let plan = crate::plan::with_inputs(&plan, inputs)?;
         let plan = self.lower_arguments(plan, columns)?;
-        // an operator that is no filter, inner join, or SELECT list reads
-        // its calls from a SELECT list below it
         let plan = match plan {
             LogicalPlan::Aggregate(_) | LogicalPlan::Window(_) | LogicalPlan::Sort(_) => {
                 self.extract(plan)?
@@ -232,7 +196,6 @@ impl Extracted {
             }
             plan => lower_node(plan, columns)?.data,
         };
-        // a call inside a larger expression is read from a SELECT list below
         let nested = !matches!(plan, LogicalPlan::Extension(_))
             && plan
                 .expressions()
@@ -248,8 +211,6 @@ impl Extracted {
         Ok(plan)
     }
 
-    /// `plan` with each AI call that is an argument of another read as
-    /// a column of a SELECT list below it, innermost first.
     fn lower_arguments(
         &mut self,
         mut plan: LogicalPlan,
@@ -307,20 +268,10 @@ impl Extracted {
         }
     }
 
-    /// A join with each AI call of one input read from a SELECT list
-    /// below that input, so the join reads columns: for example `JOIN v
-    /// ON AI.MAP(i.text, ...) = v.name` reads the map's answer from a
-    /// SELECT list over `i`, and so does a test of one input in ON, such
-    /// as `ON r.id = v.rid AND AI.IF(PROMPT('{0}', r.body))`.
-    ///
-    /// A call that reads both inputs is the join's own AI predicate and
-    /// stays. The join keeps the added columns in its output, as the
-    /// operators above may read the same answers.
     fn join_keys_below(&mut self, plan: LogicalPlan) -> Result<LogicalPlan> {
         let LogicalPlan::Join(join) = &plan else {
             return Ok(plan);
         };
-        // which input an expression reads: 0, 1, or neither alone
         let side = |expr: &Expr| {
             let columns = expr.column_refs();
             let within = |input: &LogicalPlan| {
@@ -337,9 +288,6 @@ impl Extracted {
         };
         let mut sides = [(*join.left).clone(), (*join.right).clone()];
         let mut moved = false;
-        // `expr` with each of its AI calls read as a column of the SELECT
-        // list below the input the call reads, named as the lowering
-        // names a call anywhere else; unchanged when a call reads both
         let mut below = |this: &mut Self, expr: &Expr| -> Result<Expr> {
             let calls = ai_calls(expr)?;
             let read: Vec<Option<usize>> = calls.iter().map(&side).collect();
@@ -408,14 +356,10 @@ impl Extracted {
         }
     }
 
-    /// Move each AI call of an `Aggregate`, `Window`, or `Sort` into a
-    /// `Projection` below it.
     fn extract(&mut self, node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
         self.extract_calls(node, false)
     }
 
-    /// [`Self::extract`]; with `whole`, also a SELECT list's items that
-    /// are a call and nothing else.
     fn extract_calls(
         &mut self,
         node: LogicalPlan,
@@ -433,8 +377,6 @@ impl Extracted {
         }
         let mut calls: Vec<Expr> = Vec::new();
         for expr in node.expressions() {
-            // a SELECT list item that is a model call already sits where
-            // a region reads it
             if !whole
                 && matches!(node, LogicalPlan::Projection(_))
                 && ai_calls(&expr)?.first() == Some(expr.clone().unalias_nested().data).as_ref()
@@ -453,8 +395,6 @@ impl Extracted {
         let named = self.name(calls, node.inputs()[0].schema());
         let read = |expr: &Expr| read_calls(expr, &named);
         let exprs: Vec<Expr> = node.expressions().iter().map(read).collect::<Result<_>>()?;
-        // the projection passes on the input columns an aggregate reads,
-        // or every input column a window or sort passes on
         let input = node.inputs()[0].clone();
         let mut read_columns: Vec<Expr> = Vec::new();
         if !matches!(node, LogicalPlan::Aggregate(_)) {
@@ -475,7 +415,6 @@ impl Extracted {
         let projection = LogicalPlan::Projection(projection);
         let rewritten = match &node {
             LogicalPlan::Aggregate(aggregate) => {
-                // the operators above read each output by its original name
                 let keep = |exprs: &[Expr]| -> Result<Vec<Expr>> {
                     exprs
                         .iter()
@@ -497,7 +436,6 @@ impl Extracted {
                 LogicalPlan::Window(Window::try_new(keep, Arc::new(projection))?)
             }
             LogicalPlan::Projection(found) => {
-                // each output keeps its name
                 let keep = found
                     .expr
                     .iter()
@@ -510,8 +448,6 @@ impl Extracted {
         Ok(Transformed::yes(rewritten))
     }
 
-    /// A column name for each call: the SELECT list's name for it, or a
-    /// new hidden one.
     fn name(
         &mut self,
         calls: Vec<Expr>,
@@ -530,7 +466,6 @@ impl Extracted {
                     .map(|(_, name)| name.clone());
                 let name = named.unwrap_or_else(|| {
                     let mut name = self.fresh_call();
-                    // a span column is its extraction's answer name with the suffix
                     if crate::functions::function_name(&call) == Some("ai_extract_span") {
                         name.push_str(quail_planner::constants::SPAN_SUFFIX);
                     }
@@ -543,7 +478,6 @@ impl Extracted {
     }
 }
 
-/// The outermost AI calls in `expr`, each once.
 fn ai_calls(expr: &Expr) -> Result<Vec<Expr>> {
     let mut calls: Vec<Expr> = Vec::new();
     expr.apply(|inner| {
@@ -558,7 +492,6 @@ fn ai_calls(expr: &Expr) -> Result<Vec<Expr>> {
     Ok(calls)
 }
 
-/// `expr` with each named call replaced by its column.
 fn read_calls(expr: &Expr, named: &[(Expr, String)]) -> Result<Expr> {
     Ok(expr
         .clone()

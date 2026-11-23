@@ -295,9 +295,7 @@ def bounded_reader(source: pa.RecordBatchReader, limit: int | None = None,
             close()
 
     iterator = batches()
-    # a generator never started runs no finally block
     close = weakref.finalize(iterator, source.close)
-    # the C stream releases the iterator on close; from_batches alone does not
     return pa.RecordBatchReader.from_stream(pa.RecordBatchReader.from_batches(
         source.schema if schema is None else schema, iterator))
 
@@ -322,21 +320,16 @@ class QueryResult:
         self.columns = list(table.column_names)
         self.schema = table.schema
         self.report = report or {}
-        # the executed physical graph and each node's measured metrics,
-        # filled in by Query.finish
         self.plan = None
         self.node_metrics: dict = {}
         self.answer_tables = {"filters": {}, "joins": {}}
         self.survivor_indices: dict[str, pa.Array] = {}
         self.true_join_tables: dict[int, pa.Table] = {}
         self._table = table
-        # DataFusion's plan around the model region, when it ran one
         self.datafusion_plan: str | None = None
         self.region_rows: int | None = None
-        # Full executed plan (including estimates), alongside .plan's graph.
         self.physical_plan = None
         self.region_id: int | None = None
-        # Query-local logical occurrence IDs, never completion-order indices.
         self.region_results: dict[int, QueryResult] = {}
 
     @classmethod

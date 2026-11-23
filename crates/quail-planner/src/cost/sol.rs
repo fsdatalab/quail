@@ -1,6 +1,3 @@
-//! Speed-of-light time: the sum of each model component's time at the
-//! device's limits.
-
 use crate::cost::dense_decoder_cost::{
     ComponentLatency, component_latencies, dense_decoder_components,
 };
@@ -22,7 +19,6 @@ fn scalar_tokens(work: &Work) -> f64 {
         .expect("speed of light takes summed work")
 }
 
-/// Compute time without memory movement, optionally at the spec peak.
 pub fn compute_seconds(work: &Work, model: &ModelSpec, device: &DeviceSpec, peak: bool) -> f64 {
     if peak {
         return python_sum(
@@ -41,11 +37,6 @@ pub fn compute_seconds(work: &Work, model: &ModelSpec, device: &DeviceSpec, peak
     )
 }
 
-/// Component time with fractional ideal forward passes.
-///
-/// # Panics
-///
-/// `chunk_tokens` is below 1.
 pub fn unrounded_seconds(
     work: &Work,
     model: &ModelSpec,
@@ -61,7 +52,6 @@ pub fn unrounded_seconds(
     )
 }
 
-/// The speed-of-light estimate and its components.
 #[derive(Debug, Clone)]
 pub struct SpeedOfLight {
     pub work: Work,
@@ -70,7 +60,6 @@ pub struct SpeedOfLight {
 }
 
 impl SpeedOfLight {
-    /// Bytes moved by every component.
     pub fn bytes_moved(&self) -> f64 {
         python_sum(
             self.components
@@ -79,7 +68,6 @@ impl SpeedOfLight {
         )
     }
 
-    /// Compute time over the components.
     pub fn compute(&self) -> f64 {
         python_sum(
             self.components
@@ -88,7 +76,6 @@ impl SpeedOfLight {
         )
     }
 
-    /// Memory time over the components.
     pub fn memory(&self) -> f64 {
         python_sum(
             self.components
@@ -97,17 +84,11 @@ impl SpeedOfLight {
         )
     }
 
-    /// The estimate: each component's slower limit, summed.
     pub fn seconds(&self) -> f64 {
         python_sum(self.components.iter().map(ComponentLatency::seconds))
     }
 }
 
-/// Price aggregate query work with ideal packing.
-///
-/// # Panics
-///
-/// `chunk_tokens` is below 1.
 pub fn speed_of_light(
     work: &Work,
     model: &ModelSpec,

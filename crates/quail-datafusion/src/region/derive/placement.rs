@@ -1,6 +1,3 @@
-//! Place conditions where their columns exist: at a table's scan, after
-//! the column operator whose answer they read, or on the result rows.
-
 use super::{ByAlias, lookup, push};
 use quail_planner::error::CompileError;
 use quail_planner::expressions::{column_references, condition_columns};
@@ -9,8 +6,6 @@ use quail_planner::physical::ValueExpression;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// A condition that asks no model, with its HINT's selectivity and, for
-/// a test of a label, the labels it accepts.
 #[derive(Clone)]
 pub(super) struct Term {
     condition: ValueExpression,
@@ -19,8 +14,6 @@ pub(super) struct Term {
 }
 
 impl Term {
-    /// A condition with its HINT's selectivity, and the labels it
-    /// accepts when it tests a label.
     pub(super) fn new(
         condition: ValueExpression,
         selectivity: Option<f64>,
@@ -34,7 +27,6 @@ impl Term {
     }
 }
 
-/// The conditions of a relation, by where they run.
 #[derive(Default)]
 pub(super) struct PlacedConditions {
     scans: ByAlias<ValueExpression>,
@@ -43,17 +35,6 @@ pub(super) struct PlacedConditions {
 }
 
 impl PlacedConditions {
-    /// Place each condition where its columns exist: at a table's scan,
-    /// after the operator of one table that computes the columns it
-    /// reads, or on the result rows.
-    ///
-    /// `computed` maps (alias, column) to the kind of the operator that
-    /// computes it.
-    ///
-    /// # Errors
-    ///
-    /// A hinted test reads source columns or result rows, or a test reads
-    /// different model results that include a label.
     pub(super) fn place(
         conditions: Vec<Term>,
         computed: &BTreeMap<(String, String), &str>,
@@ -104,22 +85,14 @@ impl PlacedConditions {
         Ok(placed)
     }
 
-    /// The tests `alias`'s scan runs.
     pub(super) fn at_scan(&self, alias: &str) -> Vec<ValueExpression> {
         lookup(&self.scans, alias).to_vec()
     }
 
-    /// Whether a test of `alias` reads the answer of one of its column
-    /// operators.
     pub(super) fn tests_answers(&self, alias: &str) -> bool {
         !lookup(&self.computed, alias).is_empty()
     }
 
-    /// `alias`'s tests of answers as column filters, numbered from
-    /// `position`: each test follows the last of `producers`, the
-    /// table's column operators in the plan's order, whose answer it
-    /// reads, label tests first. None when a test reads no producer's
-    /// answer.
     pub(super) fn column_tests(
         &self,
         alias: &str,
@@ -156,8 +129,6 @@ impl PlacedConditions {
         )
     }
 
-    /// The first test of the result rows, which DataFusion runs above the
-    /// region.
     pub(super) fn row_test(&self) -> Option<&ValueExpression> {
         self.rows.first()
     }

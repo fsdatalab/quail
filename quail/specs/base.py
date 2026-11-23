@@ -7,32 +7,17 @@ from typing import Literal, get_args
 import _quail_native
 
 Precision = Literal["fp4", "fp8", "bf16", "fp32"]
-# What a model answers with: a generative model scores TRUE against
-# FALSE for AI_FILTER and AI_JOIN; a reranker scores yes against no
-# for AI.SCORE; a decision model scores its yes and no options with
-# its own head for AI_FILTER and AI_JOIN.
 Role = Literal["generative", "reranker", "decision"]
-# What a layer keeps for a sequence. Full and sliding attention keep KV
-# (every token, or the last sliding_window tokens); Gated DeltaNet and
-# short convolution keep a fixed-size state that does not grow with
-# the tokens read.
 LayerKind = Literal[
     "full_attention", "sliding_attention", "gated_delta_net", "short_conv"]
 
-# The recurrent state is kept in fp32 and the convolution columns in
-# bf16.
 GDN_STATE_ELEMENT_BYTES = _quail_native.GDN_STATE_ELEMENT_BYTES
 CONV_STATE_ELEMENT_BYTES = _quail_native.CONV_STATE_ELEMENT_BYTES
 
-# Peak per-token activation bytes per hidden dim.
 ACT_BYTES_PER_HIDDEN = _quail_native.ACT_BYTES_PER_HIDDEN
 
 
-# Every random canvas token comes from this seed: a filter's fixed
-# canvas, and a classified document's canvas with the document's row.
 CANVAS_SEED = 0
-# A canvas answer whose first draw is less certain than this, in nats,
-# takes the rest of its noise draws and averages them.
 CANVAS_ENTROPY_NATS = 0.1
 
 
@@ -102,139 +87,66 @@ def _tuples(value):
 @dataclass(frozen=True)
 class ModelSpec:
     name: str
-    params: float        # active projection parameters per token
-    layers: int          # L
-    hidden: int          # h
-    num_q_heads: int             # query heads
-    num_kv_heads: int            # KV heads
-    d_head: int          # head dim
-    ffn_width: int       # dense or shared gate_up output columns
-    #                      (gate_up: 2 x intermediate at Qwen3)
-    w_bytes: float       # weight bytes per param (fp8 = 1)
-    hf_name: str = ""    # the checkpoint (weights + tokenizer)
-    revision: str = ""   # pinned hub commit hash; resolves from the
-    #                      HF cache without the API round trips a
-    #                      branch name pays. "" tracks the default.
-    kv_bytes: float = 2.0    # KV bytes per element (bf16 default)
-    w_mem_bytes: float = 0.0    # measured weight footprint as loaded;
-    #                             0 falls back to params * w_bytes.
-    #                             Embeddings and quant scales sit
-    #                             outside the dense param count, so the
-    #                             measured number is larger.
-    vocab: int = 0       # vocabulary rows in the embedding and lm_head
-    tied_head: bool = False    # lm_head shares the embedding tensor
+    params: float
+    layers: int
+    hidden: int
+    num_q_heads: int
+    num_kv_heads: int
+    d_head: int
+    ffn_width: int
+    w_bytes: float
+    hf_name: str = ""
+    revision: str = ""
+    kv_bytes: float = 2.0
+    w_mem_bytes: float = 0.0
+    vocab: int = 0
+    tied_head: bool = False
     weight_precision: Precision = "fp8"
     attention_precision: Precision = "bf16"
-    arch: str = "qwen3"    # forward pass in executor/models/<arch>.py
+    arch: str = "qwen3"
     role: Role = "generative"
-    readout: str = ""    # a decision model's head: "" is Decision 2.0's
-    #                      option head, "slot_lm" the output head's
-    #                      logits of the option letters
-    decision_head_dim: int = 0    # width of a decision model's option
-    #                               head (its key, query, and MLP rows);
-    #                               the head's FLOPs and bytes follow
-    # KV geometry of the full_attention layers, when it differs from the
-    # sliding layers' num_kv_heads x d_head; 0 means the same as theirs.
-    full_num_kv_heads: int = 0         # KV heads of a full-attention layer
-    full_d_head: int = 0       # head dim of a full-attention layer
-    sliding_window: int = 0    # tokens the other layers see behind each
-    #                            row; 0 means no layer slides
-    # Experts beside the dense MLP, for a mixture-of-experts model;
-    # 0 means the dense MLP alone.
+    readout: str = ""
+    decision_head_dim: int = 0
+    full_num_kv_heads: int = 0
+    full_d_head: int = 0
+    sliding_window: int = 0
     experts: int = 0
-    experts_active: int = 0    # experts one token multiplies
-    expert_intermediate: int = 0    # one expert's MLP width
-    canvas_tokens: int = 0    # rows a diffusion model appends after
-    #                           the answer cue. 0 for an autoregressive
-    #                           model, which answers at the last
-    #                           prompt row.
-    canvas_answer_row: int = 0    # canvas row the answer is read at;
-    #                               later than 0 when the model opens
-    #                               its turn with fixed tokens, such as
-    #                               an empty thinking channel
-    answer_canvas: "AnswerCanvas | None" = None    # a diffusion model's
-    #                                        answer canvas, which the
-    #                                        letters rule reads
-    turn_prefix: str = ""     # chat-turn text before every prompt
-    turn_suffix: str = ""     # chat-turn text after the answer cue
-    bos_text: str = ""    # the beginning-of-text token at the start of
-    #                       turn_prefix, for a model whose tokenizer adds it
-    #                       to every prompt: Quail tokenizes without special
-    #                       tokens, so the prefix carries it, and the text
-    #                       sent to vLLM drops it because vLLM adds its own
-    answer_temperature: float = 1.0    # divides a score's yes-against-no
-    #                                    margin before the sigmoid
-    read_found: tuple[tuple[float, float], ...] = ()    # a pointer
-    #                    read's (raw, calibrated) P(found) knots, read
-    #                    linearly between knots and flat past the ends;
-    #                    empty keeps the raw value
-    read_span_tokens: int = 0    # the longest span a pointer read returns
-    set_size: int = 0    # the most questions one set-attention pass
-    #                      holds: the size the model was trained with
+    experts_active: int = 0
+    expert_intermediate: int = 0
+    canvas_tokens: int = 0
+    canvas_answer_row: int = 0
+    answer_canvas: "AnswerCanvas | None" = None
+    turn_prefix: str = ""
+    turn_suffix: str = ""
+    bos_text: str = ""
+    answer_temperature: float = 1.0
+    read_found: tuple[tuple[float, float], ...] = ()
+    read_span_tokens: int = 0
+    set_size: int = 0
     attention_mask: Literal["causal", "set", "document_isolated"] = "causal"
-    #                    "set": d1's set attention, under which a
-    #                    document reads its questions, so a document's
-    #                    work is redone in every pass and no KV is kept
-    #                    "document_isolated": mammoth-1's, whose
-    #                    full-attention layers read the document block
-    #                    both ways and each question block whole, so a
-    #                    document's KV serves its own questions only
     answer_spellings: tuple[tuple[str, ...], tuple[str, ...]] = ()
-    #                    (true spellings, false spellings) that a
-    #                    filter, join, or score reads at the answer row;
-    #                    empty reads TRUE against FALSE
-    prompt_format: str = "raw-v1"    # names the turn layout in run records
-    prompt_layout: str = "ai-if"     # the prompt layout AI.IF
-    #                                  prompts are written in
-    chunk_cap_tokens: int = 0    # upper bound on tokens per chunk; 0
-    #                              leaves the memory and kernel bounds
-    moe_backend: str | None = None    # vLLM's moe_backend setting, one
-    #                                   of its MoEBackend names ("triton",
-    #                                   "cutlass", "deep_gemm", ...);
-    #                                   None lets vLLM pick
-    vllm_reserve_bytes: float = 0.0    # bytes left outside vLLM's memory pool
-    layer_kinds: tuple[LayerKind, ...] = ()    # one kind per layer; required
-    #                                            when sliding_window is set;
-    #                                            empty means every layer is
-    #                                            full_attention
-    vision_tower: bool = False    # the checkpoint ships a vision tower;
-    #                               vLLM must be told to take no images
-    #                               or video, or it builds an image
-    #                               processor that cannot copy Quail's
-    #                               tokenizer
-    vision_mem_bytes: float = 0.0    # bytes the vision tower takes beside
-    #                                  the text weights: its weights, its
-    #                                  encoder calls' activations, and a
-    #                                  chunk's image embeddings
-    # the image processor's patch side in pixels, its patches merged along
-    # each side of one image token, and the fewest and most pixels it reads
-    # an image at: patch_size, merge_size, size.shortest_edge, and
-    # size.longest_edge in the checkpoint's preprocessor_config.json
+    prompt_format: str = "raw-v1"
+    prompt_layout: str = "ai-if"
+    chunk_cap_tokens: int = 0
+    moe_backend: str | None = None
+    vllm_reserve_bytes: float = 0.0
+    layer_kinds: tuple[LayerKind, ...] = ()
+    vision_tower: bool = False
+    vision_mem_bytes: float = 0.0
     image_patch_pixels: int = 0
     image_merge: int = 0
     image_min_pixels: int = 0
     image_max_pixels: int = 0
-    max_num_seqs: int = 0    # sequences vLLM may run at once; 0 keeps the
-    #                          engine setting. A hybrid model holds one
-    #                          recurrent-state block per running sequence,
-    #                          and vLLM refuses a larger setting.
-    attn_output_gate: bool = False    # q_proj also emits a gate the width
-    #                                   of the queries, which scales the
-    #                                   attention output
-    # Gated DeltaNet layers, for a model whose layer_kinds name them.
-    # Each layer keeps a (value heads x value dim x key dim) state and
-    # the last conv_width - 1 columns of its convolution input.
+    max_num_seqs: int = 0
+    attn_output_gate: bool = False
     gdn_key_heads: int = 0
     gdn_value_heads: int = 0
     gdn_key_dim: int = 0
     gdn_value_dim: int = 0
     gdn_weight_precision: Precision | None = None
-    # the MLP projections' precision, when it differs from weight_precision
     mlp_weight_precision: Precision | None = None
     conv_width: int = 0
-    checkpoint_layers: int = 0    # layers in the checkpoint; when larger
-    #                               than layers, the loader keeps the first
-    #                               `layers` and frees the rest
+    checkpoint_layers: int = 0
     sae: SaeSpec | None = None
 
     def __post_init__(self):
@@ -373,8 +285,6 @@ class ModelSpec:
         """The chat-turn text wrapped around every prompt."""
         return self.turn_prefix, self.turn_suffix
 
-    # W_mem and W_resident are the weight-memory names used throughout
-    # the code and the engine wiki.
     @property
     def W_mem(self) -> float:  # noqa: N802
         """Weight bytes as loaded, before the full untied head is discarded."""
@@ -403,21 +313,19 @@ class ModelSpec:
 @dataclass(frozen=True)
 class DeviceSpec:
     name: str
-    mem_bytes: float     # M: physical memory
-    hbm_bw: float        # BW: memory bandwidth, bytes/s
-    fp8_flops: float     # dense tensor-core FLOP/s, without sparsity
-    bf16_flops: float    # dense tensor-core FLOP/s, without sparsity
-    fp32_flops: float    # CUDA-core FLOP/s, not tensor-core TF32
-    usd_per_hour: float = 0.0    # rental price of one device; 0 means
-    #                              no price is known
-    price_source: str = ""       # where usd_per_hour was read from
-    cuda_name: str = ""          # substring of torch.cuda.get_device_name
-    modal_gpu: str = ""          # Modal gpu= string, such as "H100!"
-    page_tokens: int = 16    # tokens per KV page required by the attention kernel
-    mamf_fp8_flops: float = 0.0    # 0 uses the specification rate
+    mem_bytes: float
+    hbm_bw: float
+    fp8_flops: float
+    bf16_flops: float
+    fp32_flops: float
+    usd_per_hour: float = 0.0
+    price_source: str = ""
+    cuda_name: str = ""
+    modal_gpu: str = ""
+    page_tokens: int = 16
+    mamf_fp8_flops: float = 0.0
     mamf_bf16_flops: float = 0.0
-    fp4_flops: float = 0.0    # dense FP4 tensor-core FLOP/s, without
-    #                           sparsity; 0 means no FP4 tensor cores
+    fp4_flops: float = 0.0
 
     def __post_init__(self):
         for precision in get_args(Precision):

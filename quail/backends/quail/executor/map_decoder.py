@@ -19,13 +19,7 @@ from quail.backends.quail.executor.answer_curves import AnswerCurves
 from quail.backends.quail.executor.chunk import DecodeRows, InputStaging
 from quail.backends.quail.executor.groups import FullAttentionGroup
 
-# copies of chosen tokens kept in flight before the host waits on the
-# oldest; three lets the host keep two passes queued ahead of the GPU
 IN_FLIGHT = 3
-# per extraction field: rounds that fed a draft, and of them the rounds
-# with several live positions; draft rows fed and written; rounds whose
-# draft the model left for another position, the draft rows unread after
-# it, and the draft rows unread after an answer's end
 DRAFT_COUNTS = ("draft_rounds", "draft_rounds_many_positions", "draft_rows",
                 "draft_rows_written", "draft_rounds_rejected",
                 "draft_rows_rejected", "draft_rows_after_end")
@@ -37,12 +31,10 @@ class _Copy:
 
     event: object
     host: object
-    buffer: object          # owning pinned buffer returned to the pool after read
+    buffer: object
     documents: np.ndarray
-    indices: np.ndarray     # each token's position in its answer
-    maps: np.ndarray        # each token's map, when it was chosen
-    # copy continuations to prepare for these answers' next rows, run while
-    # a later forward pass is on the GPU and before the tokens are read
+    indices: np.ndarray
+    maps: np.ndarray
     lookahead: list = field(default_factory=list)
 
 
@@ -78,38 +70,27 @@ class MapDecoder:
         self.page_tokens = page_tokens
         n = num_documents
         self.stop_ids = np.asarray(sorted(stop_ids), dtype=np.int64)
-        # per map, each document's tokens and its answer's length, -1
-        # while the answer has not ended
         self.tokens = [np.zeros((n, int(limit)), dtype=np.int32)
                        for limit in self.limits]
         self.lengths = np.full((len(self.limits), n), -1, dtype=np.int64)
         self.written = np.zeros((len(self.limits), n), dtype=np.int64)
         self.paused = np.zeros(n, dtype=bool)
-        # the answer each document is writing now
-        self.map = np.full(n, -1, dtype=np.int64)      # its map, -1 for none
-        self.origin = np.zeros(n, dtype=np.int64)      # its first decode position
-        self.fed = np.zeros(n, dtype=np.int64)         # decode rows packed
-        # when a list, each settle appends the slots whose answers ended
+        self.map = np.full(n, -1, dtype=np.int64)
+        self.origin = np.zeros(n, dtype=np.int64)
+        self.fed = np.zeros(n, dtype=np.int64)
         self.ended_log = None
-        # the answers' survival curves, built at their first use
         self.answer_curves = None
-        self.stopped = np.zeros(n, dtype=bool)         # read a stop token
+        self.stopped = np.zeros(n, dtype=bool)
         self.kv = FullAttentionGroup(n, page_tokens)
         self.device = head.device
         self.next_token = None
         self.copies = deque()
-        # per slot, the token copies on their way to the host that hold
-        # one of its tokens; an evicted answer recomputes once it has none
         self.inflight = np.zeros(n, dtype=np.int64)
-        self.finished = []      # (document, map) whose answers ended
-        self.rows_fed = np.zeros(len(self.limits), dtype=np.int64)  # per map
-        # KV tokens the decode rows read: in all, alone, through their
-        # own pages beside a shared read, and through shared reads
+        self.finished = []
+        self.rows_fed = np.zeros(len(self.limits), dtype=np.int64)
         self.read_tokens = dict(all=0, alone=0, own=0, shared=0)
-        # Per answer stage, each branch's map index.
         self.slot_maps = {}
         self.answer_slots = {}
-        # whether a document's branches read its shared pages together
         self.share = False
         self.copy_constraints = {}
         self.draft_counts = {}
@@ -125,13 +106,9 @@ class MapDecoder:
         self.copy_sources = np.full(n, -1, dtype=np.int64)
         self.num_streams = np.zeros(n, dtype=np.int64)
         self.steps = [np.zeros(n, dtype=np.int64) for _ in self.limits]
-        # per map, each document's rounds whose draft the model rejected
         self.rejected_steps = [np.zeros(n, dtype=np.int64) for _ in self.limits]
         self.drafts = np.zeros(n, dtype=np.int64)
-        # per map, its AnswerStop; the tokenizer decodes a map's text so far
         self.answer_stops = {}
-        # (map, slot) -> an answer's text so far, the token its last
-        # decoded piece starts at, and how many tokens the text holds
         self.partial_texts = {}
         self.tokenizer = None
         self.stopped_early = np.zeros(len(self.limits), dtype=np.int64)
@@ -295,7 +272,6 @@ class MapDecoder:
             self.copy_document[slots], state.sources[slots],
             self.lengths[map_index][slots])
 
-    # ---- documents entering and leaving -----------------------------------
 
     def start(self, document: int, map_index: int, position: int, pages,
               parent: int | None = None, shared_tokens: int = 0) -> None:
@@ -400,7 +376,6 @@ class MapDecoder:
         finished, self.finished = self.finished, []
         return finished
 
-    # ---- one pass --------------------------------------------------------
 
     def rows(self) -> DecodeRows | None:
         """Lay out each continuing answer's chosen token and optional copy drafts.
@@ -483,7 +458,6 @@ class MapDecoder:
         documents = np.concatenate([
             np.asarray(first_documents, dtype=np.int64),
             np.empty(0, dtype=np.int64) if rows is None else rows.slots])
-        # Recomputed prompts continue after their saved tokens, not at token zero.
         indices = np.concatenate([
             self.fed[np.asarray(first_documents, dtype=np.int64)],
             np.empty(0, dtype=np.int64) if rows is None else
@@ -744,8 +718,6 @@ class MapDecoder:
                     completions, length = self._partial_answer(q, slot)
                 else:
                     text, length = texts[index]
-                    # the answer is the text without the whitespace
-                    # around it, and it goes on from there
                     text = text.strip()
                     if not text:
                         continue
@@ -841,7 +813,6 @@ class MapDecoder:
         written = np.bincount(inverse, minlength=len(slots)) - 1
         unread = drafts - written
         chose = values[last, 0] >= 0
-        # the model chose a token of another position with draft rows unread
         rejected = chose & (values[last, 3] == 0) & (unread > 0)
         self.rejected_steps[q][slots] += rejected
         for name, count in zip(DRAFT_COUNTS, (

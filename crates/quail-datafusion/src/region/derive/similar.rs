@@ -1,23 +1,3 @@
-//! AI calls in one region that are written almost the same.
-//!
-//! The planner asks the model once for calls written the same way
-//! ([`crate::MergeRepeatedAiCalls`]). Two calls that differ only in a
-//! few characters of a prompt are most likely one call written twice by
-//! mistake: the model then answers both, and each answer may differ.
-//! [`similar_calls`] finds such pairs: the same function over the same
-//! columns and options, whose text arguments differ only in
-//!
-//! - case, whitespace, or punctuation ([`Likeness::Spelling`]), which
-//!   [`crate::region::derive::derive_region`] refuses; or
-//! - at most two letter edits of a text at least 12 characters long,
-//!   with the same digits ([`Likeness::Typo`]), which Quail warns about.
-//!
-//! For example, `AI.IF(PROMPT('Is {0} rude?', r.body))` and `AI.IF(
-//! PROMPT('is {0} rude', r.body))` differ in spelling, and `'Is the
-//! review about the ending? {0}'` and `'Is the reveiw about the ending?
-//! {0}'` by a typo. `'Is it from 2027? {0}'` and `'Is it from 2028?
-//! {0}'` differ in a digit and are two calls.
-
 use datafusion::common::ScalarValue;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::{Expr, LogicalPlan, lit};
@@ -25,17 +5,12 @@ use datafusion::logical_expr::{Expr, LogicalPlan, lit};
 use crate::ai::AiNode;
 use crate::plan::as_node;
 
-/// How alike two calls' texts are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Likeness {
-    /// A few letters apart.
     Typo,
-    /// The same but for case, whitespace, and punctuation.
     Spelling,
 }
 
-/// Two calls of one region written almost the same: how alike they are,
-/// and the first text in which they differ, as each call writes it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Similar {
     pub likeness: Likeness,
@@ -44,7 +19,6 @@ pub struct Similar {
 }
 
 impl Similar {
-    /// The message that names both calls and what to do.
     pub fn message(&self) -> String {
         let reason = match self.likeness {
             Likeness::Spelling => "differ only in case, whitespace, or punctuation",
@@ -59,8 +33,6 @@ impl Similar {
     }
 }
 
-/// The pairs of AI calls in `plan` written almost the same, in plan
-/// order.
 pub fn similar_calls(plan: &LogicalPlan) -> Vec<Similar> {
     let mut calls: Vec<Expr> = Vec::new();
     let _ = plan.apply(|node| {
@@ -87,8 +59,6 @@ pub fn similar_calls(plan: &LogicalPlan) -> Vec<Similar> {
     found
 }
 
-/// How alike two calls are, and the first texts in which they differ;
-/// None when they differ in more than their texts' spelling or a typo.
 fn likeness(first: &Expr, second: &Expr) -> Option<(Likeness, (String, String))> {
     let (first_shape, first_texts) = shape(first);
     let (second_shape, second_texts) = shape(second);
@@ -114,7 +84,6 @@ fn likeness(first: &Expr, second: &Expr) -> Option<(Likeness, (String, String))>
     least.zip(differing)
 }
 
-/// `expr` with each text literal blanked, and the texts in order.
 fn shape(expr: &Expr) -> (Expr, Vec<String>) {
     let mut texts = Vec::new();
     let blank = expr
@@ -131,7 +100,6 @@ fn shape(expr: &Expr) -> (Expr, Vec<String>) {
     (blank, texts)
 }
 
-/// `text` in lower case, without whitespace or punctuation.
 fn normalized(text: &str) -> String {
     text.chars()
         .filter(|c| c.is_alphanumeric() || *c == '{' || *c == '}')
@@ -139,8 +107,6 @@ fn normalized(text: &str) -> String {
         .collect()
 }
 
-/// Whether two texts at least 12 characters long are at most two letter
-/// edits apart, with the same digits and placeholders.
 fn is_typo(left: &str, right: &str) -> bool {
     let (left, right) = (normalized(left), normalized(right));
     let not_letters =

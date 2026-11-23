@@ -9,14 +9,14 @@ const ALGORITHMS = {
   reuse an answer only while every returned row keeps it unchanged
 
 derive(plan):
-  move each filter term to the operator producing its columns
+  move each predicate term to the operator producing its columns
   give each AI operator only the answer columns read above it
   pass each limit, DISTINCT, semi join, or count threshold down
-  pass each CASE or Boolean guard to the operator producing its answer
+  pass each CASE or Boolean precondition to the operator producing its answer
 
 offer(node, condition):
   if node produces a column read by condition:
-    add condition to the node's filter
+    add condition to the node's inline_predicate
   else if node preserves condition:
     offer condition to the child
   else:
@@ -24,7 +24,7 @@ offer(node, condition):
 
 enough(node, required_rows):
   if node is an AI operator:
-    set fetch to required_rows
+    set row_limit to required_rows
   else if node preserves required_rows:
     pass required_rows to the child
   else:
@@ -40,7 +40,7 @@ enough(node, required_rows):
     if the region cannot run:
       compute prompt arguments below the region
       split the top operator into another region
-      move one filter or fetch above the region
+      move one inline predicate or row limit above the region
       try the smaller region again
 
   return every answer and source column read above the region
@@ -70,11 +70,11 @@ enough(node, required_rows):
   accept the filter only when every column reaches the right region column
 
 run_pipeline(operators, rows):
-  for each row, while fewer than fetch rows have passed:
+  for each row, while fewer than row_limit rows have passed:
     admit the document and write its KV
 
     for each AI operator:
-      if guard is false or the document is NULL:
+      if precondition is false or the document is NULL:
         write a NULL answer and continue
 
       append the question after the resident document KV
@@ -138,8 +138,8 @@ export function PlanStagesFigure() {
           <h3>After optimization</h3>
           <Stack>{[
             <PlanNode owner="datafusion">Projection: id, sentiment</PlanNode>,
-            <PlanNode owner="quail"><b>AI.CLASSIFY</b><small>projection: sentiment · fetch: 10</small></PlanNode>,
-            <PlanNode owner="quail"><b>AI.IF</b><small>filter: answer is yes</small></PlanNode>,
+            <PlanNode owner="quail"><b>AI.CLASSIFY</b><small>pruned_fields: sentiment · row_limit: 10</small></PlanNode>,
+            <PlanNode owner="quail"><b>AI.IF</b><small>inline_predicate: answer is yes</small></PlanNode>,
             <PlanNode owner="datafusion"><b>Scan reviews</b><small>filter: year = 2024</small></PlanNode>,
           ]}</Stack>
           <p>DataFusion moves the year filter. Quail moves the answer test and limit.</p>
@@ -190,11 +190,11 @@ export function PlanStagesFigure() {
 }
 
 const DERIVE_ROWS = [
-  ['Before Limit', 'columns: id, sentiment · tests: none · rows needed: all', '—'],
-  ['After Limit 10', 'columns: id, sentiment · tests: none · rows needed: 10', '—'],
-  ['After Filter', 'columns: id, sentiment · test: AI.IF answer · rows needed: 10', '—'],
-  ['After AI.CLASSIFY', 'columns: id, text · test: AI.IF answer · rows needed: 10', 'projection: sentiment · fetch: 10'],
-  ['After AI.IF', 'columns: id, text · tests: none · rows needed: 10', 'filter: answer is yes'],
+  ['Before Limit', 'columns: id, sentiment · predicates: none · rows needed: all', '—'],
+  ['After Limit 10', 'columns: id, sentiment · predicates: none · rows needed: 10', '—'],
+  ['After Filter', 'columns: id, sentiment · predicate: AI.IF answer · rows needed: 10', '—'],
+  ['After AI.CLASSIFY', 'columns: id, text · predicate: AI.IF answer · rows needed: 10', 'pruned_fields: sentiment · row_limit: 10'],
+  ['After AI.IF', 'columns: id, text · predicates: none · rows needed: 10', 'inline_predicate: answer is yes'],
 ] as const;
 
 export function DeriveFigure() {

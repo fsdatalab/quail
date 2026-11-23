@@ -120,7 +120,7 @@ def test_a_cte_runs_once_however_many_times_it_is_read():
     AI.IF(PROMPT('same clause? {0} {1}', a.clause.terms, b.clause.terms))  ---
 plan
   __quail_answer_1 = ai_filter('same clause? {0} {1}', get_field(a.clause, 'terms'),
-      get_field(b.clause, 'terms')), filter: __quail_answer_1, returns: []
+      get_field(b.clause, 'terms')), inline_predicate: __quail_answer_1, returns: []
   clause = ai_extract(c.text, named_struct('terms', 'What is the termination clause?')),
       returns: [clause]
 asked 7 of 10
@@ -150,8 +150,8 @@ def test_a_cte_that_filters_or_classifies_returns_the_rows_its_reader_selects():
     c.text))     ORDER BY c.id LIMIT 2) SELECT f.id AS result_id FROM first f WHERE f.id
     > 0  ---
 plan
-  __quail_answer_1 = ai_filter('keep {0}', c.text), filter: __quail_answer_1, returns:
-      []
+  __quail_answer_1 = ai_filter('keep {0}', c.text), inline_predicate: __quail_answer_1,
+      returns: []
 asked 3 of 3
   'keep {0}': 1 TRUE, 2 FALSE, 3 TRUE
 rows 2
@@ -162,10 +162,10 @@ rows 2
     {0}', c.text))) SELECT a.id, b.id AS other FROM contracts a JOIN kept b ON
     AI.IF(PROMPT('same? {0} {1}', a.text, b.text))  ---
 plan
-  __quail_answer_2 = ai_filter('same? {0} {1}', a.text, b.text), filter:
+  __quail_answer_2 = ai_filter('same? {0} {1}', a.text, b.text), inline_predicate:
       __quail_answer_2, returns: []
-  __quail_answer_1 = ai_filter('keep {0}', c.text), filter: __quail_answer_1, returns:
-      []
+  __quail_answer_1 = ai_filter('keep {0}', c.text), inline_predicate: __quail_answer_1,
+      returns: []
 asked 9 of 9
   'keep {0}': 1 TRUE, 2 FALSE, 3 TRUE
   'same? {0} {1}': 1+1 TRUE, 1+2 FALSE, 1+3 FALSE, 3+1 FALSE, 3+2 FALSE, 3+3 TRUE
@@ -176,7 +176,8 @@ rows 2
 --- WITH k AS (SELECT c.id, AI.CLASSIFY(c.text, ['lease', 'note']) AS kind FROM
     contracts c) SELECT k.id, k.kind FROM k WHERE k.kind = 'lease' ---
 plan
-  kind = ai_classify(c.text, make_array('lease', 'note')), filter: kind = 'lease'
+  kind = ai_classify(c.text, make_array('lease', 'note')), inline_predicate: kind =
+      'lease'
 asked 3 of 3
   '?': 1 'lease', 2 'note', 3 'lease'
 columns k.id int64, k.kind string
@@ -198,8 +199,8 @@ def test_a_cte_join_can_reuse_an_alias_from_the_ctes_scope():
     c.text))) SELECT k.id AS contract_id, c.text AS contract_text FROM kept k JOIN
     contracts c ON k.id = c.id ---
 plan
-  __quail_answer_1 = ai_filter('keep {0}', c.text), filter: __quail_answer_1, returns:
-      []
+  __quail_answer_1 = ai_filter('keep {0}', c.text), inline_predicate: __quail_answer_1,
+      returns: []
 asked 3 of 3
   'keep {0}': 1 TRUE, 2 TRUE, 3 TRUE
 columns contract_id int64, contract_text string
@@ -212,8 +213,8 @@ rows 3
     c.text))) SELECT k.id AS contract_id, c.text AS contract_text FROM kept k JOIN
     contracts c ON k.id = c.id ---
 plan
-  __quail_answer_1 = ai_filter('keep {0}', c.text), filter: __quail_answer_1, returns:
-      []
+  __quail_answer_1 = ai_filter('keep {0}', c.text), inline_predicate: __quail_answer_1,
+      returns: []
 asked 3 of 3
   'keep {0}': 1 FALSE, 2 FALSE, 3 FALSE
 columns contract_id int64, contract_text string

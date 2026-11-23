@@ -1,36 +1,3 @@
-//! The `PlaceAiNodes` optimizer rule: Quail's `AiNode`s on the tables
-//! and joins they read.
-//!
-//! [`crate::LowerAiCalls`] leaves each `AiNode` where the query wrote its
-//! call: an `AI.IF` in WHERE above the joins, a classification below the
-//! SELECT list. The rule moves each node as low as its inputs allow, as
-//! `PushDownFilter` does for plain filters:
-//!
-//! - A node with a fetch stays where it is: below a filter or join it
-//!   would limit different rows.
-//! - An AI filter or AI column of one table, and a test of one table's
-//!   answers, move through joins, AI joins, other filters, windows, and
-//!   projections that only pass columns, down to the table. Through an
-//!   outer, semi, or anti join they move only on the side whose rows
-//!   the join returns ([`preserved_sides`]).
-//! - An AI join or `EXISTS` gate, and an AI column of joined rows, move
-//!   to the lowest join whose inputs hold every table they read; a
-//!   classification of joined rows stays above the AI join of the same
-//!   two tables.
-//!
-//! - An AI column that an `ORDER BY ... LIMIT` above it does not sort
-//!   by moves above it, so the model answers only the rows the limit
-//!   keeps: `TopK(AI(R)) ⇒ AI(TopK(R))`. For example, in `SELECT r.id,
-//!   AI.MAP(r.body, ...) FROM r ORDER BY r.id LIMIT 1` the map writes one
-//!   answer. A `LIMIT` with no `ORDER BY` is the node's fetch instead
-//!   ([`crate::rules::derive`]).
-//!
-//! Then it orders the operators on each table as Quail's executor reads
-//! them: the table's `AI.IF` and `AI.SCORE` filters in written order;
-//! each test of a label right after the classification it reads; the
-//! other classifications; then each extraction, SAE feature, and map
-//! column, each followed by the tests its answers allow.
-
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -45,8 +12,6 @@ use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 use crate::ai::AiNode;
 use crate::plan::{as_node, extension_node};
 
-/// Move each `AiNode` to the tables and joins it reads and order each
-/// table's operators, as the module explains.
 #[derive(Debug, Default)]
 pub struct PlaceAiNodes;
 
@@ -63,8 +28,6 @@ impl OptimizerRule for PlaceAiNodes {
         let lifted = plan.transform_down(lift_above_limit)?;
         let mut plan = lifted.data;
         let mut changed = lifted.transformed;
-        // each step moves one node one operator down; a plan has fewer
-        // operators than this many steps
         for _ in 0..256 {
             let step = plan.transform_down(push_down)?;
             plan = step.data;
@@ -81,7 +44,6 @@ impl OptimizerRule for PlaceAiNodes {
     }
 }
 
-/// The aliases of the tables a plan scans, not looking into derived tables.
 fn plan_tables(plan: &LogicalPlan) -> BTreeSet<String> {
     let mut found = BTreeSet::new();
     let _ = plan.apply(|node| {
@@ -89,7 +51,6 @@ fn plan_tables(plan: &LogicalPlan) -> BTreeSet<String> {
             found.insert(alias.alias.table().to_string());
             return Ok(TreeNodeRecursion::Jump);
         }
-        // a table read without an alias names its columns itself
         if let LogicalPlan::TableScan(scan) = node {
             found.insert(scan.table_name.table().to_string());
         }
@@ -98,8 +59,6 @@ fn plan_tables(plan: &LogicalPlan) -> BTreeSet<String> {
     found
 }
 
-/// The answer columns the `AiNode`s in a plan return, with the tables
-/// each reads.
 fn plan_answers(plan: &LogicalPlan) -> Vec<(String, BTreeSet<String>)> {
     let mut found = Vec::new();
     let _ = plan.apply(|node| {
@@ -117,8 +76,6 @@ fn plan_answers(plan: &LogicalPlan) -> Vec<(String, BTreeSet<String>)> {
     found
 }
 
-/// The tables an expression reads: its columns' tables, and for an
-/// answer column, the tables its `AiNode` reads.
 fn expr_tables(expr: &Expr, answers: &[(String, BTreeSet<String>)]) -> BTreeSet<String> {
     let mut found = BTreeSet::new();
     for column in expr.column_refs() {
@@ -136,7 +93,6 @@ fn expr_tables(expr: &Expr, answers: &[(String, BTreeSet<String>)]) -> BTreeSet<
     found
 }
 
-/// The answer columns an expression reads.
 fn expr_answers(expr: &Expr) -> BTreeSet<String> {
     expr.column_refs()
         .into_iter()
@@ -145,23 +101,16 @@ fn expr_answers(expr: &Expr) -> BTreeSet<String> {
         .collect()
 }
 
-/// A node that moves down, with the tables it reads and the columns it adds.
 struct Mover {
     tables: BTreeSet<String>,
     added: BTreeSet<String>,
-    /// Whether it pairs rows of two tables: an AI join or a
-    /// classification of joined rows.
     pairs: bool,
 }
 
-/// What an `AiNode` does to the rows of the tables it reads.
 #[derive(PartialEq)]
 enum Role {
-    /// Keeps the rows of one table that pass its test.
     TableFilter,
-    /// Keeps the pairs of two tables that pass its test, or gates rows.
     Join,
-    /// Adds an answer column.
     Column,
 }
 
@@ -175,25 +124,20 @@ fn role(node: &AiNode) -> Role {
     Role::Join
 }
 
-/// The `AiNode` that is an AI join or gate, if `plan` is one.
 fn ai_join(plan: &LogicalPlan) -> Option<&AiNode> {
     as_node::<AiNode>(plan).filter(|node| role(node) == Role::Join)
 }
 
 fn mover(node: &LogicalPlan) -> Option<Mover> {
     if let Some(ai) = as_node::<AiNode>(node) {
-        // moving a node with a fetch below an operator moves the operator
-        // above the fetch
-        if ai.has_fetch() {
+        if ai.has_row_limit() {
             return None;
         }
-        // every table the node reads, by its call, guard, or filter
         let answers = plan_answers(ai.inputs()[0]);
         let mut tables = expr_tables(&ai.call(), &[]);
-        for expr in ai.guard().into_iter().chain(ai.filter()) {
+        for expr in ai.precondition().into_iter().chain(ai.inline_predicate()) {
             tables.extend(expr_tables(&expr, &answers));
         }
-        // an AI filter whose answer the query reads adds it as a column
         let added = ai
             .returned_fields()
             .iter()
@@ -220,11 +164,8 @@ fn mover(node: &LogicalPlan) -> Option<Mover> {
     if let LogicalPlan::Filter(filter) = node {
         let answers = plan_answers(&filter.input);
         if expr_answers(&filter.predicate).is_empty() {
-            // a plain filter is DataFusion's to push
             return None;
         }
-        // a column no table and no `AiNode` below names, such as a model
-        // region's answer, is read where the filter stands
         let unknown = filter.predicate.column_refs().iter().any(|column| {
             column.relation.is_none() && !answers.iter().any(|(name, _)| *name == column.name)
         });
@@ -241,8 +182,6 @@ fn mover(node: &LogicalPlan) -> Option<Mover> {
     None
 }
 
-/// An `ORDER BY` with a `LIMIT`, as a limit over a sort or a sort that
-/// keeps its first rows: the sort.
 fn top_rows(plan: &LogicalPlan) -> Option<&Sort> {
     match plan {
         LogicalPlan::Limit(limit) => match limit.input.as_ref() {
@@ -262,8 +201,6 @@ fn sorted(expr: Vec<SortExpr>, input: LogicalPlan, fetch: Option<usize>) -> Logi
     })
 }
 
-/// Move the AI column below an `ORDER BY ... LIMIT` above it, through a
-/// SELECT list between them, when the sort does not read its answer.
 fn lift_above_limit(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     let Some(sort) = top_rows(&plan) else {
         return Ok(Transformed::no(plan));
@@ -275,13 +212,10 @@ fn lift_above_limit(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     let Some(node) = as_node::<AiNode>(below) else {
         return Ok(Transformed::no(plan));
     };
-    // a node over another shares its documents' KV with it, which rows
-    // cut off between them would not keep
     let shares = as_node::<AiNode>(node.inputs()[0]).is_some();
     if !node.asks_every_row() || shares {
         return Ok(Transformed::no(plan));
     }
-    // each sort key as the node's input computes it
     let mut keys_below = Vec::new();
     for key in &sort.expr {
         let expr = match projection {
@@ -310,12 +244,10 @@ fn lift_above_limit(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     Ok(Transformed::yes(lifted))
 }
 
-/// `node`, whose one input was `input`, over `below` instead.
 fn with_input(node: &LogicalPlan, below: LogicalPlan) -> Result<LogicalPlan> {
     crate::plan::with_inputs(node, vec![below])
 }
 
-/// The tables each input of a join holds.
 fn join_sides(plan: &LogicalPlan) -> Option<(BTreeSet<String>, BTreeSet<String>)> {
     match plan {
         LogicalPlan::Join(join) => Some((plan_tables(&join.left), plan_tables(&join.right))),
@@ -323,14 +255,6 @@ fn join_sides(plan: &LogicalPlan) -> Option<(BTreeSet<String>, BTreeSet<String>)
     }
 }
 
-/// Whether a join returns every row of its left and of its right input
-/// that its condition does not drop for the other side's sake: the
-/// sides a filter or column of that side alone moves below. It is
-/// DataFusion's `lr_is_preserved` (`push_down_filter.rs`), which
-/// `PushDownFilter` uses for a plain filter and does not export.
-///
-/// An outer join adds rows of NULLs for its other side, where a node
-/// above the join would read a NULL document, so nothing moves there.
 fn preserved_sides(join_type: JoinType) -> (bool, bool) {
     match join_type {
         JoinType::Inner => (true, true),
@@ -344,7 +268,6 @@ fn preserved_sides(join_type: JoinType) -> (bool, bool) {
     }
 }
 
-/// Move `node` one operator down when its input does not need it above.
 fn push_down(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     let Some(moving) = mover(&node) else {
         return Ok(Transformed::no(node));
@@ -384,7 +307,6 @@ fn push_down(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
             let fits = sides.is_some_and(|(left, right)| {
                 moving.tables.is_subset(&left) || moving.tables.is_subset(&right)
             });
-            // a classification of joined rows reads the pairs the join keeps
             let same_pair = moving.pairs && expr_tables(&join.call(), &[]) == moving.tables;
             if fits && !same_pair {
                 let below = with_input(&node, join.inputs()[0].clone())?;
@@ -396,7 +318,6 @@ fn push_down(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
         LogicalPlan::Filter(filter) => {
             let answers = plan_answers(&filter.input);
             let below_tables = expr_tables(&filter.predicate, &answers);
-            // a test of the same table's answers belongs to the table's stack
             if reads_added(&input) || (!moving.pairs && below_tables == moving.tables) {
                 None
             } else {
@@ -404,9 +325,6 @@ fn push_down(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
                 Some(with_input(&input, below)?)
             }
         }
-        // a SELECT list that passes on every column the node reads,
-        // whatever else it computes, such as a field of another
-        // node's answer
         LogicalPlan::Projection(projection)
             if projection
                 .expr
@@ -439,17 +357,13 @@ fn push_down(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     })
 }
 
-/// One operator of a table's stack.
 enum Item {
     Filter(AiNode),
     Column(AiNode),
     Test(Expr),
 }
 
-/// Put the operators on one table in Quail's order, as the module explains.
 fn order_stack(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
-    // a stack starts at its topmost operator: one whose parent is not on
-    // the same table; reorder from each SubqueryAlias's parent chain
     let Some(top) = mover(&node) else {
         return Ok(Transformed::no(node));
     };
@@ -506,9 +420,6 @@ fn order_stack(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
             .map(|field| field.name().clone())
             .collect()
     };
-    // the order Quail prefers: the AI filters, each label test after
-    // the classification it reads, then the other columns by kind, each
-    // followed by the tests it completes
     let mut sequence: Vec<Item> = filters.iter().cloned().map(Item::Filter).collect();
     let mut placed: Vec<&AiNode> = Vec::new();
     let mut done_tests = vec![false; tests.len()];
@@ -549,9 +460,6 @@ fn order_stack(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     for (test, _) in tests.iter().zip(&done_tests).filter(|(_, done)| !**done) {
         sequence.push(Item::Test(test.clone()));
     }
-    // each operator goes over the first input that has every answer it
-    // reads: an AI filter that took a test of another node's answer
-    // follows that node
     let stack: BTreeSet<String> = filters
         .iter()
         .chain(&columns)
@@ -576,7 +484,6 @@ fn order_stack(node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
             .iter()
             .position(|item| needs(item).is_subset(&available))
         else {
-            // operators that read each other's answers stay as written
             return Ok(Transformed::no(node));
         };
         plan = match sequence.remove(next) {

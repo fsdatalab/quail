@@ -12,13 +12,8 @@ from pathlib import Path
 
 import modal
 
-# the uv the images sync with; pyproject.toml's required-version must
-# match it (tests/test_images.py checks), and the value stays a literal
-# because Modal imports this module inside the container, where the
-# repository's pyproject.toml is not mounted
 UV_VERSION = "0.12.13"
 CUDA_BASE = "nvidia/cuda:13.0.1-devel-ubuntu24.04"
-# every kernel cache under one mount, so a volume keeps them warm
 CACHE_ENV = {
     "QUAIL_CACHE_DIR": "/root/.cache/kernels",
     "FLASHINFER_WORKSPACE_BASE": "/root/.cache/kernels",
@@ -33,26 +28,18 @@ CACHE_ENV = {
     "TORCHINDUCTOR_CACHE_DIR": "/root/.cache/kernels/torchinductor",
     "CUDA_CACHE_PATH": "/root/.cache/kernels/cuda",
     "CUDA_CACHE_MAXSIZE": "4294967296",
-    # FlashAttention 4 (heads wider than 256) keeps compiled kernels in
-    # memory only unless its disk cache is on
     "FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED": "1",
     "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR": "/root/.cache/kernels/flash_attention_cute",
 }
 
 
-# the package that declares Quail's vLLM plugin, installed in the images
 VLLM_PLUGIN_DIR = Path(__file__).parent / "vllm_plugin"
 
-# the Rust workspace the planner's native module builds from
 REPOSITORY = Path(__file__).resolve().parents[2]
 NATIVE_SOURCE = "/opt/quail-native"
-# where CI uploads a prebuilt native module for each key of the Rust
-# sources (.github/workflows/publish.yml)
 NATIVE_WHEELS_URL = ("https://github.com/fsdatalab/quail/releases/download/"
                      "native-wheels")
 MATURIN = "maturin>=1.9,<2"
-# the native module alone, as a project: the image mounts the quail
-# package from source
 NATIVE_PROJECT_TEXT = """\
 [build-system]
 requires = ["maturin>=1.9,<2"]
@@ -66,15 +53,12 @@ version = "0.1.0"
 manifest-path = "crates/quail-python/Cargo.toml"
 module-name = "_quail_native"
 """
-# the model and device spec files quail.specs reads
 SPEC_DATA = Path(__file__).resolve().parents[1] / "specs" / "data"
 
-# local variables copied into the image when set
 FORWARDED_ENV = ("QUAIL_GDN_PREFILL",)
 
 
 def _cuda_base() -> modal.Image:
-    # a run picks the Gated DeltaNet prefill kernel from its own shell
     forwarded = {name: os.environ[name] for name in FORWARDED_ENV
                  if name in os.environ}
     return (modal.Image.from_registry(CUDA_BASE, add_python="3.12")
@@ -94,8 +78,6 @@ def _with_sources(image: modal.Image) -> modal.Image:
 
 def _is_rust_source(path: Path) -> bool:
     """Whether a file under crates/ is source the dependency build leaves out."""
-    # a build script too: quail-python's links its tests, which an empty
-    # library does not have
     return path.suffix == ".rs"
 
 
@@ -115,8 +97,6 @@ def _prebuilt_native_url() -> str | None:
     spec.loader.exec_module(module)
     url = f"{NATIVE_WHEELS_URL}/quail_native-{module.native_key()}-linux-x86_64.whl"
     try:
-        # GitHub redirects to a link signed for GET, which refuses a HEAD;
-        # one byte answers whether the wheel exists
         with urllib.request.urlopen(
                 urllib.request.Request(url, headers={"Range": "bytes=0-0"}),
                 timeout=10):
@@ -136,7 +116,6 @@ def _with_native_planner(image: modal.Image) -> modal.Image:
     """
     url = _prebuilt_native_url()
     if url is not None:
-        # the image's environment has no pip; a wheel is a zip archive
         fetch = f"import urllib.request as r; r.urlretrieve('{url}', '/tmp/native.whl')"
         unpack = ("import sysconfig, zipfile; "
                   "wheel = zipfile.ZipFile('/tmp/native.whl'); "
@@ -146,8 +125,6 @@ def _with_native_planner(image: modal.Image) -> modal.Image:
             f'python -c "{fetch}"', f'python -c "{unpack}"',
             "python -c 'import _quail_native; _quail_native.LOGICAL_RULES'")
     cargo = (f"cd {NATIVE_SOURCE} && PATH=$HOME/.cargo/bin:$PATH "
-             # an image builds once: Cargo's default release settings,
-             # not the workspace's fast-rebuild ones
              "CARGO_PROFILE_RELEASE_INCREMENTAL=false "
              "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 ")
     return (image.apt_install("curl", "build-essential")
@@ -163,8 +140,6 @@ def _with_native_planner(image: modal.Image) -> modal.Image:
             .add_local_dir(REPOSITORY / "crates", f"{NATIVE_SOURCE}/crates", copy=True,
                            ignore=_is_rust_source)
             .run_commands(
-                # each crate as an empty library, so Cargo builds what
-                # the crates depend on and nothing of their own
                 f"cd {NATIVE_SOURCE} && for crate in crates/*/; do "
                 "mkdir -p $crate/src && touch $crate/src/lib.rs; done",
                 cargo + "cargo build --release --locked -p quail-python")
@@ -172,11 +147,8 @@ def _with_native_planner(image: modal.Image) -> modal.Image:
             .run_commands(
                 f"cat > {NATIVE_SOURCE}/pyproject.toml <<'EOF'\n"
                 f"{NATIVE_PROJECT_TEXT}EOF",
-                # Cargo compares file times: a copied file older than the
-                # empty library's build would leave the empty one in place
                 f"find {NATIVE_SOURCE}/crates -name '*.rs' -exec touch {{}} +",
                 cargo + f"maturin build --release -o {NATIVE_SOURCE}/wheels",
-                # the image's environment has no pip; a wheel is a zip archive
                 "python -c \"import glob, sysconfig, zipfile; "
                 "zipfile.ZipFile(glob.glob("
                 f"'{NATIVE_SOURCE}/wheels/quail_native-*.whl')[0]).extractall("

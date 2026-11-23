@@ -1,6 +1,3 @@
-//! Rules that change executable graphs, and the loop that applies them
-//! to a plan.
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::budgets::{cheaper_attention_path, chunk_budget, tree_attention_allowed};
@@ -19,7 +16,6 @@ use crate::pricing::classify::classify_statistics;
 use crate::pricing::plan_statistics::{expected_rows_after_filters, plan_statistics};
 use crate::pricing::{expected_documents, head_tokens, pass_question_tokens, set_pass_tokens};
 
-/// The built-in physical rules, in the order the registry applies them.
 pub const PHYSICAL_RULES: [&str; 9] = [
     "should_push_down_limit",
     "choose_classify_implementation",
@@ -32,7 +28,6 @@ pub const PHYSICAL_RULES: [&str; 9] = [
     "should_stop_answers_early",
 ];
 
-/// `graph` with `nodes` in place of its own, returning the same port.
 fn with_nodes(graph: &PhysicalGraph, nodes: Vec<PhysicalNode>) -> PhysicalGraph {
     PhysicalGraph {
         nodes,
@@ -126,7 +121,6 @@ fn choose_classify_implementation(
     Ok(Some(with_nodes(graph, nodes)))
 }
 
-/// The kind of question a node asks in a set-attention pass, if any.
 fn packed_kind(node: &PhysicalNode) -> Option<&'static str> {
     match node {
         PhysicalNode::AiFilter(_) => Some("filter"),
@@ -137,7 +131,6 @@ fn packed_kind(node: &PhysicalNode) -> Option<&'static str> {
     }
 }
 
-/// The pipeline's runs of packable operators, in order, as `chains`.
 fn chains(nodes: &[PhysicalNode], pipeline: &[usize]) -> Vec<Vec<usize>> {
     let mut out = Vec::new();
     let mut current = Vec::new();
@@ -157,8 +150,6 @@ fn chains(nodes: &[PhysicalNode], pipeline: &[usize]) -> Vec<Vec<usize>> {
     out
 }
 
-/// Each packable operator's pass group, numbered across the plan, as
-/// `set_pass_groups`.
 fn set_pass_groups(
     nodes: &[PhysicalNode],
     context: &PlanningContext,
@@ -257,8 +248,6 @@ fn tokens_of(values: &[Value]) -> Vec<i64> {
     values.iter().filter_map(Value::as_i64).collect()
 }
 
-/// The tables a set-attention node reads and the tokens after their
-/// documents, as `document_tails`: (alias, head, tail) per table.
 fn document_tails(node: &PhysicalNode) -> Vec<(String, Vec<i64>, Vec<i64>)> {
     match node {
         PhysicalNode::AiFilter(filter) => {
@@ -359,8 +348,6 @@ fn set_document_ends(node: &mut PhysicalNode, ends: Value) {
     }
 }
 
-/// Each last token's tokens when the tokenizer reads it with the tail,
-/// as `document_ends`.
 fn document_ends(
     last: &[i64],
     tail: &[i64],
@@ -381,7 +368,6 @@ fn document_ends(
     Ok(Value::Array(out))
 }
 
-/// A table a node reads, its prompt head, and the tokens after its documents.
 type Tail = (String, Vec<i64>, Vec<i64>);
 
 fn join_document_ends(graph: &PhysicalGraph, context: &PlanningContext) -> Rewrite {
@@ -438,8 +424,6 @@ fn join_document_ends(graph: &PhysicalGraph, context: &PlanningContext) -> Rewri
     Ok(changed.then(|| with_nodes(graph, nodes)))
 }
 
-/// Set operators' KV retention from the next compatible document consumer,
-/// as `plan_kv_retention`.
 pub fn plan_kv_retention(graph: &PhysicalGraph) -> PhysicalGraph {
     let nodes = &graph.nodes;
     let paths = build_pipelines(nodes, &[]);
@@ -465,7 +449,6 @@ pub fn plan_kv_retention(graph: &PhysicalGraph) -> PhysicalGraph {
             .copied()
             .filter(|member| nodes[*member].backend().is_some())
             .collect();
-        // joins settle anchors after any classification of their surviving pairs
         let settling = model_nodes
             .iter()
             .rev()
@@ -611,7 +594,6 @@ fn should_retain_kv(
     Ok(Some(plan_kv_retention(graph)))
 }
 
-/// Whether a node borrows its documents' shared prefix KV.
 fn shares_prefixes(node: &PhysicalNode) -> bool {
     match node {
         PhysicalNode::AiFilter(node) => node.attributes.share_prefixes,
@@ -741,7 +723,6 @@ fn should_share_prefixes(graph: &PhysicalGraph, context: &PlanningContext) -> Re
         } else {
             node.document_aliases()[0].clone()
         };
-        // borrowed KV has no residual rows from which to recover SAE maxima
         let Some(shared) = context
             .page_shared
             .get(&alias)
@@ -797,7 +778,6 @@ fn mean_length(context: &PlanningContext, alias: &str) -> f64 {
     }
 }
 
-/// The attention path for each table's answer branches, as `_answer_attention`.
 fn answer_attention(
     graph: &PhysicalGraph,
     context: &PlanningContext,
@@ -931,13 +911,11 @@ fn choose_attention_path(graph: &PhysicalGraph, context: &PlanningContext) -> Re
             PhysicalNode::AiJoin(join) => {
                 let stage = &join.attributes;
                 Some(if tree_available {
-                    // the partners each live anchor reads, on average
                     let readers = if stage.anchor_documents != 0.0 {
                         stage.expected_rows / stage.anchor_documents
                     } else {
                         1.0
                     };
-                    // a partner's rows: its document and the question tail
                     let rows = stage.pair_tail_tokens as f64
                         + crate::cost::work::python_sum(
                             stage
@@ -998,8 +976,6 @@ fn should_deduplicate(
             _ => aliases.extend(node.spec_aliases()),
         }
     }
-    // a key document stands for copies in several stop key groups; the
-    // executor counts each copy's survival in its own group
     let chosen: Map<String, Value> = aliases
         .into_iter()
         .filter(|alias| context.key_documents(alias).is_some())
@@ -1011,14 +987,6 @@ fn should_deduplicate(
     Ok(None)
 }
 
-/// Give each map and extraction the region's exact tests of its answer
-/// alone, so the executor stops an answer once one is decided.
-///
-/// A test is a `Filter` of the node's table whose condition reads only
-/// the node's answer column. The executor may also stop once every such
-/// test is decided TRUE when nothing else reads the answer: no other
-/// `Filter` and not the region's projection, which reads an extraction's
-/// answers as one struct.
 fn should_stop_answers_early(graph: &PhysicalGraph, context: &PlanningContext) -> Rewrite {
     let Some(found) = &context.operators else {
         return Ok(None);
@@ -1109,12 +1077,6 @@ fn should_stop_answers_early(graph: &PhysicalGraph, context: &PlanningContext) -
     Ok(changed.then(|| with_nodes(graph, nodes)))
 }
 
-/// Apply one rule by name.
-///
-/// # Errors
-///
-/// The rule is unknown, a classification no rule can score refuses the
-/// plan, or a callback fails.
 pub fn apply_rule(
     name: &str,
     graph: &PhysicalGraph,
@@ -1139,12 +1101,6 @@ pub fn apply_rule(
     }
 }
 
-/// Refine a plan by applying the rules in order and pricing it again,
-/// as `apply_plan_rules`.
-///
-/// # Errors
-///
-/// A rule fails other than by refusing the plan.
 pub fn apply_plan_rules(
     plan: PhysicalPlan,
     rules: &[String],

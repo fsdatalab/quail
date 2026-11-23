@@ -1,5 +1,3 @@
-//! A host's own DataFusion session with Quail added to it.
-
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -16,7 +14,6 @@ use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, Phy
 use datafusion::prelude::SessionContext;
 use quail_datafusion::{InputStream, ModelRegion, QuailExtension, RegionBatches, RegionRunner};
 
-/// Stands in for Quail's executor: the model keeps the first review.
 #[derive(Debug)]
 struct KeepsFirstReview;
 
@@ -29,7 +26,6 @@ impl RegionRunner for KeepsFirstReview {
         _hint: &quail_datafusion::RegionHint,
     ) -> Result<RegionBatches> {
         let schema = Arc::new(region.plan.schema().as_arrow().clone());
-        // one row: each id column, such as a row number, read from "0"
         let columns = schema
             .fields()
             .iter()
@@ -76,13 +72,10 @@ async fn count(context: &SessionContext) -> Result<i64> {
 async fn a_host_session_with_quail_runs_ai_functions_in_its_own_sql() -> Result<()> {
     let state = SessionStateBuilder::new().with_default_features().build();
     let state = QuailExtension::new(Arc::new(KeepsFirstReview)).register(state)?;
-    // the host's DataFusion counts the rows the model region returns
     assert_eq!(count(&SessionContext::new_with_state(state)).await?, 1);
     Ok(())
 }
 
-/// A host's own query planner: it claims the model regions and has
-/// Quail's extension planner.
 struct HostPlanner {
     extensions: Vec<Arc<dyn ExtensionPlanner + Send + Sync>>,
 }
@@ -107,7 +100,6 @@ impl QueryPlanner for HostPlanner {
     }
 }
 
-/// A host's own function rewrite, which changes nothing.
 #[derive(Debug)]
 struct HostRewrite;
 
@@ -135,7 +127,6 @@ fn adding_quail_keeps_the_hosts_session_id_and_function_rewrites() -> Result<()>
         .build();
     host.register_function_rewrite(Arc::new(HostRewrite))?;
     let extension = QuailExtension::new(Arc::new(KeepsFirstReview));
-    // adding Quail twice adds each of its hooks once
     let state = extension.register(extension.register(host)?)?;
     assert_eq!(state.session_id(), "host");
     let rewrites: Vec<&str> = state
@@ -261,7 +252,6 @@ fn an_expression_that_calls_a_hosts_function_is_refused_by_name() -> Result<()> 
     use quail_datafusion::derive::expressions::{PhysicalExpression, expression};
     use quail_planner::physical::ColumnRef;
 
-    // a host function Quail's executor does not have
     let shout = create_udf(
         "quail_test_shout",
         vec![DataType::Utf8],
@@ -293,18 +283,14 @@ mod host_session;
 #[tokio::test]
 async fn a_host_with_its_own_function_and_rule_runs_ai_functions_beside_them() -> Result<()> {
     let (plan, rows) = host_session::run().await?;
-    // the host's rule rewrote its function, and Quail claimed the AI call
     assert!(plan.contains("upper(r.body)"), "{plan}");
     assert!(!plan.contains("shout("), "{plan}");
     assert!(plan.contains("AiNode"), "{plan}");
-    // the stand-in model keeps the first review
     assert!(rows.contains("| r1 | TOO SLOW. |"), "{rows}");
     assert!(!rows.contains("r2"), "{rows}");
     Ok(())
 }
 
-/// Plans `query` on a thread with `stack_bytes` of stack, as Quail Server
-/// plans each query on a blocking thread.
 fn plan_on_a_thread(query: String, stack_bytes: usize) -> Result<()> {
     std::thread::Builder::new()
         .stack_size(stack_bytes)

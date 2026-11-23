@@ -29,10 +29,8 @@ def install_step_trace() -> None:
         return
     schedule = Scheduler.schedule
     preempt = Scheduler._preempt_request
-    # request id -> KV positions it had computed when last preempted
     computed_at_preemption = {}
     counts = {"preempted": 0, "preempted_again": 0}
-    # request id -> times preempted
     preemptions = {}
 
     def traced_preempt(self, request, *args, **kwargs):

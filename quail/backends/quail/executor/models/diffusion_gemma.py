@@ -42,11 +42,8 @@ class DiffusionGemmaPipeline(ModelPipeline):
     """
 
     needs_pages = True
-    # every chunk runs one causal call; the tree path's merge writes
-    # the engine's fp8 GEMM inputs, which this model does not use
     tree_attention = False
     gemm_warmup = False
-    # Partial join batches also need compiled expert kernels at these sizes.
     warm_tokens = ModelPipeline.warm_tokens + (4096, 8192, 16384, 32768)
 
     def __init__(self, model, arena, *, spec, engine_class=Engine):
@@ -71,19 +68,14 @@ class DiffusionGemmaPipeline(ModelPipeline):
             raise ValueError(
                 f"the loaded model's geometry (window, q heads, kv heads, "
                 f"head dim) {loaded} differs from the spec's {expected}")
-        # the engine's fp8 GEMM path is not used: the projections run
-        # vLLM's own fp8 linear modules
         self.engine = engine_class(
             arena, num_q_heads=attn.num_heads, num_kv_heads=attn.num_kv_heads,
             head_dim=attn.head_dim, rotary=attn.rotary_emb, fp8=False)
         self._ones = {}
         for layer in self.layers:
             rope = layer.self_attn.rotary_emb
-            # the rotary kernel reads the cache at the activations' dtype
             rope.cos_sin_cache = rope.cos_sin_cache.to(self.engine.torch.bfloat16)
             router = layer.router
-            # the router's constant scale and learned per-dimension scale
-            # fold into one vector
             router.quail_scale = (router.root_size.to(router.scale.dtype)
                                   * router.scale).detach()
         if any(layer.self_attn.v_norm.has_weight for layer in self.layers):
@@ -91,7 +83,6 @@ class DiffusionGemmaPipeline(ModelPipeline):
         self._fold_layer_scalars(model)
         self.scales = [float(layer.layer_scalar) for layer in self.layers]
         self.canvas_ids = canvas_token_ids(spec.vocab, spec.canvas_tokens)
-        # an empty canvas reads the answer at the prompt's last row
         self.canvas_answer_row = (spec.canvas_answer_row
                                   if spec.canvas_tokens else 0)
         init_moe_workspace()
@@ -102,7 +93,6 @@ class DiffusionGemmaPipeline(ModelPipeline):
 
     def _norm(self, x, module):
         """One of the model's RMS norms, through the engine's kernel."""
-        # The loaded module dispatches to unfused PyTorch on this vLLM version.
         weight = module.weight if module.has_weight else self._ones_like(module, x)
         return self.engine.norm_rows(x, weight, module.variance_epsilon)
 
@@ -147,17 +137,9 @@ class DiffusionGemmaPipeline(ModelPipeline):
             rows = canvas["rows"]
             x = hidden.index_select(0, rows)
             hidden.index_copy_(0, rows, self._norm(x, self.conditioning.post_norm))
-        # the fused MoE kernels look their layer up in the forward
-        # context
         with set_forward_context(None, self.vllm_config, num_tokens=n):
             return self._layers(hidden, chunk.positions, meta)
 
-    # ---- the layer stack --------------------------------------------
-    # vLLM's layer arithmetic with the residual adds, the norms
-    # that feed a linear, and that linear's input quantization fused,
-    # and the per-head q and k norms fused with the rotary. The layer
-    # scalars are folded into the post-feedforward norm weights at
-    # build time.
 
     def _norm_quant(self, x, norm):
         return self.engine.norm_quant_rows(x, norm.weight,
@@ -173,8 +155,6 @@ class DiffusionGemmaPipeline(ModelPipeline):
             qkv = engine.fp8_linear(attn.qkv_proj, x_q, x_s)
             out = self._attention_fused(attn, qkv, positions, meta)
             out = self._norm(out, layer.post_attention_layernorm)
-            # residual becomes the attention sum; the feedforward reads
-            # its norm
             pre = layer.pre_feedforward_layernorm
             x_q, x_s = engine.scale_add_norm_quant(
                 out, residual, 1.0, pre.weight, pre.variance_epsilon)
@@ -186,26 +166,19 @@ class DiffusionGemmaPipeline(ModelPipeline):
                 dense = self._norm(dense, layer.post_feedforward_layernorm_1)
                 router = layer.router
                 pre = layer.pre_feedforward_layernorm_2
-                # the expert input and the router input are two norms
-                # of the residual
                 routed_in, routed_scale, router_in = engine.norm_router_quant(
                     residual, pre.weight, router.quail_scale,
                     pre.variance_epsilon)
                 logits, _ = router.proj(router_in)
                 routed = self.experts[index](routed_in, routed_scale, logits)
                 routed = self._norm(routed, layer.post_feedforward_layernorm_2)
-                # dense becomes the norm of the two branches' sum
                 engine.fused_add_rms_norm(dense, routed,
                                           layer.post_feedforward_layernorm)
             else:
                 dense = self._norm(dense, layer.post_feedforward_layernorm)
-            # dense carries the layer scalar through its norm weight;
-            # the residual takes it in the kernel that sums them
             scale = self.scales[index]
             if index == last:
                 return dense + residual * scale
-            # residual becomes the layer's output; the next layer reads
-            # its norm
             next_norm = self.layers[index + 1].input_layernorm
             x_q, x_s = engine.scale_add_norm_quant(
                 dense, residual, scale, next_norm.weight,

@@ -1,5 +1,3 @@
-//! `ModelRegionExec` hands DataFusion each batch as the runner yields it.
-
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -13,8 +11,6 @@ use quail_datafusion::{
     IdentifiedTable, InputStream, ModelRegion, RegionBatches, RegionRunner, session_context,
 };
 
-/// Stands in for Quail's executor: it yields one row per review, and
-/// yields the second only once the test has read the first.
 #[derive(Debug)]
 struct WaitsForTheReader {
     read: Mutex<Option<Receiver<()>>>,
@@ -30,7 +26,6 @@ impl RegionRunner for WaitsForTheReader {
     ) -> Result<RegionBatches> {
         let schema = Arc::new(region.plan.schema().as_arrow().clone());
         let read = self.read.lock().expect("the lock").take().expect("one run");
-        // each column, such as a row number, read from the given text
         let batch = move |value: &str| {
             let columns = schema
                 .fields()
@@ -74,7 +69,6 @@ async fn the_first_batch_reaches_datafusion_before_the_region_finishes() -> Resu
             Arc::new(StringArray::from(vec!["Too slow.", "Lovely."])),
         ],
     )?;
-    // the id column as a primary key: the region returns the ids itself
     let reviews = MemTable::try_new(schema, vec![vec![reviews]])?.with_constraints(
         Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]),
     );
@@ -95,7 +89,6 @@ async fn the_first_batch_reaches_datafusion_before_the_region_finishes() -> Resu
     Ok(())
 }
 
-/// Stands in for an executor that yields one row, then panics.
 #[derive(Debug)]
 struct PanicsAfterOneRow;
 
@@ -146,7 +139,6 @@ async fn a_runner_that_panics_fails_the_query() -> Result<()> {
     let frame = context
         .sql("SELECT r.id FROM reviews r WHERE ai_filter(prompt('Negative? {0}', r.body))")
         .await?;
-    // the stream re-raises the runner's panic on the reading task
     let collected = tokio::spawn(frame.collect()).await;
     assert!(collected.is_err_and(|error| error.is_panic()));
     Ok(())

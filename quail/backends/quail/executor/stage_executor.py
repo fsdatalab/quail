@@ -26,8 +26,6 @@ from quail.progress import Progress, detail, logger
 
 ANSWER_ADMISSION_ENV = "QUAIL_ANSWER_ADMISSION"
 ANSWER_ADMISSION_MODES = ("headroom=0", "headroom")
-# a directory each headroom run writes a file of its headroom over time
-# and its curves to
 HEADROOM_TRACE_ENV = "QUAIL_HEADROOM_TRACE"
 
 
@@ -74,7 +72,6 @@ def forward_chunk(pipeline, arena, chunk):
         if images:
             chunk.rotary = images.rotary_positions(
                 chunk, getattr(arena, "answer_keys", ()))
-        # a graph embeds token ids from the vocabulary only
         rotary = getattr(chunk, "rotary", None)
         if (pipeline.piecewise_graphs is not None
                 and (rotary is None or rotary.dim() == 1)):
@@ -228,45 +225,33 @@ class StageExecutor:
         self.summary = summary
         self.gpu_timing = gpu_timing
         self.decoder = decoder
-        # the stages whose answers the decoder writes, in map order
         self.answer_maps = {j: stage.answer_index for j, stage in enumerate(stages)
                             if stage.answer_tokens}
-        # per document, the stage of the answer it writes now
         self.answer_stage = np.zeros(len(anchor_prefixes), dtype=np.int64)
         if self.answer_maps and decoder is None:
             raise ValueError("stages with answer_tokens need a decoder")
-        self.deferred = {}      # document -> its answer stage's group
+        self.deferred = {}
         self.waiting_reports = []
-        self.answered = set()   # documents whose answers ended first
-        self.recomputing = {}   # evicted slot -> tokens prefilled since readmission
+        self.answered = set()
+        self.recomputing = {}
         self.num_evictions = 0
-        # per pass: its rows, and whether documents were still queued
         self.pass_rows = []
         self.pass_queued = []
-        # per pass that decodes, its decode rows
         self.pass_decode_rows = []
-        # per pass, when its packing started and whether it held decode rows alone
         self.pass_started = []
         self.pass_decode_alone = []
         self.knee_rows = knee_rows
         self.recomputed_tokens = 0
         self.decode_cost = decode_cost
-        # host seconds spent refreshing answer admission and admitting
         self.admission_s = 0.0
-        # rounds and the work in them: tokens by kind, attention pairs,
-        # KV tokens read, and their SoL seconds when specs are known
         self.pass_work = dict(passes=0, decode_rows=0, replay_tokens=0,
                               prefill_tokens=0, pairs=0, kv_read=0, sol_s=0.0)
 
         k = len(self.stages)
         self.mask = getattr(self.pipeline, "mask", "causal")
-        # a non-causal mask reads each document whole: a shared prefix's KV
-        # depends on the document after it, so no document borrows one
         if prefix_tree is not None and (self.mask != "causal"
                                         or not prefix_tree.shared_tokens):
             prefix_tree = None
-        # a whole-sequence anchor is one pass: it asks one request at its
-        # start stage, its own or the stage's one suffix
         self.whole_sequences = getattr(self.pipeline, "whole_sequences", False)
         if not self.paged and not self.whole_sequences and (
                 k > 1 or prefix_tree is not None
@@ -277,7 +262,6 @@ class StageExecutor:
         if any(stage.append and not stage.single for stage in self.stages):
             raise ValueError("an append stage sends one request per document")
         self.prefixes = anchor_prefixes
-        # a prefix is built on each access, so its length is read once
         self.prefix_lengths = [len(prefix) for prefix in self.prefixes]
         self.keys = (list(range(len(self.prefixes))) if anchor_keys is None
                      else list(anchor_keys))
@@ -291,19 +275,16 @@ class StageExecutor:
         if getattr(self.arena, "num_state_slots", 0):
             self.writes = [write or (stage.rewind and bool(stage.frame))
                            for write, stage in zip(self.writes, self.stages)]
-        # a stage whose suffixes are each document's own is priced by
-        # one sequence of its most tokens until a document enters it
         self.suffixes = [Suffixes.of([[0] * stage.suffix_tokens])
                          if stage.own_suffixes else Suffixes.of(stage.suffixes)
                          for stage in self.stages]
-        self.own = {}      # (stage, document) -> its StageRequests
+        self.own = {}
         self.read_rows = [None if stage.read_rows is None
                           else np.asarray(stage.read_rows, dtype=np.int64)
                           for stage in self.stages]
         self.read_masks = [None if stage.read_mask is None
                            else np.asarray(stage.read_mask, dtype=bool)
                            for stage in self.stages]
-        # Stages packing label paths always need tree attention.
         if any(stage.paths is not None for stage in self.stages):
             attention_mode = "tree"
         self.mode = attention_path(
@@ -317,14 +298,10 @@ class StageExecutor:
                 and max(self.prefix_lengths) + len(self.frames[0])
                 + int(self.suffixes[0].lengths.max(initial=0))
                 + self.canvas_rows[0] > budget):
-            # a document too long for one pass writes its prefix over
-            # several, which needs its KV in pages
             self.paged = True
 
-        # A frame's canvas occupies document pages after the frame.
         frame_max = max(len(f) + (len(self.canvas) if f else 0) for f in self.frames)
         self.capacity_extra = frame_max
-        # A single suffix also occupies document pages on the unified path.
         if self.paged and self.mode == "unified":
             self.capacity_extra = max(
                 [frame_max] + [len(frame) + int(other.lengths.max()) + rows
@@ -343,11 +320,8 @@ class StageExecutor:
             self.capacity_extra = max(self.capacity_extra, len(frame) + kept)
         self.answer_admission = None
         if self.answer_maps:
-            # every answer starts with a page, so a readmitted one can
-            # write before it grows again
             self.capacity_extra += min(self.arena.page_tokens,
                                        int(self.decoder.limits.max()) - 1)
-        # append-stage tokens each document holds after its frame
         self.appended = [0] * len(self.prefixes)
 
         resident = {}
@@ -356,12 +330,9 @@ class StageExecutor:
                 if not self.arena.is_resident(key):
                     continue
                 if self.arena.prefix_tokens(key) != self.prefix_lengths[a]:
-                    # KV an earlier operator left under this key was
-                    # built for another prefix; it is fed afresh
                     self.arena.free_key(key)
                     continue
                 resident[a] = self._held_pages(key, self.prefix_lengths[a])
-        # Pin resident documents while fresh admissions evict retained KV.
         for a in resident:
             self.arena.pin(self.keys[a])
 
@@ -378,8 +349,6 @@ class StageExecutor:
                 frame_tokens=[len(f) for f in self.frames], resident=resident,
                 anchor_partners={a: self._requests_of(a, key)
                                  for a, key in enumerate(self.keys)},
-                # a windowed model may pack any chunk unified, so it reserves
-                # the unified path's temporary pages throughout
                 temporary_suffix_pages=self.paged and self.mode == "unified",
                 answer_dtype=[stage.readout.dtype for stage in self.stages],
                 frame_canvas_tokens=len(self.canvas),
@@ -398,9 +367,6 @@ class StageExecutor:
                        if stage.prepare is not None],
                 reserve=self._reserve if self.paged else None,
                 dependencies=dependencies,
-                # a paged causal document writes its prefix over several passes
-                # when it is too long for one; a non-causal mask reads each
-                # document whole in one pass
                 chunked_prefill=self.paged and self.mask == "causal",
                 start_stages=start_stages,
                 one_stage=self.whole_sequences,
@@ -412,8 +378,6 @@ class StageExecutor:
         self.borrowing.can_borrow = borrow_check(self.arena, self.keys, self.borrowing)
         self.admission_mode = answer_admission_mode()
         if self.answer_maps and decoder.constrained.all():
-            # copy-constrained extraction answers stop at a few pages, so they
-            # grow on demand without headroom admission
             self.admission_mode = "on demand"
         elif self.answer_maps and self.paged:
             from quail.backends.quail.executor.answer_admission import (
@@ -427,8 +391,6 @@ class StageExecutor:
                 choose_headroom=self.admission_mode == "headroom",
                 chunk_tokens=self.sched.chunk_budget,
                 trace=bool(os.environ.get(HEADROOM_TRACE_ENV)))
-        # a Gated DeltaNet layer starts a borrower from the parent's state
-        # at the shared point, so a parent writes one slot per point
         self.share_points = [()] * len(self.keys)
         self._extends = False
         spec = getattr(self.pipeline, "spec", None)
@@ -441,9 +403,6 @@ class StageExecutor:
         if self.paged and getattr(self.arena, "num_state_slots", 0):
             self._extends = (any(self.writes)
                              or any(s.append for s in self.stages))
-            # a parent holds one slot per share length beside its own and
-            # its extension, and its borrowers need slots of their own, so
-            # a small pool keeps only the lengths that save the most
             base = 1 + int(self._extends)
             room = max(0, (self.arena.num_state_slots - base) // 3)
             self.share_points = state_share_points(
@@ -458,18 +417,17 @@ class StageExecutor:
                     f"or a larger pool")
             self.borrowing.can_borrow = self._state_borrow_check(
                 self.borrowing.can_borrow)
-        # The admission detaches residents from borrowing: they pack no prefix.
         self.borrowers = self.borrowing.borrowers()
         self.lowest_borrow = lowest_borrows(self.borrowing)
         self.held = [self.keys[a] for a, n in enumerate(self.borrowers) if n]
 
         self._held_parents = set()
         self._reserved_parents = {}
-        self._prefill_keys = set()    # keys of prefixes part way written
+        self._prefill_keys = set()
         self.spans = []
         self.tokens = 0
         self.pack_s = 0.0
-        self.outstanding = []     # PendingAnswers in launch order
+        self.outstanding = []
         self.split_answers = any(s.append and s.own_suffixes for s in stages)
 
         if self.label is None:
@@ -518,9 +476,6 @@ class StageExecutor:
         return rows
 
     def _held_pages(self, key, prefix_tokens):
-        # the admission prices a document at page_cost(prefix + extra)
-        # less what it holds; a trimmed window holds fewer sliding
-        # pages than that price assumes, so count what growing takes
         capacity = prefix_tokens + self.capacity_extra
         return (self.arena.page_cost(capacity)
                 - self.arena.growth_cost(key, capacity))
@@ -571,7 +526,6 @@ class StageExecutor:
                 return False
             if not shared > self.borrowing.shared(parent):
                 return False
-            # the parent saves a state only at the lengths it kept
             if (shared != self.prefix_lengths[parent]
                     and shared not in self.share_points[parent]):
                 return False
@@ -598,7 +552,6 @@ class StageExecutor:
                     anchor, self.arena.free_pages, prompt_pages):
                 if self.answer_admission.waits():
                     return False
-                # No answer can free pages: start with one page and grow.
         if not self.arena.reserve(
                 key, prefix, capacity_tokens=capacity, borrow=borrowed,
                 extension=self._extends, share_points=points):
@@ -640,7 +593,6 @@ class StageExecutor:
                               * self.arena.page_tokens]
             if not len(growing):
                 return
-            # Copy drafts can cross more than one page.
             added = self.arena.grow_pages([self.keys[a] for a in growing.tolist()])
             if added is not None:
                 decoder.kv.add_pages(growing, added)
@@ -664,11 +616,10 @@ class StageExecutor:
             if not room:
                 break
             if decoder.map[a] < 0:
-                # its answer ended in a token that landed after eviction
                 del self.recomputing[a]
                 continue
             if decoder.inflight[a] or decoder.copy_pending[a]:
-                continue    # its next copy inputs are not ready
+                continue
             q = self.decoder.map[a]
             written = int(self.decoder.written[q][a])
             length = int(self.decoder.origin[a]) + written
@@ -681,7 +632,7 @@ class StageExecutor:
                 if not self.arena.reserve(
                         key, self.prefix_lengths[a], capacity_tokens=capacity,
                         extension=self._extends):
-                    break       # the pool is short; the rest wait in order
+                    break
                 decoder.kv.set_pages(a, self.arena.owned_pages(key))
             end = min(length, start + room)
             replays.append((a, start, end))
@@ -727,8 +678,6 @@ class StageExecutor:
             frame = self.frames[j]
             append = self.stages[j].append
             request = self.own.get((j, a))
-            # a written frame, or a rewinding stage, replaces any path
-            # an earlier stage kept
             rewinds = self.writes[j] or self.stages[j].rewind
             path = 0 if rewinds and start == 0 else self.appended[a]
             if request is not None:
@@ -770,8 +719,6 @@ class StageExecutor:
                 own = dict(canvas=ids)
                 if read_all:
                     rows = self.stages[j].canvas_rows * len(sufs)
-            # under tree attention a borrowing document with one
-            # suffix reads its parent's pages stacked with its siblings
             read_key = self.keys[parent] if shared and self.stages[j].single else None
             carry = {}
             if prefix is not None:
@@ -791,8 +738,6 @@ class StageExecutor:
             if append or (rewinds and start == 0):
                 appended[a] = path + kept
             if self.writes[j] and start == 0 and self._merged(j, start, end):
-                # the frame and the one suffix are one entry; the
-                # frame's rows are scattered into KV after the document
                 specs.append(dict(
                     key=key, prefix=prefix, start=shared, read_key=read_key,
                     f=f, suffixes=Suffixes(
@@ -801,8 +746,6 @@ class StageExecutor:
                     write_suffix_tokens=len(frame) + kept, single=True,
                     read_all_rows=read_all, **carry, **own))
             elif self.writes[j] and start == 0:
-                # frame entry: scatter the frame into KV after the
-                # document rows; its own answer row means nothing
                 specs.append(dict(
                     key=key, prefix=prefix, start=shared, read_key=read_key,
                     f=f, suffixes=Suffixes(self.frame_ids[j], [len(frame)]),
@@ -912,7 +855,6 @@ class StageExecutor:
                 anchor, settlement.survived, self.sched.answers[-1].get(anchor, []))
 
     def _event(self, settlement):
-        # Progress counts settled documents: a dropped one is done too.
         self.finished += int(settlement.anchor not in self.sched.dependencies)
         if settlement.kind == "finished":
             self._settle(settlement)
@@ -929,12 +871,11 @@ class StageExecutor:
         for a, j, start, end, _ in groups:
             key = self.readouts.group_key[j]
             if self.writes[j] and start == 0 and not self._merged(j, start, end):
-                position[key] += 1        # the frame entry's answer means nothing
+                position[key] += 1
             count = end - start
             rows = values[key][position[key]:position[key] + count]
             position[key] += count
             if j in self.answer_maps:
-                # the row stands until the decoder ends the answer
                 self.deferred[a] = (j, start, end, rows)
                 continue
             transitions.extend(self._record(a, j, start, end, rows))
@@ -944,7 +885,6 @@ class StageExecutor:
         self.progress.update(
             self.progress.done + sum(end - start for _, _, start, end, _ in groups)
             if self.counting_answers else self.finished)
-        # with on_answers, answers may finish rows before any document moves
         if (transitions or self.on_answers is not None) and self.on_chunk is not None:
             self.on_chunk(transitions)
         self._release_skipped()
@@ -955,7 +895,6 @@ class StageExecutor:
             waiting = self.stages[j + 1].answer_dependencies
             if any(self.decoder.lengths[q][self.decoder.answer_slots[q][a]] < 0
                    for q in waiting):
-                # A readout may reuse its host buffer before the dependency ends.
                 self.waiting_reports.append(
                     (a, j, start, end, np.array(rows, copy=True)))
                 return []
@@ -975,8 +914,6 @@ class StageExecutor:
         self.decoder.harvest(prepare=False)
         self.answered.update(a for a, _ in self.decoder.take_finished())
         transitions = []
-        # each branch settles at its own answer's end and frees its pages;
-        # admission counts a document toward a limit once all have ended
         for a in sorted(self.answered & self.deferred.keys()):
             self.answered.discard(a)
             transitions.extend(self._record(a, *self.deferred.pop(a)))
@@ -989,7 +926,6 @@ class StageExecutor:
         for entry in waiting:
             transitions.extend(self._record(*entry))
         self._decide_waiting()
-        # with on_answers, answers may finish rows before any document moves
         if (transitions or self.on_answers is not None) and self.on_chunk is not None:
             self.on_chunk(transitions)
 
@@ -1054,7 +990,6 @@ class StageExecutor:
         try:
             self._run_one(part, decode, replays, prefills)
         except ArenaFullError as error:
-            # retained KV nothing here reads makes room first
             need = self.arena.page_cost(sum(self._entry_rows(*e) for e in part))
             if self.arena.evict_retained(need):
                 self._log_memory_event("evict_retry", groups=len(part))
@@ -1106,8 +1041,6 @@ class StageExecutor:
             kv_read += start
         for a, j, start, end, carried in part:
             rows = self._entry_rows(a, j, start, end, carried)
-            # a carried entry's rows count its whole prompt from token 0,
-            # borrowed prefix included; a later entry's follow its prompt
             begin = 0 if carried else self.prefix_lengths[a]
             first = self.borrowing.shared(a) if carried else begin
             pairs += float(triangle(begin + rows) - triangle(first))
@@ -1158,20 +1091,14 @@ class StageExecutor:
                 stage = self.sched._stage[a]
                 by_stage[stage] = by_stage.get(stage, 0) + end - start
             if decode is not None:
-                # a decode row counts toward its answer's stage
                 stages = self.answer_stage[decode.slots]
                 for j, count in enumerate(np.bincount(stages).tolist()):
                     if count:
                         by_stage[j] = by_stage.get(j, 0) + count
             self.spans.append((by_stage, chunk.tokens, e0, e1))
         for key in chunk.fresh_keys:
-            # a prefix written in pieces keeps its window until written
             if key not in self._prefill_keys:
                 self.arena.trim_window(key)
-        # the earlier passes' readouts finished before this forward pass
-        # started, so their answers are decided while the GPU runs it;
-        # a readout of many rows launches enough kernels to fill the
-        # launch queue, and a host blocked there could not decide them
         while self.outstanding:
             self._report_next()
         if self.decoder is not None:
@@ -1202,7 +1129,6 @@ class StageExecutor:
     def run(self):
         """Drive admission and drain the launched answer handles in order."""
         while True:
-            # documents with nothing to send at their first stage never run
             for settlement in self.sched.take_settled():
                 self._event(settlement)
             if self.sched.done():
@@ -1210,13 +1136,10 @@ class StageExecutor:
             if len(self.outstanding) > 1:
                 self._report_next()
             if self.sched.blocked_pages:
-                # the free list is short for the next fresh document:
-                # retained KV nothing here reads makes room
                 self.arena.evict_retained(self.sched.blocked_pages)
             if self.decoder is not None:
                 self._grow_answers()
             decode = None if self.decoder is None else self.decoder.rows()
-            # Answers keep their rows; recomputations and new prompts fill the rest.
             room = self.sched.chunk_budget - (0 if decode is None else len(decode))
             room -= sum(end - start
                         for _, start, end in self.arena.answer_replays(decode))
@@ -1241,35 +1164,28 @@ class StageExecutor:
                 continue
             if not groups:
                 if self.sched.done():
-                    # every document left was skipped as it was admitted
                     continue
                 if self._release_skipped():
-                    # borrowers of a skipped document pack their whole prefix
                     continue
                 if self.outstanding:
                     self._report_next(partial=True)
                     self._answers_landed()
                     continue
                 if self.decoder is not None and self.decoder.copy_pending.any():
-                    # No other prefill, decode or replay can hide this preparation.
                     self.decoder.prepare()
                     continue
                 if self.decoder is not None and self.decoder.copies:
-                    # Every answer waits on a token still on its way.
                     self.decoder.harvest(wait=True, prepare=False)
                     self._answers_landed()
                     continue
                 if (self.sched.blocked_pages
                         and self.arena.evict_retained(self.sched.blocked_pages)):
                     continue
-                # parents freed but held for queued children hold the
-                # pages: the children pack their whole prefixes
                 if self.arena.drop_holds(self.held):
                     continue
                 raise AssertionError("nothing buildable and nothing in flight")
             self._run_part(groups, decode, replays, prefills)
             self._prefilled(prefills)
-            # the packed children hold their parents' pages now
             for a, _, start, _, carried in groups:
                 parent = (self.borrowing.tree_parent[a]
                           if a < len(self.borrowing.tree_parent) else None)
@@ -1280,7 +1196,6 @@ class StageExecutor:
         while self.outstanding:
             self._report_next()
         self._release_skipped()
-        # a limit ends the run with documents still queued
         for anchor in self.sched.drain():
             if self.arena.is_resident(self.keys[anchor]):
                 self.arena.free_key(self.keys[anchor])
@@ -1303,7 +1218,6 @@ class StageExecutor:
                 self.stats["pass_work"]["median_decode_rows"] = float(
                     np.median(self.pass_decode_rows))
             self.stats["admission_s"] = self.admission_s
-        # one indented line under the run's "done" line
         details = []
         if self.pass_rows and self.summary:
             rows = np.asarray(self.pass_rows)
@@ -1314,15 +1228,11 @@ class StageExecutor:
             details.append(f"{int(alone.sum()):,} of decode rows alone over "
                            f"{float(took[alone].sum()):.1f} s")
             if self.knee_rows:
-                # a pass below the size where it becomes compute-bound,
-                # while documents wait, is one admission left short
                 short = (rows < self.knee_rows) & np.asarray(self.pass_queued)
                 details.append(f"{int(short.sum()):,} under {self.knee_rows:,} rows "
                                f"while documents waited")
         if self.spans and self.summary:
             self.torch.cuda.synchronize()
-            # between forward passes the GPU runs readouts and uploads,
-            # and waits when the host is late
             between = sum(max(0.0, end.elapsed_time(start))
                           for (*_, end), (*_, start, _)
                           in zip(self.spans, self.spans[1:])) / 1000.0
@@ -1343,7 +1253,6 @@ class StageExecutor:
             if curves and directory:
                 name = "".join(c if c.isalnum() else "_" for c in self.label)[:60]
                 path = os.path.join(directory, f"{time.time_ns()}-{name}.json")
-                # written once the query's timing ends (write_trace_files)
                 self.arena.trace_files.append((path, {
                     "label": self.label,
                     "page_tokens": self.arena.page_tokens,

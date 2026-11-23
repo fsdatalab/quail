@@ -54,12 +54,8 @@ class Vocabulary:
     def __init__(self, tokenizer: Tokenizer):
         self.tokenizer = tokenizer
         self.vocab = tokenizer.token_texts()
-        # the tokens that end an answer
         self.is_stop = np.zeros(len(self.vocab), dtype=bool)
         self.is_stop[list(tokenizer.stop_ids)] = True
-        # a document token may be written without its leading space
-        # or in another case after the opening quote: every
-        # vocabulary token with the same text up to those can start it
         self.variants, self.keys, self.key_of = word_index(self.vocab)
         self._options = [None] * len(self.keys)
         self._fillers = [None] * len(self.vocab)

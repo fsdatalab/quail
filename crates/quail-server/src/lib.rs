@@ -1,48 +1,3 @@
-//! Quail Server: a Quail [`Session`] over Arrow Flight.
-//!
-//! A client uploads tables, runs SQL, and reads rows as Arrow:
-//!
-//! - `DoPut` with the descriptor path `[table]` or `[table, id column]`
-//!   registers the uploaded rows as a table. The id column's values are
-//!   unique; Quail names each row a model region returns by it.
-//! - `DoGet` with a ticket that is a SQL query runs it and returns its
-//!   rows as the query produces them.
-//! - `DoAction` `submit` queues a query and returns its status at once.
-//!   Its body is JSON: `sql`, and optionally `dialect`, a DataFusion
-//!   dialect name ("Snowflake" by default), `id`, which names the
-//!   submission, and `timeout_s`. `status`, with an id as its body,
-//!   returns the submission's status, and the running region's
-//!   progress; `cancel` stops it; `list` returns every submission.
-//!   A status is JSON ([`queue::Submission`]): it has each model
-//!   region's plan once planned, and a `revision` that grows with each
-//!   change. `status` with the JSON body `{"id", "after", "wait_s"}`
-//!   answers once the revision is past `after`, or after `wait_s`
-//!   seconds at the latest.
-//! - `DoAction` `answers`, with the JSON body `{"id", "after",
-//!   "limit"}`, returns the answer events of a submission's run from
-//!   the event numbered `after` on, while it runs and after: JSON with
-//!   `answers` and `next`.
-//! - `DoAction` `report`, with an id as its body, returns each model
-//!   region's report of a submission that succeeded.
-//! - `DoGet` with the ticket `{"query_id": id}` returns the rows of a
-//!   submission that succeeded. With `"table": n` as well, it returns
-//!   the rows of the operator port the status lists at `n` of `tables`.
-//!   With `"stream": true` instead, it waits for a queued or running
-//!   submission and returns its rows as the query produces them.
-//!
-//! A server started with a token refuses every call whose
-//! `authorization` header is not `Bearer <token>` ([`check_token`]).
-//! - `DoAction` `explain`, whose body is JSON with `sql` and optionally
-//!   `dialect`, returns DataFusion's plan, with each model region as
-//!   one operator.
-//!
-//! One query runs at a time; another waits its turn. A model region's
-//! rows reach a streaming reader as the workers finish them; an
-//! aggregate or a sort above a region holds its rows until the region
-//! ends. A submission's status and
-//! rows are files in the server's data directory ([`queue`]), so a
-//! server started on the same directory still has them.
-
 pub mod queue;
 
 use std::sync::Arc;
@@ -63,7 +18,6 @@ use futures::{StreamExt, TryStreamExt};
 use quail::Session;
 use tonic::{Request, Response, Status, Streaming};
 
-/// The Flight service of one session.
 pub struct QuailService {
     session: Arc<Session>,
     queue: Arc<queue::Queue>,
@@ -71,8 +25,6 @@ pub struct QuailService {
 }
 
 impl QuailService {
-    /// A service that runs every query on `session` and keeps its
-    /// submissions in `queue`.
     pub fn new(session: Arc<Session>, queue: Arc<queue::Queue>) -> Self {
         QuailService {
             session,
@@ -81,7 +33,6 @@ impl QuailService {
         }
     }
 
-    /// Run `call` on the session, on a thread that may block.
     async fn blocking<T: Send + 'static>(
         &self,
         call: impl FnOnce(&Session) -> datafusion::common::Result<T> + Send + 'static,
@@ -95,12 +46,6 @@ impl QuailService {
 }
 
 impl QuailService {
-    /// The schema and the rows of submission `id`, as it produces them.
-    ///
-    /// # Errors
-    ///
-    /// The id is unknown, or the submission fails or is cancelled
-    /// before it plans.
     async fn streamed_submission(
         &self,
         id: String,
@@ -110,7 +55,6 @@ impl QuailService {
         }
         let queue = Arc::clone(&self.queue);
         let asked = id.clone();
-        // a submission that waits its turn has no schema yet
         let schema = tokio::task::spawn_blocking(move || {
             loop {
                 if let (Some(schema), _, _) = queue.rows_after(&asked, 0, STREAM_WAIT)? {
@@ -147,15 +91,10 @@ impl QuailService {
     }
 }
 
-/// A stream of rows, as the Flight encoder reads them.
 type Rows = BoxStream<'static, Result<RecordBatch, FlightError>>;
 
-/// The longest a streaming reader's thread waits for rows before it
-/// checks whether the reader is still there.
 const STREAM_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// The rows `produce` hands its `send` on a thread that may block, as a
-/// stream; `send` returns false once the reader is gone.
 fn produced(
     produce: impl FnOnce(&mut dyn FnMut(Result<RecordBatch, FlightError>) -> bool) + Send + 'static,
 ) -> Rows {
@@ -168,8 +107,6 @@ fn produced(
     received.boxed()
 }
 
-/// A query's failure as a Flight status: the query's own fault is an
-/// invalid argument, anything else an internal error.
 fn query_status(error: DataFusionError) -> Status {
     match error.find_root() {
         DataFusionError::Plan(_)
@@ -179,12 +116,6 @@ fn query_status(error: DataFusionError) -> Status {
     }
 }
 
-/// Refuse a call whose `authorization` header is not `Bearer <token>`;
-/// with no token every call passes.
-///
-/// # Errors
-///
-/// The header is missing or names another token.
 pub fn check_token<T>(token: Option<&str>, request: Request<T>) -> Result<Request<T>, Status> {
     let Some(token) = token else {
         return Ok(request);
@@ -196,7 +127,6 @@ pub fn check_token<T>(token: Option<&str>, request: Request<T>) -> Result<Reques
     }
 }
 
-/// The server's actions, each with what it does.
 const ACTIONS: [(&str, &str); 7] = [
     (
         "explain",
@@ -227,7 +157,6 @@ fn text(bytes: &[u8], what: &str) -> Result<String, Status> {
         .map_err(|_| Status::invalid_argument(format!("{what} is not UTF-8 text")))
 }
 
-/// The SQL and the dialect of an action's JSON body.
 fn asked_query(body: &str) -> Result<(String, Option<String>), Status> {
     let asked: serde_json::Value =
         serde_json::from_str(body).map_err(|error| Status::invalid_argument(error.to_string()))?;
@@ -252,7 +181,6 @@ impl FlightService for QuailService {
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
         let query = text(&request.into_inner().ticket, "the ticket")?;
-        // a ticket that is JSON names a submission; any other is SQL
         let submitted = serde_json::from_str::<serde_json::Value>(&query)
             .ok()
             .and_then(|ticket| {
@@ -333,7 +261,6 @@ impl FlightService for QuailService {
                 "the table has no id column {column}"
             )));
         }
-        // each upload is new rows, so a table tokenized before is not reused
         let identity = format!(
             "upload:{name}:{}",
             self.num_uploads.fetch_add(1, Ordering::Relaxed)
@@ -372,7 +299,6 @@ impl FlightService for QuailService {
                 json(serde_json::json!(found))
             }
             "status" => {
-                // a body that is JSON waits for a newer revision
                 let asked = serde_json::from_str::<serde_json::Value>(&body)
                     .ok()
                     .filter(serde_json::Value::is_object);
@@ -478,22 +404,11 @@ impl FlightService for QuailService {
     }
 }
 
-/// The largest Arrow batch a client uploads in one message. gRPC's
-/// default, 4 MiB, is smaller than one batch of long documents.
 const MAX_UPLOAD_MESSAGE_BYTES: usize = 1 << 30;
 
-/// How to call the program.
 pub const USAGE: &str = "usage: quail-server --model <model> --device <device> \
 [--gpus <n>] [--backend <backend>] [--listen <address>] [--data <directory>]";
 
-/// Serve a session over Arrow Flight until Ctrl-C or SIGTERM.
-///
-/// `arguments` are the program's, without its name: see [`USAGE`].
-///
-/// # Errors
-///
-/// An argument is wrong, the workers do not start, or the address is
-/// taken.
 pub fn run(
     arguments: impl IntoIterator<Item = String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -518,11 +433,9 @@ pub fn run(
         return Err(USAGE.into());
     }
     let address = listen.parse()?;
-    // a token is a secret, so it comes from the environment
     let token = std::env::var("QUAIL_SERVER_TOKEN")
         .ok()
         .filter(|token| !token.is_empty());
-    // the session starts its workers before the server accepts a query
     let session = Arc::new(Session::new(&config)?);
     let queue = queue::Queue::open(std::path::Path::new(&data), Arc::clone(&session))?;
     let service = QuailService::new(session, Arc::clone(&queue));
@@ -530,7 +443,6 @@ pub fn run(
         "Quail Server: {} on {}, at {listen}",
         config.model, config.device
     );
-    // the server plans each query on a blocking thread of this runtime
     quail::runtime()?.block_on(
         tonic::transport::Server::builder()
             .add_service(tonic::service::interceptor::InterceptedService::new(
@@ -541,11 +453,9 @@ pub fn run(
             .serve_with_shutdown(address, stopped()),
     )?;
     queue.close();
-    // the session's workers stop, and their sockets go, as it drops
     Ok(())
 }
 
-/// Resolves when the server is told to stop: Ctrl-C, or SIGTERM.
 async fn stopped() {
     use tokio::signal::unix::{SignalKind, signal};
     let mut terminate = signal(SignalKind::terminate()).expect("a SIGTERM handler");

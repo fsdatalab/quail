@@ -1,6 +1,6 @@
 logical:
   Projection: r.id, m.id
-    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Does the medical report in DOCUMENT {0} describe the reaction in DOCUMENT {1} as something the patient experienced?"), r.report, m.term), named_struct(Utf8("selectivity"), Float64(0.03397338065661047))), filter: __quail_answer_1, returns: []
+    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Does the medical report in DOCUMENT {0} describe the reaction in DOCUMENT {1} as something the patient experienced?"), r.report, m.term), named_struct(Utf8("selectivity"), Float64(0.03397338065661047))), inline_predicate: __quail_answer_1, returns: []
       Cross Join:
         SubqueryAlias: r
           TableScan: reports projection=[id, report]
