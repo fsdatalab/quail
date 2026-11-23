@@ -4,7 +4,7 @@
 //! Python mixes integers and floats here; each function keeps the type
 //! Python's result has, and `//` on floats rounds as CPython's does.
 
-use crate::cost::specs::{DeviceSpec, ModelSpec, Precision};
+use crate::specs::{DeviceSpec, ModelSpec, Precision};
 
 /// Fraction of device memory the executor claims.
 pub const POOL_FRACTION: f64 = 0.95;

@@ -3,14 +3,14 @@
 use crate::constants::{DECODE_SCORING, LETTERS_SCORING, TREE_SCORING};
 use std::collections::BTreeSet;
 
-use crate::cost::budgets::{chunk_budget, tree_attention_allowed};
+use crate::budgets::{chunk_budget, tree_attention_allowed};
 use crate::cost::classify::{self, ClassifyCost, ClassifyInputs, suffix_lengths};
-use crate::cost::quantity::Quantity;
 use crate::cost::sol::unrounded_seconds;
-use crate::cost::specs::{DeviceSpec, ModelSpec};
 use crate::cost::statistics::{AliasStats, round_half_even};
+use crate::cost::work::Quantity;
 use crate::cost::work::{Work, packed};
 use crate::physical::{ClassifySpec, ModelCall, Prompt};
+use crate::specs::{DeviceSpec, ModelSpec};
 use serde::Deserialize;
 use serde_json::Value;
 

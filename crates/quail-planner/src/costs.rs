@@ -3,11 +3,11 @@
 
 use std::collections::BTreeMap;
 
-use crate::cost::budgets::parallel_copies;
-use crate::cost::filters::filter_work;
+use crate::budgets::parallel_copies;
 use crate::cost::joins::PricedJoin;
 use crate::cost::score::ScoreCost;
 use crate::cost::work::Work;
+use crate::cost::work::filter_work;
 use crate::physical::{Equality, FilterPredicate, Prompt};
 
 use crate::classify::classify_work;

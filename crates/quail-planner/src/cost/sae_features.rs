@@ -1,12 +1,12 @@
 //! Work and time of an `AI.SAE_FEATURES` call.
 
-use crate::cost::budgets::parallel_copies;
-use crate::cost::quantity::Quantity;
+use crate::budgets::parallel_copies;
 use crate::cost::score::{python_min, score_work};
 use crate::cost::sol::speed_of_light;
-use crate::cost::specs::{DeviceSpec, ModelSpec};
 use crate::cost::statistics::AliasStats;
+use crate::cost::work::Quantity;
 use crate::cost::work::Work;
+use crate::specs::{DeviceSpec, ModelSpec};
 
 /// Encoded rows, including a shared max hook in a mixed pipeline.
 pub fn sae_encoded_tokens(

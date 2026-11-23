@@ -10,12 +10,10 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use quail_planner::cost::classify::{self, ClassifyInputs};
 use quail_planner::cost::extract::{self, ExtractInputs};
-use quail_planner::cost::labels;
-use quail_planner::cost::quantity::{Quantity, numpy_sum};
-use quail_planner::cost::specs::{DeviceSpec, ModelSpec, read_devices, read_models};
 use quail_planner::cost::statistics::AliasStats;
-use quail_planner::cost::work::Work;
+use quail_planner::cost::work::{Quantity, Work, numpy_sum};
 use quail_planner::cost::{packing, sol};
+use quail_planner::specs::{DeviceSpec, ModelSpec, read_devices, read_models};
 
 /// A number, or a list of numbers, from Python.
 fn quantity(value: &Bound<'_, PyAny>) -> PyResult<Quantity> {
@@ -102,7 +100,7 @@ impl CostModel {
     #[new]
     fn new(data: &str) -> PyResult<Self> {
         let data = Path::new(data);
-        let error = |error: quail_planner::cost::specs::SpecError| PyValueError::new_err(error.0);
+        let error = |error: quail_planner::specs::SpecError| PyValueError::new_err(error.0);
         Ok(Self {
             models: read_models(&data.join("models")).map_err(error)?,
             devices: read_devices(&data.join("devices")).map_err(error)?,
@@ -199,9 +197,9 @@ impl CostModel {
     /// decode round tokens, as sorted lists.
     #[staticmethod]
     fn label_nodes(labels: Vec<Vec<i64>>) -> PyResult<LabelNodes> {
-        let read = labels::read_nodes(&labels).map_err(PyValueError::new_err)?;
-        let fed = labels::fed_nodes(&read);
-        let rounds = labels::decode_round_tokens(&labels).map_err(PyValueError::new_err)?;
+        let read = classify::read_nodes(&labels).map_err(PyValueError::new_err)?;
+        let fed = classify::fed_nodes(&read);
+        let rounds = classify::decode_round_tokens(&labels).map_err(PyValueError::new_err)?;
         Ok((
             read.into_iter().collect(),
             fed.into_iter().collect(),

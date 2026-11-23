@@ -2,8 +2,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::cost::quantity::{Quantity, python_sum};
 use crate::cost::work::triangle;
+use crate::cost::work::{Quantity, python_sum};
 
 /// Python's `int / int`: the quotient correctly rounded to the nearest
 /// float, ties to even, however large the integers.

@@ -13,6 +13,7 @@
 //! - [`explain`], [`sol`], [`request_plan`]: plan text, speed-of-light
 //!   estimates, and the plans of the request baselines.
 
+pub mod budgets;
 pub mod cost;
 pub mod inputs;
 pub mod physical;
@@ -42,6 +43,7 @@ pub mod retention;
 pub mod scores;
 pub mod search;
 pub mod sol;
+pub mod specs;
 pub mod stages;
 pub mod statistics;
 pub mod validation;

@@ -707,7 +707,7 @@ fn model_answers<'py>(
     model: &str,
     tokenizer: Bound<'py, PyAny>,
 ) -> PyResult<(Vec<i64>, Vec<i64>, Vec<usize>)> {
-    let spec: quail_planner::cost::specs::ModelSpec = from_json(model)?;
+    let spec: quail_planner::specs::ModelSpec = from_json(model)?;
     let model = quail_planner::lowering::PromptModel {
         role: spec.role.clone(),
         answer_spellings: spec.answer_spellings.clone(),
@@ -727,11 +727,11 @@ fn model_answers<'py>(
 #[pyfunction]
 fn read_specs(kind: &str, directory: &str) -> PyResult<String> {
     let directory = std::path::Path::new(directory);
-    let failed = |error: quail_planner::cost::specs::SpecError| PyValueError::new_err(error.0);
+    let failed = |error: quail_planner::specs::SpecError| PyValueError::new_err(error.0);
     let found = if kind == "models" {
-        serde_json::to_value(quail_planner::cost::specs::read_models(directory).map_err(failed)?)
+        serde_json::to_value(quail_planner::specs::read_models(directory).map_err(failed)?)
     } else {
-        serde_json::to_value(quail_planner::cost::specs::read_devices(directory).map_err(failed)?)
+        serde_json::to_value(quail_planner::specs::read_devices(directory).map_err(failed)?)
     };
     found
         .map(|value| value.to_string())
@@ -1476,7 +1476,7 @@ pub fn _quail_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     // the names and numbers Python shares with the planner
     {
         use quail_planner::constants as shared;
-        use quail_planner::cost::specs;
+        use quail_planner::specs;
         module.add("SPAN_SUFFIX", shared::SPAN_SUFFIX)?;
         module.add("PROBABILITIES_SUFFIX", shared::PROBABILITIES_SUFFIX)?;
         module.add("NULL_DOCUMENT", shared::NULL_DOCUMENT)?;

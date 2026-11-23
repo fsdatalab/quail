@@ -12,10 +12,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cost::decode::DecodeCost;
 use crate::cost::joins::{longest_join_input, partner_stream_work};
-use crate::cost::quantity::Quantity;
 use crate::cost::sae_features::sae_encoded_tokens;
 use crate::cost::sol::speed_of_light;
 use crate::cost::statistics::int_true_divide;
+use crate::cost::work::Quantity;
 use crate::cost::work::{Work, ask, scan};
 use crate::physical::{ModelCall, Prompt, ValueExpression};
 use serde::Deserialize;

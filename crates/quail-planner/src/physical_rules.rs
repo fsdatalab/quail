@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::cost::budgets::{cheaper_attention_path, chunk_budget, tree_attention_allowed};
+use crate::budgets::{cheaper_attention_path, chunk_budget, tree_attention_allowed};
 use crate::cost::packing::choose_pass_groups;
 use crate::cost::retention::coefficients;
 use crate::cost::statistics::AliasStats;
@@ -938,7 +938,7 @@ fn choose_attention_path(graph: &PhysicalGraph, context: &PlanningContext) -> Re
                     };
                     // a partner's rows: its document and the question tail
                     let rows = stage.pair_tail_tokens as f64
-                        + crate::cost::quantity::python_sum(
+                        + crate::cost::work::python_sum(
                             stage
                                 .partners
                                 .iter()

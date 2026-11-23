@@ -4,9 +4,9 @@
 use crate::constants::SPAN_SUFFIX;
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::cost::budgets::pages;
-use crate::cost::quantity::python_sum;
+use crate::budgets::pages;
 use crate::cost::work::Work;
+use crate::cost::work::python_sum;
 use crate::physical::{
     AiClassifyAttributes, AiExtractAttributes, AiFilterAttributes, AiJoinAttributes,
     AiMapAttributes, AiSaeFeaturesAttributes, AiScoreAttributes, Asked, BarrierAttributes,

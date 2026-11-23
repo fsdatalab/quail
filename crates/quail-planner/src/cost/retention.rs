@@ -1,12 +1,12 @@
 //! The priority and price of document KV kept between operators, as
 //! `quail/common/retention.py` computes them.
 
-use crate::cost::budgets::{checkpoint_pages, execution_pages, floor_divide_int};
+use crate::budgets::{checkpoint_pages, execution_pages, floor_divide_int};
 use crate::cost::dense_decoder_cost::attention_pair_flops;
-use crate::cost::quantity::Quantity;
 use crate::cost::sol::compute_seconds;
-use crate::cost::specs::{DeviceSpec, ModelSpec};
+use crate::cost::work::Quantity;
 use crate::cost::work::Work;
+use crate::specs::{DeviceSpec, ModelSpec};
 
 /// A model's ideal prefix computation coefficients.
 #[derive(Debug, Clone, PartialEq)]

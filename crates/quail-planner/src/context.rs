@@ -2,9 +2,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::cost::budgets::arena_pages;
-use crate::cost::specs::{DeviceSpec, ModelSpec};
+use crate::budgets::arena_pages;
 use crate::cost::statistics::AliasStats;
+use crate::specs::{DeviceSpec, ModelSpec};
 
 use crate::error::CompileError;
 use crate::lowering::{Decoder, LoweredPrompt, PromptModel, Tokenizer, lower_prompt};

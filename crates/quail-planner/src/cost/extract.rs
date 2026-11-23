@@ -6,12 +6,12 @@
 use crate::constants::SAMPLE_ROWS;
 use std::collections::BTreeMap;
 
-use crate::cost::budgets::parallel_copies;
+use crate::budgets::parallel_copies;
 use crate::cost::draft_policy::{DraftPolicy, draft_lengths};
-use crate::cost::quantity::{Quantity, numpy_sum};
 use crate::cost::sol::unrounded_seconds;
-use crate::cost::specs::{DeviceSpec, ModelSpec};
+use crate::cost::work::{Quantity, numpy_sum};
 use crate::cost::work::{Work, ask, scan, triangle};
+use crate::specs::{DeviceSpec, ModelSpec};
 
 fn scalar(value: f64) -> Quantity {
     Quantity::Scalar(value)

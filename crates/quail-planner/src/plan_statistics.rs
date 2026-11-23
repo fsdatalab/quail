@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::cost::budgets::{arena_pages, chunk_budget};
+use crate::budgets::{arena_pages, chunk_budget};
 use crate::cost::joins::PricedJoin;
 use crate::cost::retention::retention_pages;
 use crate::cost::statistics::{AliasStats, int_true_divide};

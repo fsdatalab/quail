@@ -1,11 +1,11 @@
 //! Execution constraints checked before a graph is built.
 
-use crate::cost::budgets::{
+use crate::budgets::{
     POOL_FRACTION, arena_bytes, chunk_budget, chunk_memory_bytes, minimum_weight_gpus,
     sliding_kv_fits, transient_sliding_pages,
 };
-use crate::cost::specs::{DeviceSpec, ModelSpec};
 use crate::physical::{Asked, Prompt, ValueExpression};
+use crate::specs::{DeviceSpec, ModelSpec};
 
 use crate::context::PlanningContext;
 use crate::error::{CompileError, Refusal};

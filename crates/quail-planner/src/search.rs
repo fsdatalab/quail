@@ -3,13 +3,13 @@
 use crate::constants::{DEFAULT_SELECTIVITY, MAX_EXACT_UNITS};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::cost::budgets::parallel_copies;
+use crate::budgets::parallel_copies;
 use crate::cost::joins::{
     PricedJoin, longest_join_input, packed_join_work, stage_work as join_work,
 };
-use crate::cost::quantity::Quantity;
 use crate::cost::sol::{speed_of_light, unrounded_seconds};
 use crate::cost::statistics::AliasStats;
+use crate::cost::work::Quantity;
 use crate::cost::work::{Work, ask, scan};
 use crate::physical::Prompt;
 
@@ -201,7 +201,7 @@ pub fn table_steps(
         let (first, later) = if estimate {
             let tail = context.lowered(&call.prompt)?.tail_token_ids.len() as i64;
             let cost = |fresh: bool| {
-                StepCost::PerDocument(Box::new(crate::cost::filters::filter_work(
+                StepCost::PerDocument(Box::new(crate::cost::work::filter_work(
                     tail,
                     mean_tokens,
                     &context.model,
@@ -1314,7 +1314,7 @@ pub fn choose_operator_order(
 mod tests {
     use std::path::Path;
 
-    use crate::cost::specs::{read_devices, read_models};
+    use crate::specs::{read_devices, read_models};
 
     use super::*;
 

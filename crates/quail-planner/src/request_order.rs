@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::cost::budgets::chunk_budget;
+use crate::budgets::chunk_budget;
 use crate::cost::statistics::AliasStats;
 use crate::cost::work::Work;
 use crate::physical::{PhysicalNode, PortRef, port};

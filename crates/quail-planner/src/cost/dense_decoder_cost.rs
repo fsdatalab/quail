@@ -1,9 +1,9 @@
 //! Decoder components priced by the roofline.
 
-use crate::cost::quantity::Quantity;
-use crate::cost::roofline::CostComponent;
-use crate::cost::specs::{ModelSpec, Precision};
+use crate::cost::sol::CostComponent;
+use crate::cost::work::Quantity;
 use crate::cost::work::Work;
+use crate::specs::{ModelSpec, Precision};
 
 /// vLLM's `FLA_CHUNK_SIZE`: tokens per chunk of the chunked gated delta rule.
 pub const GDN_CHUNK_TOKENS: i64 = 64;

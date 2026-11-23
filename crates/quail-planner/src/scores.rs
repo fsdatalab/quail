@@ -2,10 +2,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::cost::quantity::python_sum;
 use crate::cost::score::ScoreCost;
 use crate::cost::statistics::AliasStats;
 use crate::cost::work::Work;
+use crate::cost::work::python_sum;
 use crate::physical::{Prompt, ScoreSpec};
 
 use crate::context::PlanningContext;

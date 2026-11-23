@@ -1,11 +1,11 @@
 //! Work and time of an `AI.SCORE` call.
 
-use crate::cost::budgets::parallel_copies;
-use crate::cost::quantity::{Quantity, python_sum};
+use crate::budgets::parallel_copies;
 use crate::cost::sol::speed_of_light;
-use crate::cost::specs::{DeviceSpec, ModelSpec};
 use crate::cost::statistics::AliasStats;
+use crate::cost::work::{Quantity, python_sum};
 use crate::cost::work::{Work, packed, triangle};
+use crate::specs::{DeviceSpec, ModelSpec};
 
 /// The tokens a score adds to each input besides its documents.
 pub fn score_fixed_tokens(token_lengths: &[i64], canvas_tokens: i64, draws: i64) -> i64 {
