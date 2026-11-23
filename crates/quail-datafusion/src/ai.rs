@@ -646,9 +646,22 @@ impl AiNode {
         &self.answer
     }
 
-    /// Which rows the node returns.
-    pub fn semantics(&self) -> Semantics {
-        self.semantics
+    /// Whether the node asks about the pairs of its input join and
+    /// returns the join's left rows: a semi or anti join, not a node of
+    /// rows.
+    pub fn is_join(&self) -> bool {
+        self.semantics != Semantics::Rows
+    }
+
+    /// Whether the node adds its call's answers as columns to each row of
+    /// its input: neither an `AI.IF` or tested score, nor a join.
+    pub fn is_column(&self) -> bool {
+        !self.is_predicate() && !self.is_join()
+    }
+
+    /// Whether the node returns the left rows with no pair that passes.
+    pub fn is_anti(&self) -> bool {
+        self.semantics == Semantics::Anti
     }
 
     /// The query's own call, such as `ai_classify(...)`, without its

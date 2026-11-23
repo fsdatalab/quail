@@ -15,7 +15,7 @@ use datafusion::logical_expr::{
     Aggregate, Expr, JoinType, LogicalPlan, UserDefinedLogicalNodeCore,
 };
 
-use crate::ai::{AiNode, Semantics};
+use crate::ai::AiNode;
 use crate::plan::as_node;
 
 /// Whether an `Aggregate` is a `DISTINCT`: it groups by each of its
@@ -71,9 +71,7 @@ pub(crate) fn is_unique(plan: &LogicalPlan, columns: &BTreeSet<Column>) -> bool 
         LogicalPlan::Limit(found) => is_unique(&found.input, columns),
         LogicalPlan::Extension(_) => match as_node::<AiNode>(plan) {
             // a node of rows returns at most one row for each input row
-            Some(node) if node.semantics() == Semantics::Rows => {
-                is_unique(node.inputs()[0], columns)
-            }
+            Some(node) if !node.is_join() => is_unique(node.inputs()[0], columns),
             _ => false,
         },
         LogicalPlan::Join(join) => {

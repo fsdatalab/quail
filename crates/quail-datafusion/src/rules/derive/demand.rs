@@ -46,7 +46,7 @@ use datafusion::logical_expr::{
 };
 
 use super::fetch::{at_least, is_count_star};
-use crate::ai::{AiNode, Semantics};
+use crate::ai::AiNode;
 use crate::functions::options::unfolded;
 use crate::plan::{as_node, extension_node, with_inputs};
 use crate::rules::distinct::{is_distinct, is_unique};
@@ -772,9 +772,7 @@ impl Pass {
         // a node that returns each input row as it is passes the count on
         let count = match &demand.count {
             _ if taken.count || node.has_fetch() => Count::All,
-            Count::Rows(_)
-                if node.semantics() == Semantics::Rows && node.filter().is_none() && decided =>
-            {
+            Count::Rows(_) if !node.is_join() && node.filter().is_none() && decided => {
                 demand.count.clone()
             }
             _ => Count::All,
@@ -821,10 +819,7 @@ fn project(node: &mut AiNode, above: &Demand) -> Option<(String, bool)> {
 /// and tests read, of its answer and its spans; each field is a question
 /// of its own, so leaving one out changes no other's answer.
 fn ask_read_fields(node: &mut AiNode, above: &Demand) -> Result<()> {
-    if node.function() != "ai_extract"
-        || node.semantics() != Semantics::Rows
-        || above.reads.is_none()
-    {
+    if node.function() != "ai_extract" || node.is_join() || above.reads.is_none() {
         return Ok(());
     }
     let call = unfolded(node.call());

@@ -4,7 +4,7 @@
 use super::binding::{AnswerColumn, Binder, negated_inward, unsupported};
 use super::walk::{Kind, Walk};
 use super::{ByAlias, push};
-use crate::ai::{AiNode, Semantics, WrittenTest};
+use crate::ai::{AiNode, WrittenTest};
 use crate::functions::is_quail_call;
 use crate::functions::options::{string_literal, unwrap_hint};
 use datafusion::common::tree_node::{Transformed, TreeNode};
@@ -171,7 +171,7 @@ impl Relation {
             };
             let Some(parts) = node
                 .or_parts()
-                .filter(|_| node.function() == "ai_filter" && node.semantics() == Semantics::Rows)
+                .filter(|_| node.function() == "ai_filter" && !node.is_join())
             else {
                 continue;
             };
@@ -201,9 +201,7 @@ impl Relation {
         let mut asked: Vec<(usize, &AiNode)> = walk
             .ids()
             .filter_map(|id| match &walk.get(id).kind {
-                Kind::Ai(node) if node.is_predicate() || node.semantics() != Semantics::Rows => {
-                    Some((id, *node))
-                }
+                Kind::Ai(node) if !node.is_column() => Some((id, *node)),
                 _ => None,
             })
             .collect();
@@ -254,8 +252,7 @@ impl Relation {
                     tests.push(test);
                 }
             }
-            if !node.is_predicate()
-                && node.semantics() == Semantics::Rows
+            if node.is_column()
                 && let Some(filter) = node.filter()
             {
                 terms.extend(split_conjunction(&filter).into_iter().cloned());
@@ -294,7 +291,7 @@ impl Relation {
     ) -> Result<(), CompileError> {
         let join = node.in_on().then_some(true);
         let call = walk.through(&node.call());
-        if node.semantics() != Semantics::Rows {
+        if node.is_join() {
             let input = walk.get(walk.get(id).inputs[0]);
             let Kind::Join(_) = &input.kind else {
                 self.unplaced = true;
@@ -308,7 +305,7 @@ impl Relation {
             binder.add_table(&table.alias, &table.provider, table.schema.clone())?;
             let (call, options) =
                 binder.bind_ai_filter_call(&call, &["selectivity", "anchor"], Some(true))?;
-            let anti = node.semantics() == Semantics::Anti;
+            let anti = node.is_anti();
             let spec = gate(
                 &call,
                 &table.alias,
@@ -559,7 +556,7 @@ fn bind_answers(
         let Kind::Ai(node) = &walk.get(id).kind else {
             continue;
         };
-        if node.semantics() != Semantics::Rows {
+        if node.is_join() {
             continue;
         }
         let name = names
