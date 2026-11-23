@@ -15,7 +15,7 @@ use datafusion::arrow::compute::cast;
 use datafusion::arrow::compute::{concat_batches, filter_record_batch};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::{Constraints, DataFusionError, Result};
+use datafusion::common::{Constraint, Constraints, DataFusionError, Result};
 use datafusion::datasource::TableType;
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::{Expr, LogicalPlan, TableProviderFilterPushDown};
@@ -1235,7 +1235,6 @@ fn source_lookup(
     batches: &[RecordBatch],
 ) -> Result<Option<datafusion::arrow::array::UInt64Array>> {
     use datafusion::arrow::datatypes::DataType;
-    use datafusion::common::Constraint;
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
     use datafusion::datasource::source_as_provider;
     use datafusion::logical_expr::LogicalPlan;
@@ -1258,20 +1257,13 @@ fn source_lookup(
     let Some(scanned) = table.inner().downcast_ref::<ScannedTable>() else {
         return Ok(None);
     };
-    let key = scanned
-        .constraints
-        .iter()
-        .find_map(|constraint| match constraint {
-            Constraint::PrimaryKey(keys) if keys.len() == 1 => Some(keys[0]),
-            _ => None,
-        });
-    let Some(key) = key.map(|index| scanned.schema.field(index).name().clone()) else {
+    let Some(key) = scanned.id_column() else {
         return Ok(None);
     };
     let Some(first) = batches.first() else {
         return Ok(None);
     };
-    let Ok(column) = first.schema().index_of(&key) else {
+    let Ok(column) = first.schema().index_of(key) else {
         return Ok(None);
     };
     let texts = |values: &ArrayRef| -> Result<Vec<Option<String>>> {
@@ -1287,7 +1279,7 @@ fn source_lookup(
     };
     let mut positions: HashMap<String, u64> = HashMap::new();
     let mut next = 0u64;
-    for batch in scanned.column_rows(&key)? {
+    for batch in scanned.column_rows(key)? {
         let column = batch.columns().first().ok_or_else(|| {
             DataFusionError::Execution(format!("the table's scan returned no column {key}"))
         })?;
@@ -1402,43 +1394,24 @@ fn planning_tables(
         let Some(scanned) = table.inner().downcast_ref::<ScannedTable>() else {
             continue;
         };
-        let mut names = required.get(&name).cloned().unwrap_or_default();
+        let names = required.get(&name).map_or(&[][..], Vec::as_slice);
         // The hint reads passed-through columns by source position. Include
         // them and primary keys even if no physical alternative reads them.
-        for column in &columns.0 {
-            if let quail_datafusion::RegionColumn::Source(source, index) = column
-                && *source == name
-            {
-                names.push(scanned.schema.field(*index).name().clone());
-            }
-        }
-        for constraint in scanned.constraints.iter() {
-            if let datafusion::common::Constraint::PrimaryKey(indices) = constraint {
-                names.extend(
-                    indices
-                        .iter()
-                        .map(|index| scanned.schema.field(*index).name().clone()),
-                );
-            }
-        }
-        let mut indices = names
-            .iter()
-            .map(|name| scanned.schema.index_of(name))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        indices.sort_unstable();
-        indices.dedup();
-        let schema = Arc::new(scanned.schema.project(&indices)?);
-        let names = schema
-            .fields()
-            .iter()
-            .map(|field| field.name().clone())
+        let positions: Vec<usize> = (columns.0.iter())
+            .filter_map(|column| match column {
+                quail_datafusion::RegionColumn::Source(source, index) if *source == name => {
+                    Some(*index)
+                }
+                _ => None,
+            })
             .collect();
+        let (schema, batches) = scanned.rows_with_keys(names, &positions)?;
         tables.insert(
             name,
             TableRows {
                 identity: Some(table.identity().to_string()),
                 schema,
-                batches: scanned.scan_columns(names)?,
+                batches,
             },
         );
     }
@@ -1475,11 +1448,9 @@ fn whole_table_identity(input: &datafusion::logical_expr::LogicalPlan) -> Option
                     let scanned = table.inner().downcast_ref::<ScannedTable>()?;
                     // in_source_order restores only inputs retaining the source
                     // primary key. Otherwise partition order is not stable.
-                    let ordered = scanned.constraints.iter().any(|constraint| {
-                        matches!(constraint, datafusion::common::Constraint::PrimaryKey(keys)
-                            if keys.len() == 1 && input.schema().as_arrow()
-                                .index_of(scanned.schema.field(keys[0]).name()).is_ok())
-                    });
+                    let ordered = scanned
+                        .id_column()
+                        .is_some_and(|key| input.schema().as_arrow().index_of(key).is_ok());
                     ordered.then(|| table.identity().to_string())
                 });
             }
@@ -1573,6 +1544,49 @@ impl ScannedTable {
             state,
             constraints,
         }
+    }
+
+    /// The name of the id column: the column of a primary key of one
+    /// column.
+    fn id_column(&self) -> Option<&str> {
+        self.constraints
+            .iter()
+            .find_map(|constraint| match constraint {
+                Constraint::PrimaryKey(keys) if keys.len() == 1 => {
+                    Some(self.schema.field(keys[0]).name().as_str())
+                }
+                _ => None,
+            })
+    }
+
+    /// Every row of the named columns, the columns at `positions`, and
+    /// the primary key columns, in the table's column order: their
+    /// schema and the rows.
+    ///
+    /// # Errors
+    ///
+    /// The table has no column of a name, or the scan fails.
+    fn rows_with_keys(
+        &self,
+        names: &[String],
+        positions: &[usize],
+    ) -> Result<crate::shared::Table> {
+        let keys = (self.constraints.iter()).flat_map(|constraint| match constraint {
+            Constraint::PrimaryKey(keys) => keys.as_slice(),
+            _ => &[],
+        });
+        let mut indices = names
+            .iter()
+            .map(|name| self.schema.index_of(name))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        indices.extend(positions.iter().chain(keys));
+        indices.sort_unstable();
+        indices.dedup();
+        let schema = Arc::new(self.schema.project(&indices)?);
+        let names = (schema.fields().iter())
+            .map(|field| field.name().clone())
+            .collect();
+        Ok((schema, self.scan_columns(names)?))
     }
 
     /// One column of the table's rows.
