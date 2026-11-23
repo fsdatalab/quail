@@ -170,15 +170,11 @@ pub fn quail_schema(plan: &LogicalPlan, query: &str, dialect: Dialect) -> Schema
         .zip(quail_column_names(plan))
         .enumerate()
         .map(|(index, (field, name))| {
-            let written = aliases
+            let named = aliases
                 .get(index)
                 .and_then(Option::as_deref)
-                .filter(|alias| alias.eq_ignore_ascii_case(field.name()));
-            let name = match written {
-                Some(alias) if matches!(dialect, Dialect::BigQuery) => alias.to_string(),
-                Some(_) => field.name().clone(),
-                None => name,
-            };
+                .is_some_and(|alias| alias.eq_ignore_ascii_case(field.name()));
+            let name = if named { field.name().clone() } else { name };
             field.as_ref().clone().with_name(name)
         })
         .collect();

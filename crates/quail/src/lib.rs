@@ -1,6 +1,7 @@
 #[cfg(test)]
 use quail_dylib as _;
 
+mod bigquery;
 mod executor;
 pub mod finished;
 mod images;
@@ -581,15 +582,19 @@ async fn frame(
         options.sql_parser.dialect = dialect;
         if matches!(dialect, datafusion::config::Dialect::BigQuery) {
             options.sql_parser.default_null_ordering = "nulls_min".to_string();
+            options.sql_parser.enable_ident_normalization = false;
         }
     }
     let dialect = state.config().options().sql_parser.dialect;
-    let statement = match state.sql_to_statement(query, &dialect) {
+    let mut statement = match state.sql_to_statement(query, &dialect) {
         Err(original) if matches!(dialect, datafusion::config::Dialect::Snowflake) => state
             .sql_to_statement(query, &datafusion::config::Dialect::Generic)
             .map_err(|_| original)?,
         parsed => parsed?,
     };
+    if matches!(dialect, datafusion::config::Dialect::BigQuery) {
+        bigquery::rewrite(&mut statement);
+    }
     let plan = state.statement_to_plan(statement).await?;
     Ok(datafusion::dataframe::DataFrame::new(state, plan))
 }
