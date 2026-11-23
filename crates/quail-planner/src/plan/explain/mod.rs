@@ -12,23 +12,16 @@
 mod tree;
 mod values;
 
-use crate::constants::DEFAULT_SELECTIVITY;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
-use crate::physical::{PhysicalNode, PortRef};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::expressions::asked_call;
-use crate::expressions::{column_name, condition_text, repr_float, repr_str};
-use crate::operators::table_name;
-use crate::operators::{Operators, SemanticJoin};
+use crate::operators::Operators;
 use crate::plan::stages::Stage;
-use crate::operators::effective_selectivity;
-use crate::pricing::statistics::{OrTerm, RowFlow};
 
+use tree::{Graph, physical_tree, stage_lines};
 use values::{Shown, commas, commas_int, field_lines, number, py_str, seconds, width};
-use tree::{Graph, attributes, physical_tree, stage_lines};
 
 /// What to explain, as Python sends it.
 #[derive(Debug, Deserialize)]
@@ -285,14 +278,7 @@ fn run_summary(report: &Value, graph: &Graph, gpus: i64, usd_per_hour: Option<f6
             .and_then(Value::as_f64)
             .unwrap_or(0.0);
     }
-    let documents: i64 = graph
-        .nodes
-        .iter()
-        .filter_map(|node| match &node.known {
-            Some(PhysicalNode::Scan(scan)) => Some(scan.attributes.num_documents),
-            _ => None,
-        })
-        .sum();
+    let documents = graph.num_documents();
     if wall > 0.0 && pairs != 0.0 {
         items.push((
             "throughput",
@@ -441,4 +427,3 @@ fn architecture_lines(spec: Option<&Value>) -> Vec<String> {
         format!("kernels: {}", paths.join("; ")),
     ]
 }
-

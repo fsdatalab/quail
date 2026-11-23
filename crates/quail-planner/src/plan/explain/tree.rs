@@ -1,7 +1,6 @@
 //! The physical plan tree of `explain()`: each node, its fields and
 //! estimates, and the stages.
 
-use crate::constants::DEFAULT_SELECTIVITY;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::physical::{PhysicalNode, PortRef};
@@ -9,15 +8,29 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::expressions::asked_call;
-use crate::expressions::{column_name, condition_text, repr_float, repr_str};
+use crate::expressions::{column_name, condition_text, repr_str};
+use crate::operators::effective_selectivity;
 use crate::operators::table_name;
 use crate::operators::{Operators, SemanticJoin};
 use crate::plan::stages::Stage;
-use crate::operators::effective_selectivity;
 use crate::pricing::statistics::{OrTerm, RowFlow};
 
+use super::values::{
+    Shown, commas, commas_int, default_note, field_lines, field_lines_as, format_g, number, prefix,
+    py_str, seconds, selectivity, short_prompt, width,
+};
 use super::{ExtensionNode, PhysicalRequest, RunRequest};
-use super::values::{Shown, commas, commas_int, default_note, field_lines, field_lines_as, format_g, number, prefix, py_str, seconds, selectivity, short_prompt, width};
+
+/// The table's columns in display order: (cell key, header).
+const COLUMNS: [(&str, &str); 7] = [
+    ("est_rows", "est. rows"),
+    ("rows", "rows"),
+    ("est_pass", "est. pass"),
+    ("pass", "pass"),
+    ("est_time", "est. time"),
+    ("time", "time"),
+    ("tokens", "fresh tokens"),
+];
 
 // ---------------------------------------------------------------- physical
 
@@ -337,7 +350,18 @@ pub(super) struct Graph {
 }
 
 impl Graph {
-    fn read(physical: &PhysicalRequest) -> Result<Self, String> {
+    /// The documents the graph's scans read.
+    pub(super) fn num_documents(&self) -> i64 {
+        self.nodes
+            .iter()
+            .filter_map(|node| match &node.known {
+                Some(PhysicalNode::Scan(scan)) => Some(scan.attributes.num_documents),
+                _ => None,
+            })
+            .sum()
+    }
+
+    pub(super) fn read(physical: &PhysicalRequest) -> Result<Self, String> {
         let mut nodes = Vec::new();
         for value in physical.graph["nodes"].as_array().into_iter().flatten() {
             let id = value["id"].as_str().unwrap_or_default().to_string();
@@ -1193,4 +1217,3 @@ pub(super) fn stage_lines(stages: &[Stage]) -> Vec<String> {
         })
         .collect()
 }
-

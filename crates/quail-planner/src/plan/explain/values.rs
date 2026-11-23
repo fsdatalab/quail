@@ -1,20 +1,11 @@
 //! How `explain()` writes numbers, values, and prompts.
 
 use crate::constants::DEFAULT_SELECTIVITY;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use crate::physical::{PhysicalNode, PortRef};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::expressions::asked_call;
-use crate::expressions::{column_name, condition_text, repr_float, repr_str};
-use crate::operators::table_name;
-use crate::operators::{Operators, SemanticJoin};
-use crate::plan::stages::Stage;
-use crate::operators::effective_selectivity;
-use crate::pricing::statistics::{OrTerm, RowFlow};
-
+use crate::expressions::{repr_float, repr_str};
 
 /// The mark beside a selectivity the planner assumed.
 const DEFAULT_MARK: &str = "*";
@@ -186,7 +177,11 @@ pub(super) fn field_lines(fields: &[(String, Shown)], depth: usize) -> Vec<Strin
 }
 
 /// `key=value` lines, each array shown as a tuple when `tuples` holds.
-pub(super) fn field_lines_as(fields: &[(String, Shown)], depth: usize, tuples: bool) -> Vec<String> {
+pub(super) fn field_lines_as(
+    fields: &[(String, Shown)],
+    depth: usize,
+    tuples: bool,
+) -> Vec<String> {
     let pad = "  ".repeat(depth);
     let mut lines = Vec::new();
     for (key, value) in fields {
@@ -376,7 +371,6 @@ impl Shown {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::{format_g, group_thousands, number, seconds};
@@ -400,4 +394,3 @@ mod tests {
         assert_eq!(seconds(Some(2.5)), "2.5 s");
     }
 }
-
