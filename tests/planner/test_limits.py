@@ -204,3 +204,48 @@ rows 3
   r2
   r4
 """)
+
+
+def _pair_answer(kind, prompt, rows):
+    """Pass the pairs whose two row numbers sum to a multiple of 3."""
+    return sum(int(row[1:]) for row in rows) % 3 == 0
+
+
+def test_a_limit_over_a_join_alone_stops_the_model_once_enough_anchors_keep_a_pair():
+    pair = "AI_FILTER(PROMPT('pair: {0} {1}', r.body, n.body))"
+    with Transcripts({"reviews": REVIEWS, "notes": NOTES}, _pair_answer,
+                     chunk_tokens=256) as runs:
+        text = "\n".join(runs.query(sql) for sql in (
+            f"SELECT r.id, n.id FROM reviews r JOIN notes n ON {pair} LIMIT 2",
+            # another AI operator in the region keeps every pair asked
+            f"SELECT r.id, n.id FROM reviews r JOIN notes n ON {pair} "
+            "AND AI_FILTER(PROMPT('long: {0}', r.body)) LIMIT 2"))
+    assert_transcript(text, """\
+--- SELECT r.id, n.id FROM reviews r JOIN notes n ON AI_FILTER(PROMPT('pair: {0} {1}',
+    r.body, n.body)) LIMIT 2 ---
+plan
+  __quail_answer_1 = ai_filter('pair: {0} {1}', r.body, n.body), inline_predicate:
+      __quail_answer_1, row_limit: 2, returns: []
+asked 13 of 36
+  'pair: {0} {1}': r0+n0 TRUE, r0+n1 FALSE, r0+n2 FALSE, r0+n3 TRUE, r0+n4 FALSE, r0+n5
+      FALSE, r1+n0 FALSE, r1+n1 FALSE, r1+n2 TRUE, r1+n3 FALSE, r1+n4 FALSE, r1+n5 TRUE,
+      r2+n0 FALSE
+rows 2
+  r0, n0
+  r0, n3
+
+--- SELECT r.id, n.id FROM reviews r JOIN notes n ON AI_FILTER(PROMPT('pair: {0} {1}',
+    r.body, n.body)) AND AI_FILTER(PROMPT('long: {0}', r.body)) LIMIT 2 ---
+plan
+  __quail_answer_1 = ai_filter('pair: {0} {1}', r.body, n.body), inline_predicate:
+      __quail_answer_1, row_limit: 2, returns: []
+  __quail_call_1 = ai_filter('long: {0}', r.body), inline_predicate: __quail_call_1,
+      returns: []
+asked 18 of 18
+  'long: {0}': r0 TRUE, r1 FALSE, r2 FALSE, r3 TRUE, r4 FALSE, r5 FALSE
+  'pair: {0} {1}': r0+n0 TRUE, r0+n1 FALSE, r0+n2 FALSE, r0+n3 TRUE, r0+n4 FALSE, r0+n5
+      FALSE, r3+n0 TRUE, r3+n1 FALSE, r3+n2 FALSE, r3+n3 TRUE, r3+n4 FALSE, r3+n5 FALSE
+rows 2
+  r0, n0
+  r0, n3
+""")
