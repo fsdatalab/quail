@@ -4,8 +4,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use quail_planner::cost::dense_decoder_cost::CostComponent;
 use quail_planner::cost::dense_decoder_cost::{dense_decoder_components, dense_params};
-use quail_planner::cost::sol::CostComponent;
 use quail_planner::cost::sol::speed_of_light;
 use quail_planner::cost::work::Quantity;
 use quail_planner::cost::work::{Work, ask, scan, stream};
