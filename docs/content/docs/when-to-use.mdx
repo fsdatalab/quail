@@ -1,83 +1,72 @@
 ---
-title: Quail or warehouse AI functions
-description: When to run a query with Quail instead of Snowflake Cortex AISQL, BigQuery AI functions, or Databricks AI Functions.
+title: When to use Quail
+description: Use Quail to run AI functions in SQL with open models on your own GPUs or on Modal, for much less than a hosted model costs.
 ---
 
-Use Quail instead of your warehouse's AI functions when a query runs one
-or more AI functions over 1,000 or more rows. Snowflake Cortex AISQL,
-BigQuery AI functions, and Databricks AI Functions charge for each call
-to the vendor's model. Quail runs open source LLMs on a GPU you choose,
-so you pay for GPU time instead of for each call.
+Use Quail to run AI functions in SQL when any of the following is true:
 
-## Choose Quail or warehouse AI functions
+- You have GPUs or a [Modal](/docs/user-guide/models#no-local-gpu-use-modal)
+  subscription.
+- You want much cheaper queries. Quail ran two `AI.IF` filters over
+  100,000 movie reviews for $0.37 on one H100 rented from Modal, and
+  GPT-5 nano would cost about $1.75 for the same filters
+  ([full run](https://fsdatalab.github.io/blog/introducing-quail/)).
+- You want open models. [Models and GPUs](/docs/user-guide/models) lists
+  the models Quail runs.
 
-Quail runs outside your warehouse, so you export the tables a query
-reads before Quail runs the query. Warehouse AI functions skip the
-export, so they fit a query over fewer than 1,000 rows, or a table you
-can't export. Quail fits when:
+## Start with an Iceberg table
 
-- A query runs one or more AI functions over 1,000 or more rows.
-- Your data can't go to the vendor's model.
+The easiest way to start is to read a table that your warehouse stores
+in Apache Iceberg format. Snowflake, BigQuery, and Databricks can each
+store a table as Iceberg. Quail needs Python 3.12 and a
+[supported CUDA GPU](/docs/user-guide/models). Install Quail and
+PyIceberg:
 
-| | Warehouse AI functions | Quail |
-| --- | --- | --- |
-| Where the data lives | In the warehouse | In files or tables you export from the warehouse |
-| Where the model runs | The vendor's servers | Your GPU, [Modal](/docs/user-guide/models#no-local-gpu-use-modal), or [Quail Server](/docs/user-guide/server) |
-| Models | Models the vendor hosts | Open source LLMs in [Models and GPUs](/docs/user-guide/models) |
-| Price | A price per token or credit | A price per GPU hour |
-| SQL | The vendor's dialect | Snowflake syntax, or BigQuery syntax with `dialect="bq"` |
+```bash
+uv pip install quail-engine "pyiceberg[pyarrow]"
+```
 
-## Cost of a filter over 100,000 rows
+The following program reads the `shop.reviews` table from an Iceberg
+catalog and keeps the reviews that ask for a refund:
 
-Quail ran two `AI.IF` filters over the 100,000 movie reviews in the
-Stanford IMDB dataset for $0.37. The
-[query](https://github.com/fsdatalab/quail/blob/d8d31f14f9d5c40d6cf683a74ba860788ce0d500/demos/imdb_ending_filter.py)
-ran for 5.6 minutes, including model startup, on one H100 rented from
-Modal at $3.95 per GPU hour. GPT-5 nano would cost about $1.75 for the
-same two filters. [Building an Ultra-High Throughput AI-SQL Engine](https://fsdatalab.github.io/blog/introducing-quail/)
-reports the full run.
+```python
+import quail
+from pyiceberg.catalog import load_catalog
 
-A hosted model's cost for your table is about the number of rows, times
-the tokens in each prompt, times the price per token. A Quail run costs
-the GPU's price per hour, times the hours the run takes.
+catalog = load_catalog("warehouse", type="rest", uri="https://your-catalog/")
+reviews = (
+    catalog.load_table("shop.reviews")
+    .scan(selected_fields=("id", "body"))
+    .to_arrow()
+)
 
-## Speed compared with vLLM
+config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
 
-Quail plans the SQL and the model inference together. Quail ran the 29
-queries in [QUAIL-B](https://github.com/fsdatalab/quail-bench), our
-benchmark of AI-SQL queries, 1.84 times faster on average than tuned
-vLLM, a common LLM inference server, on the same GPU and model. The
-largest speedup came on BIO-4, a query with two AI joins over medical
-reports. Quail ran BIO-4 14.04 times faster, and the GPU cost fell from
-$27.03 to $1.93 per query. The numbers come from the September 2026
-benchmark run.
+with quail.Session(config=config) as session:
+    session.register("reviews", reviews, id_col="id")
+    refunds = session.sql("""
+        SELECT r.id
+        FROM reviews r
+        WHERE AI.IF(PROMPT('Does the reviewer ask for a refund? {0}', r.body))
+    """).collect()
 
-## Move a query from your warehouse
+print(f"Reviews that ask for a refund: {refunds.num_rows}")
+```
 
-First, export each table the query reads, e.g., to Parquet files, and
-register the table in a Quail session:
+`load_catalog` takes your catalog's settings, and
+[PyIceberg's configuration docs](https://py.iceberg.apache.org/configuration/)
+list the settings for each kind of catalog.
+
+## Start with Parquet, CSV, or JSON files
+
+Export the table from your warehouse to files, and register the files in
+place of the Iceberg table:
 
 ```python
 session.register_parquet("reviews", "data/reviews/", id_col="id")
 ```
 
-Quail also registers Delta Lake and Iceberg tables, so you can read a
-warehouse table stored in either format without an export.
+`register_csv` and `register_json` read CSV and JSON files the same way.
 [Sessions](/docs/user-guide/sessions) lists every way to register a
-table.
-
-Second, run the query. Quail reads Snowflake syntax by default,
-including Snowflake's function names, such as `AI_FILTER` and
-`AI_CLASSIFY`. Quail runs the following Snowflake query:
-
-```sql
-SELECT r.id
-FROM reviews r
-WHERE AI_FILTER(PROMPT('Does the reviewer ask for a refund? {0}', r.body));
-```
-
-Pass `dialect="bq"` to `session.sql()` for BigQuery syntax. The dialect
-changes ordinary SQL syntax and the syntax for AI function options.
-Quail has no Databricks dialect, so rewrite each `ai_query` call with
-one of Quail's [AI functions](/docs/user-guide/sql/ai-functions). The
-[Quickstart](/docs/user-guide/quickstart) walks through a first query.
+table, and [AI functions](/docs/user-guide/sql/ai-functions) lists every
+function a query can use.
