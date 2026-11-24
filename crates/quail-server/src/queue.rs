@@ -81,6 +81,7 @@ pub struct Queue {
     changed: Condvar,
     num_submitted: AtomicUsize,
     runner: Mutex<Option<std::thread::JoinHandle<()>>>,
+    turn: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Queue {
@@ -110,6 +111,7 @@ impl Queue {
             changed: Condvar::new(),
             num_submitted: AtomicUsize::new(0),
             runner: Mutex::new(None),
+            turn: Arc::new(tokio::sync::Mutex::new(())),
         });
         let runner = Arc::clone(&queue);
         let thread = std::thread::spawn(move || runner.run());
@@ -161,6 +163,10 @@ impl Queue {
         state.waiting.push_back(id);
         self.changed.notify_all();
         Ok(found)
+    }
+
+    pub async fn turn(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.turn).lock_owned().await
     }
 
     pub fn status(&self, id: &str) -> Option<Value> {
@@ -296,11 +302,6 @@ impl Queue {
             home.join("report.json"),
             json!({"regions": reports}).to_string(),
         )?;
-        let events = {
-            let state = self.state.lock().expect("the queue lock");
-            state.answers.get(id).cloned().unwrap_or_default()
-        };
-        std::fs::write(home.join("answers.json"), json!(*events).to_string())?;
         Ok(saved)
     }
 
@@ -425,29 +426,39 @@ impl Queue {
         }
     }
 
-    fn run(self: Arc<Self>) {
+    fn next(&self) -> Option<(Submission, tokio::sync::OwnedMutexGuard<()>)> {
         loop {
-            let found = {
+            {
                 let mut state = self.state.lock().expect("the queue lock");
-                let id = loop {
-                    if state.closed {
-                        return;
-                    }
-                    if let Some(id) = state.waiting.pop_front() {
-                        break id;
-                    }
+                while !state.closed && state.waiting.is_empty() {
                     state = self.changed.wait(state).expect("the queue lock");
-                };
-                state.running = Some((id.clone(), None));
-                let found = state
-                    .submissions
-                    .get_mut(&id)
-                    .expect("a waiting submission");
-                found.state = "running".into();
-                found.started_at = Some(now());
-                let _ = save(&self.directory, found);
-                found.clone()
+                }
+                if state.closed {
+                    return None;
+                }
+            }
+            let turn = Arc::clone(&self.turn).blocking_lock_owned();
+            let mut state = self.state.lock().expect("the queue lock");
+            if state.closed {
+                return None;
+            }
+            let Some(id) = state.waiting.pop_front() else {
+                continue;
             };
+            state.running = Some((id.clone(), None));
+            let found = state
+                .submissions
+                .get_mut(&id)
+                .expect("a waiting submission");
+            found.state = "running".into();
+            found.started_at = Some(now());
+            let _ = save(&self.directory, found);
+            return Some((found.clone(), turn));
+        }
+    }
+
+    fn run(self: Arc<Self>) {
+        while let Some((found, _turn)) = self.next() {
             let (done, finished) = std::sync::mpsc::channel::<()>();
             let watcher = found.timeout_s.map(|seconds| {
                 let (queue, id) = (Arc::clone(&self), found.id.clone());
@@ -483,6 +494,11 @@ impl Queue {
             let mut state = self.state.lock().expect("the queue lock");
             let stopped = state.running.take().and_then(|(_, stopped)| stopped);
             state.streaming.remove(&found.id);
+            let answers = state.answers.remove(&found.id).unwrap_or_default();
+            let _ = std::fs::write(
+                self.directory.join(&found.id).join("answers.json"),
+                json!(*answers).to_string(),
+            );
             self.session.resume();
             let found = state
                 .submissions

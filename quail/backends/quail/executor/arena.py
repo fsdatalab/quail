@@ -145,9 +145,7 @@ class KVArena:
         key first, and without it a resident key is an error.
         """
         if free_resident:
-            self.drop_holds()
-            for key in self.resident_keys():
-                self.free_key(key)
+            self.free_all()
         if self.accounting.owned:
             raise RuntimeError("the arena holds keys; free them before resizing")
         if (num_pages, num_sliding_pages, num_state_slots) == (
@@ -680,6 +678,14 @@ class KVArena:
         for key in keys:
             self._release_hold(key)
         return bool(keys)
+
+    def free_all(self) -> None:
+        """Free every resident key, with every hold and reader dropped first."""
+        self._holds.clear()
+        self._reading.clear()
+        self._deferred.clear()
+        for key in self.resident_keys():
+            self.free_key(key)
 
     def free_key(self, key):
         """Free a key's pages, or once its holds are released.

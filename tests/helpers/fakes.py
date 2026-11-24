@@ -362,6 +362,10 @@ class FakeArena:
         self.owned.discard(key)
         self.retained.discard(key)
 
+    def free_all(self):
+        self.owned.clear()
+        self.retained.clear()
+
     def retain(self, key, prefix_tokens, priority=None):
         self.owned.add(key)
         self.retained.add(key)
