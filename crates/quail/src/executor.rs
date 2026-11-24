@@ -64,6 +64,7 @@ pub struct Executor {
     regions: Mutex<Vec<RegionRan>>,
     observer: Mutex<Option<(Observer, bool)>>,
     interrupter: Option<crate::workers::Interrupter>,
+    stopped: tokio::sync::watch::Sender<bool>,
     progress: Arc<Mutex<Option<serde_json::Value>>>,
 }
 
@@ -141,6 +142,7 @@ impl Executor {
         let interrupter = workers.lock().expect("the workers lock").interrupter();
         Ok(Self {
             interrupter: Some(interrupter),
+            stopped: tokio::sync::watch::Sender::new(false),
             progress: Arc::new(Mutex::new(None)),
             runs: Runs::Workers(workers),
             rules,
@@ -161,6 +163,7 @@ impl Executor {
     ) -> Self {
         Self {
             interrupter: None,
+            stopped: tokio::sync::watch::Sender::new(false),
             progress: Arc::new(Mutex::new(None)),
             runs: Runs::Engine(engine),
             rules: rules.unwrap_or_else(quail_datafusion::default_rule_names),
@@ -307,15 +310,21 @@ impl Executor {
     }
 
     pub fn interrupt(&self) {
+        self.stopped.send_replace(true);
         if let Some(interrupter) = &self.interrupter {
             interrupter.interrupt();
         }
     }
 
     pub fn resume(&self) {
+        self.stopped.send_replace(false);
         if let Some(interrupter) = &self.interrupter {
             interrupter.resume();
         }
+    }
+
+    pub(crate) fn stopped(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.stopped.subscribe()
     }
 
     pub fn progress(&self) -> Option<serde_json::Value> {
@@ -379,6 +388,14 @@ pub(crate) struct RegionCall {
     pub(crate) fetch: Option<usize>,
     pub(crate) hint: RegionHint,
     pub(crate) rows: RowSender,
+}
+
+impl RegionCall {
+    pub(crate) fn refuse(self, failed: &str) {
+        let error = format!("an earlier model region of the query failed: {failed}");
+        let _ = (self.rows).send(RegionRows::Batch(Err(DataFusionError::Execution(error))));
+        let _ = self.rows.send(RegionRows::Done);
+    }
 }
 
 #[derive(Debug)]
@@ -583,7 +600,7 @@ impl Executor {
         ))
     }
 
-    pub(crate) fn serve(&self, call: RegionCall) {
+    pub(crate) fn serve(&self, call: RegionCall) -> std::result::Result<(), String> {
         let found = self.run_here(
             &call.region,
             call.inputs,
@@ -591,10 +608,15 @@ impl Executor {
             &call.hint,
             &call.rows,
         );
+        let served = found
+            .as_ref()
+            .map(|_| ())
+            .map_err(|error| error.to_string());
         if let Err(error) = found {
             let _ = call.rows.send(RegionRows::Batch(Err(error)));
         }
         let _ = call.rows.send(RegionRows::Done);
+        served
     }
 
     fn run_here(
@@ -860,7 +882,9 @@ impl RegionRunner for Executor {
             Some((thread, sender)) if thread != std::thread::current().id() => sender
                 .send(call)
                 .map_err(|_| DataFusionError::Execution("the query ended".into()))?,
-            _ => self.serve(call),
+            _ => {
+                let _ = self.serve(call);
+            }
         }
         Ok(Box::new(ReceivedRows {
             receiver,

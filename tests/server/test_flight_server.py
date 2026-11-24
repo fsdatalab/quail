@@ -1,5 +1,6 @@
 """Quail Server in Rust: a client uploads tables and runs SQL over Arrow Flight."""
 
+import concurrent.futures
 import contextlib
 import json
 import os
@@ -256,3 +257,41 @@ def test_a_remote_stream_hands_out_kept_rows_while_the_query_runs(tmp_path):
         # a stream of a query that fails raises its error
         with pytest.raises(pa.ArrowException, match="missing"):
             session.sql("SELECT * FROM missing").execute_stream().read_all()
+
+
+def test_a_submission_and_direct_queries_keep_out_of_each_others_runs(tmp_path):
+    expected = {"r.id": ["r0", "r2", "r4"]}
+    with serving(tmp_path, delay=0.2) as client, \
+            concurrent.futures.ThreadPoolExecutor() as pool:
+        direct = pool.submit(_rows, client, QUERY)
+        time.sleep(0.3)
+        _act(client, "submit", {"sql": QUERY, "id": "stopped"})
+        assert _act(client, "cancel", "stopped")["state"] == "cancelled"
+        assert direct.result() == expected
+        _act(client, "submit", {"sql": QUERY, "id": "kept"})
+        others = [pool.submit(_rows, client, QUERY) for _ in range(3)]
+        status = _finished(client, "kept")
+        assert [other.result() for other in others] == [expected] * 3
+        assert status["state"] == "succeeded" and len(status["plans"]) == 1
+        assert status["num_answers"] == 1 and status["tables"]
+        assert len(_act(client, "report", "kept")["regions"]) == 1
+
+
+def test_a_timeout_stops_a_query_with_no_ai_call(tmp_path):
+    slow = ("SELECT count(*) AS n FROM generate_series(1, 400000000) t(v) "
+            "WHERE v % 7 = 3")
+    with serving(tmp_path) as client:
+        _act(client, "submit", {"sql": slow, "id": "slow", "timeout_s": 0.2})
+        status = _finished(client, "slow")
+    assert status["state"] == "failed" and "timed out" in status["error"]
+    assert status["finished_at"] - status["started_at"] < 1
+
+
+def test_a_stopped_submission_keeps_its_answers_after_a_restart(tmp_path):
+    with serving(tmp_path, delay=0.5, chunk_tokens=128) as client:
+        _act(client, "submit", {"sql": QUERY, "id": "stopped", "timeout_s": 1.8})
+        status = _finished(client, "stopped")
+        assert status["state"] == "failed" and status["num_answers"] > 0
+    with serving(tmp_path) as client:
+        found = _act(client, "answers", {"id": "stopped"})
+    assert found["next"] == status["num_answers"]
