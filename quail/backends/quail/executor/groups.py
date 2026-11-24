@@ -138,10 +138,6 @@ class FullAttentionGroup:
                           page_table=table, slots=running)
         if not share:
             return rows
-        # a group is a slot and the slots that borrow the most from it,
-        # whose first pages are the same; its rows read those pages once
-        # together when two or more of them run. A slot both borrowing
-        # and lent from takes the group with the longer shared pages
         groups, shared = decode_groups(running, self.parent, self.borrowed, self.lead)
         together = shared > 0
         if not together.any():

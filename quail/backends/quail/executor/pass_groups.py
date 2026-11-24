@@ -165,7 +165,6 @@ def _decode(values, places, code_width, width, temperature):
         elif place[0] in ("yes_no", "score"):
             kind, slot, yes, no = place
             margin = code[:, slot, yes].max(-1) - code[:, slot, no].max(-1)
-            # AsyncScores' probability: the margin over the temperature
             out.append(margin if kind == "yes_no"
                        else 1 / (1 + np.exp(-margin / temperature)))
         else:
@@ -204,7 +203,7 @@ class PassGroup:
         self.questions = questions
         self.ends = dict(first.ends) if first.ends else None
         self.reads_any = any(q.kind == "read" for q in questions)
-        self.reads = []         # per pass asked, the state rows a read scores
+        self.reads = []
         rows = state.answer_rows
         yes = [rows.allowed[i] for i in rows.true_cols.tolist()]
         no = [rows.allowed[i] for i in rows.false_cols.tolist()]
@@ -263,8 +262,6 @@ class PassGroup:
         """
         states = [self.state_of(prefix) for prefix in prefixes]
         head = len(self.questions[0].head)
-        # a read's document rows: the first row, which stands for nothing,
-        # then each document row the state kept
         reads = ([np.r_[0, np.arange(head, min(len(prefix), len(kept)))]
                   for prefix, kept in zip(prefixes, states)]
                  if self.reads_any else [])

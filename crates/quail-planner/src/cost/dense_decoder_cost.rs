@@ -1,14 +1,8 @@
-//! Decoder components priced by the roofline.
+use crate::cost::work::{Quantity, Work};
+use crate::specs::{DeviceSpec, ModelSpec, Precision};
 
-use crate::cost::quantity::Quantity;
-use crate::cost::roofline::CostComponent;
-use crate::cost::specs::{ModelSpec, Precision};
-use crate::cost::work::Work;
-
-/// vLLM's `FLA_CHUNK_SIZE`: tokens per chunk of the chunked gated delta rule.
 pub const GDN_CHUNK_TOKENS: i64 = 64;
 
-/// Q, K, V, and output projection parameters over the layers.
 pub fn attention_projection_params(model: &ModelSpec) -> i64 {
     let h = model.hidden;
     let query_width = if model.attn_output_gate { 2 } else { 1 };
@@ -23,7 +17,6 @@ pub fn attention_projection_params(model: &ModelSpec) -> i64 {
         .sum()
 }
 
-/// Gated DeltaNet input and output projection parameters.
 pub fn gdn_projection_params(model: &ModelSpec) -> i64 {
     let key_width = model.gdn_key_heads * model.gdn_key_dim;
     let value_width = model.gdn_value_heads * model.gdn_value_dim;
@@ -32,12 +25,10 @@ pub fn gdn_projection_params(model: &ModelSpec) -> i64 {
     per_layer * model.gdn_layers().len() as i64
 }
 
-/// Short convolution input and output projection parameters.
 pub fn short_conv_projection_params(model: &ModelSpec) -> i64 {
     4 * model.hidden * model.hidden * model.short_conv_layers().len() as i64
 }
 
-/// FLOPs per token of the chunked gated delta rule, over all layers.
 pub fn gdn_core_flops_per_token(model: &ModelSpec) -> f64 {
     let c = GDN_CHUNK_TOKENS;
     let (k, v) = (model.gdn_key_dim, model.gdn_value_dim);
@@ -45,7 +36,6 @@ pub fn gdn_core_flops_per_token(model: &ModelSpec) -> f64 {
     per_head * model.gdn_value_heads as f64 * model.gdn_layers().len() as f64
 }
 
-/// FLOPs per token of the depthwise convolutions, over all layers.
 pub fn conv_flops_per_token(model: &ModelSpec) -> f64 {
     let gdn = model.gdn_layers().len() as i64 * model.conv_channels();
     let short = model.short_conv_layers().len() as i64 * model.hidden;
@@ -57,18 +47,14 @@ fn mlp_params_with(model: &ModelSpec, experts: i64, layers: i64) -> i64 {
     3 * model.hidden * (model.intermediate() + experts * model.expert_intermediate) * layers
 }
 
-/// The MLP parameters one token multiplies.
 pub fn mlp_params(model: &ModelSpec) -> i64 {
     mlp_params_with(model, model.experts_active, model.layers)
 }
 
-/// The MLP parameters a full chunk reads: every expert of every
-/// weight layer.
 pub fn mlp_weight_params(model: &ModelSpec) -> i64 {
     mlp_params_with(model, model.experts, model.weight_layer_count())
 }
 
-/// Parameters used by the modeled dense components.
 pub fn dense_params(model: &ModelSpec) -> i64 {
     attention_projection_params(model)
         + gdn_projection_params(model)
@@ -77,7 +63,6 @@ pub fn dense_params(model: &ModelSpec) -> i64 {
         + mlp_params(model)
 }
 
-/// FLOPs per attention pair across the full layers and the sliding layers.
 pub fn attention_pair_flops(model: &ModelSpec) -> (i64, i64) {
     let sliding = model.sliding_layer_set();
     let (mut full, mut sliding_flops) = (0, 0);
@@ -91,21 +76,9 @@ pub fn attention_pair_flops(model: &ModelSpec) -> (i64, i64) {
     (full, sliding_flops)
 }
 
-/// Weight bytes per MLP parameter: its own precision's, or the model's.
-fn mlp_weight_bytes(model: &ModelSpec) -> f64 {
-    model
-        .mlp_weight_precision
-        .map_or(model.w_bytes, Precision::bytes)
-}
-
-/// The modeled decoder components, with a readout when the work has answer rows.
-///
-/// # Panics
-///
-/// `passes` is negative, or `work.sae_encoded` is an array.
 pub fn dense_decoder_components(work: &Work, model: &ModelSpec, passes: f64) -> Vec<CostComponent> {
     assert!(passes >= 0.0, "passes must be nonnegative");
-    let separate_gdn = if model.gdn_weight_precision.is_some() {
+    let separate_gdn = if model.gdn_has_own_precision() {
         gdn_projection_params(model)
     } else {
         0
@@ -134,9 +107,9 @@ pub fn dense_decoder_components(work: &Work, model: &ModelSpec, passes: f64) -> 
             name: "mlp",
             flops: (2.0 * mlp * (1.0 - fp8_share)) * &work.tokens,
             bytes_moved: Quantity::Scalar(
-                mlp_weights * (1.0 - fp8_weight_share) * mlp_weight_bytes(model) * passes,
+                mlp_weights * (1.0 - fp8_weight_share) * model.mlp_weight_bytes() * passes,
             ),
-            precision: model.mlp_weight_precision.unwrap_or(model.weight_precision),
+            precision: model.mlp_precision(),
             gemm: true,
         },
         CostComponent {
@@ -170,9 +143,8 @@ pub fn dense_decoder_components(work: &Work, model: &ModelSpec, passes: f64) -> 
             gemm: true,
         });
     }
-    if let Some(precision) = model.gdn_weight_precision
-        && separate_gdn != 0
-    {
+    if separate_gdn != 0 {
+        let precision = model.gdn_precision();
         components.push(CostComponent {
             name: "gdn_proj",
             flops: (2.0 * separate_gdn as f64) * &work.tokens,
@@ -212,15 +184,15 @@ pub fn dense_decoder_components(work: &Work, model: &ModelSpec, passes: f64) -> 
             gemm: false,
         });
     }
-    if let Some(sae) = &model.sae
+    if let Some((num_features, keep)) = model.sae_shape()
         && work.sae_encoded.is_nonzero()
     {
-        let encode = 2.0 * model.hidden as f64 * sae.num_features as f64;
+        let encode = 2.0 * model.hidden as f64 * num_features as f64;
         components.push(CostComponent {
             name: "sae_encode",
             flops: encode * &work.sae_encoded,
             bytes_moved: &Quantity::Scalar(encode * passes)
-                + &(&work.sae_encoded * (2.0 * model.hidden as f64 + 8.0 * sae.keep as f64)),
+                + &(&work.sae_encoded * (2.0 * model.hidden as f64 + 8.0 * keep as f64)),
             precision: Precision::Bf16,
             gemm: true,
         });
@@ -233,11 +205,9 @@ pub fn dense_decoder_components(work: &Work, model: &ModelSpec, passes: f64) -> 
     components
 }
 
-/// The answer readout: the decision head, or the output head's rows.
 fn readout(model: &ModelSpec, rows: f64, passes: f64, head_rows: f64) -> CostComponent {
-    if !model.readout.is_empty() {
-        // every code row of the fp32 readout times the prompt's last row
-        let codes = (crate::prompts::MAX_LETTERS as i64 * model.hidden) as f64;
+    if model.reads_letter_logits() {
+        let codes = (crate::constants::MAX_LETTERS as i64 * model.hidden) as f64;
         return CostComponent {
             name: "readout",
             flops: Quantity::Scalar(2.0 * codes * rows),
@@ -266,4 +236,51 @@ fn readout(model: &ModelSpec, rows: f64, passes: f64, head_rows: f64) -> CostCom
         precision: Precision::Bf16,
         gemm: true,
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CostComponent {
+    pub name: &'static str,
+    pub flops: Quantity,
+    pub bytes_moved: Quantity,
+    pub precision: Precision,
+    pub gemm: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComponentLatency {
+    pub component: CostComponent,
+    pub compute_seconds: Quantity,
+    pub memory_seconds: Quantity,
+}
+
+impl ComponentLatency {
+    pub fn seconds(&self) -> f64 {
+        let compute = self.compute_seconds.scalar().expect("scalar compute time");
+        let memory = self.memory_seconds.scalar().expect("scalar memory time");
+        if memory > compute { memory } else { compute }
+    }
+}
+
+pub fn component_latency(component: CostComponent, device: &DeviceSpec) -> ComponentLatency {
+    let bandwidth = if component.gemm {
+        device.gemm_flops(component.precision)
+    } else {
+        device.arithmetic_bandwidth(component.precision)
+    };
+    ComponentLatency {
+        compute_seconds: &component.flops / bandwidth,
+        memory_seconds: &component.bytes_moved / device.hbm_bw,
+        component,
+    }
+}
+
+pub fn component_latencies(
+    components: Vec<CostComponent>,
+    device: &DeviceSpec,
+) -> Vec<ComponentLatency> {
+    components
+        .into_iter()
+        .map(|component| component_latency(component, device))
+        .collect()
 }

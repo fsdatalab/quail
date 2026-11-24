@@ -1,7 +1,3 @@
-//! The tables a planned region sends its workers: each scan's
-//! documents, its documents' text, and the value columns the executor
-//! reads.
-
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -22,30 +18,20 @@ use serde_json::Value;
 
 use crate::shared::Table;
 
-/// The column of a table the plan deduplicates that holds each row's
-/// first row with the same document.
 pub const FIRST_DOCUMENT: &str = "__first_document";
 
-/// The column of a token store that holds each document's token ids.
 const TOKEN_IDS: &str = "__quail_token_ids";
 
-/// The value column that holds a scan's image documents.
 const IMAGES: &str = "__quail_images";
 
-/// What a region reads of one scan: its alias, its token store, and
-/// the columns of its rows.
 pub type Scanned = (String, Table, Table);
 
 fn arrow_error(error: arrow::error::ArrowError) -> CompileError {
     CompileError::new(error.to_string())
 }
 
-/// One column of a table as its chunks, one per batch, so a column of
-/// many images reaches the executor without a copy.
 type Chunks = Vec<ArrayRef>;
 
-/// One column of a table, as its chunks: one empty chunk for a table of
-/// no batches.
 fn column_chunks(table: &Table, name: &str) -> Option<Chunks> {
     let (schema, batches) = table;
     let index = schema.index_of(name).ok()?;
@@ -57,8 +43,6 @@ fn column_chunks(table: &Table, name: &str) -> Option<Chunks> {
     })
 }
 
-/// One column of a table, as one array, for a key that compares rows
-/// across batches.
 fn column(table: &Table, name: &str) -> Result<Option<ArrayRef>, CompileError> {
     let Some(chunks) = column_chunks(table, name) else {
         return Ok(None);
@@ -68,7 +52,6 @@ fn column(table: &Table, name: &str) -> Result<Option<ArrayRef>, CompileError> {
         .map_err(arrow_error)
 }
 
-/// One array split into chunks of `lengths` rows, without a copy.
 fn split(values: &ArrayRef, lengths: &[usize]) -> Chunks {
     let mut offset = 0;
     (lengths.iter())
@@ -80,7 +63,6 @@ fn split(values: &ArrayRef, lengths: &[usize]) -> Chunks {
         .collect()
 }
 
-/// A table of one batch per chunk; every column has the same chunks.
 fn table_of(columns: Vec<(String, Chunks)>) -> Result<Table, CompileError> {
     let fields: Vec<Field> = columns
         .iter()
@@ -99,8 +81,6 @@ fn table_of(columns: Vec<(String, Chunks)>) -> Result<Table, CompileError> {
     Ok((schema, batches))
 }
 
-/// Values as keys that group by numeric equality: a dictionary is
-/// decoded, a signed zero is 0, and every NaN is one key.
 fn equality_keys(values: ArrayRef) -> Result<ArrayRef, CompileError> {
     let values = match values.data_type() {
         DataType::Dictionary(_, value) => cast(&values, value).map_err(arrow_error)?,
@@ -139,8 +119,6 @@ fn equality_keys(values: ArrayRef) -> Result<ArrayRef, CompileError> {
     })
 }
 
-/// Each row's first row with the same tokens and the same values in
-/// each of `names`.
 fn first_documents(
     tokens: &Table,
     columns: &Table,
@@ -171,8 +149,6 @@ fn first_documents(
     )))
 }
 
-/// A scan's documents, evaluated over each batch of its columns, when
-/// the columns hold every column the document reads.
 fn document_values(document: &ScanColumn, columns: &Table) -> Result<Option<Chunks>, CompileError> {
     let expression = match document {
         ScanColumn::Unnamed(name) => return Ok(column_chunks(columns, name)),
@@ -186,32 +162,17 @@ fn document_values(document: &ScanColumn, columns: &Table) -> Result<Option<Chun
     let chunks = (columns.1.iter())
         .map(|batch| built.evaluate(batch, false))
         .collect::<Result<Vec<_>, _>>()?;
-    // a scan of no rows has no batch, and its text is no rows
     if chunks.is_empty() {
         return Ok(Some(vec![new_empty_array(&DataType::Utf8)]));
     }
     Ok(Some(chunks))
 }
 
-/// The text of a scan's documents, when the scan's columns hold every
-/// column the document reads; None for image documents.
 fn texts(document: &ScanColumn, columns: &Table) -> Result<Option<Chunks>, CompileError> {
     Ok(document_values(document, columns)?
         .filter(|chunks| !crate::images::holds_images(chunks[0].data_type())))
 }
 
-/// The tables a region's workers read, by name: `documents:<alias>`
-/// for each scan of the plan, `texts:<alias>` where the scan's columns
-/// hold its documents' text, and `columns:<alias>` with the value
-/// columns the executor reads.
-///
-/// A table the plan deduplicates carries [`FIRST_DOCUMENT`], and a
-/// table with a NULL document carries [`NULL_DOCUMENT`].
-///
-/// # Errors
-///
-/// The plan does not decode, a scan of the plan is not in `scans`, or
-/// a column the executor reads is missing.
 pub fn request_tables(
     envelope: &Value,
     operators: &Operators,
@@ -224,7 +185,7 @@ pub fn request_tables(
         Some(found) => serde_json::from_value(found.clone()).map_err(decode)?,
         None => BTreeMap::new(),
     };
-    let facts = quail_planner::facts::region_facts(operators)?;
+    let facts = quail_planner::plan::facts::region_facts(operators)?;
     let read: BTreeMap<String, Vec<String>> =
         serde_json::from_value(facts["value_columns"].clone()).map_err(decode)?;
     let scanned = |alias: &str| {
@@ -270,8 +231,6 @@ pub fn request_tables(
             let first = first_documents(tokens, columns, rows)?;
             values.push((FIRST_DOCUMENT.into(), split(&first, &lengths)));
         }
-        // the executor reads an image document's pixels from the first
-        // binary column: the document's values, such as p.u['image']
         let document = (operators.scans.iter()).find(|found| &found.alias == alias);
         if let Some(images) = document
             .map(|found| document_values(&found.column, columns))
@@ -292,17 +251,6 @@ pub fn request_tables(
     Ok(tables)
 }
 
-/// By alias, lists of each document's group, for the stages' hash: a
-/// document goes to the GPU of the smallest document it is grouped
-/// with ([`crate::stages`]).
-///
-/// One list holds each document's first document, for a table the
-/// plan deduplicates; one holds each AI filter's stop key groups, so a
-/// key's documents reach one GPU.
-///
-/// # Errors
-///
-/// A table the plan groups has no columns, or lacks a grouped column.
 pub fn stage_groupings(
     graph: &PhysicalGraph,
     deduplicated: &[String],
@@ -344,7 +292,6 @@ pub fn stage_groupings(
             .collect();
         let converter = RowConverter::new(fields).map_err(arrow_error)?;
         let rows = converter.convert_columns(&values).map_err(arrow_error)?;
-        // a key's group is the first document with its values
         let mut first: HashMap<&[u8], i64> = HashMap::new();
         let groups = (rows.iter().enumerate())
             .map(|(document, row)| *first.entry(row.data()).or_insert(document as i64))

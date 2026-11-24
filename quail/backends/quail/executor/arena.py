@@ -82,7 +82,6 @@ class KVArena:
         self.conv_state_shape = conv_state_shape
         self._build(num_pages, page_tokens, num_sliding_pages, num_state_slots)
         self.reset_stats()
-        # (path, JSON-ready payload) of trace files a query left to write
         self.trace_files = []
 
     def bind_answers(self, group, keys):
@@ -113,18 +112,12 @@ class KVArena:
              * page_tokens, heads, dim)
             for layer, (heads, dim) in enumerate(self.shapes)]
         sizes = [math.prod(shape) for shape in shapes]
-        # one allocation: a failure leaves no layer's pool behind, and
-        # the pools cannot fragment the allocator between each other
         storage = torch.empty(2 * sum(sizes), dtype=self.dtype, device=self.device)
         parts = storage.split([size for size in sizes for _ in range(2)])
         self.k = [part.view(shape) for part, shape in zip(parts[::2], shapes)]
         self.v = [part.view(shape) for part, shape in zip(parts[1::2], shapes)]
-        # one checkpoint per slot: the recurrent state in fp32 and the
-        # convolution columns in bf16, each across every GDN layer
         self.gdn_state = self.gdn_state_rows = self.conv_state = None
         if num_state_slots:
-            # vLLM's recurrent decode kernel reads state index 0 as no
-            # state, so slot s is row s + 1 and row 0 stays unused
             self.gdn_state_rows = torch.zeros(
                 (num_state_slots + 1, *self.gdn_state_shape),
                 dtype=torch.float32, device=self.device)
@@ -132,19 +125,17 @@ class KVArena:
             self.conv_state = torch.zeros(
                 (num_state_slots, *self.conv_state_shape),
                 dtype=self.dtype, device=self.device)
-        # row indices stay on the host: pageable H2D copies block the
-        # CPU behind the running stream
-        self._rows = {}       # key -> row-index tensor on CPU
-        self._capacity_rows = {}  # key -> every row in the claimed pages
-        self._stale_rows = set()  # keys grown since their rows were built
-        self._sliding_rows = {}   # key -> every row in its sliding pages
-        self._base = {}       # key -> tokens the window is anchored below
-        self._sliding_start = {}  # key -> logical row of its first sliding page
-        self._holds = {}      # key -> queued keys that will borrow from it
-        self._reading = {}    # key -> groups of the planned chunk reading it
-        self._deferred = set()    # held keys freed by their operator
-        self._window_floor = {}   # key -> lowest sliding row a borrower reads
-        self._trimmed = set()     # keys past their own pass's trim_window
+        self._rows = {}
+        self._capacity_rows = {}
+        self._stale_rows = set()
+        self._sliding_rows = {}
+        self._base = {}
+        self._sliding_start = {}
+        self._holds = {}
+        self._reading = {}
+        self._deferred = set()
+        self._window_floor = {}
+        self._trimmed = set()
 
     def resize(self, num_pages: int, num_sliding_pages: int = 0, *,
                free_resident: bool = False, num_state_slots: int = 0) -> None:
@@ -154,9 +145,7 @@ class KVArena:
         key first, and without it a resident key is an error.
         """
         if free_resident:
-            self.drop_holds()
-            for key in self.resident_keys():
-                self.free_key(key)
+            self.free_all()
         if self.accounting.owned:
             raise RuntimeError("the arena holds keys; free them before resizing")
         if (num_pages, num_sliding_pages, num_state_slots) == (
@@ -167,7 +156,6 @@ class KVArena:
         self.gdn_state = self.gdn_state_rows = self.conv_state = None
         self._build(num_pages, page_tokens, num_sliding_pages, num_state_slots)
 
-    # ---- checkpoints ---------------------------------------------------
 
     @property
     def num_state_slots(self) -> int:
@@ -286,7 +274,6 @@ class KVArena:
             round(torch.cuda.memory_allocated() / 2**20, 1),
             tokens, groups, self.evicted_keys))
 
-    # ---- the window --------------------------------------------------
 
     @property
     def has_sliding(self) -> bool:
@@ -342,7 +329,6 @@ class KVArena:
         if self._window_floor.pop(key, None) is not None and key in self._trimmed:
             self.trim_window(key)
 
-    # ---- allocation ----------------------------------------------------
 
     def alloc(self, key, tokens: int, capacity_tokens: int | None = None,
               base_tokens: int | None = None, sliding_tokens=None,
@@ -371,9 +357,6 @@ class KVArena:
                 return None
         self._base[key] = tokens if base_tokens is None else base_tokens
         self._sliding_start[key] = start_s
-        # the logical rows are the first `tokens` entries of the
-        # capacity rows (same pages, same order), so build once and
-        # slice instead of walking the pages twice
         self._refresh_rows(key, tokens)
         return pages
 
@@ -456,7 +439,6 @@ class KVArena:
         if self.sliding is not None:
             self.sliding.rewind(key, tokens - self._sliding_start[key])
         self._refresh_rows(key, tokens)
-        # a rewound key's state past its document is not needed again
         self.accounting.drop_extension(key)
         self.accounting.retain(key, priority)
         cap = self.accounting.retention_cap_pages
@@ -537,8 +519,6 @@ class KVArena:
                           - len(self.sliding.table_pages(key)))
                       if self.sliding is not None else 0)
             self._evict_for_pages(need, need_s)
-            # neither pool grows unless both can, so a refusal leaves
-            # the key as it was
             if need > self.accounting.free_pages or (
                     self.sliding is not None
                     and need_s > self.sliding.free_pages):
@@ -622,8 +602,6 @@ class KVArena:
                     and (self.sliding is None
                          or self.sliding.free_pages >= need_s))
 
-        # Neither the candidate's existing state nor its parent's state can
-        # be evicted to make room for the candidate's reservation.
         protected = (key,) if borrow is None else (key, borrow[0])
         self.read_state(protected)
         try:
@@ -647,7 +625,6 @@ class KVArena:
                            sliding_tokens=sliding_tokens)
         return None if pages is None else (key, pages)
 
-    # ---- holds: keys that queued borrowers will read ------------------
 
     def hold(self, key, borrowers: int) -> None:
         """Keep a key for `borrowers` keys that will borrow its pages.
@@ -702,6 +679,14 @@ class KVArena:
             self._release_hold(key)
         return bool(keys)
 
+    def free_all(self) -> None:
+        """Free every resident key, with every hold and reader dropped first."""
+        self._holds.clear()
+        self._reading.clear()
+        self._deferred.clear()
+        for key in self.resident_keys():
+            self.free_key(key)
+
     def free_key(self, key):
         """Free a key's pages, or once its holds are released.
 
@@ -722,7 +707,6 @@ class KVArena:
             self.sliding.free_key(key)
         return self.accounting.free_key(key)
 
-    # ---- residency and retention, read by the loop and operators ------
 
     @property
     def page_tokens(self) -> int:
@@ -846,7 +830,6 @@ class KVArena:
         """Row index tensor (CPU) over every row in the key's sliding pages."""
         return self._sliding_rows[key]
 
-    # ---- tensors, read by the attention paths ------------------------
 
     def layer_kv(self, layer: int):
         """Flat K and V pools of one layer, shape (rows, num_kv_heads, d_head)."""

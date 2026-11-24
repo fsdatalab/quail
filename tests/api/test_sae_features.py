@@ -152,7 +152,7 @@ def test_an_empty_feature_list_is_not_null():
     {'pooling': 'last'}) IS NULL ---
 plan
   features = ai_sae_features('Topic? {0}', r.body, named_struct('pooling', 'last')),
-      filter: features IS NULL
+      inline_predicate: features IS NULL
 asked 3 of 3
   'Topic? {0}': r0 [], r1 [], r2 []
 rows 0
@@ -162,7 +162,7 @@ rows 0
     {'pooling': 'last'}) IS NOT NULL ---
 plan
   features = ai_sae_features('Topic? {0}', r.body, named_struct('pooling', 'last')),
-      filter: features IS NOT NULL
+      inline_predicate: features IS NOT NULL
 asked 3 of 3
   'Topic? {0}': r0 [], r1 [], r2 []
 rows 3

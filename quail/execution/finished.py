@@ -29,16 +29,10 @@ from quail.execution.types import output_table
 class _Region(threading.local):
     rows = None
     held = False
-    # callable(table) -> the table over the region's rows, or None to
-    # hold it back, while a node runs over renumbered rows
     translate = None
     hint = None
-    # alias -> the table the hint holds rows of
     tables = {}
-    # alias -> (the hint's generation, whether each row is kept)
     keep = {}
-    # alias -> each row's first row with the same document, for a table
-    # the plan deduplicates
     first = {}
 
 
@@ -197,7 +191,6 @@ def keeps(alias, document: int) -> bool:
         keep = np.asarray(region.hint.keep(table), dtype=bool)
         first = region.first.get(alias)
         if first is not None:
-            # a document is kept while the hint keeps one of its copies
             any_copy = np.zeros(len(keep), dtype=bool)
             np.logical_or.at(any_copy, first, keep)
             keep = any_copy[first]

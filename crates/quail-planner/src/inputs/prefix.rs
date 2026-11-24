@@ -1,7 +1,3 @@
-//! The statistics the planner reads from a table's tokens: which
-//! documents repeat another, which share a prefix whose KV they can
-//! read, and which tokens end the documents.
-
 use std::collections::{BTreeSet, HashMap};
 
 use arrow::array::ArrayRef;
@@ -10,14 +6,9 @@ use arrow::row::{RowConverter, SortField};
 
 use crate::inputs::store::Documents;
 
-/// The documents in sorted token order, and the tokens each shares with
-/// its predecessor in that order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrefixIndex {
-    /// Document positions in sorted token order.
     pub order: Vec<usize>,
-    /// Per document, the tokens it has in common with its predecessor,
-    /// short of its last token, which every document computes.
     pub shared: Vec<i64>,
 }
 
@@ -29,7 +20,6 @@ fn common_prefix<T: PartialEq>(left: &[T], right: &[T]) -> usize {
 }
 
 impl PrefixIndex {
-    /// Sort `documents` and measure what each shares with its predecessor.
     pub fn new(documents: &Documents<'_>) -> Self {
         let documents = documents.ids();
         let mut order: Vec<usize> = (0..documents.len()).collect();
@@ -43,7 +33,6 @@ impl PrefixIndex {
         PrefixIndex { order, shared }
     }
 
-    /// The prefix tree whose shares round down to `page_tokens`.
     pub fn tree(&self, page_tokens: i64) -> PrefixTree {
         let shared: Vec<i64> = self
             .shared
@@ -73,33 +62,21 @@ impl PrefixIndex {
     }
 }
 
-/// Which document each document borrows its KV prefix from, with the
-/// borrowed tokens rounded down to a whole page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrefixTree {
-    /// Document positions in sorted token order; a parent comes before
-    /// its children.
     pub order: Vec<usize>,
-    /// Per document, the position it borrows from, or None.
     pub parent: Vec<Option<usize>>,
-    /// Per document, the borrowed tokens, a multiple of the page size.
     pub shared: Vec<i64>,
 }
 
-/// One group of documents that read the same borrowed prefix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReaderGroup {
-    /// The borrowed tokens.
     pub shared: i64,
-    /// The documents in the group.
     pub count: i64,
-    /// The tokens the documents compute beyond the borrowed prefix.
     pub rows: i64,
 }
 
 impl PrefixTree {
-    /// Group the documents that borrow by their parent and borrowed
-    /// tokens, in the order each group first appears.
     pub fn reader_groups(&self, lengths: &[i64]) -> Vec<ReaderGroup> {
         let mut positions: HashMap<(usize, i64), usize> = HashMap::new();
         let mut groups: Vec<ReaderGroup> = Vec::new();
@@ -121,13 +98,6 @@ impl PrefixTree {
     }
 }
 
-/// Each document's first document with the same tokens and the same
-/// values in each of `columns`; a document no earlier one equals is its
-/// own first.
-///
-/// # Errors
-///
-/// A column's type has no row encoding.
 pub fn first_documents(
     documents: &Documents<'_>,
     columns: &[ArrayRef],
@@ -154,7 +124,6 @@ pub fn first_documents(
     Ok(first)
 }
 
-/// The distinct last tokens of the documents that have tokens, in order.
 pub fn last_tokens(documents: &Documents<'_>) -> Vec<i32> {
     let ends: BTreeSet<i32> = documents
         .ids()

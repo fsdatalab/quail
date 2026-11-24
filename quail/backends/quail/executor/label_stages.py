@@ -175,14 +175,14 @@ class ClassifyStages:
             documents.
     """
 
-    canvas_rows = 0         # rows of a letters stage's canvas on a canvas model
-    draws = 1               # noise draws a canvas letters read may average
-    probabilities = None    # (documents, labels) label probabilities, when asked
-    seeds = None            # document index -> canvas seed; None uses the index
-    partners = None         # JoinPartners, for joined rows
-    pair_labels = None      # (anchor index, partner index) -> label, for joined rows
+    canvas_rows = 0
+    draws = 1
+    probabilities = None
+    seeds = None
+    partners = None
+    pair_labels = None
 
-    choice = None           # (frame, request) of a decision_choice rule
+    choice = None
 
     def __init__(self, state: QueryExecutionState, spec, count, index_of, on_label=None,
                  partners=None):
@@ -201,14 +201,11 @@ class ClassifyStages:
         self.readout_rows = readout_rows = (
             sum(request.read_mask) if request.read_mask is not None
             else max(map(len, request.suffixes)) if read_all else 1)
-        # a letters stage on a canvas model reads its canvas's rows
         answer_canvas = state.loaded_model.model_spec.answer_canvas
         if spec.scoring == "letters" and answer_canvas is not None:
             self.canvas_rows = answer_canvas.rows
             self.readout_rows = readout_rows = self.canvas_rows
             self.draws = max(1, spec.draws)
-        # one-token labels are all read at the cue row, so their logits
-        # need no normalizer
         same_rows = all(len(ids) == 1 for ids in spec.label_token_ids)
         self.readout = readout = _label_readout(state, targets, readout_rows,
                                                 not same_rows)
@@ -278,7 +275,6 @@ class ClassifyStages:
         self.decoder = None
         question = request.frame
         (cue,) = request.suffixes[0]
-        # suffix p is partner p's block and the cue; its last row is read
         suffixes = [concat_tokens(document, question, (cue,))
                     for document in partners.documents]
         self.block_tokens = [len(tokens) - 1 for tokens in suffixes]
@@ -321,7 +317,6 @@ class ClassifyStages:
             ends = np.cumsum([len(block) for block in spec.label_token_ids])
             offsets = [len(request) - int(end) for end in ends] + [0]
         else:
-            # coded options: every label is read at the request's last row
             offsets = [0] * (len(spec.labels) + 1)
         self.readout = readout = AsyncDecisionChoices(state.torch, head, offsets)
         self.labels = np.full(count, None, dtype=object)
@@ -469,7 +464,6 @@ class ClassifyStages:
     def _scores(self, logprobs):
         """Compute one score per label from the readout values."""
         if self.read_all:
-            # a one-row readout returns (suffixes, targets)
             logprobs = logprobs.reshape(
                 len(self.request.suffixes), self.readout_rows, -1)
         return self.request.score(logprobs)

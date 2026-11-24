@@ -1,14 +1,3 @@
-//! Run an AI filter over a small table.
-//!
-//! Quail starts one GPU worker per GPU: `python -m quail.worker`, from
-//! the Python environment `VIRTUAL_ENV` names. Install Quail's Python
-//! package there first, on a machine with the GPU:
-//!
-//! ```sh
-//! pip install quail-engine
-//! cargo run --example quickstart
-//! ```
-
 use std::sync::Arc;
 
 use datafusion::arrow::array::{RecordBatch, StringArray};

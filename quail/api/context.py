@@ -162,7 +162,6 @@ class SessionContext:
 
     def sql(self, text: str, dialect: str = "snowflake") -> pa.Table:
         """Run a query and return its rows."""
-        # DataFusion's batches, shared through the Arrow C stream interface
         try:
             return self._native.sql(text, DATAFUSION_DIALECTS[dialect])
         except RuntimeError as error:

@@ -1,16 +1,3 @@
-//! Add Quail to a DataFusion session that has its own function and rule.
-//!
-//! The host here is a program with its own DataFusion extensions: a
-//! function `shout` and an optimizer rule that rewrites `shout(x)` to
-//! `upper(x)`. `QuailExtension::register` adds the AI functions beside
-//! them, and one SQL statement uses both.
-//!
-//! `FirstRow` stands in for the model: it keeps the first row of each
-//! region. A program with a GPU passes `quail::Executor` instead:
-//! `QuailExtension::new(Arc::new(quail::Executor::open(&config)?))`.
-//!
-//! Run with `cargo run --example host_session`.
-
 use std::sync::Arc;
 
 use datafusion::arrow::array::{RecordBatch, StringArray};
@@ -29,11 +16,9 @@ use quail_datafusion::{
     collect_inputs,
 };
 
-/// The query: a host function and an AI function in one statement.
 pub const SQL: &str = "SELECT r.id, shout(r.body) AS loud FROM reviews r \
                        WHERE AI.IF(PROMPT('Is the review negative? {0}', r.body))";
 
-/// Stands in for Quail's executor: the model keeps the first row.
 #[derive(Debug)]
 struct FirstRow;
 
@@ -48,7 +33,6 @@ impl RegionRunner for FirstRow {
         let schema = Arc::new(region.plan.schema().as_arrow().clone());
         let (_, rows) = collect_inputs(inputs)?.remove(0);
         let first = rows[0].slice(0, 1);
-        // the region's columns are its input's, by name
         let columns = schema
             .fields()
             .iter()
@@ -64,7 +48,6 @@ impl RegionRunner for FirstRow {
     }
 }
 
-/// The host's optimizer rule: `shout(x)` is `upper(x)`.
 #[derive(Debug)]
 struct ShoutIsUpper;
 
@@ -91,18 +74,12 @@ impl OptimizerRule for ShoutIsUpper {
     }
 }
 
-/// A host session with `shout`, the host's rule, and Quail.
-///
-/// # Errors
-///
-/// DataFusion or Quail refuses the session.
 pub fn host_context() -> Result<SessionContext> {
     let shout = create_udf(
         "shout",
         vec![DataType::Utf8],
         DataType::Utf8,
         Volatility::Immutable,
-        // the host's rule replaces every call before a row reaches it
         Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
     );
     let host = SessionStateBuilder::new()
@@ -130,12 +107,6 @@ pub fn host_context() -> Result<SessionContext> {
     Ok(context)
 }
 
-/// Run [`SQL`] in the host session and return the optimized plan and the
-/// rows, as text.
-///
-/// # Errors
-///
-/// The query fails.
 pub async fn run() -> Result<(String, String)> {
     let context = host_context()?;
     let frame = context.sql(SQL).await?;

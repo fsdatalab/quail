@@ -1,19 +1,3 @@
-//! A region's hint: the tests above it that it may drop rows by.
-//!
-//! An operator above a region, such as a top-k sort (`SortExec` with a
-//! fetch) or a hash join, can hand the region a dynamic filter: a test
-//! of the region's columns that it tightens as it runs. A row where the
-//! test is not TRUE leaves the query above anyway, so the region may
-//! drop it before asking the model. Each test reads the region's
-//! columns by position.
-//!
-//! A region column the region passes on unchanged from one input column,
-//! such as an id, is known for each input row before the model runs. An
-//! answer column is not, though its values may be bounded. [`RegionHint`]
-//! decides each test per input row over what is known: TRUE, FALSE,
-//! NULL, or undecided. A row is dropped only when every value its
-//! answers may take leaves the test FALSE or NULL.
-
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, ArrayRef, RecordBatch};
@@ -22,7 +6,7 @@ use datafusion::arrow::datatypes::DataType;
 use datafusion::common::cast::{as_boolean_array, as_float64_array};
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column as LogicalColumn, Result};
-use datafusion::logical_expr::{Expr, LogicalPlan, Operator};
+use datafusion::logical_expr::{Expr, LogicalPlan, Operator, UserDefinedLogicalNodeCore};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{
     BinaryExpr, Column, IsNotNullExpr, IsNullExpr, NotExpr,
@@ -33,32 +17,25 @@ use datafusion::physical_expr_common::physical_expr::{
 };
 
 use crate::ai::AiNode;
-use crate::derive::partial::{Completions, Decision, LISTED, decide_expr};
 use crate::region::ModelRegion;
+use crate::region::derive::partial::{Completions, Decision, LISTED, decide_expr};
 
-/// The tests above a region that it may drop rows by, over the region's
-/// columns. They may tighten while the query runs.
 #[derive(Debug, Clone, Default)]
 pub struct RegionHint {
-    /// Each test, over the region's columns by position.
     pub tests: Vec<Arc<dyn PhysicalExpr>>,
 }
 
 impl RegionHint {
-    /// Whether the region has no test to drop rows by.
     pub fn is_empty(&self) -> bool {
         self.tests.is_empty()
     }
 
-    /// A number that changes whenever a test tightens.
     pub fn generation(&self) -> u64 {
         self.tests.iter().fold(0u64, |sum, test| {
             sum.wrapping_add(snapshot_generation(test))
         })
     }
 
-    /// The tables whose passed-on columns a test reads, in the order
-    /// the tests first read them.
     pub fn tables(&self, columns: &RegionColumns) -> Vec<String> {
         let mut found: Vec<String> = Vec::new();
         for test in &self.tests {
@@ -73,12 +50,6 @@ impl RegionHint {
         found
     }
 
-    /// Whether each row of `rows`, rows of the table `input` the region
-    /// reads, may still pass every test as the tests are now.
-    ///
-    /// # Errors
-    ///
-    /// A test does not evaluate over the rows.
     pub fn keep(
         &self,
         columns: &RegionColumns,
@@ -92,8 +63,6 @@ impl RegionHint {
                 *kept &= !matches!(truth, Truth::False | Truth::Null);
             }
         }
-        // a row whose document is NULL stays: its answers are NULL, which
-        // the tests here take to be values, and the model is not asked
         for (table, position) in &columns.1 {
             if table != input || *position >= rows.num_columns() {
                 continue;
@@ -106,8 +75,6 @@ impl RegionHint {
         Ok(keep)
     }
 
-    /// Whether a test reads the answer in column `index` and no other
-    /// column.
     pub fn reads_answer(&self, index: usize) -> bool {
         self.tests.iter().any(|test| {
             let columns = collect_columns(test);
@@ -115,18 +82,6 @@ impl RegionHint {
         })
     }
 
-    /// Whether some test, as the tests are now, is TRUE for no complete
-    /// answer still possible in column `index`, or in its field `field`
-    /// when the column is an extraction's struct: the row leaves the
-    /// query above whatever the rest of the answer says.
-    ///
-    /// Each test is decided as a WHERE test of the answer is, by
-    /// [`decide_expr`]. A part of a test that reads another column, or
-    /// that has no logical form here, may be any value.
-    ///
-    /// # Errors
-    ///
-    /// A test does not give its current form.
     pub fn rejects_answer(
         &self,
         index: usize,
@@ -145,10 +100,6 @@ impl RegionHint {
     }
 }
 
-/// A test above a region as a logical expression of the answer, the
-/// column [`LISTED`]: column `index`, or `get_field` of it and `field`.
-/// Any part with no logical form here, and any other column, is a column
-/// of another name, which the evaluator reads as any value.
 fn logical(test: &Arc<dyn PhysicalExpr>, index: usize, field: Option<&str>) -> Expr {
     use datafusion::logical_expr::expr::{InList, ScalarFunction};
     use datafusion::physical_expr::ScalarFunctionExpr;
@@ -217,33 +168,17 @@ fn logical(test: &Arc<dyn PhysicalExpr>, index: usize, field: Option<&str>) -> E
     other()
 }
 
-/// What a region knows about each of its columns before the model runs.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RegionColumn {
-    /// The column of this position in this table, passed on unchanged:
-    /// an input by the name the region reads it by, or a table the
-    /// region reads by name.
     Source(String, usize),
-    /// An answer that is never NULL and lies between the two bounds.
     Bounded(f64, f64),
-    /// An answer of any value.
     Answer,
 }
 
-/// What a region knows about each of its columns, by position, and the
-/// table and column position of each document its AI calls read.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RegionColumns(pub Vec<RegionColumn>, pub Vec<(String, usize)>);
 
 impl RegionColumns {
-    /// Read a region's columns from its plan: each column passed on
-    /// from a table, each AI.SCORE answer between 0 and 1, and every
-    /// other answer.
-    ///
-    /// A name two of the region's columns share, such as `id` of two
-    /// joined tables, is an answer of any value: DataFusion's filter
-    /// pushdown binds a test's column by name, so the test may read
-    /// either column.
     pub fn of(region: &ModelRegion) -> Self {
         let schema = region.plan.schema();
         let scores = score_columns(&region.plan);
@@ -260,8 +195,9 @@ impl RegionColumns {
             if let LogicalPlan::Extension(extension) = node
                 && let Some(ai) = extension.node.as_any().downcast_ref::<AiNode>()
             {
-                for column in ai.call.column_refs() {
-                    if let Some(found) = passed_on(region, &ai.input, column)
+                let call = ai.call();
+                for column in call.column_refs() {
+                    if let Some(found) = passed_on(region, ai.inputs()[0], column)
                         && !documents.contains(&found)
                     {
                         documents.push(found);
@@ -291,8 +227,6 @@ impl RegionColumns {
         )
     }
 
-    /// The table whose columns a test reads, when it reads only that
-    /// table's passed-on columns.
     pub fn input_of(&self, test: &Arc<dyn PhysicalExpr>) -> Option<&str> {
         let mut input: Option<&str> = None;
         for column in collect_columns(test) {
@@ -309,10 +243,6 @@ impl RegionColumns {
     }
 }
 
-/// The names of the region's AI.SCORE answers. A score is the model's
-/// probability of its yes answer, or the mean of several, from one
-/// readout per row: it is never NULL and lies between 0 and 1, and no
-/// partial answer bounds it more tightly before the readout.
 fn score_columns(plan: &LogicalPlan) -> Vec<String> {
     let mut found = Vec::new();
     let _ = plan.apply(|node| {
@@ -321,7 +251,7 @@ fn score_columns(plan: &LogicalPlan) -> Vec<String> {
                 if let Some(ai) = extension.node.as_any().downcast_ref::<AiNode>()
                     && ai.function() == "ai_score"
                 {
-                    found.extend(ai.fields.iter().map(|field| field.name().clone()));
+                    found.extend(ai.added_names());
                 }
             }
             LogicalPlan::Projection(projection) => {
@@ -344,9 +274,6 @@ fn score_columns(plan: &LogicalPlan) -> Vec<String> {
     found
 }
 
-/// The table and column position a plan's column passes on unchanged,
-/// through projections, aliases, and the operators that keep their
-/// input's columns.
 fn passed_on(
     region: &ModelRegion,
     plan: &LogicalPlan,
@@ -393,7 +320,6 @@ fn passed_on(
     }
 }
 
-/// What a test is for one row, before the region's answers are known.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Truth {
     True,
@@ -440,7 +366,6 @@ impl Truth {
     }
 }
 
-/// A test's truth for each input row.
 fn decide(
     test: &Arc<dyn PhysicalExpr>,
     columns: &RegionColumns,
@@ -476,7 +401,6 @@ fn decide(
         ),
     ] {
         if expr.is_some_and(|expr| bounded(expr).is_some()) {
-            // a bounded answer is never NULL
             let truth = if null { Truth::False } else { Truth::True };
             return Ok(vec![truth; num_rows]);
         }
@@ -522,8 +446,6 @@ fn decide(
     }
 }
 
-/// `x op value` for every x between the bounds: TRUE or FALSE when it
-/// is the same for all of them.
 fn compare((low, high): (f64, f64), op: Operator, value: f64) -> Truth {
     let (always, never) = match op {
         Operator::Gt => (low > value, high <= value),
@@ -543,8 +465,6 @@ fn compare((low, high): (f64, f64), op: Operator, value: f64) -> Truth {
     }
 }
 
-/// An expression's value for each input row, when it reads only
-/// constants and the input's passed-on columns.
 fn input_values(
     expr: &Arc<dyn PhysicalExpr>,
     columns: &RegionColumns,
@@ -587,7 +507,6 @@ mod tests {
         assert_eq!(compare(bounds, Operator::GtEq, -0.5), Truth::True);
     }
 
-    /// `expr`, over the columns of `schema`, as the one test of a hint.
     fn hint_of(schema: &Schema, expr: Expr) -> RegionHint {
         use datafusion::common::DFSchema;
         let fields = DFSchema::try_from(schema.clone()).unwrap();
@@ -605,7 +524,6 @@ mod tests {
             Field::new("id", DataType::Utf8, false),
             Field::new("vendor", DataType::Utf8, true),
         ]);
-        // the sort keeps the vendors that sort before Globex
         let hint = hint_of(&schema, col("vendor").lt(lit("Globex")));
         assert!(hint.reads_answer(1));
         assert!(!hint.reads_answer(0));
@@ -616,9 +534,7 @@ mod tests {
         assert!(rejects("Initech"));
         assert!(rejects("H"));
         assert!(!rejects("Acme"));
-        // an answer that starts as the threshold does may still sort first
         assert!(!rejects("G"));
-        // a join on the vendor's name in lower case reads the answer so
         let keys = vec![lit("acme"), lit("globex")];
         let folded = hint_of(
             &schema,
@@ -631,7 +547,6 @@ mod tests {
         };
         assert!(folded.reads_answer(1));
         assert!(!rejects("ACME"));
-        // a test that also reads the id is not the answer's alone
         let both = hint_of(&schema, col("vendor").lt(col("id")));
         assert!(!both.reads_answer(1));
     }
@@ -652,10 +567,8 @@ mod tests {
             get_field(col("contract"), "law").in_list(keys, false),
         );
         assert!(hint.reads_answer(0));
-        // a test of the law is none of the party
         let party = Completions::text("Texas");
         assert!(!hint.rejects_answer(0, Some("party"), &party).unwrap());
-        // the span copies the document, which goes on as one of two texts
         let copied = |prefix: &str, tails: &[&str]| Completions {
             prefix: prefix.to_string(),
             complete: false,

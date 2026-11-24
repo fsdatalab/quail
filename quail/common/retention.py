@@ -17,8 +17,7 @@ class RetentionPolicy:
     uses: dict = field(default_factory=dict)
     sliding_pair_seconds: float = 0.0
     sliding_window: int = 0
-    checkpoint_pages: float = 0.0    # pages of the state a hybrid model's
-    #                                  document keeps beside its KV
+    checkpoint_pages: float = 0.0
 
     def prefill_seconds(self, tokens: int) -> float:
         """Return ideal compute time to rebuild a prefix of this length."""

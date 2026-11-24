@@ -1,6 +1,7 @@
 """Shared retention priority, capacity, and eviction tests."""
 
 from helpers.fakes import bare_arena
+from helpers.kv_checker import Setup, make_arena
 
 from quail.backends.quail.executor.arena import KVArena
 from quail.backends.quail.retention import apply_retention
@@ -68,3 +69,13 @@ def test_retention_priority_capacity_eviction_and_its_report():
     assert set(arena.accounting.retained) == {('b', 1)}
     assert arena.accounting.retained_pages == 2
     assert arena.accounting.free_pages == 14
+
+
+def test_a_query_that_failed_while_holding_kv_leaves_the_arena_resizable():
+    arena = make_arena(Setup(path="unified", pages=8, page_tokens=16))
+    assert arena.alloc("parent", 32) is not None
+    arena.hold("parent", 2)
+    arena.read_state(("parent",))
+    arena.free_key("parent")
+    arena.resize(8, free_resident=True)
+    assert not arena.resident_keys() and arena.free_pages == 8

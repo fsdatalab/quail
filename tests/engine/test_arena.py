@@ -136,3 +136,15 @@ def test_pages_are_allocated_retained_rewound_pinned_and_borrowed_until_freed():
     # the parent still holds the borrowed page; one own page goes free
     assert a.drop_leading("s", 2) == 1
     assert a.borrowed["s"] == [] and len(a.owned["s"]) == 1
+
+
+def test_a_retained_parent_counts_the_pages_its_borrowers_stop_sharing():
+    a = PageArena(num_pages=8, page_tokens=16)
+    a.alloc("parent", 32)
+    a.alloc("child", 48, borrowed=a.shared_pages("parent", 16))
+    a.retain("parent")
+    assert a.retained_pages == 1
+    a.free_key("child")
+    assert a.retained_pages == 2
+    a.alloc("late child", 48, borrowed=a.shared_pages("parent", 16))
+    assert a.retained_pages == 1

@@ -1,14 +1,8 @@
-//! The draft length of each extraction round, as
-//! `quail/common/draft_policy.py` chooses it.
-
 use crate::cost::answers::{prior_survival, survival_rows};
 
-/// Drafted rounds the seed of the source odds counts as.
 pub const SOURCE_PRIOR_WEIGHT: i64 = 8;
-/// Ranges of live positions the source odds are learned per.
 pub const LIVE_BUCKETS: [i64; 11] = [1, 2, 3, 5, 10, 20, 50, 100, 200, 500, 1000];
 
-/// The range of live positions a count falls in, nearest on a log scale.
 pub fn live_bucket(num_streams: i64) -> usize {
     let point = (num_streams as f64).ln_1p();
     let mut best = 0;
@@ -23,7 +17,6 @@ pub fn live_bucket(num_streams: i64) -> usize {
     best
 }
 
-/// P(the position followed is the answer's source) for one round.
 pub fn source_odds(num_streams: i64, trials: &[i64], accepts: &[i64]) -> f64 {
     if num_streams <= 1 {
         return 1.0;
@@ -33,12 +26,6 @@ pub fn source_odds(num_streams: i64, trials: &[i64], accepts: &[i64]) -> f64 {
         / (SOURCE_PRIOR_WEIGHT + trials[bucket]) as f64
 }
 
-/// Each answer's expected written tokens from each draft token, one row
-/// of `cap` per answer.
-///
-/// Column j - 1 is draft token j's: the chance the answer goes on past
-/// j more tokens times the chance the position followed is its source.
-/// It never rises with j. Draft tokens at or past the limit write none.
 pub fn draft_gains(
     cap: usize,
     limit: usize,
@@ -70,10 +57,6 @@ pub fn draft_gains(
         .collect()
 }
 
-/// Each answer's draft length: the least cost per written token.
-///
-/// `survival` is the field's S(t), t = 0..=limit; `written`,
-/// `num_streams`, and `rho` hold one value per answer.
 #[allow(clippy::too_many_arguments)]
 pub fn draft_lengths(
     cap: usize,
@@ -91,8 +74,6 @@ pub fn draft_lengths(
         .zip(rho)
         .zip(&gains)
         .map(|((written, rho), gains)| {
-            // the chosen token, then each draft token while the answer goes
-            // on and the position followed is its source
             let mut writes = 1.0;
             let mut best = 0;
             let mut best_cost = f64::INFINITY;
@@ -115,11 +96,6 @@ pub fn draft_lengths(
         .collect()
 }
 
-/// The draft lengths that keep the most expected writes in `room` rows.
-///
-/// A pass holds at most `room` draft rows. Since an answer's gains never
-/// rise along its draft, keeping the `room` largest gains keeps a prefix
-/// of every draft; ties go to the earlier answers.
 pub fn fit_drafts(gains: &[Vec<f64>], drafts: &[i64], room: i64) -> Vec<i64> {
     if drafts.iter().sum::<i64>() <= room {
         return drafts.to_vec();
@@ -166,23 +142,17 @@ pub fn fit_drafts(gains: &[Vec<f64>], drafts: &[i64], room: i64) -> Vec<i64> {
         .collect()
 }
 
-/// Chooses each round's draft length for one question.
 #[derive(Debug, Clone)]
 pub struct DraftPolicy {
     pub cap: usize,
     pub max_answer_tokens: usize,
     pub prior: Vec<f64>,
-    /// Settled answers by length.
     pub lengths: Vec<i64>,
-    /// Drafted rounds per range of live positions.
     pub trials: Vec<i64>,
-    /// Of those, the rounds whose first draft token was written.
     pub accepts: Vec<i64>,
 }
 
 impl DraftPolicy {
-    /// A policy with no rounds seen, starting from the planner's guess
-    /// at the mean answer length.
     pub fn new(cap: usize, max_answer_tokens: usize, expected_answer_tokens: f64) -> Self {
         Self {
             cap,
@@ -194,7 +164,6 @@ impl DraftPolicy {
         }
     }
 
-    /// The answer survival curve of the settled answers.
     pub fn curve(&self) -> Vec<f64> {
         survival_rows(
             std::slice::from_ref(&self.lengths),

@@ -1,12 +1,12 @@
 logical:
   Projection: c1.id, e1.id, c2.id, e2.id
-    AiNode: __quail_answer_3 = ai_filter(prompt(Utf8("Does the Wikipedia passage in DOCUMENT {1} support the claim in DOCUMENT {0}?"), c2.claim, e2.text), named_struct(Utf8("selectivity"), Float64(0.002167247386759582))), filter: __quail_answer_3, returns: []
+    AiNode: __quail_answer_3 = ai_filter(prompt(Utf8("Does the Wikipedia passage in DOCUMENT {1} support the claim in DOCUMENT {0}?"), c2.claim, e2.text), named_struct(Utf8("selectivity"), Float64(0.002167247386759582))), inline_predicate: __quail_answer_3, returns: []
       Cross Join:
         Projection: c1.id, e1.id, c2.id, c2.claim
-          AiNode: __quail_answer_2 = ai_filter(prompt(Utf8("Does the Wikipedia passage in DOCUMENT {1} refute or contradict the claim in DOCUMENT {0}?"), c2.claim, e1.text), named_struct(Utf8("selectivity"), Float64(0.00332404181184669))), filter: __quail_answer_2, returns: []
+          AiNode: __quail_answer_2 = ai_filter(prompt(Utf8("Does the Wikipedia passage in DOCUMENT {1} refute or contradict the claim in DOCUMENT {0}?"), c2.claim, e1.text), named_struct(Utf8("selectivity"), Float64(0.00332404181184669))), inline_predicate: __quail_answer_2, returns: []
             Cross Join:
               Projection: c1.id, e1.id, e1.text
-                AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Does the Wikipedia passage in DOCUMENT {1} support the claim in DOCUMENT {0}?"), c1.claim, e1.text), named_struct(Utf8("selectivity"), Float64(0.002167247386759582))), filter: __quail_answer_1, returns: []
+                AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Does the Wikipedia passage in DOCUMENT {1} support the claim in DOCUMENT {0}?"), c1.claim, e1.text), named_struct(Utf8("selectivity"), Float64(0.002167247386759582))), inline_predicate: __quail_answer_1, returns: []
                   Cross Join:
                     SubqueryAlias: c1
                       TableScan: claims projection=[id, claim]

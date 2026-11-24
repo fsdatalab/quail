@@ -23,7 +23,8 @@ we use DataFusion to parse, plan, and run the rest of the SQL.
 
 [Documentation](https://fsdatalab.github.io/quail) |
 [Quickstart](https://fsdatalab.github.io/quail/docs/user-guide/quickstart) |
-[QUAIL-B](https://github.com/fsdatalab/quail-bench)
+[QUAIL-B](https://github.com/fsdatalab/quail-bench) |
+[When to use Quail](https://fsdatalab.github.io/quail/docs/when-to-use)
 
 ## Install
 

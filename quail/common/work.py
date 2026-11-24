@@ -25,7 +25,6 @@ class Work:
     sliding_kv_read: float = 0.0
     state_written: float = 0.0
     state_read: float = 0.0
-    # tokens the model's SAE encodes, for AI.SAE_FEATURES
     sae_encoded: float = 0.0
 
     def __add__(self, other: "Work") -> "Work":

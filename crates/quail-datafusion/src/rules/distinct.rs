@@ -1,25 +1,14 @@
-//! Whether a `DISTINCT` removes a row: [`crate::Derive`] drops one that
-//! cannot, so a `LIMIT` above it reaches the `AiNode` below.
-//!
-//! A `DISTINCT` removes no row when the columns it compares include a
-//! unique key of its input. [`is_unique`] reads the keys DataFusion
-//! derives (its functional dependencies), and adds what DataFusion does
-//! not keep: the keys of each side of a join together are a key of the
-//! join.
-
 use std::collections::BTreeSet;
 
 use datafusion::common::Column;
 use datafusion::common::Dependency;
-use datafusion::logical_expr::{Aggregate, Expr, JoinType, LogicalPlan};
+use datafusion::logical_expr::{
+    Aggregate, Expr, JoinType, LogicalPlan, UserDefinedLogicalNodeCore,
+};
 
-use crate::ai::{AiNode, Semantics};
-use crate::extension::as_node;
+use crate::ai::AiNode;
+use crate::plan::as_node;
 
-/// Whether an `Aggregate` is a `DISTINCT`: it groups by each of its
-/// input's columns, in order, and computes nothing else.
-///
-/// DataFusion's `replace_distinct_aggregate` writes a `DISTINCT` so.
 pub(crate) fn is_distinct(aggregate: &Aggregate) -> bool {
     let columns: Vec<Expr> = aggregate
         .input
@@ -31,7 +20,6 @@ pub(crate) fn is_distinct(aggregate: &Aggregate) -> bool {
     aggregate.aggr_expr.is_empty() && aggregate.group_expr == columns
 }
 
-/// Whether no two rows of `plan` have equal values in `columns`.
 pub(crate) fn is_unique(plan: &LogicalPlan, columns: &BTreeSet<Column>) -> bool {
     let schema = plan.schema();
     let keyed = schema.functional_dependencies().iter().any(|dependency| {
@@ -45,7 +33,6 @@ pub(crate) fn is_unique(plan: &LogicalPlan, columns: &BTreeSet<Column>) -> bool 
     }
     match plan {
         LogicalPlan::Projection(projection) => {
-            // the input columns the SELECT list returns as they are
             let mut below = BTreeSet::new();
             for (expr, column) in projection.expr.iter().zip(schema.columns()) {
                 if let (Expr::Column(input), true) =
@@ -68,8 +55,7 @@ pub(crate) fn is_unique(plan: &LogicalPlan, columns: &BTreeSet<Column>) -> bool 
         LogicalPlan::Sort(found) => is_unique(&found.input, columns),
         LogicalPlan::Limit(found) => is_unique(&found.input, columns),
         LogicalPlan::Extension(_) => match as_node::<AiNode>(plan) {
-            // a node of rows returns at most one row for each input row
-            Some(node) if node.semantics == Semantics::Rows => is_unique(&node.input, columns),
+            Some(node) if !node.is_join() => is_unique(node.inputs()[0], columns),
             _ => false,
         },
         LogicalPlan::Join(join) => {
@@ -79,8 +65,6 @@ pub(crate) fn is_unique(plan: &LogicalPlan, columns: &BTreeSet<Column>) -> bool 
                     .collect()
             };
             match join.join_type {
-                // a row of the join is one row of each side, or one side's
-                // row with NULLs, which only that row's key tells apart
                 JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full => {
                     is_unique(&join.left, &side(&join.left))
                         && is_unique(&join.right, &side(&join.right))

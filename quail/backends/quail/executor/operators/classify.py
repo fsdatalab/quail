@@ -47,7 +47,6 @@ class ClassifyOperator(ColumnOperator, SingleNodeOperator):
                     if isinstance(operator, JoinOperator))
         stage = next(stage for stage in join.nodes
                      if set(spec.aliases) == {stage.anchor, *stage.partners})
-        # the join's partner tuples, one partner alias each
         partner_ids = [int(entry[0]) if isinstance(entry, (tuple, list))
                        else int(entry)
                        for entry in join.inputs["partner_indices"][
@@ -69,9 +68,9 @@ class ClassifyOperator(ColumnOperator, SingleNodeOperator):
         self.plan = plan
         self.stages = plan.stages
         self.kept = kept
-        self.finished = []      # documents settled since the last take
-        self.sent = set()       # documents whose labels went to the sink
-        self.reported = set()   # documents whose label rows were taken
+        self.finished = []
+        self.sent = set()
+        self.reported = set()
 
     def settle(self, document, survived, row):
         self.finished.append(document)
@@ -173,7 +172,6 @@ class ClassifyOperator(ColumnOperator, SingleNodeOperator):
                 extension={"output": spec.name, "aliases": list(spec.aliases),
                            "input_rows": len(pairs),
                            "suffix_tokens": self.suffix_tokens}))
-        # a document whose answer named no label has no row
         labeled = [index for index, label in enumerate(plan.labels)
                    if label is not None]
         scored = self._label_rows(labeled)

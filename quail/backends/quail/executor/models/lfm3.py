@@ -22,11 +22,8 @@ from quail.backends.quail.executor.attention import Engine
 from quail.backends.quail.executor.models import lfm3_kernels as kernels
 from quail.backends.quail.executor.models.base import ModelPipeline
 
-# where transformers puts the language model in each checkpoint type
 LANGUAGE_MODEL = {"lfm3": "model", "lfm3_vl": "model.language_model"}
-# the parts of a checkpoint the text pass does not read
 SKIPPED_PARTS = ("model.vision_tower.", "model.multi_modal_projector.")
-# each layer's tensors, by layer kind, under layers.<index>.
 LAYER_TENSORS = {
     "conv": ("conv.in_proj", "conv.out_proj", "conv.conv"),
     "attention": ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
@@ -106,7 +103,6 @@ def rotary_tables(torch, config, layer_type, max_positions, device):
                  for t in (angles.cos(), angles.sin()))
 
 
-# the block of the fp8 weights and activations, as Quail's fp8 GEMM reads them
 FP8_BLOCK = 128
 
 
@@ -198,8 +194,6 @@ def load_lfm3(path, device="cuda", max_positions=None, *, quantize_fp8=False):
             is_deep_gemm_e8m0_used,
             per_block_cast_to_fp8,
         )
-        # whole 128-row blocks, so the fp8 GEMM's output columns align;
-        # the padding rows are zero and their columns are dropped
         padded = -(-rows // FP8_BLOCK) * FP8_BLOCK
         if padded != rows:
             weight = torch.cat((weight, weight.new_zeros(padded - rows,
@@ -209,7 +203,6 @@ def load_lfm3(path, device="cuda", max_positions=None, *, quantize_fp8=False):
         return SimpleNamespace(weight=quantized, weight_scale_inv=scale,
                                out_features=rows)
 
-    # the execution layout: q, k, v, and the gate fused, and w1 with w3
     layers = []
     for index, kind in enumerate(config["layer_types"]):
         def own(name, index=index):
@@ -295,8 +288,6 @@ class Lfm3Pipeline(ModelPipeline):
             arena, num_q_heads=spec.num_q_heads, num_kv_heads=spec.num_kv_heads,
             head_dim=spec.d_head, rotary=None,
             fp8=spec.weight_precision == "fp8")
-        # per attention layer kind, its [cos | sin] table, as the fused
-        # q/k norm and rotary kernel reads it
         self.cos_sin = {kind: self.engine.torch.cat(tables, -1).contiguous()
                         for kind, tables in model.rotary.items()}
         attention = next(layer for layer in self.layers if layer.kind != "conv")

@@ -86,8 +86,8 @@ def test_a_distinct_fetches_one_row_of_each_selected_value():
 --- SELECT DISTINCT r.stars FROM reviews r WHERE AI_FILTER(PROMPT('kind: {0}', r.body))
     ---
 plan
-  __quail_answer_1 = ai_filter('kind: {0}', r.body), filter: __quail_answer_1, fetch: 1
-      per [stars], returns: []
+  __quail_answer_1 = ai_filter('kind: {0}', r.body), inline_predicate: __quail_answer_1,
+      row_limit: 1 per [stars], returns: []
 asked 4 of 6
   'kind: {0}': k0 FALSE, k1 TRUE, k2 TRUE, k4 TRUE
 rows 3
@@ -98,8 +98,8 @@ rows 3
 --- SELECT * FROM (SELECT DISTINCT r.stars FROM reviews r WHERE AI_FILTER(PROMPT('kind:
     {0}', r.body))) d WHERE d.stars > 3 ---
 plan
-  __quail_answer_1 = ai_filter('kind: {0}', r.body), filter: __quail_answer_1, fetch: 1
-      per [stars], returns: []
+  __quail_answer_1 = ai_filter('kind: {0}', r.body), inline_predicate: __quail_answer_1,
+      row_limit: 1 per [stars], returns: []
 asked 3 of 4
   'kind: {0}': k0 FALSE, k1 TRUE, k2 TRUE
 rows 2
@@ -109,7 +109,7 @@ rows 2
 --- SELECT DISTINCT AI_CLASSIFY(PROMPT('tone: {0}', r.body), ['a', 'b', 'c']) AS t FROM
     reviews r ---
 plan
-  t = ai_classify('tone: {0}', r.body, make_array('a', 'b', 'c')), fetch: 1 per [t]
+  t = ai_classify('tone: {0}', r.body, make_array('a', 'b', 'c')), row_limit: 1 per [t]
 asked 6 of 6
   'tone: {0}': k0 'a', k1 'b', k2 'c', k3 'c', k4 'c', k5 'c'
 rows 3

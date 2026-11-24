@@ -1,29 +1,3 @@
-//! Which of a region's columns a dynamic filter may read.
-//!
-//! A join or a top-k sort hands the operators below it a dynamic
-//! filter: a test of one of their columns that tightens as it runs.
-//! DataFusion 55.2 maps the filter's column into each operator below by
-//! name, to the first column of that name. Below a join of two tables
-//! with an `id` each, a filter of the second `id` then reads the first
-//! (tests/integration/dynamic_filter.rs), and a region that took it
-//! would drop rows the query returns.
-//!
-//! [`GuardRegionFilters`] runs before DataFusion pushes dynamic
-//! filters. It walks from the plan's root to each
-//! [`ModelRegionExec`], following every column name a filter may
-//! arrive on:
-//!
-//! - a hash join's keys and a top-k sort's sort columns start a filter
-//!   on the operator's input, mapped correctly;
-//! - a filter that passes into an input with two columns of its name
-//!   may read the wrong one from there down;
-//! - a SELECT list passes a filter on to the columns its expression
-//!   reads, and may read the wrong one when two of its outputs share
-//!   the name.
-//!
-//! The region takes a dynamic filter only when every column it reads
-//! arrived mapped correctly. A region the rule did not visit takes none.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -41,16 +15,10 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 
 use super::exec::ModelRegionExec;
 
-/// The rule before which [`GuardRegionFilters`] runs: DataFusion's
-/// pushdown of dynamic filters.
 pub(crate) const BEFORE_RULE: &str = "FilterPushdown(Post)";
 
-/// For each column name a dynamic filter may arrive on, whether an
-/// operator above may have mapped it to another column of that name.
 type Arriving = BTreeMap<String, bool>;
 
-/// Marks each [`ModelRegionExec`] with the columns a dynamic filter may
-/// read, as the module explains.
 #[derive(Debug, Default)]
 pub struct GuardRegionFilters;
 
@@ -90,7 +58,6 @@ fn guard(plan: Arc<dyn ExecutionPlan>, arriving: &Arriving) -> Result<Arc<dyn Ex
             .filter(|(name, wrong)| !**wrong && !shared(&schema, name))
             .map(|(name, _)| name.clone())
             .collect();
-        // a region's inputs are below the model: no filter passes it
         let inputs = children
             .into_iter()
             .map(|input| guard(input, &Arriving::new()))
@@ -111,7 +78,6 @@ fn guard(plan: Arc<dyn ExecutionPlan>, arriving: &Arriving) -> Result<Arc<dyn Ex
     )
 }
 
-/// The filters that may arrive at `child`, input `index` of `plan`.
 fn below(
     plan: &Arc<dyn ExecutionPlan>,
     index: usize,
@@ -141,7 +107,6 @@ fn below(
             pass(name, *wrong);
         }
     }
-    // the filters this operator starts read its input's own columns
     let mut start = |name: &str| {
         found.entry(name.to_string()).or_insert(false);
     };

@@ -65,8 +65,7 @@ class AsyncAnswers:
     the event and reads the answers without stalling the GPU stream.
     """
 
-    dtype = None    # answers arrive as Python lists of bits
-    # the readout contract a stage reads: one trailing row, no normalizer
+    dtype = None
     trailing_rows = 1
     normalize = False
 
@@ -115,10 +114,7 @@ def answer_rows(rows_per_answer) -> tuple[np.ndarray, np.ndarray]:
 class _HostReadout:
     """Copy readout tensors asynchronously using reusable pinned buffers."""
 
-    # the rows a stage reads at the end of each suffix
     trailing_rows = 1
-    # whether label scores are normalized over the vocabulary, for
-    # readouts that score labels
     normalize = False
 
     def __init__(self, torch):
@@ -163,8 +159,6 @@ class AsyncLabelLogprobs(_HostReadout):
         softcap: The cap of the model's logits, or 0 for none.
     """
 
-    # rows per head block: every block reads the whole head, so few big
-    # blocks; 512 x 151,936 logits in bf16 and float32 are 445 MiB
     BLOCK_ROWS = READOUT_BLOCK_ROWS
 
     def __init__(self, torch, F, head, targets, rows=1, normalize=True,
@@ -223,8 +217,6 @@ class AsyncLabelLogprobs(_HostReadout):
             answers = torch.full((len(rows_per_answer), self.rows,
                                   values.shape[1]), float("nan"),
                                  dtype=torch.float32, device=values.device)
-            # copied from pinned memory, so the host does not wait for
-            # the forward pass ahead of the copy on the stream
             answer_index, row_index = (
                 torch.from_numpy(index).pin_memory().to(
                     values.device, non_blocking=True)
@@ -416,8 +408,6 @@ def pointer_spans(torch, F, rows, queries, firsts, states, span_tokens):
     def tensor(array):
         return torch.from_numpy(np.ascontiguousarray(array)).to(device)
 
-    # each slot against every row of the chunk: (slots, rows); a slot
-    # then keeps only its own answer's document rows
     scores = queries @ rows.T / math.sqrt(rows.shape[-1])
     valid = np.arange(widest)[None, :] < states[:, None]
     columns = np.where(valid, firsts[:, None] + np.arange(widest), 0)
@@ -434,8 +424,6 @@ def pointer_spans(torch, F, rows, queries, firsts, states, span_tokens):
     index = (start[:, 1:] + windows[:, 0]).argmax(-1)
     last = indices[:, 0].gather(1, index[:, None])[:, 0] + 1
     at = torch.stack((index + 1, last), -1).float()
-    # nothing when P(found) is under one half, or when the answer has no
-    # document row past the first
     nothing = (found < 0.5) | tensor(states == 1)
     at = torch.where(nothing[:, None], torch.zeros_like(at), at)
     return torch.cat((at, found[:, None]), -1)
@@ -472,7 +460,6 @@ class AsyncPassReadout(_SlotReadout):
         kinds = np.asarray(() if slot_kinds is None else slot_kinds)
         self.slots = len(kinds)
         self.code = np.flatnonzero(kinds == "code")
-        # start then end, read by read
         self.read = np.flatnonzero((kinds == "start") | (kinds == "end"))
         self.span_tokens = span_tokens
 
@@ -519,7 +506,6 @@ class DecisionHead:
         ValueError: The weights are not exactly TENSORS.
     """
 
-    # every tensor of decision_head.safetensors, by name
     TENSORS = frozenset((
         "candidate_norm.weight", "candidate_norm.bias", "query_norm.weight",
         "query_norm.bias", "key.weight", "query.weight", "candidate_mlp.weight",
@@ -698,7 +684,7 @@ class AsyncDecisions(DecisionRows):
     The options are No then Yes; the bit is 1 when Yes scores above No.
     """
 
-    dtype = None    # answers arrive as Python lists of bits
+    dtype = None
 
     def submit(self, normed, rows_per_answer=None):
         scores = self.scores(normed, rows_per_answer)
@@ -716,7 +702,7 @@ class AsyncDecisionScores(DecisionRows):
     """Non-blocking AI.SCORE readout of a decision head: P(Yes) over No and Yes."""
 
     dtype = np.float32
-    rows = None    # scores no answer rows of the output head
+    rows = None
 
     def submit(self, normed, rows_per_answer=None):
         scores = self.scores(normed, rows_per_answer)

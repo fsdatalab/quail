@@ -919,3 +919,22 @@ def test_an_answers_text_so_far_is_its_tokens_decoded_from_the_first():
     # each step decodes the new tokens and the piece before them, not
     # the answer from its first token
     assert max(tokenizer.calls) <= 8
+
+
+def test_a_replay_that_cannot_reserve_lets_resident_replays_go_on():
+    arena = make_arena(Setup(path="unified", pages=7, page_tokens=2))
+    decoder = SimpleNamespace(
+        map=np.array([0, 0]), inflight=np.array([0, 0]),
+        copy_pending=np.array([True, False]),
+        written={0: np.array([3, 3])}, origin=np.array([4, 4]),
+        limits=np.array([8]),
+        kv=SimpleNamespace(set_pages=lambda a, pages: None))
+    executor = SimpleNamespace(
+        decoder=decoder, arena=arena, keys=[("m", 0), ("m", 1)],
+        prefix_lengths=[4, 4], capacity_extra=2, _extends=False,
+        recomputing={0: 0, 1: 0})
+    replays = StageExecutor._replays.__get__(executor)
+    for a, _, end in replays(3)[0]:
+        executor.recomputing[a] = end
+    decoder.copy_pending[:] = False
+    assert replays(3)[0] == [(1, 3, 6)]

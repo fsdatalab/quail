@@ -1,14 +1,3 @@
-//! Plan a model region in Rust: tokenize the documents it reads, measure
-//! them, and search its physical plans.
-//!
-//! [`Planner::plan`] takes a region's operators and the rows of each
-//! table it scans. For each scan it tokenizes the document column into
-//! an in-memory token store, and keeps the value columns the executor
-//! reads; Python's `TokenStore` and `ScanInput` read both over the same
-//! buffers. It computes the statistics the planner reads from them, then
-//! runs the column placements and the plan search with the model's
-//! tokenizer.
-
 use quail_planner::constants::{NULL_DOCUMENT, SAMPLE_ROWS};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -26,20 +15,16 @@ use quail_planner::inputs::{
 };
 use quail_planner::operators::Operators;
 use quail_planner::operators::{Scan, ScanColumn};
-use quail_planner::optimize::Selected;
 use quail_planner::physical::ValueExpression;
-use quail_planner::placements::{Alternative, placements};
+use quail_planner::plan::optimize::Selected;
+use quail_planner::plan::placements::{Alternative, placements};
 
-/// The configuration a region is planned for.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Settings {
-    /// The model's spec, as Python's codec writes it without type tags.
     pub model: serde_json::Value,
-    /// The device's spec, likewise.
     pub device: serde_json::Value,
     pub gpus: i64,
     pub canvas_draws: i64,
-    /// Whether a run reports its GPU seconds and chunks.
     #[serde(default)]
     pub gpu_timing: bool,
     #[serde(default)]
@@ -47,71 +32,47 @@ pub struct Settings {
     #[serde(default)]
     pub order: Option<String>,
     pub backend: String,
-    /// The physical rules, in the order they apply.
     pub physical_rules: Vec<String>,
-    /// How a request backend, such as stock vLLM, submits its operators;
-    /// None plans for Quail's backend.
     #[serde(default)]
-    pub request: Option<quail_planner::request_plan::RequestSettings>,
+    pub request: Option<quail_planner::plan::request_plan::RequestSettings>,
 }
 
-/// The rows of one table a region scans.
 pub struct TableRows {
-    /// What the rows are, such as a registered provider's content
-    /// identity, when they are the same for every query; the token store
-    /// of a table with an identity is kept for later queries.
     pub identity: Option<String>,
     pub schema: arrow::datatypes::SchemaRef,
     pub batches: Vec<RecordBatch>,
 }
 
-/// The message of a region whose document is an expression, which
-/// [`Planner::plan`] does not tokenize.
 pub const DOCUMENT_EXPRESSION: &str = "a document must be a column or a struct field";
 
-/// What the executor reads for one scan.
 #[derive(Debug, Clone)]
 pub struct ScanInputs {
     pub alias: String,
-    /// The token store of the scan's document column.
     pub tokens: Arc<TokenStore>,
-    /// The value columns, in the scan's order, over the rows' buffers.
     pub columns: crate::shared::Table,
 }
 
-/// A planned region as JSON, and what its scans read.
 pub type PlannedRegion = (String, Vec<ScanInputs>);
 
-/// A region's selected physical plan, the operators it lowers, and the
-/// context it was planned in.
 pub struct Planned {
     pub selected: Selected,
     pub operators: Operators,
-    /// The planning context's fields, as Python's planner reads them.
     pub fields: serde_json::Value,
 }
 
-/// What [`Planner::plan`] returns for a region, beside its scans.
 pub enum PlanOutcome {
-    /// Quail's backend's plan, priced.
     Planned(Box<Planned>),
-    /// The refusal of every alternative.
     Refused(Refusal),
-    /// A request backend's plan, which nothing prices, as JSON.
     Fixed(serde_json::Value),
 }
 
-/// A region's column placements, its scans' inputs, and the planning
-/// context's fields, before a backend lowers it.
 pub struct Prepared {
     pub alternatives: Vec<Alternative>,
-    /// The planning context's fields, as Python's planner reads them.
     pub fields: serde_json::Value,
     pub scans: Vec<ScanInputs>,
     measured: Measured,
 }
 
-/// What the Quail backend's search reads of a region's scans.
 struct Measured {
     document_tokens: BTreeMap<String, Vec<i64>>,
     first_documents: BTreeMap<String, Vec<bool>>,
@@ -121,14 +82,9 @@ struct Measured {
     pair_fractions: BTreeMap<usize, f64>,
 }
 
-/// Plans regions for one session: holds the model's tokenizer, and the
-/// token stores of the tables its queries read whole.
 pub struct Planner {
     tokenizer: HfTokenizer,
-    /// (identity, document column, whether it holds character ranges)
-    /// -> the token store of a table read whole, kept for later queries.
     stores: Mutex<HashMap<(String, String, bool), Arc<TokenStore>>>,
-    /// The first token id of each image the session's documents hold.
     images: Mutex<crate::images::ImageIds>,
 }
 
@@ -143,11 +99,6 @@ impl std::fmt::Debug for Planner {
 }
 
 impl Planner {
-    /// A planner with the `tokenizer.json` at `tokenizer_file`.
-    ///
-    /// # Errors
-    ///
-    /// The tokenizer does not read.
     pub fn new(tokenizer_file: &Path) -> Result<Self, CompileError> {
         Ok(Self {
             tokenizer: HfTokenizer::from_file(tokenizer_file).map_err(arrow_error)?,
@@ -156,19 +107,10 @@ impl Planner {
         })
     }
 
-    /// The model's tokenizer.
     pub fn tokenizer(&self) -> &HfTokenizer {
         &self.tokenizer
     }
 
-    /// Place the column operators of `found`, tokenize each scan's
-    /// documents from `tables` and keep its value columns, and measure
-    /// them: what every backend plans from.
-    ///
-    /// # Errors
-    ///
-    /// A scanned table is missing, or a document is an expression or not
-    /// text.
     pub fn prepare(
         &self,
         found: &Operators,
@@ -181,8 +123,6 @@ impl Planner {
                 .iter()
                 .map(|alternative| &alternative.operators),
         );
-        // AI.EXTRACT places its answers in its documents' text by the
-        // character range of each token
         let extracted: Vec<String> = alternatives
             .iter()
             .flat_map(|alternative| &alternative.operators.extracts)
@@ -208,7 +148,6 @@ impl Planner {
             let sizing = crate::images::ImageSizing::of_model(&settings.model);
             let store = self.token_store(scan, rows, extracted.contains(&scan.alias), sizing)?;
             let mut names = scan.columns.clone();
-            // the executor reads the document's text to locate answers in it
             if let Some(source) = source_column(&scan.column)
                 && !names.contains(&source)
             {
@@ -238,8 +177,6 @@ impl Planner {
                         .collect(),
                 );
             }
-            // a document_isolated model reads each document as one block,
-            // so a shared prefix's KV differs from document to document
             let tree = if settings.model["attention_mask"] == "document_isolated" {
                 let count = store.lengths().len();
                 PrefixTree {
@@ -299,16 +236,6 @@ impl Planner {
         })
     }
 
-    /// Plan `found` over `tables`, each scanned table's rows by provider
-    /// name, for `settings`.
-    ///
-    /// Returns the plan, or the refusal of every alternative, and what
-    /// the region's scans read.
-    ///
-    /// # Errors
-    ///
-    /// A scanned table is missing, a document column is not text, or
-    /// planning fails.
     pub fn plan(
         &self,
         found: &Operators,
@@ -368,8 +295,11 @@ impl Planner {
             .iter()
             .map(|alternative| (alternative.operators.clone(), alternative.rules.clone()))
             .collect();
-        let searched =
-            quail_planner::optimize::search_plan(&operators, &context, &settings.physical_rules)?;
+        let searched = quail_planner::plan::optimize::search_plan(
+            &operators,
+            &context,
+            &settings.physical_rules,
+        )?;
         let outcome = match searched {
             Ok(selected) => PlanOutcome::Planned(Box::new(Planned {
                 operators: alternatives[selected.alternative].operators.clone(),
@@ -381,8 +311,6 @@ impl Planner {
         Ok((outcome, files))
     }
 
-    /// The token store of a scan's document column: a table read whole
-    /// keeps its store for later queries.
     fn token_store(
         &self,
         scan: &Scan,
@@ -396,7 +324,6 @@ impl Planner {
             .map(|identity| (identity.clone(), format!("{:?}", scan.column), with_offsets));
         if let Some((identity, column, _)) = &key {
             let stores = self.stores.lock().expect("the stores lock");
-            // a store with character ranges also serves a scan without
             let found = stores
                 .get(&(identity.clone(), column.clone(), true))
                 .or_else(|| {
@@ -454,7 +381,6 @@ impl Planner {
     }
 }
 
-/// The columns `names` of the rows, over the rows' buffers.
 fn value_columns(names: &[String], rows: &TableRows) -> Result<crate::shared::Table, CompileError> {
     let missing = |name: &String| CompileError::new(format!("no column {name}"));
     let indices = names
@@ -479,8 +405,6 @@ fn value_columns(names: &[String], rows: &TableRows) -> Result<crate::shared::Ta
     Ok((schema, batches))
 }
 
-/// `columns` with the [`NULL_DOCUMENT`] column, when a document of the
-/// scan is NULL: the executor asks the model about no such row.
 fn with_null_documents(
     columns: crate::shared::Table,
     column: &ScanColumn,
@@ -501,7 +425,6 @@ fn with_null_documents(
                 .ok_or_else(|| CompileError::new(format!("no column {name}")))?,
             (ScanColumn::Expression(_), None) => unreachable!("an expression is built"),
         };
-        // an untyped NULL has no validity buffer: count what reads as NULL
         found |= values.logical_null_count() > 0;
         masks.push(Arc::new(
             arrow::compute::is_null(&values).map_err(arrow_error)?,
@@ -530,8 +453,6 @@ fn with_null_documents(
     Ok((schema, batches))
 }
 
-/// The document and value columns each provider must materialize, including
-/// columns read only by a different placement alternative.
 pub(crate) fn required_columns(operators: &Operators) -> HashMap<String, Vec<String>> {
     let alternatives = placements(operators);
     let scans = scans_of(
@@ -551,7 +472,6 @@ pub(crate) fn required_columns(operators: &Operators) -> HashMap<String, Vec<Str
     required
 }
 
-/// Each alias's scan, with the value columns any alternative reads.
 fn scans_of<'a>(alternatives: impl Iterator<Item = &'a Operators>) -> Vec<Scan> {
     let mut found: Vec<Scan> = Vec::new();
     for operators in alternatives {
@@ -571,8 +491,6 @@ fn scans_of<'a>(alternatives: impl Iterator<Item = &'a Operators>) -> Vec<Scan> 
     found
 }
 
-/// The values of a scan's document column in one batch, the column
-/// built as `built` when it is an expression.
 fn document_values(
     column: &ScanColumn,
     built: Option<&PhysicalValue>,
@@ -591,9 +509,6 @@ fn document_values(
     Ok(values)
 }
 
-/// The fraction of each join's cross product its equalities keep,
-/// estimated from the first rows of each side, by join position. A
-/// join's filter keeps the default selectivity of those pairs.
 fn pair_fractions(
     found: &Operators,
     scans: &[Scan],
@@ -650,17 +565,12 @@ fn first_rows(rows: &TableRows) -> Result<RecordBatch, CompileError> {
     Ok(joined.slice(0, joined.num_rows().min(SAMPLE_ROWS)))
 }
 
-/// The pairs whose keys are equal over the cross product of two samples:
-/// the sum over the keys both sides hold of the product of their counts,
-/// over the product of the sample sizes; a null key matches nothing, and
-/// samples that share no key still give one pair.
 fn estimate_pair_fraction(left: &[ArrayRef], right: &[ArrayRef]) -> Result<f64, CompileError> {
     let rows = |keys: &[ArrayRef]| keys.first().map_or(0, |key| key.len());
     let (num_left, num_right) = (rows(left), rows(right));
     if num_left == 0 || num_right == 0 {
         return Ok(0.0);
     }
-    // each side's keys take the left side's types, as the join compares them
     let types: Vec<DataType> = left.iter().map(|key| key.data_type().clone()).collect();
     let counts = |keys: &[ArrayRef]| -> Result<HashMap<Vec<u8>, f64>, CompileError> {
         let typed: Vec<ArrayRef> = keys
@@ -695,8 +605,6 @@ fn estimate_pair_fraction(left: &[ArrayRef], right: &[ArrayRef]) -> Result<f64, 
     Ok(pairs.max(1.0) / (num_left as f64 * num_right as f64))
 }
 
-/// The table column a document reads, or a struct column it reads a
-/// field of.
 pub(crate) fn source_column(column: &ScanColumn) -> Option<String> {
     fn root(expression: &ValueExpression) -> Option<String> {
         match expression {
@@ -719,18 +627,14 @@ fn is_column(expression: &ValueExpression) -> bool {
     }
 }
 
-/// A request backend's plan of the first alternative it does not refuse,
-/// as Python's backend search selected it: a request backend prices no
-/// plan, so ties go to the earlier alternative. The plan's settings list
-/// every alternative's outcome under `candidates`.
 fn request_outcome(
     alternatives: &[Alternative],
     context: &PlanningContext,
-    request: &quail_planner::request_plan::RequestSettings,
+    request: &quail_planner::plan::request_plan::RequestSettings,
 ) -> Result<PlanOutcome, CompileError> {
     let mut found = Vec::new();
     for alternative in alternatives {
-        found.push(quail_planner::request_plan::request_plan(
+        found.push(quail_planner::plan::request_plan::request_plan(
             &alternative.operators,
             context,
             request,
@@ -767,16 +671,10 @@ fn request_outcome(
     })))
 }
 
-/// Operators as JSON text, as Python passes them back to Rust.
-///
-/// # Errors
-///
-/// The operators do not write.
 pub fn operators_json(found: &Operators) -> Result<String, CompileError> {
     serde_json::to_string(found).map_err(arrow_error)
 }
 
-/// A refusal's fields as JSON.
 pub fn refusal_json(refusal: &Refusal) -> serde_json::Value {
     serde_json::json!({
         "reasons": refusal.reasons, "constraint": refusal.constraint,
@@ -784,12 +682,6 @@ pub fn refusal_json(refusal: &Refusal) -> serde_json::Value {
     })
 }
 
-/// A region's outcome as JSON: a refusal's fields under `refusal`, a
-/// request backend's plan, or Quail's plan as [`planned_json`] writes it.
-///
-/// # Errors
-///
-/// The operators do not write.
 pub fn outcome_json(outcome: &PlanOutcome) -> Result<serde_json::Value, CompileError> {
     Ok(match outcome {
         PlanOutcome::Planned(planned) => planned_json(planned)?,
@@ -798,12 +690,6 @@ pub fn outcome_json(outcome: &PlanOutcome) -> Result<serde_json::Value, CompileE
     })
 }
 
-/// A planned region as JSON: the plan's envelope, estimates, and pricer,
-/// the chosen operators, and the context fields.
-///
-/// # Errors
-///
-/// The operators do not write.
 pub fn planned_json(planned: &Planned) -> Result<serde_json::Value, CompileError> {
     let plan = &planned.selected.plan;
     Ok(serde_json::json!({

@@ -334,8 +334,6 @@ class PiecewiseGraphs:
         torch = engine.torch
         buffers = captured.buffers
         started = time.perf_counter()
-        # The allocator reuses a pool's freed blocks only on the stream
-        # that freed them, so every capture shares one stream.
         stream = self.stream
         current = torch.cuda.current_stream()
         stream.wait_stream(current)
@@ -357,9 +355,6 @@ class PiecewiseGraphs:
                     graphs.append(graph)
             current.wait_stream(stream)
             stream.synchronize()
-            # The pool's segments stay reserved until its graphs die. A
-            # query's own tensors live outside the pool, so a capture
-            # during a query counts only the pool and the buffers.
             self.captured_bytes = self.buffer_bytes + sum(
                 segment["total_size"]
                 for segment in torch.cuda.memory_snapshot()

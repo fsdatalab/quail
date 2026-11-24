@@ -1,13 +1,9 @@
-//! The prefix statistics of a small hand-made document set.
-
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array, LargeListArray};
 use arrow::datatypes::Int32Type;
 use quail_planner::inputs::{Documents, PrefixIndex, ReaderGroup, first_documents, last_tokens};
 
-/// Two documents that share a prefix with a third, an exact duplicate,
-/// an empty document, and a prefix of another document.
 fn tokens() -> LargeListArray {
     let documents: [&[i32]; 6] = [
         &[1, 2, 3, 4, 5],
@@ -31,7 +27,6 @@ fn documents_sort_by_tokens_and_share_all_but_their_last_token() {
     let batches = [tokens()];
     let index = PrefixIndex::new(&Documents::new(&batches));
     assert_eq!(index.order, vec![3, 5, 0, 2, 1, 4]);
-    // document 2 equals document 0 but computes its last token
     assert_eq!(index.shared, vec![2, 4, 4, 0, 0, 0]);
 }
 
@@ -61,7 +56,6 @@ fn readers_of_one_prefix_group_under_one_parent() {
         ]
     );
 
-    // at four tokens a page, document 0 borrows nothing from document 5
     let tree = index.tree(4);
     assert_eq!(tree.shared, vec![0, 4, 4, 0, 0, 0]);
     assert_eq!(tree.parent, vec![None, Some(0), Some(0), None, None, None]);

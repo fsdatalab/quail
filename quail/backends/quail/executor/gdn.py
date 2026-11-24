@@ -120,8 +120,6 @@ def plan_phases(arena, groups, stage):
         ArenaFullError: Every checkpoint slot belongs to a pinned key.
     """
     undo = []
-    # a later group's slot allocation must not evict a parent that an
-    # earlier group reads, or the two would share one slot
     parents = [group["borrow_key"] for group in groups
                if group["fresh"] and group["start"]
                and group.get("borrow_key") is not None]
@@ -129,9 +127,6 @@ def plan_phases(arena, groups, stage):
     try:
         return _plan_phases(arena, groups, stage, undo)
     except Exception:
-        # a failed plan leaves no record or slot for a state it never
-        # computed, so a retry after the chunk splits asks at the old
-        # length and no borrower reads a share slot nothing wrote
         accounting = arena.accounting
         for kind, key, *rest in reversed(undo):
             if kind == "extension":
@@ -166,8 +161,6 @@ def _plan_phases(arena, groups, stage, undo):
         BorrowStateMissingError,
     )
 
-    # level 0 runs from zero state; level n >= 1 reads slots that a lower
-    # level wrote in this chunk or an earlier one
     levels = {}
     ready = {}
     lists = {name: ([], [], []) for name in ("suffix", "extension")}
@@ -199,7 +192,6 @@ def _plan_phases(arena, groups, stage, undo):
 
     all_transient = bool(groups) and all(_can_run_transient(g) for g in groups)
     extended_after = set()
-    # slots a question of this chunk reads at their current length
     suffix_slots = set()
     for group in (() if all_transient else groups):
         key = group["key"]
@@ -284,9 +276,6 @@ def _plan_phases(arena, groups, stage, undo):
         pure = bool(kept) and len(begins) == 1 and kept == ends[0] - begins[0]
         target = source
         if kept:
-            # the document-end checkpoint stays for a later operator
-            # that asks at the document's length; the retained suffix
-            # advances a second slot
             held = arena.extension(key)
             if held is not None and held[0] == source:
                 target = source
@@ -314,7 +303,6 @@ def _plan_phases(arena, groups, stage, undo):
         if pure:
             continue
         for begin, end in zip(begins, ends):
-            # an empty sequence would repeat a cu_seqlens entry
             if end <= begin:
                 raise ValueError(f"group {key!r}: a suffix holds no tokens")
             add("suffix", np.arange(begin, end, dtype=np.int64), source)
@@ -345,8 +333,6 @@ def _plan_phases(arena, groups, stage, undo):
                          and len(np.unique(writes_arr)) == len(writes_arr))
         same_unique = (unique_writes and reads_arr is not None
                        and np.array_equal(reads_arr, writes_arr))
-        # each moved state copies into its write slot before the phase runs
-        # in place, so no write slot may hold another sequence's read
         moved = None
         if unique_writes and reads_arr is not None and not same_unique:
             owner = {int(slot): index for index, slot in enumerate(writes_arr)}
@@ -409,7 +395,6 @@ def _plan_phases(arena, groups, stage, undo):
             phases.append(build("level0", rows, lengths, None,
                                 [pair[1] for pair in slots]))
             continue
-        # a one-token sequence is an answer's decode step
         single = [index for index, length in enumerate(lengths) if length == 1]
         rest = [index for index, length in enumerate(lengths) if length != 1]
         if rest:
@@ -431,8 +416,6 @@ def _plan_phases(arena, groups, stage, undo):
                             [pair[1] for pair in slots], output=False))
     return tuple(phases)
 
-
-# ---- kernel path ------------------------------------------------------
 
 def gdn_prefill_backend():
     """Return "flashinfer" or "triton" for the chunked recurrence.
@@ -478,8 +461,6 @@ def _flashinfer_delta_rule(q, k, v, g, beta, state, cu_seqlens,
         kwargs["output_state"] = output_state
     if state_indices is not None:
         kwargs["state_indices"] = state_indices
-    # FlashInfer 0.6.18 passes the bounds unconverted to the context-parallel
-    # kernel it picks for few sequences: int32 on SM100, int64 on SM90
     major = torch.cuda.get_device_capability(q.device)[0] if q.is_cuda else 0
     bounds = cu_seqlens.int() if major == 10 else cu_seqlens.long()
     result = chunk_gated_delta_rule(
@@ -567,7 +548,6 @@ def causal_conv_kernel(x, weight, phase, history, bias=None, activate=True,
         x.T, weight, bias, conv_states=conv_states,
         query_start_loc=phase.cu_seqlens, cache_indices=metadata.cache_indices,
         has_initial_state=metadata.has_initial_state,
-        # Slot zero holds the first sequence; no private slot is reserved.
         null_block_id=None,
         activation="silu" if activate else None, metadata=metadata)
     return out.T, (None if state_pool is not None else history[:len(phase.lengths)])
@@ -580,7 +560,6 @@ def _conv_history(arena, phase, layer_slot):
     if phase.read_slots is None:
         return None
     count = len(phase.lengths)
-    # vLLM specializes on capacity; powers of two bound the compiled variants.
     capacity = 1 << (count - 1).bit_length()
     source = arena.conv_state[:, layer_slot]
     history = source.new_empty((capacity, *source.shape[1:]))
@@ -588,13 +567,7 @@ def _conv_history(arena, phase, layer_slot):
     return history
 
 
-# a CUDA launch has at most this many blocks along its second grid axis,
-# and the kernel spends one per sequence and value head
 GRID_LIMIT = 65_535
-# A launch holds the state it gathered and the final state the kernel
-# writes: two copies per sequence of one layer. The pass budget reserves
-# one copy for each of CHECKPOINT_PASS_QUESTIONS questions, so a launch
-# takes half that many sequences.
 SEQUENCES_PER_LAUNCH = CHECKPOINT_PASS_QUESTIONS // 2
 
 
@@ -632,40 +605,50 @@ def _kernel_in_batches(spec, q, k, v, g, beta, load, store, phase, scale, *,
     return pieces[0] if len(pieces) == 1 else torch.cat(pieces)
 
 
-def _sm100_pool_delta_rule(spec, q, k, v, g, beta, arena, phase, layer_slot,
-                           *, output=None):
-    """Run SM100 FlashInfer GDN prefill directly against the arena state pool."""
+def _pool_delta_rule(spec, q, k, v, g, beta, arena, phase, layer_slot, *,
+                     output=None):
+    """Run FlashInfer GDN prefill against the arena state pool."""
     import torch
 
     count = len(phase.lengths)
-    per_launch = max(1, GRID_LIMIT // spec.gdn_value_heads)
-    pool = arena.gdn_state[:, layer_slot]
-    has_reads = phase.read_slots_i32 is not None
-    has_writes = phase.write_slots_i32 is not None
-    indices = phase.write_slots_i32 if has_writes else phase.read_slots_i32
-    initial = pool if has_reads else None
-    out_state = pool if has_writes else None
-    if count <= per_launch:
-        core, _ = _flashinfer_delta_rule(
-            q, k, v, g, beta, initial, phase.cu_seqlens, has_writes,
-            g_is_exp=True, output=output, output_state=out_state,
-            state_indices=indices)
-        return core
-    starts = [0]
-    for length in phase.lengths:
-        starts.append(starts[-1] + length)
+    has_reads = phase.read_slots is not None
+    has_writes = phase.write_slots is not None
+    is_sm100 = q.is_cuda and torch.cuda.get_device_capability(q.device)[0] == 10
+    direct = (is_sm100 and not has_reads
+              and (not has_writes or phase.unique_writes))
+    per_launch = max(
+        1,
+        GRID_LIMIT // spec.gdn_value_heads if direct
+        else min(GRID_LIMIT // spec.gdn_value_heads, SEQUENCES_PER_LAUNCH))
+    pool = arena.gdn_state[:, layer_slot] if (has_reads or has_writes) else None
     target = (output if output is not None else torch.empty(
         (q.shape[0], spec.gdn_value_heads, spec.gdn_value_dim),
         dtype=q.dtype, device=q.device))
+    low = 0
     for first in range(0, count, per_launch):
         last = min(count, first + per_launch)
-        low, high = starts[first], starts[last]
-        _flashinfer_delta_rule(
-            q[low:high], k[low:high], v[low:high], g[low:high],
-            beta[low:high], initial, phase.cu_seqlens[first:last + 1] - low,
-            has_writes, g_is_exp=True, output=target[low:high],
-            output_state=out_state,
-            state_indices=(None if indices is None else indices[first:last]))
+        high = (q.shape[0] if last == count
+                else low + sum(phase.lengths[first:last]))
+        bounds = phase.cu_seqlens[first:last + 1] - low
+        if direct:
+            indices = (phase.write_slots_i32[first:last]
+                       if has_writes else None)
+            _flashinfer_delta_rule(
+                q[low:high], k[low:high], v[low:high], g[low:high],
+                beta[low:high], None, bounds, has_writes, g_is_exp=True,
+                output=target[low:high],
+                output_state=pool if has_writes else None,
+                state_indices=indices)
+        else:
+            initial = pool[phase.read_slots[first:last]] if has_reads else None
+            _, final = _flashinfer_delta_rule(
+                q[low:high], k[low:high], v[low:high], g[low:high],
+                beta[low:high], initial, bounds, has_writes, g_is_exp=True,
+                output=target[low:high])
+            if has_writes:
+                copy_slots(final, torch.arange(last - first, device=q.device),
+                           phase.write_slots[first:last], dst_pool=pool)
+        low = high
     return target
 
 
@@ -736,18 +719,17 @@ def _gdn_kernels() -> dict:
                          mask=mask, other=0.0), mask=mask)
 
     @triton.jit
-    def copy_slots(pool_ptr, src_ptr, dst_ptr, stride_slot,
-                   WIDTH: tl.constexpr, BLOCK: tl.constexpr):
-        pair = tl.program_id(0)
-        offs = tl.program_id(1).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    def copy_slots(src_ptr, dst_ptr, src_index_ptr, dst_index_ptr, stride_src,
+                   stride_dst, WIDTH: tl.constexpr, BLOCK: tl.constexpr):
+        offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        pair = tl.program_id(1)
         mask = offs < WIDTH
-        src = tl.load(src_ptr + pair).to(tl.int64)
-        dst = tl.load(dst_ptr + pair).to(tl.int64)
-        tl.store(pool_ptr + dst * stride_slot + offs,
-                 tl.load(pool_ptr + src * stride_slot + offs, mask=mask),
+        src = tl.load(src_index_ptr + pair).to(tl.int64)
+        dst = tl.load(dst_index_ptr + pair).to(tl.int64)
+        tl.store(dst_ptr + dst * stride_dst + offs,
+                 tl.load(src_ptr + src * stride_src + offs, mask=mask),
                  mask=mask)
 
-    # PDL invariant: loads before gdc_wait read only weights and staged indices.
     @triton.jit
     def gdn_decode_step(
         x_ptr, a_ptr, b_ptr, a_log_ptr, dt_bias_ptr, state_ptr, state_rows_ptr,
@@ -843,20 +825,21 @@ def scatter_gdn_rows(core, rows, out):
     return out
 
 
-def copy_slots(pool, src, dst):
-    """Copy pool[src[i]] into pool[dst[i]]; no dst may also be a src."""
+def copy_slots(pool, src, dst, *, dst_pool=None):
+    """Copy pool[src[i]] into dst_pool[dst[i]]; within one pool no dst is a src."""
     from quail.backends.quail.executor.attention import launch_triton
 
+    target = pool if dst_pool is None else dst_pool
     count = src.shape[0]
     if count == 0:
-        return pool
-    assert pool[0].is_contiguous()
+        return target
+    assert pool[0].is_contiguous() and target[0].is_contiguous()
     width, block = pool[0].numel(), 4096
     launch_triton(
-        _gdn_kernels()["copy_slots"], (count, (width + block - 1) // block),
-        (pool, src, dst, pool.stride(0)),
+        _gdn_kernels()["copy_slots"], ((width + block - 1) // block, count),
+        (pool, target, src, dst, pool.stride(0), target.stride(0)),
         key=(width, block), kwargs=dict(WIDTH=width, BLOCK=block, num_warps=8))
-    return pool
+    return target
 
 
 def gdn_decode_step(conv_out, a, b, a_log, dt_bias, state_pool, state_rows, out,
@@ -903,8 +886,6 @@ def _move_states(arena, phase, layer_slot):
     arena.conv_state[phase.copy_writes, layer_slot] = (
         arena.conv_state[phase.copy_reads, layer_slot])
 
-
-# ---- the layer --------------------------------------------------------
 
 def short_conv_core(inputs, weight, phases, arena, layer_slot):
     """Run one short convolution layer's causal convolution.
@@ -974,11 +955,8 @@ def gdn_core(geometry, tensors, phases, arena, layer_slot, *, output=None):
            if not single_identity else None)
     scale = spec.gdn_key_dim ** -0.5
     use_flashinfer = qkv.is_cuda and gdn_prefill_backend() == "flashinfer"
-    is_sm100 = (use_flashinfer
-                and spec.gdn_key_dim == 128
-                and torch.cuda.get_device_capability(qkv.device)[0] == 10)
     for phase in active_phases:
-        span = getattr(phase, "contiguous_span", None)
+        span = phase.contiguous_span
         if single_identity:
             mixed_in = qkv
             a_in, b_in = tensors["a"], tensors["b"]
@@ -994,8 +972,6 @@ def gdn_core(geometry, tensors, phases, arena, layer_slot, *, output=None):
             a_in = tensors["a"].index_select(0, phase.rows)
             b_in = tensors["b"].index_select(0, phase.rows)
         decode = phase.state_rows is not None and phase.write_slots_i32 is not None
-        # the phase runs on its write slots in the arena pools after each
-        # moved state is copied there
         in_place = qkv.is_cuda and phase.write_slots_i32 is not None and (
             (phase.read_slots is None and phase.unique_writes)
             or phase.same_unique_slots or phase.moves_in_place)
@@ -1046,12 +1022,11 @@ def gdn_core(geometry, tensors, phases, arena, layer_slot, *, output=None):
             num_k_heads=spec.gdn_key_heads, head_k_dim=spec.gdn_key_dim,
             head_v_dim=spec.gdn_value_dim, apply_l2norm=True,
             output_g_exp=g_exp)
-        pool_ok = is_sm100 and (phase.write_slots is None or in_place)
-        if pool_ok:
+        if use_flashinfer and spec.gdn_key_dim == 128:
             direct_out = (out if single_identity
                           else out[span[0]:span[1]]
                           if phase.output and span is not None else None)
-            core = _sm100_pool_delta_rule(
+            core = _pool_delta_rule(
                 spec, q, k, v, g, b, arena, phase, layer_slot,
                 output=direct_out)
             if single_identity:

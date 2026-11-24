@@ -13,7 +13,6 @@ from quail.common.decode import DecodeCost
 class QuailModelExecution:
     """Quail model state shared by model nodes on one GPU executor."""
 
-    # the runner groups the operators a document flows through into chains
     groups_operators = True
 
     def __init__(self, context: GpuContext):

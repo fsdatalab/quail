@@ -190,8 +190,6 @@ class TokenLengths(Sequence):
         return values if dtype is None else values.astype(dtype, copy=False)
 
 
-# a model's tokenizer, run in Rust: the planner tokenizes documents with it
-# and the GPU worker encodes continuations and decodes answers with it
 Tokenizer = _quail_native.Tokenizer
 
 

@@ -1,10 +1,6 @@
-//! Token, attention, and KV work, as `quail/common/work.py` counts it.
+use crate::specs::ModelSpec;
+use std::ops::{Add, Div, Mul, Sub};
 
-use std::ops::{Add, Mul};
-
-use crate::cost::quantity::{Quantity, python_sum, sum_quantities};
-
-/// Tokens, full and sliding attention pairs, and KV and state movement.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Work {
     pub tokens: Quantity,
@@ -15,12 +11,8 @@ pub struct Work {
     pub sliding_kv_read: Quantity,
     pub state_written: Quantity,
     pub state_read: Quantity,
-    /// Tokens the model's SAE encodes, for `AI.SAE_FEATURES`.
     pub sae_encoded: Quantity,
-    /// Answer rows the model's head reads out.
     pub readout_rows: Quantity,
-    /// Head rows read, summed over the answer rows: an answer row that
-    /// reads the whole vocabulary counts the vocabulary's size.
     pub readout_head_rows: Quantity,
 }
 
@@ -63,9 +55,6 @@ impl Mul<f64> for &Work {
 }
 
 impl Work {
-    /// This work with `rows` answer rows read out, each reading
-    /// `head_rows` rows of the model's head, or the whole vocabulary
-    /// when `head_rows` is 0.
     pub fn with_readout(mut self, rows: f64, head_rows: i64, vocab: i64) -> Work {
         let head = if head_rows != 0 { head_rows } else { vocab };
         self.readout_rows = Quantity::Scalar(rows);
@@ -73,7 +62,6 @@ impl Work {
         self
     }
 
-    /// The work's counts, each summed over documents, in field order.
     pub fn values(&self) -> Vec<f64> {
         [
             &self.tokens,
@@ -93,8 +81,6 @@ impl Work {
         .collect()
     }
 
-    /// The work of counts in the order [`Work::values`] gives them; no
-    /// work for an empty list.
     pub fn from_values(values: &[f64]) -> Work {
         let at = |index: usize| Quantity::Scalar(values.get(index).copied().unwrap_or(0.0));
         Work {
@@ -112,7 +98,6 @@ impl Work {
         }
     }
 
-    /// Sum work over document arrays, leaving scalar counts unchanged.
     pub fn total(&self) -> Work {
         let sum = |value: &Quantity| Quantity::Scalar(value.total());
         Work {
@@ -130,11 +115,6 @@ impl Work {
         }
     }
 
-    /// Whether every count is no larger than the other record's.
-    ///
-    /// # Panics
-    ///
-    /// A count is an array; Python refuses to compare those too.
     pub fn dominates(&self, other: &Work) -> bool {
         let fields = |work: &Work| {
             [
@@ -160,12 +140,10 @@ impl Work {
     }
 }
 
-/// One per document of `shape`: `1.0 + 0.0 * np.asarray(shape)`.
 fn ones(value: f64, shape: &Quantity) -> Quantity {
     value + &(0.0 * shape)
 }
 
-/// Causal attention pairs, each token's own key included.
 pub fn triangle(n: &Quantity, window: i64) -> Quantity {
     if window != 0 {
         let visible = n.minimum(&Quantity::Scalar(window as f64));
@@ -175,7 +153,6 @@ pub fn triangle(n: &Quantity, window: i64) -> Quantity {
     }
 }
 
-/// Compute one document and its first suffix from nothing.
 pub fn scan(prefix: &Quantity, suffix: &Quantity, window: i64) -> Work {
     let n = prefix + suffix;
     Work {
@@ -192,7 +169,6 @@ pub fn scan(prefix: &Quantity, suffix: &Quantity, window: i64) -> Work {
     }
 }
 
-/// Attach one suffix to a prefix already in KV.
 pub fn ask(prefix: &Quantity, suffix: &Quantity, window: i64) -> Work {
     Work {
         tokens: suffix.clone(),
@@ -214,7 +190,6 @@ pub fn ask(prefix: &Quantity, suffix: &Quantity, window: i64) -> Work {
     }
 }
 
-/// Attach several independent suffixes to one prefix in KV.
 pub fn stream(prefix: &Quantity, suffixes: &[Quantity], window: i64) -> Work {
     let mut tokens = Quantity::Scalar(0.0);
     let mut pairs = Quantity::Scalar(0.0);
@@ -245,7 +220,6 @@ pub fn stream(prefix: &Quantity, suffixes: &[Quantity], window: i64) -> Work {
     }
 }
 
-/// One set-attention pass: a state, then its questions, nothing kept.
 pub fn packed(state: &Quantity, questions: &[f64], window: i64) -> Work {
     let asked = python_sum(questions.iter().copied());
     let n = state + asked;
@@ -274,7 +248,6 @@ pub fn packed(state: &Quantity, questions: &[f64], window: i64) -> Work {
     }
 }
 
-/// Append accepted tokens over sequential rounds, rereading KV each round.
 pub fn decode(prefix: &Quantity, rounds: &[f64], window: i64) -> Work {
     let mut work = Work::default();
     let mut prefix = prefix.clone();
@@ -301,4 +274,232 @@ pub fn decode(prefix: &Quantity, rounds: &[f64], window: i64) -> Work {
         };
     }
     work
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Quantity {
+    Scalar(f64),
+    Array(Vec<f64>),
+}
+
+impl Default for Quantity {
+    fn default() -> Self {
+        Quantity::Scalar(0.0)
+    }
+}
+
+impl From<f64> for Quantity {
+    fn from(value: f64) -> Self {
+        Quantity::Scalar(value)
+    }
+}
+
+impl From<Vec<f64>> for Quantity {
+    fn from(values: Vec<f64>) -> Self {
+        Quantity::Array(values)
+    }
+}
+
+impl Quantity {
+    pub fn zip_with(&self, other: &Quantity, f: impl Fn(f64, f64) -> f64) -> Quantity {
+        match (self, other) {
+            (Quantity::Scalar(a), Quantity::Scalar(b)) => Quantity::Scalar(f(*a, *b)),
+            (Quantity::Array(a), Quantity::Scalar(b)) => {
+                Quantity::Array(a.iter().map(|x| f(*x, *b)).collect())
+            }
+            (Quantity::Scalar(a), Quantity::Array(b)) => {
+                Quantity::Array(b.iter().map(|y| f(*a, *y)).collect())
+            }
+            (Quantity::Array(a), Quantity::Array(b)) => {
+                assert_eq!(a.len(), b.len(), "arrays of different lengths");
+                Quantity::Array(a.iter().zip(b).map(|(x, y)| f(*x, *y)).collect())
+            }
+        }
+    }
+
+    pub fn map(&self, f: impl Fn(f64) -> f64) -> Quantity {
+        match self {
+            Quantity::Scalar(a) => Quantity::Scalar(f(*a)),
+            Quantity::Array(a) => Quantity::Array(a.iter().map(|x| f(*x)).collect()),
+        }
+    }
+
+    pub fn minimum(&self, other: &Quantity) -> Quantity {
+        self.zip_with(other, |a, b| {
+            if a.is_nan() || b.is_nan() {
+                f64::NAN
+            } else {
+                a.min(b)
+            }
+        })
+    }
+
+    pub fn scalar(&self) -> Option<f64> {
+        match self {
+            Quantity::Scalar(value) => Some(*value),
+            Quantity::Array(_) => None,
+        }
+    }
+
+    pub fn is_array(&self) -> bool {
+        matches!(self, Quantity::Array(_))
+    }
+
+    pub fn total(&self) -> f64 {
+        match self {
+            Quantity::Scalar(value) => *value,
+            Quantity::Array(values) => numpy_sum(values),
+        }
+    }
+
+    pub fn is_nonzero(&self) -> bool {
+        self.scalar()
+            .map(|value| value != 0.0)
+            .expect("the truth of an array is ambiguous")
+    }
+}
+
+macro_rules! arithmetic {
+    ($trait:ident, $method:ident, $op:tt) => {
+        impl $trait<&Quantity> for &Quantity {
+            type Output = Quantity;
+            fn $method(self, other: &Quantity) -> Quantity {
+                self.zip_with(other, |a, b| a $op b)
+            }
+        }
+        impl $trait<Quantity> for Quantity {
+            type Output = Quantity;
+            fn $method(self, other: Quantity) -> Quantity {
+                (&self).$method(&other)
+            }
+        }
+        impl $trait<f64> for &Quantity {
+            type Output = Quantity;
+            fn $method(self, other: f64) -> Quantity {
+                self.map(|a| a $op other)
+            }
+        }
+        impl $trait<f64> for Quantity {
+            type Output = Quantity;
+            fn $method(self, other: f64) -> Quantity {
+                self.map(|a| a $op other)
+            }
+        }
+        impl $trait<&Quantity> for f64 {
+            type Output = Quantity;
+            fn $method(self, other: &Quantity) -> Quantity {
+                other.map(|b| self $op b)
+            }
+        }
+        impl $trait<Quantity> for f64 {
+            type Output = Quantity;
+            fn $method(self, other: Quantity) -> Quantity {
+                other.map(|b| self $op b)
+            }
+        }
+    };
+}
+
+arithmetic!(Add, add, +);
+arithmetic!(Sub, sub, -);
+arithmetic!(Mul, mul, *);
+arithmetic!(Div, div, /);
+
+pub fn numpy_sum(values: &[f64]) -> f64 {
+    pairwise_sum(values)
+}
+
+fn pairwise_sum(values: &[f64]) -> f64 {
+    const BLOCK: usize = 128;
+    let n = values.len();
+    if n < 8 {
+        let mut total = 0.0;
+        for value in values {
+            total += value;
+        }
+        total
+    } else if n <= BLOCK {
+        let mut partial = [0.0; 8];
+        partial.copy_from_slice(&values[..8]);
+        let whole = n - n % 8;
+        let mut index = 8;
+        while index < whole {
+            for lane in 0..8 {
+                partial[lane] += values[index + lane];
+            }
+            index += 8;
+        }
+        let mut total = ((partial[0] + partial[1]) + (partial[2] + partial[3]))
+            + ((partial[4] + partial[5]) + (partial[6] + partial[7]));
+        for value in &values[whole..] {
+            total += value;
+        }
+        total
+    } else {
+        let mut half = n / 2;
+        half -= half % 8;
+        pairwise_sum(&values[..half]) + pairwise_sum(&values[half..])
+    }
+}
+
+pub fn python_sum(values: impl IntoIterator<Item = f64>) -> f64 {
+    let mut total = 0.0_f64;
+    let mut compensation = 0.0_f64;
+    for value in values {
+        let next = total + value;
+        if total.abs() >= value.abs() {
+            compensation += (total - next) + value;
+        } else {
+            compensation += (value - next) + total;
+        }
+        total = next;
+    }
+    if compensation != 0.0 && compensation.is_finite() {
+        total += compensation;
+    }
+    total
+}
+
+pub fn sum_quantities(values: impl IntoIterator<Item = Quantity>) -> Quantity {
+    let values: Vec<Quantity> = values.into_iter().collect();
+    if values.iter().all(|value| !value.is_array()) {
+        return Quantity::Scalar(python_sum(values.iter().filter_map(Quantity::scalar)));
+    }
+    let mut total = Quantity::Scalar(0.0);
+    for value in values {
+        total = &total + &value;
+    }
+    total
+}
+
+pub fn filter_work(question_tokens: i64, mean_tokens: f64, model: &ModelSpec, first: bool) -> Work {
+    let mean = Quantity::Scalar(mean_tokens);
+    let question = Quantity::Scalar(question_tokens as f64);
+    if model.attention_mask == "set" {
+        packed(&mean, &[question_tokens as f64], model.sliding_window)
+    } else if first {
+        scan(&mean, &question, model.sliding_window)
+    } else {
+        ask(&mean, &question, model.sliding_window)
+    }
+}
+
+#[cfg(test)]
+mod quantity_tests {
+    use super::*;
+
+    #[test]
+    fn compensated_summation_keeps_a_small_term_beside_large_ones() {
+        assert_eq!(python_sum([1e16, 1.0, -1e16]), 1.0);
+    }
+
+    #[test]
+    fn a_scalar_broadcasts_over_an_array() {
+        let documents = Quantity::Array(vec![1.0, 2.0]);
+        assert_eq!(&documents * 2.0, Quantity::Array(vec![2.0, 4.0]));
+        assert_eq!(
+            documents.minimum(&Quantity::Scalar(1.5)),
+            Quantity::Array(vec![1.0, 1.5])
+        );
+    }
 }

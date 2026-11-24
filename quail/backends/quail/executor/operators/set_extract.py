@@ -99,7 +99,6 @@ def read_texts(spans, keep, documents, texts, head, vocabulary):
         text = texts[index]
         text = text.as_py() if hasattr(text, "as_py") else str(text)
         tokens = [int(token) for token in documents[index]][head:]
-        # a read row's document token is one before it: row 0 is nothing
         answers[index], characters[index] = token_span(
             text, tokens, vocabulary, int(spans[index, 0]) - 1,
             int(spans[index, 1]) - 1)

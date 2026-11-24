@@ -17,21 +17,19 @@ class PageArena:
         self.num_pages = num_pages
         self.page_tokens = page_tokens
         self.num_slots = num_slots
-        self.free_slots = list(range(num_slots - 1, -1, -1))    # stack
-        self.slots = {}    # key -> the checkpoint slot it holds
-        self.slot_tokens = {}    # key -> tokens its checkpoint covers
-        self.ext_slots = {}    # key -> slot of the state past retained suffix
-        self.ext_tokens = {}    # key -> tokens that second checkpoint covers
-        self.share_slots = {}    # (key, tokens) -> slot of the state there
-        self.free = list(range(num_pages - 1, -1, -1))    # stack
-        self.owned = {}       # key -> list of page ids it alone writes
-        self.borrowed = {}    # key -> leading page ids read from a parent
-        self.holds = np.zeros(num_pages, dtype=np.int32)    # page id -> its holders
-        self.tokens = {}      # key -> resident token count, borrowed included
-        self.pinned = set()    # current operators depend on these keys
-        self._retained_sizes = {}
-        self._retained_pages = 0
-        self.retained = {}     # key -> reusable prefix tokens
+        self.free_slots = list(range(num_slots - 1, -1, -1))
+        self.slots = {}
+        self.slot_tokens = {}
+        self.ext_slots = {}
+        self.ext_tokens = {}
+        self.share_slots = {}
+        self.free = list(range(num_pages - 1, -1, -1))
+        self.owned = {}
+        self.borrowed = {}
+        self.holds = np.zeros(num_pages, dtype=np.int32)
+        self.tokens = {}
+        self.pinned = set()
+        self.retained = {}
         self._retained_heap = []
         self._retained_versions = {}
         self._retention_version = 0
@@ -184,7 +182,6 @@ class PageArena:
         self.pinned.add(key)
 
     def _forget_retained(self, key):
-        self._retained_pages -= self._retained_sizes.pop(key, 0)
         self.retained.pop(key, None)
         self._retained_versions.pop(key, None)
 
@@ -195,25 +192,19 @@ class PageArena:
         self.pinned.discard(key)
         prefix_tokens = self.tokens[key]
         self._forget_retained(key)
-        # the pages evicting the key would free: those it alone holds
-        # now; a child freed later leaves more, so the count is a
-        # lower bound, and admission short of pages evicts anyway
-        pages = int((self.holds[self.table_pages(key)] == 1).sum())
+        pages = self._pages_alone(key)
         self.retained[key] = prefix_tokens
-        self._retained_sizes[key] = pages
-        self._retained_pages += pages
         self._retention_version += 1
         version = self._retention_version
         self._retained_versions[key] = version
         if priority is None:
-            # a key whose pages its children all share frees none alone
             priority = (self.retention_policy.priority(
                 key, prefix_tokens, max(1, pages))
                 if self.retention_policy
                 else (prefix_tokens / max(1, pages),))
         heapq.heappush(
             self._retained_heap,
-            (priority, version, key, pages, prefix_tokens),
+            (priority, version, key, prefix_tokens),
         )
 
     def configure_retention(self, policy, cap_pages: int) -> None:
@@ -236,14 +227,14 @@ class PageArena:
         victim = None
         while self._retained_heap:
             entry = heapq.heappop(self._retained_heap)
-            _, version, key, pages, prefix_tokens = entry
+            _, version, key, prefix_tokens = entry
             if self._retained_versions.get(key) != version:
                 continue
             if key in keep:
                 passed.append(entry)
                 continue
+            victim = key, self._pages_alone(key), prefix_tokens
             self._forget_retained(key)
-            victim = key, pages, prefix_tokens
             break
         for entry in passed:
             heapq.heappush(self._retained_heap, entry)
@@ -315,9 +306,12 @@ class PageArena:
     def resident_tokens(self) -> int:
         return sum(self.tokens.values())
 
+    def _pages_alone(self, key) -> int:
+        return int((self.holds[self.table_pages(key)] == 1).sum())
+
     @property
     def retained_pages(self) -> int:
-        return self._retained_pages
+        return sum(self._pages_alone(key) for key in self.retained)
 
     @property
     def retained_prefix_tokens(self) -> int:

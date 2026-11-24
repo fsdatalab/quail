@@ -1,5 +1,3 @@
-//! Optional engine properties must not hide Python initialization failures.
-
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 

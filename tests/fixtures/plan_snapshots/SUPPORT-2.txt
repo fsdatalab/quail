@@ -9,7 +9,7 @@ CooperativeExec
 model region:
 logical:
   Projection: a.id, u.id
-    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Does the customer's reply in DOCUMENT {1} disagree with, correct, or push back on what the agent said in DOCUMENT {0}? Answer TRUE if the reply objects to the agent's statement, rejects its proposal, or says the agent got something wrong, FALSE otherwise."), a.content, u.content), named_struct(Utf8("selectivity"), Float64(0.052648790058862))), filter: __quail_answer_1, returns: []
+    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Does the customer's reply in DOCUMENT {1} disagree with, correct, or push back on what the agent said in DOCUMENT {0}? Answer TRUE if the reply objects to the agent's statement, rejects its proposal, or says the agent got something wrong, FALSE otherwise."), a.content, u.content), named_struct(Utf8("selectivity"), Float64(0.052648790058862))), inline_predicate: __quail_answer_1, returns: []
       Inner Join: a.id = u.prev_assistant_id
         SubqueryAlias: a
           TableScan: support_messages projection=[id, content]

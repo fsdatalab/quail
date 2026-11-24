@@ -20,15 +20,12 @@ class SQLDialect(StrEnum):
     BQ = "bq"
 
 
-# a dialect -> DataFusion's name for it
 DATAFUSION_DIALECTS = {"snowflake": "Snowflake", "bq": "BigQuery"}
 
-# the start of a DataFusion error, which names its kind
 _ERROR_KINDS = ("Error during planning: ", "SQL error: ", "Schema error: ",
                 "External error: ", "CompileError: ")
 
 
-# what WHERE tests besides an AI call, in the refusal of anything else
 REGULAR_PREDICATES = (
     "=, <>, <, <=, >, >=, IN (literals), IS NULL, IS NOT NULL, LIKE, ILIKE, "
     "CONTAINS, STARTSWITH, ENDSWITH, REGEXP_LIKE, or a boolean column or scalar "
@@ -45,7 +42,6 @@ def _sql_text(expression: str) -> str:
 def compile_message(error: Exception, sql: str) -> str:
     """A DataFusion error's message, in the front end's words where it has them."""
     text = str(error).strip()
-    # DataFusion wraps rule failures (including lower_ai_calls) in a cause chain.
     text = re.split(r"\n\s*caused by\s*\n", text)[-1].strip()
     while prefix := next(
         (kind for kind in _ERROR_KINDS if text.startswith(kind)), None

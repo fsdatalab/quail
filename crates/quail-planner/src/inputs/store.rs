@@ -1,12 +1,3 @@
-//! Token stores: a document column's tokens as Arrow record batches in
-//! memory.
-//!
-//! The batches are the ones Python's `quail.common.tokens.TokenStore`
-//! reads: a `__quail_token_ids` column of token lists and a
-//! `__quail_token_count` column of their lengths, and optionally a
-//! `__quail_token_offsets` column of each token's character range, with
-//! the schema metadata `quail.kind = token_store`.
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -16,11 +7,8 @@ use arrow::error::ArrowError;
 
 use crate::inputs::tokenizer::HfTokenizer;
 
-/// The column of each document's tokens.
 pub const TOKEN_COLUMN: &str = "__quail_token_ids";
-/// The column of each document's token count.
 pub const COUNT_COLUMN: &str = "__quail_token_count";
-/// The column of each document's tokens' character ranges.
 pub const OFFSET_COLUMN: &str = "__quail_token_offsets";
 
 fn store_schema(with_offsets: bool) -> SchemaRef {
@@ -45,20 +33,16 @@ fn store_schema(with_offsets: bool) -> SchemaRef {
     Arc::new(Schema::new(fields).with_metadata(metadata))
 }
 
-/// Builds a token store batch by batch.
 pub struct TokenStoreWriter {
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
 }
 
 impl TokenStoreWriter {
-    /// Start an empty token store.
     pub fn new() -> Self {
         Self::with(false)
     }
 
-    /// Start an empty token store that also holds each token's character
-    /// range, which `AI.EXTRACT` reads to place its answers.
     pub fn with_offsets() -> Self {
         Self::with(true)
     }
@@ -74,11 +58,6 @@ impl TokenStoreWriter {
         self.schema.fields().len() == 3
     }
 
-    /// Append the tokens of some documents, int32 ids.
-    ///
-    /// # Errors
-    ///
-    /// The tokens are not int32 ids, or the store holds character ranges.
     pub fn write(&mut self, tokens: LargeListArray) -> Result<(), ArrowError> {
         self.write_with(tokens, None)
     }
@@ -105,11 +84,6 @@ impl TokenStoreWriter {
         Ok(())
     }
 
-    /// Tokenize `texts` and append their tokens.
-    ///
-    /// # Errors
-    ///
-    /// The tokenizer fails.
     pub fn write_texts(
         &mut self,
         tokenizer: &HfTokenizer,
@@ -123,7 +97,6 @@ impl TokenStoreWriter {
         }
     }
 
-    /// The token store of the batches written.
     pub fn finish(self) -> TokenStore {
         let tokens = self
             .batches
@@ -140,7 +113,6 @@ impl Default for TokenStoreWriter {
     }
 }
 
-/// A document column's tokens, held as record batches.
 #[derive(Debug, Clone)]
 pub struct TokenStore {
     schema: SchemaRef,
@@ -163,46 +135,30 @@ impl TokenStore {
         }
     }
 
-    /// The store's schema: the token, count, and optional offset columns.
-    pub fn schema(&self) -> &SchemaRef {
-        &self.schema
+    pub fn to_table(&self) -> (SchemaRef, Vec<RecordBatch>) {
+        (Arc::clone(&self.schema), self.batches.clone())
     }
 
-    /// The store's record batches.
-    pub fn record_batches(&self) -> &[RecordBatch] {
-        &self.batches
-    }
-
-    /// Each document's token count.
     pub fn lengths(&self) -> &[i64] {
         &self.lengths
     }
 
-    /// The number of documents.
     pub fn len(&self) -> usize {
         self.lengths.len()
     }
 
-    /// Whether the store holds no document.
     pub fn is_empty(&self) -> bool {
         self.lengths.is_empty()
     }
 
-    /// Each document's tokens, as one array per document position.
     pub fn documents(&self) -> Documents<'_> {
         Documents::new(&self.tokens)
     }
 }
 
-/// Each document's token ids, by document position.
 pub struct Documents<'a>(Vec<&'a [i32]>);
 
 impl<'a> Documents<'a> {
-    /// The documents of `batches` of int32 token lists, in order.
-    ///
-    /// # Panics
-    ///
-    /// A batch's values are not int32.
     pub fn new(batches: &'a [LargeListArray]) -> Self {
         let mut documents = Vec::new();
         for batch in batches {
@@ -214,17 +170,14 @@ impl<'a> Documents<'a> {
         Documents(documents)
     }
 
-    /// The token ids of each document.
     pub fn ids(&self) -> &[&'a [i32]] {
         &self.0
     }
 
-    /// The number of documents.
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
-    /// Whether there is no document.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }

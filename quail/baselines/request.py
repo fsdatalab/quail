@@ -54,7 +54,6 @@ def execute_request_graph(context, backend, engine_state, boot):
         if not hasattr(client, "image_pad_id"):
             raise ValueError(f"{backend.name} reads no image documents")
         client.images = ImagePrompts(images, client.image_pad_id())
-        # an image has no text: its prompt goes as token ids and a picture
         model_execution.submit_text = False
     try:
         return _run_request_graph(context, backend, engine_state, boot,
@@ -129,8 +128,6 @@ def _warm_boot() -> dict:
     }
 
 
-# Architectures the request backends do not serve: vLLM 0.29 has no
-# LFM3 or Inkling model.
 UNSERVED_ARCHS = frozenset({"lfm3", "inkling2_loop"})
 
 
@@ -241,7 +238,6 @@ class RequestBackend:
         ) | set(envelope["settings"]["false_ids"]))
         started = time.perf_counter()
         with ExitStack() as rollback:
-            # a failed boot must leave the GPU free for the next attempt
             rollback.callback(release_models, context.runtime_state)
             engine = LoadedRequestEngine()
             context.runtime_state["engine"] = engine

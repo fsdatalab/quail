@@ -1,10 +1,3 @@
-//! Run a planned region on the session's GPU workers.
-//!
-//! [`run_region`] sends the region and its tables to each worker, runs
-//! its stages, and builds the region's rows as the workers finish them
-//! ([`FinishedRows`]). It returns what each worker ran, for the run's
-//! report.
-
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
@@ -16,8 +9,8 @@ use quail_planner::error::CompileError;
 use quail_planner::expressions::column_references;
 use quail_planner::operators::Operators;
 use quail_planner::physical::{PhysicalGraph, PhysicalNode};
-use quail_planner::results::source_columns;
-use quail_planner::stages::{Stage, compute_nodes};
+use quail_planner::plan::results::source_columns;
+use quail_planner::plan::stages::{Stage, compute_nodes};
 use serde_json::{Value, json};
 
 use crate::finished::FinishedRows;
@@ -30,17 +23,11 @@ fn compile(error: CompileError) -> DataFusionError {
     DataFusionError::External(Box::new(error))
 }
 
-/// A planned region, as its run reads it.
 pub struct Planned<'a> {
-    /// The plan's envelope: its graph, model, device, and settings.
     pub envelope: &'a Value,
-    /// The operators the plan lowers, and their JSON.
     pub operators: &'a Operators,
     pub operators_json: &'a str,
-    /// What each scan reads.
     pub scans: &'a [Scanned],
-    /// By alias, each document's row in the registered table, for a
-    /// scan that reads some of a table's rows.
     pub source_rows: &'a BTreeMap<String, Vec<i32>>,
 }
 
@@ -49,8 +36,6 @@ impl Planned<'_> {
         serde_json::from_value(self.envelope["graph"].clone()).map_err(failure)
     }
 
-    /// The region's compute nodes as a graph: the nodes the workers run
-    /// and the scans they read.
     fn compute(&self) -> Result<PhysicalGraph> {
         let graph = self.graph()?;
         let nodes: Vec<PhysicalNode> = compute_nodes(&graph)
@@ -60,16 +45,10 @@ impl Planned<'_> {
         let last = (nodes.last()).ok_or_else(|| failure("the plan has no compute operation"))?;
         let port = (last.output_ports().into_iter().next())
             .ok_or_else(|| failure("the plan's last node has no output"))?;
-        let root = quail_planner::physical::port(last.id(), &port.name);
+        let root = quail_planner::topology::port(last.id(), &port.name);
         Ok(PhysicalGraph { nodes, root })
     }
 
-    /// What the region's rows are built from: its operators, every port
-    /// its run returns, and each scan's number of documents.
-    ///
-    /// # Errors
-    ///
-    /// The plan's graph does not decode.
     pub fn answer_request(&self) -> Result<AnswerRequest> {
         let ports = (self.compute()?.nodes.iter())
             .flat_map(|node| {
@@ -103,12 +82,6 @@ impl Planned<'_> {
         })
     }
 
-    /// Each column of the region's rows that a source expression
-    /// computes, by name: one value per document of the scan it reads.
-    ///
-    /// # Errors
-    ///
-    /// A source reads a column its scan did not load.
     pub fn sources(&self) -> Result<HashMap<String, ArrayRef>> {
         let mut found = HashMap::new();
         for (name, expression) in source_columns(self.operators) {
@@ -142,31 +115,19 @@ impl Planned<'_> {
         Ok(found)
     }
 
-    /// The rows of the region, to build as its operators finish them.
-    ///
-    /// # Errors
-    ///
-    /// The graph does not decode, or a column has no source.
     pub fn finished_rows(&self) -> Result<FinishedRows> {
         FinishedRows::new(&self.answer_request()?, &self.sources()?).map_err(failure)
     }
 }
 
-/// What a region's run tells its workers besides the plan.
 pub struct Listening {
-    /// Each scan alias's table name, for the tables the region's hint
-    /// holds rows of; None when the region has no hint.
     pub hinted: Option<BTreeMap<String, String>>,
-    /// Whether someone takes progress counts, and answers as the model
-    /// gives them.
     pub progress: bool,
     pub answers: bool,
 }
 
-/// Builds the region rows a table of finished rows completes.
 type Reporter = Arc<dyn Fn(&Table) -> Result<()> + Send + Sync>;
 
-/// The node and port a finished table is tagged with.
 fn tag(table: &Table) -> Result<(String, String)> {
     let metadata = table.0.metadata();
     match (metadata.get("quail.node"), metadata.get("quail.port")) {
@@ -177,15 +138,6 @@ fn tag(table: &Table) -> Result<(String, String)> {
     }
 }
 
-/// Run `planned` on `workers`, building the region's rows in
-/// `finished` and handing each batch of them to `on_rows` as it is
-/// built; returns what each worker ran.
-///
-/// A worker's question that is not the hint's goes to `ask`.
-///
-/// # Errors
-///
-/// The plan does not decode, a worker fails, or the rows do not build.
 pub fn run_region(
     workers: &mut Workers,
     planned: &Planned<'_>,
@@ -222,7 +174,6 @@ pub fn run_region(
         "listening": [listening.progress, listening.answers],
     });
     let mut tables = request_tables(envelope, planned.operators, planned.scans).map_err(compile)?;
-    // a worker may name a document by its row in the registered table
     for (alias, positions) in planned.source_rows {
         let positions: ArrayRef = Arc::new(Int32Array::from(positions.clone()));
         let batch = RecordBatch::try_from_iter([("row", positions)])?;
@@ -236,13 +187,11 @@ pub fn run_region(
         _ => Vec::new(),
     };
     let groupings = stage_groupings(&compute, &deduplicated, &tables).map_err(compile)?;
-    // a table of finished rows builds the region rows it completes
     let report: Reporter = {
         let (finished, on_rows) = (Arc::clone(finished), Arc::clone(&on_rows));
         Arc::new(move |table: &Table| {
             let (node, port) = tag(table)?;
             let empty = [RecordBatch::new_empty(table.0.clone())];
-            // an empty table still gives its columns' types
             let batches = match table.1.is_empty() {
                 true => &empty[..],
                 false => &table.1[..],
@@ -268,8 +217,6 @@ pub fn run_region(
     let ran = workers.run_region(&region, &tables, |connections| {
         crate::stages::run_stages(&compute, cut, groupings, connections, calls)
     })?;
-    // each returned output builds the rows its operator did not report;
-    // a worker with no rows of a port may type its columns apart
     for (node, port) in &wanted {
         let named: Vec<&Table> = (ran.iter())
             .flat_map(|(_, tables)| tables)

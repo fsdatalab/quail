@@ -93,21 +93,14 @@ class ModelOperator(ABC):
     """
 
     stages: Sequence[Stage] = ()
-    # the physical nodes the operator executes, every member of a group
     nodes: Sequence = ()
-    # the computed columns a later condition may test
     tested_columns: tuple = ()
     combine: ClassVar[bool] = False
     appended_tokens = 0
-    # the frame tokens the operator's first stage writes; 0 when the
-    # stage before it left the same frame
     frame_tokens = 0
     attention = None
-    # the answer limits of the maps the operator runs, in order; the
-    # region's MapDecoder writes their answers into operator.decoder
     answer_limits = ()
     answer_dependencies = ()
-    # the documents pushed into the operator so far
     pushed = 0
 
     @classmethod
@@ -248,7 +241,6 @@ class ColumnOperator:
 class SingleNodeOperator(ModelOperator):
     """An operator that runs one physical node and produces one result."""
 
-    # the physical node the operator executes
     node = None
     result_value = None
 
@@ -277,7 +269,6 @@ def operator_label(word: str, nodes) -> str:
     names = [node.spec.name for node in nodes]
     head, dot, _ = names[0].partition(".")
     if dot and all(name.startswith(head + ".") for name in names):
-        # fields of one struct, such as contract.parties
         word, names = f"{word} {head}:", [name[len(head) + 1:] for name in names]
     shown = ", ".join(names[:3])
     if len(names) > 3:
@@ -322,9 +313,6 @@ def gated_stages(operators, gate=None) -> list:
     dependencies = []
     for operator in operators[1:]:
         if operator.stages and not operator.stages[0].rewind:
-            # an operator's first request follows the document, in
-            # place of whatever the operator before it appended, as
-            # the next question of an extraction does
             operator.stages = [replace(operator.stages[0], rewind=True),
                                *operator.stages[1:]]
     for operator in operators:
@@ -360,8 +348,6 @@ def gated_stages(operators, gate=None) -> list:
                     return Stage.DROP
             return Stage.SKIP
 
-        # a document that passes the trailing conditions skips this
-        # stage and counts as a survivor, with nothing asked
         terminal = Stage(suffixes=[], readout=stages[-1].readout, requests=finish,
                          answer_dependencies=tuple(dict.fromkeys(dependencies)),
                          prepare=_prepare(tuple(pending), None))

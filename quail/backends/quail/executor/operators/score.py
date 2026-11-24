@@ -141,7 +141,6 @@ def scored_outputs(node, scored, priors) -> dict:
     for alias, prior in priors.items():
         scored = scored.joined(prior, alias)
     if isinstance(node.spec, ClassifySpec):
-        # a document whose decoded answer names no label leaves the query
         return classify_outputs(node, scored.filter(
             pc.is_valid(scored.column(node.spec.name))))
     return {node.rows_port: scored}
@@ -161,7 +160,6 @@ def finished_scores(node, rows, values, probabilities=None) -> list:
         return []
     scored = scored_rows(node, rows, values, probabilities)
     if isinstance(node.spec, ClassifySpec):
-        # a document whose decoded answer names no label leaves the query
         scored = scored.filter(pc.is_valid(scored.column(node.spec.name)))
     return [finished_table(node.node_id, node.rows_port, scored.table())]
 
@@ -273,7 +271,7 @@ class ScoreOperator(SingleNodeOperator):
         self.skipped = np.zeros(len(self.rows), dtype=bool)
         self.sent = np.zeros(len(self.rows), dtype=bool)
         self.finished = []
-        self.order = self.offsets = None   # a grouped layout's rows by anchor
+        self.order = self.offsets = None
         hinted = hinted_rows(node, rows)
         self.skip = None
         if hinted is not None:
@@ -284,7 +282,6 @@ class ScoreOperator(SingleNodeOperator):
             self.skip = skip
         parts = spec.prompt_token_parts
         if not len(self.rows):
-            # no rows: nothing to run
             self.stages, self.total = (), 0
             self.table = _table([], [])
             return
@@ -297,9 +294,6 @@ class ScoreOperator(SingleNodeOperator):
                 state.loaded_model.pipeline.mask != "causal"
                 or spec.share_prefixes
                 or (self.skip is not None and parts[1])):
-            # admission skips whole documents, and a non-causal mask reads each
-            # document block whole, so each document takes its own prefix; with
-            # no prompt after the document, a skipped causal score asks every row
             self._shared(documents)
         else:
             self._grouped(documents)
@@ -382,9 +376,6 @@ class ScoreOperator(SingleNodeOperator):
             return True
 
         prefixes = DocumentPrefixes(head, documents[alias], document_ids)
-        # the question is the frame and its last token the cue; a mask
-        # that keeps no question KV reads the whole tail as the suffix and
-        # shares no prefix, since a prefix's KV depends on the document
         causal = self.state.loaded_model.pipeline.mask == "causal"
         frame, cue = ((list(tail[:-1]), [tail[-1]]) if causal
                       else ([], list(tail)))

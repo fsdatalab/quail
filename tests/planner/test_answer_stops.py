@@ -50,8 +50,8 @@ def test_a_map_stops_each_answer_once_its_prefix_test_is_decided():
             f"WHERE {VERDICT}")), """\
 --- SELECT r.id FROM reviews r WHERE LEFT(AI_MAP(r.body, 'Is it kind?'), 3) = 'yes' ---
 plan
-  __quail_column_1 = ai_map(r.body, 'Is it kind?'), filter: left(__quail_column_1,
-      Int64(3)) = 'yes'
+  __quail_column_1 = ai_map(r.body, 'Is it kind?'), inline_predicate:
+      left(__quail_column_1, Int64(3)) = 'yes'
 asked 6 of 6
   'Is it kind?': r0 'yes, it is kind' stopped at 'yes', r1 'no, it is not kind' stopped
       at 'no', r2 'yes, it is kind' stopped at 'yes', r3 'no, it is not kind' stopped at
@@ -66,7 +66,7 @@ rows 3
 --- SELECT r.id, AI_MAP(r.body, 'Is it kind?') AS v FROM reviews r WHERE
     LEFT(AI_MAP(r.body, 'Is it kind?'), 3) = 'yes' ---
 plan
-  v = ai_map(r.body, 'Is it kind?'), filter: left(v, Int64(3)) = 'yes'
+  v = ai_map(r.body, 'Is it kind?'), inline_predicate: left(v, Int64(3)) = 'yes'
 asked 6 of 6
   'Is it kind?': r0 'yes, it is kind', r1 'no, it is not kind' stopped at 'no', r2 'yes,
       it is kind', r3 'no, it is not kind' stopped at 'no', r4 'yes, it is kind', r5
@@ -90,8 +90,8 @@ def test_an_extraction_stops_once_no_span_of_its_document_can_pass():
 --- SELECT r.id, AI_EXTRACT(r.body, {'w': 'When?'}) AS e FROM reviews r WHERE
     LEFT(AI_EXTRACT(r.body, {'w': 'When?'})['w'], 7) = 'March 3' ---
 plan
-  e = ai_extract(r.body, named_struct('w', 'When?')), filter: left(get_field(e, 'w'),
-      Int64(7)) = 'March 3', returns: [e]
+  e = ai_extract(r.body, named_struct('w', 'When?')), inline_predicate:
+      left(get_field(e, 'w'), Int64(7)) = 'March 3', returns: [e]
 asked 6 of 6
   'When?': r0 'March 3, 2020 was', r1 'May 2021' stopped at 'M', r2 'March 9' stopped at
       'M', r3 'Jan 1' stopped at 'J', r4 'March 30', r5 'Apr 2' stopped at 'A'

@@ -133,7 +133,6 @@ def set_steps(state, nodes, ids, prefixes, ask, *, texts=None, inputs=None,
                 group = ask.group(node.pass_group, kept)
                 groups[node.pass_group] = (members, group, kept[group.positions])
             members, group, answered = groups[node.pass_group]
-            # the kept rows the group answered, and their answers
             at = np.searchsorted(answered, kept)
             hit = at < len(answered)
             hit[hit] = answered[at[hit]] == kept[hit]
@@ -236,8 +235,6 @@ class SetChain:
                 self.groups[node.pass_group] = PassGroup(
                     state, [node_question(member) for member in members],
                     self.prefixes, f"pass group ({len(members)} questions)")
-        # a limit and stop keys apply to the pass group that ends the
-        # chain, when it is one pass
         last = self.nodes[-1]
         ending = (self.groups.get(last.pass_group) if _kind(last) in PACKED
                   else None)

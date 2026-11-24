@@ -28,6 +28,7 @@ from quail.backends.quail.executor.models.qwen3_5_kernels import (
     nvfp4_mlp,
     qkv_gemma_norm_rope_gate,
     sigmoid_gate,
+    silu_mul,
 )
 from quail.backends.quail.executor.moe import init_moe_workspace
 from quail.common.budgets import kernel_index_cap
@@ -36,16 +37,12 @@ from quail.common.budgets import kernel_index_cap
 class Qwen35Pipeline(ModelPipeline):
     """Forward passes for dense and MoE Qwen hybrid checkpoints."""
 
-    # head dim 256 runs paged attention only, and a hybrid chunk reads
-    # its documents from checkpoints, which the unified path plans
     needs_pages = True
     tree_attention = False
     warm_row_classes = False
     warm_joins = False
     gemm_warmup = False
     masks = ("causal", "document_isolated")
-    # the vision encoder, and the images the running region's documents
-    # hold (executor/images.py)
     visual = None
     images = None
 
@@ -56,7 +53,6 @@ class Qwen35Pipeline(ModelPipeline):
         self.spec = spec
         self.visual = getattr(model, "visual", None)
         self.arena = arena
-        # vLLM's norms and rotary dispatch read the current config
         self.vllm_config = getattr(model, "quail_vllm_config", None)
         self.layers = text.model.layers
         self.embed = text.model.embed_tokens
@@ -70,7 +66,6 @@ class Qwen35Pipeline(ModelPipeline):
             arena, num_q_heads=attn.num_heads, num_kv_heads=attn.num_kv_heads,
             head_dim=attn.head_dim, rotary=attn.rotary_emb,
             fp8=False, kernels=kernels)
-        # each Gated DeltaNet layer's index among them, its state slot
         gdn_layers = [index for index, layer in enumerate(self.layers)
                       if hasattr(layer, "linear_attn")]
         self.gdn_slots = {index: slot for slot, index in enumerate(gdn_layers)}
@@ -93,7 +88,6 @@ class Qwen35Pipeline(ModelPipeline):
         """Apply the projection using its loaded quantization method."""
         bias = getattr(module, "bias", None)
         if x.is_cuda and is_static_fp8(module) and x.dtype != module.weight.dtype:
-            # Unfused callers still benefit from the fast SM100 FP8 GEMM.
             from vllm._custom_ops import scaled_fp8_quant
 
             x_fp8, _ = scaled_fp8_quant(x, module.input_scale)
@@ -160,7 +154,6 @@ class Qwen35Pipeline(ModelPipeline):
         rows = qkv.shape[0]
         q_gate, k, v = qkv.split(
             [attn.q_size * 2, attn.kv_size, attn.kv_size], dim=-1)
-        # per head: head_dim query columns, then head_dim gate columns
         q, gate = q_gate.view(rows, attn.num_heads, -1).chunk(2, dim=-1)
         q = attn.q_norm(q.reshape(rows, attn.num_heads, attn.head_dim))
         k = attn.k_norm(k.reshape(rows, attn.num_kv_heads, attn.head_dim))
@@ -239,7 +232,8 @@ class Qwen35Pipeline(ModelPipeline):
         if x.is_cuda and is_nvfp4(mlp.gate_up_proj) and is_nvfp4(mlp.down_proj):
             return nvfp4_mlp(x, mlp.gate_up_proj, mlp.down_proj)
         gate_up = self._linear(x, mlp.gate_up_proj)
-        return self._linear(mlp.act_fn(gate_up), mlp.down_proj)
+        act = silu_mul(gate_up) if gate_up.is_cuda else mlp.act_fn(gate_up)
+        return self._linear(act, mlp.down_proj)
 
     def _norm(self, norm, x, residual, *, inplace_x=False):
         """One Gemma-style norm with the residual add, as (normed, residual)."""
@@ -266,7 +260,6 @@ class Qwen35Pipeline(ModelPipeline):
 
             stack.enter_context(set_forward_context(
                 None, self.vllm_config, num_tokens=num_tokens))
-            # Register Quail's stream before vLLM can lazily select a different one.
             stack.enter_context(torch.cuda.stream(torch.cuda.current_stream()))
         return stack
 
@@ -291,7 +284,6 @@ class Qwen35Pipeline(ModelPipeline):
         for index, layer in enumerate(self.layers):
             inputs, residual = self._norm_and_inputs(
                 layer, hidden, residual, positions)
-            # arena layers are indexed by model layer
             chunk.meta["layer"] = index
             x = self._mixer_from_inputs(index, inputs, chunk)
             x, residual = self._norm(layer.post_attention_layernorm, x,
@@ -299,8 +291,6 @@ class Qwen35Pipeline(ModelPipeline):
             hidden = self.feed_forwards[index](x)
         final = chunk.final_indices
         if self.spec.sae is not None:
-            # the SAE reads the residual stream after the last layer: the
-            # MLP output not yet added (hidden) plus the running residual
             if self.forward_hook is not None:
                 stream = hidden + residual
                 self.forward_hook(stream, chunk)
