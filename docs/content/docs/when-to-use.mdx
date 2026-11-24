@@ -3,26 +3,25 @@ title: Quail or warehouse AI functions
 description: When to run a query with Quail instead of Snowflake Cortex AISQL, BigQuery AI functions, or Databricks AI Functions.
 ---
 
-Use Quail instead of your warehouse's AI functions when a query makes
-millions of model calls. Snowflake Cortex AISQL, BigQuery AI functions,
-and Databricks AI Functions charge for each call to a model the vendor
-hosts. Quail runs open source LLMs on a GPU you choose, so you pay for
-GPU time instead of for each call.
+Use Quail instead of your warehouse's AI functions when a query runs one
+or more AI functions over 1,000 or more rows. Snowflake Cortex AISQL,
+BigQuery AI functions, and Databricks AI Functions charge for each call
+to the vendor's model. Quail runs open source LLMs on a GPU you choose,
+so you pay for GPU time instead of for each call.
 
 ## Choose Quail or warehouse AI functions
 
-Warehouse AI functions cost less when a query makes few model calls,
-e.g., an `AI.IF` over a few thousand rows, because you rent no GPU.
-Quail costs less, or is the only option, when:
+Quail runs outside your warehouse, so you export the tables a query
+reads before Quail runs the query. Warehouse AI functions skip the
+export, so they fit a query over fewer than 1,000 rows, or a table you
+can't export. Quail fits when:
 
-- A query runs an AI function over millions of rows.
-- A query has an AI join, which asks the model about pairs of rows from
-  two tables.
-- Your data can't go to a model the vendor hosts.
-- You run the same query again and again.
+- A query runs one or more AI functions over 1,000 or more rows.
+- Your data can't go to the vendor's model.
 
 | | Warehouse AI functions | Quail |
 | --- | --- | --- |
+| Where the data lives | In the warehouse | In files or tables you export from the warehouse |
 | Where the model runs | The vendor's servers | Your GPU, [Modal](/docs/user-guide/models#no-local-gpu-use-modal), or [Quail Server](/docs/user-guide/server) |
 | Models | Models the vendor hosts | Open source LLMs in [Models and GPUs](/docs/user-guide/models) |
 | Price | A price per token or credit | A price per GPU hour |
@@ -55,9 +54,21 @@ benchmark run.
 
 ## Move a query from your warehouse
 
-Quail reads Snowflake syntax by default, including Snowflake's function
-names, such as `AI_FILTER` and `AI_CLASSIFY`. Quail runs the following
-Snowflake query:
+First, export each table the query reads, e.g., to Parquet files, and
+register the table in a Quail session:
+
+```python
+session.register_parquet("reviews", "data/reviews/", id_col="id")
+```
+
+Quail also registers Delta Lake and Iceberg tables, so you can read a
+warehouse table stored in either format without an export.
+[Sessions](/docs/user-guide/sessions) lists every way to register a
+table.
+
+Second, run the query. Quail reads Snowflake syntax by default,
+including Snowflake's function names, such as `AI_FILTER` and
+`AI_CLASSIFY`. Quail runs the following Snowflake query:
 
 ```sql
 SELECT r.id
