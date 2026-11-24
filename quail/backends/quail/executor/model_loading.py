@@ -323,7 +323,6 @@ def load_model(model_name: str, revision: str | None = None, *,
     if is_lfm3(model_path):
         model = load_lfm3(model_path, quantize_fp8=quantize_fp8)
     elif is_inkling2(model_path):
-        # vLLM 0.29 has no Inkling model
         model = load_inkling2(model_path)
     else:
         model = _load_vllm_model(model_path, max_batched_tokens, moe_backend,

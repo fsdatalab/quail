@@ -65,7 +65,6 @@ class GdnPhase:
     unique_writes: bool = False
     same_unique_slots: bool = False
     moves_in_place: bool = False
-    # the rows and slots on the host, for a pass that plans from them
     host_rows: object = None
     host_read_slots: object = None
     host_write_slots: object = None

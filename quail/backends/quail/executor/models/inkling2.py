@@ -38,26 +38,14 @@ from quail.backends.quail.executor.models import inkling2_kernels as kernels
 from quail.backends.quail.executor.models.base import ModelPipeline
 
 ROOT = "model.llm."
-# the parts of the checkpoint the text pass does not read
 SKIPPED_PARTS = ("model.visual.",)
-# the convolution state columns of one visit: key, value, attention
-# output, expert output
-# passes above this many tokens run the NVFP4 experts through FlashInfer's
-# fused MoE; smaller ones run Quail's, since the fused call's host time
-# outweighs its GPU savings on launch-bound answer steps
 FUSED_MIN_TOKENS = 4096
-# a sequence with at most this many new queries in a pass runs its
-# attention one token per program
 DECODE_MAX_QUERIES = 4
-# a chunk whose longer sequences hold at most this many queries runs them
-# in query tiles of SHORT_BLOCK_ROWS rows; a longer one, on FA4, or in
-# tiles of PREFILL_BLOCK_ROWS rows on a GPU FA4's patch does not cover
 SHORT_MAX_QUERIES = 5
 SHORT_BLOCK_ROWS = 16
 PREFILL_BLOCK_ROWS = 64
 STATE_CHANNELS = {"k": (0, 1024), "v": (1024, 2048), "attn": (2048, 4352),
                   "mlp": (4352, 6656)}
-# the message gates of a loop layer, by checkpoint controller name
 GATES = (("q", "attn"), ("k", "k"), ("v", "v"), ("mlp", "mlp"))
 
 
@@ -193,7 +181,6 @@ def load_inkling2(path, device="cuda"):
     config = text_config(path)
     hidden = config["hidden_size"]
     scale = hidden ** -0.5
-    # a GPU without FP4 tensor cores runs the NVFP4 experts on Marlin
     fp4_cores = torch.cuda.get_device_capability(device)[0] >= 10
     files = {}
     for file in sorted(Path(path).glob("model*.safetensors")):
@@ -289,7 +276,6 @@ def load_inkling2(path, device="cuda"):
             layer.w13_scale = swizzle_blockscale(
                 _fused_order(torch, w13_scale)).contiguous()
             layer.w2_scale = swizzle_blockscale(w2_scale).contiguous()
-            # the same scales, viewed in FlashInfer's MMA layout
             experts, rows, cols = w13.shape
             layer.w13_mma = convert_sf_to_mma_layout(
                 layer.w13_scale.view(experts * rows, -1), m=rows,
@@ -320,8 +306,6 @@ def load_inkling2(path, device="cuda"):
                                message[name])
 
             def stacked(names, gates=gates):
-                # the gates of names, batched: (gates, ...) weights, already
-                # transposed for x @ w
                 return SimpleNamespace(
                     down_t=torch.stack([gates[n][0].t() for n in names]),
                     gains_t=torch.stack([gates[n][1].t() for n in names]),
@@ -480,13 +464,11 @@ class Inkling2Pipeline(ModelPipeline):
             num_kv_heads=spec.num_kv_heads, head_dim=spec.d_head,
             rotary=None, fp8=False)
         self.max_chunk_tokens = (2**31 - 1) // (8 * 2 * self.hidden)
-        # whether torch.mm takes out_dtype for bf16 inputs; probed once
         self._fp32_out = None
         self._fc2_scale = None
         self.schedule, self.final_blocks = visit_schedule(model.layers,
                                                           self.loop)
         self.message = self._message_weights(model.layers)
-        # the piecewise graphs capture one piece per visit, plus the last
         self.layers = self.schedule
         self.final_norm = SimpleNamespace(weight=model.final_norm)
 
@@ -516,7 +498,6 @@ class Inkling2Pipeline(ModelPipeline):
             down_m=torch.cat(down_m, dim=1).contiguous(),
             queries_t=torch.stack(queries).t().contiguous())
 
-    # ---- small pieces ---------------------------------------------
 
     def _message_products(self, run):
         """The loop messages' products every looped visit's gates read.
@@ -703,7 +684,6 @@ class Inkling2Pipeline(ModelPipeline):
         torch = self.torch
         values, scales, row_scale = kernels.quantize_dense(torch, x)
         if self._fc2_scale is None:
-            # the row scale is the row's largest magnitude over 1536
             self._fc2_scale = torch.tensor([1.0 / 1536.0],
                                            dtype=torch.float32,
                                            device=x.device)
@@ -715,7 +695,6 @@ class Inkling2Pipeline(ModelPipeline):
             situ_linear_beta=self.config["mlp_up_softcap"],
             per_token_scale=row_scale)
 
-    # ---- one visit --------------------------------------------------
 
     def _attention_inputs(self, layer, h, blocks, num_blocks, run):
         """The normed (q, k, v) inputs, one shared tensor when they agree.
@@ -734,7 +713,6 @@ class Inkling2Pipeline(ModelPipeline):
                                    layer.attn_query, eps=self.eps,
                                    squares=True)
         if layer.is_local:
-            # one input feeds the query, key, and value gates
             hidden = raw[0]
             weight = layer.attn_norm.expand(3, -1).contiguous()
         else:
@@ -778,7 +756,6 @@ class Inkling2Pipeline(ModelPipeline):
         if visit.enter == "save":
             self._keep(run, "before", run.residual)
         elif visit.enter == "restart":
-            # the next pass rewrites the block its messages read
             self._keep(run, "prev_block",
                        run.blocks[:, visit.blocks + 1].clone())
             self._keep(run, "prev_out", run.residual)
@@ -864,7 +841,6 @@ class Inkling2Pipeline(ModelPipeline):
         self._save_state(expert_out, run, state, "mlp")
         self._keep(run, "residual", out)
 
-    # ---- pieces between token mixers ----------------------------------
 
     def boundary(self, num_tokens, device):
         """The tensors pieces and token mixers pass to each other, by row."""
@@ -886,7 +862,6 @@ class Inkling2Pipeline(ModelPipeline):
             prev_block=rows(self.hidden), prev_out=rows(self.hidden),
             q3=rows(heads, dim), rel=rows(heads, self.config["d_rel"]),
             sink=rows(heads), gate=rows(heads * dim), attn=rows(heads, dim),
-            # padding rows read no taps and write no state
             taps=rows(3, dtype=torch.int32, fill=kernels.ZERO_TAP),
             write_slots=rows(dtype=torch.int64, fill=-1),
             write_sources=rows(3, dtype=torch.int32, fill=kernels.ZERO_TAP))
@@ -925,7 +900,6 @@ class Inkling2Pipeline(ModelPipeline):
             buffers.attn = torch.empty_like(buffers.q3)
         window = self.window if layer.is_local else 0
         args = (unified["cu_q"], unified["used"], unified["table"])
-        # the query tiles first: they write every row
         if plan["prefill"] is not None:
             kernels.prefill_attention(
                 torch, buffers.q3[:n], kp, vp, buffers.rel[:n],
@@ -960,12 +934,10 @@ class Inkling2Pipeline(ModelPipeline):
             buffers.taps[:n].copy_(plan["taps"])
             buffers.write_slots[:writes].copy_(plan["write_slots"])
             buffers.write_sources[:writes].copy_(plan["write_sources"])
-        # a padding write's sources are still read before its slot masks it
         buffers.taps[n:].fill_(kernels.ZERO_TAP)
         buffers.write_slots[writes:].fill_(-1)
         buffers.write_sources[writes:].fill_(kernels.ZERO_TAP)
 
-    # ---- the chunk --------------------------------------------------
 
     def _plan(self, chunk):
         """The chunk's convolution taps, state writes, and attention tiles.
@@ -983,9 +955,6 @@ class Inkling2Pipeline(ModelPipeline):
         group = self.spec.num_q_heads // self.spec.num_kv_heads
         cu = np.asarray(unified["cu_q_host"], dtype=np.int64)
         lengths = np.diff(cu)
-        # answer steps' tokens run one per program; longer sequences, in
-        # 16-row query tiles when every one is short, else on FA4, whose
-        # patch changes only its SM100 kernel, or in Triton's 64-row tiles
         decoded = lengths <= DECODE_MAX_QUERIES
         longest = int(lengths[~decoded].max()) if (~decoded).any() else 0
         short = longest <= SHORT_MAX_QUERIES

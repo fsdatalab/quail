@@ -194,21 +194,12 @@ pub struct ModelSpec {
     pub mlp_weight_precision: Option<Precision>,
     #[serde(default)]
     pub conv_width: i64,
-    /// Convolution channels every attention layer keeps beside its KV,
-    /// for a model whose keys, values, and residual stream pass short
-    /// convolutions; 0 for none.
     #[serde(default)]
     pub attention_conv_channels: i64,
-    /// Layers that hold distinct weights, when layers run more than once;
-    /// 0 when every layer holds its own.
     #[serde(default)]
     pub weight_layers: i64,
-    /// Layers, each run once, whose experts run at fp8 instead of the MLP
-    /// precision.
     #[serde(default)]
     pub mlp_fp8_layers: i64,
-    /// Per-token bf16 projection parameters outside the modeled
-    /// components, such as relative-bias and gate projections.
     #[serde(default)]
     pub extra_projection_params: i64,
     #[serde(default)]
@@ -338,7 +329,6 @@ impl ModelSpec {
                 * CONV_STATE_ELEMENT_BYTES
     }
 
-    /// The attention layers that keep convolution state beside their KV.
     pub fn attention_conv_layers(&self) -> Vec<i64> {
         if self.attention_conv_channels == 0 {
             return Vec::new();
@@ -346,7 +336,6 @@ impl ModelSpec {
         self.attention_layers()
     }
 
-    /// Layers that hold distinct weights.
     pub fn weight_layer_count(&self) -> i64 {
         if self.weight_layers != 0 {
             self.weight_layers

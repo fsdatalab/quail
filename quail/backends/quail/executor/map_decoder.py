@@ -61,7 +61,6 @@ class MapDecoder:
         self.in_flight = in_flight
         self.torch = torch
         self.head = head
-        # the cap of the model's logits, set by map_decoder
         self.softcap = 0.0
         self._staging = (InputStaging(torch, head.device)
                          if head.is_cuda else None)

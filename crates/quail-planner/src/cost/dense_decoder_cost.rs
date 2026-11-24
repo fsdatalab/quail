@@ -88,7 +88,6 @@ pub fn dense_decoder_components(work: &Work, model: &ModelSpec, passes: f64) -> 
         + short_conv_projection_params(model)
         + model.extra_projection_params
         - separate_gdn;
-    // layers that run more than once read their weights once a pass
     let weight_share = model.weight_layer_count() as f64 / model.layers as f64;
     let fp8_share = model.mlp_fp8_layers as f64 / model.layers as f64;
     let fp8_weight_share = model.mlp_fp8_layers as f64 / model.weight_layer_count() as f64;

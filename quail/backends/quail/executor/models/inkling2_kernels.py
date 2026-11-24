@@ -37,12 +37,9 @@ the pass computes what the reference computes up to accumulation order.
 
 import math
 
-# a tap source in a conv tap table: a chunk row (>= 0), zero (-1), or a
-# saved state column of slot s, tap j (-(2 + 3 * s + j))
 ZERO_TAP = -1
 
 _KERNELS = {}
-# the FA4 score_mod of each KV head count
 _MARKERS = {}
 
 
@@ -76,8 +73,6 @@ def _kernels() -> dict:
     def _state(blocks_ptr, stride_bb, partial_ptr, addend_ptr, row_b, row_p,
                row_a, cols, J: tl.constexpr, NB: tl.constexpr,
                NS: tl.constexpr, HAS_ADDEND: tl.constexpr):
-        # state J of one row: a completed block, the partial (+ addend), or
-        # zero past the last state
         if J < NB:
             x = tl.load(blocks_ptr + row_b + J * stride_bb + cols)
             x = x.to(tl.float32)
@@ -115,11 +110,6 @@ def _kernels() -> dict:
             CH: tl.constexpr, NB: tl.constexpr, NS: tl.constexpr,
             NQ: tl.constexpr, HAS_ADDEND: tl.constexpr, NORM: tl.constexpr,
             SQUARES: tl.constexpr):
-        # One row of up to five states and three queries. The first pass
-        # accumulates the states' pairwise products and each query's
-        # products with each state elementwise, reduced once at the end;
-        # the RMS norms, the softmax weights, and each output's norm
-        # follow from those sums, so the second pass writes finished rows.
         row = tl.program_id(0).to(tl.int64)
         row_b = row * stride_br
         row_p = row * stride_p
@@ -233,7 +223,6 @@ def _kernels() -> dict:
                 g34 += x3 * x4
             if NS > 4:
                 g44 += x4 * x4
-        # the reductions, once
         s00 = tl.sum(g00, axis=0)
         s01 = tl.sum(g01, axis=0)
         s02 = tl.sum(g02, axis=0)
@@ -425,9 +414,6 @@ def _kernels() -> dict:
 
     @triton.jit
     def _blend(aa, bb, ab, qa, qb, eps, H: tl.constexpr):
-        # the message (alpha a + beta b) of the previous pass's last block a
-        # and output b: their RMS-normed softmax blend by query score;
-        # returns alpha, beta, and the message's squared sum
         inv_a = tl.math.rsqrt(aa / H + eps)
         inv_b = tl.math.rsqrt(bb / H + eps)
         sa = qa * inv_a
@@ -443,7 +429,6 @@ def _kernels() -> dict:
     @triton.jit
     def _gate_tile(d, gains, hidden, block, prev, alpha, beta, cols, offs_r,
                    ok, H: tl.constexpr, R: tl.constexpr):
-        # (1 - tanh f) h + tanh(g) (alpha a + beta b) over columns cols
         f = tl.dot(d, tl.load(gains + offs_r[:, None] * (2 * H)
                               + cols[None, :]))
         g = tl.dot(d, tl.load(gains + offs_r[:, None] * (2 * H) + H
@@ -455,7 +440,6 @@ def _kernels() -> dict:
         b = tl.load(prev + cols[None, :], mask=ok[:, None],
                     other=0.0).to(tl.float32)
         m = alpha[:, None] * a + beta[:, None] * b
-        # the row is rounded to bf16, so the approximate tanh suffices
         return (1.0 - _tanh_approx(f)) * h + _tanh_approx(g) * m
 
     @triton.jit
@@ -465,10 +449,6 @@ def _kernels() -> dict:
                  stats_ptr, gains_ptr, weight_ptr, out_ptr, stride_og,
                  stride_o, rows, eps, H: tl.constexpr, R: tl.constexpr,
                  BM: tl.constexpr, BN: tl.constexpr):
-        # One gate (program_id(1)) of BM rows. Its down projection is
-        # rebuilt from h @ Dh, a @ Dm, and b @ Dm with each row's norms;
-        # the gains GEMM (K = R) then runs on two passes: the first sums
-        # the gated row's squares, the second writes it RMS-normed.
         r = tl.program_id(0) * BM + tl.arange(0, BM)
         gate = tl.program_id(1)
         ok = r < rows
@@ -498,7 +478,6 @@ def _kernels() -> dict:
                      mask=ok[:, None], other=0.0)
         pb = tl.load(pb_ptr + r64[:, None] * stride_m + cols_r[None, :],
                      mask=ok[:, None], other=0.0)
-        # [norm(h) | norm(m)] @ down, rounded to bf16 as the reference's is
         d = (inv_h[:, None] * ph + inv_m[:, None] * (
             alpha[:, None] * pa + beta[:, None] * pb)).to(tl.bfloat16)
         total = tl.zeros((BM,), dtype=tl.float32)
@@ -536,7 +515,6 @@ def _kernels() -> dict:
                    stride_base2, out_ptr, stride_out, rows, C, inv_scale,
                    BT: tl.constexpr, BC: tl.constexpr,
                    HAS_BASE: tl.constexpr, HAS_BASE2: tl.constexpr):
-        # w is (C, 4) with w[:, 3] on the current row
         r = tl.program_id(0) * BT + tl.arange(0, BT)
         cols = tl.program_id(1) * BC + tl.arange(0, BC)
         row_ok = r < rows
@@ -566,8 +544,6 @@ def _kernels() -> dict:
     @triton.jit
     def _taps(x_ptr, stride_x, state_ptr, stride_slot, stride_tap, src, cols,
               ok):
-        # (rows, cols) values of each row's tap source src (rows,): a row
-        # of x, zero, or a saved state column
         is_row = (src >= 0)[:, None] & ok[:, None]
         old = -src - 2
         is_old = (src <= -2)[:, None] & ok[:, None]
@@ -587,9 +563,6 @@ def _kernels() -> dict:
                 clip, inv_scale, HEADS: tl.constexpr, D: tl.constexpr,
                 BT: tl.constexpr, DYNAMIC: tl.constexpr,
                 IS_KEY: tl.constexpr):
-        # BT rows, every head. static: w is (C, 4), w[:, 3] current;
-        # dynamic: w is (4, C) by backward distance, plus each row's
-        # (heads, 4) taps at dyn_ptr
         C: tl.constexpr = HEADS * D
         r = tl.program_id(0) * BT + tl.arange(0, BT)
         ok = r < rows
@@ -636,8 +609,6 @@ def _kernels() -> dict:
     @triton.jit(do_not_specialize=["rows"])
     def route(logits_ptr, bias_ptr, ids_ptr, weights_ptr, rows, scale,
               E: tl.constexpr, K: tl.constexpr, BT: tl.constexpr):
-        # each row's K experts by sigmoid score plus bias, and their scores
-        # normalized to sum to scale; ties go to the lower expert
         r = tl.program_id(0) * BT + tl.arange(0, BT)
         ok = r < rows
         r64 = r.to(tl.int64)
@@ -668,7 +639,6 @@ def _kernels() -> dict:
                    stride_o0, stride_o1, clip, alpha, floor,
                    H: tl.constexpr, HP: tl.constexpr, D: tl.constexpr,
                    LOG_SCALE: tl.constexpr):
-        # every head of one row
         row = tl.program_id(0).to(tl.int64)
         heads = tl.arange(0, HP)
         offs = tl.arange(0, D)
@@ -707,8 +677,6 @@ def _kernels() -> dict:
                      stride_v2, BN: tl.constexpr, D: tl.constexpr,
                      EXTENT: tl.constexpr, PAGE: tl.constexpr,
                      HAS_WINDOW: tl.constexpr, NEAR: tl.constexpr):
-        # one key tile of the online softmax; a far tile's keys are all
-        # earlier than every query, past the bias and any window
         LOG2E: tl.constexpr = 1.4426950408889634
         offs_key = tl.arange(0, BN)
         offs_d = tl.arange(0, D)
@@ -730,13 +698,10 @@ def _kernels() -> dict:
             valid = (dist >= 0) & key_ok[None, :] & row_ok[:, None]
             if HAS_WINDOW:
                 valid = valid & (dist < window)
-            # bias_rows points at each row's bias for this tile's first key
             bias = tl.load(bias_rows[:, None] + offs_key[None, :])
             s += tl.where(dist < EXTENT, bias.to(tl.float32) * LOG2E, 0.0)
             s = tl.where(valid, s, -float("inf"))
         m_new = tl.maximum(m_i, tl.max(s, axis=1))
-        # a later split's row that has seen no key keeps m at -inf, and
-        # exp2(-inf - -inf) would be NaN
         m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
         alpha = tl.math.exp2(m_i - m_safe)
         p = tl.math.exp2(s - m_safe[:, None])
@@ -757,10 +722,6 @@ def _kernels() -> dict:
                       EXTENT: tl.constexpr, PAGE: tl.constexpr,
                       SPAN: tl.constexpr, WCH: tl.constexpr,
                       HAS_WINDOW: tl.constexpr, SPLIT: tl.constexpr):
-        # each program first writes its rows' bias by key position over
-        # its near keys to its own (BM, SPAN) scratch, so every near key
-        # tile reads an aligned rectangle; reads that start at a different
-        # column in each row do not vectorize
         LOG2E: tl.constexpr = 1.4426950408889634
         TQ: tl.constexpr = BM // GROUP
         tile = tl.program_id(0) // splits
@@ -786,7 +747,6 @@ def _kernels() -> dict:
                     mask=row_ok[:, None], other=0.0)
         sink = tl.load(sink_ptr + q_row * stride_s0 + head, mask=row_ok,
                        other=0.0).to(tl.float32)
-        # the sink is one more logit, with a zero value, counted once
         if split == 0:
             m_i = sink * LOG2E
             l_i = tl.zeros((BM,), dtype=tl.float32) + 1.0
@@ -800,11 +760,8 @@ def _kernels() -> dict:
         if HAS_WINDOW:
             lo = tl.maximum(first_q - (window - 1), 0)
         start = (lo // BN) * BN
-        # the first tile some query of this tile is near: its last key is
-        # within EXTENT - 1 of the first query
         behind = tl.maximum(first_q - EXTENT - BN + 2 - start, 0)
         near = start + tl.cdiv(behind, BN) * BN
-        # this split's share of the key tiles
         per = tl.cdiv(tl.cdiv(last_q + 1 - start, BN), splits) * BN
         lo_key = start + split * per
         hi_key = tl.minimum(lo_key + per, last_q + 1)
@@ -820,7 +777,6 @@ def _kernels() -> dict:
             rel = tl.load(rel_ptr + q_row[:, None] * stride_r0
                           + head[:, None] * stride_r1 + offs_r[None, :],
                           mask=row_ok[:, None], other=0.0)
-            # the near keys' distances, from the last key to the first
             d_lo = tl.maximum(first_q - hi_key + 1, 0) // WCH * WCH
             reach = tl.minimum(last_q - near_start + 1, EXTENT)
             for c0 in range(d_lo, reach, WCH):
@@ -828,7 +784,6 @@ def _kernels() -> dict:
                 part = tl.load(proj_ptr + offs_r[:, None] * EXTENT
                                + dists[None, :],
                                mask=(dists < EXTENT)[None, :], other=0.0)
-                # rounded to bf16 as the reference's bias is
                 values = tl.dot(rel, part).to(tl.bfloat16)
                 cols = qpos[:, None] - dists[None, :] - near_start
                 tl.store(bias_rows[:, None] + cols, values,
@@ -872,10 +827,6 @@ def _kernels() -> dict:
                          R: tl.constexpr, EXTENT: tl.constexpr,
                          PAGE: tl.constexpr, HAS_WINDOW: tl.constexpr,
                          SPLIT: tl.constexpr):
-        # One query token's GROUP heads against one KV head's keys. Every
-        # row shares the token's position, so a key tile's bias is one dot:
-        # the rows' relative states times the profile at the tile's
-        # distances, read from the transposed (EXTENT, R) profile.
         LOG2E: tl.constexpr = 1.4426950408889634
         token = tl.program_id(0) // splits
         split = tl.program_id(0) % splits
@@ -931,7 +882,6 @@ def _kernels() -> dict:
                                                       EXTENT - 1)[:, None] * R
                               + offs_r[None, :], mask=near[:, None],
                               other=0.0)
-            # rounded to bf16 as the reference's bias is
             bias = tl.dot(rel, tl.trans(profile)).to(tl.bfloat16)
             s += bias.to(tl.float32) * LOG2E
             valid = (kpos >= lo) & (dist >= 0)
@@ -959,8 +909,6 @@ def _kernels() -> dict:
     def merge_tokens(part_acc_ptr, part_ml_ptr, rows_ptr, out_ptr, stride_o0,
                      stride_o1, splits, HEADS: tl.constexpr, D: tl.constexpr,
                      MAX_SPLITS: tl.constexpr):
-        # one decoded token and head: the splits' softmax states, merged
-        # into the token's row
         token = tl.program_id(0).to(tl.int64)
         head = tl.program_id(1)
         row = tl.load(rows_ptr + token).to(tl.int64)
@@ -982,7 +930,6 @@ def _kernels() -> dict:
     def merge_splits(part_acc_ptr, part_ml_ptr, out_ptr, stride_o0,
                      stride_o1, splits, HEADS: tl.constexpr,
                      D: tl.constexpr, MAX_SPLITS: tl.constexpr):
-        # one row and head: the splits' softmax states, merged
         row = tl.program_id(0).to(tl.int64)
         head = tl.program_id(1)
         offs_s = tl.arange(0, MAX_SPLITS)
@@ -1016,8 +963,6 @@ def _kernels() -> dict:
 
     @triton.jit
     def _e2m1_pairs(x, HW: tl.constexpr):
-        # (blocks, 8, 2) values -> (blocks, 8) bytes, low nibble first,
-        # and the values rounded to e2m1, (blocks, 16)
         low, high = tl.split(x)
         if HW:
             packed, halves = tl.inline_asm_elementwise(
@@ -1039,10 +984,6 @@ def _kernels() -> dict:
 
     @triton.jit
     def _nvfp4_chunk(x, amax, CH: tl.constexpr, HW: tl.constexpr):
-        # four-over-six: per 16-value block, the 6.0- or 4.0-based fp8
-        # scale with the smaller absolute error; returns packed bytes
-        # (CH // 2,) and fp8 scales (CH // 16,). The row scale amax / 1536
-        # leaves each block's fp8 scale headroom below 448.
         NBLK: tl.constexpr = CH // 16
         encoder = tl.minimum(1536.0 / amax, 3.4028234663852886e38)
         decoder = 1.0 / encoder
@@ -1070,7 +1011,6 @@ def _kernels() -> dict:
 
     @triton.jit
     def _scale_offset(row, block, KB4):
-        # CUTLASS's swizzled block-scale layout: 128 x 4 tiles
         return (((row // 128) * KB4 + block // 4) * 512 + (row % 32) * 16
                 + ((row % 128) // 32) * 4 + block % 4)
 
@@ -1079,7 +1019,6 @@ def _kernels() -> dict:
         groups = tl.reshape(x, (NBLK, 32))
         amax = tl.max(tl.abs(groups), 1)
         raw = amax * (1.0 / 448.0)
-        # fp32 constants: a bare 2**-127 would be typed fp64
         smallest = tl.full((), 5.877471754111438e-39, tl.float32)
         largest = tl.full((), 1.7014118346046923e38, tl.float32)
         exponent = ((raw.to(tl.int32, bitcast=True) + 0x007FFFFF)
@@ -1099,10 +1038,6 @@ def _kernels() -> dict:
                         bf16_ptr, K: tl.constexpr, CH: tl.constexpr,
                         TOPK: tl.constexpr, NVFP4: tl.constexpr,
                         HW: tl.constexpr, LINEAR: tl.constexpr):
-        # one token, quantized once and stored to each of its TOPK
-        # permuted rows; NVFP4 writes packed values, swizzled (or, with
-        # LINEAR, row-major) scales, and the row scale, else the
-        # MXFP8-rounded row in bf16
         token = tl.program_id(0).to(tl.int64)
         slots = token * TOPK + tl.arange(0, TOPK)
         rows = tl.load(c_map_ptr + slots).to(tl.int64)
@@ -1158,9 +1093,6 @@ def _kernels() -> dict:
     @triton.jit
     def _situ(gate_up_ptr, p, start, outer, gamma, gate_cap, up_cap,
               N: tl.constexpr, W: tl.constexpr, NVFP4: tl.constexpr):
-        # the softcapped SwiGLU of columns [start, start + W), from 2N
-        # columns that alternate 64 up and 64 gate columns; the result is
-        # rounded to bf16, so approximate tanh and sigmoid suffice
         index = start + tl.arange(0, W)
         column = gate_up_ptr + p * 2 * N + (index // 64) * 128 + index % 64
         up = tl.load(column).to(tl.float32)
@@ -1195,7 +1127,6 @@ def _kernels() -> dict:
                         N: tl.constexpr, HEAD: tl.constexpr,
                         TAIL: tl.constexpr, NVFP4: tl.constexpr,
                         HW: tl.constexpr):
-        # one pass over a power-of-two head and a power-of-two tail
         p = tl.program_id(0).to(tl.int64)
         outer = 1.0
         sf_row = p
@@ -1241,8 +1172,6 @@ def _kernels() -> dict:
     def gather_state(x_ptr, stride_x, srcs_ptr, slots_ptr, state_ptr,
                      stride_slot, stride_tap, out_ptr, C,
                      BLOCK: tl.constexpr):
-        # out[w, j] = the value of tap source srcs[w, j]; a padding write,
-        # with a negative slot, reads nothing
         w = tl.program_id(0).to(tl.int64)
         j = tl.program_id(1)
         cols = tl.program_id(2) * BLOCK + tl.arange(0, BLOCK)
@@ -1256,7 +1185,6 @@ def _kernels() -> dict:
     @triton.jit
     def scatter_state(values_ptr, slots_ptr, state_ptr, stride_slot,
                       stride_tap, C, BLOCK: tl.constexpr):
-        # state[slots[w], j] = values[w, j]; a negative slot is padding
         w = tl.program_id(0).to(tl.int64)
         j = tl.program_id(1)
         cols = tl.program_id(2) * BLOCK + tl.arange(0, BLOCK)
@@ -1272,9 +1200,6 @@ def _kernels() -> dict:
                    GROUP: tl.constexpr, KV_HEADS: tl.constexpr,
                    R: tl.constexpr, EXTENT: tl.constexpr, BM: tl.constexpr,
                    BN: tl.constexpr, SPAN: tl.constexpr, WCH: tl.constexpr):
-        # one FA4 query tile of one KV head: its rows' bias over the key
-        # tiles from its first near tile, column c at key
-        # near_start + c, the layout the patched FA4 kernel reads
         tile = tl.program_id(0)
         kv_head = tl.program_id(1)
         seq = tl.load(tile_seq_ptr + tile)
@@ -1307,12 +1232,10 @@ def _kernels() -> dict:
             tl.store(out_row[:, None] + cols, values,
                      mask=(cols >= 0) & (cols < SPAN) & ok[:, None])
 
-    # lse's stride is the chunk's row count
     @triton.jit(do_not_specialize=["stride_lse"])
     def sink_gate(o_ptr, lse_ptr, stride_lse, sink_ptr, stride_s0, out_ptr,
                   stride_o0, stride_o1, HEADS: tl.constexpr,
                   HP: tl.constexpr, D: tl.constexpr):
-        # the sink's share of each head's softmax mass: o * sigmoid(lse - sink)
         row = tl.program_id(0).to(tl.int64)
         heads = tl.arange(0, HP)
         ok = heads < HEADS
@@ -1331,8 +1254,6 @@ def _kernels() -> dict:
     @triton.jit
     def situ_rows(gate_up_ptr, weights_ptr, out_ptr, gate_cap, up_cap,
                   N: tl.constexpr, BLOCK: tl.constexpr):
-        # one (token, expert) row of Marlin's FC1 output, gate columns then
-        # up columns: the softcapped SwiGLU times the routing weight
         row = tl.program_id(0).to(tl.int64)
         cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
         mask = cols < N
@@ -1362,7 +1283,6 @@ def _kernels() -> dict:
 
 
 
-# ---- launchers --------------------------------------------------------
 
 def _hp(h):
     return _pow2(h)
@@ -1463,7 +1383,6 @@ def gate_out(torch, hidden, squares, prev_block, prev_out, ph, pa, pb,
     stride_hg, stride_h = _gate_hidden(hidden)
     stride_sg = squares.stride(0) if squares.shape[0] > 1 else 0
     if ph.dim() == 2:
-        # a shared hidden's products sit side by side
         stride_pg, stride_p = rank, ph.stride(0)
     else:
         stride_pg, stride_p = ph.stride(0), ph.stride(1)
@@ -1679,8 +1598,6 @@ def rel_attention(torch, q3, kp, vp, rel, sink, proj, out, tiles, cu_q, used,
         return out
     num_tiles = tiles[0].numel()
     splits = num_splits(num_tiles * kv_heads, max_keys, window)
-    # a program's near keys run from its first near tile to its last
-    # query, plus a tile past it; rows start on 16 bytes
     span = -(-(extent + block_rows // group + 2 * block_keys) // 8) * 8
     scratch = torch.empty(num_tiles * splits * kv_heads * block_rows * span,
                           dtype=torch.bfloat16, device=q3.device)
@@ -1709,10 +1626,7 @@ def rel_attention(torch, q3, kp, vp, rel, sink, proj, out, tiles, cu_q, used,
     return out
 
 
-# FA4's query and key tile, and the arena page
 FA4_TILE = 128
-# key tiles the patched FA4 kernel reads bias for: the bias's 1,024
-# distances, a query tile's 43 tokens, and alignment
 FA4_BIAS_TILES = 10
 
 
@@ -1789,7 +1703,6 @@ def prefill_attention(torch, q3, kp, vp, rel, sink, proj, out, tiles, cu_q,
         rel, rel.stride(0), rel.stride(1), proj, bias, tiles[0], tiles[1],
         cu_q, used, GROUP=group, KV_HEADS=kv_heads, R=rank, EXTENT=extent,
         BM=FA4_TILE, BN=FA4_TILE, SPAN=span, WCH=32, num_warps=4)
-    # FA4 builds the bias's TMA descriptor from these
     bias.__assumed_align__ = 16
     bias.__leading_dim__ = 1
     attended, lse = flash_attn_varlen_func(
@@ -1863,11 +1776,8 @@ def decode_attention(torch, q3, kp, vp, rel, sink, proj_t, out, tokens,
     return out
 
 
-# at most this many programs share one query tile's keys
 MAX_SPLITS = 16
-# programs that fill a B200 several times over
 TARGET_PROGRAMS = 4 * 148
-# the fewest keys a split reads
 SPLIT_KEYS = 512
 
 
@@ -1911,7 +1821,6 @@ def quantize_tokens(torch, x, c_map, ids, offsets, sf_offsets, *, nvfp4,
     topk = ids.shape[1]
     rows = tokens * topk
     device = x.device
-    # the swizzled scales come in whole 128-row tiles
     sf_rows = -(-sf_rows // 128) * 128
     if nvfp4:
         q = torch.empty((rows, k // 2), dtype=torch.uint8, device=device)
@@ -1944,7 +1853,6 @@ def quantize_dense(torch, x):
                      device=device)
     row_scale = torch.empty((rows,), dtype=torch.float32, device=device)
     if rows:
-        # one expert holding every row in order
         c_map = torch.arange(rows, dtype=torch.int32, device=device)
         zeros = torch.zeros(rows, dtype=torch.int32, device=device)
         _kernels()["quantize_tokens"][(rows,)](

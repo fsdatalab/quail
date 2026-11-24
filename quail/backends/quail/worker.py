@@ -101,8 +101,6 @@ class LoadedGpu:
                              num_kv_heads=spec.num_kv_heads, d_head=spec.d_head,
                              dtype=torch.bfloat16,
                              layer_kv=spec.kv_shapes,
-                             # a model whose sliding layers keep every
-                             # token, as a hybrid model's do, has no pool
                              sliding_layers=(spec.sliding_layer_set
                                              if sliding_pages else ()),
                              sliding_window=spec.sliding_window,
