@@ -21,16 +21,10 @@ Quail runs SQL with AI functions. An AI function, such as
 Quail is an [Apache DataFusion](https://datafusion.apache.org) extension:
 we use DataFusion to parse, plan, and run the rest of the SQL.
 
-Use Quail instead of Snowflake Cortex AISQL, BigQuery AI functions, or
-Databricks AI Functions when a query makes millions of model calls, or
-when your data can't go to a model the vendor hosts. Quail runs open
-source LLMs on your GPU and reads Snowflake and BigQuery syntax.
-[Quail or warehouse AI functions](https://fsdatalab.github.io/quail/docs/when-to-use)
-compares the two.
-
 [Documentation](https://fsdatalab.github.io/quail) |
 [Quickstart](https://fsdatalab.github.io/quail/docs/user-guide/quickstart) |
-[QUAIL-B](https://github.com/fsdatalab/quail-bench)
+[QUAIL-B](https://github.com/fsdatalab/quail-bench) |
+[Quail or warehouse AI functions](https://fsdatalab.github.io/quail/docs/when-to-use)
 
 ## Install
 
