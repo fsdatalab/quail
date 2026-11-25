@@ -91,11 +91,7 @@ def execution_context(state, payload, graph: PhysicalGraph) -> ExecutionContext:
     runtime_state = {
         **state,
         "retention": retention,
-        "filter_limit": (
-            None if any(isinstance(node, AiJoin)
-                        for node in graph.nodes)
-            else payload.get("filter_limit")
-        ),
+        "filter_limit": payload.get("filter_limit"),
         "joins_started": False,
         "kv_stats": {
             "retained_after_filters": 0,

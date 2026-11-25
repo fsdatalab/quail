@@ -37,17 +37,33 @@ fn with_nodes(graph: &PhysicalGraph, nodes: Vec<PhysicalNode>) -> PhysicalGraph 
 
 type Rewrite = Result<Option<PhysicalGraph>, CompileError>;
 
+fn join_feeds_limit_alone(graph: &PhysicalGraph) -> bool {
+    graph
+        .nodes
+        .iter()
+        .filter(|node| matches!(node, PhysicalNode::AiJoin(_)))
+        .count()
+        == 1
+        && graph.nodes.iter().all(|node| match node {
+            PhysicalNode::AiJoin(join) => join.attributes.semantics != "anti",
+            PhysicalNode::Scan(_) | PhysicalNode::HashJoin(_) | PhysicalNode::Limit(_) => true,
+            _ => false,
+        })
+}
+
 fn should_push_down_limit(graph: &PhysicalGraph, settings: &mut Map<String, Value>) -> Rewrite {
     let limit = graph.nodes.iter().find_map(|node| match node {
         PhysicalNode::Limit(limit) => Some(limit.attributes.count),
         _ => None,
     });
     let pipelines = build_pipelines(&graph.nodes, &[]);
-    let blocked = pipelines.members.len() > 1
-        || graph
-            .nodes
-            .iter()
-            .any(|node| matches!(node, PhysicalNode::AiJoin(_)));
+    let lone_join = join_feeds_limit_alone(graph);
+    let blocked = !lone_join
+        && (pipelines.members.len() > 1
+            || graph
+                .nodes
+                .iter()
+                .any(|node| matches!(node, PhysicalNode::AiJoin(_))));
     match limit {
         Some(count) if !blocked => {
             settings.insert("filter_limit".into(), Value::from(count));
