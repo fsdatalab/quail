@@ -3,6 +3,7 @@
 from contextlib import contextmanager
 
 import pytest
+from _quail_native import IMAGE_TOKEN_BASE
 
 from quail.backends.quail.executor.arena import KVArena
 from quail.backends.quail.executor.host_kv import (
@@ -264,6 +265,20 @@ def test_freeing_every_key_waits_for_a_save_still_reading_its_pages():
     arena.free_all()
     assert events[0].waited and not arena.accounting.owned
     assert arena.free_pages == 8
+
+
+def test_a_prefix_with_an_image_is_not_saved():
+    arena = make_arena()
+    host = attach(arena)
+    key = ("d", 0)
+    prefix = [1, 2, IMAGE_TOKEN_BASE, IMAGE_TOKEN_BASE + 1, 3, 4]
+    digest = host.register(key, prefix, len(prefix))
+    assert arena.reserve(key, 6, capacity_tokens=8)
+    write_prefix(arena, key, 6, seed=1)
+    host.mark_written(key)
+    arena.free_key(key)
+    assert host.saved_keys == 0 and not host.holds(digest)
+    assert not host.entries
 
 
 def test_the_hash_names_the_tokens_and_their_count():

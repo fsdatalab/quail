@@ -45,6 +45,7 @@ from collections import deque
 from contextlib import contextmanager
 
 import numpy as np
+from _quail_native import IMAGE_TOKEN_BASE
 
 from quail.backends.quail.executor.chunk import Suffixes
 
@@ -54,9 +55,16 @@ MAX_STAGING = 8
 PENDING = "pending"
 
 
-def prefix_hash(prefix) -> bytes:
-    """Hash a prefix's token ids: the document head, then the document."""
+def prefix_hash(prefix) -> bytes | None:
+    """Hash a prefix's token ids: the document head, then the document.
+
+    Returns None for a prefix with an image: an image's token ids name
+    it only within one session, so they cannot key KV the store keeps
+    across sessions.
+    """
     ids = np.ascontiguousarray(Suffixes.of([prefix]).ids, dtype=np.int64)
+    if (ids >= IMAGE_TOKEN_BASE).any():
+        return None
     digest = hashlib.blake2b(digest_size=16)
     digest.update(np.int64(len(ids)).tobytes())
     digest.update(ids.tobytes())
@@ -292,7 +300,7 @@ class HostKV:
         self.reset_stats()
 
     def register(self, key, prefix, prefix_tokens: int):
-        """Name the prefix a key holds; returns its hash.
+        """Name the prefix a key holds; returns its hash, or None for an image.
 
         A key renamed to another prefix holds no saved KV until an
         operator writes it again.
@@ -325,7 +333,7 @@ class HostKV:
         nothing is saved or the copies ran at once.
         """
         named = self._keys.get(key)
-        if named is None or key not in self._written:
+        if named is None or named[0] is None or key not in self._written:
             return None
         digest, prefix_tokens = named
         self._written.discard(key)

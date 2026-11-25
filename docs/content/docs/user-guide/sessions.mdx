@@ -191,8 +191,8 @@ config = quail.EngineConfig(
 
 The store lives as long as the loaded model, so it serves every session
 in the process and every query on one Quail Server. Quail keys an entry
-by the prefix's token ids. Join partners are not saved. A query that
-fails saves nothing it had not saved already.
+by the prefix's token ids. Join partners and documents with images are
+not saved. A query that fails saves nothing it had not saved already.
 New entries drop the oldest ones, but a query never drops its own
 entries: once its documents fill the store, Quail stops saving them.
 [Metrics](/docs/user-guide/metrics#kv-kept-between-queries) lists the
