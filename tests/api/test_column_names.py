@@ -4,7 +4,9 @@ A column the SQL selects without a name keeps its table, as `r.id`. A
 column the SQL names with `AS` takes that name, even when it is the
 column's own name, which DataFusion plans as the bare column. The
 BigQuery dialect leaves unquoted names unnormalized, so a name keeps the
-letter case the SQL writes, as BigQuery returns it.
+letter case the SQL writes, as BigQuery returns it. A BigQuery query
+that plans only with lowercased names, such as `SELECT ID FROM Reviews`,
+plans with them.
 """
 
 import pyarrow as pa
@@ -34,6 +36,7 @@ def session():
     ("snowflake", "SELECT r.vin AS vin FROM reviews AS r", ["vin"]),
     ("snowflake", 'SELECT r.id, r."reviewId" AS reviewId1 FROM reviews r',
      ["r.id", "reviewid1"]),
+    ("bq", "SELECT ID FROM Reviews", ["reviews.id"]),
 ])
 def test_a_column_named_with_as_takes_that_name(session, dialect, sql, names):
     assert session.sql(sql, dialect=dialect).run().collect().schema.names == names

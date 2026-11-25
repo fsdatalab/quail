@@ -602,9 +602,21 @@ async fn frame(
             .map_err(|_| original)?,
         parsed => parsed?,
     };
-    if matches!(dialect, datafusion::config::Dialect::BigQuery) {
-        bigquery::rewrite(&mut statement);
+    if !matches!(dialect, datafusion::config::Dialect::BigQuery) {
+        let plan = state.statement_to_plan(statement).await?;
+        return Ok(datafusion::dataframe::DataFrame::new(state, plan));
     }
-    let plan = state.statement_to_plan(statement).await?;
+    bigquery::rewrite(&mut statement);
+    let plan = match state.statement_to_plan(statement.clone()).await {
+        Err(original) => {
+            let options = state.config_mut().options_mut();
+            options.sql_parser.enable_ident_normalization = true;
+            state
+                .statement_to_plan(statement)
+                .await
+                .map_err(|_| original)?
+        }
+        planned => planned?,
+    };
     Ok(datafusion::dataframe::DataFrame::new(state, plan))
 }
