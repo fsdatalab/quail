@@ -65,6 +65,28 @@ def test_a_saved_prefix_restores_bit_for_bit_on_cuda():
     assert all(torch.equal(a, b) for a, b in zip(before, after))
 
 
+def test_a_restore_right_after_a_save_reads_the_saved_rows():
+    arena = make_arena()
+    host = HostKV(arena, 2 * 2**30, torch)
+    arena.host = host
+    key, tokens = ("d", 0), 4000
+    digest = host.register(key, list(range(tokens)), tokens)
+    assert arena.reserve(key, tokens, capacity_tokens=tokens)
+    fill(arena, key, tokens, seed=2)
+    host.mark_written(key)
+    before = snapshot(arena, key, tokens)
+    torch.cuda.synchronize()
+    arena.free_key(key)
+    other = ("e", 0)
+    host.register(other, list(range(tokens)), tokens)
+    assert arena.reserve(other, tokens, capacity_tokens=tokens)
+    assert host.restore(other, digest)
+    torch.cuda.current_stream().wait_event(host._fences[-1])
+    after = snapshot(arena, other, tokens)
+    torch.cuda.synchronize()
+    assert all(torch.equal(a, b) for a, b in zip(before, after))
+
+
 def test_a_save_costs_the_host_little_while_a_pass_runs():
     arena = make_arena(pages=8192)
     host = HostKV(arena, 16 * 2**30, torch)

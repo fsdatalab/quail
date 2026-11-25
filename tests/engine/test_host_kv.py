@@ -1,5 +1,7 @@
 """The host store keeps a freed document prefix and restores it into new pages."""
 
+from contextlib import contextmanager
+
 import pytest
 
 from quail.backends.quail.executor.arena import KVArena
@@ -205,6 +207,63 @@ def test_a_hybrid_prefix_restores_its_checkpoint_with_its_rows():
     assert torch.all(arena.gdn_state[slot] == 2.5)
     assert torch.all(arena.conv_state[slot] == -1.0)
     assert read_prefix(arena, key, 0, 6) == before
+
+
+def test_a_failed_query_saves_nothing_and_drops_its_queued_saves(monkeypatch):
+    arena = make_arena()
+    host = attach(arena, entries=4)
+    keys = [("d", 0), ("d", 1)]
+    digests = [host.register(key, [index] * 6, 6) for index, key in enumerate(keys)]
+    for index, key in enumerate(keys):
+        assert arena.reserve(key, 6, capacity_tokens=8)
+        write_prefix(arena, key, 6, seed=index)
+        host.mark_written(key)
+    monkeypatch.setattr(host, "_staging_free", lambda direction: False)
+    arena.free_key(keys[0])
+    assert arena.is_resident(keys[0])
+    arena.free_all()
+    assert not arena.accounting.owned and arena.free_pages == 8
+    assert not any(host.holds(digest) for digest in digests)
+    host.begin_query()
+
+
+def test_the_end_of_a_query_saves_every_written_key():
+    arena = make_arena()
+    host = attach(arena)
+    key = ("d", 0)
+    digest = host.register(key, [1, 2, 3, 4, 5, 6], 6)
+    assert arena.reserve(key, 6, capacity_tokens=8)
+    write_prefix(arena, key, 6, seed=3)
+    host.mark_written(key)
+    arena.free_all(save=True)
+    assert host.holds(digest) and not arena.accounting.owned
+
+
+def test_freeing_every_key_waits_for_a_save_still_reading_its_pages():
+    arena = make_arena()
+    events = []
+
+    class Store:
+        def before_free(self, key):
+            events.append(_Event())
+            return events[-1]
+
+        def flush_pending(self, wait=False, until=None):
+            return {}
+
+        def forget_writes(self):
+            return []
+
+        @contextmanager
+        def patient(self):
+            yield
+
+    arena.host = Store()
+    assert arena.reserve(("d", 0), 6, capacity_tokens=8)
+    arena.free_key(("d", 0))
+    arena.free_all()
+    assert events[0].waited and not arena.accounting.owned
+    assert arena.free_pages == 8
 
 
 def test_the_hash_names_the_tokens_and_their_count():

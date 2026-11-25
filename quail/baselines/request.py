@@ -8,26 +8,20 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from quail.backends.base import GpuContext
+from quail.backends.quail.executor.images import RegionImages
 from quail.backends.resources import release_models
 from quail.baselines.execution import RequestModelExecution
-from quail.baselines.nodes import RequestExecution
-from quail.baselines.planning import plan_request_backend
+from quail.baselines.images import ImagePrompts
 from quail.execution.metrics import scalar_node_metrics
 from quail.execution.runner import ExecutionContext, GenericRunner, compute_subgraph
 from quail.execution.runtimes import ModelNodeRuntime
 from quail.execution.types import PhysicalResponse, export_physical_outputs
-from quail.physical import Scan
-from quail.planner.optimizer.candidates import SupportResult
+from quail.physical import RequestExecution, Scan
+from quail.specs import DEVICES, SupportResult
 
 
 def execute_request_graph(context, backend, engine_state, boot):
     """Run a request backend over its compute subgraph."""
-    try:
-        import torch
-    except ImportError:
-        torch = None
-
-
     envelope = context.request.plan
     documents = {
         node.alias: context.request.inputs[node.input_id].documents
@@ -53,6 +47,28 @@ def execute_request_graph(context, backend, engine_state, boot):
             "document_texts": document_texts,
         },
     ))
+    client = engine_state["client"]
+    images = RegionImages(documents, context.request.column_tables(),
+                          context.registry.model(envelope["model"]))
+    if images:
+        if not hasattr(client, "image_pad_id"):
+            raise ValueError(f"{backend.name} reads no image documents")
+        client.images = ImagePrompts(images, client.image_pad_id())
+        model_execution.submit_text = False
+    try:
+        return _run_request_graph(context, backend, engine_state, boot,
+                                  model_execution, documents)
+    finally:
+        if images:
+            client.images = None
+
+
+def _run_request_graph(context, backend, engine_state, boot, model_execution,
+                       documents):
+    try:
+        import torch
+    except ImportError:
+        torch = None
     if engine_state["client"].reset_prefix_cache() is False:
         raise RuntimeError("request engine did not reset its prefix cache")
     if torch is not None and torch.cuda.is_available():
@@ -68,7 +84,6 @@ def execute_request_graph(context, backend, engine_state, boot):
                    for alias, value in documents.items()},
                 **context.request.relations,
             },
-            functions=context.registry.functions,
         ),
     )
     metrics = run.metrics
@@ -100,7 +115,7 @@ def request_runtimes() -> dict:
     return {RequestExecution.runtime_key: ModelNodeRuntime()}
 
 
-SUPPORTED_DEVICES = frozenset({"h100-sxm", "rtx-pro-6000-blackwell-server"})
+SUPPORTED_DEVICES = frozenset(DEVICES)
 
 
 def _warm_boot() -> dict:
@@ -111,6 +126,9 @@ def _warm_boot() -> dict:
         "kv_profile_s": None,
         "boot_s": 0.0,
     }
+
+
+UNSERVED_ARCHS = frozenset({"lfm3"})
 
 
 @dataclass
@@ -137,9 +155,9 @@ class LoadedRequestEngine:
 class RequestBackend:
     """A model backend that submits one request per prompt to an engine.
 
-    The engine adapter boots vLLM or SGLang and returns a client with
+    The engine adapter boots vLLM and returns a client with
     generate, reset_prefix_cache, and run_filter_sequence. The submission
-    strategies decide how filter stages and join tuples become
+    strategies decide how filter stages, join tuples, and maps become
     requests.
     """
 
@@ -147,6 +165,7 @@ class RequestBackend:
     engine: Any
     filter_submission: str
     join_submission: str = "anchor-major"
+    answer_submission: str = "operator-at-a-time"
     locates_answers_in_text = False
 
     @property
@@ -177,6 +196,14 @@ class RequestBackend:
             return SupportResult.reject(
                 f"the {label} request backends use one model copy on one GPU"
             )
+        if model.bidirectional:
+            return SupportResult.reject(
+                f"{label} does not support model {model.name!r}: it runs "
+                f"causal attention, not the {model.attention_mask} mask")
+        if model.arch in UNSERVED_ARCHS:
+            return SupportResult.reject(
+                f"{label} does not support model {model.name!r}: it has no "
+                f"model for architecture {model.arch!r}")
         if model.canvas_tokens == 1 and not getattr(self.engine, "reads_logprobs",
                                                      False):
             return SupportResult.reject(
@@ -185,15 +212,16 @@ class RequestBackend:
                 f"does not return")
         return SupportResult.accept()
 
-    def plan(self, region, context):
-        return plan_request_backend(
-            region,
-            context,
-            backend_name=self.name,
-            filter_submission=self.filter_submission,
-            join_submission=self.join_submission,
-            scores_labels=getattr(self.engine, "scores_labels", False),
-        )
+    @property
+    def request_settings(self) -> dict:
+        """How Rust's planner submits this backend's operators."""
+        return {
+            "backend_name": self.name,
+            "filter_submission": self.filter_submission,
+            "join_submission": self.join_submission,
+            "answer_submission": self.answer_submission,
+            "scores_labels": getattr(self.engine, "scores_labels", False),
+        }
 
     def start(self, context):
         return RequestModelExecution(context)
@@ -210,12 +238,13 @@ class RequestBackend:
         ) | set(envelope["settings"]["false_ids"]))
         started = time.perf_counter()
         with ExitStack() as rollback:
-            # a failed boot must leave the GPU free for the next attempt
             rollback.callback(release_models, context.runtime_state)
             engine = LoadedRequestEngine()
             context.runtime_state["engine"] = engine
             engine.settings, boot = self.engine.boot(
-                model, allowed_ids, resources=engine.resources)
+                model, allowed_ids,
+                device=context.registry.device(envelope["device"]),
+                resources=engine.resources)
             rollback.pop_all()
         return engine, {**boot, "boot_s": round(time.perf_counter() - started, 2)}
 

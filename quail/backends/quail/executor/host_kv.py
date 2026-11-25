@@ -23,10 +23,8 @@ A restore is the reverse on a second stream: the copy engine fills
 a staging block and the scatter into the pages the arena reserved
 follows it there, so the block is free again at the link's pace; the
 compute stream waits on the scatters (fence) before the pass that
-reads the pages. A kernel writing host memory directly would need no
-staging, but it holds the SMs for the whole transfer and slowed the
-passes beside it; the copy engine does not. Staging blocks are few
-and reused once their copy has landed. When none is free, a save
+reads the pages. Staging blocks are few, MAX_STAGING per layer group
+and direction, and reused once their copy has landed. When none is free, a save
 waits in a queue with its pages still held (the arena's pages are the
 queue) and runs when the chunk loop next reclaims and a block has
 come free, so the store never paces a running query; a restore waits
@@ -35,7 +33,10 @@ the arena frees every document at once with the GPU idle, so those
 saves wait for a block too (patient).
 
 A key's rows are saved only once an operator computed or restored them
-(mark_written); pages reserved for a chunk that never ran hold nothing.
+(mark_written); pages reserved for a chunk that never ran hold nothing,
+and a failed query saves no key (forget_writes). Row indices reach the
+device through INDEX_SLOTS pinned slots of INDEX_TOKENS rows each; a
+longer prefix pins its own buffer.
 """
 
 import hashlib
@@ -45,23 +46,17 @@ from contextlib import contextmanager
 
 import numpy as np
 
-from quail.catalog.tokens import token_array
+from quail.backends.quail.executor.chunk import Suffixes
 
-# pinned slots for row indices on their way to the device, and the
-# longest prefix a slot holds; a longer one pins its own buffer. A
-# save in flight holds its slot; 4096 slots of 4096 rows are 128 MB
 INDEX_SLOTS = 4096
 INDEX_TOKENS = 4096
-# staging blocks per layer group and direction; a 300-token document
-# of a 4B model takes about 45 MB, so 8 each way is about 720 MB
 MAX_STAGING = 8
-# before_free's answer for a save queued until a staging block is free
 PENDING = "pending"
 
 
 def prefix_hash(prefix) -> bytes:
     """Hash a prefix's token ids: the document head, then the document."""
-    ids = np.ascontiguousarray(token_array(prefix), dtype=np.int32)
+    ids = np.ascontiguousarray(Suffixes.of([prefix]).ids, dtype=np.int64)
     digest = hashlib.blake2b(digest_size=16)
     digest.update(np.int64(len(ids)).tobytes())
     digest.update(ids.tobytes())
@@ -95,9 +90,6 @@ class _Ring:
         index = 0
         while True:
             if head + rows > self.num_rows:
-                # the run would cross the end: the rows up to it go
-                # unused, and the entries still ahead of the head are
-                # the oldest, so they go
                 while index < len(self.entries) and self.entries[index][0] >= head:
                     evicted.append(self.entries[index])
                     index += 1
@@ -106,8 +98,6 @@ class _Ring:
             if index >= len(self.entries):
                 break
             oldest = self.entries[index][0]
-            # free rows run from the head to the oldest entry when it
-            # sits ahead of the head, else to the end of the ring
             if oldest >= head and oldest - head < rows:
                 evicted.append(self.entries[index])
                 index += 1
@@ -167,8 +157,6 @@ class HostKV:
                            * arena.gdn_state.element_size()
                            + arena.conv_state[0].numel()
                            * arena.conv_state.element_size())
-        # a hybrid model keeps one checkpoint beside each entry, so the
-        # rows per slot follow the arena's own ratio of rows to slots
         rows_per_slot = 0
         if state_bytes:
             rows_per_slot = max(1, arena.num_pages * arena.page_tokens
@@ -192,21 +180,21 @@ class HostKV:
                 dtype=arena.conv_state.dtype, device="cpu", pin_memory=self.pinned)
         self._free_slots = list(range(self.num_slots - 1, -1, -1))
         self.ring = _Ring(self.num_rows)
-        self.entries = {}       # prefix hash -> (start, tokens, slot or None)
-        self._by_start = {}     # ring start -> prefix hash
-        self._keys = {}         # arena key -> (prefix hash, prefix tokens)
-        self._written = set()   # keys whose prefix rows hold computed KV
-        self._fresh = set()     # hashes saved during this query
+        self.entries = {}
+        self._by_start = {}
+        self._keys = {}
+        self._written = set()
+        self._fresh = set()
         self._flat = [self._flat_view(layers, width)
                       for layers, width, _ in self._groups]
-        self._staging = {}      # (direction, group) -> [[tensor, event], ...]
-        self._patient = False   # wait for a staging block instead of skipping
-        self._pending = {}      # key -> (digest, prefix tokens), saves queued
+        self._staging = {}
+        self._patient = False
+        self._pending = {}
         self.stream = (torch.cuda.Stream(device=self.device)
                        if self.pinned else None)
         self.restore_stream = (torch.cuda.Stream(device=self.device)
                                if self.pinned else None)
-        self._fences = []       # restore events the next pass waits on
+        self._fences = []
         self._index_slots = None
         self._index_events = [None] * INDEX_SLOTS
         self._next_slot = 0
@@ -248,8 +236,6 @@ class HostKV:
                 if offset % width:
                     return None
                 bases.append(offset // width)
-        # the bases live on the device: a copy per save would wait on
-        # the stream's queued passes
         return storage.view(-1, width), self.torch.tensor(
             bases, dtype=self.torch.int64, device=self.device)
 
@@ -295,7 +281,6 @@ class HostKV:
             "host_kv_rows": self.num_rows,
         }
 
-    # ---- the keys of one query -----------------------------------------
 
     def begin_query(self) -> None:
         """Forget the last query's keys: a key names a document per query."""
@@ -306,7 +291,7 @@ class HostKV:
         self._fresh.clear()
         self.reset_stats()
 
-    def register(self, key, prefix, prefix_tokens: int) -> bytes:
+    def register(self, key, prefix, prefix_tokens: int):
         """Name the prefix a key holds; returns its hash.
 
         A key renamed to another prefix holds no saved KV until an
@@ -329,7 +314,6 @@ class HostKV:
     def holds(self, digest: bytes) -> bool:
         return digest in self.entries
 
-    # ---- save ----------------------------------------------------------
 
     def before_free(self, key):
         """Save a registered key's prefix rows before the arena frees them.
@@ -368,8 +352,6 @@ class HostKV:
         events = {}
         if not self._pending:
             return events
-        # a query's end and a resize flush outside the pass's inference
-        # mode, and the staging blocks were made inside it
         with self._patience(wait), self.torch.inference_mode():
             for key in list(self._pending):
                 if not self._staging_free("save"):
@@ -389,6 +371,16 @@ class HostKV:
         finally:
             self._patient = was
 
+    def forget_writes(self) -> list:
+        """Save no key written so far, and drop the queued saves.
+
+        Returns:
+            The keys whose queued saves were dropped.
+        """
+        self._written.clear()
+        dropped, self._pending = list(self._pending), {}
+        return dropped
+
     def cancel_pending(self, key) -> None:
         """A queued key is used again: it keeps its rows and is not saved."""
         self._pending.pop(key, None)
@@ -397,9 +389,6 @@ class HostKV:
         """Take ring rows and a slot for the key and queue its copies."""
         started = time.perf_counter()
         start, evicted = self.ring.plan(prefix_tokens)
-        # a store smaller than the query's documents keeps the first
-        # ones it saved: a save that would drop one of them would move
-        # the rows over PCIe for nothing
         if start is None or any(self._by_start[old_start] in self._fresh
                                 for old_start, _ in evicted):
             self.skipped_keys += 1
@@ -484,7 +473,6 @@ class HostKV:
         event.synchronize()
         self.wait_s += time.perf_counter() - started
 
-    # ---- staging blocks on the device ------------------------------------
 
     @contextmanager
     def patient(self):
@@ -624,7 +612,6 @@ class HostKV:
         for event in fences:
             stream.wait_event(event)
 
-    # ---- restore -------------------------------------------------------
 
     def restore(self, key, digest: bytes) -> bool:
         """Copy a saved prefix into the key's reserved pages.

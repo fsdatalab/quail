@@ -603,15 +603,14 @@ class QuailJudge:
 
     def filter(self, spec: PredicateSpec, rows: list[dict]) -> list[bool]:
         """One answer per row, in row order."""
-        import quail
+        from bench.substrait import sql_string
 
         if not rows:
             return []
         name = self._register(rows, spec.left_column)
-        query = (self.session.docs(name).alias("l")
-                 .ai_filter(quail.prompt(
-                     spec.template, quail.col(f"l.{spec.left_column}")))
-                 .select("l.id"))
+        query = self.session.sql(
+            f"SELECT l.id FROM {name} l WHERE AI_FILTER(PROMPT("
+            f"{sql_string(spec.template)}, l.{spec.left_column}))")
         result = self._run(query, len(rows))
         table = result.answer_tables["filters"][("l", 0)]
         answers = [None] * len(rows)
@@ -632,14 +631,13 @@ class QuailJudge:
         only the pairs whose columns are equal and whose rows pass the
         predicate's WHERE conditions.
         """
-        import quail
+        from bench.substrait import sql_string
 
         if not left_rows or not right_rows:
             return {}
         pairs = _pair_columns(spec)
-        prompt = quail.prompt(spec.template,
-                              quail.col(f"l.{spec.left_column}"),
-                              quail.col(f"r.{spec.right_column}"))
+        prompt = (f"PROMPT({sql_string(spec.template)}, l.{spec.left_column}, "
+                  f"r.{spec.right_column})")
         keep_left = list(range(len(left_rows)))
         keep_right = list(range(len(right_rows)))
         if pairs:
@@ -655,20 +653,16 @@ class QuailJudge:
                                   spec.left_column, (pairs[0],))
             right = self._register([right_rows[j] for j in keep_right],
                                    spec.right_column, (pairs[1],))
-            query = (self.session.docs(left).alias("l")
-                     .join(self.session.docs(right).alias("r"),
-                           on=quail.col(f"l.{pairs[0]}")
-                           == quail.col(f"r.{pairs[1]}"))
-                     .ai_filter(prompt)
-                     .select("l.id", "r.id"))
+            query = self.session.sql(
+                f"SELECT l.id, r.id FROM {left} l JOIN {right} r "
+                f"ON l.{pairs[0]} = r.{pairs[1]} AND AI_FILTER({prompt})")
             expected = len(_matching_pairs(spec, left_rows, right_rows))
         else:
             left = self._register(left_rows, spec.left_column)
             right = self._register(right_rows, spec.right_column)
-            query = (self.session.docs(left).alias("l")
-                     .ai_join(self.session.docs(right).alias("r"), prompt,
-                              anchor="l", semantics="full")
-                     .select("l.id", "r.id"))
+            query = self.session.sql(
+                f"SELECT l.id, r.id FROM {left} l JOIN {right} r "
+                f"ON AI_FILTER({prompt}, {{'anchor': 'l'}})")
             expected = len(left_rows) * len(right_rows)
         result = self._run(query, expected)
         table = result.answer_tables["joins"][0]

@@ -10,22 +10,67 @@ from quail.baselines.request import RequestBackend
 from quail.baselines.request_scheduling import (
     MAX_BATCHED_TOKENS,
     MAX_SEQUENCES,
+    run_extract_fields,
     run_filter_sequence,
 )
+from quail.common.budgets import GRAPH_TOKEN_BUCKETS, kv_pool_cap_tokens
+from quail.specs.base import DeviceSpec, ModelSpec
 from quail.specs.files import resolve_model_path
 
 GPU_MEMORY_UTILIZATION = 0.91
-CUDA_GRAPH_CAPTURE_SIZE = 8_192
-# vLLM caps a diffusion model at 8 sequences per step whenever the
-# setting is 128 or more, sized for its 256-row canvas; one row needs
-# no cap, so stay just under the trigger.
+MAX_MODEL_LEN = -1
+
+
+def gpu_memory_utilization(device: DeviceSpec | None,
+                           model: ModelSpec) -> float:
+    """Return the fraction of device memory vLLM may use.
+
+    The default is ``GPU_MEMORY_UTILIZATION``. A model that sets
+    ``vllm_reserve_bytes`` lowers the fraction so at least that many
+    bytes stay outside the pool.
+
+    Args:
+        device: The device the engine boots on. Required when the
+            model sets a reserve.
+        model: The model spec.
+
+    Returns:
+        The ``gpu_memory_utilization`` value for ``LLM``.
+
+    Raises:
+        ValueError: The model sets a reserve and ``device`` is missing.
+    """
+    if not model.vllm_reserve_bytes:
+        return GPU_MEMORY_UTILIZATION
+    if device is None:
+        raise ValueError("a vLLM reserve needs the device")
+    reserved = 1.0 - model.vllm_reserve_bytes / device.mem_bytes
+    return min(GPU_MEMORY_UTILIZATION, reserved)
+
+
 DIFFUSION_SEQUENCES = 127
-# DiffusionGemma ignores logprob_token_ids in vLLM 0.26. Request the full
-# vocabulary so TRUE/FALSE scores are returned regardless of their ranks.
 DIFFUSION_LOGPROBS = -1
-# generated tokens a longer canvas gets; the answer word is read
-# from the text
 DIFFUSION_TEXT_TOKENS = 16
+NGRAM_SPECULATIVE_TOKENS = 5
+
+
+def register_gigatoken() -> None:
+    """Register Gigatoken as vLLM's "gigatoken" tokenizer mode.
+
+    vLLM's engine core runs in a spawned process, which has its own
+    registries, so this is also a vLLM general plugin
+    (pyproject.toml's vllm.general_plugins entry point), which vLLM
+    loads in every process it starts.
+    """
+    from vllm.renderers.registry import RENDERER_REGISTRY
+    from vllm.tokenizers import TokenizerRegistry
+
+    registered = ("quail.baselines.vllm", "GigatokenVLLMTokenizer")
+    if TokenizerRegistry.tokenizers.get("gigatoken") != registered:
+        TokenizerRegistry.register("gigatoken", *registered)
+    renderer = ("vllm.renderers.hf", "HfRenderer")
+    if RENDERER_REGISTRY.renderers.get("gigatoken") != renderer:
+        RENDERER_REGISTRY.register("gigatoken", *renderer)
 
 
 class GigatokenVLLMTokenizer:
@@ -52,21 +97,25 @@ def engine_environment(spec):
     """Scope vLLM's process selection to construction of one engine."""
     from vllm import envs
 
-    key = "VLLM_ENABLE_V1_MULTIPROCESSING"
-    previous = os.environ.get(key)
-    # vLLM 0.26 reads process selection from the environment in LLM's
-    # constructor, and caches what it read; its public LLM API has no
-    # per-instance override
-    envs.disable_envs_cache()
+    settings = {}
     if spec.vision_tower or spec.canvas_tokens == 1:
-        os.environ[key] = "0"
+        settings["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    if spec.vision_tower and os.environ.get("QUAIL_VLLM_IMAGES"):
+        root = os.environ.get("VLLM_CACHE_ROOT",
+                              os.path.expanduser("~/.cache/vllm"))
+        settings["VLLM_CACHE_ROOT"] = root.rstrip("/") + "-images"
+        settings["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+    previous = {key: os.environ.get(key) for key in settings}
+    envs.disable_envs_cache()
+    os.environ.update(settings)
     try:
         yield
     finally:
-        if previous is None:
-            os.environ.pop(key, None)
-        else:
-            os.environ[key] = previous
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
         envs.disable_envs_cache()
 
 
@@ -95,14 +144,11 @@ def diffusion_canvas(spec):
                 raise ValueError("vLLM canvas geometry differs from the model spec")
             self.canvas[slots] = tokens[0]
 
-    # vLLM 0.26 has no public canvas-input setting. Instances retain this
-    # subclass after construction; later engines see the original class.
     diffusion_gemma.DiffusionGemmaRequestStates = FixedCanvasStates
     try:
         yield tokens
     finally:
         diffusion_gemma.DiffusionGemmaRequestStates = original
-
 
 
 def _capacity(llm) -> dict:
@@ -136,15 +182,22 @@ def diffusion_kwargs(spec) -> dict:
     kwargs = {"diffusion_config": diffusion}
     if spec.canvas_tokens == 1:
         diffusion["max_denoising_steps"] = 1
-        # vLLM refuses a request for more logprobs than this
         kwargs["max_logprobs"] = DIFFUSION_LOGPROBS
     return kwargs
 
 
 def text_only_kwargs(spec) -> dict:
-    """Turn off image and video inputs of a checkpoint with a vision tower."""
+    """Turn off video inputs of a checkpoint with a vision tower.
+
+    Image inputs stay off unless ``QUAIL_VLLM_IMAGES`` is set: an engine
+    that takes images profiles its vision encoder and reserves its cache,
+    and its image processor needs the checkpoint's own tokenizer.
+    """
     if not spec.vision_tower:
         return {}
+    if os.environ.get("QUAIL_VLLM_IMAGES"):
+        return {"limit_mm_per_prompt": {"image": 1, "video": 0},
+                "tokenizer_mode": "auto"}
     return {"limit_mm_per_prompt": {"image": 0, "video": 0}}
 
 
@@ -171,9 +224,21 @@ class VLLMClient:
     def __init__(self, llm, capacity: dict):
         self.llm = llm
         self.capacity = capacity
+        self.images = None
+
+    def _prompt(self, prompt):
+        return prompt if self.images is None else self.images.prompt(prompt)
+
+    def _render(self, prompt):
+        return self.llm._preprocess_cmpl_one(self._prompt(prompt))
+
+    def image_pad_id(self) -> int:
+        """The id of the model's ``<|image_pad|>`` token."""
+        return self.llm.get_tokenizer().convert_tokens_to_ids("<|image_pad|>")
 
     def generate(self, prompts, sampling_params, use_tqdm=False):
-        return self.llm.generate(prompts, sampling_params, use_tqdm=use_tqdm)
+        return self.llm.generate([self._prompt(prompt) for prompt in prompts],
+                                 sampling_params, use_tqdm=use_tqdm)
 
     def decode_params(self, max_tokens: int, stop=None):
         """Build sampling parameters for greedy text generation.
@@ -212,7 +277,29 @@ class VLLMClient:
             max_num_seqs=self.capacity["max_num_seqs"],
             body_texts=body_texts,
             question_texts=question_texts,
-            render_prompt=self.llm._preprocess_cmpl_one,
+            render_prompt=self._render,
+        )
+
+    def run_extract_fields(self, sampling_params, body_ids, tail_ids, *,
+                           answer_tokens, tag="x", body_texts=None,
+                           tail_texts=None):
+        """Decode the answers of each document through the engine's step loop.
+
+        sampling_params is one setting for every field, or one per field.
+        """
+        return run_extract_fields(
+            self.llm.llm_engine,
+            sampling_params,
+            body_ids,
+            tail_ids,
+            self.capacity["kv_cache_size_tokens"],
+            tag=tag,
+            answer_tokens=answer_tokens,
+            block_size=self.capacity["block_size"],
+            max_num_seqs=self.capacity["max_num_seqs"],
+            body_texts=body_texts,
+            tail_texts=tail_texts,
+            render_prompt=self._render,
         )
 
 
@@ -221,33 +308,38 @@ class VLLMEngine:
 
     kind = "vllm"
     label = "vLLM"
-    # prompts are rendered as text and tokenized by vLLM
     reads_document_text = True
-    runtime_package = "vllm==0.26.0"
-    # a request can decode an answer as text
+    runtime_package = "vllm==0.29.0"
     scores_labels = True
-    # a request returns the logprobs a canvas model's answer is read from
     reads_logprobs = True
-    # a decision model runs on the pooling runner
     roles = frozenset({"generative", "decision"})
 
-    def llm_kwargs(self, spec) -> dict:
+    def llm_kwargs(self, spec, device: DeviceSpec | None = None) -> dict:
         """Return the LLM constructor arguments beyond the model name.
 
         A spec with its own chunk cap (a mixture-of-experts model)
         batches at least that many tokens per step. A one-row-canvas
         diffusion model runs more sequences per step than vLLM's
-        default for its 256-row canvas.
+        default for its 256-row canvas. Utilization is 0.91 unless
+        the model spec sets a reserve. ``max_model_len`` is -1, so
+        vLLM uses the model's context length when leftover KV holds
+        it and otherwise the longest length that fits.
+
+        Args:
+            spec: The model spec.
+            device: The device the engine boots on.
         """
         batched = max(MAX_BATCHED_TOKENS, spec.chunk_cap_tokens)
+        utilization = gpu_memory_utilization(device, spec)
         kwargs = {
             "max_num_batched_tokens": batched,
-            "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
+            "max_model_len": MAX_MODEL_LEN,
+            "gpu_memory_utilization": utilization,
             "enable_prefix_caching": True,
             "disable_log_stats": True,
             "tokenizer_mode": "gigatoken",
             "compilation_config": {
-                "cudagraph_capture_sizes": [CUDA_GRAPH_CAPTURE_SIZE]
+                "cudagraph_capture_sizes": list(GRAPH_TOKEN_BUCKETS)
             },
             "max_num_seqs": (DIFFUSION_SEQUENCES if spec.canvas_tokens == 1
                              else min(MAX_SEQUENCES,
@@ -255,43 +347,43 @@ class VLLMEngine:
         }
         if spec.moe_backend is not None:
             kwargs["moe_backend"] = spec.moe_backend
+        speculative = os.environ.get("QUAIL_VLLM_SPECULATIVE")
+        if speculative:
+            kwargs["speculative_config"] = speculative_config(speculative)
         kwargs.update(diffusion_kwargs(spec))
+        if device is not None:
+            kwargs["block_size"] = device.page_tokens
+        cap = kv_pool_cap_tokens()
+        if cap:
+            kwargs["num_gpu_blocks_override"] = cap // kwargs.get("block_size", 16)
         kwargs.update(text_only_kwargs(spec))
         return kwargs
 
-    def boot(self, spec, allowed_ids: list[int], *,
+    def boot(self, spec, allowed_ids: list[int],
+             device: DeviceSpec | None = None, *,
              resources: ExitStack) -> tuple[dict, dict]:
         """Load the spec's model and return its settings and boot record.
 
         Args:
             spec: The model to load.
             allowed_ids: The token ids a filter answer may be.
+            device: Device used to calculate the memory reserve.
             resources: Owns the engine; closing it stops the engine.
         """
-        # a session tokenizes on background threads before the engine
-        # starts, and a forked worker would inherit their locks
         os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
         if spec.role == "decision":
             from quail.baselines.vllm_decision import boot_decision
 
-            return boot_decision(spec, self.llm_kwargs(spec), resources=resources)
+            return boot_decision(
+                spec, self.llm_kwargs(spec, device), resources=resources)
         from vllm import LLM, SamplingParams
-        from vllm.renderers.registry import RENDERER_REGISTRY
-        from vllm.tokenizers import TokenizerRegistry
 
-        registered = (
-            "quail.baselines.vllm", "GigatokenVLLMTokenizer"
-        )
-        if TokenizerRegistry.tokenizers.get("gigatoken") != registered:
-            TokenizerRegistry.register("gigatoken", *registered)
-        renderer = ("vllm.renderers.hf", "HfRenderer")
-        if RENDERER_REGISTRY.renderers.get("gigatoken") != renderer:
-            RENDERER_REGISTRY.register("gigatoken", *renderer)
+        register_gigatoken()
 
         path = resolve_model_path(spec.hf_name, spec.revision)
         started = time.perf_counter()
         with engine_environment(spec), diffusion_canvas(spec) as canvas_ids:
-            llm = LLM(model=path, **self.llm_kwargs(spec))
+            llm = LLM(model=path, **self.llm_kwargs(spec, device))
             client = resources.enter_context(closing(VLLMClient(llm, {})))
         boot_s = time.perf_counter() - started
         sampling_params = SamplingParams(
@@ -338,8 +430,44 @@ class DefaultVLLMEngine(VLLMEngine):
     kind = "dumb_vllm"
     label = "vLLM with default settings"
 
-    def llm_kwargs(self, spec) -> dict:
+    def llm_kwargs(self, spec, device: DeviceSpec | None = None) -> dict:
         return {**diffusion_kwargs(spec), **text_only_kwargs(spec)}
+
+
+class NgramVLLMEngine(VLLMEngine):
+    """Boot tuned vLLM with n-gram speculation from the prompt.
+
+    vLLM drafts the next five tokens after a match of the last few
+    output tokens in the prompt, as in vLLM's documented example. The
+    engine kind differs from `VLLMEngine` so a speculative engine never
+    shares a loaded model with the other tuned vLLM backends.
+    """
+
+    kind = "ngram_vllm"
+    label = "vLLM with n-gram speculation"
+
+    def llm_kwargs(self, spec, device: DeviceSpec | None = None) -> dict:
+        return {**super().llm_kwargs(spec, device),
+                "speculative_config": speculative_config(
+                    f"ngram:{NGRAM_SPECULATIVE_TOKENS}")}
+
+
+def speculative_config(value: str) -> dict:
+    """Return the vLLM speculation an experiment turns on.
+
+    Args:
+        value: "ngram:<tokens>", vLLM's n-gram drafts from the prompt
+            with that many draft tokens, from QUAIL_VLLM_SPECULATIVE.
+
+    Raises:
+        ValueError: The value is not ngram:<tokens>.
+    """
+    method, _, tokens = value.partition(":")
+    if method != "ngram" or not tokens.isdigit() or int(tokens) < 1:
+        raise ValueError(
+            f"QUAIL_VLLM_SPECULATIVE={value!r} is not ngram:<tokens>")
+    return {"method": "ngram", "num_speculative_tokens": int(tokens),
+            "prompt_lookup_max": 4}
 
 
 def stock_vllm_backend() -> RequestBackend:
@@ -352,11 +480,31 @@ def stock_vllm_backend() -> RequestBackend:
 
 
 def pipelined_vllm_backend() -> RequestBackend:
-    """Return vLLM with per document filter pipelining."""
+    """Return vLLM with per document filter and map pipelining."""
     return RequestBackend(
         name="pipelined_vllm",
         engine=VLLMEngine(),
         filter_submission="pipelined",
+        answer_submission="pipelined",
+    )
+
+
+def ngram_vllm_backend() -> RequestBackend:
+    """Return stock vLLM with n-gram speculation, operator-at-a-time filters."""
+    return RequestBackend(
+        name="ngram_vllm",
+        engine=NgramVLLMEngine(),
+        filter_submission="operator-at-a-time",
+    )
+
+
+def shuffled_vllm_backend() -> RequestBackend:
+    """Return stock vLLM sending every map prompt in one call, in random order."""
+    return RequestBackend(
+        name="shuffled_vllm",
+        engine=VLLMEngine(),
+        filter_submission="operator-at-a-time",
+        answer_submission="shuffled",
     )
 
 

@@ -7,7 +7,7 @@ import pytest
 from quail.backends.quail.executor.pages import PageArena
 
 
-def test_allocation_retention_rewind_and_pinning():
+def test_pages_are_allocated_retained_rewound_pinned_and_borrowed_until_freed():
     a = PageArena(num_pages=10, page_tokens=16)
     pages = a.alloc("d0", 40)      # 3 pages
     assert len(pages) == 3
@@ -79,8 +79,7 @@ def test_allocation_retention_rewind_and_pinning():
 
     assert a.pop_retained_victim() is None
 
-
-def test_borrowed_pages_are_shared_until_the_last_holder_frees_them():
+    # borrowed pages are shared until the last holder frees them
     a = PageArena(num_pages=10, page_tokens=16)
     parent = a.alloc("p", 40)                 # pages for 40 tokens: 3
     child = a.alloc("c", 50, borrowed=a.shared_pages("p", 32))  # borrows 2, owns 2
@@ -139,36 +138,13 @@ def test_borrowed_pages_are_shared_until_the_last_holder_frees_them():
     assert a.borrowed["s"] == [] and len(a.owned["s"]) == 1
 
 
-def test_the_arena_allocates_its_pools_once_and_views_them_per_layer(monkeypatch):
-    import math
-
-    torch = pytest.importorskip("torch")
-    from quail.backends.quail.executor.arena import KVArena
-
-    shapes = [(2, 8), (1, 4), (3, 8)]
-    allocations = []
-    empty = torch.empty
-
-    def allocate(size, **kwargs):
-        allocations.append(size if isinstance(size, int) else math.prod(size))
-        if len(allocations) == 2:
-            raise MemoryError("out of memory")
-        return empty(size, **kwargs)
-
-    monkeypatch.setattr(torch, "empty", allocate)
-    arena = KVArena(num_layers=3, num_pages=3, page_tokens=4, num_kv_heads=2,
-                    d_head=8, layer_kv=shapes, dtype=torch.float32, device="cpu")
-    assert allocations == [2 * 12 * sum(heads * dim for heads, dim in shapes)]
-    for layer, (heads, dim) in enumerate(shapes):
-        key, value = arena.layer_kv(layer)
-        key.fill_(layer)
-        value.fill_(10 + layer)
-    for layer, (heads, dim) in enumerate(shapes):
-        key, value = arena.layer_kv(layer)
-        assert key.shape == value.shape == (12, heads, dim)
-        assert key.is_contiguous() and torch.all(key == layer)
-        assert torch.all(value == 10 + layer)
-        assert arena.paged_kv(layer)[0].shape == (3, 4, heads, dim)
-    with pytest.raises(MemoryError, match="out of memory"):
-        arena.resize(5)
-    assert arena.k is None and len(allocations) == 2
+def test_a_retained_parent_counts_the_pages_its_borrowers_stop_sharing():
+    a = PageArena(num_pages=8, page_tokens=16)
+    a.alloc("parent", 32)
+    a.alloc("child", 48, borrowed=a.shared_pages("parent", 16))
+    a.retain("parent")
+    assert a.retained_pages == 1
+    a.free_key("child")
+    assert a.retained_pages == 2
+    a.alloc("late child", 48, borrowed=a.shared_pages("parent", 16))
+    assert a.retained_pages == 1

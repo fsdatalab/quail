@@ -1,6 +1,7 @@
 """A fake model that checks every KV read, and runners for filters and joins.
 
-from quail.backends.quail.executor.stages import Stage, filter_stages, run_stages
+from quail.backends.quail.executor.stages import Stage, filter_stages
+from quail.backends.quail.executor.stage_executor import StageExecutor
 A fake model stands in for the network. Each packed row gets a hash of
 its token and the hash its attention reads at the row before it, and
 every write stores (token, position, hash) in the arena's rows. A
@@ -13,14 +14,16 @@ from its hash and check that the loop returns it.
 from dataclasses import dataclass
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 
 from helpers.fakes import fake_pipeline, fake_readout, fake_torch
 from quail.backends.quail.executor.arena import KVArena
-from quail.backends.quail.executor.operators.filter import FilterPart
-from quail.backends.quail.executor.parts import gated_stages
-from quail.backends.quail.executor.stages import Stage, filter_stages, run_stages
-from quail.catalog.tokens import prefix_tree
+from quail.backends.quail.executor.model_operator import gated_stages
+from quail.backends.quail.executor.operators.filter import FilterOperator
+from quail.backends.quail.executor.stage_executor import StageExecutor
+from quail.backends.quail.executor.stages import Stage, filter_stages
+from quail.common.tokens import prefix_tree
 
 
 @dataclass(frozen=True)
@@ -37,6 +40,7 @@ class Setup:
         sliding_pages: Sliding pool pages.
         budget: Chunk token budget.
         page_tokens: Tokens per KV page.
+        state_slots: Recurrent checkpoint slots, or zero without recurrent layers.
     """
 
     path: str
@@ -46,6 +50,7 @@ class Setup:
     sliding_pages: int = 400
     budget: int = 600
     page_tokens: int = 16
+    state_slots: int = 0
 
 
 def mix(previous, token):
@@ -83,6 +88,9 @@ class HashModel:
         self.sliding = Pool(arena.layer_kv(1)[0]) if arena.has_sliding else None
         self.answers = answers      # request hash -> answer bit
         self.canvas = canvas
+        self.state_hash = np.full(arena.num_state_slots, -1, dtype=np.int64)
+        self.state_position = np.full(arena.num_state_slots, -1, dtype=np.int64)
+        self.state_starts = np.zeros(arena.num_state_slots, dtype=np.int64)
 
     def forward_chunk(self, chunk):
         ids = chunk.input_ids.tolist()
@@ -93,6 +101,7 @@ class HashModel:
             self._unified(meta["unified"], ids, positions, hashes)
         else:
             self._tree(meta, ids, positions, hashes)
+        self._check_state(meta, ids, positions, hashes)
         out = []
         for row in chunk.final_indices.tolist():
             h = hashes[row]
@@ -101,6 +110,48 @@ class HashModel:
                 f"request has")
             out.append(self.answers[h])
         return out
+
+    def _check_state(self, meta, ids, positions, hashes):
+        """Check recurrent outputs against the full-attention token chain."""
+        if not len(self.state_hash):
+            return
+        phases = meta.get("gdn")
+        assert phases, "a hybrid chunk has no recurrent phases"
+        outputs = set()
+        for phase in phases:
+            rows = phase.rows.tolist()
+            bounds = phase.cu_seqlens.tolist()
+            assert np.diff(bounds).tolist() == list(phase.lengths)
+            reads = ([(0, -1)] * len(phase.lengths)
+                     if phase.read_slots is None else [
+                         (int(self.state_hash[slot]), int(self.state_position[slot]))
+                         for slot in phase.read_slots.tolist()])
+            writes = []
+            for index, (begin, end) in enumerate(zip(bounds, bounds[1:])):
+                previous, position = reads[index]
+                assert previous >= 0, "a recurrent phase reads an unwritten slot"
+                for row in rows[begin:end]:
+                    assert positions[row] == position + 1, (
+                        f"recurrent row at {positions[row]} follows "
+                        f"state at {position}")
+                    previous = mix(previous, ids[row])
+                    position += 1
+                    if phase.output:
+                        assert row not in outputs, "a recurrent row has two outputs"
+                        assert previous == hashes[row], (
+                            f"recurrent row {row} differs from its "
+                            "full-attention prefix")
+                        outputs.add(row)
+                writes.append((previous, position))
+            if phase.write_slots is not None:
+                slots = phase.write_slots.tolist()
+                assert len(slots) == len(writes)
+                assert len(set(slots)) == len(slots)
+                for slot, (previous, position) in zip(slots, writes):
+                    self.state_hash[slot] = previous
+                    self.state_position[slot] = position
+                    self.state_starts[slot] += phase.read_slots is None
+        assert outputs == set(range(len(ids))), "recurrent outputs omit chunk rows"
 
     # ---- unified: one paged call per pool --------------------------------
 
@@ -284,16 +335,19 @@ class HashModel:
 
 def make_arena(setup):
     """An arena whose rows hold the checking model's (token, position, hash)."""
+    state = (dict(num_state_slots=setup.state_slots,
+                  gdn_state_shape=(1, 1, 1, 1), conv_state_shape=(1, 1, 1))
+             if setup.state_slots else {})
     if setup.window is not None:
         return KVArena(num_layers=2, num_pages=setup.pages,
                        page_tokens=setup.page_tokens, num_kv_heads=1, d_head=3,
                        dtype=torch.int64, device="cpu",
                        layer_kv=[(1, 3), (1, 3)], sliding_layers=(1,),
                        sliding_window=setup.window,
-                       num_sliding_pages=setup.sliding_pages)
+                       num_sliding_pages=setup.sliding_pages, **state)
     return KVArena(num_layers=1, num_pages=setup.pages,
                    page_tokens=setup.page_tokens, num_kv_heads=1, d_head=3,
-                   dtype=torch.int64, device="cpu")
+                   dtype=torch.int64, device="cpu", **state)
 
 
 def cpu_torch():
@@ -331,8 +385,11 @@ class Run:
         return prefix_tree(documents, self.setup.page_tokens)
 
 
-def check_filter(documents, questions, setup):
-    """Run a filter chain and check its answers and its KV reads."""
+def check_filter(documents, questions, setup, negated=False):
+    """Run a filter chain and check its answers and its KV reads.
+
+    A negated chain keeps the documents the model answers no for.
+    """
     tail = list(setup.canvas)
     answers = {}
     for document in documents:
@@ -340,18 +397,18 @@ def check_filter(documents, questions, setup):
             h = chain(document + q + tail)
             answers[h] = answer(h)
     run = Run(setup, answers)
-    parts = [FilterPart(SimpleNamespace(question_token_ids=q),
+    parts = [FilterOperator(SimpleNamespace(question_token_ids=q, negated=negated),
                         list(range(len(documents))), passthrough(), len(tail))
              for q in questions]
-    got, _, _ = run_stages(
+    got, _, _ = StageExecutor(
         run.torch, run.arena, run.pipeline, gated_stages(parts), documents,
         setup.budget, anchor_keys=[("d", i) for i in range(len(documents))],
-        attention_mode=setup.path, prefix_tree=run.tree(documents))
+        attention_mode=setup.path, prefix_tree=run.tree(documents)).run()
     for d, document in enumerate(documents):
         want = []
         for q in questions:
             want.append(answers[chain(document + q + tail)])
-            if not want[-1]:
+            if bool(want[-1]) == negated:
                 break
         assert [int(stage[d][0]) for stage in got if d in stage] == want, (
             f"document {d}")
@@ -392,14 +449,14 @@ def check_join(anchors, frame, partners, setup, retain=False):
         else:
             run.arena.free_key(keys[a])
 
-    run_stages(
+    StageExecutor(
         run.torch, run.arena, run.pipeline,
         [Stage(suffixes=partners, readout=passthrough(), frame=frame)],
         anchors, setup.budget,
         anchor_keys=keys,
         attention_mode=setup.path,
         prefix_tree=run.tree(anchors),
-        on_settled=lambda anchor, survived, row: anchor_done(anchor, row))
+        on_settled=lambda anchor, survived, row: anchor_done(anchor, row)).run()
     for a, anchor in enumerate(anchors):
         assert rows[a] == [answers[chain(anchor + frame + p + tail)]
                            for p in partners], f"anchor {a}"
@@ -418,10 +475,10 @@ def check_feed(documents, question, frame, partners, setup):
     keys = [("d", i) for i in range(len(documents))]
     stage_list = filter_stages([question], passthrough()) + [
         Stage(suffixes=partners, readout=passthrough(), frame=frame)]
-    out, _, _ = run_stages(
+    out, _, _ = StageExecutor(
         run.torch, run.arena, run.pipeline, stage_list, documents, setup.budget,
         anchor_keys=keys, prefix_tree=run.tree(documents),
-        attention_mode=setup.path)
+        attention_mode=setup.path).run()
     survivors = {d for d, document in enumerate(documents)
                  if answers[chain(document + question + tail)]}
     assert set(out[1]) == survivors
@@ -449,14 +506,14 @@ def check_join_after_join(anchors, frame, partners, setup):
     def retain(a, row):
         run.arena.retain(keys[a], len(anchors[a]))
 
-    run_stages(
+    StageExecutor(
         run.torch, run.arena, run.pipeline,
         [Stage(suffixes=partners, readout=passthrough(), frame=frame)],
         first, setup.budget,
         anchor_keys=keys[:1],
         attention_mode=setup.path,
         prefix_tree=run.tree(first),
-        on_settled=lambda anchor, survived, row: retain(anchor, row))
+        on_settled=lambda anchor, survived, row: retain(anchor, row)).run()
     assert run.arena.is_resident(keys[0])
     rows = {}
 
@@ -464,14 +521,14 @@ def check_join_after_join(anchors, frame, partners, setup):
         rows[a] = list(row)
         run.arena.free_key(keys[a])
 
-    run_stages(
+    StageExecutor(
         run.torch, run.arena, run.pipeline,
         [Stage(suffixes=partners, readout=passthrough(), frame=frame)],
         anchors, setup.budget,
         anchor_keys=keys,
         attention_mode=setup.path,
         prefix_tree=run.tree(anchors),
-        on_settled=lambda anchor, survived, row: free(anchor, row))
+        on_settled=lambda anchor, survived, row: free(anchor, row)).run()
     for a, anchor in enumerate(anchors):
         assert rows[a] == [answers[chain(anchor + frame + p + tail)]
                            for p in partners], f"anchor {a}"

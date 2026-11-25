@@ -11,5 +11,5 @@ pnpm build    # static build check
 ```
 
 Page order inside each folder comes from that folder's `meta.json`.
-Diagrams use the `<Mermaid chart={...} />` component from
-`components/mermaid.tsx`.
+The planning figure on the Developers page is an inline SVG,
+`components/planning-figure.tsx`.

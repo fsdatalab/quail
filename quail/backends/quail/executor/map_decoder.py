@@ -1,0 +1,850 @@
+"""Map and extraction answers through the same decode-row scheduler.
+
+A prompt's final row chooses its first answer token. Map answers then feed
+one row per pass; extraction answers feed that token and document-copy drafts.
+Token choice and draft verification run on the GPU. One nonblocking copy per
+pass returns tokens and surviving document positions. Copy answers wait for
+their previous result before laying out rows at the accepted prefix's end.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+from dataclasses import dataclass, field
+from types import SimpleNamespace
+
+import numpy as np
+
+from quail.backends.quail.executor.answer_curves import AnswerCurves
+from quail.backends.quail.executor.chunk import DecodeRows, InputStaging
+from quail.backends.quail.executor.groups import FullAttentionGroup
+
+IN_FLIGHT = 3
+DRAFT_COUNTS = ("draft_rounds", "draft_rounds_many_positions", "draft_rows",
+                "draft_rows_written", "draft_rounds_rejected",
+                "draft_rows_rejected", "draft_rows_after_end")
+
+
+@dataclass
+class _Copy:
+    """One pass's chosen tokens on their way to the host."""
+
+    event: object
+    host: object
+    buffer: object
+    documents: np.ndarray
+    indices: np.ndarray
+    maps: np.ndarray
+    lookahead: list = field(default_factory=list)
+
+
+class MapDecoder:
+    """Every map answer of one pipeline run, in arrays by document.
+
+    Args:
+        torch: The torch module.
+        head: The model's whole output head, (vocabulary, hidden), on the GPU.
+        num_documents: Documents in the run.
+        limits: Per map, the most tokens its answer may have.
+        stop_ids: Token ids that end an answer.
+        page_tokens: Tokens per arena page.
+        expected_tokens: Prior mean answer lengths, or min(64, limit) per map.
+        workspace_bytes: Shared activation workspace available for copy verification.
+    """
+
+    def __init__(self, torch, head, num_documents: int, limits, stop_ids,
+                 page_tokens: int, expected_tokens=None, *, workspace_bytes=0,
+                 row_budget=None, in_flight: int = IN_FLIGHT):
+        assert in_flight >= 0
+        self.workspace_bytes = workspace_bytes
+        self.row_budget = row_budget
+        self.in_flight = in_flight
+        self.torch = torch
+        self.head = head
+        self._staging = (InputStaging(torch, head.device)
+                         if head.is_cuda else None)
+        self._host_pool = []
+        self.limits = np.asarray(limits, dtype=np.int64)
+        self.expected_tokens = (np.minimum(64, self.limits) if expected_tokens is None
+                                else np.asarray(expected_tokens, dtype=np.float64))
+        self.page_tokens = page_tokens
+        n = num_documents
+        self.stop_ids = np.asarray(sorted(stop_ids), dtype=np.int64)
+        self.tokens = [np.zeros((n, int(limit)), dtype=np.int32)
+                       for limit in self.limits]
+        self.lengths = np.full((len(self.limits), n), -1, dtype=np.int64)
+        self.written = np.zeros((len(self.limits), n), dtype=np.int64)
+        self.paused = np.zeros(n, dtype=bool)
+        self.map = np.full(n, -1, dtype=np.int64)
+        self.origin = np.zeros(n, dtype=np.int64)
+        self.fed = np.zeros(n, dtype=np.int64)
+        self.ended_log = None
+        self.answer_curves = None
+        self.stopped = np.zeros(n, dtype=bool)
+        self.kv = FullAttentionGroup(n, page_tokens)
+        self.device = head.device
+        self.next_token = None
+        self.copies = deque()
+        self.inflight = np.zeros(n, dtype=np.int64)
+        self.finished = []
+        self.rows_fed = np.zeros(len(self.limits), dtype=np.int64)
+        self.read_tokens = dict(all=0, alone=0, own=0, shared=0)
+        self.slot_maps = {}
+        self.answer_slots = {}
+        self.share = False
+        self.copy_constraints = {}
+        self.draft_counts = {}
+        self.copy_readouts = {}
+        self.copy_groups = []
+        self.copy_inputs = []
+        self.copy_pending = np.zeros(n, dtype=bool)
+        self.copy_words = 0
+        self.copy_trace_words = 0
+        self.copy_trace = None
+        self.constrained = np.zeros(len(self.limits), dtype=bool)
+        self.copy_document = np.full(n, -1, dtype=np.int64)
+        self.copy_sources = np.full(n, -1, dtype=np.int64)
+        self.num_streams = np.zeros(n, dtype=np.int64)
+        self.steps = [np.zeros(n, dtype=np.int64) for _ in self.limits]
+        self.rejected_steps = [np.zeros(n, dtype=np.int64) for _ in self.limits]
+        self.drafts = np.zeros(n, dtype=np.int64)
+        self.answer_stops = {}
+        self.partial_texts = {}
+        self.tokenizer = None
+        self.stopped_early = np.zeros(len(self.limits), dtype=np.int64)
+
+    def configure_copy(self, first, slots, documents, specs):
+        """Register extraction fields for setup after the first forward launch."""
+        self.constrained[first:first + len(specs)] = True
+        for q, spec in enumerate(specs, first):
+            self.draft_counts[q] = dict.fromkeys(DRAFT_COUNTS, 0)
+            self.answer_slots.setdefault(q, slots[q - first])
+            self.expected_tokens[q] = spec.expected_answer_tokens
+        self.copy_inputs.append((first, slots, documents, specs))
+
+    def _initialize(self):
+        if self.next_token is None:
+            self.next_token = self.torch.zeros(
+                len(self.map), dtype=self.torch.int64, device=self.device)
+        pending, self.copy_inputs = self.copy_inputs, []
+        for first, slots, documents, specs in pending:
+            self._configure_copy(first, slots, documents, specs)
+
+    def _configure_copy(self, first, slots, documents, specs):
+        from quail.backends.quail.executor.extract.copy import (
+            CopyConstraint,
+            StreamRows,
+        )
+        from quail.backends.quail.executor.readout import AsyncTopLogprobs
+        from quail.common.draft_policy import LIVE_BUCKETS
+
+        key = specs[0].top_tokens, tuple(documents.vocabulary.tokenizer.stop_ids)
+        if key not in self.copy_readouts:
+            self.copy_readouts[key] = (AsyncTopLogprobs(
+                self.torch, self.torch.nn.functional, self.head, key[0], [key[1]]), [])
+        _, questions = self.copy_readouts[key]
+        questions.extend(range(first, first + len(specs)))
+        constraint = CopyConstraint(self.torch, self.device, documents, specs[0])
+        self.copy_words = max(self.copy_words, constraint.mask_words)
+        self.copy_trace_words = max(self.copy_trace_words, constraint.trace_width)
+        self.copy_trace = constraint.trace or self.copy_trace
+        index = np.zeros(len(self.map), dtype=np.int64)
+        index[slots.flatten()] = np.arange(slots.size)
+        group = SimpleNamespace(
+            constraint=constraint, key=key,
+            questions=np.arange(first, first + len(specs)), index=index,
+            rows=StreamRows(constraint, slots.size),
+            widths=np.full(slots.size, constraint.max_positions, dtype=np.int64),
+            source=self.torch.zeros(slots.size, dtype=self.torch.int64,
+                                    device=self.device),
+            masks=np.zeros((slots.size, constraint.mask_words), dtype=np.int64),
+            prepared_written=np.full(slots.size, -1, dtype=np.int64),
+            prepared_drafts=np.zeros(slots.size, dtype=np.int64),
+            lookahead=np.full(slots.size, -1, dtype=np.int64))
+        self.copy_groups.append(group)
+        for q, spec in enumerate(specs):
+            self.copy_document[slots[q]] = np.arange(len(documents.documents))
+            self.copy_constraints[first + q] = SimpleNamespace(
+                constraint=constraint, spec=spec, group=group,
+                sources=np.full(len(self.map), -1, dtype=np.int64),
+                masks=group.masks[q * slots.shape[1]:(q + 1) * slots.shape[1]],
+                trials=np.zeros(len(LIVE_BUCKETS)), accepts=np.zeros(len(LIVE_BUCKETS)),
+                rho=np.array([document.rho for document in documents.documents]))
+
+    def survival_curves(self):
+        """Return each map's survival curve over its answers so far."""
+        if self.answer_curves is None:
+            self.answer_curves = AnswerCurves(self)
+        self.answer_curves.update()
+        return self.answer_curves.whole
+
+    def row_counts(self, running):
+        """Return one chosen-token row and each answer's copy draft rows."""
+        from quail.backends.quail.executor.extract.copy import STREAM_STRIDE
+        from quail.common.draft_policy import draft_lengths
+
+        counts = np.ones(len(running), dtype=np.int64)
+        written = np.zeros(len(running), dtype=np.int64)
+        sizes = np.zeros(len(running), dtype=np.int64)
+        curves = {}
+        whole = None
+        for q, state in self.copy_constraints.items():
+            mine = self.map[running] == q
+            slots = running[mine]
+            if not len(slots):
+                continue
+            written[mine] = self.written[q][slots]
+            spec = state.spec
+            if spec.draft_policy != "adaptive":
+                sizes[mine] = spec.draft_tokens
+                continue
+            if whole is None:
+                whole = self.survival_curves()
+            limit = int(self.limits[q])
+            curves[q] = curve = whole[q, :limit + 1]
+            sizes[mine] = draft_lengths(
+                spec.draft_tokens, limit, curve, written[mine],
+                self.num_streams[slots], state.rho[self.copy_document[slots]],
+                state.trials, state.accepts)
+        for group in self.copy_groups:
+            mine = np.isin(self.map[running], group.questions)
+            slots = running[mine]
+            if not len(slots):
+                continue
+            constraint = group.constraint
+            local = group.index[slots]
+            if np.any((written[mine] > 0) & (
+                    (group.prepared_written[local] != written[mine])
+                    | (group.prepared_drafts[local] < sizes[mine]))):
+                raise AssertionError("copy inputs were not prepared before packing")
+            position, option = np.divmod(self.copy_sources[slots], STREAM_STRIDE)
+            remaining = (1 + constraint.filler_lengths[option]
+                         + constraint.position_lengths[position] - written[mine])
+            counts[mine] += np.minimum(sizes[mine], np.maximum(0, remaining))
+        if self.row_budget is not None and counts.sum() > self.row_budget:
+            counts = 1 + self._fit_drafts(running, written, counts - 1, curves)
+        self.drafts[running] = counts - 1
+        return counts
+
+    def _fit_drafts(self, running, written, drafts, curves):
+        """Keep the draft rows with the most expected writes in the row budget.
+
+        Each answer keeps its chosen-token row. A fixed-length field has
+        no odds, so its j-th draft token ranks as 1 / j and fixed drafts
+        shrink evenly.
+        """
+        from quail.common.draft_policy import draft_gains, fit_drafts
+
+        width = int(drafts.max())
+        gains = np.zeros((len(running), width))
+        gains[:] = 1.0 / np.arange(1, width + 1)
+        for q, curve in curves.items():
+            mine = np.flatnonzero(self.map[running] == q)
+            state = self.copy_constraints[q]
+            gains[mine] = draft_gains(
+                width, state.spec.max_answer_tokens, curve, written[mine],
+                self.num_streams[running[mine]], state.trials, state.accepts)
+        return fit_drafts(gains, drafts, self.row_budget - len(running))
+
+    def _prepare_copy(self, group, slots, written, drafts):
+        local = group.index[slots]
+        prepare = ((written > 0) & ((group.prepared_written[local] != written)
+                                   | (group.prepared_drafts[local] < drafts)))
+        if not prepare.any():
+            return
+        slots, local = slots[prepare], local[prepare]
+        tokens = np.empty(len(slots), dtype=np.int64)
+        for q in group.questions:
+            mine = self.map[slots] == q
+            tokens[mine] = self.tokens[q][slots[mine], 0]
+        group.constraint.prepare(
+            self.copy_document[slots], tokens, group.masks[local],
+            written[prepare], drafts[prepare], self.copy_sources[slots])
+        group.prepared_written[local] = written[prepare]
+        group.prepared_drafts[local] = drafts[prepare]
+
+    def output_answers(self, map_index, slots):
+        """Return extraction text and original character spans for a field."""
+        if map_index not in self.copy_constraints:
+            return [None] * len(slots), [None] * len(slots)
+        state = self.copy_constraints[map_index]
+        return state.constraint.output_answers(
+            self.copy_document[slots], state.sources[slots],
+            self.lengths[map_index][slots])
+
+
+    def start(self, document: int, map_index: int, position: int, pages,
+              parent: int | None = None, shared_tokens: int = 0) -> None:
+        """Begin an answer whose first token the current pass chooses.
+
+        Args:
+            document: The document's index in the run.
+            map_index: The map the answer is for.
+            position: The position of the answer's first decode row,
+                right after its prompt.
+            pages: The document's page ids in logical order.
+            parent: The slot whose whole pages this one borrows, or None.
+            shared_tokens: The tokens it borrows from the parent.
+        """
+        if self.map[document] >= 0:
+            raise ValueError(f"document {document} is already writing an answer")
+        if map_index in self.slot_maps:
+            map_index = self.slot_maps[map_index][document]
+        self.map[document] = map_index
+        self.origin[document] = position
+        self.fed[document] = 0
+        self.stopped[document] = False
+        self.copy_sources[document] = -1
+        self.copy_pending[document] = False
+        self.num_streams[document] = 0
+        self.drafts[document] = 0
+        self.kv.start(document, pages, parent, shared_tokens)
+
+    def pause(self, document):
+        """Pause an answer and return slots whose shared-page identity changed."""
+        self.paused[document] = True
+        return self.kv.detach(document)
+
+    def resume(self, document, pages):
+        """Continue after prefilling the prompt and every saved answer token."""
+        self.kv.set_pages(document, pages)
+        self.fed[document] = self.written[self.map[document]][document]
+        self.paused[document] = False
+        self.drafts[document] = 0
+
+    def eviction_order(self, recompute_cost=None, page_holds=None, remaining=None):
+        """Order running slots by page-hold time saved per recomputation second.
+
+        Args:
+            recompute_cost: Prices rebuilding a slot's KV; without it,
+                slots are ordered by remaining tokens alone.
+            page_holds: How many slots hold each page; a page another
+                slot also holds is not freed.
+            remaining: Per slot, its expected remaining tokens; replaces
+                the estimate from each map's survival curve.
+        """
+        from quail.common.answers import remaining_tokens
+
+        running = np.flatnonzero((self.map >= 0) & ~self.paused)
+        scores = np.zeros(len(self.map))
+        written = np.zeros(len(self.map), dtype=np.int64)
+        whole = None
+        for q in np.unique(self.map[running]):
+            mine = running[self.map[running] == q]
+            written[mine] = self.written[q][mine]
+            if remaining is not None:
+                scores[mine] = remaining[mine]
+                continue
+            if whole is None:
+                whole = self.survival_curves()
+            left = remaining_tokens(whole[q, :int(self.limits[q]) + 1])
+            scores[mine] = left[written[mine]]
+        if recompute_cost is not None and len(running):
+            num_pages = self.kv.num_pages[running]
+            if page_holds is not None:
+                width = int(num_pages.max())
+                table = self.kv.pages[running, :width]
+                num_pages = ((np.arange(width) < num_pages[:, None])
+                             & (page_holds[table] == 1)).sum(axis=1)
+            seconds = recompute_cost.prefill_seconds(
+                self.origin[running] + written[running])
+            scores[running] *= np.divide(num_pages, seconds,
+                                         out=np.zeros(len(running)), where=seconds > 0)
+        return running[np.lexsort((running, written[running], -scores[running]))]
+
+    def running(self, writing=None):
+        """Slots whose next decode row can choose another token.
+
+        Args:
+            writing: Slots holding an answer (map >= 0), or None to find them.
+        """
+        if writing is None:
+            writing = np.flatnonzero(self.map >= 0)
+        running = writing[~self.paused[writing]]
+        ready = (~self.constrained[self.map[running]]
+                 | (self.inflight[running] == 0))
+        return running[ready & ~self.stopped[running] & ~self.copy_pending[running]
+                       & (self.fed[running] + 1 < self.limits[self.map[running]])]
+
+    @property
+    def active(self) -> bool:
+        """Whether any answer is still being written."""
+        return bool((self.map >= 0).any())
+
+    def take_finished(self) -> list:
+        """Return the (document, map) pairs whose answers ended since last asked."""
+        finished, self.finished = self.finished, []
+        return finished
+
+
+    def rows(self) -> DecodeRows | None:
+        """Lay out each continuing answer's chosen token and optional copy drafts.
+
+        An answer continues while no stop token has been read and its
+        tokens, counting the one this row writes, stay within its limit.
+        """
+        running = self.running()
+        if not len(running):
+            return None
+        counts = self.row_counts(running)
+        offsets = (np.arange(int(counts.sum()))
+                   - np.repeat(np.cumsum(counts) - counts, counts))
+        running = np.repeat(running, counts)
+        positions = self.origin[running] + self.fed[running] + offsets
+        rows = self.kv.rows(running, positions, self.share)
+        rows.advance = ~self.constrained[self.map[running]]
+        return rows
+
+    def _stage_i64(self, name: str, values):
+        """Copy an int64 index array to the device through pinned staging."""
+        if self._staging is not None:
+            return self._staging.copy(name, values, self.torch.int64)
+        return self.torch.as_tensor(values, dtype=self.torch.int64,
+                                    device=self.device)
+
+    def feed(self, chunk) -> None:
+        """Copy each decode row's input token from the token buffer."""
+        rows = chunk.decode_rows
+        if rows is None:
+            return
+        slots = self._stage_i64("decode_feed_slots", rows.slots)
+        start = chunk.tokens - len(rows)
+        inputs = self.next_token.index_select(0, slots)
+        for group in self.copy_groups:
+            mine = np.flatnonzero(np.isin(self.map[rows.slots], group.questions))
+            if not len(mine):
+                continue
+            constraint = group.constraint
+            selected = rows.slots[mine]
+            local = constraint.tensor(group.index[selected])
+            at = constraint.tensor(rows.positions[mine] - self.origin[selected])
+            tokens = constraint.tokens_at(group.source[local], at)
+            inputs[constraint.tensor(mine)] = tokens
+        chunk.input_ids[start:].copy_(inputs)
+        plain = rows.slots[~self.constrained[self.map[rows.slots]]]
+        self.fed[plain] += 1
+        self.rows_fed += np.bincount(self.map[rows.slots],
+                                     minlength=len(self.limits))
+        self._count_reads(rows, chunk.meta.get("shared") is not None)
+
+    def _count_reads(self, rows, shared: bool) -> None:
+        reads = self.read_tokens
+        lengths = rows.positions + 1
+        reads["all"] += int(lengths.sum())
+        if not shared:
+            reads["alone"] += int(lengths.sum())
+            return
+        member = np.zeros(len(lengths), dtype=bool)
+        member[rows.shared_rows] = True
+        reads["alone"] += int(lengths[~member].sum())
+        reads["own"] += int(rows.own_lengths[member].sum())
+        reads["shared"] += int(rows.shared_used.sum())
+
+    def submit(self, normed, first_rows, first_documents, rows) -> None:
+        """Choose the next token of each answer row and send it to the host.
+
+        Args:
+            normed: The pass's final-normed hidden states, decode rows last.
+            first_rows: Rows of normed that end a map prompt and choose
+                an answer's first token.
+            first_documents: The documents of those rows.
+            rows: The pass's DecodeRows, or None.
+        """
+        torch = self.torch
+        count = 0 if rows is None else len(rows)
+        if not len(first_rows) and not count:
+            return
+        self._initialize()
+        documents = np.concatenate([
+            np.asarray(first_documents, dtype=np.int64),
+            np.empty(0, dtype=np.int64) if rows is None else rows.slots])
+        indices = np.concatenate([
+            self.fed[np.asarray(first_documents, dtype=np.int64)],
+            np.empty(0, dtype=np.int64) if rows is None else
+            rows.positions - self.origin[rows.slots] + 1])
+        selected = []
+        if len(first_rows):
+            index = self._stage_i64(
+                "decode_first_rows", np.asarray(first_rows, dtype=np.int64))
+            selected.append(normed.index_select(0, index))
+        if count:
+            selected.append(normed[normed.shape[0] - count:])
+        hidden = selected[0] if len(selected) == 1 else torch.cat(selected)
+        width = 4 + self.copy_words + self.copy_trace_words
+        values = torch.full((len(documents), width), -1, dtype=torch.int64,
+                            device=self.device)
+        chosen, projections = self._project(hidden, documents)
+        plain = np.flatnonzero(~self.constrained[self.map[documents]])
+        if len(plain):
+            index = self._stage_i64("decode_plain_index", plain)
+            values[index, 0] = chosen[index]
+            slots = self._stage_i64("decode_plain_slots", documents[plain])
+            self.next_token.index_copy_(0, slots, chosen[index])
+        for group in self.copy_groups:
+            mine = np.flatnonzero(np.isin(self.map[documents], group.questions))
+            if not len(mine):
+                continue
+            self._constrain(
+                group, projections[group.key], documents[mine], indices[mine],
+                out=values, output_rows=mine)
+        num_rows, num_cols = values.shape
+        host_buf = next(
+            (self._host_pool.pop(i) for i, b in enumerate(self._host_pool)
+             if b.shape[0] >= num_rows and b.shape[1] >= num_cols), None)
+        if host_buf is None:
+            host_buf = torch.empty((max(num_rows, 64), num_cols),
+                                   dtype=torch.int64,
+                                   pin_memory=self.head.is_cuda)
+        host = host_buf[:num_rows, :num_cols]
+        host.copy_(values, non_blocking=True)
+        event = torch.cuda.Event()
+        event.record()
+        lookahead = []
+        for group in self.copy_groups:
+            mine = np.isin(self.map[documents], group.questions)
+            if (mine & (indices == 0)).any():
+                lookahead.append((group, None))
+            mine &= indices > 0
+            slots, first = np.unique(documents[mine], return_index=True)
+            if len(slots):
+                lookahead.append((group, (
+                    slots, self.copy_document[slots], group.masks[group.index[slots]],
+                    indices[mine][first])))
+        self.copies.append(_Copy(event, host, host_buf, documents, indices,
+                                 self.map[documents].copy(), lookahead))
+        np.add.at(self.inflight, documents, 1)
+        while len(self.copies) > self.in_flight:
+            self._read(self.copies.popleft())
+
+    def _project(self, hidden, documents):
+        from quail.backends.quail.executor.readout import AsyncTopLogprobs
+
+        torch = self.torch
+        chosen = torch.empty(len(hidden), dtype=torch.int64, device=self.device)
+        projections = {
+            key: torch.empty((len(hidden), readout.width), device=self.device)
+            for key, (readout, _) in self.copy_readouts.items()}
+        maps = self.map[documents]
+        for start in range(0, len(hidden), AsyncTopLogprobs.BLOCK_ROWS):
+            end = min(start + AsyncTopLogprobs.BLOCK_ROWS, len(hidden))
+            logits = torch.nn.functional.linear(
+                hidden[start:end].to(self.head.dtype), self.head)
+            chosen[start:end] = logits.argmax(dim=1)
+            for key, (readout, questions) in self.copy_readouts.items():
+                mine = np.flatnonzero(np.isin(maps[start:end], questions))
+                if not len(mine):
+                    continue
+                index = self._stage_i64("decode_proj_mine", mine)
+                projections[key][start + index] = readout.from_logits(logits[index])
+        return chosen, projections
+
+    def _constrain(self, group, projected, documents, indices, *, out=None,
+                   output_rows=None):
+        from quail.backends.quail.executor.extract.copy import verification_blocks
+
+        torch, constraint = self.torch, group.constraint
+        slots, first, counts = np.unique(
+            documents, return_index=True, return_counts=True)
+        widths = group.widths[group.index[slots]]
+        num_streams = np.maximum(1, np.where(indices[first] == 0, widths,
+                                            self.num_streams[slots]))
+        blocks = list(verification_blocks(
+            counts, widths, num_streams, constraint.max_options,
+            constraint.num_keys, constraint.spec.top_tokens, self.copy_words,
+            self.workspace_bytes))
+        if out is None:
+            width = 4 + self.copy_words + self.copy_trace_words
+            out = torch.full((len(documents), width), -2,
+                             dtype=torch.int64, device=self.device)
+        if output_rows is None:
+            output_rows = np.arange(len(documents))
+        for block, num_steps, _ in blocks:
+            sizes = counts[block]
+            offsets = np.repeat(np.cumsum(sizes) - sizes, sizes)
+            selected = (np.repeat(first[block], sizes)
+                        + np.arange(int(sizes.sum())) - offsets)
+            index = constraint.tensor(output_rows[selected])
+            out[index] = self._constrain_block(
+                group, projected[index], documents[selected], indices[selected],
+                int(widths[block].max()), int(num_streams[block].max()), num_steps)
+        return out
+
+    def _constrain_block(self, group, projected, documents, indices, stream_width,
+                         num_streams, num_steps):
+        torch, constraint = self.torch, group.constraint
+        slots, first, inverse, counts = np.unique(
+            documents, return_index=True, return_inverse=True, return_counts=True)
+        local = constraint.tensor(self.copy_document[slots])
+        index = constraint.tensor(group.index[slots])
+        limits = constraint.tensor(self.limits[self.map[slots]])
+        answers = group.index[slots]
+        streams, alive = group.rows.read(answers, local, stream_width)
+        if num_streams < stream_width:
+            streams, alive = constraint.compact(streams, alive, num_streams)
+        source = group.source[index]
+        active = torch.ones(len(slots), dtype=torch.bool, device=self.device)
+        width = 4 + self.copy_words + self.copy_trace_words
+        out = torch.full((len(documents), width), -2,
+                         dtype=torch.int64, device=self.device)
+        offsets = np.arange(len(documents)) - first[inverse]
+        for start in range(0, int(counts.max()), num_steps):
+            end = min(start + num_steps, int(counts.max()))
+            steps = np.arange(start, end)
+            valid = steps < counts[:, None]
+            row = np.minimum(first[:, None] + steps, len(documents) - 1)
+            at = constraint.tensor(np.where(valid, indices[row], 1))
+            values, alive, source, traces, active = constraint.verify(
+                projected[constraint.tensor(row)], streams, alive, source, at, local,
+                limits, constraint.tensor(valid),
+                first=bool((valid[:, 0] & (indices[row[:, 0]] == 0)).any()),
+                active=active)
+            selected = np.flatnonzero((offsets >= start) & (offsets < end))
+            take = constraint.tensor(np.column_stack((selected, inverse[selected],
+                                                      offsets[selected] - start)))
+            out[take[:, 0], :4] = values[take[:, 1], take[:, 2]]
+            if self.copy_trace is not None:
+                out[take[:, 0], 4 + self.copy_words:] = traces[take[:, 1], take[:, 2]]
+            del values, traces
+        group.rows.write(answers, streams, alive)
+        group.widths[answers] = num_streams
+        group.source[index] = source
+        packed = constraint.packed_positions(streams, alive, local)
+        out[:, 4:4 + constraint.mask_words] = packed[constraint.tensor(inverse)]
+        return out
+
+    def harvest(self, wait: bool = False, prepare: bool = True) -> None:
+        """Read landed copies, optionally preparing their next decode rows."""
+        while self.copies and (wait or self.copies[0].event.query()):
+            self._read(self.copies.popleft())
+        if prepare:
+            self.prepare()
+
+    def prepare(self):
+        """Prepare pending copy rows while a forward pass runs, or when none fits."""
+        self._initialize()
+        for copy in self.copies:
+            self._look_ahead(copy)
+        for group in self.copy_groups:
+            slots = np.flatnonzero(self.copy_pending & (self.inflight == 0)
+                                   & np.isin(self.map, group.questions))
+            if not len(slots):
+                continue
+            written = np.empty(len(slots), dtype=np.int64)
+            for q in group.questions:
+                mine = self.map[slots] == q
+                written[mine] = self.written[q][slots[mine]]
+            drafts = np.full(len(slots), group.constraint.spec.draft_tokens)
+            self._prepare_copy(group, slots, written, drafts)
+            self.copy_pending[slots] = False
+
+    def _look_ahead(self, copy: _Copy) -> None:
+        """Prepare the copy continuations a copy's answers read next."""
+        work, copy.lookahead = copy.lookahead, []
+        for group, ahead in work:
+            if ahead is None:
+                group.constraint.prepare_documents()
+                continue
+            slots, documents, masks, written = ahead
+            group.lookahead[group.index[slots]] = group.constraint.prepare_ahead(
+                documents, masks, written)
+
+    def _read(self, copy: _Copy) -> None:
+        self._look_ahead(copy)
+        copy.event.synchronize()
+        values = copy.host.numpy()
+        documents, indices, maps = copy.documents, copy.indices, copy.maps
+        np.subtract.at(self.inflight, documents, 1)
+        current = ((self.map[documents] == maps) & ~self.stopped[documents]
+                   & (values[:, 0] != -2))
+        documents, indices, values, maps = (
+            documents[current], indices[current], values[current], maps[current])
+        tokens = values[:, 0]
+        constrained = self.constrained[maps]
+        stop = np.where(constrained, tokens == -1, np.isin(tokens, self.stop_ids))
+        ended = stop | (indices + 1 >= self.limits[maps])
+        for q in np.unique(maps).tolist():
+            mine = maps == q
+            writes = mine & (~stop if q in self.copy_constraints else True)
+            self.tokens[q][documents[writes], indices[writes]] = tokens[writes]
+            np.maximum.at(self.written[q], documents[writes], indices[writes] + 1)
+            done = mine & ended
+            self.lengths[q][documents[done]] = indices[done] + ~stop[done]
+            if q in self.copy_constraints:
+                self._read_copy(q, documents[mine], indices[mine], values[mine])
+        self.stopped[documents[stop]] = True
+        self.map[documents[ended]] = -1
+        for group in self.copy_groups:
+            mine = documents[ended & np.isin(maps, group.questions)]
+            group.rows.release(group.index[mine])
+        if self.ended_log is not None:
+            self.ended_log.append(documents[ended])
+        self.copy_pending[documents[ended]] = False
+        self.finished.extend(zip(documents[ended].tolist(), maps[ended].tolist()))
+        for group in self.copy_groups:
+            slots = np.unique(documents[np.isin(maps, group.questions)])
+            slots = slots[(self.map[slots] >= 0) & (self.inflight[slots] == 0)]
+            written = np.empty(len(slots), dtype=np.int64)
+            for q in group.questions:
+                mine = self.map[slots] == q
+                written[mine] = self.written[q][slots[mine]]
+            local = group.index[slots]
+            spec = group.constraint.spec
+            needed = np.minimum(written + spec.draft_tokens,
+                                spec.max_answer_tokens + spec.draft_tokens - 1)
+            ready = ((group.prepared_written[local] > 0)
+                     & (group.lookahead[local] >= needed))
+            group.prepared_written[local[ready]] = written[ready]
+            group.prepared_drafts[local[ready]] = spec.draft_tokens
+            self.copy_pending[slots] = ~ready
+        if self.answer_stops:
+            self._stop_decided(np.unique(documents))
+        self._host_pool.append(copy.buffer)
+        if len(self._host_pool) > self.in_flight + 2:
+            self._host_pool.pop(min(
+                range(len(self._host_pool)),
+                key=lambda index: self._host_pool[index].numel()))
+
+    def _stop_decided(self, slots) -> None:
+        """End each answer whose tests are decided on its tokens so far."""
+        from quail.execution.answer_stops import Stop
+
+        for q, stop in self.answer_stops.items():
+            mine = slots[(self.map[slots] == q) & ~self.stopped[slots]]
+            mine = mine[self.written[q][mine] > 0].tolist()
+            texts = (None if q in self.copy_constraints
+                     else self._partial_texts(q, mine))
+            for index, slot in enumerate(mine):
+                if texts is None:
+                    completions, length = self._partial_answer(q, slot)
+                else:
+                    text, length = texts[index]
+                    text = text.strip()
+                    if not text:
+                        continue
+                    completions = [dict(prefix=text)]
+                if stop.decide_any(completions) is Stop.CONTINUE:
+                    continue
+                self.lengths[q][slot] = length
+                self.stopped[slot] = True
+                self.map[slot] = -1
+                if q in self.copy_constraints:
+                    group = self.copy_constraints[q].group
+                    group.rows.release(group.index[[slot]])
+                self.copy_pending[slot] = False
+                if self.ended_log is not None:
+                    self.ended_log.append(np.array([slot]))
+                self.finished.append((slot, q))
+                self.stopped_early[q] += 1
+
+    def _partial_texts(self, q, slots) -> list:
+        """Return each map answer's text so far and its length in tokens.
+
+        The text is the answer's decoded tokens up to the last whole
+        character. Each call decodes only the tokens written since the
+        last one, with the piece before them for context, as vLLM's
+        incremental detokenizer does: a token may hold part of a
+        character the next token completes, and a tokenizer may join a
+        token to the one before it.
+
+        Args:
+            q: The map's index.
+            slots: The answers' slots.
+        """
+        pieces = []
+        for slot in slots:
+            _, start, held = self.partial_texts.get((q, slot), ("", 0, 0))
+            tokens = self.tokens[q][slot]
+            pieces.append(tokens[start:held])
+            pieces.append(tokens[start:int(self.written[q][slot])])
+        decoded = self.tokenizer.decode_batch(pieces)
+        found = []
+        for index, slot in enumerate(slots):
+            text, start, held = self.partial_texts.get((q, slot), ("", 0, 0))
+            before, now = decoded[2 * index], decoded[2 * index + 1]
+            written = int(self.written[q][slot])
+            if written > held and not now.endswith("\ufffd"):
+                text += now[len(before):]
+                self.partial_texts[q, slot] = (text, held, written)
+                held = written
+            found.append((text, held))
+        return found
+
+    def _partial_answer(self, q, slot):
+        """Return an extraction's completions still possible and its length.
+
+        For each document position still in play, the completion is the
+        stripped span its tokens copy, which goes on only with the
+        document's text and is NULL no more; an extraction whose
+        positions are not known gives no completions.
+        """
+        from quail.execution.answer_stops import copied_completions
+
+        written = int(self.written[q][slot])
+        state = self.copy_constraints[q]
+        document = self.copy_document[slot]
+        spans = state.constraint.live_spans(
+            document, state.masks[document], int(self.tokens[q][slot, 0]),
+            written)
+        if spans is None:
+            return [], written
+        text = state.constraint.documents.documents[document].text
+        return copied_completions(text, spans), written
+
+    def _read_copy(self, q, documents, indices, values):
+        from quail.common.draft_policy import live_buckets
+
+        slots, first, inverse = np.unique(
+            documents, return_index=True, return_inverse=True)
+        last = np.zeros(len(slots), dtype=np.int64)
+        np.maximum.at(last, inverse, np.arange(len(documents)))
+        state = self.copy_constraints[q]
+        if self.copy_trace is not None:
+            from quail.backends.quail.executor.extract.trace import write_choices
+
+            traces = values[:, 4 + self.copy_words:].astype(np.int32).view(np.float32)
+            selected = [state.constraint.documents.documents[d]
+                        for d in self.copy_document[documents]]
+            write_choices(self.copy_trace, selected, q, indices, values[:, 0], traces)
+        state.masks[self.copy_document[slots]] = values[
+            last, 4:4 + state.constraint.mask_words]
+        observed = ((self.num_streams[slots] > 1) & (self.drafts[slots] > 0)
+                    & (values[first, 0] >= 0) & (indices[first] + 1 < self.limits[q]))
+        drafts = self.drafts[slots]
+        written = np.bincount(inverse, minlength=len(slots)) - 1
+        unread = drafts - written
+        chose = values[last, 0] >= 0
+        rejected = chose & (values[last, 3] == 0) & (unread > 0)
+        self.rejected_steps[q][slots] += rejected
+        for name, count in zip(DRAFT_COUNTS, (
+                drafts > 0, (drafts > 0) & (self.num_streams[slots] > 1), drafts,
+                written, rejected, unread * rejected, unread * ~chose)):
+            self.draft_counts[q][name] += int(count.sum())
+        buckets = live_buckets(self.num_streams[slots])
+        np.add.at(state.trials, buckets[observed], 1)
+        np.add.at(state.accepts, buckets[observed], values[first[observed], 3] > 0)
+        self.copy_sources[slots] = state.sources[slots] = values[last, 1]
+        self.num_streams[slots] = values[last, 2]
+        self.fed[slots] = np.maximum(0, self.written[q][slots] - 1)
+        self.steps[q][slots] += 1
+
+    def answers(self, map_index: int, documents) -> list[np.ndarray]:
+        """Return each document's answer tokens for one map."""
+        lengths = self.lengths[map_index]
+        return [self.tokens[map_index][document, :max(0, lengths[document])]
+                for document in documents]
+
+
+def map_decoder(state, limits, num_documents: int, expected_tokens=None) -> MapDecoder:
+    """Return a decoder for a pipeline's maps on the loaded model."""
+    from quail.backends.quail.executor.model_loading import full_output_head
+    from quail.common.budgets import copy_verification_workspace_bytes
+
+    decoder = MapDecoder(
+        state.torch, full_output_head(state.loaded_model.model), num_documents,
+        limits, state.loaded_model.tokenizer.stop_ids,
+        state.loaded_model.arena.page_tokens, expected_tokens=expected_tokens,
+        workspace_bytes=copy_verification_workspace_bytes(
+            state.loaded_model.model_spec, state.chunk_tokens),
+        row_budget=state.chunk_tokens)
+    decoder.tokenizer = state.loaded_model.tokenizer
+    return decoder

@@ -37,28 +37,3 @@ def test_flamegraph_accounts_for_nested_calls_and_gpu_overlap():
     assert gap["gpu_idle_seconds"] == pytest.approx(1e-6)
     assert sum(child["gpu_seconds"]
                for child in result["children"]) == pytest.approx(11e-6)
-
-
-def test_reader_aligns_gpu_and_cpu_clocks_and_ignores_other_cpu_threads(tmp_path):
-    import gzip
-    import json
-
-    pytest.importorskip("ijson")
-    from experiments.profile_flamegraph import read_cpu_flamegraph
-
-    path = tmp_path / "trace.json.gz"
-    payload = {"baseTimeNanoseconds": 1_000_000, "traceEvents": [
-        {"ph": "X", "cat": "kernel", "tid": 1, "name": "kernel", "ts": 0, "dur": 15},
-        {"ph": "X", "cat": "gpu_memcpy", "tid": 2, "name": "copy", "ts": 14, "dur": 10},
-        {"ph": "X", "cat": "cpu_op", "tid": 92, "name": "cpu", "ts": 12, "dur": 10},
-        {"ph": "X", "cat": "cpu_op", "tid": 93, "name": "other", "ts": 10, "dur": 20},
-    ]}
-    with gzip.open(path, "wt") as stream:
-        json.dump(payload, stream)
-    result = read_cpu_flamegraph(path, (1_010_000, 1_030_000), 92)
-    assert result["seconds"] == pytest.approx(20e-6)
-    assert result["gpu_seconds"] == pytest.approx(14e-6)
-    assert {child["name"] for child in result["children"]} == {
-        "cpu", "[no recorded CPU operation]"}
-    gap = next(child for child in result["children"] if child["calls"] == 0)
-    assert gap["gpu_seconds"] == pytest.approx(4e-6)

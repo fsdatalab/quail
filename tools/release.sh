@@ -12,8 +12,10 @@ tag="v${version}"
 root="$(git rev-parse --show-toplevel)"
 cd "$root"
 
-if [[ "$(uv version --short)" != "$version" ]]; then
-    echo "pyproject.toml version does not match ${version}" >&2
+# the one version of Quail, under [workspace.package]
+found="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)"
+if [[ "$found" != "$version" ]]; then
+    echo "Cargo.toml has version ${found}, not ${version}" >&2
     exit 1
 fi
 

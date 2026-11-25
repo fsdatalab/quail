@@ -5,7 +5,8 @@ from helpers.fakes import cpu_staging
 from helpers.kv_checker import Run, Setup, answer, chain, passthrough
 
 from quail.backends.quail.executor.host_kv import HostKV
-from quail.backends.quail.executor.stages import Stage, run_stages
+from quail.backends.quail.executor.stage_executor import StageExecutor
+from quail.backends.quail.executor.stages import Stage
 
 torch = pytest.importorskip("torch")
 
@@ -26,11 +27,11 @@ def planted(documents, questions):
 def run_filter(run, question, keys):
     """One filter stage over every document; returns its answers and tokens."""
     prefixes = [HEAD + document for document in DOCS]
-    got, _, tokens = run_stages(
+    got, _, tokens = StageExecutor(
         run.torch, run.arena, run.pipeline,
         [Stage(suffixes=[question], readout=passthrough(), single=True)],
         prefixes, run.setup.budget, anchor_keys=keys,
-        attention_mode=run.setup.path)
+        attention_mode=run.setup.path).run()
     return {d: int(got[0][d][0]) for d in range(len(DOCS))}, tokens
 
 
@@ -85,3 +86,26 @@ def test_an_entry_dropped_before_its_reserve_is_computed_instead(monkeypatch):
     assert host.restored_keys == 0 and host.misses == len(DOCS)
     assert second_tokens == sum(
         len(HEAD) + len(document) + len(QUESTIONS[1]) for document in DOCS)
+
+
+def test_a_document_stopped_partway_through_its_prefill_is_not_saved(monkeypatch):
+    cpu_staging(monkeypatch)
+    setup = Setup(path="tree", pages=64, page_tokens=4, budget=16)
+    documents = [[1, 2, 3], list(range(100, 140))]
+    question = [40, 41]
+    answers = {chain(document + question): 1.0 for document in documents}
+    run = Run(setup, answers)
+    run.arena.host = host = HostKV(run.arena, 4 * 2**20, torch, pinned=False)
+    keys = [("d", 0), ("d", 1)]
+
+    def ask(prefixes, keys, limit):
+        got, _, _ = StageExecutor(
+            run.torch, run.arena, run.pipeline,
+            [Stage(suffixes=[question], readout=passthrough(), single=True)],
+            prefixes, setup.budget, anchor_keys=keys, attention_mode="tree",
+            limit=limit).run()
+        return got[0]
+
+    assert ask(documents, keys, 1) == {0: [1.0]}
+    host.begin_query()
+    assert ask(documents[1:], keys[1:], None) == {0: [1.0]}

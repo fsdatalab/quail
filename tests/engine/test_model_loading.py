@@ -1,22 +1,22 @@
 """CPU tests for model files, retained answer weights, and readouts."""
 
 import gc
+import json
 import weakref
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from helpers.fakes import cpu_arena, fake_pipeline, fake_readout, fake_torch
 
-from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor import model_loading
 from quail.backends.quail.executor.model_loading import (
+    E2M1_VALUES,
     answer_weights,
+    dequantize_nvfp4,
+    nvfp4_output_head,
     retain_answer_head,
 )
 from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers, AsyncScores
-from quail.backends.quail.executor.stages import Stage, run_stages
-from quail.builtins import built_in_registry
 
 
 @pytest.fixture
@@ -73,12 +73,7 @@ def test_retained_answer_weights_ownership_and_answer_rows(torch):
     retain_answer_head(torch, model, [1, 3, 5])
     cpu_torch = SimpleNamespace(tensor=lambda values, **kwargs: torch.tensor(values))
 
-    def tokenizer(word, **kwargs):
-        return {"input_ids": [
-            5 if "false" in word.lower() else 3 if word.startswith(" ") else 1]}
-
-    first = AnswerRows.from_tokenizer(cpu_torch, torch.nn.functional, model,
-                                      tokenizer)
+    first = AnswerRows(cpu_torch, torch.nn.functional, model, [1, 3], [5])
     second = AnswerRows(cpu_torch, torch.nn.functional, model, [3, 1], [5])
     assert first.weights is second.weights is model.quail_answer_weights
     assert first(hidden) == second(hidden) == expected
@@ -86,39 +81,52 @@ def test_retained_answer_weights_ownership_and_answer_rows(torch):
     assert AsyncScores.dtype is np.float32
 
 
-def test_run_join_evicts_then_halves_a_chunk_that_does_not_fit(monkeypatch):
-    sizes = []
-    failed = []
-    modes = set()
+def _nvfp4(torch, codes, scales, global_scale):
+    """Pack E2M1 codes two per byte, the even column low, with their scales."""
+    codes = torch.tensor(codes, dtype=torch.uint8)
+    packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
+    return (packed, torch.tensor(scales).to(torch.float8_e4m3fn),
+            torch.tensor(global_scale, dtype=torch.float32))
 
-    def pack(torch, arena, specs, **kw):
-        if len(specs) > 1 and not failed:
-            failed.append(len(specs))
-            raise chunk_mod.ArenaFullError(
-                "unified suffix pages exceed the free KV arena")
-        sizes.append(len(specs))
-        modes.add(kw["attention_mode"])
-        return SimpleNamespace(specs=specs, tokens=len(specs), layout=[],
-                               attention_mode=kw["attention_mode"],
-                               temporary_keys=(), fresh_keys=(),
-                               rows_per_answer=None)
 
-    monkeypatch.setattr(chunk_mod, "pack_chunk", pack)
-    arena = cpu_arena(64)
-    evictions = []
-    monkeypatch.setattr(arena, "evict_retained",
-                        lambda need: evictions.append(need) or ())
-    pipeline = fake_pipeline(forward_chunk=lambda chunk: [1] * len(chunk.specs))
-    answers = fake_readout()
-    answers_out, _, _ = run_stages(
-        fake_torch(), arena, pipeline,
-        [Stage(suffixes=[[3, 4]], readout=answers)], [[1] * 8, [2] * 8], 64,
-        anchor_keys=[('a', 0), ('a', 1)])
-    # nothing retained to evict, so the two-group chunk ran as two chunks
-    assert failed == [2] and len(evictions) == 1 and evictions[0] > 0
-    assert sizes == [1, 1]
-    assert modes == {"tree"}
-    assert answers_out == [{0: [1], 1: [1]}]
+def test_nvfp4_weights_dequantize_to_their_codes_times_both_scales(torch):
+    codes = [list(range(16)) + list(range(15, -1, -1)),
+             [7] * 16 + [9] * 16]
+    scales = [[2.0, 0.5], [1.0, 4.0]]
+    packed, scale, global_scale = _nvfp4(torch, codes, scales, 0.25)
+
+    weights = dequantize_nvfp4(torch, packed, scale, global_scale, rows_per_step=1)
+
+    expected = [[E2M1_VALUES[code] * scales[row][column // 16] * 0.25
+                 for column, code in enumerate(codes[row])] for row in range(2)]
+    assert weights.dtype == torch.bfloat16
+    assert weights.float().tolist() == expected
+
+
+def test_an_nvfp4_head_is_read_from_the_checkpoint_and_kept_in_bf16(
+        torch, tmp_path):
+    safetensors = pytest.importorskip("safetensors.torch")
+    packed, scale, global_scale = _nvfp4(torch, [[1, 2] * 8, [3, 4] * 8],
+                                         [[1.0], [2.0]], 1.0)
+    safetensors.save_file({"lm_head.weight": packed,
+                           "lm_head.weight_scale": scale,
+                           "lm_head.weight_scale_2": global_scale},
+                          tmp_path / "model.safetensors")
+    layers = {"lm_head": {"quant_algo": "NVFP4", "group_size": 16}}
+    (tmp_path / "config.json").write_text(json.dumps(
+        {"quantization_config": {"quant_algo": "MIXED_PRECISION",
+                                 "quantized_layers": layers}}))
+    model = _model(torch)
+    model.lm_head = torch.nn.Linear(8, 2, bias=False)
+
+    head = nvfp4_output_head(torch, tmp_path, device="cpu")
+    retain_answer_head(torch, model, [0, 1], head=head)
+
+    assert model.quail_full_head.float().tolist() == [[0.5, 1.0] * 8, [3.0, 4.0] * 8]
+    assert model.quail_answer_weights.dtype == torch.bfloat16
+    (tmp_path / "config.json").write_text(json.dumps(
+        {"quantization_config": {"quant_method": "fp8"}}))
+    assert nvfp4_output_head(torch, tmp_path, device="cpu") is None
 
 
 @pytest.fixture
@@ -128,7 +136,7 @@ def clear_model_paths():
     model_loading.resolve_model_path.cache_clear()
 
 
-def test_model_files_are_resolved_once_and_cached_before_children_start(
+def test_model_files_are_resolved_once_and_cached(
         monkeypatch, tmp_path, clear_model_paths):
     calls = []
 
@@ -148,47 +156,21 @@ def test_model_files_are_resolved_once_and_cached_before_children_start(
         "Qwen/model", "revision-a", include_weights=False) == first
     assert "*.safetensors" not in calls[2]["allow_patterns"]
 
-    # the files are cached before the GPU children start
-    from quail.backends.quail import worker
 
-    events = []
-    registry = built_in_registry()
+def test_a_base_model_without_a_turn_close_ends_answers_at_its_config_eos(
+        tmp_path):
 
-    def resolve(name, revision):
-        events.append("resolve")
-        assert revision == registry.model("qwen3-4b-fp8").revision
-        return str(tmp_path)
+    from helpers.sessions import TOKENIZER
 
-    def round_fn(kind, subs):
-        events.append("boot")
-        assert kind == "boot"
-        assert len(subs) == 8
-        assert all(sub["registry"] is registry
-                   and sub["model_path"] == str(tmp_path) for sub in subs)
-        return [{"boot_s": 3.0, "kind": "cold"}] * 8
+    from quail.common.tokens import Tokenizer
 
-    def ensure(count, configuration):
-        events.append("children")
-        assert count == 8
-        assert configuration == ("qwen3-4b-fp8", "h100-sxm", "quail", 8)
-        return SimpleNamespace(round=round_fn)
-
-    def run_graph(*args):
-        assert events == ["resolve", "children", "boot"]
-        events.append("query")
-        return {"_outputs": {}, "boot_s": 0.0, "wall_s": 7.0}
-
-    clock = iter([10.0, 12.0, 15.0])
-    monkeypatch.setattr(worker.time, "perf_counter", lambda: next(clock))
-    monkeypatch.setattr(worker, "resolve_model_path", resolve)
-    monkeypatch.setattr(worker, "_ensure_children", ensure)
-    monkeypatch.setattr(worker, "execute_distributed_graph", run_graph)
-    result = worker.execute_quail_multi({
-        "documents": {}, "gpus": 8, "model": "qwen3-4b-fp8",
-        "physical_plan": {"device": "h100-sxm", "backend": "quail"},
-        "chunk_tokens": 100, "true_ids": [1], "false_ids": [2],
-    }, registry, object())
-    assert events == ["resolve", "children", "boot", "query"]
-    assert result.metrics["boot_s"] == 5.0
-    assert result.metrics["boot"]["model_files_s"] == 2.0
-    assert result.metrics["wall_s"] == 7.0
+    # a base checkpoint keeps its end of text as an added token
+    tokenizer = json.loads((TOKENIZER / "tokenizer.json").read_text())
+    eos = len(tokenizer["model"]["vocab"])
+    tokenizer["added_tokens"] = [{
+        "id": eos, "content": "<|endoftext|>", "single_word": False,
+        "lstrip": False, "rstrip": False, "normalized": False, "special": True}]
+    (tmp_path / "tokenizer.json").write_text(json.dumps(tokenizer))
+    (tmp_path / "tokenizer_config.json").write_text(
+        '{"eos_token": "<|endoftext|>"}')
+    assert list(Tokenizer(tmp_path).stop_ids) == [eos]

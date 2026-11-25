@@ -9,56 +9,10 @@ import pytest
 from quail.baselines.request_scheduling import (
     run_filter_sequence,
     run_filter_sequence_async,
-    run_join_grouped,
     true_bit,
 )
 
 READ_ANSWER = partial(true_bit, true_ids={1})
-
-def test_join_submission_order_and_empty_inputs():
-    for submission in ["anchor-major", "suffix-major"]:
-        prefixes = [[100 + i] * (4 + i) for i in range(5)]
-        suffixes = [[200 + j] * 3 for j in range(4)]
-        client = _ParityClient()
-        result = run_join_grouped(client, object(), prefixes, suffixes, READ_ANSWER,
-                                  submission=submission)
-        expected = ([[100 + i, 200 + j] for i in range(5) for j in range(4)]
-                    if submission == "anchor-major" else
-                    [[100 + i, 200 + j] for j in range(4) for i in range(5)])
-        assert len(client.calls) == 1
-        assert [[p["prompt_token_ids"][0], p["prompt_token_ids"][-1]]
-                for p in client.calls[0]] == expected
-        assert result["answers"] == [
-            int((i + j) % 2 == 0) for i in range(5) for j in range(4)]
-        assert result["cached_per_request"] == [
-            (100 + i) % 7 for i in range(5) for j in range(4)]
-        assert result["cached_tokens"] == sum(result["cached_per_request"])
-        assert result["fresh_tokens"] == sum(
-            len(p) + len(s) for p in prefixes for s in suffixes
-        ) - result["cached_tokens"]
-        assert result["submission"] == submission
-        pairs = [(0, 1), (0, 3), (2, 0), (2, 2), (2, 3)]
-        client = _ParityClient()
-        result = run_join_grouped(client, object(), prefixes, suffixes, READ_ANSWER,
-                                  submission=submission, pairs=pairs)
-        heads = [(p["prompt_token_ids"][0] - 100, p["prompt_token_ids"][-1] - 200)
-                 for p in client.calls[0]]
-        assert heads == (pairs if submission == "anchor-major"
-                         else sorted(pairs, key=lambda pair: pair[::-1]))
-        # answers and cache counts come back in the listed order
-        assert result["answers"] == [int((a + s) % 2 == 0) for a, s in pairs]
-        assert result["cached_per_request"] == [(100 + a) % 7 for a, _ in pairs]
-    with pytest.raises(ValueError, match="unknown join submission"):
-        run_join_grouped(_ParityClient(), object(), prefixes, suffixes, READ_ANSWER,
-                         submission="unknown")
-
-    for prefixes, suffixes in [([], [[1]]), ([[1]], []), ([], [])]:
-        result = run_join_grouped(
-            _ParityClient(), object(), prefixes, suffixes, READ_ANSWER,
-            submission="suffix-major")
-        assert result["answers"] == []
-        assert result["cached_per_request"] == []
-        assert result["fresh_tokens"] == 0
 
 
 class _FakeFilterEngine:
@@ -182,52 +136,3 @@ def test_filter_sequences_pipeline_refill_fail_and_take_empty_input():
             generate, {}, [], [[9]], 100, read_answer=READ_ANSWER))
     assert result["requests"] == 0
     assert result["survivors"] == []
-
-
-class _ParityClient:
-    def __init__(self):
-        self.calls = []
-
-    def generate(self, prompts, _sp, use_tqdm=False):
-        self.calls.append(prompts)
-        outs = []
-        for prompt in prompts:
-            ids = prompt["prompt_token_ids"]
-            bit = 1 if (ids[0] + ids[-1]) % 2 == 0 else 0
-            outs.append(SimpleNamespace(
-                outputs=[SimpleNamespace(token_ids=[bit])],
-                prompt_token_ids=ids,
-                num_cached_tokens=ids[0] % 7))
-        return outs
-
-
-@pytest.mark.parametrize("failure", ["submit", "step", "answer"])
-def test_a_failed_filter_sequence_aborts_its_queued_requests(monkeypatch, failure):
-    engine = _FakeFilterEngine()
-    read_answer = READ_ANSWER
-
-    def fail(*args, **kwargs):
-        raise RuntimeError("request failed")
-
-    if failure == "submit":
-        add_request = engine.add_request
-
-        def submit(request_id, prompt, sampling_params):
-            add_request(request_id, prompt, sampling_params)
-            if request_id == "retry-1-0":
-                fail()
-
-        monkeypatch.setattr(engine, "add_request", submit)
-    elif failure == "step":
-        monkeypatch.setattr(engine, "step", fail)
-    else:
-        read_answer = fail
-    with pytest.raises(RuntimeError, match="request failed"):
-        run_filter_sequence(
-            engine, sampling_params=object(), body_ids=[[1], [2]],
-            question_ids=[[9]], budget_tokens=100, tag="retry",
-            read_answer=read_answer, max_num_seqs=2)
-    assert not engine.pending
-    aborted = {request_id for event, request_id in engine.events
-               if event == "abort"}
-    assert aborted and aborted <= {"retry-0-0", "retry-1-0"}

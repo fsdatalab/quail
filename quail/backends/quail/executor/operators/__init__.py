@@ -1,25 +1,34 @@
-"""Operator implementations for the shared document scheduler."""
+"""Model operators, one class per physical node type."""
 
 
-def execution_parts() -> dict:
-    """Return the execution implementation for each supported node type."""
-    from quail.backends.quail.executor.operators.apply import ApplyGate
-    from quail.backends.quail.executor.operators.classify import ClassifyPart
-    from quail.backends.quail.executor.operators.extract import ExtractPart
-    from quail.backends.quail.executor.operators.filter import ConditionGate, FilterPart
-    from quail.backends.quail.executor.operators.join import JoinPart
-    from quail.backends.quail.executor.operators.score import ScoreBatch
+def operator_types() -> dict:
+    """Return the ModelOperator class of each node type the GPU runs."""
+    from quail.backends.quail.executor.operators.classify import ClassifyOperator
+    from quail.backends.quail.executor.operators.extract import ExtractOperator
+    from quail.backends.quail.executor.operators.filter import (
+        ConditionGate,
+        FilterOperator,
+    )
+    from quail.backends.quail.executor.operators.join import JoinOperator
+    from quail.backends.quail.executor.operators.map import MapOperator
+    from quail.backends.quail.executor.operators.sae_features import (
+        SaeFeaturesOperator,
+    )
+    from quail.backends.quail.executor.operators.score import ScoreOperator
     from quail.physical import (
         AiClassify,
         AiExtract,
         AiFilter,
         AiJoin,
+        AiMap,
+        AiSaeFeatures,
         AiScore,
         Filter,
-        Foreign,
     )
 
-    return {AiFilter.type_name: FilterPart, AiClassify.type_name: ClassifyPart,
-            AiExtract.type_name: ExtractPart, AiJoin.type_name: JoinPart,
-            AiScore.type_name: ScoreBatch,
-            Filter.type_name: ConditionGate, Foreign.type_name: ApplyGate}
+    return {AiFilter.type_name: FilterOperator,
+            AiClassify.type_name: ClassifyOperator,
+            AiExtract.type_name: ExtractOperator, AiJoin.type_name: JoinOperator,
+            AiSaeFeatures.type_name: SaeFeaturesOperator,
+            AiMap.type_name: MapOperator, AiScore.type_name: ScoreOperator,
+            Filter.type_name: ConditionGate}

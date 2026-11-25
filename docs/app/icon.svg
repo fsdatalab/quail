@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" role="img" aria-label="Quail">
+  <rect width="200" height="200" rx="44" fill="#C41230"/>
+  <g transform="translate(100 100) scale(0.95) translate(-100 -91.5)">
+    <path d="M30 90 C52 84 76 84 96 76 C100 56 116 44 134 46 C148 48 156 56 158 64 L170 68 L157 74 C160 86 168 100 168 116 C168 146 140 164 108 164 C78 164 56 150 46 126 C42 116 36 104 30 90 Z" fill="#FFFFFF"/>
+    <path d="M128 47 C124 31 132 19 148 19 C156 19 158 27 152 31 C144 35 138 41 138 48 Z" fill="#FFFFFF"/>
+    <circle cx="141" cy="62" r="5.5" fill="#182C4B"/>
+  </g>
+</svg>

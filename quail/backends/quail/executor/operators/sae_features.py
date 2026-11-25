@@ -1,0 +1,195 @@
+"""AI.SAE_FEATURES in a region's GPU loop."""
+
+from contextlib import contextmanager
+
+import numpy as np
+import pyarrow as pa
+
+from quail.backends.quail.executor.model_operator import (
+    ColumnOperator,
+    SingleNodeOperator,
+)
+from quail.backends.quail.executor.sae import (
+    SaeFeaturesReadout,
+    SaeMaxAccumulator,
+    SaeMaxReadout,
+    feature_lists_of_rows,
+    sae_encoder,
+)
+from quail.backends.quail.executor.stages import Stage
+from quail.backends.quail.reranker import classify_outputs
+from quail.common.expressions import FEATURE_LIST
+from quail.common.tokens import DocumentKeys
+from quail.execution.metrics import NodeMetrics, NodeResult
+from quail.execution.rows import Rows
+
+
+def _feature_column(lengths, indices, strengths) -> pa.ListArray:
+    """Build the feature-list column from flat index and strength arrays.
+
+    ``lengths`` gives each row's feature count; the arrays hold every
+    row's features in sequence. The Arrow arrays wrap the numpy ones
+    without a copy.
+    """
+    offsets = np.zeros(len(lengths) + 1, dtype=np.int64)
+    np.cumsum(lengths, out=offsets[1:])
+    values = pa.StructArray.from_arrays(
+        [pa.array(np.ascontiguousarray(indices, dtype=np.int32)),
+         pa.array(np.ascontiguousarray(strengths, dtype=np.float32))],
+        names=FEATURE_LIST.value_type.names)
+    return pa.ListArray.from_arrays(pa.array(offsets, pa.int32()), values)
+
+
+class SaeFeaturesOperator(ColumnOperator, SingleNodeOperator):
+    """One feature call's stage and result table within a chain."""
+
+    @classmethod
+    def build(cls, region, nodes, chain):
+        node = nodes[0]
+        accumulator = next(
+            (operator.accumulator for operator in chain
+             if isinstance(operator, SaeFeaturesOperator)
+             and operator.accumulator is not None), None)
+        return cls(region.query, node, region.document_ids(), region.documents,
+                   accumulator=accumulator)
+
+    @staticmethod
+    def prepare_group(operators):
+        """Clear each question's maxima when its call finishes, for either pooling."""
+        accumulator = next((operator.accumulator for operator in operators
+                            if operator.accumulator is not None), None)
+        if accumulator is not None:
+            for operator in operators:
+                operator.accumulator = accumulator
+                accumulator.register_call()
+
+    @contextmanager
+    def execution_context(self):
+        """Attach the forward hook for the GPU loop's lifetime."""
+        if self._pipeline is None:
+            yield
+            return
+        previous = self._pipeline.forward_hook
+        self._pipeline.forward_hook = self.accumulator.observe
+        try:
+            yield
+        finally:
+            self._pipeline.forward_hook = previous
+
+    def __init__(self, state, node, ids, documents, *, accumulator=None):
+        spec = node.spec
+        (alias,) = spec.aliases
+        head, tail = spec.prompt_token_parts
+        if not tail:
+            raise ValueError(
+                "AI.SAE_FEATURES needs a question after the document")
+        self.node = node
+        self.ids = list(ids)
+        self.values = [None] * len(self.ids)
+        self.pending = {}
+        self.harvested = []
+        self.reached = 0
+        torch = state.torch
+        encoder = sae_encoder(state)
+        self.keep = encoder.keep
+        keys = DocumentKeys(alias, self.ids)
+        self.accumulator = None
+        self._pipeline = None
+        if spec.pooling == "max":
+            if accumulator is None:
+                table = documents[alias]
+                lengths = {}
+
+                def document_tokens(key, head_tokens=len(head)):
+                    if key not in lengths:
+                        lengths[key] = head_tokens + len(table[key[1]])
+                    return lengths[key]
+
+                accumulator = SaeMaxAccumulator(torch, encoder,
+                                                document_tokens)
+                self._pipeline = state.loaded_model.pipeline
+            self.accumulator = accumulator
+
+            def decide(anchor, row):
+                self.pending[anchor] = self.accumulator.settle(keys[anchor])
+                self.reached += 1
+                return True
+        else:
+            def decide(anchor, row):
+                if self.accumulator is not None:
+                    self.accumulator.settle(keys[anchor], collect=False)
+                self.values[anchor] = np.asarray(row)[-1]
+                self.reached += 1
+                return True
+
+        self.stages = [Stage(
+            suffixes=[list(tail)], readout=(SaeMaxReadout(torch)
+                if spec.pooling == "max" else SaeFeaturesReadout(torch, encoder)),
+            decide=decide, single=True,
+            label=f"sae features {spec.name}")]
+
+    def column_values(self, index, positions) -> tuple:
+        if self.node.spec.pooling == "max":
+            self._harvest(completed_only=False, positions=positions)
+            return (pa.array([self.values[position] for position in positions],
+                             type=FEATURE_LIST),)
+        return (_feature_column(*feature_lists_of_rows(
+            [self.values[position] for position in positions], self.keep)),)
+
+    def read_answers(self, every) -> int:
+        """Read the settled maxima that have landed; return the suffix tokens."""
+        self._harvest(completed_only=True)
+        head, tail = self.node.spec.prompt_token_parts
+        return self.reached * len(tail)
+
+    def _harvest(self, *, completed_only: bool, positions=None) -> None:
+        """Unpack settled handles, optionally waiting for their copies.
+
+        read_answers() reads completed slabs only. A condition reads its
+        requested positions; result() reads everything left.
+        """
+        if self.accumulator is None or not self.pending:
+            return
+        anchors = np.asarray(list(self.pending) if positions is None else [
+            position for position in positions if position in self.pending], np.int64)
+        taken, lengths, indices, strengths = self.accumulator.harvest(
+            [self.pending[anchor] for anchor in anchors],
+            completed_only=completed_only)
+        if not taken.size:
+            return
+        read = anchors[taken]
+        values = _feature_column(lengths, indices, strengths)
+        self.harvested.append((read, values))
+        for anchor, value in zip(read.tolist(), values):
+            self.values[anchor] = value
+            del self.pending[anchor]
+
+    def result(self, tokens, gpu_s, chunks, stats) -> NodeResult:
+        spec = self.node.spec
+        if spec.pooling == "max":
+            self._harvest(completed_only=False)
+            batches = self.harvested or [(np.empty(0, np.int64),
+                                         pa.array([], type=FEATURE_LIST))]
+            answered = np.concatenate([anchors for anchors, _ in batches]).tolist()
+            values = pa.concat_arrays([column for _, column in batches])
+        else:
+            answered = [index for index, value in enumerate(self.values)
+                        if value is not None]
+            (values,) = self.column_values(0, answered)
+        rows = np.asarray([[self.ids[index]] for index in answered],
+                          dtype=np.int32).reshape(-1, 1)
+        (alias,) = spec.aliases
+        listed = Rows({alias: rows[:, 0]}, pa.table({
+            spec.name: values}))
+        return NodeResult(classify_outputs(self.node, listed), NodeMetrics(
+            input_rows=self.reached, output_rows=len(answered),
+            evaluated_documents=self.reached, fresh_tokens=tokens,
+            gpu_s=gpu_s, chunks=chunks,
+            extension={
+                "output": spec.name, "aliases": list(spec.aliases),
+                "pooling": spec.pooling,
+                "input_rows": self.reached,
+                "suffix_tokens": len(spec.prompt_token_parts[1]),
+                "borrowed_prefix_tokens": stats.get("borrowed_tokens", 0),
+                "pack_s": round(stats.get("pack_s", 0.0), 3),
+            }))

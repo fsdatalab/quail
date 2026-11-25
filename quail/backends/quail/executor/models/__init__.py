@@ -9,12 +9,14 @@ from quail.backends.quail.executor.models.diffusion_gemma import (
     DiffusionGemmaPipeline,
 )
 from quail.backends.quail.executor.models.lfm2 import Lfm2Pipeline
+from quail.backends.quail.executor.models.lfm3 import Lfm3Pipeline
 from quail.backends.quail.executor.models.qwen3 import Qwen3Pipeline
 from quail.backends.quail.executor.models.qwen3_5 import Qwen35Pipeline
 
 PIPELINES = {"qwen3": Qwen3Pipeline,
              "qwen3_5": Qwen35Pipeline,
              "lfm2": Lfm2Pipeline,
+             "lfm3": Lfm3Pipeline,
              "diffusion_gemma": DiffusionGemmaPipeline}
 
 
@@ -30,6 +32,11 @@ def build_pipeline(spec, model, arena, **kwargs) -> ModelPipeline:
         raise ValueError(
             f"no forward pass for architecture {spec.arch!r}; "
             f"known: {sorted(PIPELINES)}") from None
+    mask = "document_isolated" if spec.bidirectional else "causal"
+    if mask not in cls.masks:
+        raise ValueError(f"the {spec.arch} forward pass runs only the "
+                         f"{', '.join(cls.masks)} mask, not {spec.name}'s "
+                         f"{mask}")
     return cls(model, arena, spec=spec, **kwargs)
 
 

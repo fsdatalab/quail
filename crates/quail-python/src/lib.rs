@@ -1,0 +1,79 @@
+#[cfg(test)]
+use quail_dylib as _;
+
+mod engine;
+pub mod native;
+pub mod pyarrow;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use datafusion::common::{DataFusionError, Result};
+use pyo3::prelude::*;
+pub use quail::{EngineConfig, Executor, Session, region_json};
+pub use quail::{
+    finished, planning, region_run, report, request, results, shared, stages, workers,
+};
+
+pub use crate::engine::{
+    executor_with_engine, executor_with_planner, register_batches, register_files,
+    register_python_table, scans_to_pyarrow,
+};
+
+pub(crate) fn python_failure(error: PyErr) -> DataFusionError {
+    let text = Python::attach(|py| {
+        let kind = error.get_type(py).name().map(|name| name.to_string());
+        if let Ok(kind) = kind
+            && (kind == "RefusalError" || kind == "CompileError")
+        {
+            return format!("{kind}: {}", error.value(py));
+        }
+        let formatted = py
+            .import("traceback")
+            .and_then(|module| module.call_method1("format_exception", (error.value(py),)))
+            .and_then(|lines| lines.extract::<Vec<String>>());
+        match formatted {
+            Ok(lines) => lines.concat().trim_end().to_string(),
+            Err(_) => error.to_string(),
+        }
+    });
+    DataFusionError::External(text.into())
+}
+
+fn add_virtual_env(py: Python<'_>) -> PyResult<()> {
+    let Some(root) = std::env::var_os("VIRTUAL_ENV").map(PathBuf::from) else {
+        return Ok(());
+    };
+    let Ok(entries) = std::fs::read_dir(root.join("lib")) else {
+        return Ok(());
+    };
+    let site = py.import("site")?;
+    for entry in entries.flatten() {
+        let packages = entry.path().join("site-packages");
+        if packages.is_dir() {
+            site.call_method1("addsitedir", (packages.to_string_lossy().to_string(),))?;
+        }
+    }
+    Ok(())
+}
+
+pub fn start_python() -> Result<()> {
+    Python::initialize();
+    Python::attach(add_virtual_env).map_err(python_failure)
+}
+
+pub fn session_with_engine(engine: Py<PyAny>) -> Result<Session> {
+    Session::with_executor(Arc::new(executor_with_engine(engine)?))
+}
+
+pub fn session_with_planner(
+    engine: Py<PyAny>,
+    planner: Option<Arc<planning::Planner>>,
+    base: Option<datafusion::prelude::SessionContext>,
+) -> Result<Session> {
+    let executor = Arc::new(executor_with_planner(engine, planner)?);
+    match base {
+        Some(base) => Session::with_executor_on(executor, base),
+        None => Session::with_executor(executor),
+    }
+}

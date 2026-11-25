@@ -7,6 +7,31 @@ kernels, quantization, attention paths, and arena access. The chunk
 loop sees only this class.
 """
 
+from contextlib import nullcontext
+
+
+def overlaid_rows(torch, num_tokens, device, *layouts):
+    """Row-major boundary tensors of mixer kinds that are never live at once.
+
+    Each layout is a list of widths, laid out back to back from the
+    start of one shared buffer as (num_tokens, width) tensors; the
+    buffer fits the largest layout.
+
+    Returns:
+        One list of tensors per layout.
+    """
+    flat = torch.zeros(num_tokens * max(sum(layout) for layout in layouts),
+                       dtype=torch.bfloat16, device=device)
+    views = []
+    for layout in layouts:
+        start, tensors = 0, []
+        for width in layout:
+            end = start + num_tokens * width
+            tensors.append(flat[start:end].view(num_tokens, width))
+            start = end
+        views.append(tensors)
+    return views
+
 
 class ModelPipeline:
     """The contract between the chunk loop and one model family.
@@ -23,6 +48,8 @@ class ModelPipeline:
     reads paged KV only. warm_tokens are the chunk sizes the warmup
     builds one small chunk of: a gated sequence's trailing chunks are
     100-500 tokens, a shape the full-size warm chunks do not cover.
+    mask is the keys each unified row reads, one of attention.MASKS;
+    masks lists the ones the forward pass can run.
     """
 
     engine = None
@@ -31,17 +58,22 @@ class ModelPipeline:
     canvas_ids = ()
     canvas_answer_row = 0
     needs_pages = False
+    mask = "causal"
+    masks = ("causal",)
     tree_attention = True
     gemm_warmup = True
-    warm_row_classes = True    # row-count classes keep one KV row per reader
-    warm_joins = True          # join and classification chunks borrow prefixes
-    decode_graphs = None
+    warm_row_classes = True
+    warm_joins = True
+    piecewise_graphs = None
+    whole_sequences = False
+    forward_hook = None
 
     def forward_chunk(self, chunk):
         """Return the final-normed hidden state of chunk.final_indices.
 
-        The loop owns the chunk's pages, temporaries included; this
-        only computes.
+        For a spec with an SAE, return the residual stream of those rows
+        instead, without the final norm. The loop owns the chunk's
+        pages, temporaries included; this only computes.
         """
         raise NotImplementedError
 
@@ -52,3 +84,24 @@ class ModelPipeline:
     def convolutions(self):
         """Return (weight, bias, activate) per convolution shape for warmup."""
         return ()
+
+    def forward_context(self, num_tokens):
+        """Return the context a forward pass, or a captured piece, runs under."""
+        return nullcontext()
+
+
+    def boundary(self, num_tokens, device) -> dict:
+        """Row-major tensors the pieces and mixers pass to each other."""
+        raise NotImplementedError
+
+    def bucket_boundary(self, num_tokens, device) -> dict:
+        """Boundary tensors each graph size allocates, not sliced by row."""
+        return {}
+
+    def piece(self, index, buffers):
+        """Captured work before layer index's token mixer (see above)."""
+        raise NotImplementedError
+
+    def mixer(self, index, buffers, chunk):
+        """Run layer index's token mixer eagerly over the chunk's real rows."""
+        raise NotImplementedError

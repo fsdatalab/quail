@@ -1,33 +1,42 @@
-"""Prepare join requests, retain matching pairs, and collect predicate results."""
+"""Run join predicates, retain matching pairs, and collect predicate results."""
 
 import itertools
+from dataclasses import dataclass, replace
 from functools import partial
 
 import numpy as np
+import pyarrow as pa
 
-from quail.backends.quail.executor.parts import (
-    ExecutionPart,
-    execute_parts,
+from quail.backends.quail.executor.model_operator import (
+    ModelOperator,
     execution_prefix_tree,
     gpu_seconds,
     stage_spans,
 )
-from quail.backends.quail.executor.stages import Stage
+from quail.backends.quail.executor.readout import AsyncSlotMargins
+from quail.backends.quail.executor.set_passes import (
+    Passes,
+    own_stage,
+    run_passes,
+    split_passes,
+)
+from quail.backends.quail.executor.stages import Stage, StageRequests
 from quail.backends.quail.prompts import join_request
 from quail.backends.quail.retention import apply_retention, join_settlement
-from quail.catalog.pairs import (
+from quail.common.document_ends import ends_for, joined_state
+from quail.common.pairs import (
     RowGroups,
     allowed_members,
     members_by_partner,
     pair_partner,
     partner_map,
 )
-from quail.catalog.tokens import (
+from quail.common.tokens import (
     DocumentKeys,
     DocumentPrefixes,
     concat_tokens,
-    select_documents,
 )
+from quail.execution.finished import finished_rows, finished_table
 from quail.execution.ids import id_positions
 from quail.execution.metrics import NodeMetrics, NodeResult
 from quail.execution.rows import Rows
@@ -35,42 +44,47 @@ from quail.execution.runner import ExecutionContext
 from quail.progress import answer_sink
 
 
-class JoinPart(ExecutionPart):
-    """Join predicates and their anchor KV within one scheduler run."""
+class JoinOperator(ModelOperator):
+    """A group of join predicates over one anchor alias, and the anchors' KV.
+
+    Each predicate is one stage over the anchor's partner tuples. The
+    partner documents are the join's build side: they are complete
+    before the anchors run. The operator owns the anchors' KV once they
+    settle: it retains or frees each by the join's retention.
+    """
 
     combine = True
+    settles_kv = True
 
     @classmethod
-    def execute_group(cls, state, nodes, inputs):
-        """Run prepared join predicates through the shared document scheduler."""
-        state.gpu_timing = bool(inputs.get("gpu_timing", False))
-        part = cls(state, nodes, inputs, inputs["anchor_ids"])
-        prefixes = inputs["prefixes"]
-        return execute_parts(
-            state, [part], prefixes, inputs["anchor_keys"],
-            keep_kv=nodes[-1].keep_kv,
-            prefix_tree=execution_prefix_tree(
-                nodes[0], prefixes, state.loaded_model.arena),
-            attention=nodes[0].attention, label=f"join ({len(nodes)} predicates)")
+    def build(cls, region, nodes, chain):
+        """Bind partner inputs to the documents of the operators before it.
 
-    @staticmethod
-    def model_inputs(node, inputs, context, upstream=None, nodes=None):
-        return prepare_join_inputs(node, inputs, context, upstream, nodes)
+        A group of joins alone reads its anchors' KV as the arena holds
+        it; after other operators, the anchors arrive with their KV.
+        """
+        if region.one_family:
+            inputs = prepare_join_inputs(nodes, region.inputs, region.context)
+            return cls(region.query, nodes, inputs, inputs["anchor_ids"])
+        return upstream_join(region.query, nodes, region.document_ids(), chain,
+                             region.inputs, region.context)
 
     @classmethod
-    def prepare(cls, state, nodes, ids, parts, inputs, context):
-        """Bind partner inputs and any pairs produced by preceding operators."""
-        from quail.backends.quail.executor.operators.apply import ApplyGate
+    def alone(cls, region, operators, table, settings):
+        (operator,) = operators
+        return replace(settings, label=f"join ({len(operator.nodes)} predicates)")
 
-        first = parts[0].node if parts else nodes[0]
-        prefixes = DocumentPrefixes(
-            first.document_head, context.state["documents"][nodes[0].anchor], ids)
-        upstream = {"documents": prefixes, "document_ids": ids, "parts": tuple(parts),
-                 "pairs": {part.node.written_position: part.rows for part in parts
-                           if isinstance(part, ApplyGate) and part.node.ids == "pairs"}}
-        prepared = context.model_inputs(
-            nodes[0], inputs, context, upstream, nodes=nodes)
-        return cls(state, nodes, prepared, ids, context=context)
+    def layout(self, region):
+        """A group of joins alone shows its anchors as its inputs prepared them."""
+        if self.inputs.get("upstream") is not None:
+            return None
+        from quail.backends.quail.executor.region import RegionDocuments
+
+        prefixes = self.inputs["prefixes"]
+        return RegionDocuments(prefixes, self.inputs["anchor_keys"],
+                               execution_prefix_tree(
+                                   self.node, prefixes,
+                                   region.query.loaded_model.arena))
 
     def __init__(self, state, nodes, inputs, ids, *, context=None):
         self.nodes = nodes
@@ -83,6 +97,7 @@ class JoinPart(ExecutionPart):
         self.settled = np.zeros(len(ids), dtype=bool)
         self.final_rows = [None] * len(ids)
         self.readers = []
+        self.finished = []
         lists_for = inputs.get("anchor_partners")
         self.stages = [
             Stage(suffixes=suffixes, readout=state.async_answers, frame=frame,
@@ -110,13 +125,46 @@ class JoinPart(ExecutionPart):
             self.final_rows[anchor] = row
         return bool(any(row))
 
-    def on_settled(self, anchor, survived, row):
-        """Settle anchor KV using join answers after all readers finish."""
-        self.settled[anchor] = True
-        self.inputs["anchor_done"](
-            anchor, row if self.final_rows[anchor] is None else self.final_rows[anchor])
+    def answered(self, anchor, stage, start, end, answers):
+        """Record the pairs one group of an anchor's partners answered true.
 
-    def finish(self, every) -> int:
+        A pair is settled once answered: a true one is a row of the
+        join's answers, and its anchor survives a join that keeps
+        matched anchors.
+        """
+        node = self.nodes[stage]
+        anchor_id = int(self.inputs["anchor_keys"][anchor][1])
+        lists_for = self.inputs.get("anchor_partners")
+        members = None if lists_for is None else lists_for(anchor_id, stage)
+        tuples = self.inputs["partner_indices"][node.written_position]
+        matched = [tuples[start + position if members is None
+                          else int(members[start + position])]
+                   for position, answer in enumerate(answers) if answer]
+        self.finished.extend(settled_pairs(node, anchor_id, matched))
+        return bool(matched)
+
+    def take_finished(self):
+        finished, self.finished = self.finished, []
+        return finished
+
+    def settle_kv(self, anchor, survived, row):
+        """Settle anchor KV using join answers after all readers finish.
+
+        An anchor of a lone anti-join that matched nothing is one of its
+        rows from then on.
+        """
+        self.settled[anchor] = True
+        final = row if self.final_rows[anchor] is None else self.final_rows[anchor]
+        self.inputs["anchor_done"](anchor, final)
+        node = self.node
+        if (len(self.nodes) == 1 and node.semantics == "anti" and not any(final)
+                and finished_rows() is not None):
+            anchor_id = int(self.inputs["anchor_keys"][anchor][1])
+            self.finished.append(finished_table(
+                node.node_id, f"rows:{node.anchor}",
+                Rows({node.anchor: np.asarray([anchor_id], dtype=np.int32)}).table()))
+
+    def read_answers(self, every) -> int:
         """Map predicate answers to reached anchors and count suffix work."""
         self.own_tokens = _predicate_tokens(
             self.stages, every, self.inputs.get("anchor_partners"),
@@ -132,7 +180,8 @@ class JoinPart(ExecutionPart):
                 {local_of[position]: row for position, row in answers.items()}
                 for answers in every]
             self.anchor_ids = [self.ids[position] for position in reached]
-            self.kv_round = ({"hits": len(reached), "misses": 0} if upstream["parts"]
+            self.kv_round = ({"hits": len(reached), "misses": 0}
+                             if upstream["operators"]
                              else {"hits": 0, "misses": len(reached)})
         else:
             self.answers = every
@@ -140,7 +189,7 @@ class JoinPart(ExecutionPart):
             self.kv_round = self.inputs.get("kv_round") or {}
         return sum(self.own_tokens)
 
-    def complete(self, tokens, spans, stats, offset):
+    def close(self, tokens, spans, stats, offset) -> dict:
         """Build each join predicate's answers and measured costs."""
         nodes, inputs = self.nodes, self.inputs
         node = self.node
@@ -157,13 +206,12 @@ class JoinPart(ExecutionPart):
             matched = [anchor_ids[int(local)] for local in sorted(rows)
                        if any(rows[local])]
             survivors = matched
-            # Anchors with no candidates never launch a request.
             if member.semantics == "anti":
                 candidates = np.asarray(
                     anchor_ids if j == 0 else id_positions(results[
                         nodes[j - 1].node_id].outputs[f"rows:{node.anchor}"]),
                     dtype=np.int64)
-                survivors = candidates[~np.isin(candidates, matched)]
+                survivors = candidates[member.keeps(np.isin(candidates, matched))]
             answer = {
                 "rows": rows,
                 "anchor_index": anchor_ids,
@@ -189,23 +237,222 @@ class JoinPart(ExecutionPart):
                     gpu_s=gpu_seconds(own_spans),
                     chunks=len(own_spans),
                     extension={
-                        "answers": [rows],
                         **({"borrowed_prefix_tokens": stats["borrowed_tokens"]}
                            if j == 0 and stats.get("borrowed_tokens") else {}),
                         **({"pack_s": round(stats["pack_s"], 3)}
                            if j == 0 and stats.get("pack_s") else {}),
                     }))
         self._results = results
-        self.result_value = results[node.node_id]
         if self.context is not None:
-            # the first predicate's hits count the anchors that reached
-            # the group on resident KV
             first = nodes[0]
             self.context.model_result(first, results[first.node_id], self.context)
+        return results
 
     def results(self) -> dict:
         """Return results for every join predicate in the group."""
         return self._results
+
+
+def settled_pairs(node, anchor_id, partner_tuples) -> list:
+    """The finished rows of an anchor's pairs a join answered true.
+
+    Args:
+        node: The AiJoin.
+        anchor_id: The anchor's document id.
+        partner_tuples: Each true pair's partner ids, one per partner alias.
+
+    Returns:
+        The pairs as rows of the join's answers, and, for a join that
+        keeps matched anchors, the anchor as a row of its rows port.
+    """
+    if not partner_tuples or finished_rows() is None:
+        return []
+    count = len(partner_tuples)
+    columns = {node.anchor: pa.array([anchor_id] * count, pa.int32())}
+    for index, alias in enumerate(node.partners):
+        columns[alias] = pa.array([int(found[index]) for found in partner_tuples],
+                                  pa.int32())
+    columns["answer"] = pa.array([True] * count)
+    tables = [finished_table(node.node_id, f"join_answers:{node.written_position}",
+                             pa.table(columns))]
+    if node.semantics != "anti":
+        tables.append(finished_table(node.node_id, f"rows:{node.anchor}", Rows(
+            {node.anchor: np.asarray([anchor_id], dtype=np.int32)}).table()))
+    return tables
+
+
+@dataclass(frozen=True)
+class JoinQuestions:
+    """What a set-attention pass over an anchor asks about its partners.
+
+    An AiJoin has these fields; a classification of a join's pairs
+    builds them from its spec.
+
+    Attributes:
+        partners: The partner aliases, in question order.
+        label_token_ids: Per partner alias, its record label's tokens.
+        tail_token_ids: The tokens after the last partner document.
+        separator_tokens: The tail's first tokens: the blank line after
+            each partner document.
+        frame_token_ids: The state tail after the anchor document.
+        question_header_token_ids: The tokens that open a later question.
+        anchor: The anchor alias.
+        document_ends: The plan's document ends (JoinDocumentEnds) for
+            the anchor's frame and each partner's separator.
+    """
+
+    partners: tuple
+    label_token_ids: tuple
+    tail_token_ids: tuple
+    separator_tokens: int
+    frame_token_ids: tuple
+    question_header_token_ids: tuple
+    anchor: str = ""
+    document_ends: tuple = ()
+
+
+def set_join_questions(node, documents) -> list:
+    """Each partner tuple's question tokens, in member order.
+
+    A question is every partner's label and document, each document
+    followed by the blank line that opens the tail and joined to it as
+    the model's tokenizer joins them, then the rest of the tail.
+
+    Args:
+        node: The AiJoin.
+        documents: alias -> the partner documents' token ids, by local
+            position.
+    """
+    labels = dict(node.label_token_ids)
+    tail = list(node.tail_token_ids)
+    separator, rest = tail[:node.separator_tokens], tail[node.separator_tokens:]
+    blocks = {}
+    for alias in node.partners:
+        ends = ends_for(node.document_ends, alias, separator)
+        blocks[alias] = [list(labels[alias])
+                         + list(joined_state(document, separator, ends))
+                         for document in documents[alias]]
+    questions = []
+    for positions in itertools.product(
+            *(range(len(blocks[alias])) for alias in node.partners)):
+        tokens = []
+        for alias, position in zip(node.partners, positions):
+            tokens += blocks[alias][position]
+        questions.append(tokens + rest)
+    return questions
+
+
+def join_passes(node, prefixes, anchors, members_of, documents, set_size: int,
+                budget: int) -> Passes:
+    """One join's passes over the anchors, each pass's questions its own request.
+
+    Args:
+        node: The AiJoin, or the JoinQuestions of a classification.
+        prefixes: Per anchor, its head and document token ids.
+        anchors: The anchors to ask, by index into prefixes.
+        members_of: Callable(anchor) -> the member indices it asks, or
+            None for every member.
+        documents: alias -> the partner documents' token ids.
+        set_size: The most questions in one pass.
+        budget: The chunk token budget a pass fits.
+
+    Returns:
+        The Passes, each owned by its anchor, with no stages yet; an
+        anchor that asks no member has none.
+    """
+    questions = set_join_questions(node, documents)
+    lengths = [len(question) for question in questions]
+    header = list(node.question_header_token_ids)
+    frame = list(node.frame_token_ids)
+    ends = ends_for(node.document_ends, node.anchor, frame)
+    passes = Passes(requests=[])
+    for anchor in anchors:
+        members = members_of(anchor)
+        members = range(len(questions)) if members is None else members
+        if not len(members):
+            continue
+        prefix = joined_state(prefixes[anchor], frame, ends)
+        for block in split_passes(len(prefix), members, lengths, len(header),
+                                  set_size, budget):
+            suffix, shape = [], []
+            for index, member in enumerate(block):
+                question = (header if index else []) + questions[member]
+                suffix += question
+                shape.append(len(question))
+            passes.states.append(prefix)
+            passes.suffix_tokens.append(len(suffix))
+            passes.owners.append(anchor)
+            passes.requests.append(StageRequests([suffix], questions=(tuple(shape),)))
+    return passes
+
+
+def settled_rows(every, asked) -> dict:
+    """Each anchor's answers at the last join of the group it reached.
+
+    An anchor that reached a join but had no partner to ask there
+    settles with no answers, as unmatched, not with the answers of the
+    join before it.
+
+    Args:
+        every: Per join, anchor -> its answers.
+        asked: Per join, the anchors that reached it.
+    """
+    last = {}
+    for rows, anchors in zip(every, asked):
+        last.update((anchor, rows.get(anchor, [])) for anchor in anchors)
+    return last
+
+
+def set_joins(state, join) -> dict:
+    """Ask a group's joins under set attention, one GPU loop each.
+
+    Each anchor is the state of its passes, and each of its partner
+    tuples is one question; a pass asks up to the model's set size.
+    A later join of the group asks only the anchors with a match in
+    the join before it.
+
+    Args:
+        state: The query's execution state.
+        join: The group's JoinOperator, which turns the answers into
+            results.
+
+    Returns:
+        Node id -> NodeResult, for every join of the group.
+    """
+    nodes, inputs = join.nodes, join.inputs
+    readout = AsyncSlotMargins(state.torch, state.answer_rows)
+    keys = inputs["anchor_keys"]
+    lists_for = inputs.get("anchor_partners")
+    every, own_tokens, all_spans, asked = [], [], [], []
+    reached = range(len(join.ids))
+    for j, node in enumerate(nodes):
+        asked.append(list(reached))
+        passes = join_passes(
+            node, inputs["prefixes"], reached,
+            lambda anchor, j=j: (None if lists_for is None
+                                 else lists_for(keys[anchor][1], j)),
+            inputs["partner_documents"], state.loaded_model.model_spec.set_size,
+            state.chunk_tokens)
+        passes.stages = [0] * len(passes.states)
+        label = f"join predicate {node.written_position}"
+        run_passes(state, [own_stage(state, readout, label, passes)], passes,
+                   label=label)
+        rows = {}
+        for anchor, margins in zip(passes.owners, passes.values):
+            if margins is not None:
+                rows.setdefault(anchor, []).extend(
+                    (np.asarray(margins, dtype=float) > 0).tolist())
+        every.append(rows)
+        own_tokens.append(passes.tokens)
+        all_spans += [({j: by_stage.get(0, 0)}, chunk, start, end)
+                      for by_stage, chunk, start, end in passes.spans]
+        reached = [anchor for anchor in sorted(rows) if any(rows[anchor])]
+    last = settled_rows(every, asked)
+    for anchor in sorted(last):
+        join.settle_kv(anchor, any(last[anchor]), last[anchor])
+    join.read_answers(every)
+    join.own_tokens = own_tokens
+    return join.close(sum(own_tokens), all_spans, {}, 0)
 
 
 def _predicate_tokens(join_stages, answers, lists_for, anchor_keys,
@@ -272,15 +519,11 @@ def runs_over_pairs(join: dict) -> bool:
     return bool(join.get("pairs_from"))
 
 
-def partner_maps(group, pair_tables, streamed=()) -> dict:
-    """Written position -> anchor row -> partner rows, per pair stage.
-
-    streamed names the written positions whose pairs arrive per batch
-    and need no table here.
-    """
+def partner_maps(group, pair_tables) -> dict:
+    """Written position -> anchor row -> partner rows, per pair stage."""
     maps = {}
     for join in group:
-        if not runs_over_pairs(join) or join["written_position"] in streamed:
+        if not runs_over_pairs(join):
             continue
         table = pair_tables.get(join["written_position"])
         if table is None:
@@ -327,7 +570,6 @@ def partner_list_builder(group, tuples_by_stage, maps):
             return None
         rows, members, cache = entry
         if cache is None:
-            # Per-batch apply results can arrive after the lookup is constructed.
             return allowed_members(rows, members, anchor)
         position = np.searchsorted(rows.keys, anchor)
         if position == len(rows.keys) or rows.keys[position] != anchor:
@@ -351,27 +593,52 @@ def stage_partner_lists(group, lists_for, anchor_ids) -> list:
     return out
 
 
-def prepare_join_inputs(node, inputs, context: ExecutionContext, upstream=None,
-                        nodes=None) -> dict:
-    """Prepare join requests from graph ports and preceding operator state."""
+def upstream_join(state, nodes, ids, chain, inputs, context):
+    """Build a group of joins whose anchors arrive from the operators before it.
+
+    Args:
+        state: The query's GPU state.
+        nodes: The group's AiJoin nodes.
+        ids: The anchors' document ids.
+        chain: The operators before the group.
+        inputs: Per node id, its input values from outside the chain.
+        context: The execution context.
+    """
+    first = chain[0].node if chain else nodes[0]
+    prefixes = DocumentPrefixes(
+        first.document_head, context.state["documents"][nodes[0].anchor], ids)
+    upstream = {"documents": prefixes, "document_ids": ids, "operators": tuple(chain)}
+    prepared = prepare_join_inputs(nodes, inputs, context, upstream)
+    return JoinOperator(state, nodes, prepared, ids, context=context)
+
+
+def prepare_join_inputs(nodes, inputs, context: ExecutionContext,
+                        upstream=None) -> dict:
+    """Prepare join requests from graph ports and preceding operator state.
+
+    Args:
+        nodes: The group's AiJoin nodes.
+        inputs: Per node id, its input values by port name.
+        context: The execution context.
+        upstream: The anchors' prefixes, ids, and operators when they
+            arrive from operators before the group, or None.
+    """
     state = context.state
-    grouped = nodes is not None
-    nodes = (node,) if nodes is None else nodes
+    node = nodes[0]
     by_alias = {}
-    port_pairs = {}        # written position -> pair table from a port
+    port_pairs = {}
     for member, input_port in ((member, port) for member in nodes
                                for port in member.inputs):
-        values = inputs[member.node_id] if grouped else inputs
+        values = inputs[member.node_id]
         port = input_port.source.port
         if input_port.name not in values:
-            continue           # fed by the upstream itself
+            continue
         value = values[input_port.name]
         if port.startswith("pairs:"):
             port_pairs[int(port.split(":", 1)[1])] = value
             continue
         if not port.startswith("rows:"):
             continue
-        # the suffix and partner builders index these as Python ints
         by_alias[port.split(":", 1)[1]] = id_positions(value).tolist()
     if not state["joins_started"]:
         state["joins_started"] = True
@@ -389,7 +656,8 @@ def prepare_join_inputs(node, inputs, context: ExecutionContext, upstream=None,
     config = state["retention"]
     apply_retention(state["gpu"].arena, config,
                     config.get("before", {}).get(node.node_id, {}), by_alias)
-    documents = {alias: select_documents(state["documents"][alias], by_alias[alias])
+    documents = {alias: [state["documents"][alias][index]
+                         for index in by_alias[alias]]
                  for member in nodes for alias in member.partners}
     prefixes = (DocumentPrefixes(node.document_head, state["documents"][node.anchor],
                                  by_alias[node.anchor])
@@ -410,9 +678,7 @@ def join_inputs(nodes, documents, indices, prefixes, arena, retention, pair_tabl
     node = nodes[0]
     group = [join_request(member) for member in nodes]
     stage_suffixes, tuple_indices = join_suffixes(group, documents, indices)
-    streamed_pairs = {} if upstream is None else upstream["pairs"]
-    maps = partner_maps(group, pair_tables, streamed=streamed_pairs)
-    maps.update(streamed_pairs)
+    maps = partner_maps(group, pair_tables)
     lists_for = partner_list_builder(
         group, [tuple_indices[stage.written_position] for stage in nodes], maps)
     anchor_ids = indices[node.anchor] if upstream is None else None
@@ -452,6 +718,7 @@ def join_inputs(nodes, documents, indices, prefixes, arena, retention, pair_tabl
 
     return {
         "prefixes": prefixes,
+        "partner_documents": documents,
         "stage_suffixes": stage_suffixes,
         "stage_frames": [join.get("frame") or [] for join in group],
         "anchor_keys": anchor_keys,

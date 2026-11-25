@@ -1,0 +1,28 @@
+DataFusion:
+CooperativeExec
+  ModelRegionExec: calls=[ai_filter], tables=[agent_traces@t]
+    CoalescePartitionsExec
+      FilterExec: turn_index@2 >= 10 AND token_count@3 <= 6000, projection=[id@0, trace@1]
+        RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+          DataSourceExec: file_groups={1 group: [[<data>/agent_traces.parquet]]}, projection=[id, trace, turn_index, token_count], file_type=parquet, predicate=turn_index@3 >= 10 AND token_count@4 <= 6000, pruning_predicate=turn_index_null_count@1 != row_count@2 AND turn_index_max@0 >= 10 AND token_count_null_count@4 != row_count@2 AND token_count_min@3 <= 6000, required_guarantees=[]
+
+model region:
+logical:
+  Projection: t.id
+    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Judge strictly from the agent trace above whether the agent recovered after pursuing an approach that did not work. Recovery means the agent recognized or moved past the unsuccessful approach and then made useful progress with a different or corrected approach.\n\n{0}\n\nInstruction: answer TRUE if the trace shows the agent recovering after an unsuccessful approach, FALSE otherwise."), t.trace), named_struct(Utf8("selectivity"), Float64(0.3216704288939052))), inline_predicate: __quail_answer_1, returns: []
+      SubqueryAlias: t
+        TableScan: agent_traces@t
+
+physical: backend=quail, model=qwen3-4b-fp8, gpus=1
+  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
+  architecture=qwen3 (36 layers), weights=fp8
+  kernels: linear layers: fp8 GEMM (DeepGEMM)
+
+                                                                  est. rows   est. pass   est. time
+  AiFilter: t                                                             0                   <1 ms
+    KV: not stored
+    predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')           0       32.2%
+    Scan agent_traces as t                                                0
+      tokens=0, mean_document_tokens=0
+  est. time is each node's work alone; node times do not add up to the plan estimate
+  because chunk packing shares forward passes across nodes

@@ -1,12 +1,11 @@
-"""Run Quail and vLLM on one physical H100 per query family.
+"""Run Quail and vLLM on one physical GPU per query family.
 
 Quail runs in a fresh child process. Stock vLLM and pipelined vLLM run
-in a second child process and share one loaded model. SGLang runs in a
-separate container because its package version conflicts with vLLM.
+in a second child process and share one loaded model.
 
     run_log="results/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-quailb-parallel.log"
     uv run modal run --detach -m bench.quailb_parallel \
-      --model qwen3-4b-fp8 --sf 0.1 \
+      --model qwen3-4b-fp8 --scale-factor 0.1 --device h100-sxm \
       2>&1 | tee "$run_log"
 
 The local entrypoint starts one remote function. Detached mode keeps that
@@ -14,6 +13,7 @@ function and every family call running if the local process disconnects.
 """
 
 import json
+import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,10 +21,11 @@ from pathlib import Path
 import modal
 
 from bench.results import combine_measurements, write_json
-from quail.deploy.images import gpu_image, sglang_image
+from quail.deploy.images import gpu_image
+from quail.progress import LOG_TAG_ENV
+from quail.specs import modal_gpu_type
 
 image = gpu_image()
-sglang_gpu_image = sglang_image()
 
 app = modal.App("quail-milestone1")
 hf_cache = modal.Volume.from_name("quail-hf-cache", create_if_missing=True)
@@ -58,26 +59,34 @@ def ensure_data(scale_factor: float, query_ids: list[str], collection_id: str,
     import pyarrow.parquet as pq
 
     import quail_b as benchmark
+    from bench.quailb import data_directory, labeled
     from quail_b.data import CORPUS_COLUMNS
+    from quail_b.sec import build_sec_corpus
 
-    names = {
-        relation.table for query_id in query_ids
-        for relation in benchmark.get_query(query_id).info.relations
-    }
-    directory = Path(DATA_DIR) / f"sf{scale_factor}"
+    directory = data_directory(DATA_DIR, scale_factor, query_ids)
     directory.mkdir(parents=True, exist_ok=True)
-    for name in sorted(names):
-        path = directory / f"{name}.parquet"
-        # a table an earlier benchmark version wrote lacks its columns
-        if (path.exists() and set(CORPUS_COLUMNS[name])
-                <= set(pq.read_schema(path).names)):
-            continue
-        pq.write_table(benchmark.load_table(name, scale_factor=scale_factor), path)
+    if not labeled(query_ids):
+        if not (directory / "manifest.json").exists():
+            build_sec_corpus(directory)
+    else:
+        names = {
+            relation.table for query_id in query_ids
+            for relation in benchmark.get_query(query_id).info.relations
+        }
+        for name in sorted(names):
+            path = directory / f"{name}.parquet"
+            # a table an earlier benchmark version wrote lacks its columns
+            if (path.exists() and set(CORPUS_COLUMNS[name])
+                    <= set(pq.read_schema(path).names)):
+                continue
+            pq.write_table(benchmark.load_table(name, scale_factor=scale_factor),
+                           path)
     suite = benchmark.load_benchmark(
         query_ids, scale_factor=scale_factor, data_dir=directory,
-        collection_id=collection_id or None, root=label_root or None)
+        collection_id=collection_id or None, accuracy=labeled(query_ids),
+        root=label_root or None)
     results_vol.commit()
-    return suite.ground_truth.collection_id
+    return None if suite.ground_truth is None else suite.ground_truth.collection_id
 
 
 def _methods(csv: str) -> list[str]:
@@ -88,12 +97,13 @@ def _methods(csv: str) -> list[str]:
 def _run_family(process_groups, result_name, model, scale_factor, query_ids_csv,
                 run_dir, ground_truth_collection, root=None,
                 attention=None, gpu_timing=False,
-                canvas_draws=None, host_kv_bytes=0) -> str:
+                canvas_draws=None, device="h100-sxm", gpus=1,
+                host_kv_bytes=0) -> str:
     """Run one query family's methods, one child process per group.
 
-    Every group runs on the one GPU of this container, in a fresh
-    process. The family's result, without the per-method suites, is
-    saved under `families/` in the run directory.
+    Every group runs on this container's GPUs, in a fresh process.
+    The family's result, without the per-method suites, is saved
+    under `families/` in the run directory.
     """
     from bench.process_isolation import run_backend_group_in_fresh_process
     from quail_b.queries import query_family_name
@@ -102,6 +112,8 @@ def _run_family(process_groups, result_name, model, scale_factor, query_ids_csv,
         query_id.strip() for query_id in query_ids_csv.split(",")
         if query_id.strip())
     family = query_family_name(query_ids)
+    # every engine line names the family, as the families' logs interleave
+    os.environ[LOG_TAG_ENV] = family
     process_results = []
     suites = {}
     for methods in process_groups:
@@ -118,6 +130,8 @@ def _run_family(process_groups, result_name, model, scale_factor, query_ids_csv,
             gpu_timing=gpu_timing,
             suite_name=f"{family}{result_name}",
             canvas_draws=canvas_draws,
+            device=device,
+            gpus=gpus,
             host_kv_bytes=host_kv_bytes,
         )
         process_results.append(process_result)
@@ -126,15 +140,15 @@ def _run_family(process_groups, result_name, model, scale_factor, query_ids_csv,
         gpu_uuid for process_result in process_results
         for gpu_uuid in process_result["gpu_uuids"]
     }
-    if len(gpu_uuids) != 1:
+    if len(gpu_uuids) != gpus:
         raise RuntimeError(
-            "backend child processes did not see one physical GPU: "
-            f"{sorted(gpu_uuids)}")
+            f"backend child processes did not see {gpus} physical "
+            f"GPU(s): {sorted(gpu_uuids)}")
     result = {
         "query_family": family,
         "query_ids": list(query_ids),
         "ground_truth_collection": next(iter(suites.values()))["collection_id"],
-        "gpu": "H100!",
+        "gpu": modal_gpu_type(device, gpus),
         "gpu_uuids": sorted(gpu_uuids),
         "process_groups": [list(methods) for methods in process_groups],
         "process_cleanup": [
@@ -152,7 +166,7 @@ def _run_family(process_groups, result_name, model, scale_factor, query_ids_csv,
 
 @app.function(
     image=image,
-    gpu="H100!",
+    gpu=modal_gpu_type("h100-sxm"),
     memory=98304,
     timeout=36000,
     max_containers=8,
@@ -173,6 +187,8 @@ def run_query_family(
     gpu_timing: bool = False,
     label_root: str = "",
     canvas_draws: str = "",
+    device: str = "h100-sxm",
+    gpus: int = 1,
     host_kv_bytes: int = 0,
 ) -> str:
     """Run one query family through the selected benchmark methods.
@@ -193,6 +209,8 @@ def run_query_family(
         label_root: Optional local mirror of reference labels.
         canvas_draws: Comma-separated maximum diffusion draw counts. Empty
             keeps the default; multiple counts create separate Quail runs.
+        device: Registered device name. Defaults to ``h100-sxm``.
+        gpus: Model copies, one per GPU. Defaults to 1.
         host_kv_bytes: Host bytes of document KV Quail keeps between the
             family's queries; 0 keeps none.
 
@@ -217,33 +235,10 @@ def run_query_family(
             attention=attention or None,
             gpu_timing=gpu_timing,
             canvas_draws=canvas_draws or None,
+            device=device,
+            gpus=gpus,
             host_kv_bytes=host_kv_bytes,
         )
-    finally:
-        results_vol.commit()
-        kernel_cache.commit()
-
-
-@app.function(
-    image=sglang_gpu_image,
-    gpu="H100!",
-    memory=98304,
-    timeout=36000,
-    max_containers=8,
-    volumes=VOLUMES,
-)
-def run_sglang_query_family(
-    model: str,
-    scale_factor: float,
-    query_ids_csv: str,
-    run_dir: str,
-    ground_truth_collection: str,
-    result_name: str = "-sglang",
-) -> str:
-    """Run one query family through the SGLang backend."""
-    try:
-        return _run_family([("pipelined_sglang",)], result_name, model, scale_factor,
-                           query_ids_csv, run_dir, ground_truth_collection)
     finally:
         results_vol.commit()
         kernel_cache.commit()
@@ -313,7 +308,6 @@ def run_all(
     query: str = "",
     ground_truth_collection: str = "",
     include_baselines: bool = True,
-    include_sglang: bool = True,
     include_quail: bool = True,
     include_dumb_vllm: bool = False,
     baselines: str = "stock_vllm,pipelined_vllm",
@@ -321,6 +315,9 @@ def run_all(
     gpu_timing: bool = False,
     label_root: str = "",
     canvas_draws: str = "",
+    device: str = "h100-sxm",
+    gpus: int = 1,
+    timeout_s: int = 43200,
     host_kv_bytes: int = 0,
     memory_mb: int = 0,
 ):
@@ -343,6 +340,8 @@ def run_all(
         "sf": scale_factor,
         "attention": attention or None,
         "canvas_draws": canvas_draws or None,
+        "device": device,
+        "gpus": gpus,
         "host_kv_bytes": host_kv_bytes,
         "memory_mb": memory_mb or None,
         "query_ids": list(query_ids),
@@ -362,15 +361,14 @@ def run_all(
         manifest["collection_id"] = ground_truth_collection
 
         family_calls = []
-        sglang_calls = []
         call_ids = manifest["function_call_ids"]
         for group, family_ids, result_name in _query_groups(query_ids):
             if include_quail or include_baselines or include_dumb_vllm:
-                # a host KV store larger than the default container's
-                # memory asks for a bigger one
-                family = (run_query_family.with_options(memory=memory_mb)
-                          if memory_mb else run_query_family)
-                family_call = family.spawn(
+                family_call = run_query_family.with_options(
+                    gpu=modal_gpu_type(device, gpus),
+                    timeout=timeout_s,
+                    **({"memory": memory_mb} if memory_mb else {}),
+                ).spawn(
                     model=model,
                     scale_factor=scale_factor,
                     query_ids_csv=",".join(family_ids),
@@ -385,6 +383,8 @@ def run_all(
                     gpu_timing=gpu_timing,
                     label_root=label_root,
                     canvas_draws=canvas_draws,
+                    device=device,
+                    gpus=gpus,
                     host_kv_bytes=host_kv_bytes,
                 )
                 family_calls.append((group, family_call))
@@ -394,28 +394,10 @@ def run_all(
                     f"({group}, Quail and vLLM, {','.join(family_ids)})",
                     flush=True,
                 )
-            if include_sglang:
-                sglang_result_name = f"{result_name}-sglang"
-                sglang_call = run_sglang_query_family.spawn(
-                    model=model,
-                    scale_factor=scale_factor,
-                    query_ids_csv=",".join(family_ids),
-                    run_dir=run_dir,
-                    ground_truth_collection=ground_truth_collection,
-                    result_name=sglang_result_name,
-                )
-                sglang_calls.append((group, sglang_call))
-                call_ids[f"{group}:sglang"] = sglang_call.object_id
-                print(
-                    f"function call id: {sglang_call.object_id} "
-                    f"({group}, SGLang, {','.join(family_ids)})",
-                    flush=True,
-                )
 
         write_json(manifest_path, manifest)
         results_vol.commit()
-        return _finish_run(directory, manifest, family_calls, sglang_calls,
-                           query_ids, started)
+        return _finish_run(directory, manifest, family_calls, query_ids, started)
     except Exception as error:
         manifest.update(status="failed", error=f"{type(error).__name__}: {error}")
         raise
@@ -425,12 +407,11 @@ def run_all(
         results_vol.commit()
 
 
-def _finish_run(directory, manifest, family_calls, sglang_calls, query_ids,
-                started):
+def _finish_run(directory, manifest, family_calls, query_ids, started):
     """Wait for a run's family calls, merge their suites, write the reports.
 
-    family_calls and sglang_calls pair a family name with its Modal
-    function call. The manifest is updated in place and written.
+    family_calls pairs a family name with its Modal function call. The
+    manifest is updated in place and written.
     """
     manifest_path = directory / "manifest.json"
     call_ids = manifest["function_call_ids"]
@@ -439,21 +420,14 @@ def _finish_run(directory, manifest, family_calls, sglang_calls, query_ids,
         print(f"waiting for {family} Quail and vLLM", flush=True)
         family_parts.append(json.loads(call.get()))
         print(f"{family} Quail and vLLM finished", flush=True)
-    sglang_parts = []
-    for family, call in sglang_calls:
-        print(f"waiting for {family} SGLang", flush=True)
-        sglang_parts.append(json.loads(call.get()))
-        print(f"{family} SGLang finished", flush=True)
     elapsed = (datetime.now(timezone.utc) - started).total_seconds()
 
     # the family results name the methods they ran
     methods = list(family_parts[0]["suites"]) if family_parts else []
-    if sglang_parts:
-        methods.append("pipelined_sglang")
     reports = {}
     paths = {}
     for method in methods:
-        parts = sglang_parts if method == "pipelined_sglang" else family_parts
+        parts = family_parts
         reports[method] = _merge_suites(
             [part["suites"][method] for part in parts],
             # a family split into groups saves each group in its own folder
@@ -472,12 +446,8 @@ def _finish_run(directory, manifest, family_calls, sglang_calls, query_ids,
     manifest.update(
         status="complete",
         parallel_wall_s=round(elapsed, 1),
-        families={
-            **{Path(part["result_path"]).stem: part["result_path"]
-               for part in family_parts},
-            **{Path(part["result_path"]).stem: part["result_path"]
-               for part in sglang_parts},
-        },
+        families={Path(part["result_path"]).stem: part["result_path"]
+                  for part in family_parts},
         summaries=paths,
     )
     # several canvas draw counts save one Quail suite per count
@@ -510,17 +480,15 @@ def finish_run(run_dir: str) -> str:
     directory = Path(run_dir)
     manifest_path = directory / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
-    family_calls, sglang_calls = [], []
+    family_calls = []
     for name, call_id in manifest["function_call_ids"].items():
         family, _, kind = name.partition(":")
         if kind == "quail_vllm":
             family_calls.append((family, modal.FunctionCall.from_id(call_id)))
-        elif kind == "sglang":
-            sglang_calls.append((family, modal.FunctionCall.from_id(call_id)))
     started = datetime.fromisoformat(manifest["started_at"])
     manifest["status"] = "running"
     try:
-        return _finish_run(directory, manifest, family_calls, sglang_calls,
+        return _finish_run(directory, manifest, family_calls,
                            tuple(manifest["query_ids"]), started)
     except Exception as error:
         manifest.update(status="failed", error=f"{type(error).__name__}: {error}")
@@ -539,7 +507,6 @@ def main(
     query: str = "",
     ground_truth_collection: str = "",
     include_baselines: bool = True,
-    include_sglang: bool = True,
     include_quail: bool = True,
     include_dumb_vllm: bool = False,
     baselines: str = "stock_vllm,pipelined_vllm",
@@ -548,9 +515,14 @@ def main(
     label_root: str = "",
     finish: str = "",
     canvas_draws: str = "",
+    device: str = "h100-sxm",
+    gpus: int = 1,
+    timeout_s: int = 43200,
     host_kv_bytes: int = 0,
     memory_mb: int = 0,
 ):
+    if timeout_s < 1 or timeout_s > 86400:
+        raise ValueError("timeout_s must be from 1 to 86400 seconds")
     if finish:
         # finish an earlier run whose orchestrator died
         call = finish_run.spawn(finish)
@@ -563,14 +535,13 @@ def main(
         f"{uuid.uuid4().hex[:8]}")
     run_dir = str(Path(output_dir) / run_id)
     print(f"run directory: {run_dir}", flush=True)
-    call = run_all.spawn(
+    call = run_all.with_options(timeout=timeout_s).spawn(
         run_dir=run_dir,
         model=model,
         scale_factor=scale_factor,
         query=query,
         ground_truth_collection=ground_truth_collection,
         include_baselines=include_baselines,
-        include_sglang=include_sglang,
         include_quail=include_quail,
         include_dumb_vllm=include_dumb_vllm,
         baselines=baselines,
@@ -578,6 +549,9 @@ def main(
         gpu_timing=gpu_timing,
         label_root=label_root,
         canvas_draws=canvas_draws,
+        device=device,
+        gpus=gpus,
+        timeout_s=timeout_s,
         host_kv_bytes=host_kv_bytes,
         memory_mb=memory_mb,
     )

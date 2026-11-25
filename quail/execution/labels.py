@@ -1,11 +1,10 @@
 """Score label tokens and match decoded text to labels.
 
 The letters rule reads one token per label. The trie_tree rule scores
-each label through the end of the word that tells it apart, and gives
-a label that starts another the answers whose longest matching label
-it is. The trie_decode rule (GreedyDecoder) picks one allowed token at
-each node where the labels split and never compares complete label
-scores.
+each label up to the trie node that tells it apart, and gives a label
+that starts another the answers whose longest matching label it is.
+The trie_decode rule (GreedyDecoder) picks one allowed token at each
+node where the labels split and never compares complete label scores.
 """
 
 import math
@@ -95,7 +94,6 @@ class GreedyDecoder:
         self.runs = decode_runs(label_ids)
         self.suffixes = [[cue, *self.runs.runs[0]], *self.runs.runs[1:]]
         self.rounds = self.runs.rounds
-        # a tie between children goes to the earlier label's token
         self.order = {}
         for label, ids in enumerate(self.label_ids):
             for token in ids:
@@ -104,7 +102,7 @@ class GreedyDecoder:
         self.node = [self.runs.first] * documents
         self.pending = [0] * documents
         self.label = np.full(documents, -1, dtype=np.int64)
-        self.tokens = 0     # tokens requested so far
+        self.tokens = 0
 
     def requests(self, document):
         """Return the request that feeds the document's next run.
@@ -175,7 +173,7 @@ def trie_paths(label_ids, read=None) -> list:
         read = set(trie)
     fed = fed_nodes(read)
     paths = []
-    placed = {}       # node -> (path, row)
+    placed = {}
 
     def extend(path, node):
         placed[node] = (path, len(paths[path][0]))
@@ -247,7 +245,7 @@ def tree_scores(label_ids, paths, targets, logprobs, read=None) -> np.ndarray:
                    for depth in range(start, len(ids)) if ids[:depth] in row_of)
 
     paths = [tuple(ids) for ids in label_ids]
-    taken = dict.fromkeys(paths, 0.0)   # share held by the nearest extensions
+    taken = dict.fromkeys(paths, 0.0)
     for ids in taken:
         for depth in range(len(ids) - 1, 0, -1):
             if ids[:depth] in taken:
@@ -255,7 +253,6 @@ def tree_scores(label_ids, paths, targets, logprobs, read=None) -> np.ndarray:
                 break
     scores = np.empty(len(paths), dtype=np.float64)
     for label, ids in enumerate(paths):
-        # rounding can push the extensions' share to 1 or past it
         scores[label] = (logprob(ids) + math.log1p(-taken[ids])
                          if taken[ids] < 1.0 else -math.inf)
     return scores

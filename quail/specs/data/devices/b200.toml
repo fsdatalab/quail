@@ -1,0 +1,15 @@
+name = "b200"
+mem_bytes = 191_503_138_816
+hbm_bw = 8e12
+fp8_flops = 4.5e15
+bf16_flops = 2.25e15
+fp32_flops = 75e12
+fp4_flops = 9e15  # dense FP4: a DGX B200's 144 PFLOPS with sparsity,
+                  # over 8 GPUs, halved
+                  # (https://www.nvidia.com/en-us/data-center/dgx-b200/)
+# GPU-only rate from Modal, checked 2026-10-03
+usd_per_hour = 6.2496
+price_source = "https://modal.com/pricing"
+cuda_name = "B200"
+modal_gpu = "B200"
+page_tokens = 128

@@ -1,0 +1,12 @@
+# NVIDIA's ModelOpt quantization of Qwen3.8 27B: NVFP4 MLP projections
+# and lm_head in groups of 16, FP8 attention and Gated DeltaNet
+# projections, and the bf16 vision tower.
+
+base = "qwen3.8-27b-fp8"
+name = "qwen3.8-27b-nvfp4"
+hf_name = "nvidia/Qwen3.8-27B-NVFP4"
+revision = "9340e99f9c8a7f2c2d7df7b7e0dbd3af3fb6a038"
+mlp_weight_precision = "fp4"
+# vLLM's model memory after loading the text path and retaining the
+# bf16 output head on a B200 (LoadedGpu.weights_bytes)
+w_mem_bytes = 23_068_635_136

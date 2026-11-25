@@ -1,6 +1,7 @@
 """Booting a GPU for a query, reusing it, and releasing it for another model."""
 
 import contextlib
+import gc
 import sys
 import types
 import weakref
@@ -8,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from quail.backends import resources
+from quail.backends.base import GpuContext
 from quail.backends.quail import worker
 from quail.backends.quail.executor.chunk import InputStaging
 from quail.backends.quail.executor.memory import memory_report
@@ -46,11 +47,12 @@ def booted(monkeypatch):
     for name in ("load_model", "AnswerRows", "KVArena", "AsyncAnswers"):
         monkeypatch.setattr(worker, name, lambda *a, **k: SimpleNamespace())
     monkeypatch.setattr(worker, "build_pipeline",
-                        lambda *a, **k: SimpleNamespace(decode_graphs=None))
+                        lambda *a, **k: SimpleNamespace(piecewise_graphs=None))
     monkeypatch.setattr(worker, "KVArena", lambda *a, **k: SimpleNamespace(
         k=[], v=[], gdn_state=None, conv_state=None, num_pages=0))
     monkeypatch.setattr(worker, "warm_kernels",
                         lambda *a, **k: {"tier": "compiled"})
+    monkeypatch.setattr(worker.PiecewiseGraphs, "for_specs", lambda *a: None)
 
 
 ENVELOPE = {
@@ -58,21 +60,73 @@ ENVELOPE = {
     "gpus": 1,
     "settings": {"chunk_tokens": 8192, "true_ids": [1], "false_ids": [2]},
 }
-PAYLOAD = {"physical_plan": ENVELOPE, "model": "qwen3-4b-fp8", "gpus": 1,
-           "documents": {}, **ENVELOPE["settings"]}
+SETUP = {"model": "qwen3-4b-fp8", "device": "h100-sxm", "backend": "quail",
+         "gpus": 1, "model_path": None, "extensions": [],
+         "writes_answers": False,
+         **ENVELOPE["settings"]}
 
 
-def test_arena_resize_releases_graphs_before_reallocating(booted, monkeypatch):
+def test_a_worker_reuses_its_model_and_an_arena_resize_releases_pieces_that_write_kv(
+        booted, monkeypatch):
+    state = worker.WorkerState(0, registry=built_in_registry())
+
+    assert worker._boot_worker(state, SETUP)["kind"] == "cold"
+    gpu = state.gpu
+    assert memory_report(gpu)["memory_bytes"] == {
+        "weights": 8 * 2**30, "kv": 0, "state": 0,
+        "other": 12 * 2**30, "peak": 20 * 2**30}
+
+    execution = gpu.execution
+    loaded = execution.loaded_model
+    loaded.label_readout = object()
+    readout = loaded.label_readout
+    staging = loaded.input_staging = InputStaging(gpu.torch)
+    buffers = staging.buffers
+    buffers["tokens"] = object()
+    query = execution.query
+    query.async_scores = SimpleNamespace(rows=query.answer_rows)
+    query.gpu_timing = True
+    old_query = weakref.ref(query)
+    del query
+
+    assert worker._boot_worker(state, SETUP)["kind"] == "warm"
+    assert old_query() is None
+    assert execution.query.loaded_model is loaded
+    assert execution.query.async_answers is gpu.async_ans
+    assert execution.query.async_scores is None
+    assert execution.query.gpu_timing is False
+    assert loaded.label_readout is readout
+    assert loaded.input_staging is staging
+    assert staging.buffers is buffers and "tokens" in buffers
+    assert state.gpu is gpu
+    resized = []
+    gpu.arena = SimpleNamespace(
+        k=[], v=[], gdn_state=None, conv_state=None,
+        resize=lambda *pages, **kw: resized.append((pages, kw)))
+    gpu.bind_query([1], [2], 4096, arena_pages=(8, 2), writes_answers=True)
+    assert resized == [((8, 2), {"free_resident": True})]
+    execution.bind_loaded_model(model=object(), arena=gpu.arena,
+                                pipeline=gpu.pipeline)
+    assert execution.loaded_model is not loaded
+    assert execution.loaded_model.label_readout is None
+    assert execution.loaded_model.input_staging is None
+    with pytest.raises(RuntimeError, match="no bound query"):
+        execution.query
+    replacement = weakref.ref(execution.loaded_model)
+    execution.close()
+    assert replacement() is None
+
+    # an arena resize releases the pieces that write KV
     calls = []
     gpu = LoadedGpu.__new__(LoadedGpu)
     gpu.torch = sys.modules["torch"]
     monkeypatch.setattr(gpu.torch.cuda, "synchronize",
                         lambda: calls.append("synchronize"))
-    gpu.pipeline = SimpleNamespace(decode_graphs=SimpleNamespace(
+    gpu.pipeline = SimpleNamespace(piecewise_graphs=SimpleNamespace(
         invalidate=lambda: calls.append("invalidate")))
     gpu.arena = SimpleNamespace(
         num_pages=8, num_sliding_pages=0, k=[], v=[], gdn_state=None,
-        conv_state=None, host=None, resize=lambda *a, **kw: calls.append("resize"))
+        conv_state=None, resize=lambda *a, **kw: calls.append("resize"))
     gpu.model = gpu.F = None
     gpu.decision_head = None
     gpu.host_kv_bytes = 0
@@ -80,14 +134,14 @@ def test_arena_resize_releases_graphs_before_reallocating(booted, monkeypatch):
     gpu.spec = MODELS["qwen3-4b-fp8"]
     gpu.device = H100_SXM
     gpu.execution = SimpleNamespace(bind_query=lambda **kw: None)
-    gpu.bind_query([1], [2], 32, arena_pages=(8, 0))
+    gpu.bind_query([1], [2], 32, arena_pages=(8, 0), writes_answers=True)
     assert calls == ["resize"]
     calls.clear()
-    gpu.bind_query([1], [2], 32, arena_pages=(16, 0))
+    gpu.bind_query([1], [2], 32, arena_pages=(16, 0), writes_answers=True)
     assert calls == ["synchronize", "invalidate", "resize"]
 
 
-def test_bind_query_starts_the_host_store_at_the_configured_size(
+def test_a_worker_starts_the_host_store_at_the_size_its_setup_names(
         booted, monkeypatch):
     stores = []
 
@@ -102,159 +156,115 @@ def test_bind_query_starts_the_host_store_at_the_configured_size(
             self.flushed = True
 
     monkeypatch.setattr(worker, "HostKV", FakeStore)
-    gpu = LoadedGpu.__new__(LoadedGpu)
-    gpu.torch = sys.modules["torch"]
-    gpu.pipeline = SimpleNamespace(decode_graphs=None)
-    gpu.arena = SimpleNamespace(
-        num_pages=8, num_sliding_pages=0, k=[], v=[], gdn_state=None,
-        conv_state=None, host=None, resize=lambda *a, **kw: None)
-    gpu.model = gpu.F = None
-    gpu.decision_head = None
-    gpu.spec = MODELS["qwen3-4b-fp8"]
-    gpu.device = H100_SXM
-    gpu.host_kv_bytes = 0
-    gpu.execution = SimpleNamespace(bind_query=lambda **kw: None)
-    gpu.bind_query([1], [2], 32, arena_pages=(8, 0))
-    assert gpu.arena.host is None and not stores
-    gpu.bind_query([1], [2], 32, arena_pages=(8, 0), host_kv_bytes=1000)
-    assert gpu.arena.host is stores[0] and stores[0].bytes == 1000
-    # the same size keeps the store and its entries for the next query
-    gpu.bind_query([1], [2], 32, arena_pages=(8, 0), host_kv_bytes=1000)
-    assert gpu.arena.host is stores[0] and len(stores) == 1
-    gpu.bind_query([1], [2], 32, arena_pages=(8, 0))
-    assert gpu.arena.host is None and stores[0].flushed
+    monkeypatch.setattr(worker, "KVArena", lambda *a, **k: SimpleNamespace(
+        k=[], v=[], gdn_state=None, conv_state=None, num_pages=0, host=None))
+    state = worker.WorkerState(0, registry=built_in_registry())
+    worker._boot_worker(state, SETUP)
+    arena = state.gpu.arena
+    assert arena.host is None and not stores
+    worker._boot_worker(state, {**SETUP, "host_kv_bytes": 1000})
+    assert arena.host is stores[0] and stores[0].bytes == 1000
+    worker._boot_worker(state, {**SETUP, "host_kv_bytes": 1000})
+    assert arena.host is stores[0] and len(stores) == 1
+    worker._boot_worker(state, {**SETUP, "host_kv_bytes": None})
+    assert arena.host is None and stores[0].flushed
 
 
-def test_prepared_boot_is_handed_to_the_query_and_used_once(
+def test_a_worker_captures_cuda_graphs_only_for_a_plan_that_writes_answers(
         booted, monkeypatch):
-    registry = built_in_registry()
-    backend = registry.backend("quail")
-    runtime_state = {}
-    boots = []
-    real_boot_for_query = worker._boot_for_query
+    events = []
+    arena = SimpleNamespace(
+        k=[], v=[], gdn_state=None, conv_state=None, num_pages=0,
+        num_sliding_pages=0)
 
-    def counting_boot(*args, **kwargs):
-        boots.append(1)
-        return real_boot_for_query(*args, **kwargs)
+    def resize(num_pages, num_sliding_pages, **kw):
+        events.append(("resize", num_pages))
+        arena.num_pages, arena.num_sliding_pages = num_pages, num_sliding_pages
 
-    monkeypatch.setattr(worker, "_boot_for_query", counting_boot)
-    monkeypatch.setattr(worker, "execute_single",
-                        lambda gpu, *a, **k: {
-                            "_outputs": {}, "wall_s": 1.0,
-                            **memory_report(gpu)})
+    arena.resize = resize
+    monkeypatch.setattr(worker, "KVArena", lambda *a, **k: arena)
+    captured = []
 
-    worker.prepare_quail_request(SimpleNamespace(
-        gpus=1, registry=registry, runtime_state=runtime_state,
-        request=SimpleNamespace(plan=ENVELOPE),
-    ))
+    def prepare():
+        if captured:
+            return False
+        captured.append(arena.num_pages)
+        events.append(("capture", arena.num_pages))
+        return True
 
-    gpu = runtime_state["gpu"]
-    assert gpu.prepared_boot["kind"] == "cold"
-    assert len(boots) == 1
+    def invalidate():
+        if captured:
+            events.append(("release", captured.pop()))
 
-    response = worker.execute_quail_payload(
-        PAYLOAD, registry, object(), backend, runtime_state)
+    graphs = SimpleNamespace(prepare=prepare, invalidate=invalidate)
+    monkeypatch.setattr(worker.PiecewiseGraphs, "for_specs", lambda *a: graphs)
+    state = worker.WorkerState(0, registry=built_in_registry())
+    # the planner gives a plan without AI.MAP or AI.EXTRACT the graph memory
+    scores = {**SETUP, "arena_pages": [120, 0], "writes_answers": False}
+    writes = {**SETUP, "arena_pages": [100, 0], "writes_answers": True}
 
-    assert response.metrics["boot_kind"] == "cold"
-    assert response.metrics["memory_bytes"] == {
-        "weights": 8 * 2**30, "kv": 0, "state": 0,
-        "other": 12 * 2**30, "peak": 20 * 2**30}
-    assert gpu.prepared_boot is None
-    assert len(boots) == 1
+    boot = worker._boot_worker(state, scores)
+    assert (boot["kind"], boot["warm_tier"]) == ("cold", "compiled")
+    assert events == [("resize", 120)]
 
-    execution = gpu.execution
-    loaded = execution.loaded_model
-    loaded.label_readout = object()
-    readout = loaded.label_readout
-    staging = loaded.input_staging = InputStaging(gpu.torch)
-    buffers = staging.buffers
-    buffers["tokens"] = object()
-    staging.fixed_tokens[1] = object()
-    query = execution.query
-    query.async_scores = SimpleNamespace(rows=query.answer_rows)
-    query.gpu_timing = True
-    old_query = weakref.ref(query)
-    reranker = execution._reranker_execution({"d": [[1]]})
-    old_reranker = weakref.ref(reranker)
-    del query, reranker
+    # a later plan with AI.MAP shrinks the arena, then captures before it runs
+    events.clear()
+    assert worker._boot_worker(state, writes)["warm_tier"] == "graphs"
+    assert events == [("resize", 100), ("capture", 100)]
 
-    second = worker.execute_quail_payload(
-        PAYLOAD, registry, object(), backend, runtime_state)
+    # the graphs stay for the next plan that writes answers
+    events.clear()
+    assert "warm_tier" not in worker._boot_worker(state, writes)
+    assert events == [("resize", 100)]
 
-    assert second.metrics["boot_kind"] == "warm"
-    assert old_query() is None and old_reranker() is None
-    assert execution.query.loaded_model is loaded
-    assert execution.query.async_answers is gpu.async_ans
-    assert execution.query.async_scores is None
-    assert execution.query.gpu_timing is False
-    assert loaded.label_readout is readout
-    assert loaded.input_staging is staging
-    assert staging.buffers is buffers and "tokens" in buffers
-    assert not staging.fixed_tokens
-    assert len(boots) == 2
-    assert runtime_state["gpu"] is gpu
-    resized = []
-    gpu.arena = SimpleNamespace(
-        k=[], v=[], gdn_state=None, conv_state=None,
-        resize=lambda *pages, **kw: resized.append((pages, kw)))
-    gpu.bind_query([1], [2], 4096, arena_pages=(8, 2))
-    assert resized == [((8, 2), {"free_resident": True})]
-    execution.bind_loaded_model(model=object(), arena=gpu.arena,
-                                pipeline=gpu.pipeline)
-    assert execution.loaded_model is not loaded
-    assert execution.loaded_model.label_readout is None
-    assert execution.loaded_model.input_staging is None
-    with pytest.raises(RuntimeError, match="no bound query"):
-        execution.query
-    replacement = weakref.ref(execution.loaded_model)
-    execution.close()
-    assert replacement() is None
+    # a plan without one releases them before its arena takes their memory
+    events.clear()
+    assert "warm_tier" not in worker._boot_worker(state, scores)
+    assert events == [("release", 100), ("resize", 120)]
+
+    # even at an unchanged arena size, as under a KV pool cap
+    worker._boot_worker(state, writes)
+    events.clear()
+    worker._boot_worker(state, {**scores, "arena_pages": [100, 0]})
+    assert events == [("release", 100), ("resize", 100)]
 
 
-def test_a_failed_boot_releases_the_gpu_and_the_next_boot_loads_again(
+def test_a_failed_boot_releases_the_gpu_and_a_cold_boot_stays_out_of_collections(
         booted, monkeypatch):
     calls = []
     monkeypatch.setattr(worker, "release_models",
                         lambda state: calls.append(("release", sorted(state))))
     registry = built_in_registry()
     backend = registry.backend("quail")
-    context = worker._single_gpu_context(registry, ENVELOPE)
-    state = {}
+    context = GpuContext(
+        gpu_index=0, gpus=1, model=registry.model(ENVELOPE["model"]),
+        device=registry.device(ENVELOPE["device"]), query_settings={})
 
     def fail(*args, **kwargs):
         raise RuntimeError("warm failed")
 
     monkeypatch.setattr(worker.LoadedGpu, "warm", fail)
     with pytest.raises(RuntimeError, match="warm failed"):
-        worker._boot_for_query(state, backend, context, 100, [1], [2])
+        worker._boot_gpu(None, backend, context, 100, [1], [2],
+                         writes_answers=False)
     assert calls == [("release", ["gpu"])]
-    assert state == {}
 
-    monkeypatch.setattr(worker.LoadedGpu, "warm", lambda self: (0.0, None))
-    gpu, boot = worker._boot_for_query(state, backend, context, 100, [1], [2])
-    assert state == {"gpu": gpu} and boot["kind"] == "cold"
-    again, boot = worker._boot_for_query(state, backend, context, 100, [1], [2])
+    monkeypatch.setattr(worker.LoadedGpu, "warm",
+                        lambda self, writes_answers: (0.0, None))
+    gpu, boot = worker._boot_gpu(None, backend, context, 100, [1], [2],
+                                 writes_answers=False)
+    assert boot["kind"] == "cold"
+    again, boot = worker._boot_gpu(gpu, backend, context, 100, [1], [2],
+                                   writes_answers=False)
     assert again is gpu and boot["kind"] == "warm"
     assert calls == [("release", ["gpu"])]
 
-
-def test_releasing_a_quail_request_stops_its_children_and_frees_cuda(monkeypatch):
-    calls = []
-    cuda = SimpleNamespace(
-        is_initialized=lambda: True,
-        synchronize=lambda: calls.append("synchronize"),
-        empty_cache=lambda: calls.append("empty_cache"),
-        ipc_collect=lambda: calls.append("ipc_collect"),
-    )
-    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=cuda))
-    monkeypatch.setattr(resources.gc, "collect", lambda: calls.append("gc"))
-    monkeypatch.setattr(resources, "_release_vllm_parallel_state",
-                        lambda: calls.append("release_parallel_state"))
-    monkeypatch.setattr(worker, "_WORKERS",
-                        SimpleNamespace(close=lambda: calls.append("children")))
-    state = {"gpu": SimpleNamespace(close=lambda: calls.append("close"))}
-    worker.release_quail_request(state)
-    assert state == {}
-    assert worker._WORKERS is None
-    assert calls == ["children", "synchronize", "close", "release_parallel_state",
-                     "gc", "empty_cache", "ipc_collect"]
+    # a cold boot leaves the loaded objects out of later collections
+    gc.unfreeze()
+    try:
+        gpu, _ = worker._boot_gpu(None, backend, context, 100, [1], [2],
+                                  writes_answers=False)
+        # a full collection inside a query skips the loaded model's objects
+        assert not any(found is gpu for found in gc.get_objects())
+    finally:
+        gc.unfreeze()

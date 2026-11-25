@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 import pyarrow as pa
 
-from quail.logical import CompileError
+from quail.common.expressions import CompileError
+
+INPUT_SEPARATOR = "@"
+
+
+def table_name(provider: str) -> str:
+    """Return the registered table a scanned provider reads."""
+    return provider.split(INPUT_SEPARATOR, 1)[0]
 
 
 @dataclass(frozen=True)
@@ -67,10 +74,16 @@ def _table_reader(table: pa.Table, batch_rows: int) -> pa.RecordBatchReader:
 
 @dataclass(frozen=True)
 class ArrowDatasetProvider:
-    """Table provider backed by a PyArrow dataset."""
+    """Table provider backed by a PyArrow dataset.
+
+    ``file_format`` is "parquet", "arrow", "json", or "csv" when the
+    dataset reads every row of its files and nothing else, so DataFusion
+    can read the files itself; empty otherwise.
+    """
 
     dataset: Any
     id_col: str
+    file_format: str = ""
 
     @property
     def columns(self) -> tuple[str, ...]:
@@ -80,8 +93,6 @@ class ArrowDatasetProvider:
         return self.dataset.schema
 
     def content_identity(self) -> str:
-        # a dataset's rows and their order depend on its filter and
-        # file order as well as its files, so each dataset is its own
         return f"arrow:{id(self.dataset)}"
 
     def statistics(self) -> TableStatistics:
@@ -110,7 +121,6 @@ class HuggingFaceProvider:
     arrow_schema: pa.Schema = field(
         default_factory=lambda: pa.schema([])
     )
-    # a dataset commit hash; empty means the repository's current head
     revision: str = ""
 
     @property
@@ -219,14 +229,16 @@ class DocumentProvider:
         import pyarrow.dataset as ds
 
         dataset = ds.dataset(path, format="parquet")
-        return cls.from_dataset(dataset, id_col=id_col)
+        return replace(cls.from_dataset(dataset, id_col=id_col),
+                       file_format="parquet")
 
     @classmethod
     def from_ipc(cls, path: str, id_col: str) -> ArrowDatasetProvider:
         """Create a provider for an Arrow IPC file."""
         import pyarrow.dataset as ds
 
-        return cls.from_dataset(ds.dataset(path, format="ipc"), id_col)
+        return replace(cls.from_dataset(ds.dataset(path, format="ipc"), id_col),
+                       file_format="arrow")
 
     @classmethod
     def from_hf(
@@ -288,6 +300,10 @@ class Catalog:
     providers: dict[str, TableProvider] = field(default_factory=dict)
 
     def register(self, name: str, provider: TableProvider) -> None:
+        if INPUT_SEPARATOR in name:
+            raise CompileError(
+                f"table name {name!r} has {INPUT_SEPARATOR!r}, which Quail keeps "
+                "for the inputs of model regions")
         if name in self.providers:
             raise CompileError(f"provider {name!r} is already registered")
         self.providers[name] = provider

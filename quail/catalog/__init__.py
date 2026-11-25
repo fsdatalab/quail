@@ -1,7 +1,7 @@
-"""Registered tables, their providers, and their tokenized inputs."""
+"""Registered tables and their providers."""
 
-from .inputs import ESTIMATE_SAMPLE, InputStore
 from .providers import (
+    INPUT_SEPARATOR,
     ArrowDatasetProvider,
     Catalog,
     DocumentProvider,
@@ -10,17 +10,18 @@ from .providers import (
     ScanRequest,
     TableProvider,
     TableStatistics,
+    table_name,
 )
 
 __all__ = [
-    "ESTIMATE_SAMPLE",
+    "INPUT_SEPARATOR",
     "ArrowDatasetProvider",
     "Catalog",
     "DocumentProvider",
     "HuggingFaceProvider",
-    "InputStore",
     "MemoryTableProvider",
     "ScanRequest",
     "TableProvider",
     "TableStatistics",
+    "table_name",
 ]

@@ -39,6 +39,8 @@ def run_backend_group(
     gpu_timing: bool = False,
     suite_name: str | None = None,
     canvas_draws: str | None = None,
+    device: str = "h100-sxm",
+    gpus: int = 1,
     host_kv_bytes: int = 0,
 ) -> dict:
     """Run backend methods in one process, sharing a model when possible.
@@ -59,6 +61,8 @@ def run_backend_group(
         canvas_draws: Comma-separated maximum diffusion draw counts, or None
             to keep the default. Each count runs its own Quail suite, named
             ``quail-draws<count>`` when there is more than one.
+        device: Registered device name. Defaults to ``h100-sxm``.
+        gpus: Model copies, one per GPU. Defaults to 1.
         host_kv_bytes: Host bytes of document KV Quail keeps between
             queries; 0 keeps none.
 
@@ -69,7 +73,7 @@ def run_backend_group(
     Raises:
         ValueError: No backend methods were supplied.
     """
-    from bench.quailb import run_suite
+    from bench.quailb import data_directory, run_suite
     from quail import EngineConfig
     from quail_b.queries import query_family_name
 
@@ -94,16 +98,16 @@ def run_backend_group(
             suite = run_suite(
                 query_ids, scale_factor=scale_factor,
                 config=EngineConfig(
-                    gpus=1,
+                    gpus=gpus,
                     model=model,
                     backend=method,
-                    device="h100-sxm",
+                    device=device,
                     attention=attention,
                     gpu_timing=gpu_timing,
                     host_kv_bytes=host_kv_bytes,
                     **({} if draws is None else {"canvas_draws": draws}),
                 ),
-                data_dir=Path(data_dir) / f"sf{scale_factor}",
+                data_dir=data_directory(data_dir, scale_factor, query_ids),
                 ground_truth_collection=ground_truth_collection or None,
                 root=root,
                 output_dir=run_dir / name / (suite_name or family),

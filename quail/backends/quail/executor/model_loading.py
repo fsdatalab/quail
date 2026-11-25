@@ -19,6 +19,7 @@ instead of starting NCCL or gloo.
 import json
 from pathlib import Path
 
+from quail.backends.quail.executor.models.lfm3 import is_lfm3, load_lfm3
 from quail.backends.quail.executor.moe_configs import write_configs
 from quail.specs.files import resolve_model_path
 
@@ -39,21 +40,32 @@ def engine_args(path, architecture: str = "") -> dict:
     with `decision2.register_backbone()`. The tokenizer stays at the
     package root.
 
+    A checkpoint whose text config names another dtype than its top
+    level loads in the text config's dtype.
+
     Args:
         path: The local checkpoint directory.
         architecture: The registered class for a Decision 2.0 package;
             empty uses the generative backbone class.
     """
-    if not is_decision2(path):
-        return {"model": str(path)}
-    from quail.backends.quail.executor.models.decision2 import (
-        BACKBONE_ARCHITECTURE,
-    )
+    if is_decision2(path):
+        from quail.backends.quail.executor.models.decision2 import (
+            BACKBONE_ARCHITECTURE,
+        )
 
-    return {"model": str(Path(path) / "backbone"), "tokenizer": str(path),
-            "dtype": "bfloat16",
-            "hf_overrides": {"architectures": [architecture
-                                               or BACKBONE_ARCHITECTURE]}}
+        return {"model": str(Path(path) / "backbone"),
+                "tokenizer": str(path), "dtype": "bfloat16",
+                "hf_overrides": {"architectures": [
+                    architecture or BACKBONE_ARCHITECTURE]}}
+    settings = {"model": str(path)}
+    config = Path(path) / "config.json"
+    if not config.is_file():
+        return settings
+    fields = json.loads(config.read_text())
+    text_dtype = fields.get("text_config", {}).get("dtype")
+    if text_dtype and fields.get("dtype", text_dtype) != text_dtype:
+        settings["dtype"] = text_dtype
+    return settings
 
 
 class _SingleRank:
@@ -133,27 +145,91 @@ def _install_single_rank_groups(torch):
     ps._NODE_COUNT = 1
 
 
-def retain_answer_head(torch, model, token_ids):
-    """Keep the TRUE/FALSE answer rows and the full output head in bf16."""
+def retain_answer_head(torch, model, token_ids, head=None):
+    """Keep the TRUE/FALSE answer rows and the full output head in bf16.
+
+    Args:
+        torch: The torch module.
+        model: The loaded model.
+        token_ids: The answer token ids whose rows to keep.
+        head: The output head's weights, for a head the loaded module
+            stores packed; None reads the module's weight.
+    """
     allowed = tuple(sorted(set(token_ids)))
     if not allowed:
         raise ValueError("TRUE/FALSE token ids must not be empty")
     if hasattr(model, "quail_answer_token_ids"):
         answer_weights(model, allowed)
         return
-    # a checkpoint with a vision tower keeps its head in the language model
     owner = model if hasattr(model, "lm_head") else model.language_model
-    weight = owner.lm_head.weight
+    weight = owner.lm_head.weight if head is None else head
     indices = torch.tensor(allowed, device=weight.device, dtype=torch.long)
     weights = weight.detach().index_select(0, indices).to(dtype=torch.bfloat16)
     model.register_buffer("quail_answer_weights", weights, persistent=False)
     model.quail_answer_token_ids = allowed
-    # AI.CLASSIFY reads the whole head: bf16 logits, as in vLLM,
-    # normalized in float32. A head tied to the embedding shares its
-    # memory; the model spec prices an untied head into the KV arena.
     model.quail_full_head = weight.detach().to(dtype=torch.bfloat16)
-    # lm_head can be the same module as embed_tokens; drop only this reference.
     owner.lm_head = None
+
+
+E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+               -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
+NVFP4_GROUP = 16
+
+
+def dequantize_nvfp4(torch, packed, scale, global_scale, rows_per_step=8192):
+    """Return NVFP4 weights in bf16.
+
+    Args:
+        torch: The torch module.
+        packed: The (rows, columns / 2) uint8 weights, two E2M1 codes
+            per byte, the even column in the low four bits.
+        scale: The (rows, columns / 16) fp8 scale of each 16 columns.
+        global_scale: The weight's float32 scale.
+        rows_per_step: Rows dequantized at once, which bounds the
+            float32 scratch.
+    """
+    rows = packed.shape[0]
+    columns = 2 * packed.shape[1]
+    values = torch.tensor(E2M1_VALUES, dtype=torch.float32, device=packed.device)
+    weights = torch.empty(rows, columns, dtype=torch.bfloat16, device=packed.device)
+    global_scale = global_scale.to(device=packed.device, dtype=torch.float32)
+    for start in range(0, rows, rows_per_step):
+        block = packed[start:start + rows_per_step]
+        codes = torch.stack((block & 0xF, block >> 4), dim=-1).reshape(len(block), -1)
+        scales = scale[start:start + rows_per_step].float() * global_scale
+        weights[start:start + len(block)] = (
+            values[codes.long()].view(len(block), -1, NVFP4_GROUP)
+            * scales.unsqueeze(-1)).view(len(block), columns)
+    return weights
+
+
+def nvfp4_output_head(torch, model_path, device="cuda"):
+    """Return a ModelOpt checkpoint's NVFP4 output head in bf16.
+
+    Args:
+        torch: The torch module.
+        model_path: The local checkpoint directory.
+        device: The device to read and dequantize the head on.
+
+    Returns:
+        The (vocab, hidden) head, or None when the checkpoint does not
+        store its head in NVFP4.
+    """
+    from safetensors import safe_open
+
+    model_path = Path(model_path)
+    config = json.loads((model_path / "config.json").read_text())
+    layers = (config.get("quantization_config") or {}).get("quantized_layers", {})
+    if layers.get("lm_head", {}).get("quant_algo", "").upper() != "NVFP4":
+        return None
+    index = model_path / "model.safetensors.index.json"
+    files = json.loads(index.read_text())["weight_map"] if index.is_file() else {}
+    tensors = []
+    for name in ("lm_head.weight", "lm_head.weight_scale", "lm_head.weight_scale_2"):
+        file = model_path / files.get(name, "model.safetensors")
+        with safe_open(file, framework="pt", device=device) as checkpoint:
+            tensors.append(checkpoint.get_tensor(name))
+    return dequantize_nvfp4(torch, *tensors)
 
 
 def full_output_head(model):
@@ -176,34 +252,82 @@ def answer_weights(model, token_ids):
     return model.quail_answer_weights
 
 
+def keep_layers(torch, model, num_layers: int):
+    """Keep the first num_layers decoder layers in the forward pass.
+
+    The whole checkpoint is loaded first, then the module list is cut:
+    vLLM's load_weights maps every checkpoint tensor onto a parameter,
+    so a module list shorter than the checkpoint fails the load. The
+    cut does not release the dropped layers' memory: measured on
+    Qwen3.5-2B-Base, the memory after the cut is the full model's, so
+    something still references their weights.
+
+    Raises:
+        ValueError: The checkpoint has fewer than num_layers layers.
+    """
+    text = getattr(model, "language_model", model)
+    layers = text.model.layers
+    if len(layers) < num_layers:
+        raise ValueError(
+            f"the checkpoint has {len(layers)} layers; cannot keep "
+            f"{num_layers}")
+    if len(layers) == num_layers:
+        return
+    text.model.layers = layers[:num_layers]
+    torch.cuda.empty_cache()
+
+
 def load_model(model_name: str, revision: str | None = None, *,
-               answer_token_ids=None, max_batched_tokens=None,
-               moe_backend=None, text_only=False):
+               answer_token_ids, max_batched_tokens=None,
+               moe_backend=None, text_only=False, images=False,
+               num_layers=None, quantize_fp8=False):
     """Load model weights and retain the answer rows and the full output head.
 
     max_batched_tokens is the largest chunk the model will see. vLLM's
     fused MoE kernels size their scratch buffers from it; a dense model
     ignores it. moe_backend is passed through as vLLM's moe_backend
     setting (see ModelSpec.moe_backend); None lets vLLM pick. text_only
-    takes no image or video input, for a checkpoint with a vision tower.
+    takes no video input, for a checkpoint with a vision tower, and no
+    image input unless images is True, which loads its vision encoder.
+    num_layers keeps only the first decoder layers after the load, for a
+    spec that reads an intermediate layer's residual stream.
+    quantize_fp8 quantizes a bf16 LFM3 checkpoint's linear weights to fp8
+    as they load; vLLM's checkpoints carry their own precision.
     """
     import os
     import tempfile
 
     import torch
     import vllm
-    from vllm.config import set_current_vllm_config
-    from vllm.engine.arg_utils import EngineArgs
-    from vllm.model_executor.model_loader import get_model
 
-    # vLLM's Triton fused MoE reads tuned tile configs from this
-    # folder before its own; ours add entries for Quail's chunk sizes
     if "VLLM_TUNED_CONFIG_FOLDER" not in os.environ:
         base = Path(vllm.__file__).parent / "model_executor/layers/fused_moe/configs"
         folder = write_configs(
             Path(tempfile.gettempdir()) / "quail-moe-configs", base)
         os.environ["VLLM_TUNED_CONFIG_FOLDER"] = str(folder)
     model_path = resolve_model_path(model_name, revision)
+    if is_lfm3(model_path):
+        model = load_lfm3(model_path, quantize_fp8=quantize_fp8)
+    else:
+        model = _load_vllm_model(model_path, max_batched_tokens, moe_backend,
+                                 text_only, images)
+    if num_layers is not None:
+        keep_layers(torch, model, num_layers)
+    retain_answer_head(torch, model, answer_token_ids,
+                       head=nvfp4_output_head(torch, model_path))
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    return model
+
+
+def _load_vllm_model(model_path, max_batched_tokens, moe_backend, text_only,
+                     images=False):
+    """Load a checkpoint through vLLM's model loader, with no engine."""
+    import torch
+    from vllm.config import set_current_vllm_config
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.model_executor.model_loader import get_model
+
     if is_decision2(model_path):
         from quail.backends.quail.executor.models.decision2 import (
             register_backbone,
@@ -216,23 +340,10 @@ def load_model(model_name: str, revision: str | None = None, *,
     if moe_backend is not None:
         args["moe_backend"] = moe_backend
     if text_only:
-        args["limit_mm_per_prompt"] = {"image": 0, "video": 0}
+        args["limit_mm_per_prompt"] = {"image": int(images), "video": 0}
     config = EngineArgs(**args).create_engine_config()
     _install_single_rank_groups(torch)
     with set_current_vllm_config(config):
         model = get_model(vllm_config=config)
-    # vLLM's fused MoE kernels read the forward context, which is
-    # built from this config
     model.quail_vllm_config = config
-    if answer_token_ids is None:
-        from gigatoken import Tokenizer
-
-        from quail.planner.prompt_lowering import true_false_ids
-
-        tokenizer = Tokenizer(model_path).as_hf()
-        true_ids, false_ids = true_false_ids(tokenizer)
-        answer_token_ids = true_ids | false_ids
-    retain_answer_head(torch, model, answer_token_ids)
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize()
     return model

@@ -24,27 +24,370 @@ rotary, as Qwen3 and Gemma 4 have; qkv_norm_rope_heads is its form
 for any head geometry, with Gemma's weightless per-head V norm.
 """
 
-GROUP = 128            # fp8 quant group size, matches the engine
-# FlashAttention 3's widest head; wider heads run FlashAttention 4,
-# whose Hopper build takes heads up to 512, over arena pages.
+GROUP = 128
 FA_MAX_HEAD_DIM = 256
+TRITON_DECODE_MAX_Q = 16
+_SPLITKV_TILE_N = 32
+_SPLITKV_MAX_SPLITS = 16
+_PDL_MAX_ROWS = 512
 
-# The two attention paths a chunk can run. "unified" is one causal
-# paged call in which every row reads the KV its own document needs.
-# "tree" is two calls: a causal one over the chunk's rows and one in
-# which the readers of one resident KV (a join anchor, a shared
-# prefix) read it stacked, merged by the fused merge+quant kernel.
-# Only pipelines that set tree_attention run the tree path.
+_COMPILED_TRITON = {}
+_PDL_CAPABLE = {}
+_SM_COUNTS = {}
+_SPLITKV_KERNELS = {}
+USE_FAST_LAUNCH = True
+USE_PDL = True
+
+
+def pdl_enabled(device, rows=None) -> bool:
+    """Return whether Hopper/Blackwell PDL should run for device and rows."""
+    if not USE_PDL or (rows is not None and rows > _PDL_MAX_ROWS):
+        return False
+    import torch
+
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    capable = _PDL_CAPABLE.get(index)
+    if capable is None:
+        capable = _PDL_CAPABLE[index] = (
+            torch.cuda.get_device_capability(index)[0] >= 9)
+    return capable
+
+
+def launch_triton(kernel, grid, args, *, key, kwargs, exact_args=True):
+    """Launch a Triton kernel via its cached compiled handle when safe."""
+    import torch
+    from triton import knobs
+    from triton.runtime import driver
+
+    if (not USE_FAST_LAUNCH or knobs.runtime.debug
+            or knobs.runtime.launch_enter_hook is not None
+            or knobs.runtime.launch_exit_hook is not None
+            or knobs.runtime.add_stages_inspection_hook is not None):
+        return kernel[grid](*args, **kwargs)
+    device = next(
+        (v.device.index if v.device.index is not None else torch.cuda.current_device()
+         for v in args
+         if getattr(getattr(v, "device", None), "type", None) == "cuda"),
+        torch.cuda.current_device())
+    sig = []
+    for value in args:
+        if hasattr(value, "data_ptr"):
+            sig.append((value.dtype, (value.data_ptr() & 15) == 0)
+                       if exact_args else value.dtype)
+        elif exact_args and isinstance(value, int):
+            sig.append((value == 1, (value & 15) == 0,
+                        value < -0x80000000 or value > 0x7FFFFFFF))
+    cache_key = (device, id(kernel), key, tuple(sig))
+    entry = _COMPILED_TRITON.get(cache_key)
+    if entry is None:
+        compiled = kernel[grid](*args, **kwargs)
+        _COMPILED_TRITON[cache_key] = (
+            compiled.run, compiled.function, compiled.packed_metadata)
+        return compiled
+    run, function, metadata = entry
+    stream = driver.active.get_current_stream(device)
+    g1 = grid[1] if len(grid) > 1 else 1
+    g2 = grid[2] if len(grid) > 2 else 1
+    run(grid[0], g1, g2, stream, function, metadata, None, None, None, *args)
+    return None
+
+
+def supports_splitkv_decode(fa_version: int, head_dim: int, page_tokens: int,
+                            num_q_heads: int, num_kv_heads: int, *,
+                            causal: bool, max_q: int, dtype=None) -> bool:
+    """Return whether a paged call should run Triton Split-KV decode."""
+    if dtype is not None:
+        import torch
+
+        if dtype != torch.bfloat16:
+            return False
+    return (fa_version == 4 and head_dim == 256 and causal
+            and 0 < max_q <= TRITON_DECODE_MAX_Q
+            and page_tokens > 0 and page_tokens % _SPLITKV_TILE_N == 0
+            and (head_dim & (head_dim - 1)) == 0
+            and num_kv_heads > 0 and num_q_heads % num_kv_heads == 0)
+
+
+def _splitkv_kernels() -> dict:
+    """Compile the split-KV decode Triton kernels on first use."""
+    if _SPLITKV_KERNELS:
+        return _SPLITKV_KERNELS
+    import triton
+    import triton.language as tl
+
+    @triton.jit(
+        do_not_specialize=[
+            "stride_bt", "max_q", "num_splits", "window_left", "window_right",
+        ],
+        do_not_specialize_on_alignment=[
+            "cu_q_ptr", "seq_lens_ptr", "block_tables_ptr",
+        ],
+    )
+    def splitkv_decode_part(
+        q_ptr, k_ptr, v_ptr, cu_q_ptr, seq_lens_ptr, block_tables_ptr,
+        out_ptr, part_out_ptr, part_lse_ptr,
+        stride_q0, stride_q1, stride_o0, stride_o1,
+        stride_k0, stride_k1, stride_k2, stride_v0, stride_v1, stride_v2,
+        stride_bt, stride_po_q, stride_po_kv, stride_po_s, stride_po_g,
+        stride_pl_q, stride_pl_kv, stride_pl_s,
+        scale_log2, max_q, num_splits, window_left, window_right,
+        GROUP: tl.constexpr, GROUP_PAD: tl.constexpr,
+        HEAD_DIM: tl.constexpr, PAGE_TOKENS: tl.constexpr,
+        TILE_N: tl.constexpr, HAS_WINDOW: tl.constexpr,
+        SINGLE_SPLIT: tl.constexpr, PDL: tl.constexpr,
+    ):
+        pid_q = tl.program_id(0)
+        kv_head = tl.program_id(1)
+        split_id = tl.program_id(2)
+        seq = pid_q // max_q
+        q_local = pid_q % max_q
+        q_start = tl.load(cu_q_ptr + seq).to(tl.int64)
+        q_len = tl.load(cu_q_ptr + seq + 1).to(tl.int64) - q_start
+        if q_local >= q_len:
+            if PDL:
+                tl.extra.cuda.gdc_launch_dependents()
+            return
+        q_row = q_start + q_local
+        visible_k = tl.load(seq_lens_ptr + seq).to(tl.int64) - q_len + q_local + 1
+        k_lo = visible_k - visible_k
+        if HAS_WINDOW and window_left >= 0:
+            k_lo = tl.maximum(k_lo, visible_k - 1 - window_left)
+        first_tile = k_lo // TILE_N
+        last_tile = (visible_k + TILE_N - 1) // TILE_N
+        tiles_per = (tl.maximum(0, last_tile - first_tile)
+                     + num_splits - 1) // num_splits
+        tile_start = first_tile + split_id * tiles_per
+        tile_end = tl.minimum(last_tile, tile_start + tiles_per)
+        offs_g = tl.arange(0, GROUP_PAD)
+        offs_d = tl.arange(0, HEAD_DIM)
+        g_mask = offs_g < GROUP
+
+        m_i = tl.full([GROUP_PAD], -1e38, dtype=tl.float32)
+        l_i = tl.zeros([GROUP_PAD], dtype=tl.float32)
+        acc = tl.zeros([GROUP_PAD, HEAD_DIM], dtype=tl.float32)
+        if tile_start < tile_end:
+            if PDL:
+                tl.extra.cuda.gdc_wait()
+            q_ptrs = (q_ptr + q_row * stride_q0
+                      + (kv_head * GROUP + offs_g[:, None]) * stride_q1
+                      + offs_d[None, :])
+            q_tile = tl.load(q_ptrs, mask=g_mask[:, None], other=0.0)
+            offs_k_tile = tl.arange(0, TILE_N)
+            bt_row = block_tables_ptr + seq * stride_bt
+            for tile_index in range(tile_start, tile_end):
+                position = tile_index * TILE_N
+                page_index = position // PAGE_TOKENS
+                in_page = position - page_index * PAGE_TOKENS
+                phys_page = tl.load(bt_row + page_index).to(tl.int64)
+                k_ptrs = (k_ptr + phys_page * stride_k0
+                          + (in_page + offs_k_tile[:, None]) * stride_k1
+                          + kv_head * stride_k2 + offs_d[None, :])
+                v_ptrs = (v_ptr + phys_page * stride_v0
+                          + (in_page + offs_k_tile[:, None]) * stride_v1
+                          + kv_head * stride_v2 + offs_d[None, :])
+                key_position = position + offs_k_tile
+                key_valid = (key_position < visible_k) & (key_position >= k_lo)
+                k_tile = tl.load(k_ptrs, mask=key_valid[:, None], other=0.0)
+                v_tile = tl.load(v_ptrs, mask=key_valid[:, None], other=0.0)
+                qk = tl.where(key_valid[None, :],
+                              tl.dot(q_tile, tl.trans(k_tile)) * scale_log2,
+                              -1e38)
+                m_new = tl.maximum(m_i, tl.max(qk, axis=1))
+                valid_row = m_new > -1e30
+                alpha = tl.where(valid_row, tl.math.exp2(m_i - m_new), 0.0)
+                p = tl.where(valid_row[:, None] & key_valid[None, :],
+                             tl.math.exp2(qk - m_new[:, None]), 0.0)
+                l_i = l_i * alpha + tl.sum(p, axis=1)
+                acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v_tile)
+                m_i = m_new
+
+        norm_acc = acc * tl.where(l_i > 0.0, 1.0 / l_i, 0.0)[:, None]
+        if PDL:
+            tl.extra.cuda.gdc_launch_dependents()
+        if SINGLE_SPLIT:
+            o_ptrs = (out_ptr + q_row * stride_o0
+                      + (kv_head * GROUP + offs_g[:, None]) * stride_o1
+                      + offs_d[None, :])
+            tl.store(o_ptrs, norm_acc.to(out_ptr.dtype.element_ty),
+                     mask=g_mask[:, None])
+        else:
+            lse = tl.where(l_i > 0.0, m_i + tl.math.log2(l_i), -1e38)
+            po_ptrs = (part_out_ptr + q_row * stride_po_q
+                       + kv_head * stride_po_kv + split_id * stride_po_s
+                       + offs_g[:, None] * stride_po_g + offs_d[None, :])
+            pl_ptrs = (part_lse_ptr + q_row * stride_pl_q
+                       + kv_head * stride_pl_kv + split_id * stride_pl_s
+                       + offs_g)
+            tl.store(po_ptrs, norm_acc, mask=g_mask[:, None])
+            tl.store(pl_ptrs, lse, mask=g_mask)
+
+    @triton.jit(do_not_specialize=["num_splits"])
+    def splitkv_decode_reduce(
+        part_out_ptr, part_lse_ptr, out_ptr,
+        stride_po_q, stride_po_kv, stride_po_s, stride_po_g,
+        stride_pl_q, stride_pl_kv, stride_pl_s,
+        stride_o0, stride_o1, num_splits,
+        GROUP: tl.constexpr, HEAD_DIM: tl.constexpr,
+        MAX_SPLITS: tl.constexpr, PDL: tl.constexpr,
+    ):
+        q_row = tl.program_id(0).to(tl.int64)
+        q_head = tl.program_id(1)
+        kv_head = q_head // GROUP
+        g = q_head % GROUP
+        offs_s = tl.arange(0, MAX_SPLITS)
+        offs_d = tl.arange(0, HEAD_DIM)
+        pl_base = part_lse_ptr + q_row * stride_pl_q + kv_head * stride_pl_kv + g
+        if PDL:
+            tl.extra.cuda.gdc_wait()
+        m_max = tl.max(tl.load(pl_base + offs_s * stride_pl_s,
+                               mask=offs_s < num_splits, other=-1e38), axis=0)
+        acc = tl.zeros([HEAD_DIM], dtype=tl.float32)
+        w_sum = 0.0
+        po_base = (part_out_ptr + q_row * stride_po_q
+                   + kv_head * stride_po_kv + g * stride_po_g + offs_d)
+        for split_id in range(0, num_splits):
+            lse_s = tl.load(pl_base + split_id * stride_pl_s)
+            if lse_s > -1e30:
+                w = tl.math.exp2(lse_s - m_max)
+                acc += w * tl.load(po_base + split_id * stride_po_s)
+                w_sum += w
+        out_val = (acc * tl.where(w_sum > 0.0, 1.0 / w_sum, 0.0)).to(
+            out_ptr.dtype.element_ty)
+        if PDL:
+            tl.extra.cuda.gdc_launch_dependents()
+        tl.store(out_ptr + q_row * stride_o0 + q_head * stride_o1 + offs_d,
+                 out_val)
+
+    _SPLITKV_KERNELS.update(
+        splitkv_decode_part=splitkv_decode_part,
+        splitkv_decode_reduce=splitkv_decode_reduce,
+    )
+    return _SPLITKV_KERNELS
+
+
+def triton_splitkv_decode(q3, kp, vp, cu_q, max_q, seqused_k, max_seqused_k,
+                          block_table, *, softmax_scale=None, window=None,
+                          output=None, workspace=None):
+    """Causal paged attention for short queries with dynamic Split-KV and PDL."""
+    import torch
+
+    total_q, num_q_heads, head_dim = q3.shape
+    page_tokens, num_kv_heads = kp.shape[1], kp.shape[2]
+    num_seqs = seqused_k.shape[0]
+    assert page_tokens % _SPLITKV_TILE_N == 0
+    assert q3.dtype == kp.dtype == vp.dtype == torch.bfloat16
+    assert (head_dim & (head_dim - 1)) == 0 and num_q_heads % num_kv_heads == 0
+    out = output if output is not None else torch.empty_like(q3)
+    assert q3.stride(-1) == kp.stride(-1) == vp.stride(-1) == out.stride(-1) == 1
+    if total_q == 0 or num_seqs == 0:
+        return out
+    group = num_q_heads // num_kv_heads
+    group_pad = max(16, 1 << (group - 1).bit_length())
+    scale_log2 = (head_dim ** -0.5 if softmax_scale is None
+                  else float(softmax_scale)) * 1.4426950408889634
+    has_window = window is not None and (window[0] >= 0 or window[1] >= 0)
+    window_left = window[0] if has_window else -1
+    window_right = window[1] if has_window else -1
+    dev_index = (q3.device.index if q3.device.index is not None
+                 else torch.cuda.current_device())
+    num_sms = _SM_COUNTS.get(dev_index)
+    if num_sms is None:
+        num_sms = _SM_COUNTS[dev_index] = int(
+            torch.cuda.get_device_properties(dev_index).multi_processor_count)
+    base_ctas = num_seqs * max_q * num_kv_heads
+    max_useful = max(1, (max_seqused_k + page_tokens - 1) // page_tokens)
+    num_splits = min(_SPLITKV_MAX_SPLITS, max_useful,
+                     max(1, (4 * num_sms + base_ctas - 1) // base_ctas))
+    single_split = num_splits == 1
+    if single_split:
+        part_out, part_lse, po_strides, pl_strides = out, out, (0,) * 4, (0,) * 3
+    else:
+        buf_key = (q3.device, num_kv_heads, group, head_dim)
+        cached = None if workspace is None else workspace.get(buf_key)
+        if cached is None or cached[0].shape[0] < total_q:
+            cap_q = max(total_q, 64 if cached is None else cached[0].shape[0])
+            buf_out = torch.empty((cap_q, num_kv_heads, _SPLITKV_MAX_SPLITS,
+                                   group, head_dim), dtype=torch.float32,
+                                  device=q3.device)
+            buf_lse = torch.empty((cap_q, num_kv_heads, _SPLITKV_MAX_SPLITS,
+                                   group), dtype=torch.float32, device=q3.device)
+            if workspace is not None:
+                workspace[buf_key] = (buf_out, buf_lse)
+        else:
+            buf_out, buf_lse = cached
+        part_out, part_lse = buf_out[:total_q], buf_lse[:total_q]
+        po_strides, pl_strides = part_out.stride()[:4], part_lse.stride()[:3]
+
+    pdl = pdl_enabled(q3.device)
+    part_args = (
+        q3, kp, vp, cu_q, seqused_k, block_table, out, part_out, part_lse,
+        q3.stride(0), q3.stride(1), out.stride(0), out.stride(1),
+        kp.stride(0), kp.stride(1), kp.stride(2),
+        vp.stride(0), vp.stride(1), vp.stride(2),
+        block_table.stride(0), *po_strides, *pl_strides,
+        scale_log2, int(max_q), int(num_splits),
+        int(window_left), int(window_right))
+    part_key = (
+        group, group_pad, head_dim, page_tokens, _SPLITKV_TILE_N,
+        has_window, single_split, pdl,
+        (q3.data_ptr() & 15) == 0, (out.data_ptr() & 15) == 0,
+        (kp.data_ptr() & 15) == 0, (vp.data_ptr() & 15) == 0,
+        (q3.stride(0) & 15) == 0, (out.stride(0) & 15) == 0,
+        (kp.stride(0) & 15) == 0, (kp.stride(1) & 15) == 0,
+        (kp.stride(2) & 15) == 0)
+    launch_triton(
+        _splitkv_kernels()["splitkv_decode_part"],
+        (num_seqs * max_q, num_kv_heads, num_splits), part_args,
+        key=part_key, exact_args=False,
+        kwargs=dict(GROUP=group, GROUP_PAD=group_pad, HEAD_DIM=head_dim,
+                    PAGE_TOKENS=page_tokens, TILE_N=_SPLITKV_TILE_N,
+                    HAS_WINDOW=has_window, SINGLE_SPLIT=single_split,
+                    PDL=pdl, num_warps=4, num_stages=3, launch_pdl=pdl))
+    if not single_split:
+        launch_triton(
+            _splitkv_kernels()["splitkv_decode_reduce"], (total_q, num_q_heads),
+            (part_out, part_lse, out, *po_strides, *pl_strides,
+             out.stride(0), out.stride(1), int(num_splits)),
+            key=(group, head_dim, _SPLITKV_MAX_SPLITS, pdl,
+                 (out.data_ptr() & 15) == 0, (out.stride(0) & 15) == 0),
+            exact_args=False,
+            kwargs=dict(GROUP=group, HEAD_DIM=head_dim,
+                        MAX_SPLITS=_SPLITKV_MAX_SPLITS, PDL=pdl,
+                        num_warps=4, launch_pdl=pdl))
+    return out
+
 ATTENTION_PATHS = ("unified", "tree")
+
+MASKS = ("causal", "document_isolated")
 
 
 def flash_attention_version(capability: tuple[int, int]) -> int:
-    """Select the attention implementation for a supported CUDA architecture."""
+    """Select the attention implementation for a supported CUDA architecture.
+
+    FlashAttention 3 is Hopper 9.x only. FlashAttention 4 covers 9.x,
+    10.x, and 11.x. FlashAttention 2 covers 8.0 and up. L40S (8.9)
+    uses 2; B200 (10.x) uses 4; H100 stays on 3; RTX PRO 6000 (12.0)
+    stays on 2.
+    """
+    major, _minor = capability
+    if capability == (8, 9):
+        return 2
     if capability == (9, 0):
         return 3
+    if major == 10:
+        return 4
     if capability == (12, 0):
         return 2
     raise ValueError(f"Quail does not support CUDA capability {capability}")
+
+
+def deep_gemm_supported(capability: tuple[int, int]) -> bool:
+    """Whether vLLM 0.29.0 enables DeepGEMM on this CUDA capability.
+
+    Matches CudaPlatform.support_deep_gemm: 9.0, 10.x, and 12.x.
+    """
+    major, _minor = capability
+    return capability == (9, 0) or major in (10, 12)
 
 
 def merge_partial(out, lse, index, out_c, lse_c) -> None:
@@ -96,7 +439,9 @@ class Engine:
                              f"got {kernels!r}")
         self.kernels = kernels
 
-        self.fa_version = flash_attention_version(torch.cuda.get_device_capability())
+        capability = torch.cuda.get_device_capability()
+        self.fa_version = flash_attention_version(capability)
+        self.use_deep_gemm = deep_gemm_supported(capability)
         self.torch = torch
         self.arena = arena
         self.rotary = rotary
@@ -107,7 +452,6 @@ class Engine:
         self.fp8 = torch.float8_e4m3fn
         self.is_fp8 = bool(fp8)
 
-    # ---- weights and quant ------------------------------------------
 
     @staticmethod
     def weight_scale(linear):
@@ -120,23 +464,54 @@ class Engine:
     def gemm(self, q_input, input_scale, linear):
         if not self.is_fp8:
             return self.torch.nn.functional.linear(q_input, linear.weight)
-        # all linear projections (QKV, O, gate-up, down) run vLLM's
-        # DeepGEMM fp8 matmul; weights and scales are vLLM's layout
-        from vllm.utils.deep_gemm import fp8_gemm_nt
-        out = self.torch.empty(
-            (q_input.shape[0], linear.weight.shape[0]),
-            dtype=self.torch.bfloat16, device=q_input.device)
-        fp8_gemm_nt((q_input, input_scale),
-                    (linear.weight, self.weight_scale(linear)),
-                    out, is_deep_gemm_e8m0_used=self.use_ue8m0)
-        return out
+        weight_scale = self.weight_scale(linear)
+        if self.use_deep_gemm:
+            from vllm.utils.deep_gemm import fp8_gemm_nt
+            out = self.torch.empty(
+                (q_input.shape[0], linear.weight.shape[0]),
+                dtype=self.torch.bfloat16, device=q_input.device)
+            fp8_gemm_nt((q_input, input_scale),
+                        (linear.weight, weight_scale),
+                        out, is_deep_gemm_e8m0_used=self.use_ue8m0)
+            return out
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            w8a8_triton_block_scaled_mm,
+        )
+        return w8a8_triton_block_scaled_mm(
+            q_input, linear.weight,
+            self._triton_activation_scales(q_input, input_scale),
+            weight_scale, [GROUP, GROUP],
+            output_dtype=self.torch.bfloat16)
 
-    def quant(self, x):
+    def _triton_activation_scales(self, q_input, input_scale):
+        """Return activation scales in the (tokens, groups) layout Triton wants.
+
+        Engine.quant writes column-major scales whose view is already
+        (tokens, K/128). A (groups, tokens) tensor is transposed.
+        """
+        groups = q_input.shape[-1] // GROUP
+        tokens = q_input.shape[0]
+        if input_scale.shape == (tokens, groups):
+            return input_scale
+        if input_scale.shape == (groups, tokens):
+            return input_scale.transpose(0, 1)
+        raise ValueError(
+            f"activation scales {tuple(input_scale.shape)} do not match "
+            f"tokens={tokens} groups={groups}")
+
+    def quant(self, x, *, output=None):
         if not self.is_fp8:
             return x, None
         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            get_fp8_min_max,
             per_token_group_quant_fp8,
         )
+        if output is not None:
+            assert x.is_contiguous()
+            self.torch.ops._C.per_token_group_fp8_quant(
+                x, *output, GROUP, 1e-10, *get_fp8_min_max(),
+                self.use_ue8m0, True, False)
+            return output
         return per_token_group_quant_fp8(
             x, group_size=GROUP, column_major_scales=True,
             use_ue8m0=self.use_ue8m0)
@@ -228,6 +603,27 @@ class Engine:
             num_warps=8 if head_dim > 256 else 4)
         return q, k, v
 
+    def qk_norm_rope_heads(self, qkv, positions, *, num_q_heads, num_kv_heads,
+                           head_dim, q_weight, k_weight, eps, cos_sin_cache):
+        """The fused per-head q and k RMS norm plus neox rotary, any geometry.
+
+        qkv_norm_rope_heads without the norm of v: q and k are read from
+        the front of each qkv row, whatever columns follow them.
+        Returns contiguous q (rows, num_q_heads * head_dim) and k (rows,
+        num_kv_heads * head_dim).
+        """
+        n = qkv.shape[0]
+        torch = self.torch
+        q = torch.empty((n, num_q_heads * head_dim), dtype=torch.bfloat16,
+                        device=qkv.device)
+        k = torch.empty((n, num_kv_heads * head_dim), dtype=torch.bfloat16,
+                        device=qkv.device)
+        self._triton_kernels()["qk"][(n,)](
+            qkv, q, k, cos_sin_cache, positions, q_weight, k_weight,
+            qkv.stride(0), q.stride(0), k.stride(0), eps,
+            QH=num_q_heads, KH=num_kv_heads, HD=head_dim, HALF=head_dim // 2)
+        return q, k
+
     def gelu_mul_quant(self, gate_up):
         """gelu_tanh(gate) * up, quantized to fp8 with per-row scales."""
         return self._gelu_mul_quant(gate_up, match_vllm_rounding=False)
@@ -265,11 +661,6 @@ class Engine:
             q.stride(0), float(scale), eps, H=width,
             BLOCK=1 << (width - 1).bit_length(), num_warps=8)
         return q, scales
-
-    def norm_rows2(self, x, weight1, weight2, eps):
-        """Two RMS norms of the same rows from one read."""
-        first, _, second = self._norm_rows2(x, weight1, weight2, eps, False)
-        return first, second
 
     def norm_router_quant(self, x, weight, router_weight, eps):
         """Return FP8 expert input, per-row scales, and BF16 router input."""
@@ -351,8 +742,6 @@ class Engine:
         self._gemma_kernel = gemma_add_rms_norm
         return self._gemma_kernel
 
-    # ---- the Triton fused kernels -----------------------------------
-    # Each fuses a sequence of vLLM ops into one kernel launch.
 
     def _triton_kernels(self):
         if hasattr(self, "_kernels"):
@@ -361,7 +750,6 @@ class Engine:
         import triton.language as tl
         from triton.language.extra.cuda import libdevice
 
-        # fuses vLLM's silu_and_mul + per_token_group_quant_fp8
         @triton.jit
         def silu_mul_quant(gu_ptr, q_ptr, s_ptr, stride_gu, stride_q,
                            s_stride_g, s_stride_t,
@@ -386,7 +774,6 @@ class Engine:
             group_index = block * GPB + tl.arange(0, GPB)
             tl.store(s_ptr + group_index * s_stride_g + t * s_stride_t, scale)
 
-        # fuses vLLM's fused_add_rms_norm + per_token_group_quant_fp8
         @triton.jit
         def add_rms_norm_quant(x_ptr, res_ptr, w_ptr, q_ptr, s_ptr,
                                stride_x, stride_res, stride_q,
@@ -422,8 +809,6 @@ class Engine:
             tl.store(s_ptr + group_index * s_stride_g + t * s_stride_t, scale,
                      mask=group_index < NG)
 
-        # fuses vLLM's two per-head rms_norm calls + rotary_emb
-        # (five launches) into one
         @triton.jit
         def qk_norm_rope(qkv_ptr, q_out_ptr, k_out_ptr, cs_ptr, position_ptr,
                          qw_ptr, kw_ptr, stride_qkv, stride_qo, stride_ko,
@@ -472,10 +857,6 @@ class Engine:
             tl.store(k_out_ptr + t * stride_ko + kb_offs,
                      out_b.to(k_out_ptr.dtype.element_ty))
 
-        # the paged-KV append every paged engine has (vLLM:
-        # reshape_and_cache_flash; FlashInfer: append_paged_kv_cache),
-        # with a fused source-side gather: only selected rows of the
-        # packed chunk are written, from arbitrary positions
         @triton.jit
         def kv_row_scatter(k_src_ptr, v_src_ptr, k_dst_ptr, v_dst_ptr,
                            src_rows_ptr, dst_rows_ptr,
@@ -490,9 +871,6 @@ class Engine:
             v = tl.load(v_src_ptr + s * ROW + offs, mask=mask)
             tl.store(v_dst_ptr + d * ROW + offs, v, mask=mask)
 
-        # the online-softmax LSE merge (Milakov & Gimelshein 2018)
-        # fused with vLLM's per-group fp8 quantize pattern; with QUANT
-        # off it stores the bf16 merge and no scales
         @triton.jit
         def merge_attn_quant(a_ptr, b_ptr, la_ptr, lb_ptr, source_ptr,
                              q_ptr, s_ptr,
@@ -541,8 +919,6 @@ class Engine:
                 tl.store(q_ptr + t * stride_q_t + h0 * D + offs,
                          tl.reshape(y, (D * GPB,)).to(q_ptr.dtype.element_ty))
 
-        # gelu_tanh_and_mul fused with the per-row fp8 quantization the
-        # next linear would run on its output
         @triton.jit
         def gelu_mul_quant(gu_ptr, q_ptr, s_ptr, stride_gu, stride_q,
                            HALF: tl.constexpr, BLOCK: tl.constexpr,
@@ -555,7 +931,6 @@ class Engine:
             up = tl.load(gu_ptr + t * stride_gu + HALF + offs, mask=mask,
                          other=0.0).to(tl.float32)
             if match_vllm_rounding:
-                # vLLM rounds GELU to BF16 before the gating multiplication.
                 cube = gate * gate * gate
                 inner = 0.7978845608028654 * (gate + 0.044715 * cube)
                 activated = (0.5 * gate * (1.0 + libdevice.tanh(inner)))
@@ -564,7 +939,6 @@ class Engine:
                 inner = 0.7978845608028654 * (gate + 0.044715 * gate * gate * gate)
                 th = 1.0 - 2.0 / (tl.exp(2.0 * inner) + 1.0)
                 y = 0.5 * gate * (1.0 + th) * up
-            # the unfused path rounds the activation to bf16 first
             y = y.to(tl.bfloat16).to(tl.float32)
             amax = tl.max(tl.abs(y), axis=0)
             if match_vllm_rounding:
@@ -579,9 +953,6 @@ class Engine:
                      q.to(q_ptr.dtype.element_ty), mask=mask)
             tl.store(s_ptr + t, scale)
 
-        # vLLM's rms_norm_dynamic_per_token_quant with a residual,
-        # with the residual scaled first: residual = residual * scale
-        # + x, then the row norm quantized per row
         @triton.jit
         def scale_add_rms_norm_quant(x_ptr, res_ptr, w_ptr, q_ptr, s_ptr,
                                      stride_x, stride_res, stride_q,
@@ -608,13 +979,11 @@ class Engine:
                      q.to(q_ptr.dtype.element_ty), mask=mask)
             tl.store(s_ptr + t, qscale)
 
-        # one read of a row for two RMS norms with different weights
         @triton.jit
         def rms_norm2(x_ptr, w1_ptr, w2_ptr, o1_ptr, o2_ptr, s_ptr, stride_x,
                       stride_o1, stride_o2, eps, H: tl.constexpr,
                       BLOCK: tl.constexpr, output_fp8: tl.constexpr):
             t = tl.program_id(0)
-            # Keep the BF16 reduction order when one output becomes FP8.
             offs = tl.max_contiguous(tl.arange(0, BLOCK), 8)
             mask = offs < H
             x = tl.load(x_ptr + t * stride_x + offs, mask=mask,
@@ -625,7 +994,6 @@ class Engine:
             w2 = tl.load(w2_ptr + offs, mask=mask, other=0.0).to(tl.float32)
             first = (xn * w1).to(x_ptr.dtype.element_ty)
             if output_fp8:
-                # Preserve the BF16 intermediate's rounding before quantizing.
                 first = first.to(tl.float32)
                 scale = tl.maximum(tl.div_rn(tl.max(tl.abs(first), axis=0),
                                              448.0),
@@ -638,8 +1006,6 @@ class Engine:
             tl.store(o2_ptr + t * stride_o2 + offs,
                      (xn * w2).to(o2_ptr.dtype.element_ty), mask=mask)
 
-        # qk_norm_rope plus the weightless per-head v norm Gemma
-        # applies, written contiguous for the KV scatter
         @triton.jit
         def qkv_norm_rope(qkv_ptr, q_out_ptr, k_out_ptr, v_out_ptr, cs_ptr,
                           position_ptr, qw_ptr, kw_ptr, stride_qkv, stride_qo,
@@ -721,8 +1087,6 @@ class Engine:
             HD=self.head_dim, HALF=self.head_dim // 2)
         return q, k
 
-    # ---- the vLLM-kernel path (kernels="vllm") ----------------------
-    # The same ops the engine's compiled graph runs, called eagerly.
 
     def vllm_norm_quant(self, hidden, norm, residual):
         """fused-add rms_norm, then a separate quantize.
@@ -769,7 +1133,26 @@ class Engine:
             k3, v3, k_pool, v_pool, src, dst,
             ROW=row, ROW_POW2=1 << (row - 1).bit_length())
 
-    def merge_attn_quant(self, out_a, lse_a, out_b, lse_b, source):
+    def write_kv(self, k3, v3, meta, *, tree=False, copy_tail=True):
+        """Write fresh rows and retained partial pages unless already captured."""
+        if meta.get("kv_written", False):
+            return
+        layer = meta["layer"]
+        if tree:
+            if meta["kv_src"] is not None:
+                self.kv_row_scatter(k3, v3, meta["kv_src"], meta["kv_dst"], layer)
+            return
+        pool = self._pool(layer, meta["unified"])
+        if pool is None:
+            return
+        if pool["src"].numel():
+            self.kv_row_scatter(k3, v3, pool["src"], pool["dst"], layer)
+        if copy_tail and pool["tail_src"] is not None:
+            k_pool, v_pool = self.arena.layer_kv(layer)
+            self.kv_row_scatter(k_pool, v_pool,
+                                pool["tail_src"], pool["tail_dst"], layer)
+
+    def merge_attn_quant(self, out_a, lse_a, out_b, lse_b, source, *, output=None):
         """Merge cached and fresh attention and write the o_proj input.
 
         The source vector maps each packed row to its row in out_b, or
@@ -782,17 +1165,20 @@ class Engine:
         if heads % gpb:
             raise ValueError(
                 f"the merge kernel takes heads in groups of {gpb}, not {heads}")
-        if self.is_fp8:
-            assert dim == GROUP
+        if output is not None:
+            q, scales = output
+        elif self.is_fp8:
             q = self.torch.empty((n, heads * dim), dtype=self.fp8,
                                  device=out_a.device)
             scales = self._col_major_scales(n, heads * dim)
-            scale_strides = scales.stride(1), scales.stride(0)
         else:
             q = self.torch.empty((n, heads * dim), dtype=self.torch.bfloat16,
                                  device=out_a.device)
             scales = None
-            scale_strides = 0, 0
+        if self.is_fp8:
+            assert dim == GROUP
+        scale_strides = ((0, 0) if scales is None
+                         else (scales.stride(1), scales.stride(0)))
         self._triton_kernels()["merge_quant"][(n, heads // gpb)](
             out_a, out_b, lse_a, lse_b, source, q,
             q if scales is None else scales,
@@ -804,7 +1190,6 @@ class Engine:
             D=dim, GPB=gpb, UE8M0=self.use_ue8m0, QUANT=self.is_fp8)
         return q, scales
 
-    # ---- the primitives a forward loop calls -------------------------
 
     def norm_quant(self, hidden, norm, residual=None):
         """RMS-normed, quantized GEMM input; adds the residual first when given."""
@@ -826,7 +1211,7 @@ class Engine:
             return self.custom_qk_norm_rope(qkv, positions, attn)
         return self.vllm_qk_norm_rope(qkv, positions, attn)
 
-    def attention(self, q, k, v, chunk):
+    def attention(self, q, k, v, chunk, *, output=None):
         """Attention over the chunk and the arena; the quantized o_proj input.
 
         The chunk carries the path it was packed for. q, k, and v are
@@ -838,45 +1223,125 @@ class Engine:
         k3 = k.view(n, KH, D)
         v3 = v.contiguous().view(n, KH, D)
         if chunk.attention_mode == "tree":
-            return self.attention_tree(q3, k3, v3, chunk.meta)
-        return self.quant(self.attention_unified(q3, k3, v3, chunk.meta))
+            return self.attention_tree(q3, k3, v3, chunk.meta, output=output)
+        if chunk.meta.get("shared") is not None:
+            return self.attention_shared(q3, k3, v3, chunk.meta, output=output)
+        target = (output[0].view(n, H, D)
+                  if output is not None and not self.is_fp8 else None)
+        return self.quant(self.attention_unified(
+            q3, k3, v3, chunk.meta, output=target), output=output)
 
-    # ---- attention: the two workload paths --------------------------
 
     def _fa(self, q, k, v, cu_q, cu_k, max_q, max_k, causal,
             block_table=None, seqused_k=None, softmax_scale=None,
-            window=None, version=None):
-        # vLLM's FA2 and FA3 both accept 16-token pages and return
-        # LSE as [heads, total_queries] for the merge kernel.
+            window=None, version=None, output=None):
         from vllm.vllm_flash_attn import flash_attn_varlen_func
+        version = version or self.fa_version
         extra = {}
+        if output is not None:
+            extra["out"] = output
         if softmax_scale is not None:
             extra["softmax_scale"] = softmax_scale
         if window is not None:
             extra["window_size"] = list(window)
+        shape = getattr(k, "shape", None)
+        if version == 4 and shape is not None and shape[-1] == 256:
+            extra["num_splits"] = 1
+            if block_table is not None:
+                max_k = block_table.shape[1] * k.shape[1]
         return flash_attn_varlen_func(
             q, k, v, max_seqlen_q=max_q, cu_seqlens_q=cu_q,
             max_seqlen_k=max_k, cu_seqlens_k=cu_k,
             block_table=block_table, seqused_k=seqused_k,
-            causal=causal, fa_version=version or self.fa_version,
+            causal=causal, fa_version=version,
             return_softmax_lse=True, **extra)
 
+    def _flashinfer_paged(self, q3, kp, vp, metadata, *, causal,
+                          softmax_scale, window, output=None):
+        """Run paged attention with a FlashInfer plan shared across layers."""
+        import numpy as np
+        from flashinfer import BatchPrefillWithPagedKVCacheWrapper
+
+        if not hasattr(self, "_flashinfer_plans"):
+            self._flashinfer_plans = {}
+            self._flashinfer_workspace = self.torch.empty(
+                256 * 1024 * 1024, dtype=self.torch.uint8, device=q3.device)
+        key = (causal, softmax_scale, window, q3.shape[1:], kp.shape[1:],
+               q3.dtype, kp.dtype)
+        previous, wrapper, uploaded = self._flashinfer_plans.get(
+            key, (None, None, None))
+        if wrapper is None:
+            wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                self._flashinfer_workspace, kv_layout="NHD", backend="fa2")
+            uploaded = self.torch.cuda.Event()
+        if metadata is not previous:
+            page_tokens = kp.shape[1]
+            used = np.asarray(metadata["used_host"], dtype=np.int32)
+            counts = -(-used // page_tokens)
+            indptr = np.concatenate(([0], counts.cumsum())).astype(np.int32)
+            indices = np.concatenate([
+                pages[:count] for pages, count in zip(metadata["page_rows"], counts)
+            ]).astype(np.int32)
+            options = dict(
+                causal=causal, sm_scale=softmax_scale,
+                window_left=-1 if window is None else window[0],
+                q_data_type=q3.dtype, kv_data_type=kp.dtype)
+            uploaded.synchronize()
+            wrapper.plan(
+                self.torch.as_tensor(metadata["cu_q_host"], dtype=self.torch.int32),
+                self.torch.from_numpy(indptr), self.torch.from_numpy(indices),
+                self.torch.from_numpy((used - 1) % page_tokens + 1),
+                q3.shape[1], kp.shape[2], q3.shape[2], page_tokens, **options)
+            uploaded.record()
+            self._flashinfer_plans[key] = metadata, wrapper, uploaded
+        return wrapper.run(q3, (kp, vp), out=output)
+
+    def triton_paged(self, q3, kp, vp, cu_q, max_q, seqused_k, max_seqused_k,
+                      block_table, *, softmax_scale=None, window=None,
+                      output=None):
+        """Causal paged attention for short queries via Triton split-KV.
+
+        Blackwell's head-256 FA4 kernel splits neither the KV nor the query
+        heads that share a KV head, so one-token rows run 3-5x slower. Dynamic
+        splitting saturates all SMs across batch sizes without mid-query
+        Triton compilations.
+        """
+        workspace = getattr(self, "_triton_segments", None)
+        if workspace is None:
+            workspace = self._triton_segments = {}
+        return triton_splitkv_decode(
+            q3, kp, vp, cu_q, max_q, seqused_k, max_seqused_k, block_table,
+            softmax_scale=softmax_scale, window=window, output=output,
+            workspace=workspace)
+
     def _paged(self, q3, kp, vp, cu_q, max_q, seqused_k, max_seqused_k, block_table, *,
-               causal, softmax_scale=None, window=None):
+               causal, softmax_scale=None, window=None, metadata=None, output=None):
         """One paged attention call.
 
         FlashAttention 3, or FlashAttention 4 when the head is wider
-        than it takes.
+        than it takes. A 512-wide head on a GPU that selects
+        FlashAttention 4 runs through FlashInfer CUDA attention.
         """
+        if self.fa_version == 4 and q3.shape[-1] == 512:
+            return self._flashinfer_paged(
+                q3, kp, vp, metadata, causal=causal,
+                softmax_scale=softmax_scale, window=window, output=output)
+        if supports_splitkv_decode(
+                self.fa_version, q3.shape[-1], kp.shape[1], q3.shape[1],
+                kp.shape[2], causal=causal, max_q=max_q,
+                dtype=getattr(q3, "dtype", None)):
+            return self.triton_paged(
+                q3, kp, vp, cu_q, max_q, seqused_k, max_seqused_k, block_table,
+                softmax_scale=softmax_scale, window=window, output=output)
         wide = q3.shape[-1] > FA_MAX_HEAD_DIM
         out, _ = self._fa(
             q3, kp, vp, cu_q, None, max_q, max_seqused_k, causal=causal,
             block_table=block_table, seqused_k=seqused_k,
             softmax_scale=softmax_scale, window=window,
-            version=4 if wide else None)
+            version=4 if wide else None, output=output)
         return out
 
-    def attention_tree(self, q3, k3, v3, meta):
+    def attention_tree(self, q3, k3, v3, meta, *, output=None):
         """The tree attention path: two calls, then one fused merge.
 
         Takes (rows, heads, dim) tensors and returns the input pair
@@ -887,17 +1352,17 @@ class Engine:
         if meta.get("canvas") is not None:
             raise ValueError("canvas rows run the unified attention path")
 
-        if meta["kv_src"] is not None:
-            self.kv_row_scatter(k3, v3, meta["kv_src"], meta["kv_dst"],
-                                layer)
+        self.write_kv(k3, v3, meta, tree=True)
 
+        reads = meta["reads"]
+        target = (output[0].view(n, H, D) if reads is None
+                  and output is not None and not self.is_fp8 else None)
         out_a, lse_a = self._fa(
             q3, k3, v3, meta["cu_a"], meta["cu_a"],
-            meta["max_a"], meta["max_a"], causal=True)
-        reads = meta["reads"]
+            meta["max_a"], meta["max_a"], causal=True, output=target)
         if reads is None:
             meta["layer"] += 1
-            return self.quant(out_a.view(n, H * D))
+            return self.quant(out_a.view(n, H * D), output=output)
 
         rows = reads["rows"]
         q_readers = q3.index_select(0, rows)
@@ -908,8 +1373,6 @@ class Engine:
             block_table=reads["table"], seqused_k=reads["used"])
         nodes = reads.get("nodes")
         if nodes is not None:
-            # call C: path rows over their ancestor rows in earlier
-            # paths of the chunk, merged into their call B result
             out_c, lse_c = self._fa(
                 q3.index_select(0, nodes["rows"]),
                 k3.index_select(0, nodes["key_rows"]),
@@ -920,7 +1383,35 @@ class Engine:
         lse_a = lse_a.transpose(0, 1)
         lse_b = lse_b.transpose(0, 1)
         q_out, scales = self.merge_attn_quant(
-            out_a, lse_a, out_b, lse_b, reads["source"])
+            out_a, lse_a, out_b, lse_b, reads["source"], output=output)
+        meta["layer"] += 1
+        return q_out, scales
+
+    def attention_shared(self, q3, k3, v3, meta, *, output=None):
+        """The unified call, plus one stacked read of shared pages, merged.
+
+        Every row reads its own pages in the causal paged call, after
+        its KV is written there. The rows of each group of branches
+        then read the group's shared pages once, together, in a
+        non-causal paged call, and each such row's two results merge by
+        their log-sum-exp weights. Takes (rows, heads, dim) tensors and
+        returns the input pair for o_proj.
+        """
+        layer = meta["layer"]
+        unified, shared = meta["unified"], meta["shared"]
+        self.write_kv(k3, v3, meta)
+        kp, vp = self.arena.paged_kv(layer)
+        out_a, lse_a = self._fa(
+            q3, kp, vp, unified["cu_q"], None, unified["max_q"],
+            unified["max_used"], causal=True, block_table=unified["table"],
+            seqused_k=unified["used"])
+        out_b, lse_b = self._fa(
+            q3.index_select(0, shared["rows"]), kp, vp, shared["cu_q"], None,
+            shared["max_q"], shared["max_used"], causal=False,
+            block_table=shared["table"], seqused_k=shared["used"])
+        q_out, scales = self.merge_attn_quant(
+            out_a, lse_a.transpose(0, 1), out_b, lse_b.transpose(0, 1),
+            shared["source"], output=output)
         meta["layer"] += 1
         return q_out, scales
 
@@ -931,11 +1422,13 @@ class Engine:
         return tables.get("sliding") or tables
 
     def attention_unified(self, q3, k3, v3, meta, *, softmax_scale=None,
-                          window=None):
-        """Write current KV to its cache slots, then one causal paged attention call.
+                          window=None, output=None):
+        """Write current KV to its cache slots, then one paged attention call.
 
-        The call reads retained and current KV together. Takes
-        (rows, heads, dim) tensors and returns (rows, heads * dim).
+        The call reads retained and current KV together. It is causal
+        unless the chunk was packed with a non-causal mask, in which
+        each row reads every key of its sequence. Takes (rows, heads,
+        dim) tensors and returns (rows, heads * dim).
 
         When meta["unified"] is None (no arena pages), falls back to
         a plain varlen causal call with no scatter or paged read.
@@ -956,6 +1449,7 @@ class Engine:
             window: Sliding window in tokens, or None for full
                 attention. Causal rows see `window` keys behind them;
                 canvas rows see `window` keys on either side.
+            output: Optional persistent BF16 attention output, (rows, heads, dim).
         """
         n = q3.shape[0]
         layer = meta["layer"]
@@ -975,7 +1469,7 @@ class Engine:
             out, _ = self._fa(
                 q3, k3, v3, meta["cu_a"], meta["cu_a"],
                 meta["max_a"], meta["max_a"], causal=True,
-                softmax_scale=softmax_scale, window=behind)
+                softmax_scale=softmax_scale, window=behind, output=output)
             if canvas is not None:
                 q_c = q3.index_select(0, canvas["rows"])
                 out_c, _ = self._fa(
@@ -985,24 +1479,42 @@ class Engine:
                 out.index_copy_(0, canvas["rows"], out_c)
             meta["layer"] += 1
             return out.view(n, -1)
-        if pool["src"].numel():
-            self.kv_row_scatter(k3, v3, pool["src"], pool["dst"], layer)
-        if pool["tail_src"] is not None:
-            k_pool, v_pool = self.arena.layer_kv(layer)
-            self.kv_row_scatter(k_pool, v_pool,
-                                pool["tail_src"], pool["tail_dst"], layer)
+        self.write_kv(k3, v3, meta)
         kp, vp = self.arena.paged_kv(layer)
-        out = self._paged(
-            q3, kp, vp, unified["cu_q"], unified["max_q"], pool["used"],
-            pool["max_used"], pool["table"], causal=True,
-            softmax_scale=softmax_scale, window=behind)
+        prefill_seqs = unified.get("prefill_seqs", 0)
+        if (prefill_seqs and unified["prefill_max_q"] > TRITON_DECODE_MAX_Q
+                and supports_splitkv_decode(
+                    self.fa_version, q3.shape[-1], kp.shape[1], q3.shape[1],
+                    kp.shape[2], causal=True, max_q=unified["decode_max_q"],
+                    dtype=getattr(q3, "dtype", None))):
+            out = output if output is not None else self.torch.empty_like(q3)
+            r0 = unified["decode_row0"]
+            self._paged(
+                q3[:r0], kp, vp, unified["cu_q"][:prefill_seqs + 1],
+                unified["prefill_max_q"], pool["used"][:prefill_seqs],
+                pool["max_used"], pool["table"][:prefill_seqs], causal=True,
+                softmax_scale=softmax_scale, window=behind, output=out[:r0])
+            self._paged(
+                q3[r0:], kp, vp, unified["decode_cu_q"],
+                unified["decode_max_q"],
+                pool.get("decode_used", pool["used"][prefill_seqs:]),
+                pool["max_used"],
+                pool.get("decode_table", pool["table"][prefill_seqs:]),
+                causal=True, softmax_scale=softmax_scale, window=behind,
+                output=out[r0:])
+        else:
+            out = self._paged(
+                q3, kp, vp, unified["cu_q"], unified["max_q"], pool["used"],
+                pool["max_used"], pool["table"], causal=unified["causal"],
+                softmax_scale=softmax_scale, window=behind, metadata=pool,
+                output=output)
         if canvas is not None:
             q_c = q3.index_select(0, canvas["rows"])
             out_c = self._paged(
                 q_c, kp, vp, canvas["cu_q"], canvas["max_q"],
                 canvas_pool["used"], canvas_pool["max_used"],
                 canvas_pool["table"], causal=False,
-                softmax_scale=softmax_scale, window=around)
+                softmax_scale=softmax_scale, window=around, metadata=canvas_pool)
             out.index_copy_(0, canvas["rows"], out_c)
         meta["layer"] += 1
         return out.view(n, -1)

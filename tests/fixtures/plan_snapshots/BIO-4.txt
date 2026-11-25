@@ -1,0 +1,51 @@
+logical:
+  Projection: r.id, n.id, c.id
+    AiNode: __quail_answer_2 = ai_filter(prompt(Utf8("Does the medical report in DOCUMENT {0} describe the reaction in DOCUMENT {1} as something the patient experienced?"), r.report, c.term), named_struct(Utf8("selectivity"), Float64(0.03397338065661047))), inline_predicate: __quail_answer_2, returns: []
+      Cross Join:
+        Projection: r.id, r.report, n.id
+          AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("Does the medical report in DOCUMENT {0} describe the reaction in DOCUMENT {1} as something the patient experienced?"), r.report, n.term), named_struct(Utf8("selectivity"), Float64(0.03397338065661047))), inline_predicate: __quail_answer_1, returns: []
+            Cross Join:
+              AiNode: __quail_answer_3 = ai_filter(prompt(Utf8("Judge strictly from the report above whether it describes a serious or life-threatening adverse event.\n\n{0}\n\nInstruction: answer TRUE if the report describes a serious or life-threatening adverse event, FALSE otherwise."), r.report), named_struct(Utf8("selectivity"), Float64(0.638))), inline_predicate: __quail_answer_3, returns: []
+                SubqueryAlias: r
+                  TableScan: reports projection=[id, report]
+              AiNode: __quail_answer_4 = ai_filter(prompt(Utf8("Is this reaction neurological, affecting the nervous system? {0}"), n.term), named_struct(Utf8("selectivity"), Float64(0.44809228039041704))), inline_predicate: __quail_answer_4, returns: []
+                SubqueryAlias: n
+                  TableScan: terms projection=[id, term]
+        AiNode: __quail_answer_5 = ai_filter(prompt(Utf8("Is this reaction cardiovascular, affecting the heart or blood vessels? {0}"), c.term), named_struct(Utf8("selectivity"), Float64(0.34960070984915703))), inline_predicate: __quail_answer_5, returns: []
+          SubqueryAlias: c
+            TableScan: terms projection=[id, term]
+
+physical: backend=quail, model=qwen3-4b-fp8, gpus=1
+  KV=bf16, chunk budget=110,376 tokens, admission budget=353,136 tokens
+  architecture=qwen3 (36 layers), weights=fp8
+  kernels: linear layers: fp8 GEMM (DeepGEMM)
+
+                                                                                               est. rows   est. pass   est. time
+  AiJoin: anchor=r                                                                                                        1.1 ms
+    KV: anchor=from filters, retain after join=no
+    join 1 full (r, n)  PROMPT('Does the medical report in DOCUM…')                                    1        3.4%
+    Barrier: next_anchor=r
+      AiJoin: anchor=c                                                                                                   5.24 ms
+        KV: anchor=from filters, retain after join=no
+        join 2 full (c, r)  PROMPT('Does the medical report in DOCUM…')                             10.7        3.4%
+        AiFilter: c                                                                                  2.1                 6.33 ms
+          KV rewind=on
+          expected recompute at the join if the sequence's KV is released: 0 tokens, 0.000 s
+          predicate 1  PROMPT('DOCUMENT:\n{0}\n\nIs this reaction …')                                  6         35%
+          Scan terms as c                                                                              6
+            tokens=60, mean_document_tokens=10
+        AiFilter: r [1]                                                                              5.1                 12.3 ms
+          KV rewind=on, retain KV for later joins
+          expected recompute at the join if the sequence's KV is released: 0 tokens, 0.000 s
+          predicate 1  PROMPT('DOCUMENT:\n{0}\n\nJudge strictly fr…')                                  8       63.8%
+          Scan reports as r                                                                            8
+            tokens=112, mean_document_tokens=14
+      Reuse [1]
+      AiFilter: n                                                                                    2.7                 6.17 ms
+        KV: not stored
+        predicate 1  PROMPT('DOCUMENT:\n{0}\n\nIs this reaction …')                                    6       44.8%
+        Scan terms as n                                                                                6
+          tokens=60, mean_document_tokens=10
+  Pipeline on c: ai_filter:c -> ai_join:c (each document runs every operator with its KV resident)
+  est. time is each node's work alone; node times do not add up to the plan estimate
+  because chunk packing shares forward passes across nodes

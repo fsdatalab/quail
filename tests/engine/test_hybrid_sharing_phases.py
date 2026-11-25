@@ -8,10 +8,6 @@ import pytest
 from helpers.fakes import bare_arena
 
 from quail.backends.quail.executor.arena import KVArena, PageArena
-from quail.backends.quail.executor.chunk import (
-    ArenaFullError,
-    BorrowStateMissingError,
-)
 from quail.backends.quail.executor.gdn import plan_phases
 
 
@@ -49,7 +45,8 @@ def lengths(phases):
     return [phase.lengths for phase in phases]
 
 
-def test_borrower_after_the_parent_chunk_reads_the_saved_state(torch_stub):
+def test_borrowers_read_the_saved_state_and_answer_steps_update_their_slot_in_place(
+        torch_stub):
     arena = arena_with_slots()
     resident(arena, "p", "c")
     plan_phases(arena, [group("p", 48, 0, 48, points=(32,))], stage)
@@ -64,21 +61,26 @@ def test_borrower_after_the_parent_chunk_reads_the_saved_state(torch_stub):
     with pytest.raises(ValueError, match="checkpoints cover"):
         plan_phases(arena, [resident_group("p", 32, 0, 2)], stage)
 
-
-def test_a_later_group_does_not_evict_a_parent_an_earlier_group_reads(
-        torch_stub):
-    arena = arena_with_slots(slots=3)
-    resident(arena, "p")
-    plan_phases(arena, [group("p", 48, 0, 48, points=(32,))], stage)
-    shared = arena.shared_state("p", 32)
-    arena.accounting.retain("p")
-    resident(arena, "c", "d")
-    groups = [group("c", 64, 0, 32, start=32, borrow_key="p"),
-              group("d", 48, 34, 82)]
-    with pytest.raises(ArenaFullError):
-        plan_phases(arena, groups, stage)
-    assert arena.shared_state("p", 32) == shared
-    assert not arena._reading
+    # one-token answer steps update their slot in place
+    arena = arena_with_slots()
+    resident(arena, "a", "b")
+    plan_phases(arena, [group("a", 48, 0, 48), group("b", 40, 50, 90)], stage)
+    document = arena.accounting.slots["a"]
+    phases = plan_phases(
+        arena, [answer_step("a", 48, 0), answer_step("b", 40, 1, tokens=2)],
+        stage)
+    assert lengths(phases) == [(2,), (1,)]
+    chunked, step = phases
+    assert chunked.state_rows is None
+    answer = arena.extension("a")[0]
+    assert answer != document
+    assert step.state_rows.tolist() == [answer + 1]
+    assert step.copy_reads.tolist() == [document]
+    assert step.copy_writes.tolist() == [answer]
+    (step,) = plan_phases(arena, [answer_step("a", 49, 0)], stage)
+    assert step.read_slots.tolist() == step.write_slots.tolist() == [answer]
+    assert step.state_rows.tolist() == [answer + 1]
+    assert step.copy_reads is None
 
 
 # ---- edge cases -------------------------------------------------------
@@ -89,103 +91,6 @@ def resident_group(key, f, row0, suffix, *, kept=0):
                 prefix_end=row0, row1=row0 + suffix,
                 suffix_spans=(np.array([row0]), np.array([row0 + suffix])),
                 kept=kept, borrow_key=None, share_points=())
-
-
-def test_points_at_or_below_the_start_are_not_saved(torch_stub):
-    arena = arena_with_slots()
-    resident(arena, "p", "c")
-    plan_phases(arena, [group("p", 48, 0, 48, points=(32,))], stage)
-    phases = plan_phases(
-        arena, [group("c", 80, 0, 48, start=32, borrow_key="p",
-                      points=(16, 32, 48))], stage)
-    assert lengths(phases)[:2] == [(16,), (32,)]
-    assert list(arena.accounting.share_slots) == [("p", 32), ("c", 48)]
-
-
-def test_only_distinct_interior_share_points_make_segments(torch_stub):
-    arena = arena_with_slots()
-    resident(arena, "p")
-    phases = plan_phases(
-        arena, [group("p", 48, 0, 48, points=(0, 32, 16, 48, 64, 32, 16))], stage)
-    assert lengths(phases) == [(16,), (16,), (16,), (2,)]
-    assert sorted(t for _, t in arena.accounting.share_slots) == [16, 32]
-
-
-def test_two_borrowers_of_one_point_run_in_the_same_phase(torch_stub):
-    arena = arena_with_slots()
-    resident(arena, "p", "a", "b")
-    groups = [group("p", 48, 0, 48, points=(32,)),
-              group("a", 64, 50, 82, start=32, borrow_key="p"),
-              group("b", 64, 84, 116, start=32, borrow_key="p")]
-    phases = plan_phases(arena, groups, stage)
-    shared = arena.shared_state("p", 32)
-    assert lengths(phases) == [(32,), (16, 32, 32), (2, 2, 2)]
-    assert phases[1].read_slots.tolist() == [shared] * 3
-
-
-def test_a_borrower_of_the_parents_whole_prefix_reads_its_slot(torch_stub):
-    arena = arena_with_slots()
-    resident(arena, "p", "c")
-    groups = [group("p", 32, 0, 32),
-              group("c", 64, 34, 66, start=32, borrow_key="p")]
-    phases = plan_phases(arena, groups, stage)
-    assert phases[1].read_slots.tolist() == [arena.accounting.slots["p"]]
-    assert phases[1].write_slots.tolist() == [arena.accounting.slots["c"]]
-
-
-def test_a_state_at_a_different_length_does_not_serve_a_borrow(torch_stub):
-    arena = arena_with_slots()
-    resident(arena, "p", "c")
-    plan_phases(arena, [group("p", 48, 0, 48, points=(32,))], stage)
-    with pytest.raises(BorrowStateMissingError, match="no state of the parent"):
-        plan_phases(
-            arena, [group("c", 80, 0, 32, start=16, borrow_key="p")], stage)
-
-
-def test_a_missing_share_slot_splits_and_the_retry_reuses_what_it_took(
-        torch_stub):
-    from quail.backends.quail.executor.chunk import ArenaFullError
-
-    arena = arena_with_slots(slots=2)
-    resident(arena, "p")
-    full = group("p", 48, 0, 48, points=(16, 32))
-    with pytest.raises(ArenaFullError, match="share"):
-        plan_phases(arena, [full], stage)
-    taken = dict(arena.accounting.share_slots)
-    arena.accounting.num_slots += 1
-    arena.accounting.free_slots.append(2)
-    phases = plan_phases(arena, [full], stage)
-    assert all(arena.accounting.share_slots[k] == v for k, v in taken.items())
-    assert lengths(phases) == [(16,), (16,), (16,), (2,)]
-
-
-def test_a_wholly_kept_suffix_continues_after_the_last_segment(torch_stub):
-    arena = arena_with_slots()
-    resident(arena, "p")
-    framed = group("p", 48, 0, 48, points=(32,))
-    framed["kept"] = 2
-    framed["suffix_spans"] = (np.array([48]), np.array([50]))
-    phases = plan_phases(arena, [framed], stage)
-    # prefix to the shared point, prefix to the end, then the frame
-    # tokens from the document's slot into a second slot
-    assert lengths(phases) == [(32,), (16,), (2,)]
-    assert phases[2].read_slots.tolist() == [arena.accounting.slots["p"]]
-    assert phases[2].write_slots.tolist() == [arena.accounting.ext_slots["p"]]
-    assert arena.extension("p") == (arena.accounting.ext_slots["p"], 50)
-
-
-def test_a_suffix_with_a_question_extends_after_it_ran(torch_stub):
-    arena = arena_with_slots()
-    resident(arena, "p")
-    framed = group("p", 48, 0, 48, points=(32,))
-    framed["kept"] = 2
-    framed["suffix_spans"] = (np.array([48]), np.array([52]))
-    phases = plan_phases(arena, [framed], stage)
-    assert lengths(phases) == [(32,), (16,), (4,), (2,)]
-    suffix, extension = phases[2], phases[3]
-    assert suffix.write_slots is None and extension.output is False
-    assert suffix.read_slots.tolist() == [arena.accounting.slots["p"]]
-    assert extension.write_slots.tolist() == [arena.accounting.ext_slots["p"]]
 
 
 def test_levels_cover_every_prefix_row_once_and_never_read_ahead(
@@ -241,3 +146,10 @@ def test_levels_cover_every_prefix_row_once_and_never_read_ahead(
                 written |= set(phase.write_slots.tolist())
     # the trials must exercise borrowing, or the checks above are empty
     assert borrowers > 20
+
+
+def answer_step(key, f, row, tokens=1):
+    return dict(key=key, fresh=False, start=0, f=f, row0=row, prefix_end=row,
+                row1=row + tokens,
+                suffix_spans=(np.array([row]), np.array([row + tokens])),
+                kept=tokens)

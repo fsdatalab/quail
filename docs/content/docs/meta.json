@@ -2,10 +2,9 @@
   "title": "Quail",
   "pages": [
     "index",
+    "when-to-use",
     "user-guide",
-    "demos",
-    "architecture",
-    "extending",
+    "cookbook",
     "contributing"
   ]
 }

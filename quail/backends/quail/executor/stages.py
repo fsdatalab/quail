@@ -40,12 +40,16 @@ class StageRequests:
             stage's readout settings.
         discard: Tokens to remove from the previously appended KV before
             processing these suffixes.
+        questions: Under set attention, per suffix, the tokens of each
+            question in it, as Stage.questions gives them for a stage's
+            own suffixes.
     """
 
     suffixes: Any
     write_suffix_tokens: int | None = None
     read_rows: list[int] | None = None
     discard: int = 0
+    questions: tuple = ()
 
     def __post_init__(self):
         from quail.backends.quail.executor.chunk import Suffixes
@@ -73,6 +77,9 @@ class Stage:
         requests: Optional callback from document key to suffix indices.
             None selects all suffixes; DROP removes the document; SKIP
             advances it without a request.
+        prepare: Optional callback from a list of document keys, run
+            before those documents enter the stage, so requests can
+            decide them together and answer each from what it saved.
         decide: Optional callback from document index and answer row to a
             Boolean. True advances the document or retains it at the final
             stage. Without a callback, any true answer is sufficient.
@@ -96,6 +103,20 @@ class Stage:
             tokens, shared by its suffixes or supplied per suffix. None uses
             the pipeline's default canvas.
         canvas_rows: Number of rows in each canvas returned by canvas.
+        answer_tokens: Limit on tokens a decoder writes after the stage's
+            request, as AI.MAP's answer. Admission reserves headroom for each answer.
+        answer_index: Index of this stage's first map in the decoder.
+        answer_dependencies: Decoder fields this stage's requests read.
+        questions: Under set attention, per suffix, the tokens of each
+            question in it, in order, after the state that the prefix
+            holds; each document requests one suffix, and each
+            question's question_slots rows are read. Empty when the
+            whole sequence is one question.
+        question_slots: The rows read in each question, counted back
+            from its last row; or, per question, its own such rows.
+        state_reads: Optional callback from document index to the rows
+            of its prefix to read before the questions' rows, as a
+            pointer read scores them.
     """
 
     DROP = DROP
@@ -105,6 +126,7 @@ class Stage:
     readout: Any
     frame: list = field(default_factory=list)
     requests: Callable | None = None
+    prepare: Callable | None = None
     decide: Callable | None = None
     read_all_rows: bool = False
     read_rows: Any = None
@@ -117,6 +139,12 @@ class Stage:
     canvas: Callable | None = None
     canvas_rows: int = 0
     suffix_tokens: int = 0
+    answer_tokens: int = 0
+    answer_index: int = 0
+    answer_dependencies: tuple[int, ...] = ()
+    questions: tuple = ()
+    question_slots: tuple = (0,)
+    state_reads: Callable | None = None
 
     def __post_init__(self):
         if self.own_suffixes:
@@ -150,17 +178,19 @@ def shared_preamble_tokens(question_ids) -> int:
     return p
 
 
-def filter_stages(question_ids, readout) -> list:
+def filter_stages(question_ids, readout, frames=True) -> list:
     """Build one filter stage per question with a shared prompt frame.
 
     The preamble common to every question is written into the
     document's KV once, at the first stage; each stage's suffix is its
-    question past the preamble.
+    question past the preamble. With frames=False, for a mask that
+    keeps no question KV, nothing is written and each suffix is its
+    whole question.
 
     Raises:
         ValueError: A question has no tokens past the shared preamble.
     """
-    p = shared_preamble_tokens(question_ids)
+    p = shared_preamble_tokens(question_ids) if frames else 0
     frame = list(question_ids[0][:p])
     stages = []
     for index, question in enumerate(question_ids):
@@ -193,86 +223,23 @@ def _advance_stage(stages, a, j, row):
     return bool(stage.decide(a, row))
 
 
-def run_stages(torch, arena, pipeline, stages, anchor_prefixes, budget, *,
-               anchor_keys=None, on_settled=None, staging=None,
-               attention_mode=None, prefix_tree=None, stats=None,
-               limit=None, paged=True, unit="documents", count_answers=False,
-               label=None, default_attention="tree", on_chunk=None,
-               on_answers=None, stop_groups=None, appended_tokens=None,
-               gpu_timing=False, survival=None):
-    """Run every stage over the documents with one admission.
+def question_ends(questions, slots=(0,)) -> np.ndarray:
+    """The mask of each question's read rows in a suffix of these questions.
 
     Args:
-        torch: The torch module, imported by the caller.
-        arena: KVArena holding the documents' KV pages.
-        pipeline: ModelPipeline that runs each packed forward chunk.
-        stages: The Stage list, in order.
-        anchor_prefixes: Document index -> its prefix token list (head
-            and document).
-        budget: Chunk token budget.
-        anchor_keys: Stable arena key per document; list positions
-            when omitted.
-        on_settled: Optional callable(document index, survived, last
-            row) run when a document finishes; it owns the document's
-            retain or free decision. Without it a finished document's
-            pages are freed.
-        staging: Optional reusable input transfer buffers.
-        attention_mode: "tree" or "unified" as the plan chose; None
-            and a model without tree attention run unified.
-        prefix_tree: A PrefixTree over anchor_prefixes, or None.
-        gpu_timing: Record forward-pass CUDA events and synchronize them once
-            at the end of the run. False returns no timing spans.
-        stats: When given, receives borrowed_tokens and pack_s, the
-            host seconds spent building chunks.
-        limit: Stop admitting documents once this many survived the
-            last stage; the rest never run.
-        survival: The fraction of documents expected to survive every
-            stage, or None. Under a limit, documents are admitted only
-            while the ones in flight are expected to fall short of it.
-        stop_groups: Per document, its stop key group, or None. One
-            document of a group runs at a time, and once one survives
-            the last stage the group's queued documents never run.
-        paged: Whether documents' KV is written to arena pages. False
-            runs one stage of one suffix per document as a single
-            causal segment without pages: the filter fast path.
-        unit: The progress unit.
-        count_answers: Whether progress counts answers, one per partner
-            of each document at each stage, instead of finished documents.
-        label: The progress label; None names the stages.
-        default_attention: The attention path when the plan chose none
-            and the model has tree attention.
-        on_chunk: Optional callable run after each chunk's answers are
-            read with the documents that completed a stage in it, as
-            (document index, stage, passed) tuples: passed says the
-            document went on to the next stage, or survived the last.
-        on_answers: Optional callable(document index, stage, start, end,
-            rows) run as each chunk's answers are read, with the
-            document's answer rows for its requests start to end at
-            the stage.
-        appended_tokens: The most tokens the append stages leave after
-            a document's frame, when stages discard tokens earlier ones
-            added; None sums every append stage's longest suffix.
-
-    Returns:
-        A tuple of answers, timing spans, and fresh token count. Answers is
-        one document-indexed mapping per stage. Each span contains a mapping
-        of stage indices to packed row counts, the chunk token count, and
-        start and end CUDA events.
+        questions: Each question's tokens, in order.
+        slots: Each read row, counted back from its question's last row;
+            or, per question, its own such rows.
     """
-    from quail.backends.quail.executor.stage_executor import StageExecutor
-
-    if not stages:
-        return [], [], 0
-    return StageExecutor(
-        torch, arena, pipeline, stages, anchor_prefixes, budget,
-        anchor_keys=anchor_keys, on_settled=on_settled, staging=staging,
-        attention_mode=attention_mode, prefix_tree=prefix_tree, stats=stats,
-        limit=limit, survival=survival, paged=paged or pipeline.needs_pages,
-        unit=unit, count_answers=count_answers,
-        label=label, default_attention=default_attention, on_chunk=on_chunk,
-        on_answers=on_answers, stop_groups=stop_groups,
-        appended_tokens=appended_tokens, gpu_timing=gpu_timing,
-    ).run()
+    mask = np.zeros(int(sum(questions)), dtype=bool)
+    ends = np.cumsum(questions) - 1
+    if slots and isinstance(slots[0], tuple):
+        for end, own in zip(ends, slots):
+            mask[end + np.asarray(own, dtype=np.int64)] = True
+        return mask
+    for slot in slots:
+        mask[ends + slot] = True
+    return mask
 
 
 def state_share_points(parents, shared, limit=None):

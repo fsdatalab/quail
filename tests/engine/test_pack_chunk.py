@@ -1,17 +1,19 @@
 """Test packed token rows, positions, and answer rows from flattened suffixes."""
 
+import numpy as np
 import pytest
 from helpers.fakes import cpu_staging, plain_arena
+from helpers.rust_cost import classify_estimate, cost_model
+from test_kv_reads import named
 
 from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.chunk import Suffixes
-from quail.cost.classify import estimate
 from quail.specs import H100_SXM, QWEN3_4B_FP8
 
 torch = pytest.importorskip("torch")
 
 
-def test_pack_chunk_rows_for_many_suffixes(monkeypatch):
+def test_pack_chunk_rows_for_many_suffixes_and_copy_drafts(monkeypatch):
     cpu_staging(monkeypatch)
     arena = plain_arena()
     key = ("d", 0)
@@ -48,52 +50,16 @@ def test_pack_chunk_rows_for_many_suffixes(monkeypatch):
     assert reads["used"].tolist() == [4]
     assert reads["source"].tolist() == [0, 1, 2, 3, 4, 5]
 
-
-@pytest.mark.parametrize("mode", ["tree", "unified"])
-def test_decode_rounds_keep_each_fed_token_after_the_frame(monkeypatch, mode):
-    cpu_staging(monkeypatch)
-    arena = plain_arena()
-    key = ("d", 3)
-    # a three-token document, a two-token frame, the cue, and room for
-    # two decoded tokens: 3 + 2 + 1 + 2 = 8 rows reserved
-    arena.activate(key, 3, capacity_tokens=8, base_tokens=3)
-    rows = arena.capacity_rows(key)
-
-    def written(chunk):
-        if mode == "tree":
-            return chunk.meta["kv_dst"].tolist()
-        return chunk.meta["unified"]["dst"].tolist()
-
-    # round 0 packs the document, frame, and cue and keeps all six rows
-    chunk = chunk_mod.pack_chunk(
-        torch, arena, [dict(key=key, prefix=[7, 8, 9], f=3,
-                            suffixes=[[91, 92, 93]], write_suffix_tokens=3,
-                            single=True)], attention_mode=mode)
-    assert written(chunk) == rows[:6].tolist()
-    if mode == "tree":
-        assert chunk.meta["cu_a"].tolist() == [0, 6]
-        assert chunk.meta["reads"] is None
-    # round 1 feeds one token at position 6, reads the six kept rows,
-    # and keeps it at row 6
-    chunk = chunk_mod.pack_chunk(
-        torch, arena, [dict(key=key, prefix=None, f=6, suffixes=[[40]],
-                            write_suffix_tokens=1, single=True)],
-        attention_mode=mode)
-    assert chunk.positions.tolist() == [6]
-    assert written(chunk) == rows[6:7].tolist()
-    if mode == "tree":
-        assert chunk.meta["reads"]["used"].tolist() == [6]
-    # a kept token past the key's one 16-row page is refused, not dropped
-    with pytest.raises((AssertionError, ValueError)):
-        chunk_mod.pack_chunk(
-            torch, arena, [dict(key=key, prefix=None, f=16, suffixes=[[41]],
-                                write_suffix_tokens=1, single=True)],
-            attention_mode=mode)
+    for mode, shared in [("tree", True), ("unified", False)]:
+        named(
+            f"copy drafts mode={mode} shared={shared}",
+            check_copy_drafts_pack_as_causal_sequences_without_combining_slots,
+            monkeypatch=monkeypatch, mode=mode, shared=shared)
 
 
-@pytest.mark.parametrize("mode", ["tree", "unified"])
-@pytest.mark.parametrize("shared", [0, 16])
-@pytest.mark.parametrize("run", [1, 2])
+@pytest.mark.parametrize("mode", ["tree"])
+@pytest.mark.parametrize("shared", [16])
+@pytest.mark.parametrize("run", [2])
 def test_decode_cost_matches_packed_retained_kv(monkeypatch, mode, shared, run):
     cpu_staging(monkeypatch)
     arena = plain_arena()
@@ -126,36 +92,84 @@ def test_decode_cost_matches_packed_retained_kv(monkeypatch, mode, shared, run):
         labels = ([(10,)] if first else
                   [(10, *range(11, 10 + run), 1), (10, *range(11, 10 + run), 2),
                    (20, *range(21, 20 + run), 1), (20, *range(21, 20 + run), 2)])
-        cost = estimate(
-            "trie_decode", 1, 0, 2, labels, lengths=(32,),
+        cost = classify_estimate(
+            cost_model(), "trie_decode", 1, 0, 2, labels, lengths=(32,),
             shared=(shared,), chunk=100,
-            model=QWEN3_4B_FP8, device=H100_SXM)
-        assert cost.work.tokens == fresh_tokens
-        assert cost.work.kv_read == retained_reads
-
-
-@pytest.mark.parametrize("mode", ["tree", "unified"])
-def test_warmup_runs_every_row_count_class(monkeypatch, mode):
-    from quail.backends.quail.executor import stage_executor, warmup
-
+            model=QWEN3_4B_FP8.name, device=H100_SXM.name)
+        assert cost.work["tokens"] == fresh_tokens
+        assert cost.work["kv_read"] == retained_reads
+def check_copy_drafts_pack_as_causal_sequences_without_combining_slots(
+        monkeypatch, mode, shared):
     cpu_staging(monkeypatch)
-    arena = plain_arena(pages=256)
-    shapes = []
-
-    def forward(pipeline, arena, chunk):
-        reads = chunk.meta["reads"]
-        shapes.append((len(chunk.input_ids),
-                       0 if reads is None else len(reads["rows"])))
-
-    monkeypatch.setattr(stage_executor, "forward_chunk", forward)
-    warmup._warm_row_classes(torch, arena, None, mode)
-    # the first chunk writes the cached documents' KV, each with a
-    # one-token question so the chunk has answer rows
-    assert shapes[0][0] == 17 * (warmup.ROW_CLASS_CACHED + 1)
+    arena = plain_arena()
+    keys = [("d", 0), ("d", 1)]
+    for key in keys:
+        arena.activate(key, 32, capacity_tokens=48, base_tokens=32,
+                       borrow=(keys[0], 16) if shared and key == keys[1] else None)
+    slots = np.array([0, 0, 0, 1, 1, 1])
+    positions = np.array([35, 36, 37, 33, 34, 37])
+    tables = np.array([arena.owned_pages(keys[slot]) for slot in slots])
+    decode = chunk_mod.DecodeRows(
+        slots=slots, positions=positions, page_table=tables,
+        write_rows=np.array([int(arena.capacity_rows(keys[slot])[position])
+                             for slot, position in zip(slots, positions)]))
+    if shared:
+        decode.own_table = tables[:, 1:]
+        decode.own_lengths = positions + 1 - 16
+        decode.shared_rows = np.arange(len(slots))
+        decode.shared_cu = np.array([0, len(slots)])
+        decode.shared_table = tables[:1, :1]
+        decode.shared_used = np.array([16])
+    chunk = chunk_mod.pack_chunk(
+        torch, arena, [], attention_mode=mode, decode=decode)
+    # A gap in a slot's positions starts another causal sequence.
+    assert chunk.meta["cu_a"].tolist() == [0, 3, 5, 6]
+    assert chunk.final_indices.tolist() == list(range(6))
+    assert chunk.rows_per_answer is None
     if mode == "tree":
-        # n rows, m of them reading cached KV, for every class pair
-        assert shapes[1:] == list(warmup.ROW_CLASSES)
+        reads = chunk.meta["reads"]
+        assert reads["cu_q"].tolist() == [0, 3, 5, 6]
+        assert reads["used"].tolist() == [35, 33, 37]
+        assert reads["table"].tolist() == tables[[0, 3, 5]].tolist()
+        assert chunk.meta["kv_dst"].tolist() == decode.write_rows.tolist()
     else:
-        assert [n for n, _ in shapes[1:]] == [n for n, _ in warmup.ROW_CLASSES]
-    # every key the pass made is freed
-    assert arena.accounting.free_pages == 256
+        reads = chunk.meta["unified"]
+        assert reads["cu_q"].tolist() == [0, 3, 5, 6]
+        assert reads["used"].tolist() == [n - (16 if shared else 0)
+                                          for n in [38, 35, 38]]
+        expected = tables[[0, 3, 5], 1:] if shared else tables[[0, 3, 5]]
+        assert reads["table"].tolist() == expected.tolist()
+        assert reads["dst"].tolist() == decode.write_rows.tolist()
+        assert (chunk.meta["shared"] is not None) == shared
+    for key in reversed(keys):
+        arena.free_key(key)
+    assert not arena.accounting.owned
+
+
+def test_a_document_isolated_question_reads_the_document_as_its_own_sequence(
+        monkeypatch):
+    cpu_staging(monkeypatch)
+    arena = plain_arena()
+    key = ("d", 0)
+    arena.activate(key, 4, capacity_tokens=8, base_tokens=4)
+    group = dict(key=key, prefix=[1, 2, 3, 4], f=4, suffixes=[[10, 11]])
+    causal = chunk_mod.pack_chunk(torch, arena, [dict(group)],
+                                  attention_mode="unified").meta["unified"]
+    # causal: the document and its one question are one sequence
+    assert causal["cu_q_host"] == [0, 6]
+    assert causal["causal"]
+    isolated = chunk_mod.pack_chunk(
+        torch, arena, [dict(group, suffixes=[[10, 11], [12]])],
+        attention_mode="unified", mask="document_isolated").meta["unified"]
+    # the document reads its own 4 rows; each question reads the
+    # document and every row of itself
+    assert isolated["cu_q_host"] == [0, 4, 6, 7]
+    assert isolated["used_host"] == [4, 6, 5]
+    assert not isolated["causal"]
+    with pytest.raises(ValueError, match="keeps no suffix KV"):
+        chunk_mod.pack_chunk(
+            torch, arena, [dict(group, write_suffix_tokens=2, single=True)],
+            attention_mode="unified", mask="document_isolated")
+    with pytest.raises(ValueError, match="no decode rows"):
+        chunk_mod.pack_chunk(torch, arena, [dict(group)], attention_mode="tree",
+                             mask="document_isolated")

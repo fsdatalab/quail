@@ -8,8 +8,16 @@ Prints pytest's output and fails when a test fails.
 import modal
 
 from quail.deploy.images import gpu_image
+from quail.specs import modal_gpu_type
 
-image = gpu_image(("tests/gpu", "/root/tests/gpu"))
+# Liquid's d1 code needs a newer transformers than the project pins; the
+# d1 test's reference process reads it from this folder alone
+D1_REFERENCE_PACKAGES = "/opt/d1-reference"
+image = gpu_image(
+    ("tests/gpu", "/root/tests/gpu"),
+    commands=(f"/usr/local/bin/python3 -m pip install --quiet --target "
+              f"{D1_REFERENCE_PACKAGES} "
+              f"transformers==5.19.0",)).add_local_python_source("experiments")
 
 app = modal.App("quail-milestone1")
 volumes = {
@@ -33,8 +41,8 @@ def run_tests(keyword: str = "") -> int:
 
 
 @app.local_entrypoint()
-def main(keyword: str = ""):
-    call = run_tests.spawn(keyword)
+def main(keyword: str = "", device: str = "h100-sxm"):
+    call = run_tests.with_options(gpu=modal_gpu_type(device)).spawn(keyword)
     print(f"function call id: {call.object_id}", flush=True)
     code = call.get()
     print(f"pytest exit code: {code}", flush=True)

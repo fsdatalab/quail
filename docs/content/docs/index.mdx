@@ -1,63 +1,30 @@
 ---
 title: Introduction
+full: true
 ---
 
-Quail (QUery Aware Inference Layer) is an open-source, extensible
-query engine for AI functions in SQL. We develop Quail at
-[Full Stack Data Lab](https://fsdatalab.github.io/) at CMU.
+<HomeHero />
 
-You can use AI functions to write instructions in natural language
-for a language model to evaluate on your data.
+<HomeGuides />
 
-For example, imagine a `reviews` table with a movie review ID in `id`
-and review text in `body`. The query below returns the IDs of reviews
-that discuss the movie's ending:
+<HomeSection
+  title="AI functions"
+  description="Each AI function returns one answer per row. SQL uses the answer like any other value."
+>
+  <HomeFunctions />
+</HomeSection>
 
-```sql
-SELECT r.id
-FROM reviews r
-WHERE AI.IF(PROMPT('Does this review discuss the ending?\n\n{0}', r.body));
-```
-
-The model answers the question for each review. Quail returns the
-review ID when the answer is `TRUE`.
-
-Quail supports AI functions for filtering rows, joining tables,
-scoring documents, and assigning classification labels. You can also
-use `EXISTS` and `NOT EXISTS` in queries. See the
-[SQL reference](/docs/user-guide/sql) for the supported functions.
-
-Quail supports two AI-SQL dialects
-([Snowflake](https://docs.snowflake.com/en/user-guide/snowflake-cortex/aisql)
-and
-[BigQuery](https://cloud.google.com/blog/products/data-analytics/sql-reimagined-for-the-ai-era-with-bigquery-ai-functions))
-and a [Python builder API](/docs/user-guide/python-api).
-
-## Requirements
-
-- Python 3.12
-- Qwen3 4B fp8, Qwen3 32B fp8, or DiffusionGemma 26B-A4B fp8
-  ([all models](/docs/user-guide/models))
-- One CUDA GPU per model copy (local, or on
-  [Modal](/docs/user-guide/models#no-local-gpu-use-modal))
-
-## Get started
-
-Install [quail-engine from PyPI](https://pypi.org/project/quail-engine/):
+<HomeSection
+  title="Install"
+  description="Quail needs Python 3.12 and a supported CUDA GPU."
+>
 
 ```bash
 uv pip install quail-engine
 ```
 
-<Cards>
-  <Card title="Quickstart" href="/docs/user-guide/quickstart"
-        description="Install Quail and run an AI filter on 100K reviews." />
-  <Card title="SQL reference" href="/docs/user-guide/sql"
-        description="Filters, joins, prompts, and what SQL Quail accepts." />
-  <Card title="Python API" href="/docs/user-guide/python-api"
-        description="Build queries in Python instead of SQL." />
-  <Card title="Models and GPUs" href="/docs/user-guide/models"
-        description="Supported hardware and running on Modal." />
-  <Card title="Demos" href="/docs/demos"
-        description="Run end-to-end examples with Quail." />
-</Cards>
+The package is `quail-engine`, and you import it as `quail`. With no
+local GPU, run Quail on [Modal](/docs/user-guide/models#no-local-gpu-use-modal)
+or connect to [Quail Server](/docs/user-guide/server).
+
+</HomeSection>

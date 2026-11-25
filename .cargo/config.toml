@@ -1,0 +1,23 @@
+# lld links the DataFusion-sized test binaries and Python module several
+# times faster than the system linker
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+# On macOS maturin links the Python module with these flags, passed as
+# RUSTFLAGS to every crate. Changed RUSTFLAGS recompile every crate, so if
+# cargo test, cargo build and rust-analyzer ran without them, each switch
+# between them and `uv sync` would recompile all of DataFusion. With the
+# flags here, maturin finds them already set and adds nothing, and every
+# build shares one set of compiled dependencies.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
+
+# pyo3 builds against the project's Python, the one an embedded
+# interpreter loads Quail from (crates/quail-python/tests). Not forced: maturin
+# sets its own, the base interpreter (use-base-python in pyproject.toml).
+[env]
+PYO3_PYTHON = { value = ".venv/bin/python", relative = true }

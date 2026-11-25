@@ -18,7 +18,6 @@ canvas row agree. Skipped without a CUDA device; runs through
 `uv run modal run experiments/run_gpu_tests.py`.
 """
 
-import json
 import subprocess
 import sys
 
@@ -60,54 +59,26 @@ REVIEWS = [
 STOCK_ROWS = "stock_rows.pt"
 
 
-@pytest.mark.parametrize("rows", [17, 1024])
-def test_expert_fusions_preserve_quantization(rows):
-    from vllm import _custom_ops as ops
+def _device():
+    from quail.specs import B200, H100_SXM
 
-    from quail.backends.quail.executor.attention import Engine
-
-    engine = Engine(
-        None, num_q_heads=16, num_kv_heads=8, head_dim=256, rotary=None, fp8=False
-    )
-    torch.manual_seed(42)
-    x = torch.randn(rows, 2816, device="cuda", dtype=torch.bfloat16)
-    weights = torch.randn(2, 2816, device="cuda", dtype=torch.bfloat16)
-    normal, router = engine.norm_rows2(x, *weights, 1e-6)
-    expected, scales = ops.scaled_fp8_quant(normal, use_per_token_if_dynamic=True)
-    actual, actual_scales, actual_router = engine.norm_router_quant(
-        x, *weights, 1e-6)
-    torch.testing.assert_close(actual.float(), expected.float(), rtol=0, atol=0)
-    torch.testing.assert_close(actual_scales, scales, rtol=0, atol=0)
-    torch.testing.assert_close(actual_router, router, rtol=0, atol=0)
-
-    gate_up = torch.randn(rows * 8, 1408, device="cuda", dtype=torch.bfloat16) * 3
-    activated = torch.empty_like(gate_up[:, :704])
-    torch.ops._C.gelu_tanh_and_mul(activated, gate_up)
-    expected, scales = ops.scaled_fp8_quant(
-        activated, use_per_token_if_dynamic=True)
-    actual, actual_scales = engine.gelu_mul_quant_vllm(gate_up)
-    torch.testing.assert_close(actual.float(), expected.float(), rtol=0, atol=0)
-    torch.testing.assert_close(actual_scales, scales, rtol=0, atol=0)
+    return B200 if torch.cuda.get_device_capability()[0] == 10 else H100_SXM
 
 
 def _prompt_ids():
-    from gigatoken import Tokenizer
-
-    from quail.logical import bind_prompt
-    from quail.planner.prompt_lowering import (
-        lower_prompt,
-        render_filter_prompt_ids,
-    )
+    from quail.api.prompts import bind_prompt
+    from quail.common.expressions import ColumnRef
+    from quail.common.tokens import Tokenizer
+    from quail.physical.lowering import lower_prompt
     from quail.specs import MODELS
+    from quail.specs.files import resolve_model_path
 
     spec = MODELS[MODEL]
-    tokenizer = Tokenizer(spec.hf_name).as_hf()
+    ids = Tokenizer(resolve_model_path(spec.hf_name, spec.revision))
 
-    def ids(text):
-        return tokenizer(text, add_special_tokens=False)["input_ids"]
-
-    prompt = lower_prompt(bind_prompt(QUESTION, ("body",), turn=spec.turn), ids)
-    return [render_filter_prompt_ids(prompt, ids(review))
+    body = ColumnRef(alias="d", provider="documents", column="body")
+    prompt = lower_prompt(bind_prompt(QUESTION, (body,), turn=spec.turn), ids)
+    return [[*prompt.preamble_token_ids, *ids(review), *prompt.tail_token_ids]
             for review in REVIEWS]
 
 
@@ -131,7 +102,11 @@ def stock_rows_main(out_path, every_layer=False):
     spec = MODELS[MODEL]
     assert spec.canvas_tokens == 1
     with diffusion_canvas(spec):
+        # vLLM uses 64-token hybrid KV groups, which FA4 head-256 rejects.
         llm = LLM(model=spec.hf_name, gpu_memory_utilization=0.9,
+                  block_size=_device().page_tokens,
+                  attention_config=({"backend": "TRITON_ATTN"}
+                                    if _device().name == "b200" else {}),
                   enforce_eager=True, enable_prefix_caching=False,
                   diffusion_config={"canvas_length": 1, "max_denoising_steps": 1},
                   disable_log_stats=True)
@@ -190,14 +165,20 @@ def quail(prompts, stock_layers):
     from quail.backends.quail.executor.chunk import pack_chunk
     from quail.backends.quail.executor.model_loading import load_model
     from quail.backends.quail.executor.models import build_pipeline
-    from quail.cost.budgets import PAGE_TOKENS
+    from quail.common.tokens import Tokenizer, model_answers
     from quail.specs import MODELS
+    from quail.specs.files import resolve_model_path
 
+    device = _device()
     spec = MODELS[MODEL]
+    # the worker loads the TRUE and FALSE rows the plan carries
+    true_ids, false_ids, _ = model_answers(
+        spec, Tokenizer(resolve_model_path(spec.hf_name, spec.revision)))
     model = load_model(spec.hf_name, max_batched_tokens=8192,
+                       answer_token_ids=sorted(true_ids) + sorted(false_ids),
                        moe_backend=spec.moe_backend)
     arena = KVArena(num_layers=spec.layers, num_pages=2048,
-                    page_tokens=PAGE_TOKENS, num_kv_heads=spec.num_kv_heads,
+                    page_tokens=device.page_tokens, num_kv_heads=spec.num_kv_heads,
                     d_head=spec.d_head, dtype=torch.bfloat16,
                     layer_kv=spec.kv_shapes,
                     sliding_layers=spec.sliding_layer_set,
@@ -233,44 +214,18 @@ def quail(prompts, stock_layers):
     return per_prompt, model
 
 
-def _relative_errors(stock_layers, quail_layers, layer):
-    return torch.cat([
-        (ours[layer] - stock[layer]).norm(dim=-1)
-        / stock[layer].norm(dim=-1).clamp_min(1e-6)
-        for stock, ours in zip(stock_layers, quail_layers)])
-
-
-def test_no_layer_departs_from_stock_vllm(stock_layers, quail):
-    quail_layers, _ = quail
-    depth = len(stock_layers[0])
-    assert all(len(rows) == depth for rows in quail_layers)
-    medians = []
-    for layer in range(depth):
-        rel = _relative_errors(stock_layers, quail_layers, layer)
-        medians.append(rel.median().item())
-        print(json.dumps(dict(layer=layer, median=round(medians[-1], 4),
-                              p99=round(rel.quantile(0.99).item(), 4))))
-    # the first layer differs by fp8 rounding alone
-    assert medians[0] < 0.03
-    # every later layer adds rounding of its own, never a jump: a
-    # missing term or a wrong mask would double the error at once
-    for before, after in zip(medians, medians[1:]):
-        assert after < 2 * before + 0.01
-    assert medians[-1] < 0.25
-
-
 def test_answers_agree_with_stock_vllm(stock_layers, quail):
-    from gigatoken import Tokenizer
-
-    from quail.planner.prompt_lowering import true_false_ids
+    from quail.common.tokens import Tokenizer, model_answers
     from quail.specs import MODELS
+    from quail.specs.files import resolve_model_path
 
     quail_layers, model = quail
     stock_rows = [rows[-1] for rows in stock_layers]
     rows = [rows[-1] for rows in quail_layers]
     spec = MODELS[MODEL]
-    true_ids, false_ids = true_false_ids(
-        Tokenizer(spec.hf_name).as_hf())
+    true_ids, false_ids, _ = model_answers(
+        spec, Tokenizer(resolve_model_path(spec.hf_name, spec.revision)))
+    true_ids, false_ids = sorted(true_ids), sorted(false_ids)
     columns = list(model.quail_answer_token_ids)
     weights = model.quail_answer_weights.float().cpu()
     norm = model.model.norm

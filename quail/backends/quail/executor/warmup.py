@@ -3,32 +3,15 @@
 import time
 
 from quail.backends.quail.executor.model_loading import full_output_head
-from quail.backends.quail.executor.stages import Stage, filter_stages, run_stages
+from quail.backends.quail.executor.readout import AsyncSlotMargins
+from quail.backends.quail.executor.stage_executor import StageExecutor
+from quail.backends.quail.executor.stages import Stage, filter_stages
 from quail.progress import Progress, logger, quiet
 
-# ------------------------------------------------------------- warmup
-#
-# compile_kernels JIT-compiles (nvcc/Triton) each kernel configuration
-# once per (software stack, GPU, model, budget) into the libraries'
-# kernel directories; a marker file records that the pass ran.
-# touch_kernels loads the cached binaries once per GPU process.
-#
-# Kernels key on token counts and model constants, never on token
-# values, so both passes run on synthetic ids.
+WARMUP_VERSION = 18
 
-# Bump when either pass covers a different set of shapes. A bumped
-# version invalidates every marker, so the next boot re-runs the
-# compile pass.
-WARMUP_VERSION = 8
-
-# Triton compiles one copy of a kernel for each class of its integer
-# arguments: equal to 1, a multiple of 16, or neither. Quail's row
-# dependent strides come from a chunk's row count n and, under tree
-# attention, the count m of its rows that read cached KV (m <= n).
-# These (n, m) pairs cover every class pair.
 ROW_CLASSES = ((1, 1), (32, 1), (32, 16), (32, 17),
                (33, 1), (33, 16), (33, 17))
-# tokens of each cached document the reading rows attend to
 ROW_CLASS_CACHED = 64
 
 
@@ -52,7 +35,6 @@ def _warm_convolutions(torch, pipeline, budget):
     """Compile and load convolution kernels for every private state capacity."""
     from quail.backends.quail.executor.gdn import GdnPhase, causal_conv_kernel
 
-    # Each sequence uses at least one token of the chunk budget.
     largest = 1 << (budget - 1).bit_length()
     for weight, bias, activate in pipeline.convolutions():
         channels, width = weight.shape
@@ -67,6 +49,89 @@ def _warm_convolutions(torch, pipeline, budget):
                                bias, activate)
 
 
+def _warm_recurrent(torch, arena, pipeline):
+    """Compile the recurrent decode kernels on the arena's state rows.
+
+    The one sequence names state row 0, which holds no checkpoint, so the
+    launch leaves every checkpoint as it was.
+    """
+    from types import SimpleNamespace
+
+    from quail.backends.quail.executor.gdn import (
+        GdnPhase,
+        _decode_conv_kernel,
+        copy_slots,
+        gdn_decode_step,
+    )
+
+    spec = getattr(pipeline, "spec", None)
+    if (getattr(arena, "gdn_state_rows", None) is None
+            or not getattr(spec, "gdn_value_heads", 0)):
+        return
+    device = arena.gdn_state_rows.device
+    heads, dim = spec.gdn_key_heads, spec.gdn_key_dim
+    value_heads, value_dim = spec.gdn_value_heads, spec.gdn_value_dim
+    conv_out = torch.zeros((1, 2 * heads * dim + value_heads * value_dim),
+                           dtype=torch.bfloat16, device=device)
+    gate = torch.zeros((1, value_heads), dtype=torch.bfloat16, device=device)
+    params = torch.zeros(value_heads, dtype=torch.float32, device=device)
+    row = torch.zeros(1, dtype=torch.int64, device=device)
+    gdn_decode_step(
+        conv_out, gate, gate, params, params, arena.gdn_state_rows[:, 0], row,
+        torch.empty((1, value_heads, value_dim), dtype=torch.bfloat16,
+                    device=device),
+        num_key_heads=heads, scale=dim ** -0.5)
+    copy_slots(arena.gdn_state_rows[:, 0], row, row)
+    copy_slots(arena.conv_state[:, 0], row, row)
+    phase = GdnPhase(
+        rows=None, lengths=(1,),
+        cu_seqlens=torch.tensor([0, 1], dtype=torch.int32, device=device),
+        state_rows=row,
+        write_slots_i32=torch.zeros(1, dtype=torch.int32, device=device))
+    for weight, bias, _ in pipeline.convolutions():
+        channels, width = weight.shape
+        scratch = SimpleNamespace(
+            conv_state=weight.new_zeros((1, 1, width - 1, channels)))
+        _decode_conv_kernel(weight.new_zeros((1, channels)), weight, bias,
+                            scratch, phase, 0)
+
+
+def _warm_short_attention(torch, arena, pipeline):
+    """Compile both split regimes of the Triton short-query attention kernel.
+
+    Single-split (one page) and multi-split (two pages) cover every batch
+    size, query length, and alignment.
+    """
+    from quail.backends.quail.executor.attention import supports_splitkv_decode
+
+    engine = getattr(pipeline, "engine", None)
+    attn = getattr(getattr(pipeline, "attention_layer", None), "self_attn", None)
+    if (engine is None or attn is None
+            or not supports_splitkv_decode(
+                engine.fa_version, attn.head_dim, arena.page_tokens,
+                attn.num_heads, attn.num_kv_heads, causal=True, max_q=1)):
+        return
+    device = arena.conv_state.device if arena.conv_state is not None else "cuda"
+    pages = torch.zeros((2, arena.page_tokens, attn.num_kv_heads, attn.head_dim),
+                        dtype=torch.bfloat16, device=device)
+    q = torch.zeros((1, attn.num_heads, attn.head_dim),
+                    dtype=torch.bfloat16, device=device)
+    cu = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    for num_pages in (1, 2):
+        used_tokens = num_pages * arena.page_tokens
+        table = torch.arange(num_pages, dtype=torch.int32, device=device).view(
+            1, num_pages)
+        engine.triton_paged(
+            q, pages, pages, cu, 1,
+            torch.tensor([used_tokens], dtype=torch.int32, device=device),
+            used_tokens, table)
+
+
+def _warm_run(*args, **kwargs):
+    """Run warm-up stages; their log lines say warm-up, not a query stage."""
+    return StageExecutor(*args, label="kernel warmup", summary=False, **kwargs).run()
+
+
 def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
                   join_chunk):
     """Run real forward passes over every attention path.
@@ -76,25 +141,32 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
     classification chunk.
     """
     _warm_convolutions(torch, pipeline, budget)
-    # a readout of several trailing rows needs a question that long
+    _warm_recurrent(torch, arena, pipeline)
+    _warm_short_attention(torch, arena, pipeline)
     trailing = 1 if async_ans is None else async_ans.trailing_rows
     warm_documents, question, document = _warm_inputs(budget, max(16, trailing))
     q_max = len(question)
     modes = ("unified", "tree") if pipeline.tree_attention else ("unified",)
     for mode in modes:
         logger.debug("kernels: warming %s attention, full chunk", mode)
-        run_stages(
+        _warm_run(
             torch, arena, pipeline,
             filter_stages([question], async_ans), warm_documents, budget,
             attention_mode=mode)
-        # small chunks, one document each: the trailing-chunk shapes
-        # of gated multi-stage runs (see ModelPipeline.warm_tokens)
+        for count in (2, 8):
+            if arena.num_state_slots >= count and len(warm_documents) >= count:
+                _warm_run(
+                    torch, arena, pipeline,
+                    [Stage(suffixes=[question], readout=async_ans,
+                           decide=lambda _, row: True),
+                     Stage(suffixes=[question], readout=async_ans)],
+                    warm_documents[:count], budget, attention_mode=mode)
         for t in pipeline.warm_tokens:
             if t >= budget:
                 continue
             logger.debug("kernels: warming %s attention, %s tokens", mode, t)
             body = (document * (t // len(document) + 1))[:max(8, t - q_max)]
-            run_stages(
+            _warm_run(
                 torch, arena, pipeline,
                 filter_stages([question], async_ans), [body], budget,
                 attention_mode=mode)
@@ -105,21 +177,27 @@ def _forward_warm(torch, arena, pipeline, async_ans, budget, *,
     join_chunk = join_chunk and getattr(pipeline, "warm_joins", True)
     if join_chunk:
         logger.debug("kernels: warming join forward pass")
-        run_stages(
+        _warm_run(
             torch, arena, pipeline,
             [Stage(suffixes=[question] * 8, readout=async_ans)], warm_documents, budget)
     if join_chunk and trailing == 1:
-        # a classification: the question as the frame after each
-        # document, then many short suffixes of mixed lengths; a
-        # decision model classifies with its own readout
         logger.debug("kernels: warming classification forward pass")
         labels = [question[:1 + i % 6] for i in range(26)]
-        run_stages(
+        _warm_run(
             torch, arena, pipeline,
             [Stage(suffixes=labels, readout=async_ans, frame=question)],
             warm_documents, budget)
+    if pipeline.whole_sequences and async_ans is not None:
+        logger.debug("kernels: warming a set-attention pass of two questions")
+        half = len(question) // 2
+        _warm_run(
+            torch, arena, pipeline,
+            [Stage(suffixes=[question], readout=AsyncSlotMargins(
+                torch, async_ans.rows), questions=((half, len(question) - half),),
+                decide=lambda _, row: True)],
+            warm_documents, budget, paged=False)
     logger.debug("kernels: warming filter without KV writes")
-    run_stages(
+    _warm_run(
         torch, arena, pipeline,
         filter_stages([question], async_ans), warm_documents, budget,
         paged=False, default_attention="unified")
@@ -130,7 +208,9 @@ def _warm_row_classes(torch, arena, pipeline, attention_mode):
 
     Each chunk holds m one-token rows that read a cached document and
     keep their token's KV, as greedy decode rounds do, and one fresh
-    filler document that brings the chunk to n rows.
+    filler document that brings the chunk to n rows. A hybrid model
+    whose arena has too few checkpoint slots for the warm documents skips
+    the passes, and a query compiles the kernels when it first runs them.
 
     Args:
         torch: The torch module.
@@ -143,15 +223,18 @@ def _warm_row_classes(torch, arena, pipeline, attention_mode):
 
     cached = ROW_CLASS_CACHED
     readers = max(m for _, m in ROW_CLASSES)
+    needed = 2 * readers + 1
+    slots = getattr(arena, "num_state_slots", 0)
+    if slots and slots < needed:
+        logger.debug("kernels: %d checkpoint slots, %d needed for the row "
+                     "classes; skipping", slots, needed)
+        return
     keys = [("warm-rows", index) for index in range(readers)]
     prefix = list(range(10, 10 + cached))
     for key in keys:
         arena.activate(key, cached, capacity_tokens=cached + 1,
                        base_tokens=cached)
     try:
-        # a forward pass ends in a norm over its answer rows, which
-        # fails with a CUDA error when there are none: each document
-        # takes a one-token question whose answer is not read
         forward_chunk(pipeline, arena, pack_chunk(
             torch, arena, [dict(key=key, prefix=prefix, f=cached, suffixes=[[11]])
                            for key in keys], attention_mode=attention_mode))
@@ -192,9 +275,6 @@ def warm_label_readout(torch, head):
     block = AsyncLabelLogprobs.BLOCK_ROWS
     hidden = torch.zeros((block + 300, head.shape[1]), dtype=torch.bfloat16,
                          device=head.device)
-    # a kernel's first launch waits for the GPU's queued work, which in
-    # a query is a whole forward pass; PyTorch selects up to 16 indices
-    # with one kernel and more with another
     for targets in (16, 128):
         for normalize, rows in ((True, 1), (True, 4), (False, 1)):
             readout = AsyncLabelLogprobs(torch, torch.nn.functional, head,
@@ -206,11 +286,18 @@ def warm_label_readout(torch, head):
                     rows_per_answer=[1] * count if rows > 1 else None))
 
 
-def compile_kernels(torch, arena, pipeline, async_ans, budget):
-    """Build every DeepGEMM kernel configuration, then warm every path.
+def _triton_warmup_m_values(budget: int) -> list[int]:
+    """Token counts that compile the Ada block-FP8 GEMM tiles."""
+    return sorted({min(n, budget) for n in (1, 16, 64, 256, 1024, budget)})
 
-    Uses vLLM's warmup heuristic to list every token count up to the
-    budget at which the chosen GEMM configuration changes. A pipeline
+
+def compile_kernels(torch, arena, pipeline, async_ans, budget):
+    """Build every GEMM kernel configuration, then warm every path.
+
+    On DeepGEMM devices, uses vLLM's warmup heuristic to list every
+    token count up to the budget at which the chosen GEMM
+    configuration changes. On L40S, walks a few token counts through
+    the same Triton block-FP8 kernel Engine.gemm uses. A pipeline
     without gemm_warmup skips the GEMM sweep. Runs once per (software
     stack, GPU, model, budget).
     """
@@ -218,19 +305,21 @@ def compile_kernels(torch, arena, pipeline, async_ans, budget):
         _forward_warm(torch, arena, pipeline, async_ans, budget,
                       join_chunk=True)
         return
-    from vllm.model_executor.warmup.deep_gemm_warmup import (
-        _generate_optimal_warmup_m_values,
-    )
     linears = pipeline.linears()
-    work = [(m, lin) for lin in linears
-            for m in _generate_optimal_warmup_m_values(
-                budget, lin.weight.shape[0], torch.device("cuda"))]
+    if pipeline.engine.use_deep_gemm:
+        from vllm.model_executor.warmup.deep_gemm_warmup import (
+            _generate_optimal_warmup_m_values,
+        )
+        work = [(m, lin) for lin in linears
+                for m in _generate_optimal_warmup_m_values(
+                    budget, lin.weight.shape[0], torch.device("cuda"))]
+    else:
+        counts = _triton_warmup_m_values(budget)
+        work = [(m, lin) for lin in linears for m in counts]
     progress = Progress("kernels: GEMM warmup", total=len(work),
                         unit="configurations", emit=logger.info)
-    logger.info("kernels: starting %s GEMM warmup configurations", len(work))
+    logger.info("warming up %s matrix multiply shapes", len(work))
     with torch.inference_mode():
-        # one buffer per linear, row-sliced per call; the sweep only
-        # needs each kernel launched once
         cur, buf = None, None
         for done, (m, lin) in enumerate(work, 1):
             if lin is not cur:
@@ -244,7 +333,7 @@ def compile_kernels(torch, arena, pipeline, async_ans, budget):
         buf = None
         torch.cuda.synchronize()
     progress.finish("kernels: GEMM warmup done")
-    logger.info("kernels: warming filter and join forward passes")
+    logger.info("warming up the forward pass kernels")
     _forward_warm(torch, arena, pipeline, async_ans, budget,
                   join_chunk=True)
 
@@ -307,13 +396,11 @@ def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
         os.makedirs(os.path.dirname(path), exist_ok=True)
         t0 = time.perf_counter()
         tier = "touch"
-        # The marker check, compilation, and publication must be one
-        # operation across processes sharing the kernel directory.
         with open(path + ".lock", "a") as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                logger.info("kernels: waiting for another worker to compile")
+                logger.info("waiting for another worker to compile the kernels")
                 fcntl.flock(lock, fcntl.LOCK_EX)
             wait_s = time.perf_counter() - t0
             on_disk = None
@@ -323,7 +410,7 @@ def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
             except (OSError, ValueError):
                 pass
             if force_compile or on_disk != identity:
-                logger.info("kernels: starting compile pass")
+                logger.info("compiling the kernels")
                 compile_kernels(torch, arena, pipeline, async_ans, budget)
                 torch.cuda.synchronize()
                 tmp = path + ".tmp"
@@ -332,15 +419,15 @@ def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
                 os.replace(tmp, path)
                 tier = "compile"
         if tier == "touch":
-            logger.info("kernels: warming cached filter and join kernels")
+            logger.info("loading the compiled kernels from the cache")
             touch_kernels(torch, arena, pipeline, async_ans, budget)
         if model is not None:
             warm_label_readout(torch, full_output_head(model))
         torch.cuda.synchronize()
         warm_s = round(time.perf_counter() - t0 - wait_s, 2)
         wait_s = round(wait_s, 2)
-        logger.info("kernels: %s pass done in %s s; waited %s s for compilation",
-                    tier, warm_s, wait_s)
+        logger.info("kernels ready in %s s (%s pass, %s s waiting for compilation)",
+                    warm_s, tier, wait_s)
         return dict(tier=tier, warm_s=warm_s, wait_s=wait_s)
 
 

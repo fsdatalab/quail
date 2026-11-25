@@ -1,0 +1,41 @@
+DataFusion:
+CooperativeExec
+  ModelRegionExec: calls=[ai_filter], tables=[issue_runs@s, issue_runs@f]
+    CoalescePartitionsExec
+      FilterExec: resolved@3 = 1, projection=[id@0, patch@1, instance_id@2]
+        RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+          DataSourceExec: file_groups={1 group: [[<data>/issue_runs.parquet]]}, projection=[id, patch, instance_id, resolved], file_type=parquet, predicate=resolved@7 = 1, pruning_predicate=resolved_null_count@2 != row_count@3 AND resolved_min@0 <= 1 AND 1 <= resolved_max@1, required_guarantees=[resolved in (1)]
+    CoalescePartitionsExec
+      FilterExec: resolved@3 = 0, projection=[id@0, patch@1, instance_id@2]
+        RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
+          DataSourceExec: file_groups={1 group: [[<data>/issue_runs.parquet]]}, projection=[id, patch, instance_id, resolved], file_type=parquet, predicate=resolved@7 = 0, pruning_predicate=resolved_null_count@2 != row_count@3 AND resolved_min@0 <= 0 AND 0 <= resolved_max@1, required_guarantees=[resolved in (0)]
+
+model region:
+logical:
+  Projection: s.id, f.id
+    AiNode: __quail_answer_1 = ai_filter(prompt(Utf8("DOCUMENT {0} and DOCUMENT {1} are the patches of two agent runs on the same issue. Does the patch in DOCUMENT {1} take a different approach from the patch in DOCUMENT {0}? Answer TRUE if the two patches change different code or fix the issue in different ways, FALSE if they make essentially the same change."), s.patch, f.patch), named_struct(Utf8("selectivity"), Float64(0.06837606837606838))), inline_predicate: __quail_answer_1, returns: []
+      Inner Join: s.instance_id = f.instance_id
+        SubqueryAlias: s
+          TableScan: issue_runs@s
+        SubqueryAlias: f
+          TableScan: issue_runs@f
+
+physical: backend=quail, model=qwen3-4b-fp8, gpus=1
+  KV=bf16, chunk budget=110,376 tokens, admission budget=362,240 tokens
+  architecture=qwen3 (36 layers), weights=fp8
+  kernels: linear layers: fp8 GEMM (DeepGEMM)
+
+                                                                                                    est. rows   est. pass   est. time
+  AiJoin: anchor=s                                                                                                            1.89 ms
+    KV: anchor=not resident, retain after join=no
+    join 1 full (s, f) over pairs from hash_join:s-f  PROMPT('DOCUMENT {0} and DOCUMENT {1} ar…')           1       6.84%
+    Scan issue_runs as s [1]                                                                                3
+      tokens=48, mean_document_tokens=16
+    Scan issue_runs as f [2]                                                                                3
+      tokens=48, mean_document_tokens=16
+    HashJoin: s.instance_id = f.instance_id
+      pairs kept: 0.1111 of the cross product
+      Reuse [1]
+      Reuse [2]
+  est. time is each node's work alone; node times do not add up to the plan estimate
+  because chunk packing shares forward passes across nodes

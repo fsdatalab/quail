@@ -3,19 +3,26 @@
 from __future__ import annotations
 
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping, Protocol
 
+from quail.execution.deduplicate import MODEL_NODES, deduplicate
+from quail.execution.finished import renumbered, report_outputs
 from quail.execution.metrics import NodeMetrics, NodeResult, RunResult
+from quail.execution.precondition import (
+    preconditioned,
+    present_join_inputs,
+    reads_null_documents,
+)
+from quail.execution.rows import Rows
 from quail.physical import (
+    AiFilter,
     ExecutionLocation,
     PhysicalGraph,
     PhysicalNode,
     PortRef,
-    Project,
-    Recombine,
 )
-from quail.physical.pipelines import build_pipelines
 
 
 class NodeRuntime(Protocol):
@@ -46,20 +53,14 @@ class ExecutionContext:
     runtimes: Mapping[str, NodeRuntime]
     model_execution: Any = None
     sources: Mapping[str, Any] = field(default_factory=dict)
-    project: Callable[[Project, Any], Any] | None = None
-    recombine: Callable[[Recombine, Mapping[str, Any]], Any] | None = None
-    model_inputs: Callable[
-        [PhysicalNode, Mapping[str, Any], "ExecutionContext"],
-        Mapping[str, Any],
-    ] | None = None
     model_result: Callable[
         [PhysicalNode, NodeResult, "ExecutionContext"], None,
     ] | None = None
     state: dict[str, Any] = field(default_factory=dict)
     observers: tuple[ExecutionObserver, ...] = ()
     functions: Mapping[str, Callable[..., Any]] = field(default_factory=dict)
-    gpus: int = 1
     run_pipeline: Callable[..., Mapping[str, "NodeResult"]] | None = None
+    deduplicate: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
 def _check_ports(node, result) -> None:
     expected = {output.name for output in node.outputs}
@@ -70,6 +71,20 @@ def _check_ports(node, result) -> None:
             f"runtime {node.runtime_key!r} returned wrong ports "
             f"for {node.node_id!r}; "
             f"missing={sorted(missing)}, extra={sorted(extra)}")
+
+
+def _answers(values: Mapping[tuple[str, str], Any]) -> dict[str, Rows]:
+    """Return the rows that hold each value column of the outputs so far.
+
+    A precondition reads an earlier node's answer from those rows, by document
+    id, instead of from a copy every node between them carries.
+    """
+    found = {}
+    for value in values.values():
+        if isinstance(value, Rows):
+            for name in value.column_names:
+                found[name] = value
+    return found
 
 
 class GenericRunner:
@@ -95,7 +110,6 @@ class GenericRunner:
 
         def record(node, result, started=None):
             if started is not None and result.metrics.wall_s == 0.0:
-                # runtimes that do not time themselves are timed here
                 result = replace(result, metrics=replace(
                     result.metrics, wall_s=time.perf_counter() - started))
             _check_ports(node, result)
@@ -104,11 +118,25 @@ class GenericRunner:
             node_results[node.node_id] = result
             for observer in context.observers:
                 observer.after_node(node, result)
+            report_outputs(node, result)
 
         completed = tuple(dict.fromkeys(ref.node_id for ref in (initial_outputs or ())))
-        pipelines = (build_pipelines(graph, completed)
-                     if context.run_pipeline else {})
-        for node in graph.topological_nodes():
+        pipelines = graph.pipelines(completed) if context.run_pipeline else {}
+        for pipeline in list(pipelines.values()):
+            if len(pipeline) > 1 and any(
+                    reads_null_documents(member, context) for member in pipeline):
+                for member in pipeline:
+                    if isinstance(member, MODEL_NODES):
+                        pipelines[member.node_id] = (member,)
+                    else:
+                        pipelines.pop(member.node_id, None)
+        ordered = graph.topological_nodes()
+        late = _without_early_stops(ordered, pipelines)
+        ordered = [late.get(node.node_id, node) for node in ordered]
+        pipelines = {
+            node_id: tuple(late.get(member.node_id, member) for member in pipeline)
+            for node_id, pipeline in pipelines.items()}
+        for node in ordered:
             pipeline = pipelines.get(node.node_id)
             if pipeline is not None:
                 if node is not pipeline[-1]:
@@ -121,9 +149,30 @@ class GenericRunner:
                         for port in member.inputs
                         if port.source.node_id not in inside}
                     for member in pipeline}
+                for member in pipeline:
+                    inputs[member.node_id] = present_join_inputs(
+                        member, inputs[member.node_id], context)
+                precondition = preconditioned(
+                    node,
+                    inputs[node.node_id],
+                    context,
+                    runtime_answers=True,
+                    answers=_answers(values),
+                )
+                if precondition is not None:
+                    inputs[node.node_id] = precondition.inputs(inputs[node.node_id])
+                deduplicated = deduplicate(graph, pipeline, inputs, context)
                 started = time.perf_counter()
-                results = context.run_pipeline(pipeline, inputs, context)
-                # a pipeline's wall is charged once, to its first member
+                with _renumbered(precondition, deduplicated):
+                    results = context.run_pipeline(
+                        pipeline,
+                        inputs if deduplicated is None else deduplicated.inputs,
+                        context)
+                if deduplicated is not None:
+                    results = deduplicated.expanded(results)
+                if precondition is not None:
+                    expanded = precondition.expanded(results[node.node_id])
+                    results = {**results, node.node_id: expanded}
                 for index, member in enumerate(pipeline):
                     record(member, results[member.node_id],
                            started if index == 0 else None)
@@ -150,10 +199,25 @@ class GenericRunner:
                     ]
                     for input_port in node.inputs
                 }
+                inputs = present_join_inputs(node, inputs, context)
+                precondition = preconditioned(
+                    node, inputs, context, answers=_answers(values))
+                if precondition is not None:
+                    inputs = precondition.inputs(inputs)
+                deduplicated = deduplicate(
+                    graph, (node,), {node.node_id: inputs}, context)
                 started = time.perf_counter()
-                result = context.runtimes[node.runtime_key].execute(
-                    node, inputs, context
-                )
+                with _renumbered(precondition, deduplicated):
+                    result = context.runtimes[node.runtime_key].execute(
+                        node,
+                        inputs if deduplicated is None
+                        else deduplicated.inputs[node.node_id],
+                        context)
+                if deduplicated is not None:
+                    result = deduplicated.expanded(
+                        {node.node_id: result})[node.node_id]
+                if precondition is not None:
+                    result = precondition.expanded(result)
                 record(node, result, started)
                 continue
             record(node, result)
@@ -163,6 +227,40 @@ class GenericRunner:
         for node in graph.topological_nodes():
             metrics = metrics + node_results[node.node_id].metrics
         return RunResult(values[root], node_results, metrics)
+
+
+def _without_early_stops(ordered, pipelines) -> dict:
+    """Return node id -> a filter without its stop key, where it would stop too soon.
+
+    A key stops once a document passes the last filter that carries the
+    key. A filter before it stops the key at the same point only when
+    the two run in one pipeline, which counts the documents that pass
+    its last filter.
+    """
+    last = {node.alias: node.node_id for node in ordered
+            if isinstance(node, AiFilter) and node.stop_key}
+    return {
+        node.node_id: node.replace(stop_key=())
+        for node in ordered
+        if isinstance(node, AiFilter) and node.stop_key
+        and last[node.alias] != node.node_id
+        and last[node.alias] not in {
+            member.node_id for member in pipelines.get(node.node_id, ())}}
+
+
+def _renumbered(precondition, deduplicated):
+    """Report a node's rows over the region's rows while it runs.
+
+    A precondition keeps the region's ids, so the rows a node finishes go on at
+    once, unless its result adds rows the node never reported. A
+    deduplicated node's rows go to every copy of their key documents.
+    Any other report waits for the node's expanded result.
+    """
+    if precondition is not None and not precondition.reports_as_run():
+        return renumbered()
+    if deduplicated is not None:
+        return renumbered(deduplicated.reported)
+    return nullcontext()
 
 
 def compute_subgraph(graph: PhysicalGraph) -> PhysicalGraph:

@@ -7,16 +7,14 @@ from dataclasses import dataclass, field
 from itertools import chain
 from typing import Any
 
-import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from quail.catalog.pairs import COLUMNS_PREFIX
-from quail.catalog.tokens import decode_token_documents
-from quail.execution.result import answer_table, filter_answer_table
+from quail.common.pairs import COLUMNS_PREFIX
+from quail.common.tokens import decode_token_documents
+from quail.execution.result import answer_table
 from quail.execution.rows import Rows, rows_of
 from quail.physical import (
-    AiFilter,
     OutputPort,
     PhysicalGraph,
     PortRef,
@@ -54,12 +52,16 @@ class PhysicalRequest:
     """A physical plan, its token input bindings, and its relations.
 
     relations holds one value table per alias a HashJoin or an apply()
-    function reads, keyed ``columns:<alias>``; see quail.catalog.pairs.
+    function reads, keyed ``columns:<alias>``; see quail.common.pairs.
+    source_rows holds, by alias, the row in the registered table of each
+    document of a scan that reads some of the table's rows, found by the
+    table's id column.
     """
 
     plan: Mapping[str, Any]
     inputs: Mapping[str, TokenizedInput]
     relations: Mapping[str, pa.Table] = field(default_factory=dict)
+    source_rows: Mapping[str, pa.Array] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for input_id, value in self.inputs.items():
@@ -78,7 +80,7 @@ class PhysicalRequest:
                 raise TypeError("execution relations must be Arrow tables")
 
     def column_tables(self) -> dict[str, pa.Table]:
-        """Return the value tables apply() functions read, by alias."""
+        """Return the value tables of the scans, by alias."""
         return {key[len(COLUMNS_PREFIX):]: table
                 for key, table in self.relations.items()
                 if key.startswith(COLUMNS_PREFIX)}
@@ -114,18 +116,6 @@ class PhysicalResponse:
                 from error
 
 
-def _filter_answers_table(node: AiFilter, value: Mapping) -> pa.Table:
-    """One row per answer a document gave, repeating the document id."""
-    lengths = np.fromiter((len(row) for row in value.values()), dtype=np.int64,
-                          count=len(value))
-    documents = np.repeat(
-        np.fromiter(value.keys(), dtype=np.int64, count=len(value)), lengths)
-    answers = (np.concatenate([np.asarray(row, dtype=bool) for row in value.values()])
-               if len(value) else np.zeros(0, dtype=bool))
-    return filter_answer_table(
-        node.alias, documents, np.full(len(documents), node.written_position), answers)
-
-
 def _join_answers_table(value: Mapping[str, Any]) -> pa.Table:
     """Build the join answer table without visiting pairs in Python.
 
@@ -152,7 +142,6 @@ def _join_answers_table(value: Mapping[str, Any]) -> pa.Table:
         documents = pa.array([int(member[index]) for member in partner_map],
                              type=pa.int32())
         columns[alias] = pc.take(documents, members)
-    # answers arrive as 0/1 integers or booleans; the cast covers both
     answers = pc.cast(pa.array(chain.from_iterable(answer_parts)), pa.bool_())
     metadata = {
         "anchor": anchor, "semantics": value["semantics"],
@@ -163,17 +152,14 @@ def _join_answers_table(value: Mapping[str, Any]) -> pa.Table:
     return answer_table(columns, answers, "join_answers", metadata)
 
 
-def _output_table(node, port: OutputPort, value: Any) -> pa.Table:
+def output_table(node, port: OutputPort, value: Any) -> pa.Table:
+    """Return one output port's value as its Arrow relation."""
     if isinstance(value, Rows):
         return value.table()
     if isinstance(value, pa.Table):
         return value
     if port.name.startswith("rows:"):
         return rows_of(value, port.name.split(":", 1)[1]).table()
-    if port.value_type is ValueType.FILTER_ANSWERS:
-        if not isinstance(node, AiFilter):
-            raise TypeError("filter answer output needs a AiFilter node")
-        return _filter_answers_table(node, value)
     if port.value_type is ValueType.JOIN_ANSWERS:
         return _join_answers_table(value)
     raise TypeError(
@@ -190,7 +176,7 @@ def export_physical_outputs(graph: PhysicalGraph, run_result) -> dict:
         result = run_result.nodes[node.node_id]
         ports = {port.name: port for port in node.outputs}
         for name, value in result.outputs.items():
-            outputs[PortRef(node.node_id, name)] = _output_table(
+            outputs[PortRef(node.node_id, name)] = output_table(
                 node, ports[name], value
             )
     return outputs

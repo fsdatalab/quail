@@ -1,0 +1,1541 @@
+use std::sync::{Arc, Mutex};
+use std::thread::ThreadId;
+
+use async_trait::async_trait;
+use datafusion::arrow::array::{ArrayRef, BooleanArray, RecordBatch};
+use datafusion::arrow::compute::cast;
+use datafusion::arrow::compute::{concat_batches, filter_record_batch};
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::catalog::{Session, TableProvider};
+use datafusion::common::{Constraint, Constraints, DataFusionError, Result};
+use datafusion::datasource::TableType;
+use datafusion::execution::SessionState;
+use datafusion::logical_expr::{Expr, LogicalPlan, TableProviderFilterPushDown};
+use datafusion::physical_plan::ExecutionPlan;
+use std::collections::{BTreeMap, HashMap};
+
+use quail_datafusion::{
+    IdentifiedTable, InputRows, InputStream, ModelRegion, RegionBatches, RegionColumns, RegionHint,
+    RegionRunner, SharedInput, collect_inputs, derive, quail_column_names,
+};
+use quail_planner::operators::Operators;
+use quail_planner::prompts::Turn;
+use tokio::sync::mpsc::UnboundedSender;
+
+use crate::EngineConfig;
+use crate::planning::{PlannedRegion, Planner, ScanInputs, Settings, TableRows, outcome_json};
+use crate::workers::Workers;
+
+pub struct EngineRegion<'a> {
+    pub region: &'a ModelRegion,
+    pub inputs: &'a [InputRows],
+    pub planned: Option<PlannedRegion>,
+    pub payload: Option<String>,
+    pub fetch: Option<usize>,
+    pub hint: Option<InputHint>,
+    pub sink: RegionSink,
+}
+
+pub trait RegionEngine: Send + Sync + std::fmt::Debug {
+    fn run(&self, region: EngineRegion<'_>) -> Result<Vec<RecordBatch>>;
+}
+
+enum Runs {
+    Engine(Arc<dyn RegionEngine>),
+    Workers(Arc<Mutex<Workers>>),
+}
+
+impl std::fmt::Debug for Runs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Runs::Engine(_) => "Engine",
+            Runs::Workers(_) => "Workers",
+        })
+    }
+}
+
+pub struct Executor {
+    runs: Runs,
+    pub(crate) rules: Vec<String>,
+    pub(crate) prompting: (Turn, String),
+    caller: Mutex<Option<(ThreadId, UnboundedSender<RegionCall>)>>,
+    execution: Mutex<()>,
+    pub(crate) planning: Option<(Arc<Planner>, Settings)>,
+    regions: Mutex<Vec<RegionRan>>,
+    observer: Mutex<Option<(Observer, bool)>>,
+    interrupter: Option<crate::workers::Interrupter>,
+    stopped: tokio::sync::watch::Sender<bool>,
+    progress: Arc<Mutex<Option<serde_json::Value>>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum RegionEvent<'a> {
+    Planned {
+        explained: &'a str,
+        estimated_seconds: f64,
+    },
+    Ready,
+    Answers(&'a serde_json::Value),
+}
+
+pub type Observer = Arc<dyn Fn(RegionEvent<'_>) + Send + Sync>;
+
+impl std::fmt::Debug for Executor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Executor")
+            .field("runs", &self.runs)
+            .field("rules", &self.rules)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+pub struct RegionRan {
+    pub planned: String,
+    pub scans: Vec<ScanInputs>,
+    pub inputs: Vec<InputRows>,
+    pub rows: RecordBatch,
+    pub ran: Vec<crate::workers::Ran>,
+    pub boots: Vec<serde_json::Value>,
+    pub seconds: f64,
+    pub total_seconds: f64,
+}
+
+impl Executor {
+    pub fn open(config: &EngineConfig) -> Result<Self> {
+        let mut workers = Workers::bind(config.gpus)?;
+        workers.spawn(&worker_command())?;
+        workers.connect()?;
+        Self::on_workers(Arc::new(Mutex::new(workers)), config)
+    }
+
+    pub fn on_workers(workers: Arc<Mutex<Workers>>, config: &EngineConfig) -> Result<Self> {
+        let described = workers
+            .lock()
+            .expect("the workers lock")
+            .describe(&serde_json::json!({
+                "model": config.model, "device": config.device,
+                "gpus": config.gpus, "backend": config.backend,
+            }))?;
+        Self::described(workers, &described, None)
+    }
+
+    pub fn described(
+        workers: Arc<Mutex<Workers>>,
+        described: &serde_json::Value,
+        planner: Option<Arc<Planner>>,
+    ) -> Result<Self> {
+        let read = |error: serde_json::Error| DataFusionError::External(Box::new(error));
+        let field = |name: &str| described[name].clone();
+        let turn: (String, String) = serde_json::from_value(field("turn")).map_err(read)?;
+        let layout: String = serde_json::from_value(field("layout")).map_err(read)?;
+        let rules: Vec<String> = serde_json::from_value(field("rules")).map_err(read)?;
+        let tokenizer: String = serde_json::from_value(field("tokenizer_file")).map_err(read)?;
+        let settings: Settings = serde_json::from_value(field("settings")).map_err(read)?;
+        let planner = match planner {
+            Some(planner) => planner,
+            None => Arc::new(
+                Planner::new(std::path::Path::new(&tokenizer))
+                    .map_err(quail_datafusion::external)?,
+            ),
+        };
+        let interrupter = workers.lock().expect("the workers lock").interrupter();
+        Ok(Self {
+            interrupter: Some(interrupter),
+            stopped: tokio::sync::watch::Sender::new(false),
+            progress: Arc::new(Mutex::new(None)),
+            runs: Runs::Workers(workers),
+            rules,
+            prompting: (turn, layout),
+            caller: Mutex::new(None),
+            execution: Mutex::new(()),
+            planning: Some((planner, settings)),
+            regions: Mutex::new(Vec::new()),
+            observer: Mutex::new(None),
+        })
+    }
+
+    pub fn with_engine(
+        engine: Arc<dyn RegionEngine>,
+        prompting: (Turn, String),
+        rules: Option<Vec<String>>,
+        planning: Option<(Arc<Planner>, Settings)>,
+    ) -> Self {
+        Self {
+            interrupter: None,
+            stopped: tokio::sync::watch::Sender::new(false),
+            progress: Arc::new(Mutex::new(None)),
+            runs: Runs::Engine(engine),
+            rules: rules.unwrap_or_else(quail_datafusion::default_rule_names),
+            prompting,
+            caller: Mutex::new(None),
+            execution: Mutex::new(()),
+            planning,
+            regions: Mutex::new(Vec::new()),
+            observer: Mutex::new(None),
+        }
+    }
+}
+
+pub(crate) struct CallerGuard<'a> {
+    executor: &'a Executor,
+    _execution: std::sync::MutexGuard<'a, ()>,
+}
+
+impl Drop for CallerGuard<'_> {
+    fn drop(&mut self) {
+        *self
+            .executor
+            .caller
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+    }
+}
+
+impl Executor {
+    pub fn observe(&self, observer: Option<Observer>, answers: bool) {
+        *self.observer.lock().expect("the observer lock") =
+            observer.map(|observer| (observer, answers));
+    }
+
+    pub(crate) fn explain_request(
+        &self,
+        planned: &serde_json::Value,
+        verbose: bool,
+    ) -> Result<serde_json::Value> {
+        use serde_json::{Value, json};
+        let read = |error: serde_json::Error| DataFusionError::External(Box::new(error));
+        let operators: Value =
+            serde_json::from_str(planned["operators"].as_str().unwrap_or("null")).map_err(read)?;
+        let mut request = json!({
+            "logical": planned["logical"], "operators": operators, "verbose": verbose,
+        });
+        if let Some((_, settings)) = &self.planning {
+            request["model_spec"] = settings.model.clone();
+            request["usd_per_hour"] = settings.device["usd_per_hour"].clone();
+            let rules = (self.rules.iter().map(|rule| (rule, "logical"))).chain(
+                settings
+                    .physical_rules
+                    .iter()
+                    .map(|rule| (rule, "physical")),
+            );
+            request["rules"] = json!(rules.collect::<Vec<_>>());
+        }
+        if let Some(refusal) = planned.get("refusal") {
+            request["refusal"] = refusal.clone();
+            return Ok(request);
+        }
+        let envelope = &planned["envelope"];
+        let settings: Vec<(String, Value)> = envelope["settings"]
+            .as_object()
+            .map(|settings| settings.clone().into_iter().collect())
+            .unwrap_or_default();
+        let estimates: Vec<(String, Value)> = match &planned["estimates"] {
+            Value::Object(estimates) => estimates.clone().into_iter().collect(),
+            _ => Vec::new(),
+        };
+        request["physical"] = json!({
+            "backend": envelope["backend"], "model": envelope["model"],
+            "device": envelope["device"], "gpus": envelope["gpus"],
+            "settings": settings, "shown_settings": settings,
+            "graph": envelope["graph"], "estimates": estimates,
+        });
+        Ok(request)
+    }
+
+    pub fn region_report(
+        &self,
+        region: &RegionRan,
+    ) -> Result<(serde_json::Value, Vec<crate::shared::Table>)> {
+        use serde_json::{Value, json};
+        let read = |error: serde_json::Error| DataFusionError::External(Box::new(error));
+        let planned: Value = serde_json::from_str(&region.planned).map_err(read)?;
+        let envelope = &planned["envelope"];
+        let graph: quail_planner::physical::PhysicalGraph =
+            serde_json::from_value(envelope["graph"].clone()).map_err(read)?;
+        let usd_per_hour = (self.planning.as_ref())
+            .and_then(|(_, settings)| settings.device["usd_per_hour"].as_f64());
+        let (mut measured, tables) = crate::report::region_report(
+            &graph,
+            &region.ran,
+            region.seconds,
+            usd_per_hour,
+            envelope["gpus"].as_i64().unwrap_or(1),
+            envelope["settings"]["gpu_timing"]
+                .as_bool()
+                .unwrap_or(false),
+        )?;
+        let root = graph.root.node_id.clone();
+        measured["node_metrics"][&root]["output_rows"] = json!(region.rows.num_rows());
+        let seconds = |boot: &Value| boot["boot_s"].as_f64().unwrap_or(0.0);
+        let slowest =
+            (region.boots.iter()).max_by(|one, two| seconds(one).total_cmp(&seconds(two)));
+        if let Some(boot) = slowest {
+            measured["boot_s"] = boot["boot_s"].clone();
+            measured["boot_kind"] = boot["kind"].clone();
+            measured["boot"] = boot.clone();
+        }
+        let report = crate::results::execution_report(
+            envelope["backend"].as_str().unwrap_or_default(),
+            planned["estimated_seconds"].as_f64().unwrap_or(0.0),
+            envelope["settings"]["order_rule"].as_str(),
+            measured.as_object().expect("a report"),
+            region.total_seconds,
+        );
+        Ok((report, tables))
+    }
+
+    pub(crate) fn analyzed_request(
+        &self,
+        region: &RegionRan,
+        verbose: bool,
+    ) -> Result<serde_json::Value> {
+        use serde_json::{Value, json};
+        let read = |error: serde_json::Error| DataFusionError::External(Box::new(error));
+        let planned: Value = serde_json::from_str(&region.planned).map_err(read)?;
+        let mut request = self.explain_request(&planned, verbose)?;
+        let (report, _) = self.region_report(region)?;
+        let metrics: serde_json::Map<String, Value> = (report["node_metrics"].as_object())
+            .into_iter()
+            .flatten()
+            .map(|(node, fields)| {
+                let pairs: Vec<Value> = (fields.as_object().into_iter().flatten())
+                    .map(|(field, value)| json!([field, value]))
+                    .collect();
+                (node.clone(), Value::Array(pairs))
+            })
+            .collect();
+        request["run"] = json!({"report": report, "metrics": metrics});
+        Ok(request)
+    }
+
+    pub fn interrupt(&self) {
+        self.stopped.send_replace(true);
+        if let Some(interrupter) = &self.interrupter {
+            interrupter.interrupt();
+        }
+    }
+
+    pub fn resume(&self) {
+        self.stopped.send_replace(false);
+        if let Some(interrupter) = &self.interrupter {
+            interrupter.resume();
+        }
+    }
+
+    pub(crate) fn stopped(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.stopped.subscribe()
+    }
+
+    pub fn progress(&self) -> Option<serde_json::Value> {
+        self.progress.lock().expect("the progress lock").clone()
+    }
+
+    pub fn take_regions<T, E>(
+        &self,
+        each: impl FnMut(RegionRan) -> std::result::Result<T, E>,
+    ) -> std::result::Result<Vec<T>, E> {
+        let regions = std::mem::take(&mut *self.regions.lock().expect("the regions lock"));
+        regions.into_iter().map(each).collect()
+    }
+
+    pub fn discard_regions(&self) {
+        self.regions.lock().expect("the regions lock").clear();
+    }
+
+    pub(crate) fn enter(&self, sender: UnboundedSender<RegionCall>) -> Result<CallerGuard<'_>> {
+        let thread = std::thread::current().id();
+        if self
+            .caller
+            .lock()
+            .expect("the caller lock")
+            .as_ref()
+            .is_some_and(|(owner, _)| *owner == thread)
+        {
+            return Err(DataFusionError::Execution(
+                "an executor cannot run a reentrant query".into(),
+            ));
+        }
+        let execution = self.execution.lock().map_err(|_| {
+            DataFusionError::Execution("the executor's previous query panicked".into())
+        })?;
+        *self.caller.lock().expect("the caller lock") = Some((thread, sender));
+        self.regions.lock().expect("the regions lock").clear();
+        Ok(CallerGuard {
+            executor: self,
+            _execution: execution,
+        })
+    }
+}
+
+fn worker_command() -> Vec<String> {
+    if let Ok(command) = std::env::var("QUAIL_WORKER") {
+        return command.split_whitespace().map(str::to_string).collect();
+    }
+    let python = match std::env::var_os("VIRTUAL_ENV") {
+        Some(root) => std::path::PathBuf::from(root)
+            .join("bin/python")
+            .to_string_lossy()
+            .into_owned(),
+        None => "python3".to_string(),
+    };
+    vec![python, "-m".into(), "quail.worker".into()]
+}
+
+pub(crate) struct RegionCall {
+    pub(crate) region: ModelRegion,
+    pub(crate) inputs: Vec<InputStream>,
+    pub(crate) fetch: Option<usize>,
+    pub(crate) hint: RegionHint,
+    pub(crate) rows: RowSender,
+}
+
+impl RegionCall {
+    pub(crate) fn refuse(self, failed: &str) {
+        let error = format!("an earlier model region of the query failed: {failed}");
+        let _ = (self.rows).send(RegionRows::Batch(Err(DataFusionError::Execution(error))));
+        let _ = self.rows.send(RegionRows::Done);
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum RegionRows {
+    Batch(Result<RecordBatch>),
+    Done,
+}
+
+pub(crate) type RowSender = std::sync::mpsc::Sender<RegionRows>;
+
+struct ReceivedRows {
+    receiver: std::sync::mpsc::Receiver<RegionRows>,
+    ended: bool,
+}
+
+impl Iterator for ReceivedRows {
+    type Item = Result<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.ended {
+            return None;
+        }
+        match self.receiver.recv() {
+            Ok(RegionRows::Batch(batch)) => Some(batch),
+            Ok(RegionRows::Done) => {
+                self.ended = true;
+                None
+            }
+            Err(_) => {
+                self.ended = true;
+                Some(Err(DataFusionError::Execution(
+                    "the region did not finish".into(),
+                )))
+            }
+        }
+    }
+}
+
+pub struct InputHint {
+    hint: RegionHint,
+    columns: RegionColumns,
+    rows: HashMap<String, RecordBatch>,
+    schema: SchemaRef,
+}
+
+impl InputHint {
+    fn answer_column(&self, answer: &str) -> Option<(usize, Option<String>)> {
+        let named = |name: &str| {
+            let mut found =
+                (self.schema.fields().iter().enumerate()).filter(|(_, field)| field.name() == name);
+            match (found.next(), found.next()) {
+                (Some((index, _)), None) => Some(index),
+                _ => None,
+            }
+        };
+        if let Some(index) = named(answer) {
+            return Some((index, None));
+        }
+        let (name, field) = answer.rsplit_once('.')?;
+        Some((named(name)?, Some(field.to_string())))
+    }
+}
+
+impl InputHint {
+    pub fn answer(&self, question: &serde_json::Value) -> Result<crate::workers::Answer> {
+        use crate::workers::Answer;
+        let text = |name: &str| question[name].as_str().unwrap_or_default();
+        Ok(match text("hint") {
+            "generation" => Answer::Json(self.hint.generation().into()),
+            "keep" => {
+                let keep: ArrayRef = Arc::new(BooleanArray::from(self.keep(text("table"))?));
+                let batch = RecordBatch::try_from_iter([("keep", keep)])?;
+                Answer::Table((batch.schema(), vec![batch]))
+            }
+            "reads_answer" => Answer::Json(self.reads_answer(text("answer")).into()),
+            _ => {
+                let completion = &question["completion"];
+                let answers = quail_datafusion::derive::partial::Completions {
+                    prefix: text("prefix").to_string(),
+                    complete: completion["complete"].as_bool().unwrap_or(false),
+                    may_be_null: completion["may_be_null"].as_bool().unwrap_or(false),
+                    tails: serde_json::from_value(completion["tails"].clone()).unwrap_or(None),
+                    max_chars: (completion["max_chars"].as_u64()).map(|count| count as usize),
+                };
+                Answer::Json(self.rejects_answer(text("answer"), &answers)?.into())
+            }
+        })
+    }
+}
+
+impl InputHint {
+    pub fn generation(&self) -> u64 {
+        self.hint.generation()
+    }
+
+    pub fn tables(&self) -> Vec<String> {
+        self.rows.keys().cloned().collect()
+    }
+
+    pub fn keep(&self, table: &str) -> Result<Vec<bool>> {
+        match self.rows.get(table) {
+            Some(rows) => self.hint.keep(&self.columns, table, rows),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    pub fn reads_answer(&self, answer: &str) -> bool {
+        self.answer_column(answer)
+            .is_some_and(|(index, _)| self.hint.reads_answer(index))
+    }
+
+    pub fn rejects_answer(
+        &self,
+        answer: &str,
+        answers: &quail_datafusion::derive::partial::Completions,
+    ) -> Result<bool> {
+        match self.answer_column(answer) {
+            Some((index, field)) => self.hint.rejects_answer(index, field.as_deref(), answers),
+            None => Ok(false),
+        }
+    }
+}
+
+pub struct RegionSink {
+    rows: RowSender,
+    names: Vec<String>,
+    schema: SchemaRef,
+}
+
+impl RegionSink {
+    pub fn send(&self, batch: RecordBatch) -> Result<()> {
+        let batch = conform(batch, &self.names, &self.schema)?;
+        let _ = self.rows.send(RegionRows::Batch(Ok(batch)));
+        Ok(())
+    }
+}
+
+impl Executor {
+    fn request(&self, region: &ModelRegion) -> Result<(Operators, LogicalPlan)> {
+        let (turn, layout) = &self.prompting;
+        derive::derive_region(region, turn, layout).map_err(quail_datafusion::external)
+    }
+
+    fn plan_here(
+        &self,
+        tables: &HashMap<String, TableRows>,
+        derived: &(Operators, LogicalPlan),
+        fetch: Option<usize>,
+    ) -> Result<Option<PlannedRegion>> {
+        let Some((planner, settings)) = &self.planning else {
+            return Ok(None);
+        };
+        let mut operators = derived.0.clone();
+        let logical = derived.1.display_indent().to_string();
+        if let Some(fetch) = fetch {
+            operators = operators.limited(fetch as i64);
+        }
+        let asks_model = !(operators.filters.is_empty()
+            && operators.joins.is_empty()
+            && operators.classifies.is_empty()
+            && operators.extracts.is_empty()
+            && operators.sae_features.is_empty()
+            && operators.maps.is_empty()
+            && operators.projections.is_empty());
+        if !asks_model {
+            return Ok(None);
+        }
+        let started = std::time::Instant::now();
+        let compile = |error: quail_planner::error::CompileError| quail_datafusion::external(error);
+        let (outcome, scans) = planner
+            .plan(&operators, tables, settings)
+            .map_err(compile)?;
+        let mut planned = outcome_json(&outcome).map_err(compile)?;
+        if planned.get("envelope").is_some() && settings.gpu_timing {
+            planned["envelope"]["settings"]["gpu_timing"] = true.into();
+        }
+        if planned.get("envelope").is_some() && settings.host_kv_bytes > 0 {
+            planned["envelope"]["settings"]["host_kv_bytes"] = settings.host_kv_bytes.into();
+        }
+        planned["logical"] = logical.into();
+        planned["planning_s"] = started.elapsed().as_secs_f64().into();
+        Ok(Some((planned.to_string(), scans)))
+    }
+
+    pub(crate) fn plan_only(
+        &self,
+        region: &ModelRegion,
+        inputs: &[InputRows],
+    ) -> Result<(String, Option<PlannedRegion>)> {
+        let derived = self.request(region)?;
+        let sorted = inputs
+            .iter()
+            .zip(&region.inputs)
+            .map(|((name, batches), input)| Ok((name.clone(), in_source_order(input, batches)?)))
+            .collect::<Result<Vec<InputRows>>>()?;
+        let planned = if self.planning.is_some() {
+            let tables = planning_tables(region, &sorted, &derived.0)?;
+            self.plan_here(&tables, &derived, None)?
+        } else {
+            None
+        };
+        Ok((
+            with_region_id(region_json(&derived.0, &derived.1)?, region.id)?,
+            planned,
+        ))
+    }
+
+    pub(crate) fn serve(&self, call: RegionCall) -> std::result::Result<(), String> {
+        let found = self.run_here(
+            &call.region,
+            call.inputs,
+            call.fetch,
+            &call.hint,
+            &call.rows,
+        );
+        let served = found
+            .as_ref()
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+        if let Err(error) = found {
+            let _ = call.rows.send(RegionRows::Batch(Err(error)));
+        }
+        let _ = call.rows.send(RegionRows::Done);
+        served
+    }
+
+    fn run_here(
+        &self,
+        region: &ModelRegion,
+        inputs: Vec<InputStream>,
+        fetch: Option<usize>,
+        hint: &RegionHint,
+        rows: &RowSender,
+    ) -> Result<()> {
+        let derived = self.request(region)?;
+        let inputs = collect_inputs(inputs)?;
+        let mut sorted;
+        let mut held = None;
+        let (planned, inputs) = if self.planning.is_some() {
+            sorted = inputs
+                .iter()
+                .zip(&region.inputs)
+                .map(|((name, batches), input)| {
+                    Ok((name.clone(), in_source_order(input, batches)?))
+                })
+                .collect::<Result<Vec<InputRows>>>()?;
+            let mut tables = planning_tables(region, &sorted, &derived.0)?;
+            held = input_hint(region, &derived.0, fetch, hint, &mut sorted, &mut tables)?;
+            (self.plan_here(&tables, &derived, fetch)?, sorted.as_slice())
+        } else {
+            (None, inputs.as_slice())
+        };
+        let schema = Arc::clone(region.plan.schema());
+        let names = quail_column_names(&region.plan);
+        let sink = RegionSink {
+            rows: rows.clone(),
+            names: names.clone(),
+            schema: Arc::clone(schema.inner()),
+        };
+        let planned = planned
+            .map(|(payload, scans)| {
+                Ok::<_, DataFusionError>((with_region_id(payload, region.id)?, scans))
+            })
+            .transpose()?;
+        let payload = match &planned {
+            None => Some(with_region_id(
+                region_json(&derived.0, &derived.1)?,
+                region.id,
+            )?),
+            Some(_) => None,
+        };
+        let engine = match &self.runs {
+            Runs::Engine(engine) => engine,
+            Runs::Workers(workers) => {
+                let (found, scans) = planned.ok_or_else(|| {
+                    DataFusionError::NotImplemented(
+                        "a region that asks no model does not run on workers".into(),
+                    )
+                })?;
+                let conformed = move |batch| conform(batch, &names, schema.inner());
+                let mut source_rows = BTreeMap::new();
+                for ((name, batches), input) in inputs.iter().zip(&region.inputs) {
+                    if let Some(positions) = source_positions(name, input, batches)? {
+                        source_rows.insert(name.clone(), positions);
+                    }
+                }
+                let observer = self.observer.lock().expect("the observer lock").clone();
+                if let Some((observer, _)) = &observer {
+                    let read =
+                        |error: serde_json::Error| DataFusionError::External(Box::new(error));
+                    let planned: serde_json::Value = serde_json::from_str(&found).map_err(read)?;
+                    if planned.get("envelope").is_some() {
+                        let request = self.explain_request(&planned, false)?;
+                        let request = serde_json::from_value(request).map_err(read)?;
+                        let explained = quail_planner::plan::explain::explain_text(&request)
+                            .map_err(DataFusionError::Execution)?;
+                        observer(RegionEvent::Planned {
+                            explained: &explained,
+                            estimated_seconds: planned["estimated_seconds"].as_f64().unwrap_or(0.0),
+                        });
+                    }
+                }
+                let ordered = region.has_sorted_input();
+                let ran = run_on_workers(
+                    workers,
+                    found,
+                    scans,
+                    inputs.to_vec(),
+                    &source_rows,
+                    held,
+                    conformed,
+                    rows,
+                    observer,
+                    Arc::clone(&self.progress),
+                    ordered,
+                )?;
+                self.regions.lock().expect("the regions lock").push(ran);
+                return Ok(());
+            }
+        };
+        let returned = engine.run(EngineRegion {
+            region,
+            inputs,
+            planned,
+            payload,
+            fetch,
+            hint: held,
+            sink,
+        })?;
+        for batch in returned {
+            let batch = conform(batch, &names, schema.inner())?;
+            if rows.send(RegionRows::Batch(Ok(batch))).is_err() {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn boot_setup(envelope: &serde_json::Value) -> Result<serde_json::Value> {
+    let settings = &envelope["settings"];
+    let Some(writes_answers) = settings["writes_answers"].as_bool() else {
+        return Err(DataFusionError::Execution(
+            "the plan's settings do not say whether it writes answers".into(),
+        ));
+    };
+    Ok(serde_json::json!({
+        "model": envelope["model"], "device": envelope["device"],
+        "backend": envelope["backend"], "gpus": envelope["gpus"],
+        "chunk_tokens": settings["chunk_tokens"], "true_ids": settings["true_ids"],
+        "false_ids": settings["false_ids"], "arena_pages": settings["arena_pages"],
+        "writes_answers": writes_answers,
+        "host_kv_bytes": settings["host_kv_bytes"].as_u64().unwrap_or(0),
+        "model_path": null, "extensions": [],
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_on_workers(
+    workers: &Mutex<Workers>,
+    found: String,
+    scans: Vec<ScanInputs>,
+    inputs: Vec<InputRows>,
+    source_rows: &BTreeMap<String, Vec<i32>>,
+    hint: Option<InputHint>,
+    conformed: impl Fn(RecordBatch) -> Result<RecordBatch> + Send + Sync + 'static,
+    rows: &RowSender,
+    observer: Option<(Observer, bool)>,
+    progress: Arc<Mutex<Option<serde_json::Value>>>,
+    ordered: bool,
+) -> Result<RegionRan> {
+    let read = |error: serde_json::Error| DataFusionError::External(Box::new(error));
+    let plan: serde_json::Value = serde_json::from_str(&found).map_err(read)?;
+    if let Some(refusal) = plan.get("refusal") {
+        return Err(DataFusionError::External(
+            format!("RefusalError: {refusal}").into(),
+        ));
+    }
+    let envelope = &plan["envelope"];
+    let operators_json = plan["operators"].as_str().unwrap_or_default();
+    let operators: Operators = serde_json::from_str(operators_json).map_err(read)?;
+    let scanned: Vec<crate::request::Scanned> = scans
+        .iter()
+        .map(|scan| {
+            (
+                scan.alias.clone(),
+                scan.tokens.to_table(),
+                scan.columns.clone(),
+            )
+        })
+        .collect();
+    let by_alias: BTreeMap<String, Vec<i32>> = (operators.scans.iter())
+        .filter_map(|scan| Some((scan.alias.clone(), source_rows.get(&scan.provider)?.clone())))
+        .collect();
+    let planned = crate::region_run::Planned {
+        envelope,
+        operators: &operators,
+        operators_json,
+        scans: &scanned,
+        source_rows: &by_alias,
+    };
+    let setup = boot_setup(envelope)?;
+    let finished = Arc::new(Mutex::new(planned.finished_rows()?));
+    let hinted = hint.as_ref().map(|hint| {
+        (operators.scans.iter())
+            .filter(|scan| hint.rows.contains_key(&scan.provider))
+            .map(|scan| (scan.alias.clone(), scan.provider.clone()))
+            .collect()
+    });
+    let listening = crate::region_run::Listening {
+        hinted,
+        progress: true,
+        answers: matches!(observer, Some((_, true))),
+    };
+    *progress.lock().expect("the progress lock") = None;
+    let conformed = Arc::new(conformed);
+    let (sender, conform_rows) = (rows.clone(), Arc::clone(&conformed));
+    let on_rows = Arc::new(move |batch: RecordBatch| {
+        if !ordered {
+            let _ = sender.send(RegionRows::Batch(Ok(conform_rows(batch)?)));
+        }
+        Ok(())
+    });
+    let listener = observer.clone();
+    let ask: crate::workers::Ask = Box::new(move |question| {
+        if let Some(counted) = question.get("progress") {
+            *progress.lock().expect("the progress lock") = Some(counted.clone());
+        }
+        if let (Some(events), Some((observer, _))) = (question.get("answer"), &listener) {
+            for event in events.as_array().into_iter().flatten() {
+                observer(RegionEvent::Answers(event));
+            }
+        }
+        match &hint {
+            Some(hint) if question.get("hint").is_some() => hint.answer(question),
+            _ => Ok(crate::workers::Answer::Json(serde_json::Value::Null)),
+        }
+    });
+    let mut workers = workers.lock().expect("the workers lock");
+    workers.revive()?;
+    workers.check_interrupted()?;
+    let entered = std::time::Instant::now();
+    let boots = workers.boot(&setup)?;
+    if let Some((observer, _)) = &observer {
+        observer(RegionEvent::Ready);
+    }
+    let started = std::time::Instant::now();
+    let ran =
+        crate::region_run::run_region(&mut workers, &planned, &listening, &finished, on_rows, ask)?;
+    let seconds = started.elapsed().as_secs_f64();
+    let built = (finished.lock().expect("the rows lock"))
+        .rows()
+        .map_err(crate::workers::failure)?;
+    if ordered {
+        let _ = rows.send(RegionRows::Batch(Ok(conformed(built.clone())?)));
+    }
+    let rows = built;
+    Ok(RegionRan {
+        planned: found,
+        scans,
+        inputs,
+        rows,
+        ran,
+        boots,
+        seconds,
+        total_seconds: entered.elapsed().as_secs_f64(),
+    })
+}
+
+impl RegionRunner for Executor {
+    fn run(
+        &self,
+        region: &ModelRegion,
+        inputs: Vec<InputStream>,
+        fetch: Option<usize>,
+        hint: &RegionHint,
+    ) -> Result<RegionBatches> {
+        let caller = self.caller.lock().expect("the caller lock").clone();
+        let (rows, receiver) = std::sync::mpsc::channel();
+        let call = RegionCall {
+            region: region.clone(),
+            inputs,
+            fetch,
+            hint: hint.clone(),
+            rows,
+        };
+        match caller {
+            Some((thread, sender)) if thread != std::thread::current().id() => sender
+                .send(call)
+                .map_err(|_| DataFusionError::Execution("the query ended".into()))?,
+            _ => {
+                let _ = self.serve(call);
+            }
+        }
+        Ok(Box::new(ReceivedRows {
+            receiver,
+            ended: false,
+        }))
+    }
+}
+
+fn input_hint(
+    region: &ModelRegion,
+    operators: &Operators,
+    fetch: Option<usize>,
+    hint: &RegionHint,
+    inputs: &mut [InputRows],
+    tables: &mut HashMap<String, TableRows>,
+) -> Result<Option<InputHint>> {
+    if hint.is_empty()
+        || fetch.is_some()
+        || operators.fetch.is_some()
+        || !operators.stop_keys.is_empty()
+    {
+        return Ok(None);
+    }
+    let mut columns = RegionColumns::of(region);
+    for (name, provider) in identified_scans(region)? {
+        if let Some(rows) = tables.get(&name) {
+            for column in &mut columns.0 {
+                if let quail_datafusion::RegionColumn::Source(table, index) = column
+                    && *table == name
+                {
+                    *index = rows
+                        .schema
+                        .index_of(provider.schema().field(*index).name())?;
+                }
+            }
+            for (table, index) in &mut columns.1 {
+                if *table == name {
+                    *index = rows
+                        .schema
+                        .index_of(provider.schema().field(*index).name())?;
+                }
+            }
+        }
+    }
+    let mut rows = HashMap::new();
+    for table in hint.tables(&columns) {
+        let found = match inputs.iter().position(|(name, _)| *name == table) {
+            Some(input) => {
+                let schema = Arc::new(region.inputs[input].schema().as_arrow().clone());
+                let all = concat_batches(&schema, &inputs[input].1)?;
+                let keep = BooleanArray::from(hint.keep(&columns, &table, &all)?);
+                let kept = filter_record_batch(&all, &keep)?;
+                inputs[input].1 = vec![kept.clone()];
+                if let Some(rows) = tables.get_mut(&table) {
+                    rows.identity = None;
+                    rows.batches = vec![kept.clone()];
+                }
+                Some(kept)
+            }
+            None => tables
+                .get(&table)
+                .map(|rows| concat_batches(&rows.schema, &rows.batches))
+                .transpose()?,
+        };
+        if let Some(found) = found {
+            rows.insert(table, found);
+        }
+    }
+    let answers = columns.0.iter().enumerate().any(|(index, column)| {
+        matches!(column, quail_datafusion::RegionColumn::Answer)
+            && hint.tests.iter().any(|test| {
+                datafusion::physical_expr::utils::collect_columns(test)
+                    .iter()
+                    .any(|read| read.index() == index)
+            })
+    });
+    Ok((!rows.is_empty() || answers).then(|| InputHint {
+        hint: hint.clone(),
+        columns,
+        rows,
+        schema: Arc::new(region.plan.schema().as_arrow().clone()),
+    }))
+}
+
+fn identified_scans(region: &ModelRegion) -> Result<Vec<(String, Arc<dyn TableProvider>)>> {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::datasource::source_as_provider;
+    use datafusion::logical_expr::LogicalPlan;
+    let mut found: Vec<(String, Arc<dyn TableProvider>)> = Vec::new();
+    region.plan.apply(|node| {
+        if let LogicalPlan::TableScan(scan) = node
+            && let Ok(provider) = source_as_provider(&scan.source)
+            && provider.downcast_ref::<IdentifiedTable>().is_some()
+        {
+            let name = scan.table_name.table().to_string();
+            if !found.iter().any(|(known, _)| *known == name) {
+                found.push((name, provider));
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    Ok(found)
+}
+
+pub fn region_json(
+    operators: &Operators,
+    plan: &datafusion::logical_expr::LogicalPlan,
+) -> Result<String> {
+    let operators =
+        crate::planning::operators_json(operators).map_err(quail_datafusion::external)?;
+    let warnings: Vec<String> = quail_datafusion::derive::similar::similar_calls(plan)
+        .iter()
+        .filter(|found| found.likeness == quail_datafusion::derive::similar::Likeness::Typo)
+        .map(quail_datafusion::derive::similar::Similar::message)
+        .collect();
+    Ok(serde_json::json!({
+        "operators": operators,
+        "logical": plan.display_indent().to_string(),
+        "warnings": warnings,
+    })
+    .to_string())
+}
+
+fn with_region_id(payload: String, id: Option<usize>) -> Result<String> {
+    let mut payload: serde_json::Value = serde_json::from_str(&payload)
+        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+    payload["region_id"] = serde_json::json!(id);
+    Ok(payload.to_string())
+}
+
+fn source_lookup(
+    input: &datafusion::logical_expr::LogicalPlan,
+    batches: &[RecordBatch],
+) -> Result<Option<datafusion::arrow::array::UInt64Array>> {
+    use datafusion::arrow::datatypes::DataType;
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::datasource::source_as_provider;
+    use datafusion::logical_expr::LogicalPlan;
+    let mut source = None;
+    input.apply(|node| {
+        if let LogicalPlan::TableScan(scan) = node
+            && let Ok(provider) = source_as_provider(&scan.source)
+            && provider.downcast_ref::<IdentifiedTable>().is_some()
+        {
+            source = Some(provider);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    let Some(provider) = source else {
+        return Ok(None);
+    };
+    let table = provider
+        .downcast_ref::<IdentifiedTable>()
+        .expect("an identified table");
+    let Some(scanned) = table.inner().downcast_ref::<ScannedTable>() else {
+        return Ok(None);
+    };
+    let Some(key) = scanned.id_column() else {
+        return Ok(None);
+    };
+    let Some(first) = batches.first() else {
+        return Ok(None);
+    };
+    let Ok(column) = first.schema().index_of(key) else {
+        return Ok(None);
+    };
+    let texts = |values: &ArrayRef| -> Result<Vec<Option<String>>> {
+        let values = cast(values, &DataType::Utf8)?;
+        let values = values
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .expect("a string array");
+        Ok(values
+            .iter()
+            .map(|value| value.map(str::to_string))
+            .collect())
+    };
+    let mut positions: HashMap<String, u64> = HashMap::new();
+    let mut next = 0u64;
+    for batch in scanned.column_rows(key)? {
+        let column = batch.columns().first().ok_or_else(|| {
+            DataFusionError::Execution(format!("the table's scan returned no column {key}"))
+        })?;
+        for value in texts(column)? {
+            if let Some(value) = value {
+                positions.entry(value).or_insert(next);
+            }
+            next += 1;
+        }
+    }
+    let mut found = Vec::new();
+    for batch in batches {
+        found.extend(
+            texts(batch.column(column))?
+                .into_iter()
+                .map(|value| value.and_then(|value| positions.get(&value).copied())),
+        );
+    }
+    Ok(Some(found.into()))
+}
+
+fn in_source_order(
+    input: &datafusion::logical_expr::LogicalPlan,
+    batches: &[RecordBatch],
+) -> Result<Vec<RecordBatch>> {
+    use datafusion::arrow::compute::sort_to_indices;
+    let Some(found) = source_lookup(input, batches)? else {
+        return Ok(batches.to_vec());
+    };
+    let order = sort_to_indices(&found, None, None)?;
+    ordered_batches(batches, order.values(), ORDERED_BATCH_BYTES)
+}
+
+fn ordered_batches(
+    batches: &[RecordBatch],
+    order: &[u32],
+    max_bytes: usize,
+) -> Result<Vec<RecordBatch>> {
+    use datafusion::arrow::compute::interleave_record_batch;
+    let places: Vec<(usize, usize)> = (batches.iter().enumerate())
+        .flat_map(|(index, batch)| (0..batch.num_rows()).map(move |row| (index, row)))
+        .collect();
+    let row_bytes: Vec<usize> = (batches.iter())
+        .map(|batch| batch.get_array_memory_size() / batch.num_rows().max(1))
+        .collect();
+    let batches: Vec<&RecordBatch> = batches.iter().collect();
+    let mut ordered = Vec::new();
+    let mut group: Vec<(usize, usize)> = Vec::new();
+    let mut bytes = 0;
+    for position in order {
+        let place = places[*position as usize];
+        if !group.is_empty() && bytes + row_bytes[place.0] > max_bytes {
+            ordered.push(interleave_record_batch(&batches, &group)?);
+            group.clear();
+            bytes = 0;
+        }
+        group.push(place);
+        bytes += row_bytes[place.0];
+    }
+    if !group.is_empty() || ordered.is_empty() {
+        ordered.push(interleave_record_batch(&batches, &group)?);
+    }
+    Ok(ordered)
+}
+
+const ORDERED_BATCH_BYTES: usize = 1 << 30;
+
+fn source_positions(
+    name: &str,
+    input: &datafusion::logical_expr::LogicalPlan,
+    batches: &[RecordBatch],
+) -> Result<Option<Vec<i32>>> {
+    if !name.contains(quail_planner::operators::INPUT_SEPARATOR) {
+        return Ok(None);
+    }
+    Ok(source_lookup(input, batches)?.map(|found| {
+        (found.iter())
+            .map(|position| position.map_or(-1, |position| position as i32))
+            .collect()
+    }))
+}
+
+fn planning_tables(
+    region: &ModelRegion,
+    inputs: &[InputRows],
+    operators: &Operators,
+) -> Result<HashMap<String, TableRows>> {
+    let required = crate::planning::required_columns(operators);
+    let columns = RegionColumns::of(region);
+    let mut tables = HashMap::new();
+    for (name, provider) in identified_scans(region)? {
+        let table = provider
+            .downcast_ref::<IdentifiedTable>()
+            .expect("an identified table");
+        let Some(scanned) = table.inner().downcast_ref::<ScannedTable>() else {
+            continue;
+        };
+        let names = required.get(&name).map_or(&[][..], Vec::as_slice);
+        let positions: Vec<usize> = (columns.0.iter())
+            .filter_map(|column| match column {
+                quail_datafusion::RegionColumn::Source(source, index) if *source == name => {
+                    Some(*index)
+                }
+                _ => None,
+            })
+            .collect();
+        let (schema, batches) = scanned.rows_with_keys(names, &positions)?;
+        tables.insert(
+            name,
+            TableRows {
+                identity: Some(table.identity().to_string()),
+                schema,
+                batches,
+            },
+        );
+    }
+    for ((name, batches), input) in inputs.iter().zip(&region.inputs) {
+        tables.insert(
+            name.clone(),
+            TableRows {
+                identity: whole_table_identity(input),
+                schema: Arc::new(input.schema().as_arrow().clone()),
+                batches: batches.clone(),
+            },
+        );
+    }
+    Ok(tables)
+}
+
+fn whole_table_identity(input: &datafusion::logical_expr::LogicalPlan) -> Option<String> {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::datasource::source_as_provider;
+    use datafusion::logical_expr::LogicalPlan;
+    let mut identity = None;
+    let mut whole = true;
+    let mut scans = 0;
+    let _ = input.apply(|node| {
+        match node {
+            LogicalPlan::TableScan(scan) => {
+                scans += 1;
+                whole &= scan.filters.is_empty() && scan.fetch.is_none();
+                identity = source_as_provider(&scan.source).ok().and_then(|provider| {
+                    let table = provider.downcast_ref::<IdentifiedTable>()?;
+                    let scanned = table.inner().downcast_ref::<ScannedTable>()?;
+                    let ordered = scanned
+                        .id_column()
+                        .is_some_and(|key| input.schema().as_arrow().index_of(key).is_ok());
+                    ordered.then(|| table.identity().to_string())
+                });
+            }
+            LogicalPlan::SubqueryAlias(_) => {}
+            LogicalPlan::Projection(projection) => {
+                whole &= projection
+                    .expr
+                    .iter()
+                    .all(|expr| matches!(expr, Expr::Column(_)));
+            }
+            LogicalPlan::Extension(extension)
+                if extension
+                    .node
+                    .as_any()
+                    .downcast_ref::<SharedInput>()
+                    .is_some_and(|shared| !shared.numbered) => {}
+            _ => whole = false,
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    if whole && scans == 1 { identity } else { None }
+}
+
+fn conform(batch: RecordBatch, names: &[String], schema: &SchemaRef) -> Result<RecordBatch> {
+    let positional = batch.num_columns() == names.len();
+    let columns = names
+        .iter()
+        .zip(schema.fields())
+        .enumerate()
+        .map(|(index, (name, field))| {
+            let found = batch
+                .column_by_name(name)
+                .or_else(|| positional.then(|| batch.column(index)));
+            let column = found.ok_or_else(|| {
+                let returned: Vec<_> = batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect();
+                DataFusionError::Execution(format!(
+                    "Quail returned columns {returned:?}, without the region's column {name}"
+                ))
+            })?;
+            Ok(cast(column, field.data_type())?)
+        })
+        .collect::<Result<Vec<ArrayRef>>>()?;
+    Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
+}
+
+pub struct ScannedTable {
+    pub(crate) schema: SchemaRef,
+    pub(crate) inner: Arc<dyn TableProvider>,
+    pub(crate) state: SessionState,
+    pub(crate) constraints: Constraints,
+}
+
+impl std::fmt::Debug for ScannedTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScannedTable")
+            .field("schema", &self.schema)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ScannedTable {
+    pub fn new(
+        inner: Arc<dyn TableProvider>,
+        state: SessionState,
+        constraints: Constraints,
+    ) -> Self {
+        Self {
+            schema: inner.schema(),
+            inner,
+            state,
+            constraints,
+        }
+    }
+
+    fn id_column(&self) -> Option<&str> {
+        self.constraints
+            .iter()
+            .find_map(|constraint| match constraint {
+                Constraint::PrimaryKey(keys) if keys.len() == 1 => {
+                    Some(self.schema.field(keys[0]).name().as_str())
+                }
+                _ => None,
+            })
+    }
+
+    fn rows_with_keys(
+        &self,
+        names: &[String],
+        positions: &[usize],
+    ) -> Result<crate::shared::Table> {
+        let keys = (self.constraints.iter()).flat_map(|constraint| match constraint {
+            Constraint::PrimaryKey(keys) => keys.as_slice(),
+            _ => &[],
+        });
+        let mut indices = names
+            .iter()
+            .map(|name| self.schema.index_of(name))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        indices.extend(positions.iter().chain(keys));
+        indices.sort_unstable();
+        indices.dedup();
+        let schema = Arc::new(self.schema.project(&indices)?);
+        let names = (schema.fields().iter())
+            .map(|field| field.name().clone())
+            .collect();
+        Ok((schema, self.scan_columns(names)?))
+    }
+
+    fn column_rows(&self, name: &str) -> Result<Vec<RecordBatch>> {
+        self.scan_columns(vec![name.to_string()])
+    }
+
+    fn scan_columns(&self, columns: Vec<String>) -> Result<Vec<RecordBatch>> {
+        let projection = columns
+            .iter()
+            .map(|column| self.schema.index_of(column))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let read = async {
+            let plan = self
+                .inner
+                .scan(&self.state, Some(&projection), &[], None)
+                .await?;
+            let context = self.state.task_ctx();
+            let mut batches = Vec::new();
+            let num_partitions = plan.properties().output_partitioning().partition_count();
+            for partition in 0..num_partitions {
+                let stream = plan.execute(partition, Arc::clone(&context))?;
+                batches.extend(datafusion::physical_plan::common::collect(stream).await?);
+            }
+            Ok(batches)
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => tokio::task::block_in_place(|| runtime.block_on(read)),
+            Err(_) => tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(read),
+        }
+    }
+}
+
+#[async_trait]
+impl TableProvider for ScannedTable {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    fn constraints(&self) -> Option<&Constraints> {
+        Some(&self.constraints)
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>> {
+        self.inner.supports_filters_pushdown(filters)
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.inner.scan(state, projection, filters, limit).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+    #[test]
+    fn rows_in_source_order_split_into_batches_of_at_most_the_byte_limit() {
+        use datafusion::arrow::array::{AsArray, BinaryArray, Int32Array};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("image", DataType::Binary, false),
+        ]));
+        let batch = |ids: &[i32]| {
+            let images: Vec<Vec<u8>> = ids.iter().map(|id| vec![*id as u8; 100]).collect();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int32Array::from(ids.to_vec())),
+                    Arc::new(BinaryArray::from_iter_values(images)),
+                ],
+            )
+            .unwrap()
+        };
+        let batches = [batch(&[2, 0]), batch(&[3, 1])];
+        let ordered = ordered_batches(&batches, &[1, 3, 0, 2], 300).unwrap();
+        assert!(ordered.len() > 1, "{} batches", ordered.len());
+        let ids: Vec<i32> = (ordered.iter())
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<datafusion::arrow::datatypes::Int32Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(ids, [0, 1, 2, 3]);
+        let images: Vec<u8> = (ordered.iter())
+            .flat_map(|batch| {
+                (batch.column(1).as_binary::<i32>().iter())
+                    .map(|image| image.unwrap()[0])
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(images, [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn a_worker_boots_with_the_plans_arena_and_whether_the_plan_writes_answers() {
+        let envelope = |settings: serde_json::Value| {
+            serde_json::json!({
+                "model": "qwen3-4b-fp8", "device": "h100-sxm", "backend": "quail",
+                "gpus": 1, "settings": settings,
+            })
+        };
+        let setup = boot_setup(&envelope(serde_json::json!({
+            "chunk_tokens": 8192, "true_ids": [1], "false_ids": [2],
+            "arena_pages": [24_630, 0], "writes_answers": false,
+        })))
+        .unwrap();
+        assert_eq!(setup["arena_pages"], serde_json::json!([24_630, 0]));
+        assert_eq!(setup["writes_answers"], false);
+
+        let refused = boot_setup(&envelope(serde_json::json!({"chunk_tokens": 8192})));
+        assert!(
+            refused
+                .unwrap_err()
+                .to_string()
+                .contains("whether it writes answers")
+        );
+    }
+
+    #[test]
+    fn hint_filtered_inputs_lose_their_whole_table_cache_identity() {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::common::ScalarValue;
+        use datafusion::datasource::{MemTable, provider_as_source};
+        use datafusion::logical_expr::{LogicalPlanBuilder, Operator};
+        use datafusion::physical_expr::expressions::{BinaryExpr, Column, Literal};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let source = MemTable::try_new(Arc::clone(&schema), vec![vec![batch.clone()]]).unwrap();
+        let plan = LogicalPlanBuilder::scan("input", provider_as_source(Arc::new(source)), None)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut region = ModelRegion::new(plan.clone());
+        region.inputs = vec![plan];
+        region.input_names = vec!["input".into()];
+        for threshold in [0, 1, 3] {
+            let mut inputs = vec![("input".into(), vec![batch.clone()])];
+            let mut tables = HashMap::from([(
+                "input".into(),
+                TableRows {
+                    identity: Some("whole-table".into()),
+                    schema: Arc::clone(&schema),
+                    batches: vec![batch.clone()],
+                },
+            )]);
+            let hint = RegionHint {
+                tests: vec![Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new("id", 0)),
+                    Operator::Gt,
+                    Arc::new(Literal::new(ScalarValue::Int64(Some(threshold)))),
+                ))],
+            };
+            input_hint(
+                &region,
+                &Operators::default(),
+                None,
+                &hint,
+                &mut inputs,
+                &mut tables,
+            )
+            .unwrap()
+            .unwrap();
+            let rows = &tables["input"];
+            assert!(rows.identity.is_none());
+            assert_eq!(rows.batches, inputs[0].1);
+            assert_eq!(rows.batches[0].num_rows(), (3 - threshold) as usize);
+        }
+    }
+
+    #[test]
+    fn executor_rows_missing_a_required_column_return_an_error() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "answer",
+            DataType::Utf8,
+            true,
+        )]));
+        let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
+        let error = conform(batch, &["answer".into()], &schema).unwrap_err();
+        assert!(matches!(error, DataFusionError::Execution(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("without the region's column answer")
+        );
+    }
+}

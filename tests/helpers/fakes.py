@@ -5,34 +5,47 @@ filter stage s asks [QUESTION + s], partner i streams [PARTNER + i] *
 length, and the join frame is [FRAME] * length.
 """
 
+import json
 import random
+import threading
+import time
+import traceback
 from contextlib import nullcontext
-from itertools import takewhile
+from functools import partial
 from types import SimpleNamespace
 
+import _quail_native
 import numpy as np
 import pyarrow as pa
 
-import quail
 from quail.backends.quail import QuailModelExecution
 from quail.backends.quail.executor import chunk as chunk_mod
 from quail.backends.quail.executor.arena import KVArena
 from quail.backends.quail.executor.models.base import ModelPipeline
 from quail.backends.quail.executor.pages import PageArena
-from quail.backends.quail.graph import execute_single_graph
+from quail.backends.quail.graph import (
+    answer_region,
+    payload_tables,
+    region_report,
+    serve_region,
+)
 from quail.builtins import built_in_registry
-from quail.logical import ColumnRef
+from quail.common.expressions import ColumnRef
+from quail.common.tokens import token_table
+from quail.execution.finished import finished_rows, hinted_tables, region_hint
+from quail.execution.runner import compute_subgraph
+from quail.execution.stages import plain
 from quail.physical import (
     AiFilter,
     AiJoin,
     Barrier,
-    Foreign,
     HashJoin,
     PhysicalGraph,
     PortRef,
     Scan,
+    input_ports,
 )
-from quail.physical.base import input_ports
+from quail.progress import answer_sink, progress_sink
 from quail.specs import DEVICES, MODELS
 
 DOC = 1000
@@ -51,6 +64,7 @@ def bare_arena(arena, pages):
     arena.pinned = False
     arena._rows = {}
     arena._capacity_rows = {}
+    arena._stale_rows = set()
     arena._sliding_rows = {}
     arena._base = {}
     arena._sliding_start = {}
@@ -63,15 +77,8 @@ def bare_arena(arena, pages):
     arena.host = None
     arena._refresh_rows = lambda *args: None
     arena.reset_stats()
+    arena.trace_files = []
     return arena
-
-
-def letter_tokens(text):
-    """Tokenize text as bytes, treating short answer letters as one token."""
-    import re
-    if re.fullmatch(r" [A-Za-z]{1,2}", text):
-        return [10_000 * (len(text) - 1) + sum(map(ord, text[1:]))]
-    return list(text.encode())
 
 
 def cpu_staging(monkeypatch):
@@ -215,16 +222,7 @@ def fake_pack(torch, arena, specs, **kw):
                            meta=meta)
 
 
-def expected_filter_rows(filter_truth):
-    """Each document's answers up to and including its first FALSE."""
-    rows = {}
-    for d, truth in enumerate(filter_truth):
-        passed = list(takewhile(bool, truth))
-        rows[d] = passed + truth[len(passed):len(passed) + 1]
-    return rows
-
-
-def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None,
+def two_alias_graph(pipelined, *, stages=1, hash_join=False,
                     filtered=True, semantics="full", keep_kv=False):
     """R's filter sequence into a join with p.
 
@@ -235,8 +233,6 @@ def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None,
         stages: Filter stages on r.
         hash_join: Pair r and p on their "key" columns with a HashJoin
             over the scans that feeds the join its pairs port.
-        foreign: (kind, ids) of a Foreign node between the sequence and
-            the join; ids "pairs" feeds the join its pairs port.
         filtered: Whether r's filter sequence runs at all; otherwise the
             join reads r's scan and loads every anchor itself.
         semantics: The join stage's semantics, "full" or "anti".
@@ -271,23 +267,6 @@ def two_alias_graph(pipelined, *, stages=1, hash_join=False, foreign=None,
             on=((ColumnRef("r", "r", "key"), ColumnRef("p", "p", "key")),)))
         join_inputs.append(PortRef("hash_join:r-p", "pairs:0"))
         pairs_from = "hash_join:r-p"
-    if foreign and foreign[1] == "pairs":
-        nodes.append(Foreign(
-            node_id="apply:same_key",
-            inputs=input_ports((anchor_src, PortRef("input:p", "rows:p"))),
-            function="same_key", kind=foreign[0], ids="pairs",
-            columns=(ColumnRef("r", "r", "key"), ColumnRef("p", "p", "key")),
-            aliases=("r", "p"),
-            written_position=0))
-        join_inputs.append(PortRef("apply:same_key", "pairs:0"))
-        pairs_from = "apply:same_key"
-    elif foreign:
-        nodes.append(Foreign(
-            node_id="apply:keep_even",
-            inputs=input_ports((anchor_src,)),
-            function="keep_even", kind=foreign[0], ids=foreign[1],
-            columns=(), aliases=("r",)))
-        anchor_src = PortRef("apply:keep_even", "rows:r")
     resident = "filter" if filtered and pipelined else "none"
     nodes.append(AiJoin(
         node_id="group:0", anchor="r", anchor_resident=resident, keep_kv=keep_kv,
@@ -341,35 +320,9 @@ def run_graph_on_arena(monkeypatch, graph, *, num_documents=14, num_partners=4,
         "device": DEVICES["h100-sxm"],
         "chunk_tokens": 120, "documents": documents, **extra,
     }
-    result = execute_single_graph(state, SETTINGS, graph)
+    result = run_graph(state, SETTINGS, graph)
     assert not arena.accounting.owned
     return result, model, filter_truth, join_truth
-
-
-def register_claims_evidence(session, claim_words=20, text_words=100):
-    """Four claims and three evidence rows sharing a url column."""
-    session.register("claims", quail.DocumentProvider.from_table(pa.table({
-        "id": [f"c{i}" for i in range(4)],
-        "claim": [f"{i} " + "word " * claim_words for i in range(4)],
-        "url": ["u0", "u1", "u1", "u9"],
-    }), id_col="id"))
-    session.register("evidence", quail.DocumentProvider.from_table(pa.table({
-        "id": [f"e{i}" for i in range(3)],
-        "text": [f"{i} " + "word " * text_words for i in range(3)],
-        "url": ["u1", "u0", "u1"],
-    }), id_col="id"))
-
-
-def keep_even(tables):
-    (alias,) = tables
-    table = tables[alias]
-    return [document for document in table.column(alias).to_pylist()
-            if document % 2 == 0]
-
-
-def same_key(tables):
-    left, right = tables["r"], tables["p"]
-    return left.join(right, keys=["key"], join_type="inner").select(["r", "p"])
 
 
 class FakeArena:
@@ -386,10 +339,6 @@ class FakeArena:
 
     def reclaim(self, wait=False):
         return 0
-
-    def free_all(self):
-        for key in list(self.owned):
-            self.free_key(key)
 
     @property
     def retained_pages(self):
@@ -419,6 +368,10 @@ class FakeArena:
         self.owned.discard(key)
         self.retained.discard(key)
 
+    def free_all(self, save=False):
+        self.owned.clear()
+        self.retained.clear()
+
     def retain(self, key, prefix_tokens, priority=None):
         self.owned.add(key)
         self.retained.add(key)
@@ -429,17 +382,8 @@ class FakeArena:
     def reset_stats(self):
         pass
 
-
-def graph_state(model_execution, documents):
-    return {
-        "gpu": SimpleNamespace(torch=fake_torch(), arena=FakeArena(),
-                               pipeline=fake_pipeline(), execution=model_execution,
-                               spec=MODELS["qwen3-4b-fp8"]),
-        "runtimes": built_in_registry().runtimes,
-        "device": DEVICES["h100-sxm"],
-        "chunk_tokens": 8192,
-        "documents": documents,
-    }
+    def write_trace_files(self):
+        pass
 
 
 def plain_arena(pages=64):
@@ -462,3 +406,114 @@ def fake_readout(**attributes):
         "trailing_rows": 1, "normalize": False, "dtype": None,
         "submit": lambda value, rows_per_answer=None: value,
         "result": lambda value: value, **attributes})
+
+
+def run_graph(state, payload, graph) -> dict:
+    """Run a graph on one executor state, as a region on one GPU runs.
+
+    The graph is one stage, which a thread serves as a worker.
+
+    Args:
+        state: The executor's state: its "gpu", runtimes, device, and documents.
+        payload: The query's runtime payload, without its stages.
+        graph: The region's graph.
+    """
+    # the region sends each scan's document ids, so a scan built
+    # without its count takes it from the documents
+    graph = PhysicalGraph(tuple(
+        node.replace(num_documents=len(state["documents"][node.alias]))
+        if isinstance(node, Scan) else node for node in graph.nodes), graph.root)
+    payload = {
+        **payload, "gpu_timing": state.get("gpu_timing", False),
+        "stages": json.loads(_quail_native.region_stages(graph.to_json(), 1))}
+    return run_on_threads([state], payload, graph, state["device"])
+
+
+def region_tables(payload: dict) -> list:
+    """Return a payload's documents, texts, and columns as named tables."""
+    tables = []
+    for alias, documents in payload.get("documents", {}).items():
+        tables.append((f"documents:{alias}", token_table(documents)))
+    for alias, texts in payload.get("texts", {}).items():
+        tables.append((f"texts:{alias}", pa.table({"text": texts})))
+    for alias, columns in payload.get("columns", {}).items():
+        tables.append((f"columns:{alias}", columns))
+    for alias, rows in payload.get("source_rows", {}).items():
+        tables.append((f"source_rows:{alias}", rows))
+    return tables
+
+
+def run_on_workers(workers, payload, graph, device) -> dict:
+    """Run a hand-built region's stages on workers and report the run.
+
+    A test that builds a graph without a query runs it here: the
+    region's rows go to the FinishedRows the test reports to, and the
+    workers ask the test's hint.
+
+    Args:
+        workers: The ``_quail_native.Workers`` to run on.
+        payload: The query's runtime payload, with its stages.
+        graph: The region's graph.
+        device: The GPUs' device spec.
+    """
+    compute = compute_subgraph(graph)
+    rows = finished_rows()
+    wanted = None if rows is None else [
+        (node.node_id, port.name) for node in compute.nodes
+        for port in node.outputs if rows.wants(node.node_id, port.name)]
+    sinks = (progress_sink(), answer_sink())
+    region = json.dumps({
+        "query": {name: value for name, value in payload.items()
+                  if name not in ("documents", "texts", "columns",
+                                  "source_rows")},
+        "wanted": wanted, "hinted": hinted_tables(),
+        "listening": [sink is not None for sink in sinks]}, default=plain)
+    started = time.perf_counter()
+    ran = workers.run_region(
+        region, region_tables(payload), compute.to_json(),
+        json.dumps(payload["stages"]),
+        lambda table: None if rows is None else rows.report(table),
+        partial(answer_region, region_hint(), sinks))
+    return region_report(graph, ran, time.perf_counter() - started, device,
+                         gpus=len(workers.paths),
+                         gpu_timing=payload.get("gpu_timing", False))
+
+
+def run_on_threads(states, payload, graph, device) -> dict:
+    """Run a region's stages on workers that each serve a GPU on a thread.
+
+    Each thread answers the region as a worker process does, with the
+    executor state given for that GPU.
+
+    Args:
+        states: Per GPU, the executor's state, as ``run_graph`` takes it.
+        payload: The query's runtime payload.
+        graph: The region's graph.
+        device: The GPUs' device spec.
+    """
+    workers = _quail_native.Workers(len(states))
+    try:
+        for state, path in zip(states, workers.paths, strict=True):
+            threading.Thread(target=_serve,
+                             args=(state, payload, graph, str(path)),
+                             daemon=True).start()
+        workers.connect()
+        return run_on_workers(workers, payload, graph, device)
+    finally:
+        workers.close()
+
+
+def _serve(state, payload, graph, path):
+    """Serve each region Quail begins until it closes the connection."""
+    end = _quail_native.WorkerEnd(path)
+    while (message := end.next()) is not None:
+        try:
+            region = json.loads(message[1])
+            # the documents, texts, and columns the region sent replace
+            # the state's own, as a worker process reads them
+            sent = {name: found for name, found
+                    in payload_tables(message[2]).items() if found}
+            serve_region({**state, **sent}, payload, graph, end,
+                         region["wanted"], region["hinted"])
+        except Exception:
+            end.fail(traceback.format_exc())

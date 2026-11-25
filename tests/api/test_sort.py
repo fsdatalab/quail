@@ -1,193 +1,113 @@
-"""ORDER BY, OFFSET, and DISTINCT: the Sort node, its runtime, and the limit rule."""
+"""ORDER BY, LIMIT, OFFSET, and DISTINCT run in DataFusion above the model region."""
 
 import pyarrow as pa
 import pytest
-from helpers.planning import _optimize, _plan, node_kinds, token_lengths, tokenizer
+from helpers.oracle import Oracle, finish
+from helpers.sessions import TOKENIZER
+from helpers.transcript import Transcripts, assert_transcript
 
-from quail.builtins import built_in_registry
-from quail.catalog import Catalog, DocumentProvider
-from quail.execution.metrics import NodeResult
-from quail.execution.result import QueryResult
-from quail.execution.runtimes import SortRuntime
-from quail.explain import explain
-from quail.frontend.builder import docs
-from quail.frontend.expressions import col, count, prompt
-from quail.logical import Result, Scan, SemanticFilter
-from quail.physical import AiFilter, Project, Sort
-from quail.physical.base import input_ports
-from quail.planner import plan_query
-from quail.planner.optimizer.context import PlanningContext
-from quail.planner.optimizer.tree_rewrites import logical_alternatives
-from quail.planner.rules import built_in_rules
-from quail.specs import H100_SXM, QWEN3_4B_FP8
+import quail
+from quail.api.config import EngineConfig
+from quail.catalog import DocumentProvider
+from quail.physical import Limit
+
+# the fourth review has no body, so it has no score
+BODIES = ["refund now", "fine", "refund please", None, "refund", "ok"]
+# the score of each document, by its position; the executor reads a
+# score as a float32, which holds each of these exactly
+SCORES = [0.875, 0.125, 0.625, None, 0.75, 0.25]
 
 
 @pytest.fixture()
-def catalog():
-    cat = Catalog()
-    cat.register("reviews", DocumentProvider.from_table(
-        pa.table({"id": ["x", "y"], "review": ["x", "y"],
-                  "author": ["a", "a"]}), id_col="id"))
-    return cat
+def session():
+    value = quail.Session(EngineConfig(model="qwen3-4b-fp8", device="h100-sxm"),
+                          tokenizer=TOKENIZER)
+    value.register("reviews", DocumentProvider.from_table(
+        pa.table({"id": [10, 11, 12, 13, 14, 15], "body": BODIES,
+                  "stars": [1, 2, 1, 2, 1, 2]}), id_col="id"))
+    yield value
+    value.close()
 
 
-def _optimize_with(catalog, logical, tokens):
-    """Run the built in tree rewrites with the catalog's id columns."""
-    context = PlanningContext(
-        catalog=catalog, model=QWEN3_4B_FP8, device=H100_SXM,
-        document_tokens=token_lengths(tokens), tokenizer=tokenizer)
-    candidate, = logical_alternatives(logical, built_in_rules(), context)
-    return candidate.plan, candidate.rules
+def _scores():
+    return Oracle(scores=lambda spec, ids: SCORES[ids[0]])
 
 
-def _sort(**fields):
-    return Sort(node_id="sort", inputs=input_ports(()), **fields)
+SCORE = "AI.SCORE(PROMPT('Asks for a refund: {0}', r.body))"
 
 
-def _rows(node, table):
-    result = SortRuntime().execute(node, {"rows": table}, None)
-    assert isinstance(result, NodeResult)
-    value = result.outputs["rows"]
-    assert isinstance(value, QueryResult)
-    return value.to_rows(), result.metrics
+def test_order_by_limit_and_offset_over_an_ai_score_return_the_sorted_rows(session):
+    query = session.sql(f"SELECT r.id, {SCORE} AS score FROM reviews r "
+                        "ORDER BY score DESC NULLS LAST LIMIT 2")
+    rows = finish(query, _scores()).collect().to_pylist()
+    assert rows == [{"r.id": 10, "score": 0.875}, {"r.id": 14, "score": 0.75}]
+    # the region scores every review; DataFusion keeps the top two
+    assert not any(isinstance(node, Limit) for node in query.plan().nodes)
+    assert "filter_limit" not in query.plan().settings
+    assert "SortExec: TopK(fetch=2)" in query.explain()
+    # an offset skips the sorted rows, with nulls highest
+    query = session.sql(f"SELECT r.id FROM reviews r ORDER BY {SCORE} DESC "
+                        "LIMIT 2 OFFSET 3")
+    rows = finish(query, _scores()).collect().to_pylist()
+    assert rows == [{"r.id": 12}, {"r.id": 15}]
+    last = session.sql(f"SELECT r.id FROM reviews r ORDER BY {SCORE} LIMIT 1 OFFSET 5")
+    assert finish(last, _scores()).collect().to_pylist() == [{"r.id": 13}]
 
 
-def test_sort_runtime_orders_bounds_and_deduplicates_rows():
-    table = pa.table({
-        "r.id": ["a", "b", "c", "d", "e"],
-        "score": [0.2, None, 0.9, 0.2, 0.5],
-        "label": pa.array(["x", "y", "x", "x", "y"]).dictionary_encode(),
-    })
-    rows, metrics = _rows(_sort(keys=(("score", True, False),),
-                                columns=("r.id",)), table)
-    assert rows == [("c",), ("e",), ("a",), ("d",), ("b",)]
-    assert (metrics.input_rows, metrics.output_rows) == (5, 5)
-    rows, _ = _rows(_sort(keys=(("score", True, True),),
-                          columns=("r.id", "score"), offset=1, fetch=2), table)
-    assert rows == [("c", 0.9), ("e", 0.5)]
-    rows, _ = _rows(_sort(keys=(("score", False, False), ("r.id", True, False)),
-                          columns=("r.id",)), table)
-    assert rows == [("d",), ("a",), ("e",), ("c",), ("b",)]
-    rows, _ = _rows(_sort(keys=(("label", False, False), ("score", True, True)),
-                          columns=("r.id",)), table)
-    assert rows == [("c",), ("a",), ("d",), ("b",), ("e",)]
-    rows, metrics = _rows(_sort(keys=(("label", True, False),),
-                                columns=("label",), distinct=True), table)
-    assert rows == [("y",), ("x",)]
-    assert (metrics.input_rows, metrics.output_rows) == (5, 2)
-    rows, _ = _rows(_sort(columns=("label", "score"), distinct=True), table)
-    assert rows == [("x", 0.2), ("y", None), ("x", 0.9), ("y", 0.5)]
-    rows, _ = _rows(_sort(columns=("r.id",), offset=4), table)
-    assert rows == [("e",)]
-    materialized = QueryResult.from_table(table)
-    result = SortRuntime().execute(
-        _sort(keys=(("r.id", True, False),), columns=("r.id",), fetch=1),
-        {"rows": materialized}, None)
-    assert result.outputs["rows"].to_rows() == [("e",)]
+def test_a_limit_stops_an_ai_filter_and_a_distinct_returns_each_value_once(session):
+    query = session.sql("SELECT r.id FROM reviews r "
+                        "WHERE AI.IF(PROMPT('Asks for a refund: {0}', r.body)) LIMIT 2")
+    assert query.plan().settings["filter_limit"] == 2
+    rows = finish(query, Oracle(filters=lambda alias, document, position:
+                                "refund" in (BODIES[document] or ""))).collect()
+    assert rows.column("r.id").to_pylist() == [10, 12]
+    # DISTINCT returns each value of the kept rows once
+    query = session.sql("SELECT DISTINCT r.stars FROM reviews r "
+                        "WHERE AI.IF(PROMPT('Asks for a refund: {0}', r.body)) "
+                        "ORDER BY r.stars")
+    rows = finish(query, Oracle(filters=lambda alias, document, position:
+                                "refund" in (BODIES[document] or "") or document == 5))
+    assert rows.collect().to_pylist() == [{"r.stars": 1}, {"r.stars": 2}]
+    assert "AggregateExec" in query.explain()
 
 
-@pytest.mark.parametrize("name", ["key_0", "row_position", "column_0"])
-def test_distinct_keeps_a_user_column_named_like_an_internal_one(name):
-    table = pa.table({name: ["a", "a", None, None, "b"], "other": [1, 1, 2, 2, 3]})
-    rows, metrics = _rows(_sort(columns=(name, "other"), distinct=True), table)
-    assert rows == [("a", 1), (None, 2), ("b", 3)]
-    assert (metrics.input_rows, metrics.output_rows) == (5, 3)
-    # signed zeros and NaNs are one value each
-    table = pa.table({"v": [0.0, -0.0, float("nan"), float("nan"), 1.0]})
-    rows, _ = _rows(_sort(columns=("v",), distinct=True), table)
-    assert [0.0, 1.0] == [v for (v,) in rows if v == v] and len(rows) == 3
+def test_a_sorted_limit_keeps_the_order_when_an_extraction_finishes_early():
+    # r3's extraction has no answer, so it finishes before the others
+    table = pa.table({"id": [f"r{index}" for index in range(6)],
+                      "body": [f"w{index} x" for index in range(6)]})
 
+    def answer(kind, prompt, rows):
+        return None if rows[0] == "r3" else f"w{rows[0][1:]}"
 
-def _filtered(catalog):
-    return (docs(catalog, "reviews").alias("r")
-            .ai_filter(prompt("flag: {0}", col("r.review")), selectivity=0.5))
+    extract = "AI.EXTRACT(r.body, {'w': 'Which word?'})['w']"
+    with Transcripts({"r": table}, answer) as runs:
+        assert_transcript("\n".join(runs.query(sql, ordered=True) for sql in (
+            f"SELECT r.id, {extract} AS w FROM r ORDER BY r.id LIMIT 5",
+            f"SELECT r.id, {extract} AS w FROM r ORDER BY r.id LIMIT 100 OFFSET 3")),
+        """\
+--- SELECT r.id, AI.EXTRACT(r.body, {'w': 'Which word?'})['w'] AS w FROM r ORDER BY r.id
+    LIMIT 5 ---
+plan
+  __quail_call_1 = ai_extract(r.column_1, named_struct('w', 'Which word?')), row_limit:
+      5, returns: [__quail_call_1]
+asked 5 of 6
+  'Which word?': r0 'w0', r1 'w1', r2 'w2', r3 NULL, r4 'w4'
+rows 5, in order
+  r0, 'w0'
+  r1, 'w1'
+  r2, 'w2'
+  r3, NULL
+  r4, 'w4'
 
-
-def test_order_by_ends_the_plan_in_a_sort_and_keeps_every_survivor(catalog):
-    tokens = {"r": [400] * 100}
-    plain = _plan(_filtered(catalog).limit(3).select("r.id"), tokens)
-    assert node_kinds(plain)[-2:] == ["Project", "Limit"]
-    assert plain.settings["filter_limit"] == 3
-
-    logical = (_filtered(catalog).order_by(col("r.id").desc()).limit(3)
-               .select("r.review"))
-    optimized, _ = _optimize(logical, tokens)
-    scan = next(node for node in optimized.walk() if isinstance(node, Scan))
-    assert scan.columns == ("id", "review")
-    plan = _plan(logical, tokens)
-    assert node_kinds(plan)[-2:] == ["Project", "Sort"]
-    assert "filter_limit" not in plan.settings
-    project = next(node for node in plan.nodes if isinstance(node, Project))
-    sort = next(node for node in plan.nodes if isinstance(node, Sort))
-    assert project.columns == ("r.review", "r.id")
-    assert sort.columns == ("r.review",)
-    assert (sort.keys, sort.fetch) == ((("r.id", True, True),), 3)
-    text = explain(logical, plan)
-    assert "Sort: r.id DESC NULLS FIRST" in text and "Limit: 3" in text
-    assert "Sort: r.id DESC" in text.split("physical:", 1)[1]
-    assert "Sort: r.id DESC NULLS FIRST" in text.split("physical:", 1)[1]
-    assert "fetch=3" in text
-
-    distinct = _plan(_filtered(catalog).distinct().offset(2).select("r.id"),
-                     tokens)
-    sort = next(node for node in distinct.nodes if isinstance(node, Sort))
-    assert (sort.keys, sort.distinct, sort.offset, sort.fetch) == (
-        (), True, 2, None)
-    assert "filter_limit" not in distinct.settings
-
-
-def test_distinct_is_dropped_when_every_tables_id_is_selected(catalog):
-    tokens = {"r": [400] * 100}
-    optimized, changed = _optimize_with(
-        catalog, _filtered(catalog).distinct().limit(3).select("r.id"), tokens)
-    assert "should_eliminate_distinct" in changed
-    assert not isinstance(optimized.root, Result) or not optimized.root.distinct
-    plan = plan_query(optimized, model=QWEN3_4B_FP8, device=H100_SXM,
-                      registry=built_in_registry(),
-                      document_tokens=token_lengths(tokens), tokenizer=tokenizer)
-    assert node_kinds(plan)[-2:] == ["Project", "Limit"]
-    assert plan.settings["filter_limit"] == 3
-    # a group's keys name it once, so DISTINCT over them is redundant too
-    grouped = (_filtered(catalog).group_by("r.author").agg(n=count())
-               .distinct().select("r.author", "n"))
-    optimized, changed = _optimize_with(catalog, grouped, tokens)
-    assert "should_eliminate_distinct" in changed and not optimized.root.distinct
-    # without the id the rows can repeat, so the DISTINCT stays
-    optimized, changed = _optimize_with(
-        catalog, _filtered(catalog).distinct().select("r.author"), tokens)
-    assert "should_eliminate_distinct" not in changed and optimized.root.distinct
-    # without a catalog the rule cannot know the id columns
-    optimized, changed = _optimize(
-        _filtered(catalog).distinct().select("r.id"), tokens)
-    assert "should_eliminate_distinct" not in changed and optimized.root.distinct
-
-
-def test_distinct_over_one_tables_columns_stops_its_filter_per_key(catalog):
-    tokens = {"r": [400] * 100}
-    logical = (_filtered(catalog).distinct().order_by("r.author").limit(2)
-               .select("r.author"))
-    optimized, changed = _optimize_with(catalog, logical, tokens)
-    assert "should_push_down_distinct" in changed
-    node = next(node for node in optimized.walk()
-                if isinstance(node, SemanticFilter))
-    assert node.stop_key == ("author",)
-    plan = plan_query(optimized, model=QWEN3_4B_FP8, device=H100_SXM,
-                      registry=built_in_registry(),
-                      document_tokens=token_lengths(tokens), tokenizer=tokenizer)
-    ai_filter = next(node for node in plan.nodes if isinstance(node, AiFilter))
-    assert ai_filter.stop_key == ("author",)
-    text = explain(optimized, plan)
-    assert "SemanticFilter stop_key=author" in text
-    assert "stop per key: author" in text
-    # a second model call, or a column the filter's rows do not determine,
-    # leaves the filter alone
-    for logical in (
-            _filtered(catalog).ai_classify(
-                prompt("tone: {0}", col("r.review")), ["pos", "neg"],
-                name="tone").distinct().select("r.author", "tone"),
-            _filtered(catalog).distinct().select("r.id", "r.author"),
-            _filtered(catalog).select("r.author")):
-        optimized, changed = _optimize_with(catalog, logical, tokens)
-        assert "should_push_down_distinct" not in changed
-        assert all(not node.stop_key for node in optimized.walk()
-                   if isinstance(node, SemanticFilter))
+--- SELECT r.id, AI.EXTRACT(r.body, {'w': 'Which word?'})['w'] AS w FROM r ORDER BY r.id
+    LIMIT 100 OFFSET 3 ---
+plan
+  __quail_call_1 = ai_extract(r.column_1, named_struct('w', 'Which word?')), row_limit:
+      103, returns: [__quail_call_1]
+asked 6 of 6
+  'Which word?': r0 'w0', r1 'w1', r2 'w2', r3 NULL, r4 'w4', r5 'w5'
+rows 3, in order
+  r3, NULL
+  r4, 'w4'
+  r5, 'w5'
+""")

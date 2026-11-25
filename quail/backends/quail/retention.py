@@ -1,6 +1,6 @@
 """Apply saved KV retention decisions to a GPU arena."""
 
-from quail.cost.retention import RetentionPolicy
+from quail.common.retention import RetentionPolicy
 
 
 def policy(config, uses):
@@ -35,9 +35,7 @@ def join_settlement(arena, keys, prefixes, node, config):
         key = keys[anchor]
         if not arena.is_resident(key):
             return
-        matched = any(row)
-        alive = not matched if node.semantics == "anti" else matched
-        if alive and node.keep_kv:
+        if node.keeps(any(row)) and node.keep_kv:
             tokens = len(prefixes[anchor])
             value = (priority.priority(key, tokens, arena.pages_needed(tokens))
                      if priority is not None else None)

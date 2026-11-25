@@ -16,7 +16,7 @@ from pathlib import Path
 import numpy as np
 
 from quail.backends.quail.executor.model_loading import answer_weights
-from quail.planner.prompt_lowering import true_false_ids
+from quail.common.budgets import READOUT_BLOCK_ROWS
 
 
 class AnswerRows:
@@ -41,12 +41,6 @@ class AnswerRows:
             [i for i, t in enumerate(self.allowed) if t in set(false_ids)],
             device="cuda")
 
-    @classmethod
-    def from_tokenizer(cls, torch, F, model, tokenizer):
-        """Rows for the TRUE and FALSE spellings the tokenizer produces."""
-        true_ids, false_ids = true_false_ids(tokenizer)
-        return cls(torch, F, model, true_ids, false_ids)
-
     def logits(self, normed):
         """Per row, the best logit of each class over its spellings."""
         scores = self.F.linear(normed, self.weights)
@@ -66,31 +60,35 @@ class AsyncAnswers:
     the event and reads the answers without stalling the GPU stream.
     """
 
-    dtype = None    # answers arrive as Python lists of bits
-    # the readout contract a stage reads: one trailing row, no normalizer
+    dtype = None
     trailing_rows = 1
     normalize = False
 
     def __init__(self, torch, rows):
         self.torch = torch
         self.rows = rows
+        self.available = []
 
     def submit(self, normed):
         torch = self.torch
         t, f = self.rows.logits(normed)
         bits = (t > f).to(torch.uint8)
-        host = torch.empty(bits.shape[0], dtype=torch.uint8,
-                           pin_memory=True)
-        host.copy_(bits, non_blocking=True)
+        count = bits.shape[0]
+        host = self.available.pop() if self.available else None
+        if host is None or host.shape[0] < count:
+            host = torch.empty(max(count, 64), dtype=torch.uint8,
+                               pin_memory=bits.is_cuda)
+        host[:count].copy_(bits, non_blocking=True)
         event = torch.cuda.Event()
         event.record()
-        return event, host
+        return event, host, count
 
-    @staticmethod
-    def result(handle):
-        event, host = handle
+    def result(self, handle):
+        event, host, count = handle
         event.synchronize()
-        return [int(b) for b in host.tolist()]
+        values = [int(b) for b in host[:count].tolist()]
+        self.available.append(host)
+        return values
 
 
 def answer_rows(rows_per_answer) -> tuple[np.ndarray, np.ndarray]:
@@ -111,10 +109,7 @@ def answer_rows(rows_per_answer) -> tuple[np.ndarray, np.ndarray]:
 class _HostReadout:
     """Copy readout tensors asynchronously using reusable pinned buffers."""
 
-    # the rows a stage reads at the end of each suffix
     trailing_rows = 1
-    # whether label scores are normalized over the vocabulary, for
-    # readouts that score labels
     normalize = False
 
     def __init__(self, torch):
@@ -158,9 +153,7 @@ class AsyncLabelLogprobs(_HostReadout):
         normalize: Whether to normalize against the full vocabulary.
     """
 
-    # rows per head block: every block reads the whole head, so few big
-    # blocks; 512 x 151,936 logits in bf16 and float32 are 445 MiB
-    BLOCK_ROWS = 512
+    BLOCK_ROWS = READOUT_BLOCK_ROWS
 
     def __init__(self, torch, F, head, targets, rows=1, normalize=True):
         super().__init__(torch)
@@ -213,8 +206,6 @@ class AsyncLabelLogprobs(_HostReadout):
             answers = torch.full((len(rows_per_answer), self.rows,
                                   values.shape[1]), float("nan"),
                                  dtype=torch.float32, device=values.device)
-            # copied from pinned memory, so the host does not wait for
-            # the forward pass ahead of the copy on the stream
             answer_index, row_index = (
                 torch.from_numpy(index).pin_memory().to(
                     values.device, non_blocking=True)
@@ -261,7 +252,9 @@ class AsyncTopLogprobs(_HostReadout):
             members = list(extra) if isinstance(extra, tuple) else [extra]
             self.groups.append(slice(len(ids), len(ids) + len(members)))
             ids.extend(members)
-        self.extras = torch.tensor(ids, device=head.device, dtype=torch.long)
+        self.extras = torch.tensor(
+            ids, dtype=torch.long, pin_memory=head.is_cuda
+        ).to(head.device, non_blocking=True)
         self.width = len(extras) + 2 * k
         self.ragged = ragged
         self.dtype = (np.dtype(object) if ragged
@@ -272,19 +265,22 @@ class AsyncTopLogprobs(_HostReadout):
         torch = self.torch
         out = torch.empty((normed.shape[0], self.width), dtype=torch.float32,
                           device=normed.device)
-        n = len(self.groups)
         for start in range(0, normed.shape[0], self.BLOCK_ROWS):
             block = normed[start:start + self.BLOCK_ROWS]
-            logits = self.F.linear(block.to(self.head.dtype), self.head).float()
-            logits -= torch.logsumexp(logits, dim=1, keepdim=True)
-            rows = slice(start, start + block.shape[0])
-            picked = logits.index_select(1, self.extras)
-            for column, group in enumerate(self.groups):
-                out[rows, column] = torch.logsumexp(picked[:, group], dim=1)
-            top, ids = torch.topk(logits, self.k, dim=1)
-            out[rows, n:n + self.k] = ids.float()
-            out[rows, n + self.k:] = top
+            logits = self.F.linear(block.to(self.head.dtype), self.head)
+            out[start:start + block.shape[0]] = self.from_logits(logits)
         return out
+
+    def from_logits(self, logits):
+        """Return compact top-token values from a full-vocabulary projection."""
+        torch = self.torch
+        logits = logits.float()
+        logits = logits - torch.logsumexp(logits, dim=1, keepdim=True)
+        picked = logits.index_select(1, self.extras)
+        extras = [torch.logsumexp(picked[:, group], dim=1)[:, None]
+                  for group in self.groups]
+        top, ids = torch.topk(logits, self.k, dim=1)
+        return torch.cat([*extras, ids.float(), top], dim=1)
 
     def submit(self, normed, rows_per_answer=None):
         return (*self._copy(self.values(normed)), rows_per_answer)
@@ -308,24 +304,175 @@ def split_rows(values, rows_per_answer):
 
 
 class AsyncScores(_HostReadout):
-    """Non-blocking yes-against-no sigmoid readout for AI.SCORE."""
+    """Non-blocking yes-against-no sigmoid readout for AI.SCORE.
+
+    Args:
+        torch: The torch module.
+        rows: The AnswerRows of the query's yes and no tokens.
+        temperature: Divides the yes-against-no margin before the sigmoid.
+    """
 
     dtype = np.float32
 
-    def __init__(self, torch, rows):
+    def __init__(self, torch, rows, temperature=1.0):
         super().__init__(torch)
         self.rows = rows
         self.weights = rows.weights.float()
+        self.temperature = temperature
 
     def submit(self, normed):
         torch, rows = self.torch, self.rows
         logits = rows.F.linear(normed.float(), self.weights)
         yes = logits.index_select(1, rows.true_cols).amax(dim=1)
         no = logits.index_select(1, rows.false_cols).amax(dim=1)
-        return self._copy(torch.sigmoid(yes - no))
+        return self._copy(torch.sigmoid((yes - no) / self.temperature))
 
     def result(self, handle):
         return super().result(handle, copy=False)
+
+
+class _SlotReadout(_HostReadout):
+    """A set-attention pass's readout, whose answer is one row per question.
+
+    The result is an object array holding each answer's rows in order.
+    """
+
+    dtype = np.dtype(object)
+
+    def result(self, handle):
+        *transfer, rows_per_answer = handle
+        return split_rows(super().result(transfer), rows_per_answer)
+
+
+class AsyncSlotMargins(_SlotReadout):
+    """Each read row's best true logit minus its best false logit, per answer.
+
+    Args:
+        torch: The torch module.
+        rows: The AnswerRows of the query's true and false tokens.
+    """
+
+    def __init__(self, torch, rows):
+        super().__init__(torch)
+        self.rows = rows
+        self.weights = rows.weights.float()
+
+    def submit(self, normed, rows_per_answer=None):
+        rows = self.rows
+        logits = rows.F.linear(normed.float(), self.weights)
+        margins = (logits.index_select(1, rows.true_cols).amax(dim=1)
+                   - logits.index_select(1, rows.false_cols).amax(dim=1))
+        return (*self._copy(margins), rows_per_answer)
+
+
+def pointer_spans(torch, F, rows, queries, firsts, states, span_tokens):
+    """Every read's span in a chunk, computed together.
+
+    A read has a start and an end slot. Each slot scores its answer's
+    document rows by dot product over the square root of the width; the
+    first document row stands for nothing. A read is found when its
+    start's probability off the first row is at least one half; its span
+    is then the likeliest start and end at most span_tokens rows apart.
+
+    Args:
+        torch: The torch module.
+        F: torch.nn.functional.
+        rows: (read rows, width) float32 rows of the chunk's answers.
+        queries: (reads * 2, width) the slot rows, start then end, read by read.
+        firsts: Per read, its answer's first row in rows.
+        states: Per read, its answer's document rows.
+        span_tokens: The longest span, in rows.
+
+    Returns:
+        (reads, 3): each read's first and last document row, (0, 0) for
+        nothing, and its raw P(found).
+    """
+    widest = int(states.max())
+    device = rows.device
+
+    def tensor(array):
+        return torch.from_numpy(np.ascontiguousarray(array)).to(device)
+
+    scores = queries @ rows.T / math.sqrt(rows.shape[-1])
+    valid = np.arange(widest)[None, :] < states[:, None]
+    columns = np.where(valid, firsts[:, None] + np.arange(widest), 0)
+    logits = scores.gather(1, tensor(np.repeat(columns, 2, axis=0)))
+    logits = logits.masked_fill(~tensor(np.repeat(valid, 2, axis=0)), -math.inf)
+    start, end = logits.log_softmax(-1).view(-1, 2, widest).unbind(1)
+    found = -torch.expm1(start[:, 0])
+    if widest == 1:
+        return torch.cat((torch.zeros_like(start).repeat(1, 2), found[:, None]), -1)
+    cap = min(span_tokens, widest - 1)
+    windows, indices = F.max_pool1d(
+        F.pad(end[:, None, 1:], (0, cap - 1), value=-math.inf),
+        cap, stride=1, return_indices=True)
+    index = (start[:, 1:] + windows[:, 0]).argmax(-1)
+    last = indices[:, 0].gather(1, index[:, None])[:, 0] + 1
+    at = torch.stack((index + 1, last), -1).float()
+    nothing = (found < 0.5) | tensor(states == 1)
+    at = torch.where(nothing[:, None], torch.zeros_like(at), at)
+    return torch.cat((at, found[:, None]), -1)
+
+
+class AsyncPassReadout(_SlotReadout):
+    """A set-attention pass's answers to questions of any kind, per document.
+
+    An answer's rows are, when the pass holds a read, its document rows,
+    then its slot rows in question order. A code slot (a yes/no or an
+    option-code question's last row) is projected through the output
+    head's rows for the targets. A read's start and end slots point at
+    the document rows (pointer_spans). Each answer's result is one row:
+    the code slots' target logits, then each read's first row, last row,
+    and raw P(found).
+
+    Args:
+        torch: The torch module.
+        F: torch.nn.functional.
+        head: The model's full output head.
+        targets: The token ids the code slots are read for, in column order.
+        slot_kinds: Per slot row of an answer, "code", "start", or "end";
+            None reads every row as a code slot, answers of any number
+            of rows, each answer's result its rows' target logits.
+        span_tokens: The longest span a read returns, in rows.
+    """
+
+    def __init__(self, torch, F, head, targets, slot_kinds, span_tokens=0):
+        super().__init__(torch)
+        self.F = F
+        self.weights = head.index_select(0, torch.tensor(
+            list(targets), device=head.device)).float()
+        self.ragged = slot_kinds is None
+        kinds = np.asarray(() if slot_kinds is None else slot_kinds)
+        self.slots = len(kinds)
+        self.code = np.flatnonzero(kinds == "code")
+        self.read = np.flatnonzero((kinds == "start") | (kinds == "end"))
+        self.span_tokens = span_tokens
+
+    def submit(self, normed, rows_per_answer=None):
+        torch = self.torch
+        rows = normed.float()
+        if self.ragged:
+            return (*self._copy(rows @ self.weights.T), rows_per_answer)
+        counts = np.asarray(rows_per_answer, dtype=np.int64)
+        firsts = np.concatenate(([0], np.cumsum(counts)[:-1]))
+        states = counts - self.slots
+        slot_rows = (firsts + states)[:, None] + np.arange(self.slots)
+
+        def take(columns):
+            index = np.ascontiguousarray(slot_rows[:, columns].reshape(-1))
+            return rows.index_select(0, torch.from_numpy(index).to(rows.device))
+
+        answers = len(counts)
+        parts = []
+        if len(self.code):
+            parts.append((take(self.code) @ self.weights.T).view(answers, -1))
+        if len(self.read):
+            reads = len(self.read) // 2
+            spans = pointer_spans(
+                torch, self.F, rows, take(self.read), np.repeat(firsts, reads),
+                np.repeat(states, reads), self.span_tokens)
+            parts.append(spans.view(answers, -1))
+        return (*self._copy(torch.cat(parts, -1)), None)
 
 
 class DecisionHead:
@@ -339,9 +486,21 @@ class DecisionHead:
         torch: The torch module.
         F: torch.nn.functional.
         weights: The tensors of decision_head.safetensors by name.
+
+    Raises:
+        ValueError: The weights are not exactly TENSORS.
     """
 
+    TENSORS = frozenset((
+        "candidate_norm.weight", "candidate_norm.bias", "query_norm.weight",
+        "query_norm.bias", "key.weight", "query.weight", "candidate_mlp.weight",
+        "candidate_mlp.bias", "query_mlp.weight", "scalar.weight"))
+
     def __init__(self, torch, F, weights):
+        if missing := self.TENSORS - weights.keys():
+            raise ValueError(f"the decision head is missing {sorted(missing)}")
+        if unknown := weights.keys() - self.TENSORS:
+            raise ValueError(f"the decision head does not use {sorted(unknown)}")
         self.torch = torch
         self.F = F
         self.w = {name: t.float() for name, t in weights.items()}
@@ -380,6 +539,81 @@ class DecisionHead:
                    + F.linear(query, w["query_mlp.weight"])[:, None, :]),
             w["scalar.weight"]).squeeze(-1)
         return bilinear / math.sqrt(self.head_dim) + mlp
+
+
+class LetterReadout:
+    """The slot_lm readout of mammoth-1 and elephant-1, in fp32.
+
+    Every option is scored at the prompt's last row: option i's score is
+    the last row times the output head's row of option i's letter. The
+    readout implements the DecisionHead interface, so decision readouts
+    read every option at offset 0.
+
+    Args:
+        F: torch.nn.functional.
+        weight: The (letters, hidden) rows of the output head.
+    """
+
+    def __init__(self, F, weight):
+        self.F = F
+        self.weight = weight.float()
+
+    @classmethod
+    def load(cls, torch, F, path, letters=None, *, turn_suffix="",
+             device="cuda"):
+        """Read the output head's rows of the option letters.
+
+        Args:
+            torch: The torch module.
+            F: torch.nn.functional.
+            path: The checkpoint directory, with tokenizer.json and
+                either a safetensors index naming lm_head.weight's shard
+                or one model.safetensors holding it.
+            letters: The option letters in option order, or None to
+                select MAX_LETTERS codes with code_letters.
+            turn_suffix: The assistant turn opener code_letters checks.
+            device: Where the readout lives.
+        """
+        import json
+
+        from safetensors import safe_open
+        from tokenizers import Tokenizer
+
+        from quail.physical.lowering import MAX_LETTERS, code_letters
+
+        path = Path(path)
+        tokenizer = Tokenizer.from_file(str(path / "tokenizer.json"))
+
+        def encode(text):
+            return tokenizer.encode(text, add_special_tokens=False).ids
+
+        if letters is None:
+            letters = code_letters(MAX_LETTERS, encode, turn_suffix)
+        ids = [encode(letter) for letter in letters]
+        assert all(len(token) == 1 for token in ids)
+        index_path = path / "model.safetensors.index.json"
+        shard = (json.loads(index_path.read_text())["weight_map"]["lm_head.weight"]
+                 if index_path.exists() else "model.safetensors")
+        with safe_open(str(path / shard), framework="pt") as tensors:
+            head = tensors.get_slice("lm_head.weight")
+            rows = torch.cat([head[token:token + 1] for (token,) in ids])
+        return cls(F, rows.to(device))
+
+    def reordered(self, order):
+        """Return a LetterReadout with rows taken in the given order."""
+        return type(self)(self.F, self.weight[list(order)])
+
+    def scores(self, options, last):
+        """Per prompt, one score per option.
+
+        Args:
+            options: (prompts, options, hidden) rows; only their count is read.
+            last: (prompts, hidden) last rows of the prompts.
+
+        Returns:
+            (prompts, options) float32 scores.
+        """
+        return self.F.linear(last.float(), self.weight[:options.shape[1]])
 
 
 class DecisionRows:
@@ -435,21 +669,25 @@ class AsyncDecisions(DecisionRows):
     The options are No then Yes; the bit is 1 when Yes scores above No.
     """
 
-    dtype = None    # answers arrive as Python lists of bits
+    dtype = None
 
     def submit(self, normed, rows_per_answer=None):
         scores = self.scores(normed, rows_per_answer)
         return self._copy((scores[:, 1] > scores[:, 0]).to(self.torch.uint8),
                           self.torch.uint8)
 
-    result = staticmethod(AsyncAnswers.result)
+    @staticmethod
+    def result(handle):
+        event, host = handle
+        event.synchronize()
+        return [int(b) for b in host.tolist()]
 
 
 class AsyncDecisionScores(DecisionRows):
     """Non-blocking AI.SCORE readout of a decision head: P(Yes) over No and Yes."""
 
     dtype = np.float32
-    rows = None    # scores no answer rows of the output head
+    rows = None
 
     def submit(self, normed, rows_per_answer=None):
         scores = self.scores(normed, rows_per_answer)

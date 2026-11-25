@@ -1,44 +1,17 @@
-"""Projection and filter pushdown rule tests."""
+"""Each scan loads the columns its region reads, and a join's placements."""
 
-from dataclasses import replace
-from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pytest
-from helpers.sessions import _run, fake_tok, make_executor
+from helpers.planning import placements
+from helpers.sessions import TOKENIZER, _run, make_executor
+from helpers.transcript import Transcripts, assert_transcript
 
 import quail
-from quail.catalog import Catalog
-from quail.frontend.builder import docs
-from quail.frontend.expressions import col, prompt
-from quail.logical import (
-    Apply,
-    ColumnRef,
-    Filter,
-    LogicalPlan,
-    Scan,
-    SemanticClassify,
-    SemanticJoin,
-)
-from quail.physical import Recombine
-from quail.planner.optimizer.context import PlanningContext
-from quail.planner.optimizer.tree_rewrites import logical_alternatives
-from quail.planner.plan import EngineConfig
-from quail.planner.rules import built_in_rules
-from quail.planner.rules.tree_transforms import (
-    lift_maps,
-    push_down_filters,
-    push_down_projection,
-)
+from quail.api.config import EngineConfig
 
 
-def _scans(plan):
-    return {node.alias: node for node in plan.walk()
-            if isinstance(node, Scan)}
-
-
-def _session(tmp_path, tokenizer=fake_tok):
+def _session(tmp_path, tokenizer=TOKENIZER):
     session = quail.Session(
         EngineConfig(gpus=1, model="qwen3-4b-fp8", backend="quail",
                      device="h100-sxm"),
@@ -56,17 +29,13 @@ def _session(tmp_path, tokenizer=fake_tok):
     return session
 
 
+def _token_buffer(scan):
+    """The address of the first token id a scan's store holds."""
+    return scan.tokens.arrow_array.chunk(0).values.buffers()[1].address
+
+
 def test_projected_results_token_reuse_and_join_projection(tmp_path):
-    reviews = ["good one", "bad one", "fine one"]
-    calls = []
-
-    def counting_tok(text):
-        # Prompts are tokenized on every query; count documents only.
-        if text in reviews:
-            calls.append(text)
-        return fake_tok(text)
-
-    session = _session(tmp_path, tokenizer=counting_tok)
+    session = _session(tmp_path)
     truth = {"r": {"q:": [1, 0, 1]}}
     query = session.sql(
         "SELECT r.stars, r.id FROM reviews r WHERE "
@@ -75,22 +44,20 @@ def test_projected_results_token_reuse_and_join_projection(tmp_path):
     result = _run(query, make_executor(truth))
 
     assert sorted(result.to_rows()) == [(3, "r2"), (5, "r0")]
-    scan = _scans(query.logical)["r"]
-    assert scan.columns == ("stars", "id")
-    assert push_down_projection(query.logical.root) is query.logical.root
-    store = query._token_inputs["r"]
-    assert store.projected_columns == ("stars", "id")
-    tokenized = len(calls)
-    assert tokenized > 0
+    (scan,) = query.facts()["scans"]
+    assert scan["columns"] == ["stars", "id"]
+    store = query.token_inputs()["r"]
+    # the columns the query returns, then the document
+    assert store.projected_columns == ("stars", "id", "review")
+    # a later query reads the same token store instead of tokenizing again
+    tokenized = _token_buffer(store)
 
-    second = _run(session.sql(
+    later = session.sql(
         "SELECT r.stars, r.review FROM reviews r WHERE "
-        "AI_FILTER(PROMPT('q: {0}', r.review))"), make_executor(truth))
+        "AI_FILTER(PROMPT('q: {0}', r.review))")
+    second = _run(later, make_executor(truth))
     assert sorted(second.to_rows()) == [(3, "fine one"), (5, "good one")]
-    assert len(calls) == tokenized
-    assert len(session.inputs._token_stores) == 1
-    assert sorted(name for _, name in session.inputs._column_stores) == [
-        "id", "review", "stars"]
+    assert _token_buffer(later.token_inputs()["r"]) == tokenized
 
     truth = {"r": {"q:": [0, 1, 0]}}
 
@@ -99,12 +66,13 @@ def test_projected_results_token_reuse_and_join_projection(tmp_path):
         "AI_FILTER(PROMPT('q: {0}', r.review))"), make_executor(truth))
     assert text.to_rows() == [("bad one",)]
 
-    star = _run(session.sql(
+    everything = session.sql(
         "SELECT * FROM reviews r WHERE "
-        "AI_FILTER(PROMPT('q: {0}', r.review))"), make_executor(truth))
+        "AI_FILTER(PROMPT('q: {0}', r.review))")
+    star = _run(everything, make_executor(truth))
     assert star.columns == ["r.id", "r.review", "r.stars", "r.wide"]
     assert star.to_rows() == [("r1", "bad one", 1, "y" * 50)]
-    assert len(calls) == tokenized
+    assert _token_buffer(everything.token_inputs()["r"]) == tokenized
     session.close()
 
     session = _session(tmp_path)
@@ -120,237 +88,142 @@ def test_projected_results_token_reuse_and_join_projection(tmp_path):
         "AI_FILTER(PROMPT('m {0} {1}', r.review, p.description)) "
         "WHERE AI_FILTER(PROMPT('q: {0}', r.review))")
     result = _run(query, make_executor(truth, join_truth))
-    assert not [n for n in result.plan.nodes if isinstance(n, Recombine)]
     assert sorted(result.to_rows()) == [("r0", "p0"), ("r2", "p0")]
     assert result.count() == 2
     session.close()
 
 
-class _UnstableProvider:
-    id_col = "id"
-    columns = ("id", "body", "stars")
-
-    def __init__(self):
-        self.scans = 0
-
-    def schema(self):
-        return pa.schema({"id": pa.string(), "body": pa.string(),
-                          "stars": pa.int64()})
-
-    def content_identity(self):
-        return "unstable"
-
-    def statistics(self):
-        from quail.catalog import TableStatistics
-        return TableStatistics(num_rows=3)
-
-    def scan(self, request):
-        self.scans += 1
-        rows = 3 if self.scans == 1 else 2
-        table = pa.table({
-            "id": [f"r{i}" for i in range(rows)],
-            "body": ["one two"] * rows,
-            "stars": list(range(rows)),
-        }).select(list(request.columns))
-        return table.to_reader()
-
-
-def test_failed_scans_and_tokenization_leave_no_partial_cache(tmp_path):
-    session = _session(tmp_path)
-    session.register("documents", _UnstableProvider())
-    session.inputs.tokenize("documents", "body", ("id",))
-
-    with pytest.raises(RuntimeError, match="stable order"):
-        session.inputs.tokenize("documents", "body", ("stars",))
-    with pytest.raises(RuntimeError, match="stable order"):
-        session.inputs.tokenize("documents", "body", ("stars",))
-
-    assert ("unstable", "stars") not in session.inputs._column_stores
-    assert len(list(Path(session.inputs._token_directory.name).iterdir())) == 2
-    session.close()
-
-    def broken(text):
-        raise ValueError("tokenizer failed")
-
-    session = _session(tmp_path)
-    session._tokenizer = broken
-
-    with pytest.raises(ValueError, match="tokenizer failed"):
-        session.inputs.tokenize("reviews", "review", ("id",))
-
-    assert session.inputs._token_stores == {}
-    assert session.inputs._column_stores == {}
-    assert session.inputs._token_directory is None or not list(
-        Path(session.inputs._token_directory.name).iterdir())
-    session.close()
-
-
-def _pair_catalog():
-    catalog = Catalog()
-    catalog.register("reviews", quail.DocumentProvider.from_table(
+def _pair_session():
+    session = quail.Session(
+        EngineConfig(gpus=1, model="qwen3-4b-fp8", device="h100-sxm"),
+        tokenizer=TOKENIZER)
+    session.register("reviews", quail.DocumentProvider.from_table(
         pa.table({"id": ["r0", "r1"], "review": ["good one", "bad one"],
                   "stars": [5, 1]}), id_col="id"))
-    catalog.register("products", quail.DocumentProvider.from_table(
+    session.register("products", quail.DocumentProvider.from_table(
         pa.table({"asin": ["p0"], "description": ["a thing"]}),
         id_col="asin"))
-    return catalog
+    return session
 
 
-def _joined(catalog, semantics="full"):
-    return (docs(catalog, "reviews").alias("r")
-            .ai_join(docs(catalog, "products").alias("p"),
-                     prompt("same {0} {1}", col("r.review"),
-                            col("p.description")),
-                     semantics=semantics)
-            .select("r.id", "p.asin"))
+JOIN_SQL = """
+    SELECT r.id, p.asin FROM reviews r
+    JOIN products p ON AI_FILTER(PROMPT('same {0} {1}', r.review, p.description))
+"""
+
+LABELLED_JOIN_SQL = """
+    SELECT r.id, p.asin,
+           AI.CLASSIFY(PROMPT('topic of {0}', r.review), ['a', 'b']) AS topic
+    FROM reviews r
+    JOIN products p ON AI_FILTER(PROMPT('same {0} {1}', r.review, p.description))
+    WHERE AI.CLASSIFY(PROMPT('topic of {0}', r.review), ['a', 'b']) IN ('a')
+"""
 
 
-def _stars_apply(node):
-    return Apply(node, function="keep", kind="per_batch", ids="drop",
-                 columns=(ColumnRef("r", "reviews", "stars"),),
-                 aliases=("r",))
+def test_a_full_join_offers_its_classification_and_test_above_the_join():
+    session = _pair_session()
+    # a join with no column operator has one placement
+    candidate, = placements(session.sql(JOIN_SQL).operators)
+    assert candidate.rules == ()
 
-
-def test_filter_pushdown_moves_cheap_one_table_filters_below_joins():
-    catalog = _pair_catalog()
-    plan = _joined(catalog)
-    joined = plan.root.input
-    assert isinstance(joined, SemanticJoin)
-
-    # an apply above the join stays there: its function sees the
-    # join's survivors
-    above = replace(plan.root, input=_stars_apply(joined))
-    assert push_down_filters(above) is None
-    candidate, = logical_alternatives(
-        LogicalPlan(above), built_in_rules(),
-        PlanningContext(catalog=catalog))
-    optimized, changed = candidate.plan, candidate.rules
-    assert changed == ("should_push_down_projection",)
-    assert optimized.root == push_down_projection(above)
-
-    # both front ends place the filter on its table, so the rule
-    # leaves their plans alone
-    assert push_down_filters(plan.root) is None
-
-    # a filter on a label returns to its table, above the
-    # classification that computes the label
-    labelled = (docs(catalog, "reviews").alias("r")
-                .ai_classify(prompt("topic of {0}", col("r.review")),
-                             ["a", "b"], name="topic")
-                .label_in("topic", ["a"])
-                .ai_join(docs(catalog, "products").alias("p"),
-                         prompt("same {0} {1}", col("r.review"),
-                                col("p.description")))
-                .select("r.id", "p.asin", "topic"))
-    joined = labelled.root.input
-    label_filter = joined.input.left
-    assert isinstance(label_filter, Filter)
-    assert isinstance(label_filter.input, SemanticClassify)
-    lifted = replace(labelled.root, input=replace(
-        label_filter, input=replace(joined, input=replace(
-            joined.input, left=label_filter.input))))
-    LogicalPlan(lifted).validate()
-    assert push_down_filters(lifted) == labelled.root
-    # the placement rule offers the lifted plan for a full join, and
-    # keeps a gate's inner table classified and filtered before the gate
-    assert [type(node).__name__ for node in LogicalPlan(
-        lift_maps(labelled.root)).walk()][-4:] == [
-        "SemanticJoin", "SemanticClassify", "Filter", "Project"]
-    inner = (docs(catalog, "reviews").alias("r")
-             .ai_join(docs(catalog, "products").alias("p")
-                      .ai_classify(prompt("kind of {0}", col("p.description")),
-                                   ["a", "b"], name="kind")
-                      .label_in("kind", ["a"]),
-                      prompt("same {0} {1}", col("r.review"),
-                             col("p.description")), semantics="exists")
-             .select("r.id"))
-    assert lift_maps(inner.root) is None
-
-    # a gate's inner table and an apply returning pairs keep their
-    # filters above them
-    gate = _joined(catalog, semantics="exists")
-    above = replace(gate.root, input=_stars_apply(gate.root.input))
-    assert push_down_filters(above) is None
-    pairs = replace(joined, input=Apply(
-        joined.input, function="pairs", kind="barrier", ids="pairs",
-        columns=(), aliases=("r", "p"), written_position=0))
-    above = replace(labelled.root, input=_stars_apply(pairs))
-    assert push_down_filters(above) is None
-
-
-def test_apply_and_join_keys_keep_the_document_text_as_values(tmp_path):
-    from helpers.oracle import Oracle, oracle_executor
-
-    session = _session(tmp_path)
-    seen = []
-
-    def first_two(tables):
-        table = tables["r"]
-        seen.extend(table.column("review").to_pylist())
-        return table.column("r").to_pylist()[:2]
-
-    query = (session.docs("reviews").alias("r")
-             .apply(first_two, columns=[col("r.review")])
-             .ai_filter(prompt("q: {0}", col("r.review")))
-             .select("r.id"))
-    query.plan()
-    assert sorted(_scans(query.logical)["r"].columns) == ["id", "review"]
-    result = _run(query, oracle_executor(Oracle(filters={"r": {"q:": [1, 0, 1]}}),
-                                         functions=session.registry.functions))
-    # the function runs over the filter's survivors and reads their text
-    assert seen == ["good one", "fine one"]
-    assert result.to_rows() == [("r0",), ("r2",)]
-
-    session.register("products", quail.DocumentProvider.from_table(pa.table({
-        "asin": ["p0", "p1"], "description": ["bad one", "other"],
-    }), id_col="asin"))
-    query = (session.docs("reviews").alias("r")
-             .join(session.docs("products").alias("p"),
-                   on=col("r.review") == col("p.description"))
-             .ai_filter(prompt("m {0} {1}", col("r.review"), col("p.description")))
-             .select("r.id", "p.asin"))
-    query.plan()
-    assert sorted(_scans(query.logical)["r"].columns) == ["id", "review"]
-    assert sorted(_scans(query.logical)["p"].columns) == ["asin", "description"]
-    pairs = {("r", "p"): lambda r, p: True, ("p", "r"): lambda p, r: True}
-    assert _run(query, make_executor({}, pairs)).to_rows() == [("r1", "p0")]
+    labelled = session.sql(LABELLED_JOIN_SQL).operators
+    written, lifted = placements(labelled)
+    assert [column.above_joins for column in written.found.classifies] == [False]
+    assert lifted.rules == ("should_lift_column_operators",)
+    assert [column.above_joins for column in lifted.found.classifies] == [True]
+    ((alias, (test,)),) = lifted.found.column_filters
+    assert (alias, test.name, test.before_joins) == ("r", "topic", False)
     session.close()
 
 
-@pytest.mark.parametrize("kind", ["tokens", "column"])
-@pytest.mark.parametrize("phase", ["write", "open"])
-def test_a_store_that_fails_to_finish_leaves_no_file_or_handle(
-        tmp_path, monkeypatch, kind, phase):
-    from quail.catalog import tokens
 
-    path = tmp_path / "store.arrow"
-    table = pa.table({"body": ["hello", "world"]})
-    handles = []
-    for name in ("OSFile", "memory_map"):
-        original = getattr(pa, name)
+# an AI operator returns the added columns the SELECT list above it
+# reads, and an extraction asks only the fields the query reads
+EXTRACTED = pa.table({"id": ["r0", "r1", "r2"], "body": ["ab x", "cd e", "ab y"]})
 
-        def opened(*args, _original=original, **kwargs):
-            handles.append(_original(*args, **kwargs))
-            return handles[-1]
 
-        monkeypatch.setattr(pa, name, opened)
+def test_an_extraction_returns_and_asks_only_what_the_query_reads():
+    bodies = dict(zip(*(EXTRACTED.column(name).to_pylist()
+                        for name in ("id", "body"))))
 
-    def batches():
-        yield from table.to_batches()
-        if phase == "write":
-            raise KeyboardInterrupt("store failure")
+    def answer(kind, prompt, rows):
+        # each question copies its own part of the text
+        first, last = bodies[rows[0]].split()
+        return None if rows[0] == "r1" else {
+            "which?": first, "what?": last, "who?": f"{first} {last}"}[prompt]
 
-    def fail(*args, **kwargs):
-        raise OSError("store failure")
+    questions = "{'w': 'which?', 'v': 'what?', 'u': 'who?'}"
+    nested = f"(SELECT r.id, AI_EXTRACT(r.body, {questions}) AS e FROM reviews r) x"
+    with Transcripts({"reviews": EXTRACTED}, answer) as runs:
+        assert_transcript("\n".join(runs.query(sql) for sql in (
+            # the answer without its spans
+            "SELECT x.id, x.e FROM (SELECT r.id, AI_EXTRACT(r.body, "
+            "{'w': 'which?'}) AS e FROM reviews r) x",
+            # the spans, when the query reads them
+            "SELECT r.id, AI_EXTRACT(r.body, {'w': 'which?'}) AS e, "
+            "AI_EXTRACT_SPAN(r.body, {'w': 'which?'}) AS e_span FROM reviews r",
+            # one field of three
+            f"SELECT x.id, x.e.w AS w FROM {nested}",
+            # a field read through a renamed answer
+            f"SELECT y.id, y.f.w AS w FROM (SELECT x.id, x.e AS f FROM {nested}) y",
+            # the answer read whole asks every field
+            f"SELECT x.id, x.e FROM {nested}")), """\
+--- SELECT x.id, x.e FROM (SELECT r.id, AI_EXTRACT(r.body, {'w': 'which?'}) AS e FROM
+    reviews r) x ---
+plan
+  e = ai_extract(r.body, named_struct('w', 'which?')), returns: [e]
+asked 3 of 3
+  'which?': r0 'ab', r1 NULL, r2 'ab'
+rows 3
+  r0, {'w': 'ab'}
+  r1, {'w': None}
+  r2, {'w': 'ab'}
 
-    if phase == "open":
-        monkeypatch.setattr(pa.ipc, "open_file", fail)
-    with pytest.raises((KeyboardInterrupt, OSError), match="store failure"):
-        if kind == "tokens":
-            tokens.TokenStore.write(str(path), batches(), document_column="body",
-                                    tokenizer=lambda text: list(text.encode()),
-                                    token_type=pa.int32())
-        else:
-            tokens.ColumnStore.write(str(path), batches(), table.schema.field(0))
-    assert handles and all(handle.closed for handle in handles)
-    assert not path.exists()
+--- SELECT r.id, AI_EXTRACT(r.body, {'w': 'which?'}) AS e, AI_EXTRACT_SPAN(r.body, {'w':
+    'which?'}) AS e_span FROM reviews r ---
+plan
+  e = ai_extract(r.body, named_struct('w', 'which?'))
+asked 3 of 3
+  'which?': r0 'ab', r1 NULL, r2 'ab'
+rows 3
+  r0, {'w': 'ab'}, {'w': {'start': 0, 'end': 2}}
+  r1, {'w': None}, {'w': None}
+  r2, {'w': 'ab'}, {'w': {'start': 0, 'end': 2}}
+
+--- SELECT x.id, x.e.w AS w FROM (SELECT r.id, AI_EXTRACT(r.body, {'w': 'which?', 'v':
+    'what?', 'u': 'who?'}) AS e FROM reviews r) x ---
+plan
+  e = ai_extract(r.body, named_struct('w', 'which?')), returns: [e]
+asked 3 of 9
+  'which?': r0 'ab', r1 NULL, r2 'ab'
+rows 3
+  r0, 'ab'
+  r1, NULL
+  r2, 'ab'
+
+--- SELECT y.id, y.f.w AS w FROM (SELECT x.id, x.e AS f FROM (SELECT r.id,
+    AI_EXTRACT(r.body, {'w': 'which?', 'v': 'what?', 'u': 'who?'}) AS e FROM reviews r)
+    x) y ---
+plan
+  e = ai_extract(r.body, named_struct('w', 'which?')), returns: [e]
+asked 3 of 9
+  'which?': r0 'ab', r1 NULL, r2 'ab'
+rows 3
+  r0, 'ab'
+  r1, NULL
+  r2, 'ab'
+
+--- SELECT x.id, x.e FROM (SELECT r.id, AI_EXTRACT(r.body, {'w': 'which?', 'v': 'what?',
+    'u': 'who?'}) AS e FROM reviews r) x ---
+plan
+  e = ai_extract(r.body, named_struct('w', 'which?', 'v', 'what?', 'u', 'who?')),
+      returns: [e]
+asked 9 of 9
+  'which?': r0 'ab', r1 NULL, r2 'ab'
+  'what?': r0 'x', r1 NULL, r2 'y'
+  'who?': r0 'ab x', r1 NULL, r2 'ab y'
+rows 3
+  r0, {'w': 'ab', 'v': 'x', 'u': 'ab x'}
+  r1, {'w': None, 'v': None, 'u': None}
+  r2, {'w': 'ab', 'v': 'y', 'u': 'ab y'}
+""")

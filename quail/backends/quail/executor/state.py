@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 if TYPE_CHECKING:
     from quail.backends.quail.executor.arena import KVArena
     from quail.backends.quail.executor.chunk import InputStaging
+    from quail.backends.quail.executor.extract import Vocabulary
     from quail.backends.quail.executor.models.base import ModelPipeline
     from quail.backends.quail.executor.readout import (
         AnswerRows,
@@ -16,6 +17,8 @@ if TYPE_CHECKING:
         AsyncLabelLogprobs,
         AsyncScores,
     )
+    from quail.common.decode import DecodeCost
+    from quail.common.tokens import Tokenizer
     from quail.specs.base import ModelSpec
 
 
@@ -29,10 +32,10 @@ class LoadedModelState:
     model_spec: ModelSpec
     input_staging: InputStaging | None = None
     label_readout: AsyncLabelLogprobs | None = None
-    # a decision model's option-scoring head; None for other models
     decision_head: Any = None
-    # the tokenizer and vocabulary index AI.EXTRACT reads, loaded on first use
-    vocabulary: Any = None
+    tokenizer: Tokenizer | None = None
+    vocabulary: Vocabulary | None = None
+    sae: Any = None
 
 
 @dataclass
@@ -45,10 +48,10 @@ class QueryExecutionState:
     answer_rows: AnswerRows
     chunk_tokens: int
     async_scores: AsyncScores | None = None
-    # the AI.SCORE readout of a model that does not score with answer
-    # rows; None scores yes against no over answer_rows
     score_readout: Any = None
     gpu_timing: bool = False
+    knee_rows: int = 0
+    decode_cost: DecodeCost | None = None
 
 
 class GpuRuntime(Protocol):

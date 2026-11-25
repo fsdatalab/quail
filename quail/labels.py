@@ -2,28 +2,11 @@
 
 from dataclasses import dataclass
 
-# The label scoring rules the executor runs; each rule returns one of
-# the classification's labels.
-# every label is one letter token, read at one row
 LETTERS_SCORING = "letters"
-# every trie node once, in one request: tree attention only
 TREE_SCORING = "trie_tree"
-# one token per round along the greedy path: fewest tokens, most rounds
 DECODE_SCORING = "trie_decode"
-# a decision model's head scores one option block per label, in one request
 DECISION_SCORING = "decision_choice"
-
-
-def decodable(labels) -> bool:
-    """Return whether every label's token sequence ends at a trie leaf.
-
-    A label that is a proper prefix of another would make the decode
-    choose between stopping and continuing, and no rule scores an end
-    token.
-    """
-    ids = {tuple(label) for label in labels}
-    return not any(tuple(label[:depth]) in ids
-                   for label in labels for depth in range(1, len(label)))
+SET_CHOICE_SCORING = "set_choice"
 
 
 def label_trie(label_ids) -> dict[tuple[int, ...], list[int]]:
@@ -44,36 +27,6 @@ def label_trie(label_ids) -> dict[tuple[int, ...], list[int]]:
     return {prefix: sorted(tokens) for prefix, tokens in children.items()}
 
 
-def word_starts(label_ids, decode) -> tuple[tuple[bool, ...], ...]:
-    """Return which tokens of each label begin a new word.
-
-    A token begins a word when its text starts with whitespace and the
-    token before it holds a letter or digit; a label's first token never
-    does. Punctuation such as "," joins the word after it.
-
-    Args:
-        label_ids: One token id sequence per label.
-        decode: Callable from a token id list to its text, as str or
-            bytes. None marks no token, so every trie node is read.
-    """
-    if decode is None:
-        return tuple((False,) * len(ids) for ids in label_ids)
-
-    def text(token) -> str:
-        piece = decode([token])
-        return (piece.decode("utf-8", errors="replace")
-                if isinstance(piece, bytes) else str(piece))
-
-    flags = []
-    for ids in label_ids:
-        pieces = [text(token) for token in ids]
-        flags.append(tuple(
-            depth > 0 and pieces[depth][:1].isspace()
-            and any(ch.isalnum() for ch in pieces[depth - 1])
-            for depth in range(len(ids))))
-    return tuple(flags)
-
-
 def choice_nodes(label_ids) -> set:
     """Return every trie node with two or more children.
 
@@ -84,33 +37,22 @@ def choice_nodes(label_ids) -> set:
     return {node for node, tokens in trie.items() if len(tokens) > 1}
 
 
-def read_nodes(label_ids, starts=()) -> set:
+def read_nodes(label_ids) -> set:
     """Return the trie nodes whose rows the trie_tree rule reads.
 
     The root is read, and so is every node where the labels split: two
     or more children, or a label that ends where another continues.
-    After a read node, the next node is read while its token continues
-    the chosen word, so a label is scored through the end of the word
-    that tells it apart. Nodes after that are fed, when a later read
-    needs their KV, but never read.
+    Every other node has one possible next token, so a label is scored
+    only up to the node that tells it apart. Nodes after a read are fed
+    when a later read needs their KV, but never read.
 
     Args:
         label_ids: One token id sequence per label.
-        starts: Per label, which tokens begin a new word, from
-            ``word_starts``. Empty marks no token, so every node is read.
     """
     trie = label_trie(label_ids)
     ends = {tuple(ids) for ids in label_ids}
-    read = {()}
-    for index, ids in enumerate(label_ids):
-        ids = tuple(ids)
-        flags = starts[index] if starts else (False,) * len(ids)
-        for depth in range(1, len(ids)):
-            node = ids[:depth]
-            if (len(trie[node]) > 1 or node in ends
-                    or (ids[:depth - 1] in read and not flags[depth])):
-                read.add(node)
-    return read
+    return {()} | {node for node, tokens in trie.items()
+                   if len(tokens) > 1 or node in ends}
 
 
 @dataclass(frozen=True)
@@ -160,7 +102,6 @@ def decode_runs(label_ids) -> DecodeRuns:
         return node
 
     first = follow(())
-    # the only label is decided at the cue's row, with nothing fed
     runs = [list(first) if first in trie else []]
     after = {}
     reads = {first: 1}
@@ -175,29 +116,6 @@ def decode_runs(label_ids) -> DecodeRuns:
                 after[node, token] = (target, None)
     rounds = max(reads[node] for node in reads if node not in trie)
     return DecodeRuns(runs, first, after, rounds)
-
-
-def decode_round_tokens(label_ids) -> list[list[int]]:
-    """Return the tokens a greedy decode feeds for each label, per round.
-
-    The first round's count includes the answer cue. A label's list
-    ends at the round that decides it.
-    """
-    runs = decode_runs(label_ids)
-    trie = label_trie(label_ids)
-    counts = []
-    for ids in label_ids:
-        ids = tuple(ids)
-        node = runs.first
-        fed = [1 + len(runs.runs[0])]
-        while node in trie:
-            target, run = runs.after[node, ids[len(node)]]
-            if run is None:
-                break
-            fed.append(len(runs.runs[run]))
-            node = target
-        counts.append(fed)
-    return counts
 
 
 def fed_nodes(read) -> set:

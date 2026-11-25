@@ -5,16 +5,34 @@ import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
 import { TypeTable } from 'fumadocs-ui/components/type-table';
 import type { MDXComponents } from 'mdx/types';
 import { ApiClass, ApiMethod } from './api-reference';
-import { Mermaid } from './mermaid';
+import {
+  DeriveFigure,
+  PlannerAlgorithm,
+  PlanStagesFigure,
+} from './planning-details';
+import { PlanningFigure } from './planning-figure';
+import { MenuHistoryChart, MenuHistoryTable } from './menu-history';
 import { QueryOutput } from './query-output';
+import { CodeExample } from './code-example';
+import { HomeFunctions, HomeGuides, HomeHero, HomeSection } from './home-hero';
 
 export function getMDXComponents(components?: MDXComponents) {
   return {
     ...defaultMdxComponents,
+    pre: CodeExample,
     ApiClass,
     ApiMethod,
     Callout,
-    Mermaid,
+    DeriveFigure,
+    HomeFunctions,
+    HomeGuides,
+    HomeHero,
+    HomeSection,
+    MenuHistoryChart,
+    MenuHistoryTable,
+    PlannerAlgorithm,
+    PlanStagesFigure,
+    PlanningFigure,
     QueryOutput,
     Step,
     Steps,

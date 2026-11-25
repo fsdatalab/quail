@@ -29,3 +29,9 @@ results/torchprof_*.json.gz
 # subagent git worktrees, created and removed per run
 .claude/worktrees/
 docs/out/
+
+# Rust build output
+target/
+
+# the release build puts quail-server here, and maturin installs the
+# folder's scripts with the wheel

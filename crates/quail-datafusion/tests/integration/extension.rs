@@ -1,0 +1,326 @@
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use datafusion::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
+use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::catalog::Session;
+use datafusion::common::Result;
+use datafusion::datasource::MemTable;
+use datafusion::execution::SessionStateBuilder;
+use datafusion::execution::context::QueryPlanner;
+use datafusion::logical_expr::LogicalPlan;
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
+use datafusion::prelude::SessionContext;
+use quail_datafusion::{InputStream, ModelRegion, QuailExtension, RegionBatches, RegionRunner};
+
+#[derive(Debug)]
+struct KeepsFirstReview;
+
+impl RegionRunner for KeepsFirstReview {
+    fn run(
+        &self,
+        region: &ModelRegion,
+        _inputs: Vec<InputStream>,
+        _fetch: Option<usize>,
+        _hint: &quail_datafusion::RegionHint,
+    ) -> Result<RegionBatches> {
+        let schema = Arc::new(region.plan.schema().as_arrow().clone());
+        let columns = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let value: Arc<dyn Array> = Arc::new(StringArray::from(vec!["0"]));
+                datafusion::arrow::compute::cast(&value, field.data_type())
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let batch = RecordBatch::try_new(schema, columns)?;
+        Ok(Box::new(std::iter::once(Ok(batch))))
+    }
+}
+
+fn reviews() -> Result<MemTable> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("body", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(vec!["r1", "r2", "r3"])),
+            Arc::new(StringArray::from(vec!["Too slow.", "Lovely.", "Fine."])),
+        ],
+    )?;
+    MemTable::try_new(schema, vec![vec![batch]])
+}
+
+const QUERY: &str = "SELECT COUNT(*) AS n FROM reviews r \
+    WHERE ai_filter(prompt('Is this review negative? {0}', r.body))";
+
+async fn count(context: &SessionContext) -> Result<i64> {
+    context.register_table("reviews", Arc::new(reviews()?))?;
+    let batches = context.sql(QUERY).await?.collect().await?;
+    let counts = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("a count");
+    Ok(counts.value(0))
+}
+
+#[tokio::test]
+async fn a_host_session_with_quail_runs_ai_functions_in_its_own_sql() -> Result<()> {
+    let state = SessionStateBuilder::new().with_default_features().build();
+    let state = QuailExtension::new(Arc::new(KeepsFirstReview)).register(state)?;
+    assert_eq!(count(&SessionContext::new_with_state(state)).await?, 1);
+    Ok(())
+}
+
+struct HostPlanner {
+    extensions: Vec<Arc<dyn ExtensionPlanner + Send + Sync>>,
+}
+
+impl std::fmt::Debug for HostPlanner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HostPlanner")
+    }
+}
+
+#[async_trait]
+impl QueryPlanner for HostPlanner {
+    async fn create_physical_plan(
+        &self,
+        plan: &LogicalPlan,
+        state: &dyn Session,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let claimed = quail_datafusion::claim_model_regions(plan.clone(), state)?;
+        DefaultPhysicalPlanner::with_extension_planners(self.extensions.clone())
+            .create_physical_plan(&claimed, state)
+            .await
+    }
+}
+
+#[derive(Debug)]
+struct HostRewrite;
+
+impl datafusion::logical_expr::expr_rewriter::FunctionRewrite for HostRewrite {
+    fn name(&self) -> &str {
+        "host_rewrite"
+    }
+
+    fn rewrite(
+        &self,
+        expr: datafusion::logical_expr::Expr,
+        _schema: &datafusion::common::DFSchema,
+        _config: &datafusion::config::ConfigOptions,
+    ) -> Result<datafusion::common::tree_node::Transformed<datafusion::logical_expr::Expr>> {
+        Ok(datafusion::common::tree_node::Transformed::no(expr))
+    }
+}
+
+#[test]
+fn adding_quail_keeps_the_hosts_session_id_and_function_rewrites() -> Result<()> {
+    use datafusion::execution::FunctionRegistry;
+    let mut host = SessionStateBuilder::new()
+        .with_default_features()
+        .with_session_id("host".to_string())
+        .build();
+    host.register_function_rewrite(Arc::new(HostRewrite))?;
+    let extension = QuailExtension::new(Arc::new(KeepsFirstReview));
+    let state = extension.register(extension.register(host)?)?;
+    assert_eq!(state.session_id(), "host");
+    let rewrites: Vec<&str> = state
+        .analyzer()
+        .function_rewrites
+        .iter()
+        .map(|rewrite| rewrite.name())
+        .collect();
+    assert_eq!(
+        rewrites,
+        [
+            "host_rewrite",
+            "snowflake_regexp_like",
+            "JsonFunctionRewriter"
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_host_with_its_own_query_planner_claims_regions_and_adds_quails_planner() -> Result<()> {
+    let quail = QuailExtension::new(Arc::new(KeepsFirstReview));
+    let state = SessionStateBuilder::new()
+        .with_default_features()
+        .with_query_planner(Arc::new(HostPlanner {
+            extensions: vec![quail.extension_planner()],
+        }))
+        .build();
+    let state = quail.register_rules(state)?;
+    assert_eq!(count(&SessionContext::new_with_state(state)).await?, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_host_session_with_quail_reads_json_fields() -> Result<()> {
+    let state = SessionStateBuilder::new().with_default_features().build();
+    let state = QuailExtension::new(Arc::new(KeepsFirstReview)).register(state)?;
+    let context = SessionContext::new_with_state(state);
+    let reply = r#"'{"title": "Receipts, 1928", "years": [1926, 1927, 1928]}'"#;
+    let query = format!(
+        "SELECT json_get_str({reply}, 'title') AS title, \
+         json_get_int({reply}, 'years', 2) AS last_year, \
+         json_length({reply}, 'years') AS num_years, \
+         {reply} ->> 'title' AS by_operator"
+    );
+    let batches = context.sql(&query).await?.collect().await?;
+    let row = batches[0]
+        .columns()
+        .iter()
+        .map(|column| {
+            let text = datafusion::arrow::compute::cast(column, &DataType::Utf8)?;
+            let text = text.as_any().downcast_ref::<StringArray>().expect("text");
+            Ok(text.value(0).to_string())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(row, ["Receipts, 1928", "1928", "3", "Receipts, 1928"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_host_with_its_own_json_function_keeps_it_and_gets_none_of_quails() -> Result<()> {
+    use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+    let host_json = create_udf(
+        "json_get_str",
+        vec![DataType::Utf8, DataType::Utf8],
+        DataType::Utf8,
+        Volatility::Immutable,
+        Arc::new(|_args: &[ColumnarValue]| {
+            Ok(ColumnarValue::Scalar(
+                datafusion::common::ScalarValue::Utf8(Some("the host's".to_string())),
+            ))
+        }),
+    );
+    let mut host = SessionStateBuilder::new().with_default_features().build();
+    datafusion::execution::FunctionRegistry::register_udf(&mut host, Arc::new(host_json))?;
+    let state = QuailExtension::new(Arc::new(KeepsFirstReview)).register(host)?;
+    assert!(!state.scalar_functions().contains_key("json_length"));
+    assert!(
+        state
+            .analyzer()
+            .function_rewrites
+            .iter()
+            .all(|rewrite| rewrite.name() != "JsonFunctionRewriter")
+    );
+    let context = SessionContext::new_with_state(state);
+    let batches = context
+        .sql(r#"SELECT json_get_str('{"title": "Receipts"}', 'title') AS title"#)
+        .await?
+        .collect()
+        .await?;
+    let titles = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("text");
+    assert_eq!(titles.value(0), "the host's");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_host_writes_ai_functions_by_their_dotted_names() -> Result<()> {
+    let state = SessionStateBuilder::new().with_default_features().build();
+    let state = QuailExtension::new(Arc::new(KeepsFirstReview)).register(state)?;
+    let context = SessionContext::new_with_state(state);
+    context.register_table("reviews", Arc::new(reviews()?))?;
+    let batches = context
+        .sql("SELECT COUNT(*) AS n FROM reviews r WHERE AI.IF(PROMPT('Negative? {0}', r.body))")
+        .await?
+        .collect()
+        .await?;
+    let counts = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("a count");
+    assert_eq!(counts.value(0), 1);
+    Ok(())
+}
+
+#[test]
+fn an_expression_that_calls_a_hosts_function_is_refused_by_name() -> Result<()> {
+    use datafusion::logical_expr::{ColumnarValue, Volatility, col, create_udf};
+    use quail_datafusion::derive::expressions::{PhysicalExpression, expression};
+    use quail_planner::physical::ColumnRef;
+
+    let shout = create_udf(
+        "quail_test_shout",
+        vec![DataType::Utf8],
+        DataType::Utf8,
+        Volatility::Immutable,
+        Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+    );
+    let mut state = SessionStateBuilder::new().with_default_features().build();
+    datafusion::execution::FunctionRegistry::register_udf(&mut state, Arc::new(shout.clone()))?;
+    QuailExtension::new(Arc::new(KeepsFirstReview)).register(state)?;
+    let test = shout.call(vec![col("body")]);
+    let encoded = expression(&test, |column| {
+        let reference = ColumnRef {
+            alias: "r".into(),
+            provider: "reviews".into(),
+            column: column.name.clone(),
+        };
+        Ok((reference, DataType::Utf8))
+    })
+    .expect("the test encodes");
+    let refused = PhysicalExpression::new(&encoded).expect_err("an unknown function");
+    assert!(refused.message().contains("quail_test_shout"), "{refused}");
+    Ok(())
+}
+
+#[path = "../../examples/host_session.rs"]
+mod host_session;
+
+#[tokio::test]
+async fn a_host_with_its_own_function_and_rule_runs_ai_functions_beside_them() -> Result<()> {
+    let (plan, rows) = host_session::run().await?;
+    assert!(plan.contains("upper(r.body)"), "{plan}");
+    assert!(!plan.contains("shout("), "{plan}");
+    assert!(plan.contains("AiNode"), "{plan}");
+    assert!(rows.contains("| r1 | TOO SLOW. |"), "{rows}");
+    assert!(!rows.contains("r2"), "{rows}");
+    Ok(())
+}
+
+fn plan_on_a_thread(query: String, stack_bytes: usize) -> Result<()> {
+    std::thread::Builder::new()
+        .stack_size(stack_bytes)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+            runtime.block_on(async move {
+                let state = SessionStateBuilder::new().with_default_features().build();
+                let state = QuailExtension::new(Arc::new(KeepsFirstReview)).register(state)?;
+                let context = SessionContext::new_with_state(state);
+                context.register_table("reviews", Arc::new(reviews()?))?;
+                context.sql(&query).await?.create_physical_plan().await?;
+                Ok(())
+            })
+        })
+        .expect("a planning thread")
+        .join()
+        .expect("planning finishes")
+}
+
+#[test]
+fn a_query_with_two_hundred_ai_calls_plans_on_a_planning_thread() -> Result<()> {
+    let columns = (0..100)
+        .map(|i| {
+            format!(
+                "CASE WHEN AI.IF(PROMPT('Does the review mention point {i}? {{0}}', r.body)) \
+                 THEN AI.MAP(r.body, 'Quote point {i}.', 16) END AS c{i}"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!("SELECT r.id, {columns} FROM reviews r");
+    plan_on_a_thread(query, quail_datafusion::PLANNING_STACK_BYTES)
+}
