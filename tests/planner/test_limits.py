@@ -226,10 +226,10 @@ def test_a_limit_over_a_join_alone_stops_the_model_once_enough_anchors_keep_a_pa
 plan
   __quail_answer_1 = ai_filter('pair: {0} {1}', r.body, n.body), inline_predicate:
       __quail_answer_1, row_limit: 2, returns: []
-asked 13 of 36
+asked 18 of 36
   'pair: {0} {1}': r0+n0 TRUE, r0+n1 FALSE, r0+n2 FALSE, r0+n3 TRUE, r0+n4 FALSE, r0+n5
       FALSE, r1+n0 FALSE, r1+n1 FALSE, r1+n2 TRUE, r1+n3 FALSE, r1+n4 FALSE, r1+n5 TRUE,
-      r2+n0 FALSE
+      r2+n0 FALSE, r2+n1 TRUE, r2+n2 FALSE, r2+n3 FALSE, r2+n4 TRUE, r2+n5 FALSE
 rows 2
   r0, n0
   r0, n3
@@ -248,4 +248,69 @@ asked 18 of 18
 rows 2
   r0, n0
   r0, n3
+""")
+
+
+
+
+def test_a_limit_over_a_not_exists_join_asks_every_anchor():
+    with Transcripts({"reviews": REVIEWS, "notes": NOTES}, _pair_answer,
+                     chunk_tokens=256) as runs:
+        text = runs.query(
+            "SELECT r.id FROM reviews r WHERE NOT EXISTS (SELECT 1 FROM notes n "
+            "WHERE AI_FILTER(PROMPT('pair: {0} {1}', r.body, n.body))) LIMIT 2")
+    assert_transcript(text, """\
+--- SELECT r.id FROM reviews r WHERE NOT EXISTS (SELECT 1 FROM notes n WHERE
+    AI_FILTER(PROMPT('pair: {0} {1}', r.body, n.body))) LIMIT 2 ---
+plan
+  anti __quail_answer_1 = ai_filter('pair: {0} {1}', r.body, n.body), inline_predicate:
+      __quail_answer_1, row_limit: 2, returns: []
+asked 36 of 36
+  'pair: {0} {1}': r0+n0 TRUE, r0+n1 FALSE, r0+n2 FALSE, r0+n3 TRUE, r0+n4 FALSE, r0+n5
+      FALSE, r1+n0 FALSE, r1+n1 FALSE, r1+n2 TRUE, r1+n3 FALSE, r1+n4 FALSE, r1+n5 TRUE,
+      r2+n0 FALSE, r2+n1 TRUE, r2+n2 FALSE, r2+n3 FALSE, r2+n4 TRUE, r2+n5 FALSE, r3+n0
+      TRUE, r3+n1 FALSE, r3+n2 FALSE, r3+n3 TRUE, r3+n4 FALSE, r3+n5 FALSE, r4+n0 FALSE,
+      r4+n1 FALSE, r4+n2 TRUE, r4+n3 FALSE, r4+n4 FALSE, r4+n5 TRUE, r5+n0 FALSE, r5+n1
+      TRUE, r5+n2 FALSE, r5+n3 FALSE, r5+n4 TRUE, r5+n5 FALSE
+rows 0
+""")
+
+
+REPEATED = pa.table({
+    "id": [f"r{index}" for index in range(24)],
+    "body": [f"b{index if index < 12 else 6 + index % 6}" for index in range(24)],
+})
+
+
+def _two_pairs(kind, prompt, rows):
+    """Pass r0 with r1 and r2 with r3; the bodies of r6 to r11 repeat twice."""
+    return tuple(rows) in (("r0", "r1"), ("r2", "r3"))
+
+
+def test_a_limit_over_a_self_join_of_repeated_rows_finishes_each_started_anchor():
+    with Transcripts({"reviews": REPEATED}, _two_pairs, chunk_tokens=256) as runs:
+        text = runs.query(
+            "SELECT a.id, b.id FROM reviews a JOIN reviews b "
+            "ON AI_FILTER(PROMPT('pair: {0} {1}', a.body, b.body)) "
+            "WHERE a.id <> b.id LIMIT 2")
+    assert_transcript(text, """\
+--- SELECT a.id, b.id FROM reviews a JOIN reviews b ON AI_FILTER(PROMPT('pair: {0} {1}',
+    a.body, b.body)) WHERE a.id <> b.id LIMIT 2 ---
+plan
+  __quail_answer_1 = ai_filter('pair: {0} {1}', a.body, b.body), inline_predicate:
+      __quail_answer_1, row_limit: 2, returns: []
+asked 44 of 552
+  'pair: {0} {1}': r0+r1 TRUE, r0+r10/r16/r22 FALSE, r0+r11/r17/r23 FALSE, r0+r2 FALSE,
+      r0+r3 FALSE, r0+r4 FALSE, r0+r5 FALSE, r0+r6/r12/r18 FALSE, r0+r7/r13/r19 FALSE,
+      r0+r8/r14/r20 FALSE, r0+r9/r15/r21 FALSE, r1+r0 FALSE, r1+r10/r16/r22 FALSE,
+      r1+r11/r17/r23 FALSE, r1+r2 FALSE, r1+r3 FALSE, r1+r4 FALSE, r1+r5 FALSE,
+      r1+r6/r12/r18 FALSE, r1+r7/r13/r19 FALSE, r1+r8/r14/r20 FALSE, r1+r9/r15/r21
+      FALSE, r2+r0 FALSE, r2+r1 FALSE, r2+r10/r16/r22 FALSE, r2+r11/r17/r23 FALSE, r2+r3
+      TRUE, r2+r4 FALSE, r2+r5 FALSE, r2+r6/r12/r18 FALSE, r2+r7/r13/r19 FALSE,
+      r2+r8/r14/r20 FALSE, r2+r9/r15/r21 FALSE, r3+r0 FALSE, r3+r1 FALSE, r3+r10/r16/r22
+      FALSE, r3+r11/r17/r23 FALSE, r3+r2 FALSE, r3+r4 FALSE, r3+r5 FALSE, r3+r6/r12/r18
+      FALSE, r3+r7/r13/r19 FALSE, r3+r8/r14/r20 FALSE, r3+r9/r15/r21 FALSE
+rows 2
+  r0, r1
+  r2, r3
 """)
