@@ -74,8 +74,7 @@ def execution_context(state, payload, graph: PhysicalGraph) -> ExecutionContext:
     """
     arena = state["gpu"].arena
     arena.write_trace_files()
-    for key in arena.resident_keys():
-        arena.free_key(key)
+    arena.free_all()
     arena.reset_stats()
     state["gpu"].torch.cuda.reset_peak_memory_stats()
     retention = payload.get("retention", {})
@@ -178,8 +177,7 @@ def serve_region(state, payload, graph: PhysicalGraph, end, wanted,
                     f"{images.decode_wait_s:.2f} s for decoded pixels")
             images.close()
             pipeline.images = None
-        for key in arena.resident_keys():
-            arena.free_key(key)
+        arena.free_all()
     end.ran(*ran_message(results, execution_measurements(context)))
 
 

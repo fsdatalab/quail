@@ -16,7 +16,7 @@ use crate::operators::effective_selectivity;
 use crate::plan::graph::hash_join_nodes;
 use crate::pricing::costs::{join_specs, prepare_filter_costs};
 use crate::pricing::plan_statistics::CorpusStats;
-use crate::pricing::search::{StepKey, TableStep, default_order_rule, order_steps, search_joins};
+use crate::pricing::search::{TableStep, default_order_rule, order_steps, search_joins};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TableSize {
@@ -104,19 +104,9 @@ pub fn request_order(
             chunk,
             context,
         )?;
-        let steps: Vec<TableStep> = costs
-            .into_iter()
-            .enumerate()
-            .map(|(position, cost)| TableStep {
-                kind: "filter",
-                key: StepKey::Position(position),
-                selectivity: cost.selectivity,
-                or_term: None,
-                first: cost.first,
-                later: cost.later,
-                reuse_key: cost.reuse_key,
-                document_head: Vec::new(),
-                reads: Vec::new(),
+        let steps: Vec<TableStep> = (predicates.iter().zip(costs).enumerate())
+            .map(|(position, (predicate, cost))| {
+                TableStep::ask(position, predicate, cost, Vec::new())
             })
             .collect();
         filter_orders.insert(

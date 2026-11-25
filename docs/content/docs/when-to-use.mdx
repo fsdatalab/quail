@@ -1,0 +1,72 @@
+---
+title: When to use Quail
+description: Use Quail to run AI functions in SQL with open models on your own GPUs or on Modal, for much less than a hosted model costs.
+---
+
+Use Quail to run AI functions in SQL when any of the following is true:
+
+- You have GPUs or a [Modal](/docs/user-guide/models#no-local-gpu-use-modal)
+  subscription.
+- You want much cheaper queries. Quail ran two `AI.IF` filters over
+  100,000 movie reviews for $0.37 on one H100 rented from Modal, and
+  GPT-5 nano would cost about $1.75 for the same filters
+  ([full run](https://fsdatalab.github.io/blog/introducing-quail/)).
+- You want open models. [Models and GPUs](/docs/user-guide/models) lists
+  the models Quail runs.
+
+## Start with an Iceberg table
+
+The easiest way to start is to read a table that your warehouse stores
+in Apache Iceberg format. Snowflake, BigQuery, and Databricks can each
+store a table as Iceberg. Quail needs Python 3.12 and a
+[supported CUDA GPU](/docs/user-guide/models). Install Quail and
+PyIceberg:
+
+```bash
+uv pip install quail-engine "pyiceberg[pyarrow]"
+```
+
+The following program reads the `shop.reviews` table from an Iceberg
+catalog and keeps the reviews that ask for a refund:
+
+```python
+import quail
+from pyiceberg.catalog import load_catalog
+
+catalog = load_catalog("warehouse", type="rest", uri="https://your-catalog/")
+reviews = (
+    catalog.load_table("shop.reviews")
+    .scan(selected_fields=("id", "body"))
+    .to_arrow()
+)
+
+config = quail.EngineConfig(model="qwen3-4b-fp8", device="h100-sxm")
+
+with quail.Session(config=config) as session:
+    session.register("reviews", reviews, id_col="id")
+    refunds = session.sql("""
+        SELECT r.id
+        FROM reviews r
+        WHERE AI.IF(PROMPT('Does the reviewer ask for a refund? {0}', r.body))
+    """).collect()
+
+print(f"Reviews that ask for a refund: {refunds.num_rows}")
+```
+
+`load_catalog` takes your catalog's settings, and
+[PyIceberg's configuration docs](https://py.iceberg.apache.org/configuration/)
+list the settings for each kind of catalog.
+
+## Start with Parquet, CSV, or JSON files
+
+Export the table from your warehouse to files, and register the files in
+place of the Iceberg table:
+
+```python
+session.register_parquet("reviews", "data/reviews/", id_col="id")
+```
+
+`register_csv` and `register_json` read CSV and JSON files the same way.
+[Sessions](/docs/user-guide/sessions) lists every way to register a
+table, and [AI functions](/docs/user-guide/sql/ai-functions) lists every
+function a query can use.

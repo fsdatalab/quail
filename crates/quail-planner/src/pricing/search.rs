@@ -9,7 +9,7 @@ use crate::cost::sol::{speed_of_light, unrounded_seconds};
 use crate::cost::statistics::AliasStats;
 use crate::cost::work::Quantity;
 use crate::cost::work::{Work, ask, scan};
-use crate::physical::Prompt;
+use crate::physical::{FilterPredicate, Prompt, ValueExpression};
 
 use crate::context::PlanningContext;
 use crate::error::CompileError;
@@ -18,7 +18,7 @@ use crate::expressions::{call_aliases, repr_str};
 use crate::operators::{Operators, SemanticColumn};
 use crate::operators::{effective_selectivity, predicate_asked_fraction};
 pub use crate::pricing::costs::StepCost;
-use crate::pricing::costs::{prepare_filter_costs, question_tokens};
+use crate::pricing::costs::{PredicateCost, prepare_filter_costs, question_tokens};
 use crate::pricing::plan_statistics::{
     PlanStatistics, expected_rows_after_filters, filtered_before_joins, plan_statistics,
 };
@@ -44,9 +44,30 @@ pub struct TableStep {
     pub reuse_key: Option<Prompt>,
     pub document_head: Vec<i64>,
     pub reads: Vec<String>,
+    pub answer: Option<String>,
 }
 
 impl TableStep {
+    pub fn ask(
+        position: usize,
+        predicate: &FilterPredicate,
+        cost: PredicateCost,
+        document_head: Vec<i64>,
+    ) -> Self {
+        TableStep {
+            kind: ASK,
+            key: StepKey::Position(position),
+            selectivity: cost.selectivity,
+            or_term: OrTerm::of(predicate),
+            first: cost.first,
+            later: cost.later,
+            reuse_key: cost.reuse_key,
+            document_head,
+            reads: precondition_reads(predicate.precondition.iter().chain(&predicate.alternative)),
+            answer: predicate.answer.clone(),
+        }
+    }
+
     pub fn is_last_of_or<'a>(&self, later: impl IntoIterator<Item = &'a TableStep>) -> bool {
         let name = |step: &TableStep| step.or_term.as_ref().map(|term| term.disjunction.clone());
         !later.into_iter().any(|step| name(step) == name(self))
@@ -119,18 +140,9 @@ pub fn table_steps(
         .collect();
     let costs = prepare_filter_costs(&chosen, mean_tokens, chunk, context)?;
     for (position, cost) in asks.iter().zip(costs) {
-        let prompt = &asked_call(&predicates[*position].expression).prompt;
-        steps.push(TableStep {
-            kind: ASK,
-            key: StepKey::Position(*position),
-            selectivity: cost.selectivity,
-            or_term: OrTerm::of(&predicates[*position]),
-            first: cost.first,
-            later: cost.later,
-            reuse_key: cost.reuse_key,
-            document_head: head(prompt)?,
-            reads: Vec::new(),
-        });
+        let predicate = &predicates[*position];
+        let document_head = head(&asked_call(&predicate.expression).prompt)?;
+        steps.push(TableStep::ask(*position, predicate, cost, document_head));
     }
     let mut tests: Vec<(String, Vec<f64>)> = Vec::new();
     if let Some((_, filters)) = found
@@ -203,13 +215,21 @@ pub fn table_steps(
             later,
             reuse_key: None,
             document_head: head(&call.prompt)?,
-            reads: (column.precondition.iter())
-                .flat_map(crate::expressions::column_references)
-                .map(|reference| reference.column)
-                .collect(),
+            reads: precondition_reads(&column.precondition),
+            answer: Some(column.name.clone()),
         });
     }
     Ok(steps)
+}
+
+fn precondition_reads<'a>(
+    conditions: impl IntoIterator<Item = &'a ValueExpression>,
+) -> Vec<String> {
+    conditions
+        .into_iter()
+        .flat_map(crate::expressions::column_references)
+        .map(|reference| reference.column)
+        .collect()
 }
 
 pub fn label_calls(found: &Operators) -> Vec<(crate::physical::ModelCall, String)> {
@@ -281,47 +301,70 @@ pub fn order_steps(
     chunk: i64,
     context: &PlanningContext,
 ) -> Result<Vec<usize>, CompileError> {
-    let ordered = searched_order(steps, rule, count, chunk, context)?;
-    Ok(after_the_answers_read(steps, ordered))
+    let units = units(steps);
+    let reads = unit_reads(steps, &units);
+    if rule == "as_written" || steps.len() < 2 {
+        return Ok(written_order(&units, &reads));
+    }
+    searched_order(steps, &units, &reads, count, chunk, context)
 }
 
-fn after_the_answers_read(steps: &[TableStep], ordered: Vec<usize>) -> Vec<usize> {
-    let answers = |step: &TableStep, read: &str| match &step.key {
-        StepKey::Name(name) => read
-            .strip_prefix(name.as_str())
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.')),
-        StepKey::Position(_) => false,
-    };
-    let mut placed: Vec<usize> = Vec::with_capacity(ordered.len());
-    let mut waiting: Vec<usize> = Vec::new();
-    let ready = |index: usize, placed: &[usize]| {
-        steps[index].reads.iter().all(|read| {
-            (0..steps.len())
-                .filter(|other| *other != index && answers(&steps[*other], read))
-                .all(|other| placed.contains(&other))
+fn answers(step: &TableStep, read: &str) -> bool {
+    step.answer.as_deref().is_some_and(|answer| {
+        read.strip_prefix(answer)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+    })
+}
+
+fn unit_reads(steps: &[TableStep], units: &[Vec<usize>]) -> Vec<BTreeSet<usize>> {
+    let reads: Vec<BTreeSet<usize>> = units
+        .iter()
+        .enumerate()
+        .map(|(number, unit)| {
+            let read = || unit.iter().flat_map(|index| &steps[*index].reads);
+            (0..units.len())
+                .filter(|other| *other != number)
+                .filter(|other| {
+                    read().any(|read| {
+                        units[*other]
+                            .iter()
+                            .any(|index| answers(&steps[*index], read))
+                    })
+                })
+                .collect()
         })
-    };
-    for index in ordered {
-        waiting.push(index);
-        while let Some(position) = waiting.iter().position(|found| ready(*found, &placed)) {
-            placed.push(waiting.remove(position));
-        }
+        .collect();
+    if written_order_of(units.len(), &reads).len() < units.len() {
+        return vec![BTreeSet::new(); units.len()];
     }
-    placed.extend(waiting);
+    reads
+}
+
+fn written_order_of(num_units: usize, reads: &[BTreeSet<usize>]) -> Vec<usize> {
+    let mut placed: Vec<usize> = Vec::with_capacity(num_units);
+    while let Some(next) = (0..num_units).find(|number| {
+        !placed.contains(number) && reads[*number].iter().all(|read| placed.contains(read))
+    }) {
+        placed.push(next);
+    }
     placed
+}
+
+fn written_order(units: &[Vec<usize>], reads: &[BTreeSet<usize>]) -> Vec<usize> {
+    written_order_of(units.len(), reads)
+        .into_iter()
+        .flat_map(|number| units[number].iter().copied())
+        .collect()
 }
 
 fn searched_order(
     steps: &[TableStep],
-    rule: &str,
+    units: &[Vec<usize>],
+    reads: &[BTreeSet<usize>],
     count: f64,
     chunk: i64,
     context: &PlanningContext,
 ) -> Result<Vec<usize>, CompileError> {
-    let indices: Vec<usize> = (0..steps.len()).collect();
-    if rule == "as_written" || indices.len() < 2 {
-        return Ok(indices);
-    }
     let mut cache: HashMap<(usize, u64, bool), f64> = HashMap::new();
     let mut cost = |index: usize, rows: f64, first: bool| -> Result<f64, CompileError> {
         let key = (index, rows.to_bits(), first);
@@ -398,14 +441,21 @@ fn searched_order(
             }
             Ok((next, step_rank(seconds, unit_spared(steps, unit))))
         };
-    let units = units(steps);
-    let starters: Vec<&Vec<usize>> = units
-        .iter()
-        .filter(|unit| unit_spared(steps, unit) > 0.0)
-        .collect();
-    if starters.is_empty() {
-        return Ok(indices);
-    }
+    let ready = |number: usize, placed: &dyn Fn(usize) -> bool| {
+        !placed(number) && reads[number].iter().all(|read| placed(*read))
+    };
+    let starters: Vec<usize> = {
+        let first: Vec<usize> = (0..units.len())
+            .filter(|number| ready(*number, &|_| false))
+            .collect();
+        let sparing: Vec<usize> = (first.iter().copied())
+            .filter(|number| unit_spared(steps, &units[*number]) > 0.0)
+            .collect();
+        if sparing.is_empty() {
+            return Ok(written_order(units, reads));
+        }
+        sparing
+    };
     let start = Reached {
         flow: RowFlow::new(count),
         previous: None,
@@ -427,8 +477,12 @@ fn searched_order(
             };
             for before in &from {
                 for (number, unit) in units.iter().enumerate() {
-                    let first = placed == 0;
-                    if placed & (1 << number) != 0 || (first && !starters.contains(&unit)) {
+                    let allowed = if placed == 0 {
+                        starters.contains(&number)
+                    } else {
+                        ready(number, &|other| placed & (1 << other) != 0)
+                    };
+                    if !allowed {
                         continue;
                     }
                     let (next, _) = after_unit(before, unit)?;
@@ -448,22 +502,23 @@ fn searched_order(
     }
     let mut best: Option<Reached> = None;
     for first in starters {
-        let (mut reached, _) = after_unit(&start, first)?;
-        let mut remaining: Vec<&Vec<usize>> = units.iter().filter(|unit| *unit != first).collect();
-        while !remaining.is_empty() {
+        let (mut reached, _) = after_unit(&start, &units[first])?;
+        let mut placed = vec![first];
+        while placed.len() < units.len() {
             let mut choice: Option<(f64, usize, Reached)> = None;
-            for unit in &remaining {
-                let (next, candidate) = after_unit(&reached, unit)?;
-                if choice
-                    .as_ref()
-                    .is_none_or(|found| (candidate, unit[0]) < (found.0, found.1))
-                {
-                    choice = Some((candidate, unit[0], next));
+            for number in
+                (0..units.len()).filter(|number| ready(*number, &|other| placed.contains(&other)))
+            {
+                let (next, candidate) = after_unit(&reached, &units[number])?;
+                if choice.as_ref().is_none_or(|found| {
+                    (candidate, units[number][0]) < (found.0, units[found.1][0])
+                }) {
+                    choice = Some((candidate, number, next));
                 }
             }
-            let (_, selected, next) = choice.expect("a remaining unit");
+            let (_, selected, next) = choice.expect("a unit whose reads have run");
             reached = next;
-            remaining.retain(|unit| unit[0] != selected);
+            placed.push(selected);
         }
         if best.as_ref().is_none_or(|found| {
             (reached.seconds, reached.ordered[0]) < (found.seconds, found.ordered[0])

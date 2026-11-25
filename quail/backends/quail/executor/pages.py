@@ -29,8 +29,6 @@ class PageArena:
         self.holds = np.zeros(num_pages, dtype=np.int32)
         self.tokens = {}
         self.pinned = set()
-        self._retained_sizes = {}
-        self._retained_pages = 0
         self.retained = {}
         self._retained_heap = []
         self._retained_versions = {}
@@ -184,7 +182,6 @@ class PageArena:
         self.pinned.add(key)
 
     def _forget_retained(self, key):
-        self._retained_pages -= self._retained_sizes.pop(key, 0)
         self.retained.pop(key, None)
         self._retained_versions.pop(key, None)
 
@@ -195,10 +192,8 @@ class PageArena:
         self.pinned.discard(key)
         prefix_tokens = self.tokens[key]
         self._forget_retained(key)
-        pages = int((self.holds[self.table_pages(key)] == 1).sum())
+        pages = self._pages_alone(key)
         self.retained[key] = prefix_tokens
-        self._retained_sizes[key] = pages
-        self._retained_pages += pages
         self._retention_version += 1
         version = self._retention_version
         self._retained_versions[key] = version
@@ -209,7 +204,7 @@ class PageArena:
                 else (prefix_tokens / max(1, pages),))
         heapq.heappush(
             self._retained_heap,
-            (priority, version, key, pages, prefix_tokens),
+            (priority, version, key, prefix_tokens),
         )
 
     def configure_retention(self, policy, cap_pages: int) -> None:
@@ -232,14 +227,14 @@ class PageArena:
         victim = None
         while self._retained_heap:
             entry = heapq.heappop(self._retained_heap)
-            _, version, key, pages, prefix_tokens = entry
+            _, version, key, prefix_tokens = entry
             if self._retained_versions.get(key) != version:
                 continue
             if key in keep:
                 passed.append(entry)
                 continue
+            victim = key, self._pages_alone(key), prefix_tokens
             self._forget_retained(key)
-            victim = key, pages, prefix_tokens
             break
         for entry in passed:
             heapq.heappush(self._retained_heap, entry)
@@ -311,9 +306,12 @@ class PageArena:
     def resident_tokens(self) -> int:
         return sum(self.tokens.values())
 
+    def _pages_alone(self, key) -> int:
+        return int((self.holds[self.table_pages(key)] == 1).sum())
+
     @property
     def retained_pages(self) -> int:
-        return self._retained_pages
+        return sum(self._pages_alone(key) for key in self.retained)
 
     @property
     def retained_prefix_tokens(self) -> int:
