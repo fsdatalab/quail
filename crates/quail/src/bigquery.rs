@@ -16,14 +16,18 @@ const AI_CALLS: [&str; 6] = [
     "AI_CLASSIFY",
 ];
 const SERVICE_ARGUMENTS: [&str; 4] = ["connection_id", "endpoint", "model_params", "request_type"];
-const POSITIONAL_ARGUMENTS: [&str; 2] = ["prompt", "categories"];
+const POSITIONAL_ARGUMENTS: [&str; 3] = ["prompt", "input", "categories"];
 
 pub(crate) fn rewrite(statement: &mut Statement) {
-    if let Statement::Statement(inner) = statement {
-        let _ = visit_expressions_mut(inner.as_mut(), |expr| {
-            rewrite_expr(expr);
-            ControlFlow::<()>::Continue(())
-        });
+    match statement {
+        Statement::Statement(inner) => {
+            let _ = visit_expressions_mut(inner.as_mut(), |expr| {
+                rewrite_expr(expr);
+                ControlFlow::<()>::Continue(())
+            });
+        }
+        Statement::Explain(explain) => rewrite(explain.statement.as_mut()),
+        _ => {}
     }
 }
 
@@ -58,6 +62,13 @@ fn rewrite_ai_call(function: &mut Function) {
         !matches!(arg, FunctionArg::Named { name, .. }
             if SERVICE_ARGUMENTS.contains(&name.value.to_lowercase().as_str()))
     });
+    list.args.sort_by_key(|arg| match arg {
+        FunctionArg::Named { name, .. } => POSITIONAL_ARGUMENTS
+            .iter()
+            .position(|known| name.value.eq_ignore_ascii_case(known))
+            .unwrap_or(POSITIONAL_ARGUMENTS.len()),
+        _ => 0,
+    });
     for arg in &mut list.args {
         if let FunctionArg::Named {
             name, arg: value, ..
@@ -82,6 +93,7 @@ fn prompt_call(expr: &Expr) -> Option<Expr> {
             ..
         } => concatenated(expr),
         Expr::Function(function) if call_name(&function.name) == "FORMAT" => formatted(function)?,
+        Expr::Nested(inner) => return prompt_call(inner),
         _ => return None,
     };
     let mut template = String::new();
@@ -144,18 +156,29 @@ fn formatted(function: &Function) -> Option<Vec<Expr>> {
         _ => None,
     });
     let pattern = literal(&args.next()??)?;
-    let values: Vec<Expr> = args.collect::<Option<_>>()?;
-    let pieces: Vec<&str> = pattern.split("%s").collect();
-    if pieces.len() != values.len() + 1 || pieces.iter().any(|piece| piece.contains('%')) {
-        return None;
-    }
+    let mut values = args.collect::<Option<Vec<Expr>>>()?.into_iter();
     let mut parts = Vec::new();
-    for (index, piece) in pieces.iter().enumerate() {
-        parts.push(Expr::value(Value::SingleQuotedString(piece.to_string())));
-        if let Some(value) = values.get(index) {
-            parts.push(value.clone());
+    let mut piece = String::new();
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            piece.push(c);
+            continue;
+        }
+        match chars.next()? {
+            '%' => piece.push('%'),
+            's' => {
+                let text = std::mem::take(&mut piece);
+                parts.push(Expr::value(Value::SingleQuotedString(text)));
+                parts.push(values.next()?);
+            }
+            _ => return None,
         }
     }
+    if values.next().is_some() {
+        return None;
+    }
+    parts.push(Expr::value(Value::SingleQuotedString(piece)));
     Some(parts)
 }
 

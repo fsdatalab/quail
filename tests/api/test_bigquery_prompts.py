@@ -9,9 +9,11 @@ camelCase column matches as written.
 
 import pyarrow as pa
 import pytest
+from helpers.oracle import Oracle, oracle_executor
 from helpers.sessions import CONFIG, TOKENIZER
 
 import quail
+from quail.api.context import SessionContext
 
 pytest.importorskip("_quail_native")
 
@@ -40,6 +42,10 @@ def filtered(alias, condition):
     return f"SELECT id FROM reviews {alias} WHERE AI.IF({condition})"
 
 
+def classified(arguments):
+    return f"SELECT id, AI.CLASSIFY({arguments}) AS label FROM reviews"
+
+
 def ratio(condition, kind):
     return (f"SELECT CAST(SUM(CASE WHEN AI.IF({condition}) THEN 1 ELSE 0 END) "
             f"AS {kind}) / COUNT(*) AS ratio FROM reviews AS r")
@@ -65,6 +71,14 @@ def ratio(condition, kind):
      "connection_id => 'c') AS label FROM reviews",
      "SELECT id, AI.CLASSIFY(PROMPT('Review: {0}', reviewText), ['P', 'N']) "
      "AS label FROM reviews"),
+    (classified("input => ('Review: ', reviewText), categories => ['P', 'N']"),
+     classified("PROMPT('Review: {0}', reviewText), ['P', 'N']")),
+    (classified("categories => ['P', 'N'], prompt => ('Review: ', reviewText)"),
+     classified("PROMPT('Review: {0}', reviewText), ['P', 'N']")),
+    (filtered("t", "('Is ' || t.reviewText || ' a comedy?')"),
+     filtered("t", "PROMPT('Is {0} a comedy?', t.reviewText)")),
+    (filtered("t", "FORMAT('%s is 100%% a comedy', t.reviewText)"),
+     filtered("t", "PROMPT('{0} is 100% a comedy', t.reviewText)")),
 ])
 def test_a_bigquery_prompt_plans_as_its_prompt_call(session, bigquery, native):
     assert plan(session, bigquery) == plan(session, native)
@@ -73,3 +87,12 @@ def test_a_bigquery_prompt_plans_as_its_prompt_call(session, bigquery, native):
 def test_a_literal_naming_a_placeholder_is_left_unrewritten(session):
     with pytest.raises(Exception, match="needs a PROMPT"):
         plan(session, filtered("t", "('slot {0}: ', t.title)"))
+
+
+def test_explain_plans_a_bigquery_prompt_as_its_prompt_call(session):
+    context = SessionContext(session, physical_executor=oracle_executor(Oracle()))
+
+    def explained(condition):
+        plans = context.sql("EXPLAIN VERBOSE " + filtered("r", condition), dialect="bq")
+        return plans.column("plan").to_pylist()
+    assert explained("('Positive? ', r.reviewText)") == explained(POSITIVE)
