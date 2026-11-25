@@ -49,6 +49,7 @@ Every model in the table supports `AI.IF`, `AI.SCORE`, `AI.CLASSIFY`,
 | Qwen3.6 35B-A3B | `qwen3.6-35b-a3b-fp8` | FP8 |
 | Qwen3.8 27B | `qwen3.8-27b-fp8` | FP8 |
 | Qwen3.8 27B | `qwen3.8-27b-nvfp4` | NVFP4 and FP8; B200 only |
+| Inkling 2 Mini | `inkling-2-mini` | NVFP4, MXFP8, and BF16; B200 only |
 | LFM2 2.6B | `lfm2-2.6b-bf16` | BF16 |
 
 FP8 stores each model weight as an 8-bit floating-point number. BF16 stores
@@ -58,6 +59,13 @@ weight as a 4-bit floating-point number, with one FP8 scale for each group of
 [NVIDIA's checkpoint](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4) of
 Qwen3.8 27B: NVFP4 MLP weights and FP8 attention weights. It needs the FP4
 tensor cores of a B200.
+
+`inkling-2-mini` is Thinking Machines'
+[Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini), a
+mixture-of-experts model whose middle 12 layers run three times. Its experts
+are NVFP4 in 20 layers and MXFP8 in the last 4, and its attention weights are
+BF16. It needs the FP4 tensor cores of a B200. Quail runs it with thinking
+off, and reads its text only, not images.
 
 ## Models with limited functions
 
@@ -112,9 +120,9 @@ Set `device` to the value for your GPU:
 
 | GPU | `device` value | Model support |
 | --- | --- | --- |
-| NVIDIA H100 SXM | `h100-sxm` | All supported models except `qwen3.8-27b-nvfp4` |
+| NVIDIA H100 SXM | `h100-sxm` | All supported models except `qwen3.8-27b-nvfp4` and `inkling-2-mini` |
 | NVIDIA B200 | `b200` | All supported models |
-| NVIDIA RTX PRO 6000 Blackwell Server Edition | `rtx-pro-6000-blackwell-server` | All supported models except `qwen3.8-27b-nvfp4`, mammoth-1, and elephant-1 |
+| NVIDIA RTX PRO 6000 Blackwell Server Edition | `rtx-pro-6000-blackwell-server` | All supported models except `qwen3.8-27b-nvfp4`, `inkling-2-mini`, mammoth-1, and elephant-1 |
 | NVIDIA L40S | `l40s` | Qwen3, Qwen3 rerankers, Decision 2.0 Kai, LFM2, and d1-2B |
 
 The L40S cannot run DiffusionGemma or the Qwen3.5, Qwen3.6, and Qwen3.8

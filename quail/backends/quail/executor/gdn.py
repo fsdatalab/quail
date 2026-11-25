@@ -65,6 +65,9 @@ class GdnPhase:
     unique_writes: bool = False
     same_unique_slots: bool = False
     moves_in_place: bool = False
+    host_rows: object = None
+    host_read_slots: object = None
+    host_write_slots: object = None
 
 
 def plan_phases(arena, groups, stage):
@@ -353,7 +356,10 @@ def _plan_phases(arena, groups, stage, undo):
                 f"gdn_{name}_write32", writes_arr.astype(np.int32), torch.int32)),
             unique_writes=unique_writes,
             same_unique_slots=same_unique,
-            moves_in_place=moved is not None)
+            moves_in_place=moved is not None,
+            host_rows=np.concatenate(rows),
+            host_read_slots=reads_arr,
+            host_write_slots=writes_arr)
         if moved is not None and moved.any():
             phase.copy_reads = stage(f"gdn_{name}_copy_read", reads_arr[moved],
                                      torch.int64)

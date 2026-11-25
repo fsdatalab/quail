@@ -105,3 +105,12 @@ class ModelPipeline:
     def mixer(self, index, buffers, chunk):
         """Run layer index's token mixer eagerly over the chunk's real rows."""
         raise NotImplementedError
+
+    def stage(self, buffers, chunk):
+        """Copy a chunk's own inputs, beyond ids and positions, into buffers.
+
+        Called before the first piece replays; a pipeline whose pieces
+        read per-chunk inputs, such as convolution taps, stages them here.
+        A None chunk clears them, so a capture's eager pass reads and
+        writes nothing a real pass left behind.
+        """

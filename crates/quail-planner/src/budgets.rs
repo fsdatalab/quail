@@ -12,7 +12,9 @@ pub const MIB: i64 = 1 << 20;
 pub const INTERMEDIATE_BLOCK_TOKENS: i64 = 64;
 pub const SPLIT_EXTRA_TOKENS: i64 = 64;
 pub const TREE_ATTENTION_MIN_PARAMS: f64 = 2e9;
-pub const GRAPH_ARCHS: [&str; 2] = ["qwen3", "qwen3_5"];
+pub const GRAPH_ARCHS: [&str; 3] = ["qwen3", "qwen3_5", "inkling2_loop"];
+pub const EXPERT_GRAPH_ARCHS: [&str; 1] = ["inkling2_loop"];
+pub const EXPERT_GRAPH_MAX_TOKENS: i64 = 512;
 
 pub fn graph_token_buckets_all() -> Vec<i64> {
     let mut sizes = vec![1, 2, 4];
@@ -82,14 +84,18 @@ pub fn kernel_index_cap(model: &ModelSpec) -> i64 {
 }
 
 pub fn graph_token_buckets(model: &ModelSpec) -> Vec<i64> {
-    if !GRAPH_ARCHS.contains(&model.arch.as_str())
-        || model.experts != 0
+    let arch = model.arch.as_str();
+    if !GRAPH_ARCHS.contains(&arch)
+        || (model.experts != 0 && !EXPERT_GRAPH_ARCHS.contains(&arch))
         || model.has_sae()
         || model.canvas_tokens != 0
     {
         return Vec::new();
     }
-    let cap = kernel_index_cap(model);
+    let mut cap = kernel_index_cap(model);
+    if model.experts != 0 {
+        cap = cap.min(EXPERT_GRAPH_MAX_TOKENS);
+    }
     graph_token_buckets_all()
         .into_iter()
         .filter(|size| *size <= cap)

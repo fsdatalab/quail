@@ -146,6 +146,10 @@ class ModelSpec:
     gdn_weight_precision: Precision | None = None
     mlp_weight_precision: Precision | None = None
     conv_width: int = 0
+    attention_conv_channels: int = 0
+    weight_layers: int = 0
+    mlp_fp8_layers: int = 0
+    extra_projection_params: int = 0
     checkpoint_layers: int = 0
     sae: SaeSpec | None = None
 

@@ -13,11 +13,19 @@ from quail.specs import modal_gpu_type
 # Liquid's d1 code needs a newer transformers than the project pins; the
 # d1 test's reference process reads it from this folder alone
 D1_REFERENCE_PACKAGES = "/opt/d1-reference"
+# transformers' Inkling 2 Mini model, at the commit that added it, for the
+# Inkling test's reference process
+INKLING_REFERENCE_PACKAGES = "/opt/inkling-reference"
+INKLING_TRANSFORMERS = ("https://github.com/huggingface/transformers/archive/"
+                        "6173a2f679ff4ed393afc499aefc569da7e68bc1.zip")
 image = gpu_image(
     ("tests/gpu", "/root/tests/gpu"),
     commands=(f"/usr/local/bin/python3 -m pip install --quiet --target "
               f"{D1_REFERENCE_PACKAGES} "
-              f"transformers==5.19.0",)).add_local_python_source("experiments")
+              f"transformers==5.19.0",
+              f"/usr/local/bin/python3 -m pip install --quiet --target "
+              f"{INKLING_REFERENCE_PACKAGES} {INKLING_TRANSFORMERS} "
+              f"accelerate==1.13.0")).add_local_python_source("experiments")
 
 app = modal.App("quail-milestone1")
 volumes = {

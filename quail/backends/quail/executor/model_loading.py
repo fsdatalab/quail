@@ -19,6 +19,10 @@ instead of starting NCCL or gloo.
 import json
 from pathlib import Path
 
+from quail.backends.quail.executor.models.inkling2 import (
+    is_inkling2,
+    load_inkling2,
+)
 from quail.backends.quail.executor.models.lfm3 import is_lfm3, load_lfm3
 from quail.backends.quail.executor.moe_configs import write_configs
 from quail.specs.files import resolve_model_path
@@ -244,6 +248,16 @@ def full_output_head(model):
     return head
 
 
+def logit_softcap(model) -> float:
+    """The cap of the model's output logits, or 0 for uncapped logits."""
+    return float(getattr(model, "quail_logit_softcap", 0.0))
+
+
+def cap_logits(logits, cap):
+    """Return cap * tanh(logits / cap), the logits a capped model reads."""
+    return logits if not cap else cap * (logits / cap).tanh()
+
+
 def answer_weights(model, token_ids):
     """Return the retained rows for a query's answer token ids."""
     if tuple(token_ids) != model.quail_answer_token_ids:
@@ -308,6 +322,8 @@ def load_model(model_name: str, revision: str | None = None, *,
     model_path = resolve_model_path(model_name, revision)
     if is_lfm3(model_path):
         model = load_lfm3(model_path, quantize_fp8=quantize_fp8)
+    elif is_inkling2(model_path):
+        model = load_inkling2(model_path)
     else:
         model = _load_vllm_model(model_path, max_batched_tokens, moe_backend,
                                  text_only, images)

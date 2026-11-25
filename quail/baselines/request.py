@@ -128,7 +128,7 @@ def _warm_boot() -> dict:
     }
 
 
-UNSERVED_ARCHS = frozenset({"lfm3"})
+UNSERVED_ARCHS = frozenset({"lfm3", "inkling2_loop"})
 
 
 @dataclass

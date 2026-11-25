@@ -8,6 +8,7 @@ from quail.backends.quail.executor.models.base import ModelPipeline
 from quail.backends.quail.executor.models.diffusion_gemma import (
     DiffusionGemmaPipeline,
 )
+from quail.backends.quail.executor.models.inkling2 import Inkling2Pipeline
 from quail.backends.quail.executor.models.lfm2 import Lfm2Pipeline
 from quail.backends.quail.executor.models.lfm3 import Lfm3Pipeline
 from quail.backends.quail.executor.models.qwen3 import Qwen3Pipeline
@@ -17,7 +18,8 @@ PIPELINES = {"qwen3": Qwen3Pipeline,
              "qwen3_5": Qwen35Pipeline,
              "lfm2": Lfm2Pipeline,
              "lfm3": Lfm3Pipeline,
-             "diffusion_gemma": DiffusionGemmaPipeline}
+             "diffusion_gemma": DiffusionGemmaPipeline,
+             "inkling2_loop": Inkling2Pipeline}
 
 
 def supported_archs() -> frozenset:

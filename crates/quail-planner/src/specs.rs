@@ -195,6 +195,14 @@ pub struct ModelSpec {
     #[serde(default)]
     pub conv_width: i64,
     #[serde(default)]
+    pub attention_conv_channels: i64,
+    #[serde(default)]
+    pub weight_layers: i64,
+    #[serde(default)]
+    pub mlp_fp8_layers: i64,
+    #[serde(default)]
+    pub extra_projection_params: i64,
+    #[serde(default)]
     pub checkpoint_layers: i64,
     #[serde(default)]
     pub sae: Option<SaeSpec>,
@@ -281,11 +289,16 @@ impl ModelSpec {
     }
 
     pub fn state_layers(&self) -> Vec<i64> {
+        if self.attention_conv_channels != 0 {
+            return self.attention_layers();
+        }
         self.layers_of(&["gated_delta_net", "short_conv"])
     }
 
     pub fn conv_state_channels(&self) -> i64 {
-        if self.gdn_layers().is_empty() {
+        if self.attention_conv_channels != 0 {
+            self.attention_conv_channels
+        } else if self.gdn_layers().is_empty() {
             self.hidden
         } else {
             self.conv_channels()
@@ -310,6 +323,25 @@ impl ModelSpec {
                 * self.hidden
                 * (self.conv_width - 1)
                 * CONV_STATE_ELEMENT_BYTES
+            + self.attention_conv_layers().len() as i64
+                * self.attention_conv_channels
+                * (self.conv_width - 1)
+                * CONV_STATE_ELEMENT_BYTES
+    }
+
+    pub fn attention_conv_layers(&self) -> Vec<i64> {
+        if self.attention_conv_channels == 0 {
+            return Vec::new();
+        }
+        self.attention_layers()
+    }
+
+    pub fn weight_layer_count(&self) -> i64 {
+        if self.weight_layers != 0 {
+            self.weight_layers
+        } else {
+            self.layers
+        }
     }
 
     pub fn is_full_layer(&self, layer: i64) -> bool {

@@ -13,7 +13,10 @@ from typing import Callable
 
 import numpy as np
 
-from quail.backends.quail.executor.model_loading import full_output_head
+from quail.backends.quail.executor.model_loading import (
+    full_output_head,
+    logit_softcap,
+)
 from quail.backends.quail.executor.readout import (
     AsyncDecisionChoices,
     AsyncLabelLogprobs,
@@ -137,7 +140,8 @@ def _label_readout(state: QueryExecutionState, targets, rows: int, normalize: bo
         head = full_output_head(state.loaded_model.model)
         readout = AsyncLabelLogprobs(
             torch, torch.nn.functional, head, targets, rows=rows,
-            normalize=normalize)
+            normalize=normalize,
+            softcap=logit_softcap(state.loaded_model.model))
         state.loaded_model.label_readout = readout
         logger.debug("label readout: head %s x %s in %s, %s targets, "
                     "%s rows per request, %s", *head.shape,

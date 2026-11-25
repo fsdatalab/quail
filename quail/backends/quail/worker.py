@@ -101,7 +101,8 @@ class LoadedGpu:
                              num_kv_heads=spec.num_kv_heads, d_head=spec.d_head,
                              dtype=torch.bfloat16,
                              layer_kv=spec.kv_shapes,
-                             sliding_layers=spec.sliding_layer_set,
+                             sliding_layers=(spec.sliding_layer_set
+                                             if sliding_pages else ()),
                              sliding_window=spec.sliding_window,
                              num_sliding_pages=sliding_pages,
                              **checkpoint_arena_args(spec, device, budget,
