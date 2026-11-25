@@ -1,6 +1,7 @@
 #[cfg(test)]
 use quail_dylib as _;
 
+mod bigquery;
 mod executor;
 pub mod finished;
 mod images;
@@ -536,7 +537,13 @@ impl QueryRun {
                     }
                     _ => datafusion::dataframe::DataFrame::new(state, plan),
                 };
-                let schema = quail_schema(frame.logical_plan());
+                let dialect = frame
+                    .task_ctx()
+                    .session_config()
+                    .options()
+                    .sql_parser
+                    .dialect;
+                let schema = quail_schema(frame.logical_plan(), &query, dialect);
                 let mut batches = frame.execute_stream().await?;
                 if out.send(Streamed::Schema(Arc::clone(&schema))).is_err() {
                     return Ok(());
@@ -585,15 +592,31 @@ async fn frame(
         options.sql_parser.dialect = dialect;
         if matches!(dialect, datafusion::config::Dialect::BigQuery) {
             options.sql_parser.default_null_ordering = "nulls_min".to_string();
+            options.sql_parser.enable_ident_normalization = false;
         }
     }
     let dialect = state.config().options().sql_parser.dialect;
-    let statement = match state.sql_to_statement(query, &dialect) {
+    let mut statement = match state.sql_to_statement(query, &dialect) {
         Err(original) if matches!(dialect, datafusion::config::Dialect::Snowflake) => state
             .sql_to_statement(query, &datafusion::config::Dialect::Generic)
             .map_err(|_| original)?,
         parsed => parsed?,
     };
-    let plan = state.statement_to_plan(statement).await?;
+    if !matches!(dialect, datafusion::config::Dialect::BigQuery) {
+        let plan = state.statement_to_plan(statement).await?;
+        return Ok(datafusion::dataframe::DataFrame::new(state, plan));
+    }
+    bigquery::rewrite(&mut statement);
+    let plan = match state.statement_to_plan(statement.clone()).await {
+        Err(original) => {
+            let options = state.config_mut().options_mut();
+            options.sql_parser.enable_ident_normalization = true;
+            state
+                .statement_to_plan(statement)
+                .await
+                .map_err(|_| original)?
+        }
+        planned => planned?,
+    };
     Ok(datafusion::dataframe::DataFrame::new(state, plan))
 }

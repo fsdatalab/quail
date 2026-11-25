@@ -139,3 +139,14 @@ def test_an_image_decodes_at_the_size_the_planner_counts():
             {"image": pa.array([image], pa.binary())})}, SPEC).images[FIRST]
         assert (found.rows, found.columns) == (rows, columns)
         assert decode_image(found, 32).shape == (32 * rows, 32 * columns, 3)
+
+
+def test_an_image_that_does_not_decode_reads_as_gray_at_its_counted_size():
+    whole = jpeg(1000, 750)
+    truncated = whole[: len(whole) // 2]
+    document = [START, *range(FIRST, FIRST + 23 * 31), END]
+    column = pa.table({"image": pa.array([truncated], pa.binary())})
+    found = RegionImages({"pages": [document]}, {"pages": column}, SPEC).images[FIRST]
+    pixels = decode_image(found, 32)
+    assert pixels.shape == (32 * 23, 32 * 31, 3)
+    assert (pixels == 128).all()
