@@ -49,10 +49,30 @@ class Engine:
 engine = Engine()
 ";
 
+const FAILING: &std::ffi::CStr = c"
+from quail.specs import QWEN3_4B_FP8
+
+class Engine:
+    turn = tuple(QWEN3_4B_FP8.turn)
+    layout = QWEN3_4B_FP8.prompt_layout
+    rules = None
+    calls = 0
+
+    def run_region(self, payload, *_args):
+        self.calls += 1
+        raise RuntimeError('region sentinel')
+
+engine = Engine()
+";
+
 fn engine() -> Py<PyAny> {
+    load(ENGINE)
+}
+
+fn load(code: &std::ffi::CStr) -> Py<PyAny> {
     crate::start_python();
     Python::attach(|py| {
-        PyModule::from_code(py, ENGINE, c"caller_engine.py", c"caller_engine")
+        PyModule::from_code(py, code, c"caller_engine.py", c"caller_engine")
             .unwrap()
             .getattr("engine")
             .unwrap()
@@ -163,5 +183,24 @@ fn queries_own_their_caller_route_until_success_or_failure() -> Result<()> {
             });
         }
     }
+    Ok(())
+}
+
+#[test]
+fn a_failed_region_fails_the_query_without_running_the_regions_queued_behind_it() -> Result<()> {
+    let engine = load(FAILING);
+    let executor = Arc::new(quail_python::executor_with_engine(Python::attach(|py| {
+        engine.clone_ref(py)
+    }))?);
+    let session = session(executor)?;
+    let error = session
+        .sql(
+            "SELECT r.id FROM reviews r WHERE AI.IF(PROMPT('first: {0}', r.body)) UNION ALL \
+             SELECT r.id FROM reviews r WHERE AI.IF(PROMPT('second: {0}', r.body))",
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("region sentinel"));
+    let calls = Python::attach(|py| engine.bind(py).getattr("calls")?.extract::<usize>());
+    assert_eq!(calls.unwrap(), 1);
     Ok(())
 }

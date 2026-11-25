@@ -612,6 +612,7 @@ class StageExecutor:
         """Pack queued recomputations into the room left beside decode rows."""
         replays = []
         decoder = self.decoder
+        full = False
         for a, start in list(self.recomputing.items()):
             if not room:
                 break
@@ -625,6 +626,8 @@ class StageExecutor:
             length = int(self.decoder.origin[a]) + written
             key = self.keys[a]
             if not self.arena.is_resident(key):
+                if full:
+                    continue
                 reserve = min(self.arena.page_tokens,
                               int(self.decoder.limits[q]) - written - 1)
                 capacity = max(self.prefix_lengths[a] + self.capacity_extra,
@@ -632,7 +635,8 @@ class StageExecutor:
                 if not self.arena.reserve(
                         key, self.prefix_lengths[a], capacity_tokens=capacity,
                         extension=self._extends):
-                    break
+                    full = True
+                    continue
                 decoder.kv.set_pages(a, self.arena.owned_pages(key))
             end = min(length, start + room)
             replays.append((a, start, end))

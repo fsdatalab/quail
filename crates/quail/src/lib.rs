@@ -508,6 +508,8 @@ impl QueryRun {
         } = self;
         let (sender, mut calls) = unbounded_channel::<RegionCall>();
         let _caller = runner.enter(sender)?;
+        let mut stopped = runner.stopped();
+        let mut failed = None;
         let out = sent.clone();
         runtime.block_on(async {
             let query = runtime.spawn(async move {
@@ -558,10 +560,18 @@ impl QueryRun {
             tokio::pin!(query);
             loop {
                 tokio::select! {
+                    biased;
                     done = &mut query => break done
                         .map_err(|error| DataFusionError::External(Box::new(error)))
                         .and_then(|done| done),
-                    Some(call) = calls.recv() => runner.serve(call),
+                    Some(call) = calls.recv() => match &failed {
+                        None => failed = runner.serve(call).err(),
+                        Some(error) => call.refuse(error),
+                    },
+                    Ok(_) = stopped.wait_for(|stopped| *stopped) => {
+                        query.abort();
+                        break Err(DataFusionError::Execution("the query was stopped".into()));
+                    }
                 }
             }
         })?;

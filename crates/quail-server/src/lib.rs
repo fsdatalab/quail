@@ -201,11 +201,13 @@ impl FlightService for QuailService {
                 (schema, stream::iter(batches.into_iter().map(Ok)).boxed())
             }
             None => {
+                let turn = self.queue.turn().await;
                 let rows = self
                     .blocking(move |session| session.sql_stream(&query, None))
                     .await?;
                 let schema = rows.schema();
                 let batches = produced(move |send| {
+                    let _turn = turn;
                     for batch in rows {
                         let batch =
                             batch.map_err(|error| FlightError::ExternalError(Box::new(error)));

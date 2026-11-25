@@ -66,16 +66,24 @@ pub struct Connection {
     shared: String,
     num_written: usize,
     in_region: bool,
+    broken: bool,
 }
 
 impl Connection {
     fn new(stream: UnixStream, socket: &Path, end: &str) -> Result<Self> {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let generation = NEXT.fetch_add(1, Ordering::Relaxed);
         Ok(Connection {
             reader: BufReader::new(stream.try_clone()?),
             writer: BufWriter::new(stream),
-            shared: format!("{}.{end}", socket.display()),
+            shared: format!(
+                "{}.{end}{}-{generation}",
+                socket.display(),
+                std::process::id()
+            ),
             num_written: 0,
             in_region: false,
+            broken: false,
         })
     }
 
@@ -88,12 +96,16 @@ impl Connection {
     }
 
     fn receive(&mut self) -> Result<Value> {
+        self.receive_reply()?
+    }
+
+    fn receive_reply(&mut self) -> Result<Result<Value>> {
         let header: Value =
             serde_json::from_slice(&read_frame(&mut self.reader)?).map_err(failure)?;
-        match header.get("error").and_then(Value::as_str) {
+        Ok(match header.get("error").and_then(Value::as_str) {
             Some(error) => Err(failure(format!("a GPU worker failed:\n{error}"))),
             None => Ok(header),
-        }
+        })
     }
 
     fn next_header(&mut self) -> Result<Option<Value>> {
@@ -115,7 +127,13 @@ impl Connection {
     }
 
     fn receive_table(&mut self, remove: bool) -> Result<Table> {
-        let path = String::from_utf8(read_frame(&mut self.reader)?).map_err(failure)?;
+        let frame = read_frame(&mut self.reader)?;
+        if let Ok(header) = serde_json::from_slice::<Value>(&frame)
+            && let Some(error) = header.get("error").and_then(Value::as_str)
+        {
+            return Err(failure(format!("a GPU worker failed:\n{error}")));
+        }
+        let path = String::from_utf8(frame).map_err(failure)?;
         read_table(Path::new(&path), remove)
     }
 
@@ -153,13 +171,27 @@ impl Connection {
         inputs: &[Table],
         region: &Region,
     ) -> Result<Vec<Table>> {
+        let called = self.exchange(stage, inputs, region);
+        self.broken |= called.is_err();
+        called?
+    }
+
+    fn exchange(
+        &mut self,
+        stage: usize,
+        inputs: &[Table],
+        region: &Region,
+    ) -> Result<Result<Vec<Table>>> {
         self.send(&json!({"stage": stage, "inputs": inputs.len()}))?;
         for input in inputs {
             self.send_table(input)?;
         }
         self.flush()?;
         loop {
-            let header = self.receive()?;
+            let header = match self.receive_reply()? {
+                Ok(header) => header,
+                Err(failed) => return Ok(Err(failed)),
+            };
             if header.get("finished").is_some() {
                 (region.report)(self.receive_table(true)?)?;
             } else if let Some(question) = header.get("ask") {
@@ -172,13 +204,13 @@ impl Connection {
                 }
                 self.flush()?;
             } else {
-                return self.receive_tables(count(&header, "outputs")?);
+                return Ok(Ok(self.receive_tables(count(&header, "outputs")?)?));
             }
         }
     }
 
     fn end(&mut self) -> Result<Option<Ran>> {
-        if !std::mem::take(&mut self.in_region) {
+        if !std::mem::take(&mut self.in_region) || self.broken {
             return Ok(None);
         }
         self.send(&json!({"end": true}))?;
@@ -432,7 +464,10 @@ impl Workers {
     }
 
     pub fn revive(&mut self) -> Result<()> {
-        if self.alive() {
+        let connected = self.connections.len() == self.listeners.len()
+            && (self.connections.iter())
+                .all(|connection| !connection.lock().expect("the worker lock").broken);
+        if connected && self.alive() {
             return Ok(());
         }
         let command = (self.command.clone())
@@ -666,6 +701,89 @@ mod tests {
             vec!["\"r\" documents:r", "stage 0 \"no\""]
         );
         assert!(!directory.exists());
+    }
+
+    fn one_row_table() -> Table {
+        use datafusion::arrow::array::{Int32Array, RecordBatch};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        )
+        .unwrap();
+        (schema, vec![batch])
+    }
+
+    fn lost_region(on_stage: fn(&mut WorkerEnd), ask: Ask) -> (Result<Vec<Ran>>, Workers) {
+        let mut workers = Workers::bind(1).unwrap();
+        let socket = workers.paths()[0].clone();
+        std::thread::spawn(move || {
+            let mut end = WorkerEnd::connect(&socket).unwrap();
+            loop {
+                match end.read() {
+                    Ok(Message::Region(..)) => end.ready().unwrap(),
+                    Ok(Message::Stage(..)) => on_stage(&mut end),
+                    Ok(Message::Shutdown) | Err(_) => return,
+                    Ok(_) => {}
+                }
+            }
+        });
+        workers.connect().unwrap();
+        let region = Region {
+            report: Box::new(|_| Ok(())),
+            ask,
+        };
+        let ran = workers.run_region(&json!({}), &[], |connections| {
+            (connections[0].lock().unwrap()).call(0, &[one_row_table()], &region)?;
+            Ok(())
+        });
+        (ran, workers)
+    }
+
+    #[test]
+    fn a_worker_that_fails_to_write_its_outputs_fails_the_region_and_is_restarted() {
+        let (ran, mut workers) = lost_region(
+            |end| {
+                end.connection.send(&json!({"outputs": 1})).unwrap();
+                end.fail("No space left on device").unwrap();
+            },
+            Box::new(|_| Ok(Answer::Json(json!(null)))),
+        );
+        assert!(ran.unwrap_err().to_string().contains("No space left"));
+        assert!(workers.revive().is_err());
+    }
+
+    #[test]
+    fn a_question_quail_cannot_answer_fails_the_region_and_restarts_the_worker() {
+        let (ran, mut workers) = lost_region(
+            |end| {
+                let _ = end.ask(&json!("more?"));
+            },
+            Box::new(|_| Err(failure("the hint failed"))),
+        );
+        assert!(ran.unwrap_err().to_string().contains("the hint failed"));
+        assert!(workers.revive().is_err());
+    }
+
+    #[test]
+    fn workers_missing_a_connection_are_restarted() {
+        let mut workers = Workers::bind(2).unwrap();
+        let (stream, _) = UnixStream::pair().unwrap();
+        let path = workers.paths()[0].clone();
+        let connection = Connection::new(stream, &path, "quail").unwrap();
+        workers.connections.push(Arc::new(Mutex::new(connection)));
+        assert!(workers.revive().is_err());
+    }
+
+    #[test]
+    fn each_connection_at_a_socket_names_its_own_table_files() {
+        let path = PathBuf::from("/tmp/socket");
+        let named = |_| {
+            let (stream, _) = UnixStream::pair().unwrap();
+            Connection::new(stream, &path, "worker").unwrap().shared
+        };
+        assert_ne!(named(0), named(1));
     }
 
     #[test]
