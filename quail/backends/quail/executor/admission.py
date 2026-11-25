@@ -225,7 +225,9 @@ class JoinAdmission:
             whose frame is already in the anchor's KV from the stage
             before packs no frame rows. None writes every frame.
         limit: Stop admitting anchors once this many survived the last
-            stage; None runs every anchor.
+            stage; None runs every anchor. An anchor that launched part
+            of its stream at a stage finishes that stream, so no answer
+            row is cut short.
         survival: The fraction of anchors expected to survive every
             stage, or None. Under a limit, anchors are admitted only
             while the ones in flight are expected to fall short of it;
@@ -692,7 +694,7 @@ class JoinAdmission:
             self.ready.append(a)
         self._prefilled = []
         limited = self.limit_reached()
-        if limited and not self.dependencies:
+        if limited and not self.dependencies and not self._cut_streams():
             return []
         room = self.chunk_budget if room is None else room
         groups = []
@@ -700,10 +702,13 @@ class JoinAdmission:
         deferred = []
         temporary_pages = 0
         for _ in range(len(self.ready)):
-            if room == 0 or limited:
+            if room == 0:
                 break
             a = self.ready.popleft()
             j, i = self._stage[a], self._next[a]
+            if limited and not i:
+                deferred.append(a)
+                continue
             if self._first_cost(a, j, i) > room:
                 deferred.append(a)
                 continue
@@ -1012,6 +1017,10 @@ class JoinAdmission:
             self._counted.add(document)
             self.survivors += 1
 
+    def _cut_streams(self) -> bool:
+        """Whether an anchor in the ready queue has launched part of its stream."""
+        return any(self._next[a] and self._stage[a] != _DONE for a in self.ready)
+
     def limit_reached(self) -> bool:
         """Return whether enough documents survived to stop new admissions."""
         return self.limit is not None and self.survivors >= self.limit
@@ -1043,6 +1052,7 @@ class JoinAdmission:
     def done(self):
         if self.limit_reached():
             return (not self.in_flight and not self._settled
+                    and not self._cut_streams()
                     and all(self._stage[a] == _DONE for a in self.waiting))
         return len(self.pending) == self._dead and not self.ready \
             and not self._prefill and not self._prefilled \
