@@ -24,6 +24,9 @@ class EngineConfig:
 
     `model` and `device` have no defaults: they name the hardware and
     weights the query runs on. `gpus` counts model copies on one host.
+    `host_kv_bytes` is the host memory that keeps document KV the arena
+    frees, so a later operator or query reads it back instead of
+    computing it; 0 keeps none.
     """
     model: str
     device: str
@@ -32,3 +35,4 @@ class EngineConfig:
     gpu_timing: bool = False
     canvas_draws: int = 4
     attention: str | None = None
+    host_kv_bytes: int = 0

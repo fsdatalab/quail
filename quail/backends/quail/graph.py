@@ -76,6 +76,8 @@ def execution_context(state, payload, graph: PhysicalGraph) -> ExecutionContext:
     arena.write_trace_files()
     arena.free_all()
     arena.reset_stats()
+    if arena.host is not None:
+        arena.host.begin_query()
     state["gpu"].torch.cuda.reset_peak_memory_stats()
     retention = payload.get("retention", {})
     apply_retention(arena, retention, retention.get("initial", {}))
@@ -122,6 +124,7 @@ def execution_measurements(context: ExecutionContext) -> dict:
             "evicted_keys": arena.evicted_keys,
             "evicted_pages": arena.evicted_pages,
             "evicted_prefix_tokens": arena.evicted_prefix_tokens,
+            **(arena.host.report() if arena.host is not None else {}),
         },
         "memory": memory_report(gpu),
     }
@@ -157,6 +160,7 @@ def serve_region(state, payload, graph: PhysicalGraph, end, wanted,
     """
     context = execution_context(state, payload, graph)
     torch, arena = state["gpu"].torch, state["gpu"].arena
+    finished = False
     pipeline = state["gpu"].pipeline
     if hasattr(pipeline, "images"):
         pipeline.images = RegionImages(payload["documents"], payload["columns"],
@@ -168,6 +172,7 @@ def serve_region(state, payload, graph: PhysicalGraph, end, wanted,
                 wanted, hinted, payload_first_rows(payload) if hinted else None)
         torch.cuda.synchronize()
         arena.write_trace_files()
+        finished = True
     finally:
         images = getattr(pipeline, "images", None)
         if images is not None:
@@ -177,7 +182,7 @@ def serve_region(state, payload, graph: PhysicalGraph, end, wanted,
                     f"{images.decode_wait_s:.2f} s for decoded pixels")
             images.close()
             pipeline.images = None
-        arena.free_all()
+        arena.free_all(save=finished)
     end.ran(*ran_message(results, execution_measurements(context)))
 
 

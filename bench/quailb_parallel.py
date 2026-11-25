@@ -97,7 +97,8 @@ def _methods(csv: str) -> list[str]:
 def _run_family(process_groups, result_name, model, scale_factor, query_ids_csv,
                 run_dir, ground_truth_collection, root=None,
                 attention=None, gpu_timing=False,
-                canvas_draws=None, device="h100-sxm", gpus=1) -> str:
+                canvas_draws=None, device="h100-sxm", gpus=1,
+                host_kv_bytes=0) -> str:
     """Run one query family's methods, one child process per group.
 
     Every group runs on this container's GPUs, in a fresh process.
@@ -131,6 +132,7 @@ def _run_family(process_groups, result_name, model, scale_factor, query_ids_csv,
             canvas_draws=canvas_draws,
             device=device,
             gpus=gpus,
+            host_kv_bytes=host_kv_bytes,
         )
         process_results.append(process_result)
         suites.update(process_result["suites"])
@@ -187,6 +189,7 @@ def run_query_family(
     canvas_draws: str = "",
     device: str = "h100-sxm",
     gpus: int = 1,
+    host_kv_bytes: int = 0,
 ) -> str:
     """Run one query family through the selected benchmark methods.
 
@@ -208,6 +211,8 @@ def run_query_family(
             keeps the default; multiple counts create separate Quail runs.
         device: Registered device name. Defaults to ``h100-sxm``.
         gpus: Model copies, one per GPU. Defaults to 1.
+        host_kv_bytes: Host bytes of document KV Quail keeps between the
+            family's queries; 0 keeps none.
 
     Returns:
         Path to the saved family result on the results volume.
@@ -232,6 +237,7 @@ def run_query_family(
             canvas_draws=canvas_draws or None,
             device=device,
             gpus=gpus,
+            host_kv_bytes=host_kv_bytes,
         )
     finally:
         results_vol.commit()
@@ -312,6 +318,8 @@ def run_all(
     device: str = "h100-sxm",
     gpus: int = 1,
     timeout_s: int = 43200,
+    host_kv_bytes: int = 0,
+    memory_mb: int = 0,
 ):
     from quail_b import select_queries
 
@@ -334,6 +342,8 @@ def run_all(
         "canvas_draws": canvas_draws or None,
         "device": device,
         "gpus": gpus,
+        "host_kv_bytes": host_kv_bytes,
+        "memory_mb": memory_mb or None,
         "query_ids": list(query_ids),
         "summaries": {},
         "function_call_ids": {},
@@ -357,6 +367,7 @@ def run_all(
                 family_call = run_query_family.with_options(
                     gpu=modal_gpu_type(device, gpus),
                     timeout=timeout_s,
+                    **({"memory": memory_mb} if memory_mb else {}),
                 ).spawn(
                     model=model,
                     scale_factor=scale_factor,
@@ -374,6 +385,7 @@ def run_all(
                     canvas_draws=canvas_draws,
                     device=device,
                     gpus=gpus,
+                    host_kv_bytes=host_kv_bytes,
                 )
                 family_calls.append((group, family_call))
                 call_ids[f"{group}:quail_vllm"] = family_call.object_id
@@ -506,6 +518,8 @@ def main(
     device: str = "h100-sxm",
     gpus: int = 1,
     timeout_s: int = 43200,
+    host_kv_bytes: int = 0,
+    memory_mb: int = 0,
 ):
     if timeout_s < 1 or timeout_s > 86400:
         raise ValueError("timeout_s must be from 1 to 86400 seconds")
@@ -538,6 +552,8 @@ def main(
         device=device,
         gpus=gpus,
         timeout_s=timeout_s,
+        host_kv_bytes=host_kv_bytes,
+        memory_mb=memory_mb,
     )
     print(f"function call id: {call.object_id} (all families)", flush=True)
     print(call.get(), flush=True)

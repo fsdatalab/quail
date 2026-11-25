@@ -65,6 +65,7 @@ def planning_settings(session, order: str | None) -> dict:
         "device": asdict(session.device),
         "gpus": config.gpus, "canvas_draws": config.canvas_draws,
         "gpu_timing": config.gpu_timing,
+        "host_kv_bytes": config.host_kv_bytes,
         "attention": config.attention, "order": order,
         "backend": config.backend,
         "physical_rules": [rule.name for rule in

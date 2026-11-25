@@ -129,6 +129,7 @@ def test_a_worker_reuses_its_model_and_an_arena_resize_releases_pieces_that_writ
         conv_state=None, resize=lambda *a, **kw: calls.append("resize"))
     gpu.model = gpu.F = None
     gpu.decision_head = None
+    gpu.host_kv_bytes = 0
     # a dense model keeps no checkpoint slots, so resize gets no state pool
     gpu.spec = MODELS["qwen3-4b-fp8"]
     gpu.device = H100_SXM
@@ -138,6 +139,35 @@ def test_a_worker_reuses_its_model_and_an_arena_resize_releases_pieces_that_writ
     calls.clear()
     gpu.bind_query([1], [2], 32, arena_pages=(16, 0), writes_answers=True)
     assert calls == ["synchronize", "invalidate", "resize"]
+
+
+def test_a_worker_starts_the_host_store_at_the_size_its_setup_names(
+        booted, monkeypatch):
+    stores = []
+
+    class FakeStore:
+        def __init__(self, arena, capacity_bytes, torch):
+            self.num_rows = capacity_bytes // 10
+            self.bytes = capacity_bytes
+            self.flushed = False
+            stores.append(self)
+
+        def flush(self):
+            self.flushed = True
+
+    monkeypatch.setattr(worker, "HostKV", FakeStore)
+    monkeypatch.setattr(worker, "KVArena", lambda *a, **k: SimpleNamespace(
+        k=[], v=[], gdn_state=None, conv_state=None, num_pages=0, host=None))
+    state = worker.WorkerState(0, registry=built_in_registry())
+    worker._boot_worker(state, SETUP)
+    arena = state.gpu.arena
+    assert arena.host is None and not stores
+    worker._boot_worker(state, {**SETUP, "host_kv_bytes": 1000})
+    assert arena.host is stores[0] and stores[0].bytes == 1000
+    worker._boot_worker(state, {**SETUP, "host_kv_bytes": 1000})
+    assert arena.host is stores[0] and len(stores) == 1
+    worker._boot_worker(state, {**SETUP, "host_kv_bytes": None})
+    assert arena.host is None and stores[0].flushed
 
 
 def test_a_worker_captures_cuda_graphs_only_for_a_plan_that_writes_answers(

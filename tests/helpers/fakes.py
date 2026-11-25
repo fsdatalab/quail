@@ -71,8 +71,10 @@ def bare_arena(arena, pages):
     arena._holds = {}
     arena._reading = {}
     arena._deferred = set()
+    arena._draining = {}
     arena._window_floor = {}
     arena._trimmed = set()
+    arena.host = None
     arena._refresh_rows = lambda *args: None
     arena.reset_stats()
     arena.trace_files = []
@@ -331,8 +333,12 @@ class FakeArena:
 
     def __init__(self):
         self.accounting = self
+        self.host = None
         self.owned = set()
         self.retained = set()
+
+    def reclaim(self, wait=False):
+        return 0
 
     @property
     def retained_pages(self):
@@ -362,7 +368,7 @@ class FakeArena:
         self.owned.discard(key)
         self.retained.discard(key)
 
-    def free_all(self):
+    def free_all(self, save=False):
         self.owned.clear()
         self.retained.clear()
 

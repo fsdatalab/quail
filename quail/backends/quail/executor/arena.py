@@ -22,12 +22,16 @@ the same methods:
 - attention inputs: layer_kv, paged_kv, block_table, block_table_rows
 - counters: reset_stats, evicted_keys, evicted_pages,
   evicted_prefix_tokens
+- the host store: host, a HostKV that free_key hands a key's prefix
+  rows before they go, or None; reclaim frees the pages of keys whose
+  save has landed
 """
 
 import math
 
 import numpy as np
 
+from quail.backends.quail.executor.host_kv import PENDING
 from quail.backends.quail.executor.pages import PageArena, _evict_event
 from quail.progress import answer_sink
 
@@ -80,6 +84,7 @@ class KVArena:
             raise ValueError("checkpoint slots need the state shapes")
         self.gdn_state_shape = gdn_state_shape
         self.conv_state_shape = conv_state_shape
+        self.host = None
         self._build(num_pages, page_tokens, num_sliding_pages, num_state_slots)
         self.reset_stats()
         self.trace_files = []
@@ -114,6 +119,7 @@ class KVArena:
         sizes = [math.prod(shape) for shape in shapes]
         storage = torch.empty(2 * sum(sizes), dtype=self.dtype, device=self.device)
         parts = storage.split([size for size in sizes for _ in range(2)])
+        self.storage = storage
         self.k = [part.view(shape) for part, shape in zip(parts[::2], shapes)]
         self.v = [part.view(shape) for part, shape in zip(parts[1::2], shapes)]
         self.gdn_state = self.gdn_state_rows = self.conv_state = None
@@ -134,6 +140,7 @@ class KVArena:
         self._holds = {}
         self._reading = {}
         self._deferred = set()
+        self._draining = {}
         self._window_floor = {}
         self._trimmed = set()
 
@@ -155,6 +162,8 @@ class KVArena:
         self.k = self.v = None
         self.gdn_state = self.gdn_state_rows = self.conv_state = None
         self._build(num_pages, page_tokens, num_sliding_pages, num_state_slots)
+        if self.host is not None:
+            self.host.rebind()
 
 
     @property
@@ -419,7 +428,66 @@ class KVArena:
             self._sliding_rows[key] = self._page_rows(self.sliding, key, capacity_s)
 
     def pin(self, key):
+        self._undrain(key)
         self.accounting.pin(key)
+
+    def _undrain(self, key):
+        """Keep a draining key's pages for a new use, once its save has read them."""
+        event = self._draining.pop(key, None)
+        if event is PENDING:
+            self.host.cancel_pending(key)
+        elif event is not None:
+            event.synchronize()
+
+    def _flush_pending(self, wait=False, until=None) -> int:
+        """Run the store's queued saves; returns the pages freed on the way."""
+        freed = 0
+        for key, event in self.host.flush_pending(wait, until).items():
+            if key not in self._draining:
+                continue
+            if event is None:
+                del self._draining[key]
+                freed += self._free_now(key)
+            else:
+                self._draining[key] = event
+        return freed
+
+    def reclaim(self, wait: bool = False) -> int:
+        """Free the pages of draining keys whose save has landed.
+
+        A freed key whose save is still reading its pages keeps them
+        until the save's event fires, and one whose save waits for a
+        staging block keeps them until it has run. With wait, every
+        save is run and waited for. Returns the pages freed.
+        """
+        freed = 0
+        if self.host is not None:
+            freed += self._flush_pending(wait=wait)
+        for key, event in list(self._draining.items()):
+            if event is PENDING:
+                if not wait:
+                    continue
+                raise RuntimeError(f"{key!r} is still queued after a flush")
+            if not event.query():
+                if not wait:
+                    break
+                event.synchronize()
+            del self._draining[key]
+            freed += self._free_now(key)
+        return freed
+
+    def reclaim_oldest(self) -> int:
+        """Run and wait for the oldest save in flight and free its key's pages."""
+        for key, event in self._draining.items():
+            if event is PENDING:
+                freed = self._flush_pending(wait=True, until=key)
+                event = self._draining.get(key)
+                if event is None:
+                    return freed
+            event.synchronize()
+            del self._draining[key]
+            return self._free_now(key)
+        return 0
 
     def retain(self, key, tokens: int, priority=None):
         """Rewind a prefix and make it available for a later operator.
@@ -465,12 +533,17 @@ class KVArena:
         """
         keys = []
         keep = set(self._holds) | set(self._reading)
+        self.reclaim()
         while not satisfied():
             victim = self.accounting.pop_retained_victim(keep=keep)
             if victim is None:
-                break
+                if not self._draining or not self.reclaim_oldest():
+                    break
+                continue
             keys.append(victim[0])
             self.evict_key(victim[0])
+            if not satisfied() and victim[0] in self._draining:
+                self.reclaim_oldest()
         return tuple(keys)
 
     def _evict_for_pages(self, need, need_sliding):
@@ -511,6 +584,7 @@ class KVArena:
         """
         capacity = tokens if capacity_tokens is None else capacity_tokens
         if key in self.accounting.owned:
+            self._undrain(key)
             self.accounting.pin(key)
             need = max(0, self.accounting.pages_needed(capacity)
                        - len(self.accounting.table_pages(key)))
@@ -679,22 +753,55 @@ class KVArena:
             self._release_hold(key)
         return bool(keys)
 
-    def free_all(self) -> None:
-        """Free every resident key, with every hold and reader dropped first."""
+    def free_all(self, save: bool = False) -> None:
+        """Free every resident key, with every hold and reader dropped first.
+
+        With save, the host store saves each key an operator wrote,
+        waiting for staging blocks since nothing else runs on the GPU.
+        Without save, nothing new is saved: a failed query may leave a
+        key's KV incomplete. Pages a save in flight still reads go free
+        once the save has read them.
+
+        Args:
+            save: Whether the host store saves the freed keys.
+        """
         self._holds.clear()
         self._reading.clear()
         self._deferred.clear()
-        for key in self.resident_keys():
-            self.free_key(key)
+        if self.host is None:
+            for key in self.resident_keys():
+                self.free_key(key)
+            return
+        if not save:
+            for key in self.host.forget_writes():
+                if self._draining.get(key) is PENDING:
+                    del self._draining[key]
+        with self.host.patient():
+            for key in self.resident_keys():
+                self.free_key(key)
+            self.reclaim(wait=True)
 
     def free_key(self, key):
         """Free a key's pages, or once its holds are released.
+
+        With a host store, the key's prefix is saved first, and its
+        pages go free once the save has read them (reclaim).
 
         Returns the pages that went free now.
         """
         if key in self._holds or key in self._reading:
             self._deferred.add(key)
             return 0
+        if key in self._draining:
+            return 0
+        if self.host is not None and key in self.accounting.owned:
+            event = self.host.before_free(key)
+            if event is not None:
+                self._draining[key] = event
+                return 0
+        return self._free_now(key)
+
+    def _free_now(self, key):
         self._window_floor.pop(key, None)
         self._trimmed.discard(key)
         self._rows.pop(key)

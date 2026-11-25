@@ -572,6 +572,9 @@ impl Executor {
         if planned.get("envelope").is_some() && settings.gpu_timing {
             planned["envelope"]["settings"]["gpu_timing"] = true.into();
         }
+        if planned.get("envelope").is_some() && settings.host_kv_bytes > 0 {
+            planned["envelope"]["settings"]["host_kv_bytes"] = settings.host_kv_bytes.into();
+        }
         planned["logical"] = logical.into();
         planned["planning_s"] = started.elapsed().as_secs_f64().into();
         Ok(Some((planned.to_string(), scans)))
@@ -745,6 +748,7 @@ fn boot_setup(envelope: &serde_json::Value) -> Result<serde_json::Value> {
         "chunk_tokens": settings["chunk_tokens"], "true_ids": settings["true_ids"],
         "false_ids": settings["false_ids"], "arena_pages": settings["arena_pages"],
         "writes_answers": writes_answers,
+        "host_kv_bytes": settings["host_kv_bytes"].as_u64().unwrap_or(0),
         "model_path": null, "extensions": [],
     }))
 }

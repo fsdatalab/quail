@@ -20,6 +20,7 @@ import _quail_native
 from quail.backends.base import GpuContext
 from quail.backends.quail.executor.arena import KVArena
 from quail.backends.quail.executor.cuda_graphs import PiecewiseGraphs
+from quail.backends.quail.executor.host_kv import HostKV
 from quail.backends.quail.executor.model_loading import load_model
 from quail.backends.quail.executor.models import build_pipeline
 from quail.backends.quail.executor.readout import (
@@ -108,6 +109,7 @@ class LoadedGpu:
                                                      full_pages))
         self.arena_s = time.perf_counter() - t0
         self.pool_bytes = pool_bytes(self.arena)
+        self.host_kv_bytes = 0
 
         t0 = time.perf_counter()
         self.decision_head = None
@@ -139,7 +141,7 @@ class LoadedGpu:
         self.chunk_tokens = None
 
     def bind_query(self, true_ids, false_ids, chunk_tokens, arena_pages=None,
-                   *, writes_answers):
+                   *, writes_answers, host_kv_bytes=0):
         """Attach the answer rows, readout, and chunk budget for one query.
 
         arena_pages resizes the KV pools to the plan's split; nothing
@@ -156,6 +158,9 @@ class LoadedGpu:
                 arena_pages only for such a plan, so any other plan
                 releases the captured graphs before its arena takes
                 their memory.
+            host_kv_bytes: The host bytes that keep freed document
+                prefixes between queries; 0 keeps none, and a new size
+                starts an empty store.
         """
         if arena_pages is not None:
             slots = checkpoint_arena_args(
@@ -170,6 +175,7 @@ class LoadedGpu:
                               **{k: v for k, v in slots.items()
                                  if k == "num_state_slots"})
             self.pool_bytes = pool_bytes(self.arena)
+        self.configure_host_kv(host_kv_bytes)
         self.torch.cuda.reset_peak_memory_stats()
         rows = AnswerRows(self.torch, self.F, self.model, true_ids, false_ids)
         async_scores = None
@@ -190,6 +196,20 @@ class LoadedGpu:
             chunk_tokens=chunk_tokens,
             async_scores=async_scores,
         )
+
+    def configure_host_kv(self, host_kv_bytes: int) -> None:
+        """Keep, start, or drop the host store for the given size in bytes."""
+        host_kv_bytes = int(host_kv_bytes or 0)
+        if host_kv_bytes == self.host_kv_bytes:
+            return
+        if self.arena.host is not None:
+            self.arena.host.flush()
+        self.arena.host = (HostKV(self.arena, host_kv_bytes, self.torch)
+                           if host_kv_bytes else None)
+        self.host_kv_bytes = host_kv_bytes
+        if self.arena.host is not None:
+            say(f"host KV store: {self.arena.host.bytes / 2**30:.1f} GiB, "
+                f"{self.arena.host.num_rows} token rows")
 
     def warm(self, writes_answers):
         """Compile and warm kernels once, and capture the CUDA graphs.
@@ -317,7 +337,8 @@ def _boot_record(gpu, cold, warm_s, warm_tier, t_boot):
 
 
 def _boot_gpu(gpu, backend, gpu_context, chunk_tokens, true_ids, false_ids,
-              arena_pages=None, *, writes_answers, model_path=None):
+              arena_pages=None, *, writes_answers, model_path=None,
+              host_kv_bytes=0):
     """Prepare a GPU for a query, releasing it when preparation fails.
 
     A gpu of None loads the model; otherwise the loaded GPU is reused.
@@ -333,7 +354,8 @@ def _boot_gpu(gpu, backend, gpu_context, chunk_tokens, true_ids, false_ids,
                             model_path=model_path)
         state["gpu"] = gpu
         gpu.bind_query(true_ids, false_ids, chunk_tokens, arena_pages,
-                       writes_answers=writes_answers)
+                       writes_answers=writes_answers,
+                       host_kv_bytes=host_kv_bytes)
         warm_s, warm_tier = gpu.warm(writes_answers)
         if cold:
             freeze_loaded_objects()
@@ -413,6 +435,7 @@ def _boot_worker(state, setup) -> dict:
             device=registry.device(setup["device"]), query_settings={}),
         setup["chunk_tokens"], setup["true_ids"], setup["false_ids"],
         setup.get("arena_pages"), writes_answers=setup["writes_answers"],
+        host_kv_bytes=setup.get("host_kv_bytes") or 0,
         model_path=(setup["model_path"]
                     or resolve_model_path(spec.hf_name, spec.revision)))
     return boot

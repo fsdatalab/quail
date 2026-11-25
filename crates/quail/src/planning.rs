@@ -28,6 +28,8 @@ pub struct Settings {
     #[serde(default)]
     pub gpu_timing: bool,
     #[serde(default)]
+    pub host_kv_bytes: u64,
+    #[serde(default)]
     pub attention: Option<String>,
     #[serde(default)]
     pub order: Option<String>,

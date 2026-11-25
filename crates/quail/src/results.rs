@@ -333,6 +333,10 @@ pub fn execution_report(
     ] {
         report.insert(key.into(), get(key));
     }
+    report.insert(
+        "restored_tokens".into(),
+        metrics.get("restored_tokens").cloned().unwrap_or(json!(0)),
+    );
     report.insert("estimated_seconds".into(), estimated_seconds.into());
     report.insert(
         "coordinator_wall_s".into(),

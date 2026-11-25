@@ -421,6 +421,10 @@ class JoinAdmission:
                 for group in self.groups[a]:
                     self._group_members.setdefault(group, set()).add(a)
 
+    def pack_prefix(self, a) -> None:
+        """Admit the anchor as fresh after all: its KV is not resident."""
+        self._carried[a] = self.prefix[a]
+
     def num_partners(self, a, j):
         """Return the number of partner requests anchor a streams at stage j.
 

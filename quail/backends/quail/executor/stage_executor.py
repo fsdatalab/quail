@@ -325,16 +325,26 @@ class StageExecutor:
         self.appended = [0] * len(self.prefixes)
 
         resident = {}
+        self.host = getattr(self.arena, "host", None) if self.paged else None
+        self.host_hits = {}
+        if self.host is not None:
+            digests = [self.host.register(key, self.prefixes[a],
+                                          self.prefix_lengths[a])
+                       for a, key in enumerate(self.keys)]
         if self.paged:
             for a, key in enumerate(self.keys):
                 if not self.arena.is_resident(key):
+                    if self.host is not None and self.host.holds(digests[a]):
+                        self.host_hits[a] = digests[a]
+                        resident[a] = 0
                     continue
                 if self.arena.prefix_tokens(key) != self.prefix_lengths[a]:
                     self.arena.free_key(key)
                     continue
                 resident[a] = self._held_pages(key, self.prefix_lengths[a])
         for a in resident:
-            self.arena.pin(self.keys[a])
+            if a not in self.host_hits:
+                self.arena.pin(self.keys[a])
 
         self.asking = any(stage.requests is not None or stage.own_suffixes
                           for stage in self.stages)
@@ -423,6 +433,7 @@ class StageExecutor:
 
         self._held_parents = set()
         self._reserved_parents = {}
+        self._readmit = False
         self._prefill_keys = set()
         self.spans = []
         self.tokens = 0
@@ -555,6 +566,12 @@ class StageExecutor:
         if not self.arena.reserve(
                 key, prefix, capacity_tokens=capacity, borrow=borrowed,
                 extension=self._extends, share_points=points):
+            return False
+        digest = self.host_hits.pop(anchor, None)
+        if digest is not None and not self.host.restore(key, digest):
+            self.arena.free_key(key)
+            self.sched.pack_prefix(anchor)
+            self._readmit = True
             return False
         return self._reserved(anchor, key, parent)
 
@@ -1081,6 +1098,8 @@ class StageExecutor:
             e0 = self.torch.cuda.Event(enable_timing=True)
             e1 = self.torch.cuda.Event(enable_timing=True)
             e0.record()
+        if self.host is not None and self.arena.pinned:
+            self.host.fence(self.torch.cuda.current_stream())
         normed = forward_chunk(self.pipeline, self.arena, chunk)
         if self.gpu_timing:
             e1.record()
@@ -1103,6 +1122,8 @@ class StageExecutor:
         for key in chunk.fresh_keys:
             if key not in self._prefill_keys:
                 self.arena.trim_window(key)
+                if self.host is not None:
+                    self.host.mark_written(key)
         while self.outstanding:
             self._report_next()
         if self.decoder is not None:
@@ -1137,6 +1158,8 @@ class StageExecutor:
                 self._event(settlement)
             if self.sched.done():
                 break
+            if self.paged:
+                self.arena.reclaim()
             if len(self.outstanding) > 1:
                 self._report_next()
             if self.sched.blocked_pages:
@@ -1186,6 +1209,11 @@ class StageExecutor:
                         and self.arena.evict_retained(self.sched.blocked_pages)):
                     continue
                 if self.arena.drop_holds(self.held):
+                    continue
+                if self._readmit:
+                    self._readmit = False
+                    continue
+                if self.paged and self.arena.reclaim_oldest():
                     continue
                 raise AssertionError("nothing buildable and nothing in flight")
             self._run_part(groups, decode, replays, prefills)

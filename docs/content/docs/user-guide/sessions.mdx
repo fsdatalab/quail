@@ -170,3 +170,30 @@ config = quail.EngineConfig(
     gpus=4,
 )
 ```
+
+## Keep KV between queries
+
+Set `host_kv_bytes` in `EngineConfig` to keep document KV in host memory
+after the query that computed it. When the GPU frees a document's KV,
+Quail copies its prefix, the prompt head and the document, into pinned
+host memory. A later operator or query that reads the same document
+under the same prompt head copies the prefix back instead of computing
+it again. The setting is the host memory the store may use, in bytes;
+the default of 0 keeps nothing.
+
+```python
+config = quail.EngineConfig(
+    model="qwen3-4b-fp8",
+    device="h100-sxm",
+    host_kv_bytes=64 * 2**30,
+)
+```
+
+The store lives as long as the loaded model, so it serves every session
+in the process and every query on one Quail Server. Quail keys an entry
+by the prefix's token ids. Join partners and documents with images are
+not saved. A query that fails saves nothing it had not saved already.
+New entries drop the oldest ones, but a query never drops its own
+entries: once its documents fill the store, Quail stops saving them.
+[Metrics](/docs/user-guide/metrics#kv-kept-between-queries) lists the
+store's counters.

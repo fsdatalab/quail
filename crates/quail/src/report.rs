@@ -392,6 +392,8 @@ pub fn region_report(
         let values: Vec<&Value> = counters.iter().map(|worker| &worker[name]).collect();
         kv_manager.insert(name.clone(), summed(&values));
     }
+    let restored = (kv_manager.get("host_kv_restored_tokens").cloned()).unwrap_or(json!(0));
+    report.insert("restored_tokens".into(), restored);
     report.insert("kv_manager".into(), Value::Object(kv_manager));
     let memory: Vec<Value> = ran
         .iter()
