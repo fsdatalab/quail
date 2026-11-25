@@ -44,14 +44,10 @@ fn join_feeds_limit_alone(graph: &PhysicalGraph) -> bool {
         .filter(|node| matches!(node, PhysicalNode::AiJoin(_)))
         .count()
         == 1
-        && graph.nodes.iter().all(|node| {
-            matches!(
-                node,
-                PhysicalNode::Scan(_)
-                    | PhysicalNode::HashJoin(_)
-                    | PhysicalNode::AiJoin(_)
-                    | PhysicalNode::Limit(_)
-            )
+        && graph.nodes.iter().all(|node| match node {
+            PhysicalNode::AiJoin(join) => join.attributes.semantics != "anti",
+            PhysicalNode::Scan(_) | PhysicalNode::HashJoin(_) | PhysicalNode::Limit(_) => true,
+            _ => false,
         })
 }
 
