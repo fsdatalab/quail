@@ -1,16 +1,3 @@
-//! The rows a region returns, each built once the operators writing it
-//! have reported it.
-//!
-//! A region's rows are the natural join, on document ids, of a few
-//! relations: each full join's true pairs, each table's surviving
-//! documents, and each answer column's rows. Operators report rows of
-//! these relations as they finish them, each tagged with the node and
-//! port that wrote it. [`FinishedRows`] keeps every reported row by its
-//! ids and, for each new one, looks up the rows of the other relations
-//! it joins: a region row is built when the last of its parts arrives,
-//! so each row is built once, and the region's fetch keeps the first
-//! rows built.
-
 use quail_planner::constants::PROBABILITIES_SUFFIX;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -25,52 +12,35 @@ use arrow::compute::{
 use arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
 use quail_planner::expressions::{asked_call, call_aliases, column_references};
 use quail_planner::operators::Operators;
-use quail_planner::results::{answer_columns, region_columns, region_structs, source_columns};
+use quail_planner::plan::results::{
+    answer_columns, region_columns, region_structs, source_columns,
+};
 use serde_json::Value;
 
 use crate::results::{AnswerRequest, arrow_error, document_ids};
 
 type Error = String;
 
-/// Which reported rows of a relation count.
 #[derive(Debug, Clone)]
 enum Keep {
-    /// Every row.
     All,
-    /// The rows whose last column, a join's answer, is true.
     True,
 }
 
-/// The rows one port reports, kept by their document ids.
 #[derive(Debug)]
 struct Relation {
-    /// The (node, port) that reports the rows.
     step: (String, String),
-    /// The row's aliases this relation holds, by index.
     aliases: Vec<usize>,
-    /// The region columns this relation holds.
     columns: Vec<String>,
     keep: Keep,
-    /// Whether its rows were all known before the run: every document
-    /// of a table no operator drops.
     known: bool,
-    /// Whether its rows are a table's surviving documents: the table's
-    /// last rows port.
     survivors: bool,
-    /// Every column a report of it held.
     seen: HashSet<String>,
-    /// ids -> row number.
     rows: HashMap<Vec<i32>, usize>,
-    /// Per row, its ids in `aliases` order.
     keys: Vec<Vec<i32>>,
-    /// Per row, its (batch, row) in `batches`.
     places: Vec<(usize, usize)>,
-    /// (alias, id) -> the rows with that id, for a relation of several
-    /// aliases.
     by_alias: HashMap<(usize, i32), Vec<usize>>,
-    /// The reported values of `columns`, one batch per report.
     batches: Vec<Vec<ArrayRef>>,
-    /// Each column's type, once a report held it.
     types: Vec<Option<DataType>>,
 }
 
@@ -93,8 +63,6 @@ impl Relation {
         }
     }
 
-    /// Add a row under its ids; its number, or None when a row with those
-    /// ids is in.
     fn insert(&mut self, key: Vec<i32>, place: (usize, usize)) -> Option<usize> {
         if self.rows.contains_key(&key) {
             return None;
@@ -112,16 +80,9 @@ impl Relation {
     }
 }
 
-/// A region column and where its values come from.
 #[derive(Debug)]
 enum Column {
-    /// A source expression's values, by document of an alias.
     Source(String, usize, ArrayRef),
-    /// A relation's column; `labels` are a classification's labels,
-    /// which make the column a dictionary over them unless a table's
-    /// surviving documents carry the column; `answer` says whether it is
-    /// a call's answer, which a run must return, not a label's
-    /// probabilities or a span.
     Answer {
         name: String,
         relation: usize,
@@ -130,36 +91,24 @@ enum Column {
     },
 }
 
-/// A region row: its ids by alias and its row in each relation.
 type Found = (Vec<i32>, Vec<usize>);
 
-/// The step computing an answer column, and the labels that make it a
-/// dictionary.
 type Producer = (usize, Option<Value>);
 
-/// A region's rows, built as operators report the rows they finish.
 #[derive(Debug)]
 pub struct FinishedRows {
     aliases: Vec<String>,
     relations: Vec<Relation>,
-    /// Per relation, the order to join the others to a new row of it.
     orders: Vec<Vec<usize>>,
     columns: Vec<Column>,
     structs: Vec<(String, Vec<(String, String)>)>,
     fetch: Option<usize>,
-    /// The rows' schema before struct packing, fixed by the first rows
-    /// built.
     schema: Option<SchemaRef>,
-    /// The rows built so far, before struct packing, in the order they
-    /// were built.
     built: Vec<RecordBatch>,
-    /// Each built row's ids, by alias.
     keys: Vec<Vec<i32>>,
-    /// Rows complete before any report: those of known relations alone.
     pending: Vec<Found>,
 }
 
-/// A port the rows read, before the rows' aliases are known.
 struct Step {
     step: (String, String),
     aliases: Vec<String>,
@@ -167,7 +116,6 @@ struct Step {
     keep: Keep,
 }
 
-/// The index of the port's step, added with the aliases when new.
 fn step_of(steps: &mut Vec<Step>, step: (String, String), aliases: Vec<String>) -> usize {
     if let Some(index) = steps.iter().position(|known| known.step == step) {
         return index;
@@ -182,16 +130,6 @@ fn step_of(steps: &mut Vec<Step>, step: (String, String), aliases: Vec<String>) 
 }
 
 impl FinishedRows {
-    /// The rows of a region from its operators and every port its run
-    /// returns.
-    ///
-    /// `sources` holds each column a source expression computes, by
-    /// document position.
-    ///
-    /// # Errors
-    ///
-    /// A column has no source and no port computes it, or the operators
-    /// do not parse.
     pub fn new(
         request: &AnswerRequest,
         sources: &HashMap<String, ArrayRef>,
@@ -222,8 +160,6 @@ impl FinishedRows {
                 steps[index].keep = Keep::True;
             }
         }
-        // each answer column's step and the labels that make it a
-        // dictionary
         let mut wanted: Vec<(String, Option<Producer>)> = Vec::new();
         for name in region_columns(&found) {
             if source_aliases.contains_key(&name) {
@@ -243,7 +179,6 @@ impl FinishedRows {
             let entry = answers.iter().find(|column| column.0 == name);
             let Some((port, answer)) = producer else {
                 if entry.is_some_and(|column| !column.4) {
-                    // a label's probabilities or a span no port reports
                     continue;
                 }
                 return Err(format!("the run returned no column {name}"));
@@ -264,8 +199,6 @@ impl FinishedRows {
             };
             wanted.push((name, Some((index, labels))));
         }
-        // the aliases of the joins and pair answers first: the rows are
-        // ordered by the first of them, then by the rest
         let mut aliases: Vec<String> = Vec::new();
         let (pairs, single): (Vec<_>, Vec<_>) =
             steps.iter().partition(|step| step.aliases.len() > 1);
@@ -283,8 +216,6 @@ impl FinishedRows {
         if aliases.is_empty() {
             aliases.extend(scans.first().cloned());
         }
-        // each table's surviving documents: its last rows port, or every
-        // document when no operator drops any
         let mut known: Vec<(usize, usize)> = Vec::new();
         let mut survivors: Vec<usize> = Vec::new();
         for alias in &aliases {
@@ -330,8 +261,6 @@ impl FinishedRows {
             .collect();
         for index in survivors {
             relations[index].survivors = true;
-            // the survivors carry their labels as they are, a NULL one
-            // too, such as a guard's for a row it did not ask
             relations[index].keep = Keep::All;
         }
         let mut columns = Vec::new();
@@ -345,8 +274,6 @@ impl FinishedRows {
                     Column::Source(name, alias, Arc::clone(values))
                 }
                 Some((relation, labels)) => Column::Answer {
-                    // a classification's own rows port carries its labels
-                    // as they are
                     labels: labels.filter(|_| !relations[relation].survivors),
                     answer: (answers.iter().find(|column| column.0 == name))
                         .is_none_or(|column| column.4),
@@ -381,21 +308,10 @@ impl FinishedRows {
         Ok(rows)
     }
 
-    /// Whether the rows read the port's reports.
     pub fn wants(&self, node: &str, port: &str) -> bool {
         (0..self.relations.len()).any(|relation| self.wants_relation(relation, node, port))
     }
 
-    /// Take a batch of rows a port finished; return the region rows they
-    /// complete, or None when they complete none.
-    ///
-    /// A row whose ids the port reported before is skipped, so a port
-    /// may report its whole output once it ends.
-    ///
-    /// # Errors
-    ///
-    /// The batch lacks an id column of the port's relation, or an id is
-    /// null.
     pub fn report(
         &mut self,
         node: &str,
@@ -416,26 +332,11 @@ impl FinishedRows {
         !relation.known && relation.step.0 == node && relation.step.1 == port
     }
 
-    /// The rows complete before any report, when every relation was known
-    /// before the run.
-    ///
-    /// # Errors
-    ///
-    /// The rows' columns do not build.
     pub fn finish(&mut self) -> Result<Option<RecordBatch>, Error> {
         let found = std::mem::take(&mut self.pending);
         self.build(found)
     }
 
-    /// Every row built, ordered by its ids in alias order.
-    ///
-    /// A classification's label is a dictionary over its labels unless a
-    /// table's surviving documents carry it, as a later operator's rows
-    /// carry its input's columns; then it comes as they carry it.
-    ///
-    /// # Errors
-    ///
-    /// The rows' columns do not build.
     pub fn rows(&mut self) -> Result<RecordBatch, Error> {
         let rows = match self.built.first() {
             None => self.columns_of(&[])?,
@@ -474,8 +375,6 @@ impl FinishedRows {
         packed_batch(fields, arrays, rows.num_rows(), &self.structs)
     }
 
-    /// Whether a table's surviving documents carry a label column whose
-    /// classification's own rows port is not those survivors.
     fn carried(&self, name: &str) -> bool {
         let labeled = self.columns.iter().any(|column| {
             matches!(column, Column::Answer { name: found, labels: Some(_), .. } if found == name)
@@ -485,8 +384,6 @@ impl FinishedRows {
                 .any(|relation| relation.survivors && relation.seen.contains(name))
     }
 
-    /// Keep a batch's new rows in a relation and return the region rows
-    /// each completes.
     fn take_rows(&mut self, relation: usize, batch: &RecordBatch) -> Result<Vec<Found>, Error> {
         let schema = batch.schema();
         let kept: Option<BooleanArray> = match &self.relations[relation].keep {
@@ -548,8 +445,6 @@ impl FinishedRows {
         Ok(found)
     }
 
-    /// The region rows a relation's row completes with the rows the other
-    /// relations hold.
     fn joined(&self, relation: usize, row: usize) -> Vec<Found> {
         let mut binding: Vec<Option<i32>> = vec![None; self.aliases.len()];
         let own = &self.relations[relation];
@@ -563,9 +458,6 @@ impl FinishedRows {
         found
     }
 
-    /// Join the next relation of `order` to a partly bound row: on its
-    /// ids when they are all bound, else through the rows with one bound
-    /// id, else with every row.
     fn extend(
         &self,
         order: &[usize],
@@ -613,7 +505,6 @@ impl FinishedRows {
         rows[next] = usize::MAX;
     }
 
-    /// Build the region rows found, up to the fetch, and keep them.
     fn build(&mut self, mut found: Vec<Found>) -> Result<Option<RecordBatch>, Error> {
         if let Some(fetch) = self.fetch {
             found.truncate(fetch.saturating_sub(self.keys.len()));
@@ -636,8 +527,6 @@ impl FinishedRows {
         .map(Some)
     }
 
-    /// The region's columns for the rows found, before struct packing, in
-    /// the rows' schema once it is fixed.
     fn columns_of(&mut self, found: &[Found]) -> Result<RecordBatch, Error> {
         let mut fields: Vec<Field> = Vec::new();
         let mut arrays: Vec<ArrayRef> = Vec::new();
@@ -668,8 +557,6 @@ impl FinishedRows {
                         if *answer {
                             return Err(format!("the run returned no column {name}"));
                         }
-                        // a label's probabilities or a span the backend
-                        // does not report
                         continue;
                     };
                     let parts: Vec<&dyn Array> = relation
@@ -720,9 +607,6 @@ impl FinishedRows {
     }
 }
 
-/// For each relation, the order to join the others to a new row of it:
-/// next the first one sharing a known alias, or, when none shares one,
-/// the first.
 fn join_orders(relations: &[Relation]) -> Vec<Vec<usize>> {
     (0..relations.len())
         .map(|start| {
@@ -744,7 +628,6 @@ fn join_orders(relations: &[Relation]) -> Vec<Vec<usize>> {
         .collect()
 }
 
-/// A label column as a dictionary over the call's labels, in order.
 fn label_dictionary(values: &ArrayRef, labels: &Value) -> Result<ArrayRef, Error> {
     let order: Vec<&str> = (labels.as_array().into_iter().flatten())
         .filter_map(Value::as_str)
@@ -760,8 +643,6 @@ fn label_dictionary(values: &ArrayRef, labels: &Value) -> Result<ArrayRef, Error
     Ok(Arc::new(dictionary))
 }
 
-/// The rows with each struct column's members packed into it: the
-/// struct takes its first member's place, and the members leave.
 fn packed_batch(
     fields: Vec<Field>,
     arrays: Vec<ArrayRef>,
@@ -844,8 +725,6 @@ mod tests {
 
     #[test]
     fn a_row_is_built_once_every_port_writing_it_reported_it() {
-        // a filter's survivors joined to a score's answers, with a fetch
-        // of two
         let survivors = Relation::new(("filter".into(), "rows:r".into()), vec![0], vec![]);
         let scores = Relation::new(
             ("score".into(), "rows:r".into()),
@@ -872,7 +751,6 @@ mod tests {
         };
         let fun = Arc::new(Float64Array::from(vec![0.1, 0.2, 0.3])) as ArrayRef;
         let scored = batch(vec![("r", ids(vec![0, 1, 2])), ("fun", fun)]);
-        // no document has passed the filter yet
         assert!(
             rows.report("score", "rows:r", &scored)
                 .expect("a report")
@@ -883,7 +761,6 @@ mod tests {
             .expect("a report")
             .expect("a row");
         assert_eq!(passed.num_rows(), 1);
-        // the same ids again build nothing; the fetch keeps two rows
         assert!(
             rows.report("score", "rows:r", &scored)
                 .expect("a report")

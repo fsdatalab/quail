@@ -57,7 +57,6 @@ class DecodeCost:
             np.maximum.at(capped, inverse, shared_sliding)
             reads[firsts] += full
             sliding_reads[firsts] += capped
-        # Each answer advances its own state, even when its KV reads are shared.
         state = np.ones(len(contexts)) if self.state_seconds else 0.0
         return Work(tokens=np.ones(len(contexts)), pairs=contexts,
                     kv_read=reads, sliding_pairs=sliding,
@@ -114,7 +113,6 @@ class DecodeCost:
         """Return saved seconds from admitting a group of answer rows now."""
         if not added.tokens:
             return 0.0
-        # An empty pass compares with the candidate's standalone pass.
         before = self.seconds(work) if work.tokens else self.seconds(added)
         average = before / (work.tokens or added.tokens)
         marginal = ((self.seconds(work + added) - self.seconds(work))

@@ -56,7 +56,6 @@ class ExtensionRegistry:
     @classmethod
     def with_built_ins(cls) -> ExtensionRegistry:
         """Create a registry containing Quail's built in extensions."""
-        # Built in backends import this module.
         from quail.builtins import built_in_registry
 
         return built_in_registry()

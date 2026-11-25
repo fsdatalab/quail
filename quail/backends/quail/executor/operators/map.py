@@ -47,7 +47,6 @@ class MapOperator(ColumnOperator, ModelOperator):
 
     combine = True
     attention = "unified"
-    # the word naming the operator's nodes in a progress label
     word = "map"
 
     @classmethod
@@ -66,12 +65,12 @@ class MapOperator(ColumnOperator, ModelOperator):
         self.nodes = list(nodes)
         self.node = self.nodes[0]
         self.ids = np.asarray(ids, dtype=np.int64)
-        self.first = first          # the chain's index of the first map
+        self.first = first
         self._decoder = None
         self.asked = [np.zeros(len(self.ids), dtype=bool) for _ in self.nodes]
         self.slots = np.arange(len(self.ids), dtype=np.int64)[None, :]
         self._results = {}
-        self.finished = []      # (map, document) answers ended since the last take
+        self.finished = []
         tails = []
         for node in self.nodes:
             head, tail = node.spec.prompt_token_parts
@@ -199,8 +198,6 @@ class MapOperator(ColumnOperator, ModelOperator):
     def column_values(self, index, positions) -> tuple:
         tokens = self.decoder.answers(self.first + index, self._slots(index, positions))
         tokenizer = self.state.loaded_model.tokenizer
-        # an answer is the model's text without the whitespace around it:
-        # the first token of a turn starts with a space
         texts = [text.strip() for text in tokenizer.decode_batch(tokens)]
         return (pa.array(texts, pa.string()),)
 

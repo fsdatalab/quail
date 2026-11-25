@@ -42,8 +42,8 @@ def test_a_filter_above_an_ai_filter_or_classification_runs_before_the_model():
 --- SELECT d.id FROM (SELECT r.id, r.stars FROM reviews r WHERE AI_FILTER(PROMPT('kind:
     {0}', r.body))) d WHERE d.stars > 3 ---
 plan
-  __quail_answer_1 = ai_filter('kind: {0}', r.body), filter: __quail_answer_1, returns:
-      []
+  __quail_answer_1 = ai_filter('kind: {0}', r.body), inline_predicate: __quail_answer_1,
+      returns: []
 asked 3 of 3
   'kind: {0}': r0 FALSE, r2 TRUE, r4 TRUE
 rows 2
@@ -53,8 +53,8 @@ rows 2
 --- SELECT d.id, d.t FROM (SELECT r.id, r.stars, AI_CLASSIFY(PROMPT('tone: {0}',
     r.body), ['a', 'b']) AS t FROM reviews r) d WHERE d.stars > 3 ---
 plan
-  t = ai_classify('tone: {0}', r.body, make_array('a', 'b')), guard: r.stars > Int64(3)
-      IS TRUE
+  t = ai_classify('tone: {0}', r.body, make_array('a', 'b')), precondition: r.stars >
+      Int64(3) IS TRUE
 asked 3 of 3
   'tone: {0}': r0 'a', r2 'a', r4 'a'
 rows 3
@@ -82,7 +82,7 @@ def test_an_extraction_tested_with_like_reads_only_documents_with_its_literal():
 --- SELECT l.id, AI_EXTRACT(l.text, {'year': 'When does it end?'}) AS e FROM leases l
     WHERE AI_EXTRACT(l.text, {'year': 'When does it end?'})['year'] LIKE '%2027%' ---
 plan
-  e = ai_extract(l.text, named_struct('year', 'When does it end?')), filter:
+  e = ai_extract(l.text, named_struct('year', 'When does it end?')), inline_predicate:
       get_field(e, 'year') LIKE '%2027%', returns: [e]
 asked 3 of 5
   'When does it end?': c0 '2027', c2 '2027', c4 '2027'
@@ -94,7 +94,7 @@ rows 3
 --- SELECT l.id, AI_EXTRACT(l.text, {'year': 'When does it end?'}) AS e FROM leases l
     WHERE AI_EXTRACT(l.text, {'year': 'When does it end?'})['year'] ILIKE '20_7' ---
 plan
-  e = ai_extract(l.text, named_struct('year', 'When does it end?')), filter:
+  e = ai_extract(l.text, named_struct('year', 'When does it end?')), inline_predicate:
       get_field(e, 'year') ILIKE '20_7', returns: [e]
 asked 4 of 5
   'When does it end?': c0 '2027', c1 '2026', c2 '2027', c4 '2027'

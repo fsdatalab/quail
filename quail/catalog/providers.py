@@ -11,9 +11,6 @@ import pyarrow as pa
 
 from quail.common.expressions import CompileError
 
-# separates a table's name from its alias in the name of a model region's
-# input that holds some of the table's rows, as in reviews@r; a registered
-# table's name has none
 INPUT_SEPARATOR = "@"
 
 
@@ -96,8 +93,6 @@ class ArrowDatasetProvider:
         return self.dataset.schema
 
     def content_identity(self) -> str:
-        # a dataset's rows and their order depend on its filter and
-        # file order as well as its files, so each dataset is its own
         return f"arrow:{id(self.dataset)}"
 
     def statistics(self) -> TableStatistics:
@@ -126,7 +121,6 @@ class HuggingFaceProvider:
     arrow_schema: pa.Schema = field(
         default_factory=lambda: pa.schema([])
     )
-    # a dataset commit hash; empty means the repository's current head
     revision: str = ""
 
     @property

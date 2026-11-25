@@ -24,9 +24,7 @@ rotary, as Qwen3 and Gemma 4 have; qkv_norm_rope_heads is its form
 for any head geometry, with Gemma's weightless per-head V norm.
 """
 
-GROUP = 128            # fp8 quant group size, matches the engine
-# FlashAttention 3's widest head; wider heads run FlashAttention 4,
-# whose Hopper build takes heads up to 512, over arena pages.
+GROUP = 128
 FA_MAX_HEAD_DIM = 256
 TRITON_DECODE_MAX_Q = 16
 _SPLITKV_TILE_N = 32
@@ -117,7 +115,6 @@ def _splitkv_kernels() -> dict:
     import triton
     import triton.language as tl
 
-    # PDL invariant: loads before gdc_wait read only host-staged metadata.
     @triton.jit(
         do_not_specialize=[
             "stride_bt", "max_q", "num_splits", "window_left", "window_right",
@@ -359,19 +356,8 @@ def triton_splitkv_decode(q3, kp, vp, cu_q, max_q, seqused_k, max_seqused_k,
                         num_warps=4, launch_pdl=pdl))
     return out
 
-# The two attention paths a chunk can run. "unified" is one causal
-# paged call in which every row reads the KV its own document needs.
-# "tree" is two calls: a causal one over the chunk's rows and one in
-# which the readers of one resident KV (a join anchor, a shared
-# prefix) read it stacked, merged by the fused merge+quant kernel.
-# Only pipelines that set tree_attention run the tree path.
 ATTENTION_PATHS = ("unified", "tree")
 
-# Which keys a unified chunk's rows read. "causal" reads earlier rows.
-# "document_isolated" serves a bidirectional model: it packs the document
-# as its own sequence, so its KV never reads a question and any number of
-# questions reuse it, and each row reads every row of its sequence, a
-# question reading the document and itself.
 MASKS = ("causal", "document_isolated")
 
 
@@ -466,7 +452,6 @@ class Engine:
         self.fp8 = torch.float8_e4m3fn
         self.is_fp8 = bool(fp8)
 
-    # ---- weights and quant ------------------------------------------
 
     @staticmethod
     def weight_scale(linear):
@@ -757,8 +742,6 @@ class Engine:
         self._gemma_kernel = gemma_add_rms_norm
         return self._gemma_kernel
 
-    # ---- the Triton fused kernels -----------------------------------
-    # Each fuses a sequence of vLLM ops into one kernel launch.
 
     def _triton_kernels(self):
         if hasattr(self, "_kernels"):
@@ -767,7 +750,6 @@ class Engine:
         import triton.language as tl
         from triton.language.extra.cuda import libdevice
 
-        # fuses vLLM's silu_and_mul + per_token_group_quant_fp8
         @triton.jit
         def silu_mul_quant(gu_ptr, q_ptr, s_ptr, stride_gu, stride_q,
                            s_stride_g, s_stride_t,
@@ -792,7 +774,6 @@ class Engine:
             group_index = block * GPB + tl.arange(0, GPB)
             tl.store(s_ptr + group_index * s_stride_g + t * s_stride_t, scale)
 
-        # fuses vLLM's fused_add_rms_norm + per_token_group_quant_fp8
         @triton.jit
         def add_rms_norm_quant(x_ptr, res_ptr, w_ptr, q_ptr, s_ptr,
                                stride_x, stride_res, stride_q,
@@ -828,8 +809,6 @@ class Engine:
             tl.store(s_ptr + group_index * s_stride_g + t * s_stride_t, scale,
                      mask=group_index < NG)
 
-        # fuses vLLM's two per-head rms_norm calls + rotary_emb
-        # (five launches) into one
         @triton.jit
         def qk_norm_rope(qkv_ptr, q_out_ptr, k_out_ptr, cs_ptr, position_ptr,
                          qw_ptr, kw_ptr, stride_qkv, stride_qo, stride_ko,
@@ -878,10 +857,6 @@ class Engine:
             tl.store(k_out_ptr + t * stride_ko + kb_offs,
                      out_b.to(k_out_ptr.dtype.element_ty))
 
-        # the paged-KV append every paged engine has (vLLM:
-        # reshape_and_cache_flash; FlashInfer: append_paged_kv_cache),
-        # with a fused source-side gather: only selected rows of the
-        # packed chunk are written, from arbitrary positions
         @triton.jit
         def kv_row_scatter(k_src_ptr, v_src_ptr, k_dst_ptr, v_dst_ptr,
                            src_rows_ptr, dst_rows_ptr,
@@ -896,9 +871,6 @@ class Engine:
             v = tl.load(v_src_ptr + s * ROW + offs, mask=mask)
             tl.store(v_dst_ptr + d * ROW + offs, v, mask=mask)
 
-        # the online-softmax LSE merge (Milakov & Gimelshein 2018)
-        # fused with vLLM's per-group fp8 quantize pattern; with QUANT
-        # off it stores the bf16 merge and no scales
         @triton.jit
         def merge_attn_quant(a_ptr, b_ptr, la_ptr, lb_ptr, source_ptr,
                              q_ptr, s_ptr,
@@ -947,8 +919,6 @@ class Engine:
                 tl.store(q_ptr + t * stride_q_t + h0 * D + offs,
                          tl.reshape(y, (D * GPB,)).to(q_ptr.dtype.element_ty))
 
-        # gelu_tanh_and_mul fused with the per-row fp8 quantization the
-        # next linear would run on its output
         @triton.jit
         def gelu_mul_quant(gu_ptr, q_ptr, s_ptr, stride_gu, stride_q,
                            HALF: tl.constexpr, BLOCK: tl.constexpr,
@@ -961,7 +931,6 @@ class Engine:
             up = tl.load(gu_ptr + t * stride_gu + HALF + offs, mask=mask,
                          other=0.0).to(tl.float32)
             if match_vllm_rounding:
-                # vLLM rounds GELU to BF16 before the gating multiplication.
                 cube = gate * gate * gate
                 inner = 0.7978845608028654 * (gate + 0.044715 * cube)
                 activated = (0.5 * gate * (1.0 + libdevice.tanh(inner)))
@@ -970,7 +939,6 @@ class Engine:
                 inner = 0.7978845608028654 * (gate + 0.044715 * gate * gate * gate)
                 th = 1.0 - 2.0 / (tl.exp(2.0 * inner) + 1.0)
                 y = 0.5 * gate * (1.0 + th) * up
-            # the unfused path rounds the activation to bf16 first
             y = y.to(tl.bfloat16).to(tl.float32)
             amax = tl.max(tl.abs(y), axis=0)
             if match_vllm_rounding:
@@ -985,9 +953,6 @@ class Engine:
                      q.to(q_ptr.dtype.element_ty), mask=mask)
             tl.store(s_ptr + t, scale)
 
-        # vLLM's rms_norm_dynamic_per_token_quant with a residual,
-        # with the residual scaled first: residual = residual * scale
-        # + x, then the row norm quantized per row
         @triton.jit
         def scale_add_rms_norm_quant(x_ptr, res_ptr, w_ptr, q_ptr, s_ptr,
                                      stride_x, stride_res, stride_q,
@@ -1014,13 +979,11 @@ class Engine:
                      q.to(q_ptr.dtype.element_ty), mask=mask)
             tl.store(s_ptr + t, qscale)
 
-        # one read of a row for two RMS norms with different weights
         @triton.jit
         def rms_norm2(x_ptr, w1_ptr, w2_ptr, o1_ptr, o2_ptr, s_ptr, stride_x,
                       stride_o1, stride_o2, eps, H: tl.constexpr,
                       BLOCK: tl.constexpr, output_fp8: tl.constexpr):
             t = tl.program_id(0)
-            # Keep the BF16 reduction order when one output becomes FP8.
             offs = tl.max_contiguous(tl.arange(0, BLOCK), 8)
             mask = offs < H
             x = tl.load(x_ptr + t * stride_x + offs, mask=mask,
@@ -1031,7 +994,6 @@ class Engine:
             w2 = tl.load(w2_ptr + offs, mask=mask, other=0.0).to(tl.float32)
             first = (xn * w1).to(x_ptr.dtype.element_ty)
             if output_fp8:
-                # Preserve the BF16 intermediate's rounding before quantizing.
                 first = first.to(tl.float32)
                 scale = tl.maximum(tl.div_rn(tl.max(tl.abs(first), axis=0),
                                              448.0),
@@ -1044,8 +1006,6 @@ class Engine:
             tl.store(o2_ptr + t * stride_o2 + offs,
                      (xn * w2).to(o2_ptr.dtype.element_ty), mask=mask)
 
-        # qk_norm_rope plus the weightless per-head v norm Gemma
-        # applies, written contiguous for the KV scatter
         @triton.jit
         def qkv_norm_rope(qkv_ptr, q_out_ptr, k_out_ptr, v_out_ptr, cs_ptr,
                           position_ptr, qw_ptr, kw_ptr, stride_qkv, stride_qo,
@@ -1127,8 +1087,6 @@ class Engine:
             HD=self.head_dim, HALF=self.head_dim // 2)
         return q, k
 
-    # ---- the vLLM-kernel path (kernels="vllm") ----------------------
-    # The same ops the engine's compiled graph runs, called eagerly.
 
     def vllm_norm_quant(self, hidden, norm, residual):
         """fused-add rms_norm, then a separate quantize.
@@ -1232,7 +1190,6 @@ class Engine:
             D=dim, GPB=gpb, UE8M0=self.use_ue8m0, QUANT=self.is_fp8)
         return q, scales
 
-    # ---- the primitives a forward loop calls -------------------------
 
     def norm_quant(self, hidden, norm, residual=None):
         """RMS-normed, quantized GEMM input; adds the residual first when given."""
@@ -1274,15 +1231,10 @@ class Engine:
         return self.quant(self.attention_unified(
             q3, k3, v3, chunk.meta, output=target), output=output)
 
-    # ---- attention: the two workload paths --------------------------
-
 
     def _fa(self, q, k, v, cu_q, cu_k, max_q, max_k, causal,
             block_table=None, seqused_k=None, softmax_scale=None,
             window=None, version=None, output=None):
-        # LSE comes back as [heads, total_queries] for the merge kernel.
-        # Blackwell's head-256 FA4 kernel rejects the SplitKV that
-        # num_splits=0 can select.
         from vllm.vllm_flash_attn import flash_attn_varlen_func
         version = version or self.fa_version
         extra = {}
@@ -1296,7 +1248,6 @@ class Engine:
         if version == 4 and shape is not None and shape[-1] == 256:
             extra["num_splits"] = 1
             if block_table is not None:
-                # FA4 requires the table capacity; seqused_k masks padding.
                 max_k = block_table.shape[1] * k.shape[1]
         return flash_attn_varlen_func(
             q, k, v, max_seqlen_q=max_q, cu_seqlens_q=cu_q,
@@ -1313,7 +1264,6 @@ class Engine:
 
         if not hasattr(self, "_flashinfer_plans"):
             self._flashinfer_plans = {}
-            # Head-512 split-KV plans exceed the usual 128 MiB workspace.
             self._flashinfer_workspace = self.torch.empty(
                 256 * 1024 * 1024, dtype=self.torch.uint8, device=q3.device)
         key = (causal, softmax_scale, window, q3.shape[1:], kp.shape[1:],
@@ -1336,7 +1286,6 @@ class Engine:
                 causal=causal, sm_scale=softmax_scale,
                 window_left=-1 if window is None else window[0],
                 q_data_type=q3.dtype, kv_data_type=kp.dtype)
-            # FlashInfer rewrites pinned host memory before its asynchronous upload.
             uploaded.synchronize()
             wrapper.plan(
                 self.torch.as_tensor(metadata["cu_q_host"], dtype=self.torch.int32),
@@ -1424,8 +1373,6 @@ class Engine:
             block_table=reads["table"], seqused_k=reads["used"])
         nodes = reads.get("nodes")
         if nodes is not None:
-            # call C: path rows over their ancestor rows in earlier
-            # paths of the chunk, merged into their call B result
             out_c, lse_c = self._fa(
                 q3.index_select(0, nodes["rows"]),
                 k3.index_select(0, nodes["key_rows"]),

@@ -1,6 +1,3 @@
-//! A Rust program runs a query through Quail's Python executor, with
-//! the model answered by the test oracle in `tests/helpers/oracle.py`.
-
 use std::sync::Arc;
 
 use datafusion::arrow::array::{RecordBatch, StringArray};
@@ -10,8 +7,6 @@ use datafusion::datasource::MemTable;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
-/// An engine on the test configuration whose model keeps reviews r0, r2,
-/// and r3 for the question `q1:`.
 const ENGINE: &std::ffi::CStr = c"
 from helpers.oracle import Oracle, oracle_executor
 from helpers.sessions import CONFIG, TOKENIZER

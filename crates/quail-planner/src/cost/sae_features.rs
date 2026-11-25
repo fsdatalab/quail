@@ -1,14 +1,11 @@
-//! Work and time of an `AI.SAE_FEATURES` call.
-
-use crate::cost::budgets::parallel_copies;
-use crate::cost::quantity::Quantity;
+use crate::budgets::parallel_copies;
 use crate::cost::score::{python_min, score_work};
 use crate::cost::sol::speed_of_light;
-use crate::cost::specs::{DeviceSpec, ModelSpec};
 use crate::cost::statistics::AliasStats;
+use crate::cost::work::Quantity;
 use crate::cost::work::Work;
+use crate::specs::{DeviceSpec, ModelSpec};
 
-/// Encoded rows, including a shared max hook in a mixed pipeline.
 pub fn sae_encoded_tokens(
     pooling: &str,
     expected_rows: f64,
@@ -26,10 +23,8 @@ pub fn sae_encoded_tokens(
     })
 }
 
-/// Prepared inputs for one feature call's cost at any count.
 #[derive(Debug, Clone)]
 pub struct SaeFeaturesCost {
-    /// Token counts of the head and the question tail.
     pub token_lengths: Vec<i64>,
     pub summary: AliasStats,
     pub pooling: String,
@@ -41,7 +36,6 @@ pub struct SaeFeaturesCost {
 }
 
 impl SaeFeaturesCost {
-    /// Model work and seconds for the expected documents.
     pub fn estimate(&self, expected_rows: f64, resident: bool) -> (Work, f64) {
         let fixed: i64 = self.token_lengths.iter().sum();
         let mean = self.summary.mean();

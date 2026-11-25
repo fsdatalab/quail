@@ -24,13 +24,10 @@ def _kernels() -> dict:
     import triton
     import triton.language as tl
 
-    # a row count is not specialized, so each chunk size reuses one
-    # compiled kernel
     @triton.jit(do_not_specialize=["rows"])
     def gated_conv(proj_ptr, taps_ptr, starts_ptr, out_ptr, rows, stride_proj,
                    stride_out, C: tl.constexpr, WIDTH: tl.constexpr,
                    BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr):
-        # proj holds [B | C | x] per row; out = C * conv(B * x)
         row_block = tl.program_id(0)
         channel_block = tl.program_id(1)
         t = row_block * BLOCK_T + tl.arange(0, BLOCK_T)
@@ -67,7 +64,6 @@ def _kernels() -> dict:
         x = tl.load(x_ptr + row * stride_x + offs, mask=mask,
                     other=0.0).to(tl.float32)
         weight = tl.load(post_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-        # as vLLM's rms_norm: the scaled row is rounded before the weight
         scaled = x * tl.math.rsqrt(tl.sum(x * x, axis=0) / H + eps)
         normed = (scaled.to(tl.bfloat16).to(tl.float32) * weight).to(tl.bfloat16)
         hidden = tl.load(hidden_ptr + row * stride_hidden + offs, mask=mask,

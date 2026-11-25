@@ -52,7 +52,6 @@ class FP8Experts:
 
         torch = self.engine.torch
         method = self.weights.quant_method
-        # Gemma's router reads logits, not the quantized hidden states.
         top_weights, top_ids = self.module.router.select_experts(
             hidden_states=inputs, router_logits=logits,
             topk_indices_dtype=method.topk_indices_dtype)

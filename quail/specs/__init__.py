@@ -21,7 +21,6 @@ from .qwen3 import qwen3_spec
 
 MODELS = read_models()
 DEVICES = read_devices()
-# hourly rental price of one device, keyed by device name
 MODAL_GPU_USD_PER_HOUR = {
     name: device.usd_per_hour for name, device in DEVICES.items()}
 

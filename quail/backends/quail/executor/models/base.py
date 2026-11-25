@@ -62,16 +62,10 @@ class ModelPipeline:
     masks = ("causal",)
     tree_attention = True
     gemm_warmup = True
-    warm_row_classes = True    # row-count classes keep one KV row per reader
-    warm_joins = True          # join and classification chunks borrow prefixes
+    warm_row_classes = True
+    warm_joins = True
     piecewise_graphs = None
-    # every request runs as one unpaged sequence, its document and its
-    # questions together, with no KV kept or borrowed (set attention)
     whole_sequences = False
-    # For a spec with an SAE, forward_chunk returns the residual stream
-    # after the last loaded layer instead of the final-normed rows, and
-    # forward_hook, when a query sets it, is called with (stream, chunk)
-    # over every row of each chunk before the final_indices select.
     forward_hook = None
 
     def forward_chunk(self, chunk):
@@ -95,10 +89,6 @@ class ModelPipeline:
         """Return the context a forward pass, or a captured piece, runs under."""
         return nullcontext()
 
-    # A family whose specs get CUDA graph sizes (graph_token_buckets)
-    # splits its forward pass at its token mixers (executor/cuda_graphs.py):
-    # piece 0 runs up to layer 0's mixer, piece i from layer i - 1's mixer
-    # to layer i's, and the last piece writes the final-normed rows.
 
     def boundary(self, num_tokens, device) -> dict:
         """Row-major tensors the pieces and mixers pass to each other."""

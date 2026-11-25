@@ -1,13 +1,3 @@
-//! `value['field']` on a struct in the Snowflake dialect.
-//!
-//! sqlparser reads a bracket after a value in Snowflake SQL, such as
-//! `AI.EXTRACT(c.text, {...})['ends']`, as Snowflake's path access into
-//! a semi-structured value, and DataFusion's SQL planner hands it to
-//! each `ExprPlanner` as the `:` operator between the value and the path
-//! as text. [`StructFieldAccess`] plans it as `get_field` when the value
-//! is a struct or a map, as the bracket means in DataFusion's own
-//! dialect; any other value is left to the next planner.
-
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{DFSchema, Result, ScalarValue};
 use datafusion::functions::core::expr_fn::get_field;
@@ -15,8 +5,6 @@ use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawBinaryExp
 use datafusion::logical_expr::{Expr, ExprSchemable};
 use sqlparser::ast::BinaryOperator;
 
-/// Plans Snowflake's `value['field']['inner']` on a struct as nested
-/// `get_field` calls.
 #[derive(Debug, Default)]
 pub struct StructFieldAccess;
 
@@ -48,9 +36,6 @@ impl ExprPlanner for StructFieldAccess {
     }
 }
 
-/// The keys of a path written as single-quoted brackets, such as
-/// `['ends']['start']`, or None for any other path, such as `[0]`,
-/// `["ends"]`, or `ends.start`, which the next planner reads.
 fn path_keys(path: &str) -> Option<Vec<String>> {
     let mut keys = Vec::new();
     let mut rest = path;

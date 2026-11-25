@@ -1,5 +1,3 @@
-//! The Rust cost model, exposed to Python for tests.
-
 use quail_planner::constants::WORK_FIELDS;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -10,14 +8,11 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use quail_planner::cost::classify::{self, ClassifyInputs};
 use quail_planner::cost::extract::{self, ExtractInputs};
-use quail_planner::cost::labels;
-use quail_planner::cost::quantity::{Quantity, numpy_sum};
-use quail_planner::cost::specs::{DeviceSpec, ModelSpec, read_devices, read_models};
 use quail_planner::cost::statistics::AliasStats;
-use quail_planner::cost::work::Work;
+use quail_planner::cost::work::{Quantity, Work, numpy_sum};
 use quail_planner::cost::{packing, sol};
+use quail_planner::specs::{DeviceSpec, ModelSpec, read_devices, read_models};
 
-/// A number, or a list of numbers, from Python.
 fn quantity(value: &Bound<'_, PyAny>) -> PyResult<Quantity> {
     if let Ok(number) = value.extract::<f64>() {
         return Ok(Quantity::Scalar(number));
@@ -32,7 +27,6 @@ fn to_python<'py>(py: Python<'py>, value: &Quantity) -> PyResult<Bound<'py, PyAn
     }
 }
 
-/// Read nodes, fed nodes, and each label's decode round tokens.
 type LabelNodes = (Vec<Vec<i64>>, Vec<Vec<i64>>, Vec<Vec<i64>>);
 
 fn work_from(fields: &Bound<'_, PyDict>) -> PyResult<Work> {
@@ -75,7 +69,6 @@ fn work_to<'py>(py: Python<'py>, work: &Work) -> PyResult<Bound<'py, PyDict>> {
     Ok(fields)
 }
 
-/// The Rust cost model over the specs in one directory.
 #[pyclass(name = "CostModel", module = "_quail_native")]
 pub struct CostModel {
     models: BTreeMap<String, ModelSpec>,
@@ -98,35 +91,30 @@ impl CostModel {
 
 #[pymethods]
 impl CostModel {
-    /// Read the model and device specs under `data`.
     #[new]
     fn new(data: &str) -> PyResult<Self> {
         let data = Path::new(data);
-        let error = |error: quail_planner::cost::specs::SpecError| PyValueError::new_err(error.0);
+        let error = |error: quail_planner::specs::SpecError| PyValueError::new_err(error.0);
         Ok(Self {
             models: read_models(&data.join("models")).map_err(error)?,
             devices: read_devices(&data.join("devices")).map_err(error)?,
         })
     }
 
-    /// The names of the models read.
     fn model_names(&self) -> Vec<String> {
         self.models.keys().cloned().collect()
     }
 
-    /// The names of the devices read.
     fn device_names(&self) -> Vec<String> {
         self.devices.keys().cloned().collect()
     }
 
-    /// One device's GEMM rate for a precision.
     fn gemm_flops(&self, device: &str, precision: &str) -> PyResult<f64> {
         let precision = serde_json::from_value(serde_json::json!(precision))
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
         Ok(self.device(device)?.gemm_flops(precision))
     }
 
-    /// `sol::unrounded_seconds`.
     fn unrounded_seconds(
         &self,
         work: &Bound<'_, PyDict>,
@@ -145,8 +133,6 @@ impl CostModel {
         ))
     }
 
-    /// `summarize_alias`: the summary's fields, from an int64 buffer of
-    /// document token lengths.
     #[staticmethod]
     fn summarize_alias<'py>(
         py: Python<'py>,
@@ -165,7 +151,6 @@ impl CostModel {
         Ok(fields)
     }
 
-    /// `packing::choose_pass_groups`; raises ValueError on its error.
     #[allow(clippy::too_many_arguments)]
     fn choose_pass_groups(
         &self,
@@ -195,13 +180,11 @@ impl CostModel {
         .map_err(PyValueError::new_err)
     }
 
-    /// The label trie helpers: the read nodes, the fed nodes, and the
-    /// decode round tokens, as sorted lists.
     #[staticmethod]
     fn label_nodes(labels: Vec<Vec<i64>>) -> PyResult<LabelNodes> {
-        let read = labels::read_nodes(&labels).map_err(PyValueError::new_err)?;
-        let fed = labels::fed_nodes(&read);
-        let rounds = labels::decode_round_tokens(&labels).map_err(PyValueError::new_err)?;
+        let read = classify::read_nodes(&labels).map_err(PyValueError::new_err)?;
+        let fed = classify::fed_nodes(&read);
+        let rounds = classify::decode_round_tokens(&labels).map_err(PyValueError::new_err)?;
         Ok((
             read.into_iter().collect(),
             fed.into_iter().collect(),
@@ -209,8 +192,6 @@ impl CostModel {
         ))
     }
 
-    /// `classify::estimate`: seconds, passes, the work's
-    /// fields, suffix tokens, and rounds.
     #[allow(clippy::too_many_arguments)]
     fn classify_estimate<'py>(
         &self,
@@ -252,8 +233,6 @@ impl CostModel {
         ))
     }
 
-    /// `extract::estimate`: seconds, passes, the work's
-    /// fields, suffix tokens, and rows.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (expected_rows, lengths, shared, head_tokens, tail_tokens, chunk, model, device, resident, max_answer_tokens, draft_tokens, draft_policy, round_cost_per_token, gpus, answer_tokens))]
     fn extract_estimate<'py>(
@@ -307,8 +286,6 @@ impl CostModel {
         ))
     }
 
-    /// `extract::document_work`: each document's work fields, fed
-    /// tokens, and readout rows.
     #[allow(clippy::too_many_arguments)]
     #[staticmethod]
     #[pyo3(signature = (lengths, shared, head_tokens, tail_tokens, window, resident, max_answer_tokens, draft_tokens, draft_policy, round_cost_per_token, answer_tokens, recurrent))]
@@ -346,8 +323,6 @@ impl CostModel {
             .collect()
     }
 
-    /// `extract::table_work`: the table's work fields, fed tokens, and
-    /// readout rows.
     #[allow(clippy::too_many_arguments)]
     #[staticmethod]
     #[pyo3(signature = (lengths, shared, head_tokens, tail_tokens, window, resident, max_answer_tokens, draft_tokens, draft_policy, round_cost_per_token, answer_tokens, recurrent))]
@@ -383,21 +358,16 @@ impl CostModel {
         Ok((work_to(py, &work)?, fed, rows))
     }
 
-    /// `extract::survival`: the chance an answer of mean `answer_tokens`
-    /// has more than `tokens` tokens after its first.
     #[staticmethod]
     fn extract_survival(answer_tokens: i64, tokens: f64) -> f64 {
         extract::survival(answer_tokens, tokens)
     }
 
-    /// `extract::expected_rounds` with `draft_tokens` per round after
-    /// the chosen token.
     #[staticmethod]
     fn extract_rounds(answer_tokens: i64, max_answer_tokens: i64, draft_tokens: i64) -> f64 {
         extract::expected_rounds(answer_tokens, max_answer_tokens, 1 + draft_tokens)
     }
 
-    /// `float(np.sum(values))`, as the Rust port rounds it.
     #[staticmethod]
     fn numpy_sum(values: Vec<f64>) -> f64 {
         numpy_sum(&values)

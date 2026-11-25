@@ -28,8 +28,6 @@ class Qwen3Pipeline(ModelPipeline):
             arena, num_q_heads=attn.num_heads, num_kv_heads=attn.num_kv_heads,
             head_dim=attn.head_dim, rotary=attn.rotary_emb,
             fp8=fp8, kernels=kernels)
-        # The fused kernels compute element offsets in 32-bit ints,
-        # so a chunk needs rows x widest_row < 2^31.
         widest = max(max(layer.self_attn.qkv_proj.weight.shape[0],
                          layer.mlp.gate_up_proj.weight.shape[0])
                      for layer in self.layers)
@@ -37,7 +35,6 @@ class Qwen3Pipeline(ModelPipeline):
         self.tree_attention = spec is None or tree_attention_allowed(spec)
 
     def linears(self):
-        # every layer has the same four shapes
         layer = self.layers[0]
         return (layer.self_attn.qkv_proj, layer.self_attn.o_proj,
                 layer.mlp.gate_up_proj, layer.mlp.down_proj)

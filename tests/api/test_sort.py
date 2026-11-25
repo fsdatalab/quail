@@ -88,8 +88,8 @@ def test_a_sorted_limit_keeps_the_order_when_an_extraction_finishes_early():
 --- SELECT r.id, AI.EXTRACT(r.body, {'w': 'Which word?'})['w'] AS w FROM r ORDER BY r.id
     LIMIT 5 ---
 plan
-  __quail_call_1 = ai_extract(r.column_1, named_struct('w', 'Which word?')), fetch: 5,
-      returns: [__quail_call_1]
+  __quail_call_1 = ai_extract(r.column_1, named_struct('w', 'Which word?')), row_limit:
+      5, returns: [__quail_call_1]
 asked 5 of 6
   'Which word?': r0 'w0', r1 'w1', r2 'w2', r3 NULL, r4 'w4'
 rows 5, in order
@@ -102,8 +102,8 @@ rows 5, in order
 --- SELECT r.id, AI.EXTRACT(r.body, {'w': 'Which word?'})['w'] AS w FROM r ORDER BY r.id
     LIMIT 100 OFFSET 3 ---
 plan
-  __quail_call_1 = ai_extract(r.column_1, named_struct('w', 'Which word?')), fetch: 103,
-      returns: [__quail_call_1]
+  __quail_call_1 = ai_extract(r.column_1, named_struct('w', 'Which word?')), row_limit:
+      103, returns: [__quail_call_1]
 asked 6 of 6
   'Which word?': r0 'w0', r1 'w1', r2 'w2', r3 NULL, r4 'w4', r5 'w5'
 rows 3, in order

@@ -1,8 +1,5 @@
-//! Errors shared by the planner, DataFusion integration, and Python boundary.
-
 use std::fmt;
 
-/// A malformed query, unsupported region, or plan the configuration cannot run.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompileError {
     message: String,
@@ -10,17 +7,13 @@ pub struct CompileError {
     kind: ErrorKind,
 }
 
-/// What a [`CompileError`] refuses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
-    /// A query Quail cannot answer as written.
     Invalid,
-    /// A region shape DataFusion runs around a smaller model region instead.
     Unsupported,
 }
 
 impl CompileError {
-    /// An error with the message and no refusal.
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -29,7 +22,6 @@ impl CompileError {
         }
     }
 
-    /// A region shape DataFusion must run, with a concrete reason.
     pub fn unsupported(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -38,8 +30,6 @@ impl CompileError {
         }
     }
 
-    /// An error carrying a refusal; its message is the first reason, or the
-    /// constraint when no reasons were supplied.
     pub fn refused(refusal: Refusal) -> Self {
         Self {
             message: refusal
@@ -56,21 +46,22 @@ impl CompileError {
         &self.message
     }
 
-    pub fn refusal(&self) -> Option<&Refusal> {
-        self.refusal.as_deref()
+    pub fn into_refusal(self) -> Result<Refusal, CompileError> {
+        match self.refusal {
+            Some(refusal) => Ok(*refusal),
+            None => Err(self),
+        }
     }
 
     pub fn kind(&self) -> ErrorKind {
         self.kind
     }
 
-    /// Whether the error refuses a region shape DataFusion can run.
     pub fn is_unsupported(&self) -> bool {
         self.kind == ErrorKind::Unsupported
     }
 }
 
-/// A plan the configuration cannot run within its limits.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Refusal {
     pub reasons: Vec<String>,
@@ -81,7 +72,6 @@ pub struct Refusal {
 }
 
 impl Refusal {
-    /// A refusal with one reason.
     pub fn new(
         reason: impl Into<String>,
         constraint: &str,
@@ -107,7 +97,6 @@ impl fmt::Display for CompileError {
 
 impl std::error::Error for CompileError {}
 
-/// Return a `CompileError` with the message.
 pub fn compile_error<T>(message: impl Into<String>) -> Result<T, CompileError> {
     Err(CompileError::new(message))
 }
@@ -122,8 +111,8 @@ mod tests {
         refusal.reasons.clear();
         let error = CompileError::refused(refusal.clone());
         assert_eq!(error.message(), "memory");
-        assert_eq!(error.refusal(), Some(&refusal));
         assert_eq!(error.kind(), ErrorKind::Invalid);
+        assert_eq!(error.into_refusal(), Ok(refusal));
     }
 
     #[test]

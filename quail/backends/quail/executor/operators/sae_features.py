@@ -86,8 +86,8 @@ class SaeFeaturesOperator(ColumnOperator, SingleNodeOperator):
         self.node = node
         self.ids = list(ids)
         self.values = [None] * len(self.ids)
-        self.pending = {}        # anchor -> settled handle not yet read
-        self.harvested = []      # (anchors, feature-list array)
+        self.pending = {}
+        self.harvested = []
         self.reached = 0
         torch = state.torch
         encoder = sae_encoder(state)
@@ -115,8 +115,6 @@ class SaeFeaturesOperator(ColumnOperator, SingleNodeOperator):
                 self.reached += 1
                 return True
         else:
-            # the packed readout row (indices, then strengths) stays a
-            # view; every row unpacks at once in result()
             def decide(anchor, row):
                 if self.accumulator is not None:
                     self.accumulator.settle(keys[anchor], collect=False)
@@ -125,7 +123,6 @@ class SaeFeaturesOperator(ColumnOperator, SingleNodeOperator):
                 return True
 
         self.stages = [Stage(
-            # A reused frame has KV but no residual rows for this call's maxima.
             suffixes=[list(tail)], readout=(SaeMaxReadout(torch)
                 if spec.pooling == "max" else SaeFeaturesReadout(torch, encoder)),
             decide=decide, single=True,

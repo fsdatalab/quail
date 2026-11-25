@@ -1,7 +1,3 @@
-//! Reading and checking the expressions of a region's operators: the
-//! columns they read, their names and text, and the model calls they
-//! hold. DataFusion evaluates the values and conditions.
-
 use crate::constants::SPAN_SUFFIX;
 use crate::error::{CompileError, compile_error};
 use crate::physical::{
@@ -13,12 +9,7 @@ pub const DESCRIPTION_WORDS: usize = 25;
 pub const SCORE_COMPARISONS: [&str; 4] = ["<", "<=", ">", ">="];
 pub const MODEL_CALL_KINDS: [&str; 6] = ["boolean", "score", "label", "extract", "features", "map"];
 pub const SAE_POOLINGS: [&str; 2] = ["last", "max"];
-// ---------------------------------------------------------------- Python text
 
-/// Python's `repr` of a string.
-/// Whether Python's `str.isprintable` holds for `c`: not a control,
-/// format, private use, line or paragraph separator, or space separator
-/// other than the ASCII space. Unassigned code points count as printable.
 fn python_printable(c: char) -> bool {
     let code = c as u32;
     let space_separator = matches!(
@@ -91,7 +82,6 @@ pub fn repr_str(text: &str) -> String {
     out
 }
 
-/// Python's `repr` of a float.
 pub fn repr_float(value: f64) -> String {
     if value.is_nan() {
         return "nan".to_string();
@@ -130,7 +120,6 @@ pub fn repr_float(value: f64) -> String {
     }
 }
 
-/// Python's `repr` of a literal: a JSON array stands for a tuple.
 pub fn repr_value(value: &Value) -> String {
     match value {
         Value::Null => "None".to_string(),
@@ -156,15 +145,11 @@ pub fn repr_value(value: &Value) -> String {
     }
 }
 
-/// Python's `repr` of a list of strings.
 pub fn repr_list(items: &[String]) -> String {
     let parts: Vec<String> = items.iter().map(|item| repr_str(item)).collect();
     format!("[{}]", parts.join(", "))
 }
 
-// ---------------------------------------------------------------- columns
-
-/// The source columns a value expression reads, in first use order.
 pub fn column_references(expression: &ValueExpression) -> Vec<ColumnRef> {
     let mut found = Vec::new();
     collect_references(expression, &mut found);
@@ -191,16 +176,10 @@ fn collect_references(expression: &ValueExpression, found: &mut Vec<ColumnRef>) 
     }
 }
 
-/// The name of a column reference, with its table alias when it has one.
 pub fn reference_name(reference: &ColumnRef, qualified: bool) -> String {
     reference.name(qualified)
 }
 
-/// The name of a source, computed, or projected column, as `column_name`.
-///
-/// # Panics
-///
-/// The expression is a bare model call, which has no name.
 pub fn column_name(expression: &ValueExpression, qualified: bool) -> String {
     match expression {
         ValueExpression::ColumnRef(reference) => reference_name(reference, qualified),
@@ -213,7 +192,6 @@ pub fn column_name(expression: &ValueExpression, qualified: bool) -> String {
     }
 }
 
-/// The name of a projected column.
 pub fn projected_name(column: &Projected) -> String {
     match column {
         Projected::Name(name) => name.clone(),
@@ -221,7 +199,6 @@ pub fn projected_name(column: &Projected) -> String {
     }
 }
 
-/// The model call an Alias projects, if any and of one of `kinds`.
 pub fn aliased_call<'a>(expression: &'a ValueExpression, kinds: &[&str]) -> Option<&'a ModelCall> {
     let ValueExpression::Alias(alias) = expression else {
         return None;
@@ -232,7 +209,6 @@ pub fn aliased_call<'a>(expression: &'a ValueExpression, kinds: &[&str]) -> Opti
     (kinds.is_empty() || kinds.contains(&call.kind.as_str())).then_some(call)
 }
 
-/// The aliased call of a projected column.
 pub fn projected_call<'a>(column: &'a Projected, kinds: &[&str]) -> Option<&'a ModelCall> {
     match column {
         Projected::Expression(expression) => aliased_call(expression, kinds),
@@ -240,7 +216,6 @@ pub fn projected_call<'a>(column: &'a Projected, kinds: &[&str]) -> Option<&'a M
     }
 }
 
-/// The table a prompt argument reads, as the argument's `alias` property.
 pub fn argument_alias(argument: &ValueExpression) -> String {
     match argument {
         ValueExpression::ColumnRef(reference) => reference.alias.clone(),
@@ -252,7 +227,6 @@ pub fn argument_alias(argument: &ValueExpression) -> String {
     }
 }
 
-/// The table aliases a model call's prompt reads, in placeholder order.
 pub fn call_aliases(call: &ModelCall) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
     for argument in &call.prompt.args {
@@ -264,7 +238,6 @@ pub fn call_aliases(call: &ModelCall) -> Vec<String> {
     found
 }
 
-/// The predicate of an AI filter or AI join as a model call.
 pub fn asked_call(asked: &Asked) -> &ModelCall {
     match asked {
         Asked::Call(call) => call,
@@ -272,8 +245,6 @@ pub fn asked_call(asked: &Asked) -> &ModelCall {
     }
 }
 
-/// Every struct column of a SELECT list and its member columns: the
-/// answers, and the spans of each struct named in `spans`.
 pub fn packing(
     structs: &[ExtractStruct],
     spans: &[String],
@@ -304,7 +275,6 @@ pub fn packing(
     found
 }
 
-/// The one table alias a value expression of an equality reads.
 pub fn column_alias_of(expression: &ValueExpression) -> String {
     column_references(expression)
         .into_iter()
@@ -313,7 +283,6 @@ pub fn column_alias_of(expression: &ValueExpression) -> String {
         .unwrap_or_default()
 }
 
-/// The text of an equality, as `str(Equality)`.
 pub fn equality_text(equality: &Equality) -> String {
     format!(
         "{} = {}",
@@ -330,8 +299,6 @@ fn push_unique(found: &mut Vec<ColumnRef>, references: Vec<ColumnRef>) {
     }
 }
 
-/// The columns a value expression reads, through a model call's prompt,
-/// in first use order.
 pub fn value_refs(expression: &ValueExpression) -> Vec<ColumnRef> {
     match expression {
         ValueExpression::ModelCall(call) => call_refs(call),
@@ -343,7 +310,6 @@ pub fn value_refs(expression: &ValueExpression) -> Vec<ColumnRef> {
     }
 }
 
-/// The columns a model call's prompt reads, in first use order.
 pub fn call_refs(call: &ModelCall) -> Vec<ColumnRef> {
     let mut found = Vec::new();
     for argument in &call.prompt.args {
@@ -352,7 +318,6 @@ pub fn call_refs(call: &ModelCall) -> Vec<ColumnRef> {
     found
 }
 
-/// The columns an AI predicate reads, in first use order.
 pub fn asked_refs(asked: &Asked) -> Vec<ColumnRef> {
     match asked {
         Asked::Call(call) => call_refs(call),
@@ -360,17 +325,12 @@ pub fn asked_refs(asked: &Asked) -> Vec<ColumnRef> {
     }
 }
 
-/// The columns a join equality reads, in first use order.
 pub fn equality_refs(equality: &Equality) -> Vec<ColumnRef> {
     let mut found = value_refs(&equality.left);
     push_unique(&mut found, value_refs(&equality.right));
     found
 }
 
-// ---------------------------------------------------------------- conditions
-
-/// The unqualified names of the columns a condition reads, in first
-/// use order.
 pub fn condition_columns(condition: &ValueExpression) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
     for reference in column_references(condition) {
@@ -381,14 +341,10 @@ pub fn condition_columns(condition: &ValueExpression) -> Vec<String> {
     found
 }
 
-/// The text of a condition, each column named with its table alias.
 pub fn condition_text(condition: &ValueExpression) -> String {
     column_name(condition, true)
 }
 
-// ---------------------------------------------------------------- text
-
-/// The text of an expression in a message, as Python's `_explain`.
 pub fn explain(expression: &ValueExpression) -> String {
     match expression {
         ValueExpression::Alias(alias) => match aliased_call(expression, &[]) {
@@ -403,7 +359,6 @@ pub fn explain(expression: &ValueExpression) -> String {
     }
 }
 
-/// The text of a model call in a message.
 pub fn explain_call(call: &ModelCall) -> String {
     let template = repr_str(&call.prompt.template);
     match call.kind.as_str() {
@@ -432,8 +387,6 @@ fn repr_json_list(value: &Value) -> String {
     }
 }
 
-// ---------------------------------------------------------------- checks
-
 fn strings(value: &Value) -> Vec<Value> {
     match value {
         Value::Array(items) => items.clone(),
@@ -445,7 +398,6 @@ fn non_empty(value: &Value) -> bool {
     !strings(value).is_empty()
 }
 
-/// Check an AI.CLASSIFY label list and its descriptions.
 pub fn validate_labels(labels: &Value, descriptions: &Value) -> Result<(), CompileError> {
     let labels = strings(labels);
     let descriptions = strings(descriptions);
@@ -483,7 +435,6 @@ pub fn validate_labels(labels: &Value, descriptions: &Value) -> Result<(), Compi
     Ok(())
 }
 
-/// Check a model call's kind and the fields that kind takes.
 pub fn validate_call(call: &ModelCall) -> Result<(), CompileError> {
     let kind = call.kind.as_str();
     if !MODEL_CALL_KINDS.contains(&kind) {
@@ -524,8 +475,6 @@ pub fn validate_call(call: &ModelCall) -> Result<(), CompileError> {
     }
 }
 
-/// Check an `AI.SCORE` comparison: its call, its comparison, and its
-/// threshold, which lies between 0 and 1.
 pub fn validate_score_test(
     call: &ModelCall,
     comparison: &str,
@@ -571,5 +520,18 @@ mod tests {
         assert_eq!(repr_str("lease"), "'lease'");
         assert_eq!(repr_str("it's"), "\"it's\"");
         assert_eq!(repr_str("a\nb"), "'a\\nb'");
+    }
+}
+
+#[cfg(test)]
+mod repr_tests {
+    use crate::expressions::repr_str;
+
+    #[test]
+    fn a_repr_escapes_what_python_does_not_print() {
+        assert_eq!(repr_str("a\u{a0}b"), "'a\\xa0b'");
+        assert_eq!(repr_str("\u{200b}"), "'\\u200b'");
+        assert_eq!(repr_str("café — ok"), "'café — ok'");
+        assert_eq!(repr_str("it's"), "\"it's\"");
     }
 }

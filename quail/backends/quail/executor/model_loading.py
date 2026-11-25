@@ -61,8 +61,6 @@ def engine_args(path, architecture: str = "") -> dict:
     config = Path(path) / "config.json"
     if not config.is_file():
         return settings
-    # mammoth-1's config says float32 at the top and bfloat16, the
-    # weights' dtype, in its text config; vLLM's "auto" reads the top
     fields = json.loads(config.read_text())
     text_dtype = fields.get("text_config", {}).get("dtype")
     if text_dtype and fields.get("dtype", text_dtype) != text_dtype:
@@ -163,22 +161,16 @@ def retain_answer_head(torch, model, token_ids, head=None):
     if hasattr(model, "quail_answer_token_ids"):
         answer_weights(model, allowed)
         return
-    # a checkpoint with a vision tower keeps its head in the language model
     owner = model if hasattr(model, "lm_head") else model.language_model
     weight = owner.lm_head.weight if head is None else head
     indices = torch.tensor(allowed, device=weight.device, dtype=torch.long)
     weights = weight.detach().index_select(0, indices).to(dtype=torch.bfloat16)
     model.register_buffer("quail_answer_weights", weights, persistent=False)
     model.quail_answer_token_ids = allowed
-    # AI.CLASSIFY reads the whole head: bf16 logits, as in vLLM,
-    # normalized in float32. A head tied to the embedding shares its
-    # memory; the model spec prices an untied head into the KV arena.
     model.quail_full_head = weight.detach().to(dtype=torch.bfloat16)
-    # lm_head can be the same module as embed_tokens; drop only this reference.
     owner.lm_head = None
 
 
-# the 16 FP4 E2M1 values, by their 4-bit code: sign bit, then magnitude
 E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
                -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
 NVFP4_GROUP = 16
@@ -308,8 +300,6 @@ def load_model(model_name: str, revision: str | None = None, *,
     import torch
     import vllm
 
-    # vLLM's Triton fused MoE reads tuned tile configs from this
-    # folder before its own; ours add entries for Quail's chunk sizes
     if "VLLM_TUNED_CONFIG_FOLDER" not in os.environ:
         base = Path(vllm.__file__).parent / "model_executor/layers/fused_moe/configs"
         folder = write_configs(
@@ -317,7 +307,6 @@ def load_model(model_name: str, revision: str | None = None, *,
         os.environ["VLLM_TUNED_CONFIG_FOLDER"] = str(folder)
     model_path = resolve_model_path(model_name, revision)
     if is_lfm3(model_path):
-        # vLLM has no LFM3 model; its loader would also refuse the config
         model = load_lfm3(model_path, quantize_fp8=quantize_fp8)
     else:
         model = _load_vllm_model(model_path, max_batched_tokens, moe_backend,
@@ -351,13 +340,10 @@ def _load_vllm_model(model_path, max_batched_tokens, moe_backend, text_only,
     if moe_backend is not None:
         args["moe_backend"] = moe_backend
     if text_only:
-        # an image limit of 0 leaves the vision encoder out
         args["limit_mm_per_prompt"] = {"image": int(images), "video": 0}
     config = EngineArgs(**args).create_engine_config()
     _install_single_rank_groups(torch)
     with set_current_vllm_config(config):
         model = get_model(vllm_config=config)
-    # vLLM's fused MoE kernels read the forward context, which is
-    # built from this config
     model.quail_vllm_config = config
     return model

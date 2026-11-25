@@ -1,17 +1,3 @@
-//! Image documents: a binary column of PNG or JPEG images, such as the
-//! pages `AI.PDF_PAGES` renders, as the tokens of a token store.
-//!
-//! The model reads an image at the size [`image_size`] gives, as Qwen's
-//! image processor resizes it. An image of `w` by `h` pixels at that
-//! size is `(w / t) * (h / t)` image tokens, where `t` is the model's
-//! [`ImageSizing::token_pixels`],
-//! between the model's vision start and end tokens. Each image token's
-//! id is [`IMAGE_TOKEN_BASE`] or more, unique to the image's bytes, so
-//! the planner counts, shares, and deduplicates image documents as it
-//! does text, and two documents share a token only where they hold the
-//! same image. The executor reads each image's pixels from the scan's
-//! document column.
-
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
@@ -24,29 +10,18 @@ use quail_planner::inputs::HfTokenizer;
 
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
 const JPEG_SIGNATURE: &[u8] = b"\xff\xd8\xff";
-/// The longest an image's longer side may be, as a multiple of its
-/// shorter side, as Qwen's `smart_resize` allows.
 const MAX_ASPECT: u32 = 200;
 
-/// How a model's image processor sizes an image, from the model's spec.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageSizing {
-    /// The pixels along each side of one image token: the patch's side
-    /// times the patches merged along a side.
     pub token_pixels: u32,
-    /// The fewest pixels the model reads an image at.
     pub min_pixels: u64,
-    /// The most pixels the model reads an image at.
     pub max_pixels: u64,
 }
 
 impl ImageSizing {
-    /// The sizing a model spec, as JSON, gives; None when the model
-    /// loads no vision encoder.
     pub(crate) fn of_model(model: &serde_json::Value) -> Option<Self> {
         let field = |name: &str| model[name].as_u64().unwrap_or(0);
-        // a spec that loads only some of its checkpoint's layers, or a
-        // decision model, loads no vision encoder
         if !model["vision_tower"].as_bool().unwrap_or(false)
             || model["role"].as_str() == Some("decision")
             || field("checkpoint_layers") != 0
@@ -63,18 +38,13 @@ impl ImageSizing {
         })
     }
 }
-/// The field of a page struct that holds its PNG, as AI.PDF_PAGES names it.
 const PAGE_IMAGE: &str = "image";
 
-/// Whether a document column of this type holds images: a binary
-/// column of PNGs, or a list column whose binary parts are each a PNG
-/// or UTF-8 text.
 pub(crate) fn holds_images(data_type: &DataType) -> bool {
     match data_type {
         DataType::Binary | DataType::LargeBinary | DataType::BinaryView => true,
         DataType::List(part) | DataType::LargeList(part) => match part.data_type() {
             DataType::Binary | DataType::LargeBinary | DataType::BinaryView => true,
-            // the pages AI.PDF_PAGES returns: each its number and its image
             DataType::Struct(fields) => fields
                 .find(PAGE_IMAGE)
                 .is_some_and(|(_, field)| holds_images(field.data_type())),
@@ -84,7 +54,6 @@ pub(crate) fn holds_images(data_type: &DataType) -> bool {
     }
 }
 
-/// The width and height a PNG's header gives, or None for other bytes.
 fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
     if bytes.len() < 24 || !bytes.starts_with(PNG_SIGNATURE) || &bytes[12..16] != b"IHDR" {
         return None;
@@ -94,8 +63,6 @@ fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
     Some((width, height))
 }
 
-/// The width and height a JPEG's frame header gives, or None for other
-/// bytes.
 fn jpeg_size(bytes: &[u8]) -> Option<(u32, u32)> {
     if !bytes.starts_with(JPEG_SIGNATURE) {
         return None;
@@ -106,18 +73,15 @@ fn jpeg_size(bytes: &[u8]) -> Option<(u32, u32)> {
             return None;
         }
         let marker = bytes[at + 1];
-        // fill bytes before a marker
         if marker == 0xff {
             at += 1;
             continue;
         }
-        // markers with no length: restarts, and the start of the image
         if (0xd0..=0xd8).contains(&marker) || marker == 0x01 {
             at += 2;
             continue;
         }
         let length = usize::from(u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]));
-        // a start-of-frame marker; 0xc4, 0xc8, and 0xcc are other tables
         if (0xc0..=0xcf).contains(&marker) && ![0xc4, 0xc8, 0xcc].contains(&marker) {
             let frame = bytes.get(at + 5..at + 9)?;
             let height = u32::from(u16::from_be_bytes([frame[0], frame[1]]));
@@ -129,14 +93,6 @@ fn jpeg_size(bytes: &[u8]) -> Option<(u32, u32)> {
     None
 }
 
-/// The width and height the model reads an image at: each side a
-/// multiple of the sizing's token pixels, and the area from its minimum
-/// to its maximum, as Qwen's `smart_resize` gives them.
-///
-/// # Errors
-///
-/// The bytes are not a PNG or a JPEG, or the image has no pixels or is
-/// over 200 times as long as it is wide.
 pub fn image_size(bytes: &[u8], sizing: ImageSizing) -> Result<(u32, u32), CompileError> {
     let Some((width, height)) = png_size(bytes).or_else(|| jpeg_size(bytes)) else {
         return Err(CompileError::new(
@@ -152,7 +108,6 @@ pub fn image_size(bytes: &[u8], sizing: ImageSizing) -> Result<(u32, u32), Compi
     let factor = f64::from(sizing.token_pixels);
     let (min_pixels, max_pixels) = (sizing.min_pixels as f64, sizing.max_pixels as f64);
     let (width, height) = (f64::from(width), f64::from(height));
-    // Python's round(), which rounds a half to the even multiple
     let mut sides =
         [height, width].map(|side| factor.max((side / factor).round_ties_even() * factor));
     if sides[0] * sides[1] > max_pixels {
@@ -165,12 +120,10 @@ pub fn image_size(bytes: &[u8], sizing: ImageSizing) -> Result<(u32, u32), Compi
     Ok((sides[1] as u32, sides[0] as u32))
 }
 
-/// Whether a document part's bytes are an image rather than text.
 fn is_image(bytes: &[u8]) -> bool {
     bytes.starts_with(PNG_SIGNATURE) || bytes.starts_with(JPEG_SIGNATURE)
 }
 
-/// The first token id of each image a planner has seen, by its bytes.
 #[derive(Debug, Default)]
 pub(crate) struct ImageIds {
     by_content: HashMap<(u64, usize), i32>,
@@ -178,8 +131,6 @@ pub(crate) struct ImageIds {
 }
 
 impl ImageIds {
-    /// The first id of an image of `count` tokens with these bytes: the
-    /// same id for the same bytes.
     fn first_id(&mut self, bytes: &[u8], count: i64) -> Result<i32, CompileError> {
         let mut hasher = DefaultHasher::new();
         bytes.hash(&mut hasher);
@@ -201,14 +152,6 @@ impl ImageIds {
     }
 }
 
-/// The token ids of each image in `values`, a binary column: the vision
-/// start token, one id per image token, and the vision end token. A NULL
-/// image has no tokens.
-///
-/// # Errors
-///
-/// The model has no vision tokens, or a value is not an image
-/// [`image_size`] reads.
 pub(crate) fn image_token_lists(
     values: &ArrayRef,
     tokenizer: &HfTokenizer,
@@ -225,7 +168,6 @@ pub(crate) fn image_token_lists(
     let start = special("<|vision_start|>")? as i32;
     let end = special("<|vision_end|>")? as i32;
     let mut lists = LargeListBuilder::new(Int32Builder::new());
-    // one part's tokens: an image's tokens, or else its UTF-8 text's
     let mut part = |bytes: &[u8], tokens: &mut Int32Builder, text: bool| {
         if text && !is_image(bytes) {
             let text = std::str::from_utf8(bytes).map_err(|_| {
@@ -310,8 +252,6 @@ pub(crate) fn image_token_lists(
     Ok(lists.finish())
 }
 
-/// The image tokens of an image: one per token's square of pixels, at
-/// the size the model reads it.
 fn image_tokens(bytes: &[u8], sizing: ImageSizing) -> Result<i64, CompileError> {
     let (width, height) = image_size(bytes, sizing)?;
     let side = sizing.token_pixels;
@@ -331,7 +271,6 @@ mod tests {
         bytes
     }
 
-    /// A JPEG's start, an APP0 segment, and a baseline frame header.
     fn jpeg(width: u16, height: u16) -> Vec<u8> {
         let mut bytes = vec![0xff, 0xd8, 0xff, 0xe0, 0x00, 0x04, 0x4a, 0x46];
         bytes.extend_from_slice(&[0xff, 0xc0, 0x00, 0x11, 0x08]);
@@ -340,7 +279,6 @@ mod tests {
         bytes
     }
 
-    /// Qwen3.5's image processor: 16-pixel patches, merged 2 by 2.
     const QWEN: ImageSizing = ImageSizing {
         token_pixels: 32,
         min_pixels: 65_536,
@@ -357,7 +295,6 @@ mod tests {
 
     #[test]
     fn a_model_with_other_patches_sizes_an_image_its_own_way() {
-        // 14-pixel patches merged 2 by 2, as Qwen2-VL reads them
         let other = ImageSizing {
             token_pixels: 28,
             min_pixels: 3_136,
@@ -365,7 +302,6 @@ mod tests {
         };
         assert_eq!(image_size(&png(1000, 750), other).unwrap(), (1008, 756));
         assert_eq!(image_tokens(&png(1000, 750), other).unwrap(), 36 * 27);
-        // over the maximum, the image shrinks below a million pixels
         let (width, height) = image_size(&png(4000, 3000), other).unwrap();
         assert!(width * height <= 1_000_000, "{width} by {height}");
     }
@@ -390,8 +326,6 @@ mod tests {
 
     #[test]
     fn an_image_is_resized_as_qwens_image_processor_resizes_it() {
-        // expected sizes from Hugging Face's smart_resize with Qwen3.5's
-        // preprocessor_config.json; a small image grows to 65,536 pixels
         for ((width, height), resized) in [
             ((1184, 1536), (1184, 1536)),
             ((1000, 750), (992, 736)),

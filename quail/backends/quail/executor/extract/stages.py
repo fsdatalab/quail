@@ -19,7 +19,7 @@ class Document:
     prefix: Sequence
     scan: DocumentTokens
     key: tuple
-    rho: float = 0.0    # the document's KV read per round, in fed tokens
+    rho: float = 0.0
 
 
 class ExtractionInputs:
@@ -103,7 +103,6 @@ class ExtractionInputs:
         prefix = concat_tokens(self.head, ids)
         scan = DocumentTokens.from_tokens(
             self.vocabulary, tokens, ids.character_offsets, len(self.head))
-        # the round's KV read covers the prompt through the first tail
         rho = self.spec.round_cost_per_token * (len(prefix) + len(self.tails[0]))
         return Document(index=index, text=text, prefix=prefix, scan=scan, key=key,
                         rho=rho)

@@ -1,6 +1,6 @@
 # Writing
 
-The rules cover replies, docs, comments, commit messages, and pull
+The rules cover replies, docs, docstrings, commit messages, and pull
 requests.
 
 - Have a model of the reader. Start with what the reader wants to know
@@ -16,9 +16,16 @@ requests.
 
 # Code
 
-- Write comments only for constraints the code cannot show.
-- Write Google style docstrings: a one-line summary, then optional
-  Args, Returns, and Raises. Say what the code does, not its history.
+Quail is an agent-maintained codebase. Keep the code short, flat, and
+self-explanatory so agents read and edit it without wading through
+boilerplate or commentary.
+
+- Write no inline or block comments in `quail/` or `crates/`. Keep only
+  linter pragmas (`# noqa`, `#[allow(...)]`) and license headers.
+  `tools/check_comments.py` enforces zero disallowed comments.
+- Keep Python docstrings brief in Google style: a one-line summary,
+  then optional Args, Returns, and Raises. State what the code does,
+  never its history.
 - Use one name for each concept; see Names.
 - Release what you open. Enter a file, process, or engine on an
   `ExitStack` or in `closing()`, on the failure path too.
@@ -47,6 +54,7 @@ requests.
 Run every check before you push:
 
     uv run --no-sync ruff check quail bench calibrate tests experiments tools
+    uv run --no-sync python tools/check_comments.py
     uv run --no-sync python tools/check_long_strings.py
     uv run --no-sync python tools/check_names.py
     uv run --no-sync vulture
@@ -55,16 +63,32 @@ Run every check before you push:
     cargo fmt --check
     cargo clippy --all-targets --locked
     cargo test --locked
+    deslop-please
 
 - CI runs the checks on every push to `main`. On a pull request, CI
   runs when you add the label `run-ci`; remove and add the label after
   each push.
+- `check_comments.py` flags inline and block comments in `quail/` and
+  `crates/`, allowing only linter pragmas, license headers, and Python
+  docstrings.
 - `lint-imports` lets a Python package import only the packages below
   it in `[tool.importlinter]`. Put shared code in the lower package.
 - `check_long_strings.py` flags a string over 200 characters unless its
   name says content: PROMPT, TEMPLATE, SQL, QUERY, HTML, or TEXT.
 - `check_names.py` flags two names for one concept, and one name for
   two.
+- [`deslop-please`](https://github.com/deterministic-machines/deslop-please)
+  checks the Rust structure: deep modules, narrow interfaces. Install
+  it with `cargo install deslop-please --version 0.1.3 --locked`. Fix
+  an error from first principles, never with a mechanical move that
+  hides it:
+  - `module-cycle` and `tangle`: decide which module belongs at which
+    layer.
+  - `field-leak` and `shallow-module`: find what callers do with the
+    fields or functions, and give the type a method for it, not a
+    getter.
+  - A widely read module stays one file at the crate root; a directory
+    must hide more functions than it shows.
 
 # Build
 
@@ -99,7 +123,7 @@ Run every check before you push:
               f"SELECT r.id FROM reviews r WHERE r.long OR {KIND}"), """\
       --- SELECT r.id FROM reviews r WHERE r.long OR AI_FILTER(...) ---
       plan
-        __quail_answer_1 = ai_filter('kind: {0}', r.body), guard: r.long IS NOT TRUE
+        __quail_answer_1 = ai_filter('kind: {0}', r.body), precondition: r.long IS NOT TRUE
       asked 3 of 6
         'kind: {0}': r1 FALSE, r2 TRUE, r4 TRUE
       rows 5
@@ -158,6 +182,10 @@ enforces the words:
   an operator shows before each document.
 - A document operator emits one `rows:<alias>` port carrying `Rows`,
   and a pair operator emits `rows`. Read ids with `document_ids()`.
+- Demand-propagation terms follow standard database names:
+  `precondition` (not `guard`), `predicates` / `inline_predicate` (not
+  `tests` / `filter` on an AI node), `field_pruning` / `pruned_fields`
+  (not `projection` on an AI node), and `row_limit` (not `fetch`).
 - A variable with a type's name holds the type: `rows`, `scored`,
   `labels`, and `answers` hold `Rows`; `table`, `batch`, and `relation`
   hold Arrow tables.

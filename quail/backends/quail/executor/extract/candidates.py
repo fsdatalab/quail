@@ -16,8 +16,6 @@ import numpy as np
 
 from quail.backends.quail.executor.extract.vocabulary import Vocabulary
 
-# the source characters an ExtractSpec tokenizes in its first window and
-# in each later one, unless the plan sets them
 FIRST_WINDOW_CHARS = _quail_native.FIRST_WINDOW_CHARS
 WINDOW_CHARS = _quail_native.WINDOW_CHARS
 
@@ -80,7 +78,6 @@ class SqueezedText:
         right = int(np.searchsorted(self.ends, end - 1, side="right")) + 1
         ends = self.ends[left:right]
         if len(ends) and ends[-1] > end:
-            # A window may end inside a whitespace run.
             ends = ends.copy()
             ends[-1] = end
         return self.text[left:right], ends
@@ -123,11 +120,11 @@ class Stream:
     """One start position's text, as the model would write it from there."""
 
     char: int
-    stream: list        # the tokens from the start, as far as tokenized
-    ends: list          # the document character each stream token ends at
-    text: str           # the document
+    stream: list
+    ends: list
+    text: str
     exhausted: bool = False
-    windows: int = 0    # windows tokenized so far
+    windows: int = 0
     normalized: SqueezedText | None = None
     first_window_chars: int = FIRST_WINDOW_CHARS
     window_chars: int = WINDOW_CHARS
@@ -284,7 +281,6 @@ def first_tokens(vocabulary: Vocabulary, lp, scan: DocumentTokens) -> FirstToken
     index = scan.candidates
     values = lp[index.token]
     maxima = np.maximum.reduceat(values, index.offsets)
-    # Vocabulary.options orders equal-score spellings longest first.
     eligible = np.where(values == maxima[index.segment],
                         np.arange(len(values)), len(values))
     best = np.minimum.reduceat(eligible, index.offsets)

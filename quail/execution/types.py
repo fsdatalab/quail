@@ -142,7 +142,6 @@ def _join_answers_table(value: Mapping[str, Any]) -> pa.Table:
         documents = pa.array([int(member[index]) for member in partner_map],
                              type=pa.int32())
         columns[alias] = pc.take(documents, members)
-    # answers arrive as 0/1 integers or booleans; the cast covers both
     answers = pc.cast(pa.array(chain.from_iterable(answer_parts)), pa.bool_())
     metadata = {
         "anchor": anchor, "semantics": value["semantics"],

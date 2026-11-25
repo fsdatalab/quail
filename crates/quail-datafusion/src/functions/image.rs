@@ -1,19 +1,3 @@
-//! `AI.IMAGE(image, longest_edge)`: an image whose longer side is at
-//! most `longest_edge` pixels.
-//!
-//! A vision model reads one token per patch of pixels, so a large photo
-//! costs thousands of tokens. The function shrinks each PNG or JPEG on
-//! the CPU, without a model, before the model reads it. DataFusion runs
-//! it as it runs any other scalar function, so it shrinks only the rows
-//! that pass the filters below it. For example:
-//!
-//! ```sql
-//! SELECT r.id FROM receipts r
-//! WHERE AI.IF(PROMPT('Is the total over 100,000 rupiah? {0}', AI.IMAGE(r.image, 1024)))
-//! ```
-//!
-//! Snowflake SQL may write `AI_IMAGE(r.image, 1024)`.
-
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -29,13 +13,10 @@ use image::{DynamicImage, ImageFormat};
 
 use super::quiet::quietly;
 
-/// The largest `longest_edge` a call may name, as `AI.PDF_PAGES` allows.
 const MAX_LONGEST_EDGE: u32 = 8192;
 
-/// The quality of a shrunk JPEG, from 1 to 100.
 const JPEG_QUALITY: u8 = 90;
 
-/// `AI.IMAGE`, which shrinks each image to a longest side.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct ShrinkImage {
     signature: Signature,
@@ -89,8 +70,6 @@ impl ScalarUDFImpl for ShrinkImage {
     }
 }
 
-/// The `longest_edge` argument in pixels, or an error unless it is from
-/// 1 to [`MAX_LONGEST_EDGE`].
 fn longest_edge_pixels(longest_edge: &ScalarValue) -> Result<u32> {
     let ScalarValue::Int64(Some(pixels)) = longest_edge.cast_to(&DataType::Int64)? else {
         return plan_err!("AI.IMAGE takes longest_edge as an integer literal, in pixels");
@@ -103,10 +82,6 @@ fn longest_edge_pixels(longest_edge: &ScalarValue) -> Result<u32> {
     }
 }
 
-/// Each image of `images`, a binary array, shrunk to `longest_edge`:
-/// NULL for a NULL image or one that is not a PNG or a JPEG. The images
-/// are `LargeBinary`, whose 64-bit offsets let DataFusion join batches of
-/// more than 2 GiB of images into one.
 fn shrunk_images(images: &ArrayRef, longest_edge: u32) -> Result<ArrayRef> {
     let mut shrunk = LargeBinaryBuilder::new();
     let mut append =
@@ -120,9 +95,6 @@ fn shrunk_images(images: &ArrayRef, longest_edge: u32) -> Result<ArrayRef> {
     Ok(Arc::new(shrunk.finish()))
 }
 
-/// One image whose longer side is at most `longest_edge`, in the image's
-/// own format, or None for bytes that are not a PNG or a JPEG. An image
-/// already small enough keeps its bytes.
 fn shrink(bytes: &[u8], longest_edge: u32) -> Option<Vec<u8>> {
     let format = image::guess_format(bytes).ok()?;
     if !matches!(format, ImageFormat::Png | ImageFormat::Jpeg) {
@@ -135,12 +107,10 @@ fn shrink(bytes: &[u8], longest_edge: u32) -> Option<Vec<u8>> {
     }
     let scale = f64::from(longest_edge) / f64::from(width.max(height));
     let side = |pixels: u32| ((f64::from(pixels) * scale).round() as u32).max(1);
-    // Qwen's image processor resizes with bicubic interpolation
     let resized = decoded.resize_exact(side(width), side(height), FilterType::CatmullRom);
     encoded(resized, format)
 }
 
-/// An image's bytes in `format`: a PNG as it is, a JPEG as 8-bit RGB.
 fn encoded(image: DynamicImage, format: ImageFormat) -> Option<Vec<u8>> {
     let mut bytes = Cursor::new(Vec::new());
     if format == ImageFormat::Jpeg {
@@ -154,7 +124,6 @@ fn encoded(image: DynamicImage, format: ImageFormat) -> Option<Vec<u8>> {
     Some(bytes.into_inner())
 }
 
-/// `AI.IMAGE` as a DataFusion UDF, also named `AI.IMAGE` and `ai.image`.
 pub(crate) fn image_function() -> Arc<ScalarUDF> {
     Arc::new(ScalarUDF::new_from_impl(ShrinkImage {
         signature: Signature::any(2, Volatility::Immutable),

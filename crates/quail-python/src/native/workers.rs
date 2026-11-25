@@ -1,6 +1,3 @@
-//! The GPU workers ([`crate::workers`]) as Python sees them: `Workers`
-//! in the process that runs a region, `WorkerEnd` in each worker.
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -10,7 +7,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyString, PyTuple};
 use quail_planner::physical::PhysicalGraph;
-use quail_planner::stages::Stage;
+use quail_planner::plan::stages::Stage;
 
 use super::{from_json, python_error};
 use crate::pyarrow::{stream_from_pyarrow, to_pyarrow};
@@ -37,15 +34,12 @@ fn tables_to_python<'py>(py: Python<'py>, tables: Vec<Table>) -> PyResult<Vec<Bo
         .collect()
 }
 
-/// A session's GPU workers: one process per GPU, as
-/// `crate::workers::Workers`.
 #[pyclass(name = "Workers", module = "_quail_native")]
 pub(super) struct Workers {
     workers: Option<Arc<Mutex<crate::workers::Workers>>>,
 }
 
 impl Workers {
-    /// The workers, which a session may share with this object.
     pub(super) fn shared(&self) -> PyResult<Arc<Mutex<crate::workers::Workers>>> {
         self.workers
             .clone()
@@ -55,7 +49,6 @@ impl Workers {
 
 #[pymethods]
 impl Workers {
-    /// Listen for `gpus` workers, one socket each.
     #[new]
     fn new(gpus: usize) -> PyResult<Self> {
         let workers = crate::workers::Workers::bind(gpus).map_err(python_error)?;
@@ -64,7 +57,6 @@ impl Workers {
         })
     }
 
-    /// Each worker's socket, by GPU.
     #[getter]
     fn paths(&mut self) -> PyResult<Vec<PathBuf>> {
         let shared = self.shared()?;
@@ -72,29 +64,24 @@ impl Workers {
         Ok(workers.paths().to_vec())
     }
 
-    /// Start one process per GPU: `command`, then the worker's socket
-    /// and its GPU's index.
     fn spawn(&mut self, command: Vec<String>) -> PyResult<()> {
         let shared = self.shared()?;
         let mut workers = shared.lock().expect("the workers lock");
         workers.spawn(&command).map_err(python_error)
     }
 
-    /// Wait for every worker to connect.
     fn connect(&mut self, py: Python<'_>) -> PyResult<()> {
         let shared = self.shared()?;
         py.detach(|| shared.lock().expect("the workers lock").connect())
             .map_err(python_error)
     }
 
-    /// Whether the workers are open and every process is running.
     fn alive(&mut self) -> bool {
         self.workers
             .as_ref()
             .is_some_and(|shared| shared.lock().expect("the workers lock").alive())
     }
 
-    /// What Quail plans the regions of `config` with; both are JSON.
     fn describe(&mut self, py: Python<'_>, config: &str) -> PyResult<String> {
         let config: serde_json::Value = from_json(config)?;
         let shared = self.shared()?;
@@ -104,8 +91,6 @@ impl Workers {
         Ok(described.to_string())
     }
 
-    /// Prepare every worker's GPU for a plan; `setup` and each
-    /// worker's boot record are JSON.
     fn boot(&mut self, py: Python<'_>, setup: &str) -> PyResult<Vec<String>> {
         let setup: serde_json::Value = from_json(setup)?;
         let shared = self.shared()?;
@@ -115,19 +100,6 @@ impl Workers {
         Ok(booted.iter().map(ToString::to_string).collect())
     }
 
-    /// Run a region's stages on the workers.
-    ///
-    /// `region` describes the region to each worker, as JSON, and
-    /// `tables` holds its documents and columns as pyarrow Tables, by
-    /// name. `graph` is the region's compute graph as JSON; `stages`
-    /// is the plan's `stages` setting as JSON. `report(table)` takes each finished
-    /// table as a pyarrow Table over the pages its worker shared;
-    /// `ask(question)` takes a worker's question as JSON and returns
-    /// its answer, as JSON or a pyarrow Table.
-    ///
-    /// Returns, per worker, what it ran as JSON and its nodes' output
-    /// tables. No worker hears of a region whose graph or stages do
-    /// not decode.
     #[pyo3(signature = (region, tables, graph, stages, report, ask))]
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn run_region<'py>(
@@ -142,15 +114,13 @@ impl Workers {
     ) -> PyResult<Vec<(String, Vec<Bound<'py, PyAny>>)>> {
         let graph: PhysicalGraph = from_json(graph)?;
         let cut: Vec<Stage> = from_json(stages)?;
-        quail_planner::physical::validate_graph(&graph.nodes, &graph.root)
+        quail_planner::topology::validate_graph(&graph.nodes, &graph.root)
             .map_err(PyValueError::new_err)?;
         let region: serde_json::Value = from_json(region)?;
         let tables = tables
             .iter()
             .map(|(name, table)| Ok((name.clone(), table_from_python(table)?)))
             .collect::<PyResult<Vec<_>>>()?;
-        // a table the plan deduplicates or stops by a key spreads its
-        // documents over the GPUs by group
         let deduplicated: Vec<String> = match region["query"].get("deduplicate") {
             Some(serde_json::Value::Object(found)) => found.keys().cloned().collect(),
             _ => Vec::new(),
@@ -192,15 +162,12 @@ impl Workers {
             .collect()
     }
 
-    /// Stop the workers: tell each to exit, then kill what is left.
     fn close(&mut self, py: Python<'_>) {
         let workers = self.workers.take();
         py.detach(|| drop(workers));
     }
 }
 
-/// A worker's end of its connection, as `crate::workers::WorkerEnd`:
-/// it connects to the socket at `path` once made.
 #[pyclass(name = "WorkerEnd", module = "_quail_native")]
 struct WorkerEnd {
     end: crate::workers::WorkerEnd,
@@ -216,10 +183,6 @@ impl WorkerEnd {
         Ok(WorkerEnd { end })
     }
 
-    /// The next message, or None once Quail is done with the worker:
-    /// ("describe", configuration JSON), ("boot", setup JSON),
-    /// ("region", region JSON, tables by name), ("stage", index, input
-    /// tables), or ("end",).
     fn next<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyTuple>>> {
         let end = &mut self.end;
         let message = py.detach(|| end.read()).map_err(python_error)?;
@@ -246,7 +209,6 @@ impl WorkerEnd {
         Ok(Some(PyTuple::new(py, parts)?))
     }
 
-    /// Answer a describe with what Quail plans with, as JSON.
     fn described(&mut self, py: Python<'_>, description: &str) -> PyResult<()> {
         let description: serde_json::Value = from_json(description)?;
         let end = &mut self.end;
@@ -254,35 +216,29 @@ impl WorkerEnd {
             .map_err(python_error)
     }
 
-    /// Answer a boot with its record, as JSON.
     fn booted(&mut self, py: Python<'_>, record: &str) -> PyResult<()> {
         let record: serde_json::Value = from_json(record)?;
         let end = &mut self.end;
         py.detach(|| end.booted(&record)).map_err(python_error)
     }
 
-    /// Say the region's stages can start.
     fn ready(&mut self, py: Python<'_>) -> PyResult<()> {
         let end = &mut self.end;
         py.detach(|| end.ready()).map_err(python_error)
     }
 
-    /// Send a stage's output tables, which ends the stage.
     fn outputs(&mut self, py: Python<'_>, outputs: Vec<Bound<'_, PyAny>>) -> PyResult<()> {
         let outputs = tables_from_python(&outputs)?;
         let end = &mut self.end;
         py.detach(|| end.outputs(&outputs)).map_err(python_error)
     }
 
-    /// Send a table the running stage finished.
     fn finished(&mut self, py: Python<'_>, table: &Bound<'_, PyAny>) -> PyResult<()> {
         let table = table_from_python(table)?;
         let end = &mut self.end;
         py.detach(|| end.finished(&table)).map_err(python_error)
     }
 
-    /// Ask the region a question, as JSON, while a stage runs; returns
-    /// its answer as JSON text or a pyarrow Table.
     fn ask<'py>(&mut self, py: Python<'py>, question: &str) -> PyResult<Bound<'py, PyAny>> {
         let question: serde_json::Value = from_json(question)?;
         let end = &mut self.end;
@@ -292,8 +248,6 @@ impl WorkerEnd {
         }
     }
 
-    /// Answer the region's end with what the worker ran, as JSON, and
-    /// its nodes' output tables.
     fn ran(&mut self, py: Python<'_>, ran: &str, tables: Vec<Bound<'_, PyAny>>) -> PyResult<()> {
         let ran: serde_json::Value = from_json(ran)?;
         let tables = tables_from_python(&tables)?;
@@ -301,19 +255,12 @@ impl WorkerEnd {
         py.detach(|| end.ran(&ran, &tables)).map_err(python_error)
     }
 
-    /// Say why the message the worker is answering failed.
     fn fail(&mut self, py: Python<'_>, error: &str) -> PyResult<()> {
         let end = &mut self.end;
         py.detach(|| end.fail(error)).map_err(python_error)
     }
 }
 
-/// The tables a planned region's workers read, by name, as
-/// `crate::request::request_tables` builds them.
-///
-/// `envelope` is the plan's envelope as JSON; `operators` the region's
-/// operators as JSON; `scans` gives, by alias, each scan's token store
-/// and the columns of its rows, as pyarrow Tables.
 #[pyfunction]
 fn request_tables<'py>(
     py: Python<'py>,
@@ -342,15 +289,6 @@ fn request_tables<'py>(
         .collect()
 }
 
-/// The report of a region's run on its workers, as
-/// `crate::report::region_report` writes it.
-///
-/// `graph` is the region's graph as JSON; `ran` gives, per worker, what
-/// it ran as JSON and its nodes' output tables; `wall` is the seconds
-/// the region took; `usd_per_hour` prices one GPU.
-///
-/// Returns the report as JSON, and the run's output tables, one per
-/// port, each tagged with its node and port.
 #[pyfunction]
 #[pyo3(signature = (graph, ran, wall, usd_per_hour, gpus, gpu_timing))]
 fn region_report<'py>(

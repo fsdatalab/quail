@@ -19,17 +19,9 @@ from quail.common.expressions import accepts
 from quail.common.selection import equality_keys
 
 COLUMNS_PREFIX = "columns:"
-# the value column a deduplicated table carries: each row's first row
-# with the same tokens and the same deduplicate setting columns
 FIRST_DOCUMENT = "__first_document"
-# the value column that is TRUE for each document of a scan that is
-# NULL, present only when one is; Rust's planner writes it
 NULL_DOCUMENT = _quail_native.NULL_DOCUMENT
-# the value column of a deduplicated rows input to an AI filter with a
-# stop key: the documents each key document stands for
 COPIES = "__copies"
-# the most candidate pairs a join's filter tests at once, which bounds
-# the memory of a join without keys to its pairs that pass
 FILTER_BATCH_PAIRS = 1 << 20
 
 
@@ -150,7 +142,6 @@ def _join_key_columns(left, right):
     schema = pa.unify_schemas([pa.schema([("key", kind)]) for kind in types],
                               promote_options="permissive")
     kind = schema.field(0).type
-    # Arrow's hash join needs a concrete key type when every value is null
     kind = pa.bool_() if pa.types.is_null(kind) else kind
     return left.cast(kind), right.cast(kind)
 

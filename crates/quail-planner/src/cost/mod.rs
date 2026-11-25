@@ -1,39 +1,15 @@
-//! Quail's model and device specs and its cost model.
-//!
-//! The modules with a Python counterpart compute the same numbers
-//! in the same order, so results equal Python's:
-//!
-//! | Module | Python |
-//! | --- | --- |
-//! | `specs` | `quail/specs/base.py`, `quail/specs/loading.py` |
-//! | `quantity` | numpy and Python summation and broadcasting |
-//! | `work` | `quail/common/work.py` |
-//! | `budgets` | `quail/common/budgets.py` |
-//! | `answers` | `quail/common/answers.py` |
-//! | `draft_policy` | `quail/common/draft_policy.py` |
-//! | `retention` | `quail/common/retention.py` |
-//! | `decode` | `quail/common/decode.py`, the planner's part |
-//! | `roofline`, `dense_decoder_cost`, `sol`, `statistics`, `filters`, `packing`, `score`, `sae_features`, `classify`, `joins`, `extract` | none; Rust only |
-//! | `labels` | `quail/labels.py`, the trie the costs read |
-
 pub mod answers;
-pub mod budgets;
 pub mod classify;
 pub mod decode;
 pub mod dense_decoder_cost;
 pub mod draft_policy;
 pub mod extract;
-pub mod filters;
 pub mod joins;
-pub mod labels;
 pub mod packing;
-pub mod quantity;
 pub mod retention;
-pub mod roofline;
 pub mod sae_features;
 pub mod score;
 pub mod sol;
-pub mod specs;
 pub mod statistics;
 pub mod work;
 
@@ -41,7 +17,7 @@ pub mod work;
 mod tests {
     use std::path::Path;
 
-    use crate::cost::specs::{ModelSpec, Precision, read_devices, read_models};
+    use crate::specs::{ModelSpec, Precision, read_devices, read_models};
 
     fn data(kind: &str) -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -67,7 +43,6 @@ mod tests {
         assert_eq!(variant.weight_precision, Precision::Fp8);
         assert_eq!(variant.attention_precision, Precision::Bf16);
         assert_eq!(variant.gdn_weight_precision, Some(Precision::Bf16));
-        // a fine-tune names its base and keeps the base's shapes
         let mammoth = &models["mammoth-1-bf16"];
         assert_eq!(mammoth.layers, models["qwen3.5-27b-fp8"].layers);
         assert_eq!(mammoth.weight_precision, Precision::Bf16);

@@ -1,6 +1,3 @@
-//! A Python engine as Quail's [`RegionEngine`], and the Python objects
-//! it is handed: a region's hint and its sink.
-
 use std::sync::Arc;
 
 use datafusion::arrow::array::RecordBatch;
@@ -32,13 +29,6 @@ use quail::{EngineRegion, Executor, RegionEngine};
 use crate::pyarrow::{from_pyarrow, stream_from_pyarrow, to_pyarrow};
 use crate::python_failure;
 
-/// Runs each model region by calling a Python engine: its
-/// `execute(planned, tables, sink, hint)` runs a region Rust planned,
-/// and `run_region(payload, tables, fetch)` one it did not. `planned`
-/// is the planned region's JSON and its scans, as [`scans_to_pyarrow`]
-/// hands them over. `execute` hands the sink each batch of finished
-/// rows as the region runs and returns None, or returns the rows;
-/// `run_region` returns them, as a pyarrow Table or RecordBatchReader.
 #[derive(Debug)]
 struct PythonEngine(Py<PyAny>);
 
@@ -54,7 +44,6 @@ impl RegionEngine for PythonEngine {
             sink,
         } = region;
         Python::attach(|py| {
-            // each input as a pyarrow Table, by the table name the region reads
             let mut tables = Vec::new();
             for ((name, batches), input) in inputs.iter().zip(&model_region.inputs) {
                 let schema = Arc::new(input.schema().as_arrow().clone());
@@ -64,8 +53,6 @@ impl RegionEngine for PythonEngine {
             let answer = match planned {
                 Some((found, scans)) => {
                     let found = (found, scans_to_pyarrow(py, &scans)?);
-                    // rows finish out of input order, so an ordered
-                    // region returns them all once it ends
                     let sink = match model_region.has_sorted_input() {
                         true => py.None(),
                         false => Bound::new(py, RegionSink(sink))?.into_any().unbind(),
@@ -79,7 +66,6 @@ impl RegionEngine for PythonEngine {
                     (self.0).call_method1(py, "run_region", (payload.as_deref(), tables, fetch))?
                 }
             };
-            // an engine that sent every row to the sink returns None
             let answer = answer.bind(py);
             if answer.is_none() {
                 return Ok(Vec::new());
@@ -94,39 +80,27 @@ fn runtime_error(error: DataFusionError) -> PyErr {
     PyRuntimeError::new_err(error.to_string())
 }
 
-/// A region's hint over the rows of the tables the executor reads, as
-/// [`quail::InputHint`]: whether each row may still pass the tests
-/// above the region, as they tighten while the region runs.
 #[pyclass(name = "InputHint", module = "_quail_native", frozen)]
 struct InputHint(quail::InputHint);
 
 #[pymethods]
 impl InputHint {
-    /// A number that changes whenever a test tightens.
     fn generation(&self) -> u64 {
         self.0.generation()
     }
 
-    /// The tables the hint holds rows of.
     fn tables(&self) -> Vec<String> {
         self.0.tables()
     }
 
-    /// Whether each row of `table`, in the order the executor reads them,
-    /// may still pass every test.
     fn keep(&self, table: &str) -> PyResult<Vec<bool>> {
         self.0.keep(table).map_err(runtime_error)
     }
 
-    /// Whether a test reads the answer column `answer`, an operator's
-    /// name such as `vendor` or `contract.law`, and no other column.
     fn reads_answer(&self, answer: &str) -> bool {
         self.0.reads_answer(answer)
     }
 
-    /// Whether some test, as the tests are now, is TRUE for no complete
-    /// answer that starts with `prefix`; the arguments are those of
-    /// `Expression.decide`.
     #[pyo3(signature = (answer, prefix, complete=false, may_be_null=false, tails=None, max_chars=None))]
     fn rejects_answer(
         &self,
@@ -150,14 +124,11 @@ impl InputHint {
     }
 }
 
-/// The callable a region's engine hands each batch of finished rows,
-/// as a pyarrow Table or RecordBatchReader, while the region runs.
 #[pyclass(name = "RegionSink", module = "_quail_native", frozen)]
 struct RegionSink(quail::RegionSink);
 
 #[pymethods]
 impl RegionSink {
-    /// Send a table's rows on to DataFusion, in the region's schema.
     fn __call__(&self, table: &Bound<'_, PyAny>) -> PyResult<()> {
         for batch in stream_from_pyarrow(table)? {
             let batch = batch.map_err(|error| runtime_error(error.into()))?;
@@ -175,23 +146,6 @@ fn optional_string_attribute(engine: &Bound<'_, PyAny>, name: &str) -> PyResult<
     }
 }
 
-/// An executor that runs model regions on `engine`, a Python object
-/// with `run_region(payload, tables, fetch)` and the attributes `turn`,
-/// `layout`, and `rules`, planning each region in Rust when the engine
-/// has a `tokenizer_file` attribute.
-///
-/// `run_region` takes a region's operators and DataFusion plan as
-/// [`quail::region_json`] writes them, the rows of each input the
-/// region reads by table name, and the region's row limit, and returns
-/// a pyarrow Table or RecordBatchReader. An engine with a `settings`
-/// attribute also has `execute(planned, tables, sink, hint)`. `turn`
-/// and `layout` are the model's chat-turn text and prompt layout.
-/// `rules` names the optimizer rules each model region runs, in order,
-/// or is None for the built-in rules.
-///
-/// # Errors
-///
-/// An attribute is missing or malformed.
 pub fn executor_with_engine(engine: Py<PyAny>) -> Result<Executor> {
     let tokenizer_file =
         Python::attach(|py| optional_string_attribute(engine.bind(py), "tokenizer_file"))
@@ -204,13 +158,6 @@ pub fn executor_with_engine(engine: Py<PyAny>) -> Result<Executor> {
     executor_with_planner(engine, planner)
 }
 
-/// An executor as [`executor_with_engine`] describes, whose regions
-/// `planner` plans in Rust when the engine has a `settings` attribute;
-/// without a planner every region goes to `run_region`.
-///
-/// # Errors
-///
-/// An attribute is missing or malformed.
 pub fn executor_with_planner(engine: Py<PyAny>, planner: Option<Arc<Planner>>) -> Result<Executor> {
     let (prompting, rules, settings) = Python::attach(|py| {
         let bound = engine.bind(py);
@@ -237,42 +184,21 @@ pub fn executor_with_planner(engine: Py<PyAny>, planner: Option<Arc<Planner>>) -
     ))
 }
 
-/// What each scan reads, by alias, as Python's `adopt_plan` takes it:
-/// (the token store, the value columns), each a pyarrow Table over the
-/// same buffers.
-///
-/// # Errors
-///
-/// pyarrow is not importable.
 pub fn scans_to_pyarrow<'py>(
     py: Python<'py>,
     scans: &[ScanInputs],
 ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
     let found = pyo3::types::PyDict::new(py);
     for scan in scans {
-        let tokens = to_pyarrow(
-            py,
-            Arc::clone(scan.tokens.schema()),
-            scan.tokens.record_batches().to_vec(),
-        )?;
-        let (schema, batches) = &scan.columns;
-        let columns = to_pyarrow(py, Arc::clone(schema), batches.clone())?;
+        let (schema, batches) = scan.tokens.to_table();
+        let tokens = to_pyarrow(py, schema, batches)?;
+        let (schema, batches) = scan.columns.clone();
+        let columns = to_pyarrow(py, schema, batches)?;
         found.set_item(&scan.alias, (tokens, columns))?;
     }
     Ok(found)
 }
 
-/// Register a table whose rows the Python function `scan(columns)`
-/// returns as an Arrow stream, such as a pyarrow RecordBatchReader, the
-/// same rows whenever it is scanned, which `identity` names.
-/// `id_column` names the column whose values are unique.
-///
-/// DataFusion reads the stream batch by batch, and asks only for the
-/// columns a query reads.
-///
-/// # Errors
-///
-/// DataFusion refuses the name.
 pub fn register_python_table(
     context: &SessionContext,
     name: &str,
@@ -288,7 +214,6 @@ pub fn register_python_table(
     quail::register_scanned_table(context, name, Arc::new(table), id_column, identity)
 }
 
-/// A table whose rows a Python function streams.
 #[derive(Debug)]
 struct PythonTable {
     schema: SchemaRef,
@@ -331,8 +256,6 @@ impl TableProvider for PythonTable {
     }
 }
 
-/// One scan of a [`PythonTable`]: the Python function's stream of the
-/// projected columns.
 #[derive(Debug)]
 struct PythonScan {
     schema: SchemaRef,
@@ -356,7 +279,6 @@ impl PartitionStream for PythonScan {
             stream_from_pyarrow(answer.bind(py))
         })
         .map_err(python_failure);
-        // pyarrow takes the GIL itself when its stream calls Python
         let batches: Box<dyn Iterator<Item = Result<RecordBatch>> + Send> = match reader {
             Ok(reader) => Box::new(reader.map(|batch| batch.map_err(DataFusionError::from))),
             Err(error) => Box::new(std::iter::once(Err(error))),
@@ -368,13 +290,6 @@ impl PartitionStream for PythonScan {
     }
 }
 
-/// Register the batches of a Python Arrow stream, such as a pyarrow
-/// Table's, without copying them. `id_column` and `identity` are as
-/// [`register_python_table`] has them.
-///
-/// # Errors
-///
-/// A batch does not read, or DataFusion refuses the name.
 pub fn register_batches(
     context: &SessionContext,
     name: &str,
@@ -387,14 +302,6 @@ pub fn register_batches(
     quail::register_scanned_table(context, name, Arc::new(table), id_column, identity)
 }
 
-/// Register local files of one `format` ("parquet", "arrow", "json", or
-/// "csv"), read in the order of `paths`, with `schema`. `id_column`
-/// and `identity` are as [`register_python_table`] has them.
-///
-/// # Errors
-///
-/// A path is not a URL DataFusion reads, the format is unknown, or
-/// DataFusion refuses the name.
 pub fn register_files(
     context: &SessionContext,
     name: &str,
